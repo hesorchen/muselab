@@ -393,6 +393,39 @@ window.addEventListener("error", e => {
                 <span class="thinking-label"><span class="icon"><svg><use href="#i-brain"/></svg></span>thinking</span>
                 <pre x-text="m.text"></pre>
               </div>
+              <!-- Muse asks user a structured question (mcp__muselab__ask_user_question) -->
+              <div x-show="m.role==='ask_user_question'" class="ask-question">
+                <div class="ask-header">
+                  <span class="muse-mascot sm"><svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg></span>
+                  <span class="ask-title" x-text="t('ask.title')"></span>
+                  <span x-show="m.submitted" class="ask-submitted-tag" x-text="t('ask.submitted')"></span>
+                </div>
+                <template x-for="(q, qIdx) in m.questions" :key="qIdx">
+                  <div class="ask-question-block">
+                    <div class="ask-question-head">
+                      <span x-show="q.header" class="ask-question-chip" x-text="q.header"></span>
+                      <span class="ask-question-text" x-text="q.question"></span>
+                      <span x-show="q.multiSelect" class="ask-multi-tag" x-text="t('ask.multi')"></span>
+                    </div>
+                    <div class="ask-options">
+                      <template x-for="(opt, optIdx) in q.options" :key="optIdx">
+                        <button class="ask-option"
+                                :class="{ picked: isAskOptionPicked(m, qIdx, opt.label), disabled: m.submitted }"
+                                :disabled="m.submitted"
+                                @click="q.multiSelect ? toggleAskOption(m, qIdx, opt.label) : pickAskOption(m, qIdx, opt.label)">
+                          <div class="ask-option-label" x-text="opt.label"></div>
+                          <div x-show="opt.description" class="ask-option-desc" x-text="opt.description"></div>
+                        </button>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+                <!-- Multi-select: explicit submit button. Single-select auto-submits when all chosen. -->
+                <div x-show="m.questions.some(q => q.multiSelect) && !m.submitted" class="ask-submit-row">
+                  <button class="btn-primary" @click="submitAskAnswers(m)"
+                          x-text="t('ask.submit')"></button>
+                </div>
+              </div>
               <div class="msg-actions" x-show="m.role==='assistant' || m.role==='user'">
                 <button @click="copyMsg(m)" class="icon-btn sm" :title="lang==='zh'?'复制':'Copy'"><svg><use href="#i-copy"/></svg></button>
               </div>

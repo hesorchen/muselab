@@ -710,6 +710,79 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .thinking-label { font-weight: var(--fw-semibold); display: flex; align-items: center; gap: 4px; opacity: 0.85; margin-bottom: 4px; }
 .thinking pre { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; }
 
+/* ==========================================================================
+   ask_user_question — Muse asks the user with structured options (mcp tool)
+   ========================================================================== */
+.ask-question {
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-accent-soft);
+  border-left: 3px solid var(--c-accent);
+  border-radius: var(--r-md);
+  padding: 12px 14px;
+  margin: 4px 0;
+  max-width: 100%;
+}
+.ask-header {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 10px;
+  font-size: var(--fs-sm);
+}
+.ask-title { font-weight: var(--fw-semibold); color: var(--c-fg-0); }
+.ask-submitted-tag {
+  margin-left: auto;
+  padding: 1px 8px; border-radius: 999px;
+  background: var(--c-accent-soft); color: var(--c-accent);
+  font-size: var(--fs-xs); letter-spacing: 0.5px;
+}
+.ask-question-block { margin-bottom: 12px; }
+.ask-question-block:last-child { margin-bottom: 0; }
+.ask-question-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.ask-question-chip {
+  padding: 1px 8px; border-radius: 999px;
+  background: var(--c-bg-3); color: var(--c-fg-2);
+  font-size: var(--fs-xs); letter-spacing: 0.4px;
+  flex-shrink: 0;
+}
+.ask-question-text { font-size: var(--fs-md); color: var(--c-fg-0); line-height: 1.4; }
+.ask-multi-tag {
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  border: 1px solid var(--c-border-strong); border-radius: 4px;
+  padding: 0 6px;
+}
+.ask-options {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.ask-option {
+  text-align: left;
+  background: var(--c-bg-0);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
+  font-family: inherit;
+  color: var(--c-fg-0);
+}
+.ask-option:hover:not(.disabled) {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+}
+.ask-option.picked {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+  box-shadow: inset 3px 0 0 var(--c-accent);
+}
+.ask-option.picked::before {
+  content: "✓ "; color: var(--c-accent); font-weight: var(--fw-bold);
+}
+.ask-option.disabled { opacity: 0.6; cursor: default; }
+.ask-option-label { font-weight: var(--fw-semibold); font-size: var(--fs-sm); }
+.ask-option-desc { font-size: var(--fs-xs); color: var(--c-fg-3); margin-top: 2px; line-height: 1.4; }
+.ask-submit-row { margin-top: 10px; text-align: right; }
+
 .msg-actions {
   position: absolute; top: -8px; right: 8px;
   background: var(--c-bg-3); border: 1px solid var(--c-border-strong); border-radius: var(--r-md);

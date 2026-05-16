@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+from typing import Any
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
@@ -13,6 +14,10 @@ from .auth import require_token_query, require_token
 from .settings import ROOT, MODEL, MCP_CONFIG_PATH
 from . import sessions as sess
 from . import endpoints
+from .ask_user_question import (
+    build_server_for_session, register_session_queue,
+    unregister_session_queue, submit_answer,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -29,7 +34,13 @@ _stats = {"total_cost_usd": 0.0, "total_messages": 0,
 
 SYSTEM_PROMPT = (
     "You are a personal assistant for browsing and editing the user's "
-    f"archive directory at {ROOT}. Be concise. Reply in Chinese unless asked."
+    f"archive directory at {ROOT}. Be concise. Reply in Chinese unless asked.\n\n"
+    "When you need to disambiguate the user's intent or have them pick from a "
+    "small set of mutually exclusive options (2-4 choices), call the "
+    "`mcp__muselab__ask_user_question` tool with structured questions. The UI "
+    "will render clickable buttons. Prefer this over writing out the options as "
+    "plain text and waiting for the user to retype an answer — it's faster for "
+    "them. Do NOT use it for open-ended questions; use plain text reply for those."
 )
 
 
@@ -60,14 +71,14 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 system_prompt=sp,
                 resume=session_id,
                 max_buffer_size=max_buf,
-                # Block harness-only tools the SDK exposes by default. muselab has no
-                # UI to render their prompts / collect responses, so if the model calls
-                # one of these the chat hangs forever waiting for a result that never
-                # comes. The standard agent tools (Read / Edit / Bash / Glob / Grep /
-                # WebFetch / Task / TodoWrite / MCP) all work and stay enabled.
+                # Block harness-only tools the SDK exposes by default. AskUserQuestion
+                # is intentionally NOT blocked: we re-implement it via in-process MCP
+                # (mcp__muselab__ask_user_question) — see backend/ask_user_question.py.
+                # The system prompt tells the model to use that name. The built-in
+                # version is left enabled too as a fallback if the model forgets the
+                # MCP name; the frontend renders both shapes.
                 disallowed_tools=[
-                    "AskUserQuestion",        # interactive Q&A — no UI
-                    "ExitPlanMode",           # plan-mode handshake — no UI
+                    "ExitPlanMode",           # plan-mode handshake — no UI yet
                     "Skill",                  # skill invocation — needs harness
                     "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
                     "CronCreate", "CronDelete", "CronList",
@@ -88,8 +99,16 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             env_ovr = endpoints.env_override(model)
             if env_ovr is not None:
                 opts_kwargs["env"] = env_ovr
+            # MCP servers: always register the in-process muselab server (for
+            # ask_user_question). If user has mcp.json with external servers, merge.
+            mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
             if MCP_CONFIG_PATH is not None:
-                opts_kwargs["mcp_servers"] = str(MCP_CONFIG_PATH)
+                try:
+                    cfg = json.loads(MCP_CONFIG_PATH.read_text())
+                    mcp_dict.update(cfg.get("mcpServers", {}))
+                except Exception:
+                    pass  # fall through with just muselab
+            opts_kwargs["mcp_servers"] = mcp_dict
             if show_thinking:
                 from claude_agent_sdk import ThinkingConfigEnabled
                 budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
@@ -269,15 +288,57 @@ async def stream(
 
     client = await get_client(session_id, model_to_use, permission, show_thinking)
 
-    # buffer of frontend-format messages to persist
     persisted: list[dict] = [{"role": "user", "text": prompt}]
     assistant_acc = ""
 
     async def event_gen():
         nonlocal assistant_acc
+        # Subscribe to the session's side-channel queue. The MCP ask_user_question
+        # handler publishes here; we merge those events into the SSE stream so the
+        # UI can render the question UI while the SDK tool handler is await-ing.
+        side_q = register_session_queue(session_id)
+        merge_q: asyncio.Queue = asyncio.Queue()
+        SENTINEL_DONE = object()
+
+        async def pump_claude():
+            """Pull from claude SDK response stream into the merge queue."""
+            try:
+                await client.query(prompt)
+                async for msg in client.receive_response():
+                    await merge_q.put(("claude", msg))
+                    if isinstance(msg, ResultMessage):
+                        break
+            except Exception as e:
+                await merge_q.put(("error", e))
+            finally:
+                await merge_q.put(("done", SENTINEL_DONE))
+
+        async def pump_side():
+            """Pull from the side channel (MCP tool pushes) into the merge queue."""
+            try:
+                while True:
+                    evt = await side_q.get()
+                    await merge_q.put(("side", evt))
+            except asyncio.CancelledError:
+                pass
+
+        claude_task = asyncio.create_task(pump_claude())
+        side_task = asyncio.create_task(pump_side())
+
         try:
-            await client.query(prompt)
-            async for msg in client.receive_response():
+            while True:
+                kind, payload = await merge_q.get()
+                if kind == "side":
+                    # Already shaped as {"event": "...", "data": "..."} — pass through.
+                    yield payload
+                    continue
+                if kind == "error":
+                    yield {"event": "error", "data": json.dumps({"error": str(payload)})}
+                    break
+                if kind == "done":
+                    break
+                # kind == "claude"
+                msg = payload
                 if isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
@@ -300,7 +361,6 @@ async def stream(
                     _stats["total_messages"] += 1
                     _stats["total_input_tokens"] += int(u.get("input_tokens", 0) or 0)
                     _stats["total_output_tokens"] += int(u.get("output_tokens", 0) or 0)
-                    # persist assistant message
                     if assistant_acc:
                         persisted.append({
                             "role": "assistant",
@@ -315,14 +375,33 @@ async def stream(
                         "model": model_to_use,
                         "stats": _stats,
                     })}
-                    break
         except asyncio.CancelledError:
             yield {"event": "cancelled", "data": "{}"}
             raise
-        except Exception as e:
-            yield {"event": "error", "data": json.dumps({"error": str(e)})}
+        finally:
+            side_task.cancel()
+            claude_task.cancel()
+            unregister_session_queue(session_id)
 
     return EventSourceResponse(event_gen())
+
+
+# ====== ask_user_question answer endpoint ======
+
+class AnswerReq(BaseModel):
+    answers: dict[str, Any]  # question_text -> chosen label (str) or labels (list[str])
+
+
+@router.post("/answer/{session_id}/{question_id}",
+              dependencies=[Depends(require_token)])
+async def submit_answer_api(session_id: str, question_id: str, req: AnswerReq) -> dict:
+    """Frontend POSTs the user's button click here. Resolves the Future the
+    ask_user_question tool handler is await-ing; the tool then returns a
+    text result and the model continues."""
+    if not submit_answer(session_id, question_id, req.answers):
+        raise HTTPException(404, "no pending question with that id "
+                                  "(may have timed out or been answered already)")
+    return {"ok": True}
 
 
 

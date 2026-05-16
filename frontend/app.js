@@ -95,6 +95,12 @@ const STRINGS = {
     "toast.muse_back": "Muse 回来啦",
     "toast.mention_added": "已把 {path} 递给 Muse",
     "toast.lang_switched": "已切换到中文",
+    "ask.title": "Muse 在等你选",
+    "ask.submitted": "已提交",
+    "ask.multi": "可多选",
+    "ask.submit": "提交",
+    "ask.unanswered": "还有问题没选",
+    "ask.submit_failed": "提交答案失败",
     // modal generic
     "modal.confirm_delete": "确认删除 {name}？此操作不可恢复。",
     "modal.input_required": "请输入内容",
@@ -185,6 +191,12 @@ const STRINGS = {
     "toast.muse_back": "Muse is back",
     "toast.mention_added": "Handed {path} to Muse",
     "toast.lang_switched": "Switched to English",
+    "ask.title": "Muse needs your input",
+    "ask.submitted": "Submitted",
+    "ask.multi": "multi-select",
+    "ask.submit": "Submit",
+    "ask.unanswered": "Some questions still unanswered",
+    "ask.submit_failed": "Submit failed",
     "modal.confirm_delete": "Delete {name}? This cannot be undone.",
     "modal.input_required": "Input required",
     "modal.dirty_save": "Unsaved changes — save first?",
@@ -1529,6 +1541,21 @@ function portal() {
         this.messages.push({ role: "tool_result", preview: d.preview, truncated: d.truncated, is_error: d.is_error });
         this.scrollToBottom(false);
       });
+      // ask_user_question: Muse 用 mcp__muselab__ask_user_question 工具问选项。
+      // 在 chat 里插入特殊 bubble，每个 option 一个按钮。点击 → POST 答案 → 工具
+      // handler 解 future → 模型继续。pendingQId / pendingAnswers 用于 multiSelect 收集中间态。
+      es.addEventListener("ask_user_question", ev => {
+        closeAsst();
+        const d = JSON.parse(ev.data);
+        this.messages.push({
+          role: "ask_user_question",
+          id: d.id,
+          questions: d.questions,
+          pendingAnswers: {},   // multi-select intermediate; single click submits immediately
+          submitted: false,
+        });
+        this.scrollToBottom(false);
+      });
       es.addEventListener("done", ev => {
         const d = JSON.parse(ev.data);
         if (d.total_cost_usd != null && curIdx !== -1) {
@@ -1559,6 +1586,67 @@ function portal() {
       this.streaming = false;
       fetch("/api/chat/reset?token=" + encodeURIComponent(this.token) + "&session_id=" + encodeURIComponent(this.currentId),
             { method: "POST" });
+    },
+
+    // ====== ask_user_question UI helpers ======
+    // Single-select: user clicks an option → submit immediately.
+    pickAskOption(msg, qIdx, optionLabel) {
+      if (msg.submitted) return;
+      const q = msg.questions[qIdx];
+      msg.pendingAnswers[q.question] = optionLabel;
+      // If single-select AND all questions answered → submit
+      if (!q.multiSelect && this._allAskQuestionsAnswered(msg)) {
+        this.submitAskAnswers(msg);
+      }
+    },
+    // Multi-select: user toggles a checkbox; submitted via the "提交" button.
+    toggleAskOption(msg, qIdx, optionLabel) {
+      if (msg.submitted) return;
+      const q = msg.questions[qIdx];
+      const key = q.question;
+      const cur = msg.pendingAnswers[key];
+      const arr = Array.isArray(cur) ? cur.slice() : [];
+      const i = arr.indexOf(optionLabel);
+      if (i >= 0) arr.splice(i, 1); else arr.push(optionLabel);
+      msg.pendingAnswers[key] = arr;
+    },
+    isAskOptionPicked(msg, qIdx, optionLabel) {
+      const q = msg.questions[qIdx];
+      const cur = msg.pendingAnswers[q.question];
+      if (q.multiSelect) return Array.isArray(cur) && cur.includes(optionLabel);
+      return cur === optionLabel;
+    },
+    _allAskQuestionsAnswered(msg) {
+      return msg.questions.every(q => {
+        const v = msg.pendingAnswers[q.question];
+        if (q.multiSelect) return Array.isArray(v) && v.length > 0;
+        return v != null;
+      });
+    },
+    async submitAskAnswers(msg) {
+      if (msg.submitted) return;
+      if (!this._allAskQuestionsAnswered(msg)) {
+        this.toast(this.t("ask.unanswered"), "warn", 2000);
+        return;
+      }
+      msg.submitted = true;
+      try {
+        const r = await fetch(
+          `/api/chat/answer/${encodeURIComponent(this.currentId)}/${encodeURIComponent(msg.id)}`,
+          {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ answers: msg.pendingAnswers }),
+          },
+        );
+        if (!r.ok) {
+          msg.submitted = false;
+          this.toast(this.t("ask.submit_failed"), "error", 3000);
+        }
+      } catch (e) {
+        msg.submitted = false;
+        this.toast(this.t("ask.submit_failed"), "error", 3000);
+      }
     },
     copyMsg(m) {
       const text = m.text || "";
