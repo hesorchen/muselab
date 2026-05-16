@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Math formula rendering** in both contexts:
+  - Markdown: KaTeX vendored (~600 KB total: CSS 23 KB, JS 275 KB, 20 woff2 fonts ~300 KB), wired into `mdRender()` via auto-render. Supports `$...$`, `$$...$$`, `\(...\)`, `\[...\]`. Runs after DOMPurify; ignores `<code>` / `<pre>` blocks
+  - HTML preview iframe: relaxed `sandbox="allow-scripts"` + CSP allows `https:` scripts / styles / fonts / connect, so HTML reports with embedded MathJax / KaTeX / highlight.js CDN scripts render correctly. iframe still runs in unique opaque origin — cannot read MUSELAB_TOKEN, cannot fetch /api/* (CORS blocks)
+- **`MUSELAB_MAX_BUFFER_SIZE` env var** (default 32 MB, was SDK default 1 MB). Prevents "chat hangs forever" when a single tool_use JSON message (Edit / Read on a large file) blew past the SDK's 1 MB stream-json reader limit and silently killed the message reader
 - **Per-OS one-shot installers with autostart on boot**:
   - `scripts/install-macos.sh` — user-level LaunchAgent (`~/Library/LaunchAgents/com.muselab.plist`), restarts on crash
   - `scripts/install-linux.sh` — user-level systemd service (`~/.config/systemd/user/muselab.service`), reminds about `loginctl enable-linger`

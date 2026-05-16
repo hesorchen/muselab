@@ -18,6 +18,10 @@
 <script defer src="/static/app.js"></script>
 <script defer src="/static/vendor/marked.min.js"></script>
 <script defer src="/static/vendor/purify.min.js"></script>
+<!-- KaTeX (math rendering for markdown $...$ and $$...$$) -->
+<link rel="stylesheet" href="/static/vendor/katex/katex.min.css" />
+<script defer src="/static/vendor/katex/katex.min.js"></script>
+<script defer src="/static/vendor/katex/auto-render.min.js"></script>
 <!-- CodeMirror 5 (core + modes + addons, all vendored) -->
 <script defer src="/static/vendor/cm/codemirror.min.js"></script>
 <!-- addons first (some modes depend on them) -->
@@ -272,7 +276,7 @@ window.addEventListener("error", e => {
              避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
         <iframe x-show="!editing && previewMode==='html'"
                 :src="previewMode==='html' ? rawUrl(selected) : 'about:blank'"
-                class="frame" sandbox=""></iframe>
+                class="frame" sandbox="allow-scripts"></iframe>
         <img x-show="!editing && previewMode==='img'"
              :src="previewMode==='img' ? rawUrl(selected) : ''"
              class="preview-img" />

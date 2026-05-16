@@ -622,11 +622,32 @@ function portal() {
       if (!text) return "";
       const raw = window.marked ? window.marked.parse(text) : text;
       if (!window.DOMPurify) return raw;
-      return window.DOMPurify.sanitize(raw, {
-        USE_PROFILES: { html: true },
+      const safe = window.DOMPurify.sanitize(raw, {
+        USE_PROFILES: { html: true, mathMl: true },          // KaTeX may emit MathML
         FORBID_TAGS: ["style", "iframe", "form", "object", "embed"],
         FORBID_ATTR: ["style", "formaction"],
+        ADD_ATTR: ["aria-hidden"],                            // KaTeX uses these
       });
+      // Math: render $...$ / $$...$$ via KaTeX auto-render. KaTeX runs after
+      // DOMPurify (its output is trusted vendor HTML, no need to re-sanitize).
+      if (window.renderMathInElement && window.katex) {
+        const tmp = document.createElement("div");
+        tmp.innerHTML = safe;
+        try {
+          window.renderMathInElement(tmp, {
+            delimiters: [
+              { left: "$$", right: "$$", display: true },
+              { left: "$",  right: "$",  display: false },
+              { left: "\\(", right: "\\)", display: false },
+              { left: "\\[", right: "\\]", display: true },
+            ],
+            throwOnError: false,
+            ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+          });
+        } catch (e) { /* malformed math falls through as plain text */ }
+        return tmp.innerHTML;
+      }
+      return safe;
     },
 
     async login() {

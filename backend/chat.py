@@ -48,12 +48,18 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             # New CLI rule: session_id + resume/continue conflict unless fork_session
             # is set. So we use resume alone — it both loads existing state AND
             # implies the session id. Falls back to session_id-only for new sessions.
+            # SDK default max_buffer_size is 1 MB. A single tool_use JSON message
+            # (Edit on a large file, or Read of a long file) can blow past that
+            # and kill the message reader silently — the chat then "hangs forever"
+            # because no more chunks arrive. Bump to 32 MB; configurable via env.
+            max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
             opts_kwargs = dict(
                 cwd=str(ROOT),
                 model=model,
                 permission_mode=permission,
                 system_prompt=sp,
                 resume=session_id,
+                max_buffer_size=max_buf,
             )
             # Optional model params from env (UI-editable via /api/settings).
             mt = int(os.environ.get("MUSELAB_MAX_TURNS", "0") or 0)

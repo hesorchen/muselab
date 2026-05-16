@@ -46,7 +46,7 @@ claude login   # one-time, for Anthropic models; non-Claude providers need just 
 # macOS  — user-level LaunchAgent
 bash scripts/install-macos.sh
 
-# Linux  — user-level systemd service  (one extra: sudo loginctl enable-linger $USER)
+# Linux  — user-level systemd service
 bash scripts/install-linux.sh
 
 # Windows — Task Scheduler (PowerShell)
@@ -54,6 +54,23 @@ powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
 Then open `http://localhost:8765` and paste the token (in `.env`).
+
+#### After you reboot the laptop?
+
+| OS | Reboot → log back in | Reboot → never log in (lid closed, ssh-only, ...) |
+|----|---------------------|----------------------------------------------------|
+| **macOS** | ✓ auto-starts | n/a (you always log in on a Mac after reboot) |
+| **Linux** | ✓ auto-starts | ✗ needs one-time `sudo loginctl enable-linger $USER` to survive logout / no-login reboots |
+| **Windows** | ✓ auto-starts | n/a (Task Scheduler trigger is "At Logon") |
+
+For a personal laptop where you log in after each reboot, **all three just work** —
+the installer registers the autostart entry and the OS handles it.
+
+For a desktop / mini-PC you may not actively log into (Linux), enable linger:
+```bash
+sudo loginctl enable-linger $USER
+```
+The Linux installer reminds you of this at the end if it's not already enabled.
 
 Detailed per-OS guide (verify / restart / tail logs / expose to LAN / uninstall):
 [macOS](docs/install-macos.md) · [Linux](docs/install-linux.md) · [Windows](docs/install-windows.md).

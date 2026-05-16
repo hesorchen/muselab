@@ -167,12 +167,24 @@ def raw_file(path: str = Query(...)) -> FileResponse:
             "Content-Disposition": f"inline; {disp_filename}",
         })
     if suffix in SANDBOXED_INLINE_SUFFIX:
+        # CSP relaxed enough for academic HTML reports (MathJax / KaTeX / highlight.js
+        # from CDN, inline <script>window.MathJax = {...}</script> config blocks).
+        # The iframe `sandbox="allow-scripts"` attribute (set in frontend/index.html)
+        # still puts JS in a unique opaque origin: it cannot read MUSELAB_TOKEN, cannot
+        # fetch /api/* (CORS blocks), cannot use cookies. The CSP `sandbox` directive
+        # is intentionally omitted — iframe's sandbox attribute is the source of truth.
         return FileResponse(target, headers={
             **base_headers,
             "Content-Disposition": f"inline; {disp_filename}",
-            "Content-Security-Policy":
-                "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; "
-                "base-uri 'none'; form-action 'none'; sandbox",
+            "Content-Security-Policy": (
+                "default-src 'none'; "
+                "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+                "style-src 'self' 'unsafe-inline' https:; "
+                "img-src 'self' data: https:; "
+                "font-src https: data:; "
+                "connect-src https:; "
+                "base-uri 'none'; form-action 'none'"
+            ),
         })
     # FileResponse(filename=) sets Content-Disposition itself; use our safe one.
     return FileResponse(target, media_type="application/octet-stream", headers={
