@@ -60,6 +60,21 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 system_prompt=sp,
                 resume=session_id,
                 max_buffer_size=max_buf,
+                # Block harness-only tools the SDK exposes by default. muselab has no
+                # UI to render their prompts / collect responses, so if the model calls
+                # one of these the chat hangs forever waiting for a result that never
+                # comes. The standard agent tools (Read / Edit / Bash / Glob / Grep /
+                # WebFetch / Task / TodoWrite / MCP) all work and stay enabled.
+                disallowed_tools=[
+                    "AskUserQuestion",        # interactive Q&A — no UI
+                    "ExitPlanMode",           # plan-mode handshake — no UI
+                    "Skill",                  # skill invocation — needs harness
+                    "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
+                    "CronCreate", "CronDelete", "CronList",
+                    "EnterPlanMode", "EnterWorktree", "ExitWorktree",
+                    "Monitor", "PushNotification", "RemoteTrigger",
+                    "ShareOnboardingGuide",
+                ],
             )
             # Optional model params from env (UI-editable via /api/settings).
             mt = int(os.environ.get("MUSELAB_MAX_TURNS", "0") or 0)
