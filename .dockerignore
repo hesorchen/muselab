@@ -1,0 +1,40 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node (none, but defensive)
+node_modules/
+
+# Data — sessions persisted via volume mount; archive lives outside
+sessions/
+data/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Local config (each user supplies their own .env)
+.env
+.env.local
+
+# Docs / project meta
+README.md
+TODO.md
+*.md
+LICENSE
+
+# CI / build cruft
+dist/
+build/
+*.egg-info/

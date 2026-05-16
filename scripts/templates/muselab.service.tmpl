@@ -1,0 +1,21 @@
+[Unit]
+Description=muselab — your archive + Muse, the AI inside
+Documentation=https://github.com/hesorchen/muselab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{REPO_PATH}}
+EnvironmentFile={{REPO_PATH}}/.env
+ExecStart={{UV_PATH}} run python -m backend.main
+Restart=on-failure
+RestartSec=10
+# Resource limits — generous but bounded
+LimitNOFILE=8192
+# Logs go to the user journal: journalctl --user -u muselab -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

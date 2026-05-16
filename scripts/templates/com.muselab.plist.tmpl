@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.muselab</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{UV_PATH}}</string>
+    <string>run</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>backend.main</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{REPO_PATH}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PATH_DIRS}}</string>
+    <key>HOME</key>
+    <string>{{HOME_DIR}}</string>
+  </dict>
+
+  <!-- Launch at user login and keep alive on crash -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <!-- Don't churn if it keeps crashing -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{HOME_DIR}}/Library/Logs/muselab/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{HOME_DIR}}/Library/Logs/muselab/stderr.log</string>
+</dict>
+</plist>

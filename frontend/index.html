@@ -1,0 +1,619 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>muselab — Meet Muse</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<link id="hljs-theme" rel="stylesheet" href="/static/vendor/highlight-theme.css" />
+<link rel="stylesheet" href="/static/vendor/cm/codemirror.min.css" />
+<link rel="stylesheet" href="/static/vendor/cm/theme/material-darker.min.css" />
+<script defer src="/static/vendor/highlight.min.js"></script>
+<!-- 额外语言（common bundle 没的） -->
+<script defer src="/static/vendor/hljs-langs/dockerfile.min.js"></script>
+<script defer src="/static/vendor/hljs-langs/makefile.min.js"></script>
+<script defer src="/static/vendor/hljs-langs/protobuf.min.js"></script>
+<script defer src="/static/vendor/hljs-langs/accesslog.min.js"></script>
+<script defer src="/static/vendor/hljs-langs/graphql.min.js"></script>
+<script defer src="/static/app.js"></script>
+<script defer src="/static/vendor/marked.min.js"></script>
+<script defer src="/static/vendor/purify.min.js"></script>
+<!-- CodeMirror 5 (core + modes + addons, all vendored) -->
+<script defer src="/static/vendor/cm/codemirror.min.js"></script>
+<!-- addons first (some modes depend on them) -->
+<script defer src="/static/vendor/cm/addon/mode/simple.min.js"></script>
+<script defer src="/static/vendor/cm/addon/edit/closebrackets.min.js"></script>
+<script defer src="/static/vendor/cm/addon/edit/matchbrackets.min.js"></script>
+<script defer src="/static/vendor/cm/mode/meta.min.js"></script>
+<!-- base modes first; markdown / htmlmixed depend on these -->
+<script defer src="/static/vendor/cm/mode/xml/xml.min.js"></script>
+<script defer src="/static/vendor/cm/mode/javascript/javascript.min.js"></script>
+<script defer src="/static/vendor/cm/mode/css/css.min.js"></script>
+<script defer src="/static/vendor/cm/mode/clike/clike.min.js"></script>
+<!-- composite / standalone modes -->
+<script defer src="/static/vendor/cm/mode/htmlmixed/htmlmixed.min.js"></script>
+<script defer src="/static/vendor/cm/mode/markdown/markdown.min.js"></script>
+<script defer src="/static/vendor/cm/mode/python/python.min.js"></script>
+<script defer src="/static/vendor/cm/mode/yaml/yaml.min.js"></script>
+<script defer src="/static/vendor/cm/mode/shell/shell.min.js"></script>
+<script defer src="/static/vendor/cm/mode/go/go.min.js"></script>
+<script defer src="/static/vendor/cm/mode/rust/rust.min.js"></script>
+<script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+<body>
+<noscript><div style="padding:40px;color:red;font-size:20px;background:white">需要启用 JavaScript · JavaScript required</div></noscript>
+<div id="loading">加载中… / Loading…</div>
+<div id="jserr"></div>
+<script>
+window.addEventListener("error", e => {
+  const d = document.getElementById("jserr");
+  d.style.display = "block";
+  d.style.cssText = "display:block;padding:20px;color:red;background:#fff;font-family:monospace;white-space:pre-wrap;position:fixed;top:0;left:0;right:0;z-index:9999;max-height:50vh;overflow:auto";
+  d.textContent += "[error] " + e.message + " at " + e.filename + ":" + e.lineno + "\n";
+});
+</script>
+
+<!-- ============ SVG icon sprite (Lucide-style stroke icons) ============ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
+  <symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20M12 2a14.5 14.5 0 0 1 0 20M2 12h20"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-folder-plus" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/><line x1="12" y1="10" x2="12" y2="16"/><line x1="9" y1="13" x2="15" y2="13"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
+  <symbol id="i-square" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></symbol>
+  <symbol id="i-arrow-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+  <symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-alert-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-msg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-at" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+  <symbol id="i-file-search" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="14 2 14 8 20 8"/><circle cx="11" cy="14" r="2"/><path d="m13 16 2 2"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+  <symbol id="i-chevron-left" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+
+  <!-- ===== Nine Muses (希腊九缪斯) — 抽象几何形象，按日期+小时哈希挑一个 =====
+       每个 id 对应 app.js MASCOTS 表里的一位缪斯（Calliope/Clio/Erato/...）。 -->
+  <symbol id="m-hex"      viewBox="0 0 24 24"><path d="M12 3 L20 7.5 L20 16.5 L12 21 L4 16.5 L4 7.5 Z"/></symbol>           <!-- Calliope: 六边形，史诗的结构基底 -->
+  <symbol id="m-bars"     viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="17" x2="14" y2="17"/></symbol> <!-- Clio: 卷轴/史册的层叠 -->
+  <symbol id="m-lens"     viewBox="0 0 24 24"><circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/></symbol>          <!-- Erato: vesica piscis，古典爱与结合的几何 -->
+  <symbol id="m-wave"     viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5 12 Q 8.5 6 12 12 T 19 12"/></symbol> <!-- Euterpe: 声波 -->
+  <symbol id="m-crescent" viewBox="0 0 24 24"><path d="M16 3 A 9 9 0 1 0 16 21 A 7 7 0 1 1 16 3 Z"/></symbol>                  <!-- Melpomene: 残月，悲剧之夜 -->
+  <symbol id="m-halo"     viewBox="0 0 24 24"><circle cx="12" cy="14" r="5"/><path d="M5 8 A 7 4 0 0 1 19 8"/></symbol>      <!-- Polyhymnia: 圣光环 -->
+  <symbol id="m-trio"     viewBox="0 0 24 24"><circle cx="12" cy="6" r="2" fill="currentColor"/><circle cx="6" cy="17" r="2" fill="currentColor"/><circle cx="18" cy="17" r="2" fill="currentColor"/></symbol> <!-- Terpsichore: 三美神舞步 -->
+  <symbol id="m-spark"    viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/><circle cx="12" cy="12" r="2" fill="currentColor"/></symbol> <!-- Thalia: 火花/喜剧的灵光 -->
+  <symbol id="m-orbit"    viewBox="0 0 24 24"><circle cx="11" cy="13" r="5"/><circle cx="18.5" cy="6" r="1.6" fill="currentColor"/></symbol> <!-- Urania: 行星 + 卫星 -->
+</defs>
+</svg>
+
+<div id="app" x-data="portal()" x-init="document.getElementById('loading').remove(); init()" x-cloak>
+
+  <!-- 登录 -->
+  <div class="login" x-show="!authed">
+    <h2 class="login-logo">muse<span class="accent">lab</span></h2>
+    <p class="login-sub" x-html="t('login.sub')"></p>
+    <input type="password" :placeholder="t('login.token_placeholder')" x-model="tokenInput"
+           @keydown.enter="login()" autofocus />
+    <button @click="login()" class="btn-primary" x-text="t('login.go')"></button>
+    <p class="err" x-text="loginErr"></p>
+  </div>
+
+  <!-- 主界面 -->
+  <div class="layout" x-show="authed" :style="layoutStyle()">
+
+    <!-- ============ 左：文件树 ============ -->
+    <aside class="pane files" :class="{'pane-hidden': !leftOpen}">
+      <header class="pane-head">
+        <span class="pane-title"><span class="icon"><svg><use href="#i-folder"/></svg></span><span x-text="t('pane.files')"></span></span>
+        <span class="spacer"></span>
+        <button @click="$refs.upload.click()" class="icon-btn" :title="t('btn.upload')"><svg><use href="#i-upload"/></svg></button>
+        <button @click="mkdirPrompt()" class="icon-btn" :title="t('btn.new_dir')"><svg><use href="#i-folder-plus"/></svg></button>
+        <button @click="toggleHidden()" class="icon-btn"
+                :class="showHidden ? 'active' : ''"
+                :title="showHidden ? t('btn.hide_hidden') : t('btn.show_hidden')">
+          <svg><use href="#i-eye"/></svg>
+        </button>
+        <button @click="reloadTree()" class="icon-btn" :title="t('btn.refresh')"><svg><use href="#i-refresh"/></svg></button>
+        <button @click="toggleTheme()" class="icon-btn" :title="theme==='light' ? t('btn.theme_dark') : t('btn.theme_light')">
+          <svg x-show="theme==='light'"><use href="#i-moon"/></svg>
+          <svg x-show="theme!=='light'"><use href="#i-sun"/></svg>
+        </button>
+        <input type="file" x-ref="upload" style="display:none" @change="upload($event)" />
+      </header>
+      <div class="searchbar">
+        <div class="searchbar-wrap">
+          <span class="searchbar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
+          <input type="text" :placeholder="t('files.search_placeholder')" x-model="searchQ"
+                 @input.debounce.300ms="doSearch()" />
+        </div>
+        <button x-show="searchMode" @click="clearSearch()" class="icon-btn" :title="lang==='zh'?'清空':'Clear'"><svg><use href="#i-x"/></svg></button>
+      </div>
+
+      <!-- 正常树 -->
+      <ul class="filelist" x-show="!searchMode">
+        <template x-for="n in visible" :key="n.path">
+          <li :class="{file: !n.is_dir, dir: n.is_dir, sel: selected===n.path, 'drag-over': dragOver===n.path}"
+              :style="`padding-left:${10 + n.depth*14}px`"
+              @click="onNodeClick(n)"
+              @contextmenu.prevent="openCtxMenu($event, n)"
+              @dragover.prevent="n.is_dir && (dragOver=n.path)"
+              @dragleave="dragOver=''"
+              @drop.prevent="onDrop($event, n)">
+            <span class="caret">
+              <svg x-show="n.is_dir && expanded.has(n.path)"><use href="#i-chevron-down"/></svg>
+              <svg x-show="n.is_dir && !expanded.has(n.path)"><use href="#i-chevron-right"/></svg>
+            </span>
+            <span class="icon"><svg><use :href="iconRef(n)"/></svg></span>
+            <span class="name" x-text="n.name" :title="n.name"></span>
+            <span class="size" x-show="!n.is_dir" x-text="fmtSize(n.size)"></span>
+          </li>
+        </template>
+      </ul>
+
+      <!-- 搜索结果 -->
+      <div class="search-results" x-show="searchMode">
+        <div class="search-section" x-show="searchHits.length">
+          <div class="search-heading">
+            <span class="icon"><svg><use href="#i-file"/></svg></span>
+            <span x-text="lang==='zh' ? '文件名' : 'File names'"></span>
+            <span class="count" x-text="'('+searchHits.length+(searchTruncated?'+':'')+')'"></span>
+          </div>
+          <template x-for="n in searchHits" :key="'name-'+n.path">
+            <div :class="'srow ' + (selected===n.path?'sel':'')" @click="onSearchClick(n)">
+              <span class="icon"><svg><use :href="iconRef(n)"/></svg></span>
+              <div class="body">
+                <div class="name" x-text="n.name"></div>
+                <div class="path-hint" x-text="n.path"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="search-section" x-show="grepHits.length">
+          <div class="search-heading">
+            <span class="icon"><svg><use href="#i-file-search"/></svg></span>
+            <span x-text="lang==='zh' ? '内容' : 'Content'"></span>
+            <span class="count" x-text="'('+grepHits.length+(grepTruncated?'+':'')+')'"></span>
+          </div>
+          <template x-for="(h,i) in grepHits" :key="'grep-'+i">
+            <div :class="'srow ' + (selected===h.path?'sel':'')" @click="openByPath(h.path)">
+              <span class="icon"><svg><use :href="iconRef(h)"/></svg></span>
+              <div class="body">
+                <div class="name" x-text="h.name + ':' + h.line"></div>
+                <div class="snippet" x-text="h.snippet"></div>
+                <div class="path-hint" x-text="h.path"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="hint-row" x-show="!searchHits.length && !grepHits.length && !searching" x-text="t('files.empty_search')"></div>
+        <div class="hint-row" x-show="searching" x-text="t('files.searching')"></div>
+      </div>
+    </aside>
+
+    <!-- resizer between files and preview -->
+    <div class="resizer" :class="{'pane-hidden': !leftOpen}" @mousedown="startResize('left', $event)"></div>
+
+    <!-- ============ 中：预览 ============ -->
+    <section class="pane preview">
+      <header class="pane-head">
+        <button @click="leftOpen=!leftOpen; savePrefs()" class="icon-btn" :title="leftOpen?t('btn.hide_left'):t('btn.show_left')">
+          <svg x-show="leftOpen"><use href="#i-chevron-left"/></svg>
+          <svg x-show="!leftOpen"><use href="#i-chevron-right"/></svg>
+        </button>
+        <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
+        <span class="spacer"></span>
+        <button x-show="selected && isEditable(selected)" @click="toggleEdit()" class="icon-btn"
+                :title="editing ? t('btn.preview') : t('btn.edit')">
+          <svg x-show="!editing"><use href="#i-edit"/></svg>
+          <svg x-show="editing"><use href="#i-eye"/></svg>
+        </button>
+        <button x-show="editing" @click="saveEdit()" class="btn-primary" style="padding:4px 12px;font-size:12px" x-text="t('btn.save')"></button>
+        <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
+        <a x-show="selected" :href="downloadUrl(selected)" :download="selected.split('/').pop()" class="icon-btn" :title="t('btn.download')"><svg><use href="#i-download"/></svg></a>
+        <button @click="rightOpen=!rightOpen; savePrefs()" class="icon-btn" :title="rightOpen?t('btn.hide_right'):t('btn.show_right')">
+          <svg x-show="rightOpen"><use href="#i-chevron-right"/></svg>
+          <svg x-show="!rightOpen"><use href="#i-chevron-left"/></svg>
+        </button>
+      </header>
+      <!-- Tab bar (VSCode-style multi-file) -->
+      <div class="tab-bar" x-show="tabs.length">
+        <template x-for="t in tabs" :key="t.path">
+          <div :class="'tab' + (selected===t.path ? ' active' : '')"
+               @click="switchTab(t.path)"
+               @auxclick.prevent="closeTab(t.path)"
+               :title="t.path">
+            <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+            <span class="tab-name" x-text="t.name"></span>
+            <button class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
+          </div>
+        </template>
+      </div>
+
+      <div class="preview-body">
+        <div x-show="editing" class="editor-wrap">
+          <div x-ref="cmHost" class="editor-cm"></div>
+          <div class="editor-status">
+            <span class="seg">Ln <b x-text="cmStatus.line"></b>, Col <b x-text="cmStatus.col"></b></span>
+            <span class="seg" x-show="cmStatus.sel" x-text="(lang==='zh'?'(选 ':'(sel ') + cmStatus.sel + ')'"></span>
+            <span class="spacer"></span>
+            <span class="seg" x-text="cmStatus.lines + (lang==='zh' ? ' 行' : ' lines')"></span>
+            <span class="seg" x-text="fmtSize(cmStatus.chars) + ' / ' + cmStatus.chars + (lang==='zh' ? ' 字符' : ' chars')"></span>
+            <span class="seg" x-text="cmStatus.mode"></span>
+            <span class="seg" :class="cmStatus.dirty ? 'dirty' : ''" x-text="cmStatus.dirty ? (lang==='zh' ? '● 未保存' : '● Unsaved') : (lang==='zh' ? '○ 已保存' : '○ Saved')"></span>
+          </div>
+        </div>
+        <div x-show="!editing && previewMode==='md'" class="markdown" x-html="renderedMd"></div>
+        <pre x-show="!editing && previewMode==='text'" class="text"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
+        <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，
+             避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
+        <iframe x-show="!editing && previewMode==='html'"
+                :src="previewMode==='html' ? rawUrl(selected) : 'about:blank'"
+                class="frame" sandbox=""></iframe>
+        <img x-show="!editing && previewMode==='img'"
+             :src="previewMode==='img' ? rawUrl(selected) : ''"
+             class="preview-img" />
+        <iframe x-show="!editing && previewMode==='pdf'"
+                :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
+                class="frame"></iframe>
+
+        <div x-show="!editing && previewMode==='unsupported'" class="empty">
+          <span class="icon"><svg><use href="#i-file"/></svg></span>
+          <div class="empty-title" x-text="lang==='zh' ? '不支持预览' : 'Preview not supported'"></div>
+          <div class="empty-hint">
+            <span x-text="lang==='zh' ? '该文件类型无法在浏览器中预览。' : 'This file type cannot be previewed in browser. '"></span>
+            <a :href="downloadUrl(selected)" x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a>。
+          </div>
+        </div>
+        <div x-show="!selected" class="brand-empty">
+          <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
+            <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+          </span>
+          <div class="brand-logo">muse<span class="accent">·lab</span></div>
+          <div class="brand-tagline" x-text="t('empty.preview_tagline')"></div>
+          <div class="brand-tips">
+            <div class="brand-tip" x-text="t('empty.preview_tip1')"></div>
+            <div class="brand-tip"><span class="kbd">@</span><span x-text="t('empty.preview_tip2')"></span></div>
+            <div class="brand-tip" x-text="t('empty.preview_tip3')"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- resizer between preview and chat -->
+    <div class="resizer" :class="{'pane-hidden': !rightOpen}" @mousedown="startResize('right', $event)"></div>
+
+    <!-- ============ 右：chat ============ -->
+    <aside class="pane chat" :class="{'pane-hidden': !rightOpen}">
+      <header class="pane-head">
+        <span class="pane-title">
+          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'thinking': streaming}"
+                @click="cycleMascot()" :title="mascotLabel() + (lang==='zh'?'（点击换一位）':' (click for next muse)')">
+            <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+          </span>
+          <span x-text="t('pane.chat')"></span>
+        </span>
+        <span class="spacer"></span>
+        <span x-show="mcp.servers.length" class="mcp-badge"
+              :title="(lang==='zh'?'MCP 服务: ':'MCP servers: ') + mcp.servers.map(s=>s.name).join(', ')">
+          🔌 <span x-text="mcp.servers.length"></span>
+        </span>
+        <span class="cost-badge" :title="(lang==='zh'?'累计消息: ':'Total messages: ')+stats.total_messages" x-text="'$'+stats.total_cost_usd.toFixed(4)"></span>
+        <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
+      </header>
+
+      <div class="session-bar">
+        <select class="session-sel" x-model="currentId" @change="switchSession()">
+          <template x-for="s in sessions" :key="s.id">
+            <option :value="s.id" x-text="s.name + ' · ' + s.message_count"></option>
+          </template>
+        </select>
+        <button @click="newSession()" class="icon-btn sm" :title="t('btn.new_session')"><svg><use href="#i-plus"/></svg></button>
+        <button @click="renameSession()" class="icon-btn sm" :title="t('btn.rename')"><svg><use href="#i-edit"/></svg></button>
+        <button @click="editSessionPrompt()" class="icon-btn sm" :title="t('btn.edit_prompt')"><svg><use href="#i-brain"/></svg></button>
+        <button @click="deleteSession()" class="icon-btn sm" :title="t('btn.delete')"><svg><use href="#i-trash"/></svg></button>
+      </div>
+
+      <div class="session-bar">
+        <select x-model="model" style="flex:1">
+          <template x-for="grp in modelGroups()" :key="grp.name">
+            <optgroup :label="grp.name">
+              <template x-for="m in grp.items" :key="m.model">
+                <option :value="m.model" x-text="m.label"></option>
+              </template>
+            </optgroup>
+          </template>
+        </select>
+        <select x-model="permission" :title="t('set.label.default_permission')" style="flex:1">
+          <option value="bypassPermissions">bypass</option>
+          <option value="acceptEdits">acceptEdits</option>
+          <option value="default">default</option>
+          <option value="plan">plan</option>
+        </select>
+        <label class="chk" :title="lang==='zh'?'显示推理过程':'Show reasoning'"><input type="checkbox" x-model="showThinking"> <span class="icon" style="color:#9ab2d6"><svg><use href="#i-brain"/></svg></span></label>
+      </div>
+
+      <div class="chat-scroll-wrap">
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()">
+          <div x-show="!messages.length" class="brand-empty chat-empty">
+            <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
+              <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+            </span>
+            <div class="brand-logo small">Muse · <span x-text="lang==='zh' ? mascot().zhName : mascot().greek"></span></div>
+            <div class="brand-tagline">
+              <span class="muse-domain" x-text="lang==='zh' ? mascot().domain.zh : mascot().domain.en"></span>
+              · <span x-text="t('chat.runs_on')"></span> <span x-text="currentModelLabel()"></span>
+            </div>
+            <div class="brand-tips">
+              <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span></div>
+              <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
+              <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
+            </div>
+          </div>
+          <template x-for="(m,i) in messages" :key="m._k || (currentId + '-' + i)">
+            <div :class="'msg ' + m.role">
+              <div x-show="m.role==='user'" class="bubble" x-text="m.text"></div>
+              <div x-show="m.role==='assistant'" class="bubble" x-html="m.html"></div>
+            <div x-show="m.role==='assistant' && m.model" class="model-tag" x-text="m.model"></div>
+              <div x-show="m.role==='tool_use'" class="tool">
+                <span class="tool-name" x-text="m.name"></span>
+                <span class="tool-arg" x-text="m.summary"></span>
+              </div>
+              <div x-show="m.role==='tool_result'" :class="'tool-result' + (m.is_error?' err':'')">
+                <pre x-text="m.preview"></pre>
+              </div>
+              <div x-show="m.role==='thinking'" class="thinking">
+                <span class="thinking-label"><span class="icon"><svg><use href="#i-brain"/></svg></span>thinking</span>
+                <pre x-text="m.text"></pre>
+              </div>
+              <div class="msg-actions" x-show="m.role==='assistant' || m.role==='user'">
+                <button @click="copyMsg(m)" class="icon-btn sm" :title="lang==='zh'?'复制':'Copy'"><svg><use href="#i-copy"/></svg></button>
+              </div>
+              <div x-show="m.cost" class="meta" x-text="m.cost"></div>
+            </div>
+          </template>
+          <div x-show="streaming" class="msg assistant">
+            <div class="bubble pending">
+              <span class="thinking-dots"><span></span><span></span><span></span></span>
+              <span class="thinking-label" x-text="t('chat.thinking') + ' · ' + currentModelLabel()"></span>
+            </div>
+          </div>
+        </div>
+        <button class="jump-bottom" x-show="!atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
+      </div>
+
+      <div class="chat-input">
+        <!-- @ mention -->
+        <div class="mention-pop" x-show="mentionShow" x-transition.opacity>
+          <div class="mention-hint" x-html="lang==='zh' ? '<span class=&quot;kbd&quot;>↑↓</span> 选 · <span class=&quot;kbd&quot;>Enter</span> 插入 · <span class=&quot;kbd&quot;>Esc</span> 关' : '<span class=&quot;kbd&quot;>↑↓</span> nav · <span class=&quot;kbd&quot;>Enter</span> insert · <span class=&quot;kbd&quot;>Esc</span> close'"></div>
+          <template x-for="(f, i) in mentionResults" :key="f.path">
+            <div :class="'mention-item ' + (mentionIdx===i?'sel':'')"
+                 @mousedown.prevent="pickMention(i)" @mouseenter="mentionIdx=i">
+              <span class="icon"><svg><use :href="iconRef(f)"/></svg></span>
+              <div class="body">
+                <div class="name" x-text="f.name"></div>
+                <div class="path-hint" x-text="f.path"></div>
+              </div>
+            </div>
+          </template>
+          <div class="hint-row" x-show="!mentionResults.length" x-text="t('files.empty_search')"></div>
+        </div>
+        <textarea x-model="input" x-ref="chatInput"
+                  @keydown.enter.prevent.stop="onEnter($event)"
+                  @keydown.escape="mentionShow=false"
+                  @keydown.up="mentionShow && (mentionIdx=Math.max(0,mentionIdx-1)) && $event.preventDefault()"
+                  @keydown.down="mentionShow && (mentionIdx=Math.min(mentionResults.length-1,mentionIdx+1)) && $event.preventDefault()"
+                  @input="onChatInput($event); autoGrow($event.target)"
+                  :placeholder="t('chat.placeholder')" :disabled="streaming"></textarea>
+        <div class="chat-btns">
+          <button x-show="!streaming" @click="send()" :disabled="!input.trim()" class="btn-primary" :title="t('btn.send')">
+            <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
+          </button>
+          <button x-show="streaming" @click="stop()" class="btn-danger" :title="t('btn.stop') + ' (Esc)'">
+            <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- ============ Toast ============ -->
+  <div class="toast-stack">
+    <template x-for="t in toasts" :key="t.id">
+      <div :class="'toast ' + (t.type || '')">
+        <span class="icon">
+          <svg x-show="t.type==='success'"><use href="#i-check-circle"/></svg>
+          <svg x-show="t.type==='error'"><use href="#i-alert-circle"/></svg>
+          <svg x-show="t.type==='warn'"><use href="#i-alert-triangle"/></svg>
+          <svg x-show="!t.type || t.type==='info'"><use href="#i-info"/></svg>
+        </span>
+        <div class="body" x-text="t.msg"></div>
+        <button class="close" @click="dismissToast(t.id)"><svg style="width:14px;height:14px"><use href="#i-x"/></svg></button>
+      </div>
+    </template>
+  </div>
+
+  <!-- ============ Context Menu ============ -->
+  <div class="ctx-menu" x-show="ctxMenu.show"
+       :style="`top:${ctxMenu.y}px; left:${ctxMenu.x}px`"
+       @click.away="ctxMenu.show=false">
+    <!-- 目录专属：新建 -->
+    <button class="ctx-item" @click="ctxAction('newFile')" x-show="(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-file"/></svg></span><span x-text="t('btn.new_file')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('newDir')" x-show="(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-folder-plus"/></svg></span><span x-text="t('btn.new_dir')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('upload')" x-show="(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-upload"/></svg></span><span x-text="t('btn.upload')"></span>
+    </button>
+    <div class="ctx-sep" x-show="(ctxMenu.node && ctxMenu.node.is_dir)"></div>
+    <!-- 文件专属 -->
+    <button class="ctx-item" @click="ctxAction('open')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-eye"/></svg></span><span x-text="t('btn.preview')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('mention')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-at"/></svg></span><span x-text="t('btn.at_mention')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('download')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-download"/></svg></span><span x-text="t('btn.download')"></span>
+    </button>
+    <!-- 通用 -->
+    <button class="ctx-item" @click="ctxAction('copyPath')">
+      <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_path')"></span>
+    </button>
+    <button class="ctx-item" @click="ctxAction('rename')">
+      <span class="icon"><svg><use href="#i-edit"/></svg></span><span x-text="t('btn.rename')"></span>
+    </button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item danger" @click="ctxAction('delete')">
+      <span class="icon"><svg><use href="#i-trash"/></svg></span><span x-text="t('btn.delete')"></span>
+    </button>
+  </div>
+  <!-- 隐藏 input：右键"上传文件到这里"复用 -->
+  <input type="file" x-ref="ctxUpload" style="display:none" @change="ctxUploadHandler($event)" />
+
+  <!-- ============ Settings Modal ============ -->
+  <div class="modal-backdrop" x-show="settings.show" @click.self="settings.show=false">
+    <div class="modal settings-modal" @keydown.escape.window="settings.show=false">
+      <div class="modal-head">⚙ <span x-text="t('set.title')"></span></div>
+      <div class="modal-body" style="max-height:70vh;overflow-y:auto">
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.lang')"></div>
+          <div class="settings-row">
+            <label x-text="t('set.label.lang')"></label>
+            <div class="lang-picker">
+              <button class="btn-ghost" :class="{active: lang==='zh'}" @click="setLang('zh')" x-text="t('set.lang.zh')"></button>
+              <button class="btn-ghost" :class="{active: lang==='en'}" @click="setLang('en')" x-text="t('set.lang.en')"></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.provider')"></div>
+          <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
+          <template x-for="p in settings.providers" :key="p.env_key">
+            <div class="settings-row">
+              <label x-text="p.display + ' (' + p.env_key + ')'"></label>
+              <div class="settings-input-wrap">
+                <input type="password" class="settings-input"
+                       :placeholder="p.configured ? p.masked : t('set.key_unset')"
+                       x-model="settings.draftKeys[p.env_key]" />
+                <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.appearance')"></div>
+          <div class="settings-row">
+            <label x-text="t('set.label.accent')"></label>
+            <div class="accent-picker">
+              <template x-for="c in ACCENT_PRESETS" :key="c.value">
+                <button class="accent-swatch"
+                        :class="{active: accent===c.value}"
+                        :style="`background:${c.value}`"
+                        :title="c.name[lang] || c.name.zh"
+                        @click="setAccent(c.value)"></button>
+              </template>
+              <input type="color" :value="accent" @input="setAccent($event.target.value)"
+                     class="accent-custom" :title="lang==='zh' ? '自定义' : 'Custom'" />
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.defaults')"></div>
+          <div class="settings-row">
+            <label x-text="t('set.label.default_model')"></label>
+            <select x-model="settings.draftDefaults.model" class="settings-input">
+              <template x-for="m in availableModels" :key="m.model">
+                <option :value="m.model" x-text="m.group + ' · ' + m.label"></option>
+              </template>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label x-text="t('set.label.default_permission')"></label>
+            <select x-model="settings.draftDefaults.permission" class="settings-input">
+              <option value="bypassPermissions" x-text="lang==='zh' ? 'bypass（无提示）' : 'bypass (no prompts)'"></option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="default">default</option>
+              <option value="plan">plan</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label x-text="t('set.label.show_thinking_default')"></label>
+            <label class="switch">
+              <input type="checkbox" x-model="settings.draftDefaults.show_thinking" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.model_params')"></div>
+          <div class="settings-row">
+            <label x-text="t('set.label.thinking_budget')"></label>
+            <input type="number" min="1024" max="32000" step="1024"
+                   x-model.number="settings.draftParams.thinking_budget" class="settings-input" />
+          </div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '最大 tool 轮数 (0=不限)' : 'Max tool turns (0=unlimited)'"></label>
+            <input type="number" min="0" max="50"
+                   x-model.number="settings.draftParams.max_turns" class="settings-input" />
+          </div>
+        </div>
+
+      </div>
+      <div class="modal-foot">
+        <button @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
+        <button @click="settings.show=false" class="btn-ghost" x-text="t('btn.cancel')"></button>
+        <button @click="saveSettings()" class="btn-primary" x-text="t('btn.save')"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Modal ============ -->
+  <div class="modal-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
+    <div class="modal" @keydown.escape.window="modal.cancel && modal.cancel()">
+      <div class="modal-head" x-text="modal.title"></div>
+      <div class="modal-body">
+        <div x-text="modal.body"></div>
+        <input x-show="modal.input !== null" x-model="modal.input"
+               x-ref="modalInput" @keydown.enter="modal.confirm?.()" />
+      </div>
+      <div class="modal-foot">
+        <button @click="modal.cancel && modal.cancel()" class="btn-ghost" x-text="modal.cancelText || '取消'"></button>
+        <button @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || '确认'"></button>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
