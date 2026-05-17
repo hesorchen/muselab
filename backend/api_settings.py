@@ -3,16 +3,20 @@ GET returns current values with keys masked. PUT atomically rewrites .env and
 refreshes os.environ so the changes take effect without restarting the server.
 """
 from __future__ import annotations
+import json
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import require_token
 from . import endpoints
+
+MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
+MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -25,7 +29,6 @@ PROVIDER_KEYS = [
     ("DEEPSEEK_API_KEY", "DeepSeek"),
     ("ZHIPUAI_API_KEY", "智谱 GLM"),
     ("MINIMAX_API_KEY", "MiniMax"),
-    ("MOONSHOT_API_KEY", "Kimi (Moonshot)"),
 ]
 
 DEFAULT_KEYS = [
@@ -51,7 +54,6 @@ class SettingsIn(BaseModel):
     deepseek_api_key: str | None = None
     zhipuai_api_key: str | None = None
     minimax_api_key: str | None = None
-    moonshot_api_key: str | None = None
     # Defaults
     default_model: str | None = None
     default_permission: str | None = None
@@ -149,7 +151,6 @@ def put_settings(req: SettingsIn) -> dict:
         "deepseek_api_key": "DEEPSEEK_API_KEY",
         "zhipuai_api_key": "ZHIPUAI_API_KEY",
         "minimax_api_key": "MINIMAX_API_KEY",
-        "moonshot_api_key": "MOONSHOT_API_KEY",
     }
     for field, env_name in key_map.items():
         v = getattr(req, field)
@@ -173,3 +174,193 @@ def put_settings(req: SettingsIn) -> dict:
 
     _write_env(updates)
     return {"ok": True, "updated": list(updates.keys())}
+
+
+# ====== MCP server management ======
+#
+# Storage shape on disk (mcp.json):
+#   {"mcpServers": {"name": {"command": "...", "args": [...], "env": {...},
+#                              "disabled": false}, ...}}
+# `disabled` is a muselab-local field — when true, the server is omitted from
+# the dict we hand to ClaudeAgentOptions so the SDK doesn't connect to it.
+
+
+class MCPServerSpec(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    command: str = Field(..., min_length=1)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    disabled: bool = False
+
+
+def _load_mcp() -> dict:
+    if not MCP_CONFIG_PATH.exists():
+        return {"mcpServers": {}}
+    try:
+        d = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return {"mcpServers": {}}
+        d.setdefault("mcpServers", {})
+        return d
+    except (json.JSONDecodeError, OSError):
+        return {"mcpServers": {}}
+
+
+def _save_mcp(cfg: dict) -> None:
+    fd, tmp = tempfile.mkstemp(prefix="mcp.", suffix=".json",
+                                dir=str(MCP_CONFIG_PATH.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, MCP_CONFIG_PATH)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+
+def _load_examples() -> list[dict]:
+    """Return preset/example servers from mcp.json.example, if present."""
+    if not MCP_EXAMPLE_PATH.exists():
+        return []
+    try:
+        d = json.loads(MCP_EXAMPLE_PATH.read_text(encoding="utf-8"))
+        items = []
+        for name, spec in (d.get("mcpServers") or {}).items():
+            items.append({
+                "name": name,
+                "command": spec.get("command", ""),
+                "args": spec.get("args", []),
+                "env": spec.get("env", {}),
+                "description": spec.get("description", ""),
+            })
+        return items
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+@router.get("/mcp", dependencies=[Depends(require_token)])
+def get_mcp_servers() -> dict:
+    cfg = _load_mcp()
+    servers = []
+    for name, spec in (cfg.get("mcpServers") or {}).items():
+        servers.append({
+            "name": name,
+            "command": spec.get("command", ""),
+            "args": spec.get("args", []),
+            "env": {k: _mask(v) for k, v in (spec.get("env") or {}).items()},
+            "disabled": bool(spec.get("disabled", False)),
+        })
+    return {"servers": servers, "examples": _load_examples()}
+
+
+@router.put("/mcp/{name}", dependencies=[Depends(require_token)])
+def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
+    """Create or replace one MCP server entry. Path `name` wins over body `name`."""
+    cfg = _load_mcp()
+    cfg["mcpServers"][name] = {
+        "command": spec.command,
+        "args": spec.args,
+        "env": spec.env,
+        "disabled": spec.disabled,
+    }
+    _save_mcp(cfg)
+    return {"ok": True, "name": name}
+
+
+@router.delete("/mcp/{name}", dependencies=[Depends(require_token)])
+def delete_mcp_server(name: str) -> dict:
+    cfg = _load_mcp()
+    if name not in (cfg.get("mcpServers") or {}):
+        raise HTTPException(404, f"MCP server not found: {name}")
+    del cfg["mcpServers"][name]
+    _save_mcp(cfg)
+    return {"ok": True, "name": name}
+
+
+class MCPToggleReq(BaseModel):
+    disabled: bool
+
+
+@router.patch("/mcp/{name}/toggle", dependencies=[Depends(require_token)])
+def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
+    cfg = _load_mcp()
+    if name not in (cfg.get("mcpServers") or {}):
+        raise HTTPException(404, f"MCP server not found: {name}")
+    cfg["mcpServers"][name]["disabled"] = req.disabled
+    _save_mcp(cfg)
+    return {"ok": True, "name": name, "disabled": req.disabled}
+
+
+# ====== Skill discovery ======
+#
+# We don't enable/disable skills individually here — the SDK takes
+# `skills="all"` or a list. We expose what's discoverable so users can browse.
+
+SKILL_USER_DIR = Path.home() / ".claude" / "skills"
+SKILL_PROJECT_DIR = Path(__file__).resolve().parent.parent / "skills"
+
+
+def _parse_skill_md(p: Path) -> dict | None:
+    """Parse frontmatter of a SKILL.md (or skill.md). Cheap, no YAML dep."""
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return {"name": p.parent.name, "description": ""}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {"name": p.parent.name, "description": ""}
+    fm = text[3:end].strip()
+    out: dict = {"name": p.parent.name, "description": ""}
+    cur_key = None
+    cur_val: list[str] = []
+    for line in fm.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith(" ") and cur_key:  # continuation
+            cur_val.append(line.strip())
+            continue
+        if cur_key:
+            out[cur_key] = " ".join(cur_val).strip().strip('"\'')
+        if ":" in line:
+            k, _, v = line.partition(":")
+            cur_key = k.strip()
+            cur_val = [v.strip()]
+        else:
+            cur_key = None
+            cur_val = []
+    if cur_key:
+        out[cur_key] = " ".join(cur_val).strip().strip('"\'')
+    return out
+
+
+def _list_skills_in(dir_: Path, scope: str) -> list[dict]:
+    if not dir_.exists() or not dir_.is_dir():
+        return []
+    out = []
+    for child in sorted(dir_.iterdir()):
+        if not child.is_dir():
+            continue
+        for fname in ("SKILL.md", "skill.md"):
+            p = child / fname
+            if p.exists():
+                meta = _parse_skill_md(p) or {}
+                out.append({
+                    "name": meta.get("name") or child.name,
+                    "description": meta.get("description", ""),
+                    "scope": scope,
+                    "path": str(child),
+                })
+                break
+    return out
+
+
+@router.get("/skills", dependencies=[Depends(require_token)])
+def list_skills() -> dict:
+    """List all skills discoverable by the SDK (user + project scopes)."""
+    skills = (_list_skills_in(SKILL_PROJECT_DIR, "project") +
+              _list_skills_in(SKILL_USER_DIR, "user"))
+    return {"skills": skills}

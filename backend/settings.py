@@ -38,10 +38,11 @@ PORT = int(_env("MUSELAB_PORT", "PORTAL_PORT", "8765"))
 HOST = _env("MUSELAB_HOST", "PORTAL_HOST", "127.0.0.1")
 MODEL = _env("MUSELAB_MODEL", "PORTAL_MODEL", "claude-sonnet-4-6")
 
-# Optional MCP server config. If `mcp.json` exists in the project root,
-# it's passed to ClaudeAgentOptions(mcp_servers=...). See mcp.json.example.
-_MCP_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
-MCP_CONFIG_PATH = _MCP_PATH if _MCP_PATH.exists() else None
+# MCP server config. Editable via the Settings UI (api_settings.py).
+# Stored as {"mcpServers": {name: {command, args, env, disabled}}}.
+# Always set the path so the UI can create it on first write; chat.py guards
+# the read with a try/except, so it's safe if the file doesn't exist yet.
+MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 
 # Optional non-Claude providers.
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")

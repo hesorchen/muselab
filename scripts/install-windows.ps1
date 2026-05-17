@@ -40,6 +40,19 @@ if (-not $claude) {
   Ok "claude CLI: $($claude.Source)"
 }
 
+# MCP runtimes — non-fatal warnings.
+if (Get-Command uvx -ErrorAction SilentlyContinue) {
+  Ok "uvx present — uv-based MCP servers available"
+} else {
+  Warn "uvx not found — uv-based MCP presets (fetch, git, time) won't run"
+}
+if (Get-Command npx -ErrorAction SilentlyContinue) {
+  Ok "npx present — npm-based MCP servers available"
+} else {
+  Warn "npx not found — npm-based MCP presets (memory, sequential-thinking, filesystem) won't run"
+  Warn "  install Node.js from https://nodejs.org"
+}
+
 # ----- 2. Python deps -----------------------------------------------------
 Bold "2/5  Installing Python dependencies (uv sync)"
 & $UvPath sync --quiet
@@ -84,6 +97,73 @@ MUSELAB_MODEL=claude-sonnet-4-6
   Ok ".env created (ACL restricted to $env:USERNAME)"
   Ok "  MUSELAB_ROOT = $Archive"
   Ok "  MUSELAB_TOKEN = $($Token.Substring(0,6))...$($Token.Substring($Token.Length - 4))  (full token in .env)"
+
+  # First-time setup: drop a CLAUDE.md template + subdirectory skeleton, and
+  # walk the user through a short intake to populate the holistic profile.
+  $ClaudeMd = Join-Path $Archive "CLAUDE.md"
+  if (-not (Test-Path $ClaudeMd)) {
+    Write-Host
+    Write-Host "  Muse is one assistant that helps you across health / career /"
+    Write-Host "  investment / family / life simultaneously. It needs your basic"
+    Write-Host "  profile and somewhere to find your real documents."
+    Write-Host "  This is a 2-minute intake; you can skip any question (press Enter)."
+    $DoSetup = Ask "Set up archive skeleton + CLAUDE.md now? [Y/n]:" "Y"
+    if ($DoSetup -match "^[Yy]") {
+      $skel = Join-Path $Repo "scripts\templates\archive-skeleton"
+      foreach ($sub in @("health", "work", "money", "people", "notes", "archives")) {
+        $sd = Join-Path $Archive $sub
+        if (-not (Test-Path $sd)) {
+          New-Item -ItemType Directory -Path $sd | Out-Null
+          Copy-Item (Join-Path $skel "$sub\README.md") (Join-Path $sd "README.md")
+        }
+      }
+      Ok "archive skeleton created under $Archive"
+
+      Write-Host
+      Write-Host "  --- Quick intake (press Enter to skip any) ---"
+      $iName   = Ask "How should Muse address you?" ""
+      $iBirth  = Ask "Birth year (or just an age range):" ""
+      $iCity   = Ask "Where do you live?" ""
+      $iDoing  = Ask "What occupies most of your week? (study / job / freelance / care / retirement / ...)" ""
+      $iStage  = Ask "One sentence about your life stage right now:" ""
+      $iGoal   = Ask "One main goal for this year:" ""
+      $iHealth = Ask "Top health concern right now (or 'none'):" ""
+
+      $tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw
+      $tpl = $tpl -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd")
+
+      function Patch-Field($content, $label, $value) {
+        if ([string]::IsNullOrWhiteSpace($value)) { return $content }
+        $needle = "- ${label}："
+        $idx = $content.IndexOf($needle)
+        if ($idx -lt 0) { return $content }
+        return $content.Substring(0, $idx + $needle.Length) + " $value" +
+               $content.Substring($idx + $needle.Length)
+      }
+      $tpl = Patch-Field $tpl "称呼 / 名字（你希望 Muse 叫你什么）" $iName
+      $tpl = Patch-Field $tpl "出生年份（年龄段就行，不必精确）"     $iBirth
+      $tpl = Patch-Field $tpl "现在住在"                              $iCity
+      $tpl = Patch-Field $tpl "我现在主要在做"                        $iDoing
+      $tpl = Patch-Field $tpl "这一年最想做成的一件事"               $iGoal
+      $tpl = Patch-Field $tpl "当前最关心的健康问题（如有）"         $iHealth
+      if (-not [string]::IsNullOrWhiteSpace($iStage)) {
+        $tpl = $tpl -replace [regex]::Escape("（如：「大三在准备保研」"),
+                              ($iStage + "`n`n（如：「大三在准备保研」")
+      }
+
+      Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8
+      Ok "CLAUDE.md -> $ClaudeMd (with your intake answers prefilled)"
+      Write-Host
+      Write-Host "  Next steps (适合放什么完全看你自己阶段):"
+      Write-Host "    * Health: 体检 / 补剂 / 训练记录 -> $Archive\health\"
+      Write-Host "    * Work:   学业材料 / 简历 / 作品集 -> $Archive\work\"
+      Write-Host "    * Money:  预算 / 持仓 / 学贷 / 保单 -> $Archive\money\"
+      Write-Host "    * People: 关心的人的资料 -> $Archive\people\"
+      Write-Host "    * Open $ClaudeMd to fill in any blank fields"
+      Write-Host "  Each subdir has a README.md explaining what fits there."
+      Write-Host "  Muse will see all of this on your next chat - no restart needed."
+    }
+  }
 }
 
 # ----- 4. Scheduled Task --------------------------------------------------

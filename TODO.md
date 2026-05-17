@@ -5,6 +5,35 @@
 
 ---
 
+## 🌙 今晚冲刺（2026-05-16 → 17 凌晨，全部完成）
+
+> 14 / 14 ✅。122 passed (pytest)。下一项见 P0 开源前必修 / 顶部下一步建议。
+
+### P0 — 必做 ✅
+- [x] **A. smoke test 现状** — alpine guard 就位；90→122 测试全过
+- [x] **B1. Permission request UI** — `backend/permission_request.py` + 前端 Allow/Deny/Always 按钮；10 test
+- [x] **C. 默认 CLAUDE.md 预设** — `scripts/templates/default-CLAUDE.md`（4 persona）+ 3 OS install 脚本 hook + `docs/personalize-claude-md.md`
+- [x] **E1. MCP — Settings UI 管理** — `/api/settings/mcp` CRUD + 前端面板 + 10 test
+- [x] **F1. Skill — 重新启用 + 加载本地** — disallow 里去掉 Skill；`setting_sources=["user","project","local"]` + `skills="all"`
+
+### P1 ✅
+- [x] **F2. Skill — 预置 7 个** — `skills/{web-search,markdown-formatter,mermaid-helper,code-reviewer,citation-formatter,task-decomposer,summary-distiller}/SKILL.md` + `skills/README.md`
+- [x] **E2. MCP — 预置升级** — `mcp.json.example` 加 `sequential-thinking` + `time` + description 字段；3 OS install 检 npx/uvx
+- [x] **B2. TodoWrite 专用 UI** — chat 内 checkbox 任务列表 + 状态徽章
+
+### P2 ✅
+- [x] **B3. Subagent (Task) 进度可见** — Task tool 卡片：subagent_type tag + description + 折叠 prompt
+- [x] **B4. ExitPlanMode UI** — plan 卡片：markdown 渲染
+- [x] **E3. MCP tool 渲染 polish** — `mcp__` 前缀去掉 + 🔌 icon + server 边色
+- [x] **F3. Skill Settings UI** — `/api/settings/skills` + 前端列表（project / user scope）；6 test
+- [x] **F4. Skill 调用渲染** — 🧩 icon + 橙色边
+- [x] **D. 爆款项目调研** — `docs/competitive-analysis.md`（8 对标 + 3 周路线图 + README hero A/B）
+
+### P3 ✅
+- [x] **B5. ImageBlock 输入** — `POST /api/chat/upload-image`（10MB 限 + TTL）+ 前端粘贴/拖拽/选择 + thumbnail；6 test
+
+---
+
 ## 🎯 项目定位
 
 **一句话**：~2000 行可读 web 入口，浏览器里用 Pro 订阅跟 Claude 对话管你的档案。
@@ -200,4 +229,4 @@
 
 ---
 
-最后更新：2026-05-16
+最后更新：2026-05-17

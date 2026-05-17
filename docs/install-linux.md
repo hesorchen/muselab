@@ -14,7 +14,7 @@ systemd service** — no root, no system-wide config, easy to undo.
   ```bash
   claude login
   ```
-  Non-Claude providers (DeepSeek / GLM / MiniMax / Kimi) only need API keys —
+  Non-Claude providers (DeepSeek / GLM / MiniMax) only need API keys —
   set them in Settings UI later.
 
 ## Install

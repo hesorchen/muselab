@@ -143,7 +143,6 @@ def test_settings_provider_count_matches_catalog(client, auth):
     endpoints (4 today). New ones must be added to both PROVIDER_KEYS and CATALOG."""
     r = client.get("/api/settings", headers=auth)
     d = r.json()
-    assert len(d["providers"]) == 4
+    assert len(d["providers"]) == 3
     keys = {p["env_key"] for p in d["providers"]}
-    assert keys == {"DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY",
-                    "MINIMAX_API_KEY", "MOONSHOT_API_KEY"}
+    assert keys == {"DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY"}

@@ -66,6 +66,85 @@ const STRINGS = {
     "set.sec.appearance": "外观",
     "set.sec.defaults": "新会话默认",
     "set.sec.model_params": "模型参数",
+    "set.probe": "测试",
+    "set.probe_tip": "向 vendor 真发一条 ping，看 key 是否真的有效",
+    "set.probe_running": "正在测试 key...",
+    "set.probe_ok": "key 有效，端点通",
+    "set.probe_failed": "测试失败",
+    "set.sec.mcp": "MCP 工具服务器",
+    "set.mcp.hint": "MCP 让 Muse 调用外部工具（fetch、time、sequential-thinking 等）。开关控制是否加载；删除会移除配置。",
+    "set.mcp.empty": "尚未配置 MCP server。点击下方添加，或从预设安装。",
+    "set.mcp.disabled": "已禁用",
+    "set.mcp.toggle_title": "启用 / 禁用此 server",
+    "set.mcp.delete": "删除",
+    "set.mcp.presets": "预设：",
+    "set.mcp.add": "添加 MCP server",
+    "set.mcp.name": "名字",
+    "set.mcp.command": "命令",
+    "set.mcp.args": "参数（空格分隔）",
+    "set.mcp.added": "已添加",
+    "set.mcp.deleted": "已删除",
+    "set.mcp.installed": "已从预设安装",
+    "set.mcp.toggle_saved": "已切换",
+    "set.mcp.save_failed": "保存失败",
+    "set.mcp.delete_failed": "删除失败",
+    "set.mcp.name_command_required": "名字和命令都不能为空",
+    "set.sec.skills": "Skills（模型可发现的能力包）",
+    "set.skills.hint": "Muse 启动时从 ~/.claude/skills 和 muselab/skills 加载。模型按任务自动调用，无需手动启用。",
+    "set.skills.empty": "未发现任何 skill。在 ~/.claude/skills 或本项目 skills/ 下新增 SKILL.md 即可。",
+    "slash.hint": "↑↓ 选 · Enter / Tab 选中 · Esc 关",
+    "slash.none": "没有匹配的命令",
+    "slash.help_title": "可用的斜杠命令",
+    "slash.cleared": "已清空当前会话",
+    "slash.failed": "命令执行失败",
+    "slash.compact_ok": "已创建压缩会话 — 输入框已预填请求语，回车发送",
+    "slash.compact_prompt": "请把上一个会话的所有内容压缩成结构化的简短摘要，保留：关键事实 / 已做决定 / 待办 / 引用过的具体文件路径。摘要将作为新会话的起点。",
+    "slash.model_list_title": "可选模型（点 dropdown 切换更直观）",
+    "slash.model_unknown": "找不到模型：{id}",
+    "slash.model_switched": "已切到 {id}",
+    "slash.resume_list_title": "最近 10 个会话（带 ID 前缀和消息数）",
+    "slash.resume_no_match": "没找到匹配的会话",
+    "slash.resumed": "已跳到「{name}」",
+    "slash.cost_title": "当前用量",
+    "slash.unknown": "未知命令：/{cmd}（输入 /help 查看全部）",
+    "cost.total": "总成本",
+    "cost.in_out": "输入/输出 tokens",
+    "cost.cache_hit": "缓存命中",
+    "cost.budget": "预算",
+    "cost.no_budget": "未设预算（可在 Settings 加 MUSELAB_BUDGET_USD）",
+    "cost.context": "当前会话 context",
+    "cost.budget_warn": "预算告警：已用 {pct}% / ${usd}",
+    "ctx.title": "当前会话 context tokens",
+    "ctx.cache_tip": "缓存命中率 — 越高越省钱。Anthropic prompt cache 在 5 分钟内复用上次的系统提示词 + 上下文。",
+    "ctx.normal": "上下文 {used}K / {limit}K · {pct}%",
+    "ctx.warn":   "上下文用了 {pct}%（{used}K / {limit}K）· 长对话变贵，可压缩",
+    "ctx.danger": "上下文已用 {pct}%（{used}K / {limit}K）· 即将截断 · 立即压缩",
+    "ctx.compact_btn": "压缩历史",
+    "ctx.tip_line1": "每次回答都把整段历史送给模型 → token 越多越贵越慢",
+    "ctx.tip_line2": "压缩 = Muse 总结上文 → 新会话只带摘要起步，省钱也变快",
+    "ctx.compact_confirm_title": "压缩这个会话",
+    "ctx.compact_confirm_body": "Muse 会先让模型把全部历史总结一段，然后用这段摘要新建一个会话作为起点。原会话不动，可以随时切回。",
+    "ctx.compact_summarize_prompt": "请把这个会话的全部要点压缩成结构化摘要：①事实背景 ②已做决定 ③待办或下一步 ④引用过的具体文件路径。要让一个第一次看到摘要的人能凭它继续对话。",
+    "ctx.compact_step1": "Step 1/2: 让模型总结上文...",
+    "ctx.compact_done": "压缩完成，已切到新会话",
+    "toast.model_switched": "模型已切：{label}",
+    "model.switch_title": "切换模型",
+    "model.switch_body": "切换模型需要新建会话。",
+    "model.switch_new": "新建会话",
+    "model.new_session_ok": "已新建 {label} 会话",
+    "img.attach": "粘贴 / 拖拽 / 选择图片",
+    "attach.title": "粘贴 / 拖拽 / 选择图片或文档（PDF、md、txt、json、代码……）",
+    "attach.bad_type": "不支持的文件类型",
+    "img.remove": "移除",
+    "img.bad_type": "不支持的图片格式（png/jpg/gif/webp）",
+    "img.too_big": "图片超过 10MB",
+    "img.upload_failed": "图片上传失败",
+    "img.wait_upload": "等图片上传完再发送",
+    "todo.title": "任务清单",
+    "todo.doing": "进行中",
+    "subagent.label": "派子 agent",
+    "subagent.prompt_toggle": "展开 prompt",
+    "plan.title": "Muse 提出的计划",
     "set.sec.lang": "语言",
     "set.label.lang": "界面语言",
     "set.label.theme": "主题",
@@ -101,6 +180,14 @@ const STRINGS = {
     "ask.submit": "提交",
     "ask.unanswered": "还有问题没选",
     "ask.submit_failed": "提交答案失败",
+    "perm.title": "Muse 想用一个工具",
+    "perm.allow": "允许",
+    "perm.deny": "拒绝",
+    "perm.always": "本次会话总是允许",
+    "perm.decision_allow": "已允许",
+    "perm.decision_deny": "已拒绝",
+    "perm.decision_always": "已加白",
+    "perm.submit_failed": "提交决定失败",
     // modal generic
     "modal.confirm_delete": "确认删除 {name}？此操作不可恢复。",
     "modal.input_required": "请输入内容",
@@ -163,6 +250,85 @@ const STRINGS = {
     "set.sec.appearance": "Appearance",
     "set.sec.defaults": "New-session defaults",
     "set.sec.model_params": "Model parameters",
+    "set.probe": "Test",
+    "set.probe_tip": "Ping the vendor endpoint with the configured key",
+    "set.probe_running": "Testing key…",
+    "set.probe_ok": "key works, endpoint reachable",
+    "set.probe_failed": "Test failed",
+    "set.sec.mcp": "MCP tool servers",
+    "set.mcp.hint": "MCP lets Muse call external tools (fetch, time, sequential-thinking, …). The switch enables / disables; delete removes config entirely.",
+    "set.mcp.empty": "No MCP servers configured. Add one below or install from presets.",
+    "set.mcp.disabled": "disabled",
+    "set.mcp.toggle_title": "Enable / disable this server",
+    "set.mcp.delete": "Delete",
+    "set.mcp.presets": "Presets:",
+    "set.mcp.add": "Add MCP server",
+    "set.mcp.name": "Name",
+    "set.mcp.command": "Command",
+    "set.mcp.args": "Args (space-separated)",
+    "set.mcp.added": "Added",
+    "set.mcp.deleted": "Deleted",
+    "set.mcp.installed": "Installed from preset",
+    "set.mcp.toggle_saved": "Toggled",
+    "set.mcp.save_failed": "Save failed",
+    "set.mcp.delete_failed": "Delete failed",
+    "set.mcp.name_command_required": "Both name and command required",
+    "set.sec.skills": "Skills (model-discoverable capability packs)",
+    "set.skills.hint": "Muse loads skills from ~/.claude/skills and muselab/skills at startup. The model picks them automatically by task; no manual enable/disable.",
+    "set.skills.empty": "No skills discovered. Add a SKILL.md under ~/.claude/skills or this project's skills/.",
+    "slash.hint": "↑↓ pick · Enter / Tab to choose · Esc close",
+    "slash.none": "no matching command",
+    "slash.help_title": "Available slash commands",
+    "slash.cleared": "Cleared current session",
+    "slash.failed": "Command failed",
+    "slash.compact_ok": "New compact session created — request is pre-filled, hit enter to send",
+    "slash.compact_prompt": "Summarize the prior conversation into a concise structured note. Preserve: key facts / decisions made / open todos / specific file paths referenced. This summary becomes the seed of the new session.",
+    "slash.model_list_title": "Available models (use the dropdown for an easier switch)",
+    "slash.model_unknown": "Unknown model: {id}",
+    "slash.model_switched": "Switched to {id}",
+    "slash.resume_list_title": "Last 10 sessions (with ID prefix + message count)",
+    "slash.resume_no_match": "No matching session",
+    "slash.resumed": "Jumped to \"{name}\"",
+    "slash.cost_title": "Current usage",
+    "slash.unknown": "Unknown command: /{cmd} (type /help to list all)",
+    "cost.total": "Total cost",
+    "cost.in_out": "Input / output tokens",
+    "cost.cache_hit": "Cache hit",
+    "cost.budget": "Budget",
+    "cost.no_budget": "No budget set (add MUSELAB_BUDGET_USD in Settings)",
+    "cost.context": "Current session context",
+    "cost.budget_warn": "Budget warning: used {pct}% of ${usd}",
+    "ctx.title": "Current session context tokens",
+    "ctx.cache_tip": "Cache hit rate — higher is cheaper. Anthropic prompt cache reuses the last system prompt + context within 5 minutes.",
+    "ctx.normal": "Context {used}K / {limit}K · {pct}%",
+    "ctx.warn":   "Context at {pct}% ({used}K / {limit}K) · Long chats get expensive — consider compacting",
+    "ctx.danger": "Context at {pct}% ({used}K / {limit}K) · About to truncate — compact now",
+    "ctx.compact_btn": "Compact",
+    "ctx.tip_line1": "Every reply sends the full history to the model — more tokens means slower and pricier",
+    "ctx.tip_line2": "Compact = Muse summarizes the past, new session starts from that summary",
+    "ctx.compact_confirm_title": "Compact this session",
+    "ctx.compact_confirm_body": "Muse will summarize the full history first, then create a new session seeded with that summary. The original is preserved.",
+    "ctx.compact_summarize_prompt": "Compress this entire conversation into a structured summary: (1) facts / background (2) decisions made (3) open todos or next steps (4) specific file paths referenced. Make it complete enough that someone reading only the summary can pick up where we left off.",
+    "ctx.compact_step1": "Step 1/2: Asking the model to summarize…",
+    "ctx.compact_done": "Compacted — jumped to the new session",
+    "toast.model_switched": "Model switched: {label}",
+    "model.switch_title": "Switch model",
+    "model.switch_body": "Switching model requires a new session.",
+    "model.switch_new": "New session",
+    "model.new_session_ok": "New session with {label}",
+    "img.attach": "Attach image (paste / drag / pick)",
+    "attach.title": "Attach image or document (PDF / md / txt / json / source…)",
+    "attach.bad_type": "Unsupported file type",
+    "img.remove": "Remove",
+    "img.bad_type": "Unsupported image type (png/jpg/gif/webp)",
+    "img.too_big": "Image exceeds 10 MB",
+    "img.upload_failed": "Image upload failed",
+    "img.wait_upload": "Wait for images to finish uploading",
+    "todo.title": "Task list",
+    "todo.doing": "in progress",
+    "subagent.label": "Subagent dispatched",
+    "subagent.prompt_toggle": "show prompt",
+    "plan.title": "Plan from Muse",
     "set.sec.lang": "Language",
     "set.label.lang": "Interface language",
     "set.label.theme": "Theme",
@@ -197,6 +363,14 @@ const STRINGS = {
     "ask.submit": "Submit",
     "ask.unanswered": "Some questions still unanswered",
     "ask.submit_failed": "Submit failed",
+    "perm.title": "Muse wants to use a tool",
+    "perm.allow": "Allow",
+    "perm.deny": "Deny",
+    "perm.always": "Always allow (this session)",
+    "perm.decision_allow": "Allowed",
+    "perm.decision_deny": "Denied",
+    "perm.decision_always": "Whitelisted",
+    "perm.submit_failed": "Decision failed",
     "modal.confirm_delete": "Delete {name}? This cannot be undone.",
     "modal.input_required": "Input required",
     "modal.dirty_save": "Unsaved changes — save first?",
@@ -253,7 +427,34 @@ function portal() {
     permission: "bypassPermissions",
     showThinking: false,
     input: "", streaming: false, es: null,
-    stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0, total_output_tokens: 0 },
+    // 锁定当前在跑的那条请求用的模型——dropdown 切到别的，pending bubble 不能跟着变。
+    streamingModel: "",
+    pendingImages: [],    // [{id, mime, preview (data URL), uploading, error}]
+    pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
+    dragHover: false,
+
+    // ===== slash commands =====
+    slashShow: false,
+    slashIdx: 0,
+    slashAnchor: -1,      // input position where the leading '/' is
+    SLASH_CMDS: [
+      { name: "help",    desc: { zh: "查看所有可用斜杠命令", en: "List all slash commands" } },
+      { name: "clear",   desc: { zh: "清空当前会话", en: "Reset / clear current session" } },
+      { name: "compact", desc: { zh: "压缩历史 — 把上下文摘要成新会话", en: "Compact: summarize history into a new session" } },
+      { name: "model",   desc: { zh: "/model <id> 切换模型，留空看可选项", en: "/model <id> — switch model (no arg = list)" } },
+      { name: "resume",  desc: { zh: "/resume <名字> 跳到名字匹配的旧会话", en: "/resume <name> — jump to a session by name" } },
+      { name: "cost",    desc: { zh: "显示当前用量 / 预算 / 缓存命中率", en: "Show current usage / budget / cache hit rate" } },
+      { name: "config",  desc: { zh: "打开 Settings 面板", en: "Open Settings panel" } },
+      { name: "stop",    desc: { zh: "中断当前流式响应", en: "Stop the current streaming reply" } },
+    ],
+    // Per-session context meter snapshot, updated on every SSE `done` event
+    sessionUsage: { input_tokens: 0, output_tokens: 0,
+                     cache_read_tokens: 0, cache_creation_tokens: 0,
+                     context_limit: 128000, context_used_pct: 0 },
+    stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0,
+              total_output_tokens: 0, total_cache_read_tokens: 0,
+              total_cache_creation_tokens: 0, cache_hit_pct: 0,
+              budget_usd: 0, budget_used_pct: 0 },
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
     atBottom: true,
@@ -303,6 +504,11 @@ function portal() {
       draftKeys: {},
       draftDefaults: { model: "", permission: "", show_thinking: false },
       draftParams: { thinking_budget: 4000, max_turns: 0 },
+      // MCP server list (loaded from /api/settings/mcp)
+      mcpServers: [],
+      mcpExamples: [],
+      mcpDraft: { show: false, name: "", command: "", argsStr: "" },
+      skills: [],   // discovered skill list (read-only browse)
     },
 
     _pendingExpanded: null,
@@ -351,21 +557,11 @@ function portal() {
       this.$watch("rightOpen", v => { if (v) this.greetMascot(this.t("toast.muse_back")); });
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
       this.$watch("selected", () => { if (this.editing) { this.unmountCM(); this.mountCM(); } });
-      // 模型切换给视觉反馈（避免用户不确定是否切了）
-      this.$watch("model", (newM, oldM) => {
-        if (!oldM || newM === oldM) return;
-        // 防 Alpine / 浏览器 select 重复触发：1.5s 内对同一目标 model 只 toast 一次。
-        if (this._lastModelToastFor === newM) return;
-        this._lastModelToastFor = newM;
-        setTimeout(() => {
-          if (this._lastModelToastFor === newM) this._lastModelToastFor = null;
-        }, 1500);
-        const meta = this.availableModels.find(m => m.model === newM);
-        const label = meta ? `${meta.group} · ${meta.label}` : newM;
-        this.toast(this.t("toast.model_switched", { label }), "info", 2500);
-        this.savePrefs();
-      });
-      this._lastModelToastFor = null;
+      // 注意：之前这里挂过 `$watch("model", ...)` 自动 toast「模型已切」。
+      // 但 dropdown 的 x-model 是 onchange 之前就把 this.model 写新值——
+      // watch 会比 onModelChange() 的 confirm modal 先 fire，让用户看到"已
+      // 切换"toast 之后才弹"是否新建会话？"。删掉 watch，让 onModelChange()
+      // 作为唯一的视觉反馈源（成功 PATCH / 成功新建后才 toast）。
       const t = localStorage.getItem("muselab_token");
       if (t) {
         this.token = t; this.authed = true;
@@ -630,6 +826,121 @@ function portal() {
     // Render markdown -> sanitized HTML. All markdown rendering MUST go through
     // here; passing raw `marked.parse(...)` to x-html opens XSS via untrusted
     // file content / Claude responses containing <script>, on*, javascript: etc.
+    // ===== attachment helpers (images + docs) =====
+    // Classify a file by mime/extension to decide which preview chip to show
+    // and (cosmetically) what kind label to display. Server has the
+    // authoritative classification — we just guess for the chip.
+    _classifyFile(file) {
+      const m = (file.type || "").toLowerCase();
+      const name = (file.name || "").toLowerCase();
+      if (m.startsWith("image/")) return "image";
+      if (m === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+      const textMimes = ["text/", "application/json", "application/xml",
+                          "application/yaml", "application/x-yaml",
+                          "application/toml"];
+      if (textMimes.some(p => m.startsWith(p) || m === p)) return "text";
+      const textExts = [".md", ".markdown", ".txt", ".csv", ".json", ".yaml",
+                         ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".tsx",
+                         ".jsx", ".html", ".css", ".xml", ".log", ".ini",
+                         ".conf", ".cfg"];
+      if (textExts.some(ext => name.endsWith(ext))) return "text";
+      return "unknown";
+    },
+    async _attachFile(file) {
+      if (file.size > 10 * 1024 * 1024) {
+        this.toast(this.t("img.too_big"), "warn", 2500);
+        return;
+      }
+      const kind = this._classifyFile(file);
+      if (kind === "unknown") {
+        this.toast(this.t("attach.bad_type") + ": " + file.name, "warn", 3500);
+        return;
+      }
+
+      let entry;
+      if (kind === "image") {
+        const preview = await new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result);
+          fr.onerror = rej;
+          fr.readAsDataURL(file);
+        });
+        entry = { id: null, mime: file.type, preview,
+                  uploading: true, error: false };
+        this.pendingImages.push(entry);
+      } else {
+        entry = { id: null, name: file.name, kind,
+                  uploading: true, error: false };
+        this.pendingDocs.push(entry);
+      }
+
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        const r = await fetch("/api/chat/upload-image", {
+          method: "POST", headers: this.hdr(), body: fd,
+        });
+        if (!r.ok) {
+          entry.error = true; entry.uploading = false;
+          this.toast(this.t("img.upload_failed") + ": " + await r.text(),
+                      "error", 4000);
+          return;
+        }
+        const d = await r.json();
+        entry.id = d.id; entry.uploading = false;
+        // Server's classification wins for kind label.
+        if (d.kind && entry.kind) entry.kind = d.kind;
+      } catch (e) {
+        entry.error = true; entry.uploading = false;
+        this.toast(this.t("img.upload_failed"), "error", 3000);
+      }
+    },
+    async onAttachPicked(ev) {
+      const files = Array.from(ev.target.files || []);
+      ev.target.value = "";
+      for (const f of files) await this._attachFile(f);
+    },
+    async onAttachDrop(ev) {
+      const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
+      for (const f of files) await this._attachFile(f);
+    },
+    async onImagePaste(ev) {
+      // Only handle pasted image data; let normal text paste through.
+      const items = (ev.clipboardData && ev.clipboardData.items) || [];
+      const files = [];
+      for (const it of items) {
+        if (it.kind === "file") {
+          const f = it.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length) {
+        ev.preventDefault();
+        for (const f of files) await this._attachFile(f);
+      }
+    },
+    removePendingImage(i) { this.pendingImages.splice(i, 1); },
+    removePendingDoc(i) { this.pendingDocs.splice(i, 1); },
+
+    // Alias for use in inline x-html (shorter name reads better in markup).
+    renderMd(text) { return this.mdRender(text); },
+    // Friendly label for a model id — falls back to the raw id if not in catalog.
+    // Used by the bubble badge so old messages keep showing their original model
+    // (deepseek / glm / claude variants) instead of just the long id.
+    modelLabel(id) {
+      if (!id) return "";
+      const meta = (this.availableModels || []).find(m => m.model === id);
+      return meta ? meta.label : id;
+    },
+    // Render mcp__<server>__<tool> nicely: drop the mcp__ prefix, replace __ with " · "
+    renderToolName(name) {
+      if (!name) return "";
+      if (name.startsWith("mcp__")) {
+        return name.slice(5).split("__").join(" · ");
+      }
+      return name;
+    },
+
     mdRender(text) {
       if (!text) return "";
       const raw = window.marked ? window.marked.parse(text) : text;
@@ -766,6 +1077,78 @@ function portal() {
       } catch {}
     },
 
+    // Model switch — VS Code rule "one session, one model":
+    //  - virgin session (0 messages): persist the new model silently
+    //  - already-used session: prompt the user to start a new session with the
+    //    new model. If they decline, bounce the dropdown back.
+    async onModelChange() {
+      const newM = this.model;
+      if (!this.currentId) return;
+
+      const cur = this.sessions.find(s => s.id === this.currentId);
+      const oldM = cur ? cur.model : "";
+      if (newM === oldM) return;          // no-op (might happen after a bounce)
+
+      // Empty session — just persist.
+      if (this.messages.length === 0) {
+        try {
+          const r = await fetch("/api/chat/sessions/" + this.currentId, {
+            method: "PATCH",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ model: newM }),
+          });
+          if (!r.ok) {
+            this.model = oldM;            // safety bounce on any failure
+            this.toast(this.t("slash.failed"), "error");
+            return;
+          }
+          await this.refreshSessions();
+          this.savePrefs();
+          this.toast(this.t("toast.model_switched", { label: this.currentModelLabel() }),
+                      "info", 1800);
+        } catch (e) {
+          this.model = oldM;
+          this.toast(this.t("slash.failed"), "error");
+        }
+        return;
+      }
+
+      // Session has history → ask whether to start a new one.
+      const ok = await this.confirm({
+        title: this.t("model.switch_title"),
+        body: this.t("model.switch_body", { label: this.currentModelLabel() }),
+        okText: this.t("model.switch_new"),
+      });
+      if (!ok) {
+        // User declined — bounce dropdown back to session's locked model.
+        this.model = oldM;
+        return;
+      }
+      // Create a fresh session with the new model and jump to it.
+      try {
+        const r = await fetch("/api/chat/sessions", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "", model: newM }),
+        });
+        if (!r.ok) {
+          this.model = oldM;
+          this.toast(this.t("slash.failed"), "error");
+          return;
+        }
+        const meta = await r.json();
+        await this.refreshSessions();
+        this.currentId = meta.id;
+        await this.loadSession(meta.id);
+        this.savePrefs();
+        this.toast(this.t("model.new_session_ok", { label: this.currentModelLabel() }),
+                    "success", 2000);
+      } catch (e) {
+        this.model = oldM;
+        this.toast(this.t("slash.failed"), "error");
+      }
+    },
+
     modelGroups() {
       const map = {};
       for (const m of this.availableModels) {
@@ -828,6 +1211,13 @@ function portal() {
       this.atBottom = true;
       this.scrollToBottom(true);
       this.$nextTick(() => this.highlightCode(".chat-body"));
+      // Refresh per-session context meter — won't have anything yet if the
+      // process restarted, but will once a new turn fires.
+      try {
+        const ur = await fetch(`/api/chat/usage/${sid}?model=${encodeURIComponent(this.model || "")}`,
+                                 { headers: this.hdr() });
+        if (ur.ok) this.sessionUsage = await ur.json();
+      } catch (e) { /* non-fatal */ }
     },
     async renameSession() {
       const cur = this.sessions.find(x => x.id === this.currentId);
@@ -872,6 +1262,127 @@ function portal() {
       this.settings.draftDefaults = { ...d.defaults };
       this.settings.draftParams = { ...d.params };
       this.settings.show = true;
+      // Load MCP + Skill list in parallel — non-fatal if either fails.
+      this.refreshMcpList();
+      this.refreshSkillList();
+    },
+    async refreshSkillList() {
+      try {
+        const r = await fetch("/api/settings/skills", { headers: this.hdr() });
+        if (!r.ok) return;
+        const d = await r.json();
+        this.settings.skills = d.skills || [];
+      } catch (e) { /* silent */ }
+    },
+    async refreshMcpList() {
+      try {
+        const r = await fetch("/api/settings/mcp", { headers: this.hdr() });
+        if (!r.ok) return;
+        const d = await r.json();
+        this.settings.mcpServers = d.servers || [];
+        this.settings.mcpExamples = d.examples || [];
+      } catch (e) { /* silent — UI shows empty state */ }
+    },
+    async toggleMcp(name, disabled) {
+      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}/toggle`, {
+        method: "PATCH",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ disabled }),
+      });
+      if (r.ok) {
+        this.toast(this.t("set.mcp.toggle_saved"), "success", 1500);
+        this.refreshMcpList();
+      } else {
+        this.toast(this.t("set.mcp.save_failed"), "error", 3000);
+      }
+    },
+    async deleteMcp(name) {
+      const ok = await this.confirm({
+        title: this.t("set.mcp.delete"),
+        body: this.lang === "zh"
+          ? `确定删除 MCP server「${name}」？`
+          : `Delete MCP server "${name}"?`,
+        danger: true,
+        okText: this.t("set.mcp.delete"),
+      });
+      if (!ok) return;
+      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}`, {
+        method: "DELETE", headers: this.hdr(),
+      });
+      if (r.ok) {
+        this.toast(this.t("set.mcp.deleted"), "success", 1500);
+        this.refreshMcpList();
+      } else {
+        this.toast(this.t("set.mcp.delete_failed"), "error", 3000);
+      }
+    },
+    async addMcpFromDraft() {
+      const d = this.settings.mcpDraft;
+      const name = (d.name || "").trim();
+      const command = (d.command || "").trim();
+      if (!name || !command) {
+        this.toast(this.t("set.mcp.name_command_required"), "warn", 2500);
+        return;
+      }
+      const args = (d.argsStr || "").trim().split(/\s+/).filter(Boolean);
+      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ name, command, args, env: {}, disabled: false }),
+      });
+      if (r.ok) {
+        this.toast(this.t("set.mcp.added"), "success", 1500);
+        this.settings.mcpDraft = { show: false, name: "", command: "", argsStr: "" };
+        this.refreshMcpList();
+      } else {
+        this.toast(this.t("set.mcp.save_failed"), "error", 3000);
+      }
+    },
+    // Provider key self-test — hits the vendor's anthropic-compatible endpoint
+    // with the configured key and reports back. Useful when user gets 401 and
+    // doesn't want to paste keys to debug.
+    async probeProvider(envKey) {
+      // Pick a representative model id for this env key.
+      const ENV_TO_MODEL = {
+        DEEPSEEK_API_KEY: "deepseek-v4-flash",
+        ZHIPUAI_API_KEY:  "glm-4.7",
+        MINIMAX_API_KEY:  "minimax-m2.7",
+      };
+      const m = ENV_TO_MODEL[envKey];
+      if (!m) return;
+      this.toast(this.t("set.probe_running"), "info", 1500);
+      try {
+        const r = await fetch(`/api/chat/probe/${encodeURIComponent(m)}`,
+                                 { headers: this.hdr() });
+        const d = await r.json();
+        if (d.ok) {
+          this.toast(`${d.vendor}: ${this.t("set.probe_ok")} (${d.key_hint})`,
+                      "success", 4000);
+        } else {
+          const detail = (d.vendor_response_excerpt || d.reason || "").slice(0, 200);
+          this.toast(`${d.vendor || envKey}: HTTP ${d.status || "?"} · ${detail}`,
+                      "error", 8000);
+        }
+      } catch (e) {
+        this.toast(this.t("set.probe_failed") + ": " + e.message, "error", 5000);
+      }
+    },
+
+    async installMcpPreset(ex) {
+      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(ex.name)}`, {
+        method: "PUT",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: ex.name, command: ex.command, args: ex.args || [],
+          env: ex.env || {}, disabled: false,
+        }),
+      });
+      if (r.ok) {
+        this.toast(this.t("set.mcp.installed"), "success", 1500);
+        this.refreshMcpList();
+      } else {
+        this.toast(this.t("set.mcp.save_failed"), "error", 3000);
+      }
     },
     async saveSettings() {
       const body = {
@@ -886,7 +1397,6 @@ function portal() {
         DEEPSEEK_API_KEY: "deepseek_api_key",
         ZHIPUAI_API_KEY: "zhipuai_api_key",
         MINIMAX_API_KEY: "minimax_api_key",
-        MOONSHOT_API_KEY: "moonshot_api_key",
       };
       for (const [envK, field] of Object.entries(k2f)) {
         const v = this.settings.draftKeys[envK];
@@ -1416,10 +1926,233 @@ function portal() {
       ta.style.height = Math.min(ta.scrollHeight, max) + "px";
     },
 
+    // ===== slash commands =====
+    slashResults: [],   // filled by onChatInput
+    _navPop(delta) {
+      // shared up/down handler for either @ mention or / slash popup
+      if (this.slashShow) {
+        if (delta < 0) this.slashIdx = Math.max(0, this.slashIdx - 1);
+        else this.slashIdx = Math.min(this.slashResults.length - 1, this.slashIdx + 1);
+        return true;
+      }
+      if (this.mentionShow) {
+        if (delta < 0) this.mentionIdx = Math.max(0, this.mentionIdx - 1);
+        else this.mentionIdx = Math.min(this.mentionResults.length - 1, this.mentionIdx + 1);
+        return true;
+      }
+      return false;
+    },
+    pickSlash(i) {
+      const c = this.slashResults[i];
+      if (!c) return;
+      // Replace current input with the canonical form so user sees what's submitted
+      this.input = "/" + c.name + (c.name === "model" || c.name === "resume" ? " " : "");
+      this.slashShow = false;
+      if (this.$refs.chatInput) this.$refs.chatInput.focus();
+      // For commands with NO argument needed, auto-execute on selection
+      if (!["model", "resume"].includes(c.name)) {
+        this._runSlash(c.name, "");
+        this.input = "";
+      }
+    },
+
+    async _runSlash(cmd, arg) {
+      arg = (arg || "").trim();
+      switch (cmd) {
+        case "help": {
+          const lines = this.SLASH_CMDS
+            .map(c => `**/${c.name}** — ${c.desc[this.lang] || c.desc.zh}`)
+            .join("\n");
+          this._injectAssistantNote(this.t("slash.help_title") + "\n\n" + lines);
+          return;
+        }
+        case "clear": {
+          if (!this.currentId) return;
+          await fetch(`/api/chat/reset?token=${encodeURIComponent(this.token)}&session_id=${encodeURIComponent(this.currentId)}`,
+                       { method: "POST" });
+          await fetch(`/api/chat/sessions/${this.currentId}`, { method: "DELETE", headers: this.hdr() });
+          await this.refreshSessions();
+          this.messages = [];
+          // start a fresh session so the dropdown isn't empty
+          await this.newSession();
+          this.toast(this.t("slash.cleared"), "success", 1500);
+          return;
+        }
+        case "compact": {
+          if (!this.currentId) return;
+          const r = await fetch(`/api/chat/sessions/${this.currentId}/compact`,
+                                  { method: "POST", headers: this.hdr() });
+          if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
+          const meta = await r.json();
+          await this.refreshSessions();
+          this.currentId = meta.id;
+          await this.loadSession(meta.id);
+          // Pre-fill input with the compact prompt — user reviews then sends
+          this.input = this.t("slash.compact_prompt");
+          this.toast(this.t("slash.compact_ok"), "success", 2500);
+          return;
+        }
+        case "model": {
+          if (!arg) {
+            const list = (this.availableModels || []).map(m => `- ${m.group} · **${m.model}**`).join("\n");
+            this._injectAssistantNote(this.t("slash.model_list_title") + "\n\n" + list);
+            return;
+          }
+          const found = (this.availableModels || []).find(m => m.model === arg);
+          if (!found) { this.toast(this.t("slash.model_unknown", { id: arg }), "warn", 3000); return; }
+          this.model = arg;
+          this.toast(this.t("slash.model_switched", { id: arg }), "success", 1500);
+          return;
+        }
+        case "resume": {
+          if (!arg) {
+            const list = (this.sessions || []).slice(0, 10)
+              .map(s => `- **${s.name}** (${s.message_count}, ${s.id.slice(0,8)})`).join("\n");
+            this._injectAssistantNote(this.t("slash.resume_list_title") + "\n\n" + list);
+            return;
+          }
+          const q = arg.toLowerCase();
+          const hit = (this.sessions || []).find(s =>
+            s.id.startsWith(arg) || s.name.toLowerCase().includes(q));
+          if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return; }
+          this.currentId = hit.id;
+          await this.loadSession(hit.id);
+          this.toast(this.t("slash.resumed", { name: hit.name }), "success", 1500);
+          return;
+        }
+        case "cost": {
+          await this.fetchStats();
+          const s = this.stats;
+          const lines = [
+            `**${this.t("slash.cost_title")}**`,
+            `- ${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
+            `- ${this.t("cost.in_out")}: ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
+            `- ${this.t("cost.cache_hit")}: ${s.cache_hit_pct}% (${s.total_cache_read_tokens.toLocaleString()} cached read)`,
+            s.budget_usd > 0
+              ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
+              : `- ${this.t("cost.no_budget")}`,
+            `- ${this.t("cost.context")}: ${(this.sessionUsage.input_tokens/1000).toFixed(1)}K / ${(this.sessionUsage.context_limit/1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
+          ];
+          this._injectAssistantNote(lines.join("\n"));
+          return;
+        }
+        case "config": this.openSettings(); return;
+        case "stop":   if (this.streaming) this.stop(); return;
+        default:
+          this.toast(this.t("slash.unknown", { cmd }), "warn", 2000);
+      }
+    },
+
+    // Inject a synthetic assistant bubble (markdown rendered) for slash output.
+    // Not persisted — slash output is ephemeral, doesn't pollute session history.
+    _injectAssistantNote(md) {
+      this.messages.push({
+        role: "assistant", text: md, html: this.mdRender(md),
+        cost: "", model: "muselab", _ephemeral: true,
+      });
+      this.scrollToBottom(true);
+    },
+
+    costBadgeTitle() {
+      const s = this.stats;
+      const parts = [
+        `${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
+        `${s.total_messages} msg / ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
+        `cache hit ${s.cache_hit_pct}%`,
+      ];
+      if (s.budget_usd > 0) parts.push(`${this.t("cost.budget")} ${s.budget_used_pct}% of $${s.budget_usd}`);
+      return parts.join("  ·  ");
+    },
+    ctxMeterTitle() {
+      const u = this.sessionUsage;
+      return `${this.t("ctx.tip_line1")}\n` +
+             `${u.input_tokens.toLocaleString()} / ${u.context_limit.toLocaleString()} tokens (${u.context_used_pct}%)\n\n` +
+             `${this.t("ctx.tip_line2")}`;
+    },
+    ctxMeterLabel() {
+      const pct = this.sessionUsage.context_used_pct;
+      const usedK = (this.sessionUsage.input_tokens / 1000).toFixed(1);
+      const limitK = (this.sessionUsage.context_limit / 1000).toFixed(0);
+      if (pct >= 90) return this.t("ctx.danger", { used: usedK, limit: limitK, pct });
+      if (pct >= 70) return this.t("ctx.warn",   { used: usedK, limit: limitK, pct });
+      return this.t("ctx.normal", { used: usedK, limit: limitK, pct });
+    },
+    // Real compact: a) make sure the OLD session has been summarized in chat,
+    // b) fork it, c) the fork inherits the summary as starting context.
+    // Easier path: just send a /compact instruction to the CURRENT session that
+    // asks the model to produce a self-contained summary, which the user can
+    // copy / use as basis. The "true" compact is a feature of the underlying
+    // CLI we don't have direct API for, so we implement it as a synthesized
+    // summarize-and-fork workflow.
+    async runCompact() {
+      if (!this.currentId) return;
+      const ok = await this.confirm({
+        title: this.t("ctx.compact_confirm_title"),
+        body: this.t("ctx.compact_confirm_body"),
+        okText: this.t("ctx.compact_btn"),
+      });
+      if (!ok) return;
+
+      // Step 1: tell the CURRENT session to produce a self-contained summary.
+      // Model sees full history, writes a structured note we'll seed the new session with.
+      this.input = this.t("ctx.compact_summarize_prompt");
+      this.toast(this.t("ctx.compact_step1"), "info", 2500);
+      await this.send();
+      // Wait for the streaming to finish so we can grab the assistant reply
+      await new Promise(resolve => {
+        const check = () => {
+          if (!this.streaming) return resolve();
+          setTimeout(check, 200);
+        };
+        check();
+      });
+
+      // Step 2: take the last assistant message (the summary) and create a
+      // fresh fork session whose first user message IS that summary as
+      // background context.
+      const lastAsst = [...this.messages].reverse().find(m => m.role === "assistant" && m.text);
+      if (!lastAsst) { this.toast(this.t("slash.failed"), "error"); return; }
+      const summary = lastAsst.text;
+
+      const r = await fetch(`/api/chat/sessions/${this.currentId}/compact`,
+                              { method: "POST", headers: this.hdr() });
+      if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
+      const meta = await r.json();
+      // Seed the new session with the summary as a real persisted user message
+      // so subsequent turns have it as established context.
+      await fetch(`/api/chat/sessions/${meta.id}/seed`, {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ summary }),
+      });
+      await this.refreshSessions();
+      this.currentId = meta.id;
+      await this.loadSession(meta.id);
+      this.toast(this.t("ctx.compact_done"), "success", 3000);
+    },
+
     onChatInput(ev) {
       const ta = ev.target;
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
+
+      // Slash command palette — only when input starts with '/' (no leading space).
+      if (text.startsWith("/")) {
+        const q = text.slice(1).toLowerCase();
+        // Hide once user typed a space (means they're past the command name)
+        if (/\s/.test(q)) { this.slashShow = false; }
+        else {
+          this.slashResults = this.SLASH_CMDS.filter(c => c.name.startsWith(q));
+          this.slashIdx = 0;
+          this.slashShow = this.slashResults.length > 0;
+          this.slashAnchor = 0;
+        }
+        this.mentionShow = false;
+        return;
+      } else {
+        this.slashShow = false;
+      }
+
       const at = text.lastIndexOf("@");
       if (at < 0 || (at > 0 && /\S/.test(text[at - 1]))) { this.mentionShow = false; return; }
       const query = text.slice(at + 1);
@@ -1481,13 +2214,44 @@ function portal() {
 
     async send() {
       const text = this.input.trim();
-      if (!text || this.streaming || !this.currentId) return;
-      this.messages.push({ role: "user", text });
+      // Slash command: intercept BEFORE hitting the SDK. /word or /word arg
+      if (text.startsWith("/") && !this.streaming) {
+        const m = text.match(/^\/(\w+)(?:\s+(.*))?$/);
+        if (m) {
+          this.input = "";
+          this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
+          await this._runSlash(m[1], m[2] || "");
+          return;
+        }
+      }
+      const readyImages = this.pendingImages.filter(im => im.id && !im.error);
+      const readyDocs = this.pendingDocs.filter(d => d.id && !d.error);
+      if ((!text && !readyImages.length && !readyDocs.length)
+          || this.streaming || !this.currentId) return;
+      // If anything still uploading, wait.
+      if (this.pendingImages.some(im => im.uploading)
+          || this.pendingDocs.some(d => d.uploading)) {
+        this.toast(this.t("img.wait_upload"), "warn", 2000);
+        return;
+      }
+      this.messages.push({
+        role: "user", text,
+        images: readyImages.map(im => ({ preview: im.preview })),
+        docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
+      });
+      // Single id-list for both kinds — backend dispatches by stored kind.
+      const attachIds = [
+        ...readyImages.map(im => im.id),
+        ...readyDocs.map(d => d.id),
+      ];
+      this.pendingImages = [];
+      this.pendingDocs = [];
       this.input = "";
       // 发送后 textarea 重置高度
       this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
       this.mentionShow = false;
       this.streaming = true;
+      this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
       this.atBottom = true;
       this.scrollToBottom(true);
 
@@ -1497,6 +2261,7 @@ function portal() {
         + "&model=" + encodeURIComponent(this.model)
         + "&permission=" + encodeURIComponent(this.permission)
         + "&show_thinking=" + (this.showThinking ? "true" : "false")
+        + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
         + "&token=" + encodeURIComponent(this.token);
       const es = new EventSource(url);
       this.es = es;
@@ -1533,7 +2298,12 @@ function portal() {
       es.addEventListener("tool_use", ev => {
         closeAsst();
         const d = JSON.parse(ev.data);
-        this.messages.push({ role: "tool_use", name: d.name, summary: d.summary });
+        const msg = { role: "tool_use", name: d.name, summary: d.summary };
+        // Carry through structured payloads for dedicated UIs
+        if (d.todos != null) msg.todos = d.todos;
+        if (d.task != null) msg.task = d.task;
+        if (d.plan != null) msg.plan = d.plan;
+        this.messages.push(msg);
         this.scrollToBottom(false);
       });
       es.addEventListener("tool_result", ev => {
@@ -1556,12 +2326,34 @@ function portal() {
         });
         this.scrollToBottom(false);
       });
+      // permission_request: muselab's can_use_tool bridge. Shows Allow / Deny /
+      // Always-allow buttons; click POSTs decision, backend resolves the SDK callback.
+      es.addEventListener("permission_request", ev => {
+        closeAsst();
+        const d = JSON.parse(ev.data);
+        this.messages.push({
+          role: "permission_request",
+          id: d.id,
+          tool: d.tool,
+          summary: d.summary,
+          resolved: false,
+          decision: null,
+        });
+        this.scrollToBottom(false);
+      });
       es.addEventListener("done", ev => {
         const d = JSON.parse(ev.data);
         if (d.total_cost_usd != null && curIdx !== -1) {
           this.messages[curIdx].cost = "$" + d.total_cost_usd.toFixed(4);
         }
-        if (d.stats) this.stats = d.stats;
+        if (d.stats) this.stats = { ...this.stats, ...d.stats };
+        if (d.session_usage) this.sessionUsage = d.session_usage;
+        // Budget warn on every turn that crosses the threshold (don't spam if already over)
+        if (d.budget_usd > 0 && d.budget_used_pct >= 90 && !this._budgetWarned) {
+          this._budgetWarned = true;
+          this.toast(this.t("cost.budget_warn", { pct: d.budget_used_pct, usd: d.budget_usd }),
+                      "warn", 5000);
+        }
         es.close(); this.streaming = false; this.es = null;
         this.refreshSessions();
         this.$nextTick(() => this.highlightCode(".chat-body"));
@@ -1648,6 +2440,32 @@ function portal() {
         this.toast(this.t("ask.submit_failed"), "error", 3000);
       }
     },
+    // ====== permission_request helpers ======
+    async decidePermission(msg, decision) {
+      if (msg.resolved) return;
+      msg.resolved = true;
+      msg.decision = decision;
+      try {
+        const r = await fetch(
+          `/api/chat/permission/${encodeURIComponent(this.currentId)}/${encodeURIComponent(msg.id)}`,
+          {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ decision }),
+          },
+        );
+        if (!r.ok) {
+          msg.resolved = false;
+          msg.decision = null;
+          this.toast(this.t("perm.submit_failed"), "error", 3000);
+        }
+      } catch (e) {
+        msg.resolved = false;
+        msg.decision = null;
+        this.toast(this.t("perm.submit_failed"), "error", 3000);
+      }
+    },
+
     copyMsg(m) {
       const text = m.text || "";
       navigator.clipboard?.writeText(text).then(

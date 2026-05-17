@@ -64,3 +64,67 @@ def test_short_token_rejected(monkeypatch, tmp_path):
         del sys.modules[n]
     with pytest.raises(RuntimeError, match="too short"):
         import backend.settings  # type: ignore[import]  # noqa: F401
+
+
+# ---- symlink escape ----
+
+def test_symlink_to_outside_root_blocked_for_read(client, auth, temp_root, tmp_path):
+    """A symlink inside ROOT pointing at /etc/passwd must not let the reader
+    out. safe_resolve calls .resolve() which follows symlinks → we then
+    verify the resolved path is still under ROOT."""
+    secret = tmp_path / "secret"
+    secret.write_text("OUTSIDE-ROOT-CANARY")
+    (temp_root / "trap").symlink_to(secret)
+    r = client.get("/api/files/read?path=trap", headers=auth)
+    assert r.status_code in (400, 403)
+    assert b"CANARY" not in r.content
+
+
+def test_symlink_to_outside_root_blocked_for_write(client, auth, temp_root, tmp_path):
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (temp_root / "evil-link").symlink_to(outside_dir)
+    r = client.put("/api/files/write",
+                    headers=auth,
+                    json={"path": "evil-link/poisoned.txt", "content": "x"})
+    assert r.status_code in (400, 403)
+    assert not (outside_dir / "poisoned.txt").exists()
+
+
+# ---- upload caps ----
+
+def test_upload_size_cap(client, auth, monkeypatch):
+    """Large uploads abort mid-stream with 413, partial file is cleaned up."""
+    import io
+    from backend import files as f
+    monkeypatch.setattr(f, "MAX_UPLOAD_BYTES", 100)   # 100 bytes for the test
+    big = b"x" * 500
+    r = client.post(
+        "/api/files/upload",
+        headers=auth,
+        files={"file": ("big.txt", io.BytesIO(big), "text/plain")},
+        data={"path": ""},
+    )
+    assert r.status_code == 413
+
+
+def test_upload_blocks_executable_extension(client, auth):
+    import io
+    r = client.post(
+        "/api/files/upload",
+        headers=auth,
+        files={"file": ("payload.exe", io.BytesIO(b"MZ"), "application/octet-stream")},
+        data={"path": ""},
+    )
+    assert r.status_code == 400
+
+
+def test_upload_blocks_sensitive_filename(client, auth):
+    import io
+    r = client.post(
+        "/api/files/upload",
+        headers=auth,
+        files={"file": (".env.production", io.BytesIO(b"SECRET=x"), "text/plain")},
+        data={"path": ""},
+    )
+    assert r.status_code == 403

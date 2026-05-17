@@ -16,7 +16,7 @@ admin needed.
   claude login
   ```
   Stored under `%USERPROFILE%\.claude\`. Non-Claude providers (DeepSeek / GLM /
-  MiniMax / Kimi) just need API keys, set later in Settings UI.
+  MiniMax) just need API keys, set later in Settings UI.
 
 ## Install
 

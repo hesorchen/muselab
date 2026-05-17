@@ -37,13 +37,18 @@ def test_env_override_missing_key(monkeypatch):
 
 
 def test_env_override_present(monkeypatch):
+    """Both ANTHROPIC_API_KEY (x-api-key) and ANTHROPIC_AUTH_TOKEN (Bearer) are
+    set to the vendor key — different vendors prefer different headers; setting
+    both means the request authenticates regardless. CLI OAuth fallback envs
+    are zeroed so a 401 from the vendor can't silently re-route to Anthropic."""
     ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "sk-test"})
     env = ep.env_override("deepseek-v4-pro")
     assert env is not None
     assert env["ANTHROPIC_BASE_URL"].startswith("https://api.deepseek.com")
+    assert env["ANTHROPIC_API_KEY"] == "sk-test"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-test"
-    # Defensive: strip inherited key
-    assert env["ANTHROPIC_API_KEY"] == ""
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert env["CLAUDE_OAUTH_TOKEN"] == ""
 
 
 def test_is_third_party(monkeypatch):
@@ -51,7 +56,6 @@ def test_is_third_party(monkeypatch):
     assert ep.is_third_party("deepseek-v4-pro")
     assert ep.is_third_party("glm-5")
     assert ep.is_third_party("minimax-m2.7")
-    assert ep.is_third_party("kimi-k2.6")
     assert not ep.is_third_party("claude-sonnet-4-6")
 
 
@@ -60,7 +64,6 @@ def test_available_groups_only_lists_configured(monkeypatch):
         "DEEPSEEK_API_KEY": "x",
         "ZHIPUAI_API_KEY": None,
         "MINIMAX_API_KEY": None,
-        "MOONSHOT_API_KEY": None,
     })
     groups = ep.available_groups()
     names = {g["group"] for g in groups}
@@ -74,7 +77,6 @@ def test_available_groups_only_lists_configured(monkeypatch):
     ("deepseek-v4-pro", "api.deepseek.com"),
     ("glm-5", "bigmodel.cn"),
     ("minimax-m2.7", "minimax.io"),
-    ("kimi-k2.6", "moonshot.cn"),
 ])
 def test_all_providers_route_to_correct_host(monkeypatch, model, expected_host):
     """Each catalog entry's base_url contains the expected vendor domain."""
@@ -84,13 +86,16 @@ def test_all_providers_route_to_correct_host(monkeypatch, model, expected_host):
     assert expected_host in p.base_url
 
 
-def test_env_override_strips_inherited_anthropic_key(monkeypatch):
-    """Even if ANTHROPIC_API_KEY is set, env_override clears it so the SDK
-    doesn't accidentally hit Anthropic when we want a third-party."""
+def test_env_override_replaces_inherited_anthropic_key(monkeypatch):
+    """Even if the parent process has ANTHROPIC_API_KEY set to a real Anthropic
+    key, env_override must overwrite it with the vendor's key. Otherwise the
+    request would go to the vendor's base_url but authenticate as Anthropic →
+    vendor 401 → CLI OAuth fallback → bills Claude (the original Opus-billing
+    bug we're guarding against)."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xxx")
     ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "sk-ds"})
     env = ep.env_override("deepseek-v4-pro")
-    assert env["ANTHROPIC_API_KEY"] == ""   # explicitly emptied
+    assert env["ANTHROPIC_API_KEY"] == "sk-ds"      # vendor key wins
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ds"
 
 

@@ -189,8 +189,53 @@ def test_no_extension_text_file(client, auth, temp_root):
     assert "FROM python" in r.text
 
 
-def test_random_extension_blocked(client, auth, temp_root):
-    """Binary-ish unknown extensions returned 415 by /read."""
+def test_unknown_extension_allowed_when_text(client, auth, temp_root):
+    """Unknown extensions (.weird, .tmpl, .j2 …) preview as text if the content
+    is actually text. Whitelist→blacklist+sniff inversion."""
     (temp_root / "x.weird").write_text("hi")
     r = client.get("/api/files/read?path=x.weird", headers=auth)
+    assert r.status_code == 200
+    assert r.text == "hi"
+
+
+def test_known_binary_extension_rejected(client, auth, temp_root):
+    """Fast-path 415 for known-binary extensions before reading content."""
+    (temp_root / "blob.zip").write_bytes(b"PK\x03\x04not really a zip")
+    r = client.get("/api/files/read?path=blob.zip", headers=auth)
     assert r.status_code == 415
+
+
+def test_binary_content_rejected_by_sniff(client, auth, temp_root):
+    """File with no known-binary extension but NUL bytes in content → 415."""
+    (temp_root / "weird.dat").write_bytes(b"some\x00binary\x00data")
+    r = client.get("/api/files/read?path=weird.dat", headers=auth)
+    assert r.status_code == 415
+
+
+def test_tmpl_file_previewable(client, auth, temp_root):
+    """Regression: .tmpl was blocked by the old whitelist; should preview now."""
+    (temp_root / "muselab.service.tmpl").write_text(
+        "[Unit]\nDescription={{NAME}}\n")
+    r = client.get("/api/files/read?path=muselab.service.tmpl", headers=auth)
+    assert r.status_code == 200
+    assert "{{NAME}}" in r.text
+
+
+def test_empty_file_previewable(client, auth, temp_root):
+    """Empty file is text by definition."""
+    (temp_root / "empty.foo").write_text("")
+    r = client.get("/api/files/read?path=empty.foo", headers=auth)
+    assert r.status_code == 200
+    assert r.text == ""
+
+
+def test_chinese_markdown_at_sniff_boundary_previewable(client, auth, temp_root):
+    """Regression: CJK markdown files exceeding the 4 KB sniff window were
+    wrongly tagged binary because the chunk boundary split a 3-byte UTF-8
+    char and plain decode() raised UnicodeDecodeError, then the fallback
+    high-bit ratio test rejected as binary (CJK is ~100% high-bit)."""
+    chinese = "今天天气真好，我去公园散步。" * 400   # ~10 KB of pure CJK
+    (temp_root / "cn.md").write_text(chinese, encoding="utf-8")
+    r = client.get("/api/files/read?path=cn.md", headers=auth)
+    assert r.status_code == 200
+    assert "今天天气真好" in r.text

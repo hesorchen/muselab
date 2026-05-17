@@ -90,6 +90,8 @@ window.addEventListener("error", e => {
   <symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
   <symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
   <symbol id="i-alert-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></symbol>
+  <symbol id="i-tool" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></symbol>
+  <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 17.98 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
   <symbol id="i-msg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
   <symbol id="i-at" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></symbol>
@@ -325,9 +327,33 @@ window.addEventListener("error", e => {
               :title="(lang==='zh'?'MCP 服务: ':'MCP servers: ') + mcp.servers.map(s=>s.name).join(', ')">
           🔌 <span x-text="mcp.servers.length"></span>
         </span>
-        <span class="cost-badge" :title="(lang==='zh'?'累计消息: ':'Total messages: ')+stats.total_messages" x-text="'$'+stats.total_cost_usd.toFixed(4)"></span>
+        <span class="cost-badge"
+              :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
+              :title="costBadgeTitle()"
+              x-text="'$'+stats.total_cost_usd.toFixed(4)"></span>
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
+
+      <!-- Context meter — always visible, even at 0%. Low values render in a
+           muted style so they don't add noise. Compact button only appears at
+           70%+, where the action is actually relevant. -->
+      <div class="ctx-meter"
+           :class="{
+             idle: sessionUsage.context_used_pct < 30,
+             warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
+             danger: sessionUsage.context_used_pct >= 90,
+           }"
+           :title="ctxMeterTitle()">
+        <div class="ctx-meter-bar">
+          <div class="ctx-meter-fill" :style="`width: ${Math.min(100, sessionUsage.context_used_pct)}%`"></div>
+        </div>
+        <div class="ctx-meter-text">
+          <span class="ctx-meter-label" x-text="ctxMeterLabel()"></span>
+          <button class="ctx-meter-action" x-show="sessionUsage.context_used_pct >= 70"
+                  @click="runCompact()"
+                  x-text="t('ctx.compact_btn')"></button>
+        </div>
+      </div>
 
       <div class="session-bar">
         <select class="session-sel" x-model="currentId" @change="switchSession()">
@@ -342,7 +368,7 @@ window.addEventListener("error", e => {
       </div>
 
       <div class="session-bar">
-        <select x-model="model" style="flex:1">
+        <select x-model="model" @change="onModelChange()" style="flex:1">
           <template x-for="grp in modelGroups()" :key="grp.name">
             <optgroup :label="grp.name">
               <template x-for="m in grp.items" :key="m.model">
@@ -379,22 +405,80 @@ window.addEventListener("error", e => {
           </div>
           <template x-for="(m,i) in messages" :key="m._k || (currentId + '-' + i)">
             <div :class="'msg ' + m.role">
-              <div x-show="m.role==='user'" class="bubble" x-text="m.text"></div>
+              <div x-show="m.role==='user'" class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
               <div x-show="m.role==='assistant'" class="bubble" x-html="m.html"></div>
-            <div x-show="m.role==='assistant' && m.model" class="model-tag" x-text="m.model"></div>
-              <div x-show="m.role==='tool_use'" class="tool">
-                <span class="tool-name" x-text="m.name"></span>
+            <div x-show="m.role==='assistant' && m.model" class="model-tag"
+                 :title="m.model"
+                 x-text="modelLabel(m.model)"></div>
+              <!-- TodoWrite: dedicated checklist UI instead of generic tool bubble. -->
+              <template x-if="m.role==='tool_use' && m.name==='TodoWrite'"><div class="todo-card">
+                <div class="todo-card-head">
+                  <span class="todo-card-icon"><svg><use href="#i-check-circle"/></svg></span>
+                  <span class="todo-card-title" x-text="t('todo.title')"></span>
+                  <span class="todo-card-count"
+                        x-text="(m.todos || []).filter(t => t.status==='completed').length + ' / ' + (m.todos || []).length"></span>
+                </div>
+                <ul class="todo-list">
+                  <template x-for="(t, ti) in (m.todos || [])" :key="ti">
+                    <li :class="'todo-item todo-' + (t.status || 'pending')">
+                      <span class="todo-status">
+                        <svg x-show="t.status==='completed'"><use href="#i-check"/></svg>
+                        <span x-show="t.status==='in_progress'" class="todo-spinner"></span>
+                        <span x-show="t.status!=='completed' && t.status!=='in_progress'" class="todo-dot"></span>
+                      </span>
+                      <span class="todo-text" x-text="t.content || t.subject || t.description || ''"></span>
+                      <span x-show="t.status==='in_progress'" class="todo-tag" x-text="t('todo.doing')"></span>
+                    </li>
+                  </template>
+                </ul>
+              </div></template>
+              <!-- Task: subagent invocation. -->
+              <template x-if="m.role==='tool_use' && m.name==='Task'"><div class="subagent-card">
+                <div class="subagent-head">
+                  <span class="subagent-icon"><svg><use href="#i-tool"/></svg></span>
+                  <span class="subagent-label" x-text="t('subagent.label')"></span>
+                  <span class="subagent-type" x-text="(m.task && m.task.subagent_type) || 'agent'"></span>
+                </div>
+                <div class="subagent-desc" x-text="(m.task && m.task.description) || ''"></div>
+                <details class="subagent-prompt" x-show="m.task && m.task.prompt">
+                  <summary x-text="t('subagent.prompt_toggle')"></summary>
+                  <pre x-text="m.task && m.task.prompt"></pre>
+                </details>
+              </div></template>
+              <!-- ExitPlanMode: plan + approve/reject. Approval just acknowledges; SDK
+                   permission flow is what actually gates execution. -->
+              <template x-if="m.role==='tool_use' && m.name==='ExitPlanMode'"><div class="plan-card">
+                <div class="plan-head">
+                  <span class="plan-icon"><svg><use href="#i-check-circle"/></svg></span>
+                  <span class="plan-title" x-text="t('plan.title')"></span>
+                </div>
+                <div class="plan-body markdown-body" x-html="renderMd(m.plan || '')"></div>
+              </div></template>
+              <!-- Default tool bubble for anything else. -->
+              <div x-show="m.role==='tool_use' && m.name!=='TodoWrite' && m.name!=='Task' && m.name!=='ExitPlanMode'"
+                   class="tool"
+                   :class="{ 'tool-mcp': m.name && m.name.startsWith('mcp__'), 'tool-skill': m.name==='Skill' }">
+                <span class="tool-name">
+                  <span x-show="m.name && m.name.startsWith('mcp__')" class="tool-prefix-icon">🔌</span>
+                  <span x-show="m.name==='Skill'" class="tool-prefix-icon">🧩</span>
+                  <span x-text="renderToolName(m.name)"></span>
+                </span>
                 <span class="tool-arg" x-text="m.summary"></span>
               </div>
               <div x-show="m.role==='tool_result'" :class="'tool-result' + (m.is_error?' err':'')">
                 <pre x-text="m.preview"></pre>
               </div>
+              <!-- Inline system note (e.g. "model switched to X") — small, centered. -->
+              <div x-show="m.role==='system_note'" class="sys-note" x-text="m.text"></div>
               <div x-show="m.role==='thinking'" class="thinking">
                 <span class="thinking-label"><span class="icon"><svg><use href="#i-brain"/></svg></span>thinking</span>
                 <pre x-text="m.text"></pre>
               </div>
-              <!-- Muse asks user a structured question (mcp__muselab__ask_user_question) -->
-              <div x-show="m.role==='ask_user_question'" class="ask-question">
+              <!-- Muse asks user a structured question (mcp__muselab__ask_user_question).
+                   Use x-if (not x-show) so the inner expressions only evaluate when this is
+                   actually an ask_user_question message — avoids `m.questions.some(...)` on
+                   undefined for all the other message roles. -->
+              <template x-if="m.role==='ask_user_question'"><div class="ask-question">
                 <div class="ask-header">
                   <span class="muse-mascot sm"><svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg></span>
                   <span class="ask-title" x-text="t('ask.title')"></span>
@@ -421,11 +505,39 @@ window.addEventListener("error", e => {
                   </div>
                 </template>
                 <!-- Multi-select: explicit submit button. Single-select auto-submits when all chosen. -->
-                <div x-show="m.questions.some(q => q.multiSelect) && !m.submitted" class="ask-submit-row">
+                <div x-show="(m.questions || []).some(q => q.multiSelect) && !m.submitted" class="ask-submit-row">
                   <button class="btn-primary" @click="submitAskAnswers(m)"
                           x-text="t('ask.submit')"></button>
                 </div>
-              </div>
+              </div></template>
+              <!-- Muse asks the user to allow / deny a tool call (can_use_tool bridge).
+                   Mirrors the ask_user_question pattern: x-if lazy-mounts so other roles
+                   don't evaluate these expressions. -->
+              <template x-if="m.role==='permission_request'"><div class="perm-request"
+                  :class="{ resolved: m.resolved }">
+                <div class="perm-header">
+                  <span class="muse-mascot sm"><svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg></span>
+                  <span class="perm-title" x-text="t('perm.title')"></span>
+                  <span x-show="m.resolved" class="perm-decision-tag"
+                        :class="'perm-decision-' + m.decision"
+                        x-text="t('perm.decision_' + m.decision)"></span>
+                </div>
+                <div class="perm-body">
+                  <div class="perm-tool">
+                    <span class="perm-tool-icon"><svg><use href="#i-tool"/></svg></span>
+                    <span class="perm-tool-name" x-text="m.tool"></span>
+                  </div>
+                  <pre class="perm-summary" x-text="m.summary"></pre>
+                </div>
+                <div class="perm-actions" x-show="!m.resolved">
+                  <button class="btn-deny" @click="decidePermission(m, 'deny')"
+                          x-text="t('perm.deny')"></button>
+                  <button class="btn-allow" @click="decidePermission(m, 'allow')"
+                          x-text="t('perm.allow')"></button>
+                  <button class="btn-always" @click="decidePermission(m, 'always')"
+                          x-text="t('perm.always')"></button>
+                </div>
+              </div></template>
               <div class="msg-actions" x-show="m.role==='assistant' || m.role==='user'">
                 <button @click="copyMsg(m)" class="icon-btn sm" :title="lang==='zh'?'复制':'Copy'"><svg><use href="#i-copy"/></svg></button>
               </div>
@@ -435,7 +547,7 @@ window.addEventListener("error", e => {
           <div x-show="streaming" class="msg assistant">
             <div class="bubble pending">
               <span class="thinking-dots"><span></span><span></span><span></span></span>
-              <span class="thinking-label" x-text="t('chat.thinking') + ' · ' + currentModelLabel()"></span>
+              <span class="thinking-label" x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
             </div>
           </div>
         </div>
@@ -443,6 +555,18 @@ window.addEventListener("error", e => {
       </div>
 
       <div class="chat-input">
+        <!-- / slash command palette -->
+        <div class="mention-pop slash-pop" x-show="slashShow" x-transition.opacity>
+          <div class="mention-hint" x-text="t('slash.hint')"></div>
+          <template x-for="(c, i) in slashResults" :key="c.name">
+            <div :class="'mention-item ' + (slashIdx===i?'sel':'')"
+                 @mousedown.prevent="pickSlash(i)" @mouseenter="slashIdx=i">
+              <span class="slash-name mono" x-text="'/' + c.name"></span>
+              <span class="slash-desc" x-text="c.desc[lang] || c.desc.zh"></span>
+            </div>
+          </template>
+          <div class="hint-row" x-show="!slashResults.length" x-text="t('slash.none')"></div>
+        </div>
         <!-- @ mention -->
         <div class="mention-pop" x-show="mentionShow" x-transition.opacity>
           <div class="mention-hint" x-html="lang==='zh' ? '<span class=&quot;kbd&quot;>↑↓</span> 选 · <span class=&quot;kbd&quot;>Enter</span> 插入 · <span class=&quot;kbd&quot;>Esc</span> 关' : '<span class=&quot;kbd&quot;>↑↓</span> nav · <span class=&quot;kbd&quot;>Enter</span> insert · <span class=&quot;kbd&quot;>Esc</span> close'"></div>
@@ -458,20 +582,65 @@ window.addEventListener("error", e => {
           </template>
           <div class="hint-row" x-show="!mentionResults.length" x-text="t('files.empty_search')"></div>
         </div>
-        <textarea x-model="input" x-ref="chatInput"
-                  @keydown.enter.prevent.stop="onEnter($event)"
-                  @keydown.escape="mentionShow=false"
-                  @keydown.up="mentionShow && (mentionIdx=Math.max(0,mentionIdx-1)) && $event.preventDefault()"
-                  @keydown.down="mentionShow && (mentionIdx=Math.min(mentionResults.length-1,mentionIdx+1)) && $event.preventDefault()"
-                  @input="onChatInput($event); autoGrow($event.target)"
-                  :placeholder="t('chat.placeholder')" :disabled="streaming"></textarea>
-        <div class="chat-btns">
-          <button x-show="!streaming" @click="send()" :disabled="!input.trim()" class="btn-primary" :title="t('btn.send')">
-            <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
+        <!-- Attachment preview row (above input). -->
+        <div class="img-attachments" x-show="pendingImages.length || pendingDocs.length">
+          <template x-for="(img, i) in pendingImages" :key="img.id || ('i'+i)">
+            <div class="img-chip" :class="{ uploading: img.uploading, error: img.error }">
+              <img :src="img.preview" alt="" />
+              <button class="img-chip-x icon-btn sm"
+                      @click="removePendingImage(i)" :title="t('img.remove')">
+                <svg><use href="#i-x"/></svg>
+              </button>
+              <span x-show="img.uploading" class="img-chip-spin"></span>
+            </div>
+          </template>
+          <template x-for="(doc, i) in pendingDocs" :key="doc.id || ('d'+i)">
+            <div class="doc-chip" :class="{ uploading: doc.uploading, error: doc.error }"
+                 :title="doc.name + ' · ' + doc.kind">
+              <span class="doc-chip-icon"><svg><use href="#i-file-text"/></svg></span>
+              <div class="doc-chip-body">
+                <div class="doc-chip-name" x-text="doc.name"></div>
+                <div class="doc-chip-kind" x-text="doc.kind"></div>
+              </div>
+              <button class="doc-chip-x icon-btn sm"
+                      @click="removePendingDoc(i)" :title="t('img.remove')">
+                <svg><use href="#i-x"/></svg>
+              </button>
+              <span x-show="doc.uploading" class="img-chip-spin"></span>
+            </div>
+          </template>
+        </div>
+        <!-- Horizontal row: attach button (left) + textarea + send/stop (right). -->
+        <div class="chat-input-row"
+             @dragover.prevent="dragHover=true"
+             @dragleave="dragHover=false"
+             @drop.prevent="dragHover=false; onAttachDrop($event)"
+             :class="{ 'drag-hover': dragHover }">
+          <input type="file" x-ref="attachInput"
+                 accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,text/x-python,text/x-yaml,text/x-toml,text/x-shellscript,text/javascript,text/typescript,text/html,text/css,text/xml,.md,.markdown,.txt,.csv,.json,.yaml,.yml,.toml,.py,.sh,.js,.ts,.tsx,.jsx,.html,.css,.xml,.log,.ini,.conf"
+                 multiple style="display:none" @change="onAttachPicked($event)" />
+          <button @click="$refs.attachInput.click()" class="chat-attach-btn"
+                  :disabled="streaming" :title="t('attach.title')">
+            <svg><use href="#i-paperclip"/></svg>
           </button>
-          <button x-show="streaming" @click="stop()" class="btn-danger" :title="t('btn.stop') + ' (Esc)'">
-            <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
-          </button>
+          <textarea x-model="input" x-ref="chatInput"
+                    @keydown.enter.prevent.stop="onEnter($event)"
+                    @keydown.escape="mentionShow=false; slashShow=false"
+                    @keydown.up="(mentionShow || slashShow) && _navPop(-1) && $event.preventDefault()"
+                    @keydown.down="(mentionShow || slashShow) && _navPop(1) && $event.preventDefault()"
+                    @input="onChatInput($event); autoGrow($event.target)"
+                    @paste="onImagePaste($event)"
+                    :placeholder="t('chat.placeholder')" :disabled="streaming"></textarea>
+          <div class="chat-btns">
+            <button x-show="!streaming" @click="send()"
+                    :disabled="!input.trim() && !pendingImages.length && !pendingDocs.length"
+                    class="btn-primary" :title="t('btn.send')">
+              <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
+            </button>
+            <button x-show="streaming" @click="stop()" class="btn-danger" :title="t('btn.stop') + ' (Esc)'">
+              <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
+            </button>
+          </div>
         </div>
       </div>
     </aside>
@@ -562,6 +731,9 @@ window.addEventListener("error", e => {
                        :placeholder="p.configured ? p.masked : t('set.key_unset')"
                        x-model="settings.draftKeys[p.env_key]" />
                 <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
+                <button x-show="p.configured" class="btn-ghost sm"
+                        @click="probeProvider(p.env_key)" :title="t('set.probe_tip')"
+                        x-text="t('set.probe')"></button>
               </div>
             </div>
           </template>
@@ -624,6 +796,92 @@ window.addEventListener("error", e => {
             <label x-text="lang==='zh' ? '最大 tool 轮数 (0=不限)' : 'Max tool turns (0=unlimited)'"></label>
             <input type="number" min="0" max="50"
                    x-model.number="settings.draftParams.max_turns" class="settings-input" />
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.skills')"></div>
+          <div class="settings-hint" x-text="t('set.skills.hint')"></div>
+          <div x-show="!settings.skills.length" class="settings-empty"
+               x-text="t('set.skills.empty')"></div>
+          <template x-for="sk in settings.skills" :key="sk.scope + ':' + sk.name">
+            <div class="skill-row">
+              <div class="skill-row-main">
+                <div class="skill-row-head">
+                  <span class="skill-row-name mono" x-text="sk.name"></span>
+                  <span class="skill-row-scope" :class="'skill-scope-' + sk.scope" x-text="sk.scope"></span>
+                </div>
+                <div class="skill-row-desc" x-text="sk.description"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.mcp')"></div>
+          <div class="settings-hint" x-text="t('set.mcp.hint')"></div>
+
+          <div x-show="!settings.mcpServers.length && !settings.mcpExamples.length"
+               class="settings-empty" x-text="t('set.mcp.empty')"></div>
+
+          <template x-for="s in settings.mcpServers" :key="s.name">
+            <div class="mcp-server-row">
+              <div class="mcp-server-main">
+                <div class="mcp-server-name">
+                  <span class="mcp-server-dot" :class="{ active: !s.disabled }"></span>
+                  <span class="mono" x-text="s.name"></span>
+                  <span class="mcp-server-tag" x-show="s.disabled" x-text="t('set.mcp.disabled')"></span>
+                </div>
+                <div class="mcp-server-cmd mono"
+                     x-text="s.command + (s.args.length ? ' ' + s.args.join(' ') : '')"></div>
+              </div>
+              <div class="mcp-server-actions">
+                <label class="switch sm" :title="t('set.mcp.toggle_title')">
+                  <input type="checkbox" :checked="!s.disabled"
+                         @change="toggleMcp(s.name, !$event.target.checked)" />
+                  <span class="switch-slider"></span>
+                </label>
+                <button class="icon-btn sm" :title="t('set.mcp.delete')"
+                        @click="deleteMcp(s.name)">
+                  <svg><use href="#i-trash"/></svg>
+                </button>
+              </div>
+            </div>
+          </template>
+
+          <div class="mcp-preset-row" x-show="settings.mcpExamples.length">
+            <span class="settings-sub-label" x-text="t('set.mcp.presets')"></span>
+            <template x-for="ex in settings.mcpExamples" :key="ex.name">
+              <button class="mcp-preset-chip"
+                      :disabled="settings.mcpServers.some(s => s.name === ex.name)"
+                      @click="installMcpPreset(ex)">
+                <span class="mono" x-text="ex.name"></span>
+                <span x-show="ex.description" class="mcp-preset-desc" x-text="ex.description"></span>
+              </button>
+            </template>
+          </div>
+
+          <div class="settings-row mcp-add-row">
+            <button class="btn-ghost sm" @click="settings.mcpDraft.show = !settings.mcpDraft.show"
+                    x-text="settings.mcpDraft.show ? t('btn.cancel') : t('set.mcp.add')"></button>
+          </div>
+          <div x-show="settings.mcpDraft.show" class="mcp-add-form">
+            <div class="settings-row">
+              <label x-text="t('set.mcp.name')"></label>
+              <input class="settings-input" x-model="settings.mcpDraft.name" placeholder="fetch" />
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.mcp.command')"></label>
+              <input class="settings-input" x-model="settings.mcpDraft.command" placeholder="uvx" />
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.mcp.args')"></label>
+              <input class="settings-input" x-model="settings.mcpDraft.argsStr"
+                     placeholder="mcp-server-fetch" />
+            </div>
+            <div class="settings-row">
+              <button class="btn-primary sm" @click="addMcpFromDraft()" x-text="t('set.mcp.add')"></button>
+            </div>
           </div>
         </div>
 

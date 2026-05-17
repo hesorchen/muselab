@@ -40,6 +40,7 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("ZHIPUAI_API_KEY", raising=False)
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
 
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
@@ -54,7 +55,7 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.setattr(sess_mod, "INDEX", test_sess_dir / "index.json")
 
     for k in ("DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY",
-              "MOONSHOT_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+              "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         monkeypatch.delenv(k, raising=False)
 
     return main_mod

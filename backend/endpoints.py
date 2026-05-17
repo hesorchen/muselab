@@ -13,7 +13,9 @@ Adding a new provider:
 """
 from __future__ import annotations
 import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -57,15 +59,8 @@ CATALOG: tuple[Provider, ...] = (
             "minimax-m2.7", "minimax-m2.7-highspeed", "minimax-m2.5",
         )),
     ),
-    Provider(
-        prefix="kimi-",
-        base_url="https://api.moonshot.cn/anthropic",
-        env_key="MOONSHOT_API_KEY",
-        display="Kimi (Moonshot)",
-        models=tuple((m, m) for m in (
-            "kimi-k2.6", "kimi-k2", "kimi-latest",
-        )),
-    ),
+    # Kimi (Moonshot) removed 2026-05-17 — vendor's anthropic endpoint
+    # behavior was inconsistent in muselab testing; add back when verified.
 )
 
 
@@ -84,23 +79,52 @@ def is_third_party(model: str) -> bool:
 
 def env_override(model: str) -> dict[str, str] | None:
     """Build the env dict to pass to ClaudeAgentOptions(env=...) so the SDK
-    routes to the vendor's Anthropic endpoint. Returns None if no key is set.
+    routes to the vendor's Anthropic-compatible endpoint. Returns None if no
+    key is set for this provider.
 
-    IMPORTANT: SDK passes this dict to the CLI subprocess as a full env
-    REPLACEMENT (not merge). So we must include the inherited env that claude
-    CLI needs (PATH, HOME, etc.) — otherwise the subprocess can't even find its
-    own config and exits with code 1."""
+    IMPORTANT auth gotcha:
+      - `ANTHROPIC_API_KEY`    → sent as `x-api-key` header (standard).
+      - `ANTHROPIC_AUTH_TOKEN` → sent as `Authorization: Bearer` (OAuth/enterprise).
+      Third-party Anthropic-compatible vendors (DeepSeek / GLM / MiniMax)
+      expect **x-api-key**. If we only set AUTH_TOKEN, vendor returns 401 and
+      the CLI then silently falls back to OAuth credentials stored in ~/.claude/,
+      which means the request actually hits api.anthropic.com — billing as
+      Claude (often Opus). Symptom: user picked "deepseek-v4-flash" in the UI
+      but sees $0.30 / msg cost. So set BOTH; the CLI ignores AUTH_TOKEN when
+      API_KEY is present.
+
+    Also: SDK passes this dict to the CLI subprocess as a full env
+    REPLACEMENT (not merge). We must inherit PATH, HOME, etc. so the CLI can
+    even find its config dir."""
     p = lookup(model)
     if p is None:
         return None
     key = os.environ.get(p.env_key, "")
     if not key:
         return None
+    # Critical: claude CLI subprocess prefers `~/.claude/.credentials.json`
+    # (Pro OAuth) over ANTHROPIC_API_KEY env. When we point it at a vendor
+    # endpoint (DeepSeek/GLM/MiniMax) it would happily send the Claude OAuth
+    # token to that vendor → vendor 401 "invalid api key". So for third-party
+    # providers we redirect the CLI to a throwaway CLAUDE_CONFIG_DIR with no
+    # credentials.json — forcing it to fall back to env-based auth.
+    isolated_cfg = Path(tempfile.gettempdir()) / "muselab-vendor-cli-config"
+    isolated_cfg.mkdir(exist_ok=True)
+    # Make sure NO credentials file leaks in.
+    cred = isolated_cfg / ".credentials.json"
+    if cred.exists():
+        cred.unlink()
+
     merged = dict(os.environ)
     merged.update({
         "ANTHROPIC_BASE_URL": p.base_url,
-        "ANTHROPIC_AUTH_TOKEN": key,
-        "ANTHROPIC_API_KEY": "",   # defensive: strip inherited
+        "ANTHROPIC_API_KEY": key,            # primary — x-api-key header
+        "ANTHROPIC_AUTH_TOKEN": key,         # belt-and-suspenders for vendors that accept Bearer
+        # Defensive: kill OAuth fallback paths.
+        "CLAUDE_CODE_OAUTH_TOKEN": "",
+        "CLAUDE_OAUTH_TOKEN": "",
+        # Point CLI at an empty config dir so it can't load saved Pro OAuth.
+        "CLAUDE_CONFIG_DIR": str(isolated_cfg),
     })
     return merged
 

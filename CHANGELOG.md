@@ -5,7 +5,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Added — Docker / CI
+- **GitHub Container Registry images** — every push to `main` and every `v*.*.*`
+  tag publishes a multi-arch image (linux/amd64 + linux/arm64) to
+  `ghcr.io/hesorchen/muselab`. Tags: `latest` (main HEAD), `1.2.3` (semver),
+  `1.2`, `1`, `sha-abc1234` (short SHA per commit).
+- **PR docker smoke** — pull-requests still build (single-arch) without
+  pushing, to verify the Dockerfile keeps building.
+
+### Added — 2026-05-17 sprint
+- **Permission-request UI bridge** (`backend/permission_request.py`) — when `permission_mode` is not `bypassPermissions`, the SDK's `can_use_tool` callback pushes a side-channel event; the frontend renders an Allow / Deny / Always-allow bubble. Per-session always-allow cache avoids re-prompting for the same `(tool, key)` pair. 10-min timeout = deny.
+- **Default `CLAUDE.md` starter template** (`scripts/templates/default-CLAUDE.md`) — four personas (health / asset / career / research) with explicit evidence-tier rules and guardrails. Install scripts (linux/macos/windows) interactively offer to drop it into `ARCHIVE_DIR`. Docs at `docs/personalize-claude-md.md`.
+- **MCP server management UI** (Settings → MCP) — list / add / remove / enable-disable MCP servers from the browser. Backend: `GET/PUT/PATCH/DELETE /api/settings/mcp/...`. Storage in `mcp.json` with new `disabled` flag honored by the chat loop.
+- **MCP preset upgrade**: `mcp.json.example` adds `sequential-thinking` + `time` (with timezone) and a `description` field on every entry. Install scripts now check for `npx`/`uvx` and warn which presets won't run.
+- **Skills re-enabled and discovery wired in**: removed `"Skill"` from the disallowed-tools blocklist; `ClaudeAgentOptions.setting_sources=["user","project","local"]` + `skills="all"` so the SDK loads skills from `~/.claude/skills` and `muselab/skills`.
+- **7 preset skills** under `skills/`: `web-search`, `markdown-formatter`, `mermaid-helper`, `code-reviewer`, `citation-formatter`, `task-decomposer`, `summary-distiller`. Each follows the SKILL.md frontmatter format with `USE WHEN ...` descriptions.
+- **Skill discovery API** — `GET /api/settings/skills` lists discoverable skills (project + user scope). Settings modal shows them read-only with scope tag and description.
+- **Dedicated UIs for common tool calls**:
+  - **TodoWrite** — checkbox task list with status badges (pending / in-progress / completed) and a "doing" tag
+  - **Task (subagent)** — purple-bordered card with subagent_type chip + description + collapsible prompt
+  - **ExitPlanMode** — markdown-rendered plan card
+- **MCP / Skill tool-call render polish** — `mcp__server__tool` displays as `server · tool` with a 🔌 prefix and cyan border; Skill calls use 🧩 with amber border.
+- **Image input (ImageBlock)** — paste / drag / picker → thumbnail preview → POST `/api/chat/upload-image` (10 MB, 10-min TTL) → attached as base64 content to the SDK's user message. New `&image_ids=...` query param on the stream endpoint.
+- **Competitive analysis** at `docs/competitive-analysis.md` — 8 reference projects, viral-lift patterns, muselab gaps, README hero A/B, 3-week pre-launch plan.
+
+### Added — earlier
 - **Math formula rendering** in both contexts:
   - Markdown: KaTeX vendored (~600 KB total: CSS 23 KB, JS 275 KB, 20 woff2 fonts ~300 KB), wired into `mdRender()` via auto-render. Supports `$...$`, `$$...$$`, `\(...\)`, `\[...\]`. Runs after DOMPurify; ignores `<code>` / `<pre>` blocks
   - HTML preview iframe: relaxed `sandbox="allow-scripts"` + CSP allows `https:` scripts / styles / fonts / connect, so HTML reports with embedded MathJax / KaTeX / highlight.js CDN scripts render correctly. iframe still runs in unique opaque origin — cannot read MUSELAB_TOKEN, cannot fetch /api/* (CORS blocks)
@@ -23,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Bilingual UI (中文 / English)** with in-app toggle (Settings → Language). ~90 string keys in `STRINGS` table, falls back to Chinese for any missing English entry. Auto-detects browser language on first visit; persisted in localStorage.
 - **Multi-file tabs** in preview pane (VSCode-style): click files to open in tabs, click to switch, × or middle-click to close
 - **Settings modal** (gear icon in chat header):
-  - Configure API keys for DeepSeek / 智谱 GLM / MiniMax / Kimi without editing `.env`
+  - Configure API keys for DeepSeek / 智谱 GLM / MiniMax without editing `.env`
   - Default model / permission mode / show-thinking
   - Model params: thinking budget, max tool turns
   - Logout button moved here from file pane
@@ -32,7 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - DeepSeek (`api.deepseek.com/anthropic`)
   - 智谱 GLM (`open.bigmodel.cn/api/anthropic`)
   - MiniMax (`api.minimax.io/anthropic`)
-  - Kimi/Moonshot (`api.moonshot.cn/anthropic`)
 - **Brand empty states** for preview and chat panes (large `muse·lab` logo + tagline + quick tips)
 - **CodeMirror 5 editor** with 14-language syntax highlighting + line numbers + bracket matching + theme follow
 - Editor **status bar**: Ln/Col, selection length, total lines, char count, mode, dirty indicator

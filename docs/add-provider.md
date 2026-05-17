@@ -14,7 +14,6 @@ Skills/CLAUDE.md auto-load）都自动跨厂可用。
 | DeepSeek | `https://api.deepseek.com/anthropic` | ✅ 内置 |
 | 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` | ✅ 内置 |
 | MiniMax | `https://api.minimax.io/anthropic` | ✅ 内置 |
-| Kimi (Moonshot) | `https://api.moonshot.cn/anthropic` | ✅ 内置 |
 | 小米 MiMo | – | ❌ 暂只支持 OpenAI 协议 |
 | Qwen | – | ❌ 暂只支持 OpenAI 协议 |
 

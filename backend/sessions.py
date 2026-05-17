@@ -1,11 +1,31 @@
 """Session metadata + message history persisted as JSON files."""
 import json
+import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .settings import ROOT
+
+
+def _default_session_name() -> str:
+    """新会话 MM-DD HH:mm — enough to distinguish multiple new sessions per day."""
+    return "新会话 " + datetime.now().strftime("%m-%d %H:%M")
+
+
+def _title_from_message(text: str, limit: int = 24) -> str:
+    """First-line snippet of the user's first message, trimmed for the dropdown."""
+    if not text:
+        return ""
+    # Drop @-mention paths so the title shows what the user actually asked
+    cleaned = re.sub(r"@\S+\s*", "", text).strip()
+    first_line = cleaned.splitlines()[0] if cleaned else ""
+    first_line = first_line.strip()
+    if len(first_line) > limit:
+        first_line = first_line[: limit - 1].rstrip() + "…"
+    return first_line
 
 # sessions live alongside the project, not in ROOT (so they don't pollute archives)
 SESS_DIR = Path(__file__).resolve().parent.parent / "sessions"
@@ -35,12 +55,15 @@ def create_session(name: str = "", model: str = "", system_prompt: str = "") -> 
     now = time.time()
     meta = {
         "id": sid,
-        "name": name or "新会话",
+        "name": name or _default_session_name(),
         "model": model,
         "system_prompt": system_prompt,
         "created_at": now,
         "updated_at": now,
         "message_count": 0,
+        # marker: True until the user manually renames (or first message auto-renames)
+        # — used by append_messages to decide whether to auto-rename
+        "auto_named": True,
     }
     idx = _load_index()
     idx.append(meta)
@@ -82,6 +105,7 @@ def rename_session(sid: str, name: str) -> bool:
         if s["id"] == sid:
             s["name"] = name
             s["updated_at"] = time.time()
+            s["auto_named"] = False   # user-set: stop auto-renaming on next message
             _save_index(idx)
             return True
     return False
@@ -103,6 +127,20 @@ def append_messages(sid: str, new_messages: list[dict]) -> None:
         if s["id"] == sid:
             s["updated_at"] = time.time()
             s["message_count"] = len(data["messages"])
+            # Auto-rename from the first user message — only if still auto-named.
+            # (Legacy sessions don't have the flag; treat name == "新会话*" as auto.)
+            is_auto = s.get("auto_named", s.get("name", "").startswith("新会话"))
+            if is_auto:
+                first_user = next(
+                    (m for m in data["messages"] if m.get("role") == "user"
+                                                   and (m.get("text") or "").strip()),
+                    None,
+                )
+                if first_user:
+                    title = _title_from_message(first_user.get("text", ""))
+                    if title:
+                        s["name"] = title
+                        s["auto_named"] = False
             break
     _save_index(idx)
 

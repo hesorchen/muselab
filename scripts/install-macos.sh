@@ -42,6 +42,19 @@ else
   fi
 fi
 
+# MCP runtimes — non-fatal but warn.
+if command -v uvx >/dev/null 2>&1; then
+  ok "uvx present — uv-based MCP servers (fetch, git, time, …) available"
+else
+  warn "uvx not found — uv-based MCP presets (fetch, git, time) won't run"
+fi
+if command -v npx >/dev/null 2>&1; then
+  ok "npx present — npm-based MCP servers (memory, sequential-thinking, …) available"
+else
+  warn "npx not found — npm-based MCP presets (memory, sequential-thinking, filesystem) won't run"
+  warn "  install: brew install node"
+fi
+
 # ----- 2. Python deps ----------------------------------------------------
 bold "2/5  Installing Python dependencies (uv sync)"
 uv sync --quiet
@@ -72,6 +85,76 @@ EOF
   ok ".env created (mode 600)"
   ok "  MUSELAB_ROOT = $ARCHIVE"
   ok "  MUSELAB_TOKEN = ${TOKEN:0:6}…${TOKEN: -4}  (full token saved in .env)"
+
+  # First-time setup: drop a CLAUDE.md template + subdirectory skeleton, and
+  # walk the user through a short intake to populate the holistic profile.
+  if [[ ! -f "$ARCHIVE/CLAUDE.md" ]]; then
+    echo
+    echo "  Muse is one assistant that helps you across health / career / "
+    echo "  investment / family / life — simultaneously. To do that well, it"
+    echo "  needs your basic profile and somewhere to find your real documents."
+    echo "  This is a 2-minute intake; you can skip any question (press Enter)."
+    REPLY="$(ask 'Set up archive skeleton + CLAUDE.md now? [Y/n]:' 'Y')"
+    if [[ "$REPLY" =~ ^[Yy] ]]; then
+      for sub in health work money people notes archives; do
+        if [[ ! -d "$ARCHIVE/$sub" ]]; then
+          mkdir -p "$ARCHIVE/$sub"
+          cp "scripts/templates/archive-skeleton/$sub/README.md" \
+             "$ARCHIVE/$sub/README.md"
+        fi
+      done
+      ok "archive skeleton created under $ARCHIVE/"
+
+      echo
+      echo "  --- Quick intake (press Enter to skip any) ---"
+      INTAKE_NAME="$(ask 'How should Muse address you?' '')"
+      INTAKE_BIRTH="$(ask 'Birth year (or just an age range):' '')"
+      INTAKE_CITY="$(ask 'Where do you live?' '')"
+      INTAKE_DOING="$(ask 'What occupies most of your week? (study / job / freelance / care / retirement / …)' '')"
+      INTAKE_STAGE="$(ask 'One sentence about your life stage right now:' '')"
+      INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
+      INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
+
+      sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
+        scripts/templates/default-CLAUDE.md > "$ARCHIVE/CLAUDE.md"
+      _patch() {
+        local label="$1" value="$2"
+        [[ -z "$value" ]] && return
+        local esc
+        esc="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
+        # BSD sed (macOS) — different in-place flag and no -E 0,/.../ range trick;
+        # use a portable awk one-shot instead.
+        awk -v lbl="- $label：" -v val=" $esc" '
+          !done && $0 == lbl { print lbl val; done=1; next } { print }
+        ' "$ARCHIVE/CLAUDE.md" > "$ARCHIVE/CLAUDE.md.tmp" \
+          && mv "$ARCHIVE/CLAUDE.md.tmp" "$ARCHIVE/CLAUDE.md"
+      }
+      _patch "称呼 / 名字（你希望 Muse 叫你什么）" "$INTAKE_NAME"
+      _patch "出生年份（年龄段就行，不必精确）"     "$INTAKE_BIRTH"
+      _patch "现在住在"                              "$INTAKE_CITY"
+      _patch "我现在主要在做"                        "$INTAKE_DOING"
+      _patch "这一年最想做成的一件事"               "$INTAKE_GOAL"
+      _patch "当前最关心的健康问题（如有）"         "$INTAKE_HEALTH"
+      if [[ -n "$INTAKE_STAGE" ]]; then
+        local esc
+        esc="$(printf '%s' "$INTAKE_STAGE" | sed -e 's/[\\&|]/\\&/g')"
+        # BSD sed needs -i ''
+        sed -i '' "s|（如：「大三在准备保研」|$esc\\n\\n（如：「大三在准备保研」|" \
+          "$ARCHIVE/CLAUDE.md"
+      fi
+
+      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (with your intake answers prefilled)"
+      echo
+      echo "  📋 Next steps (放什么完全看你自己阶段):"
+      echo "    • Health: 体检 / 补剂 / 训练记录 → $ARCHIVE/health/"
+      echo "    • Work:   学业材料 / 简历 / 作品集 / 项目 → $ARCHIVE/work/"
+      echo "    • Money:  预算 / 持仓 / 学贷 / 保单 → $ARCHIVE/money/"
+      echo "    • People: 关心的人的资料 → $ARCHIVE/people/"
+      echo "    • Open $ARCHIVE/CLAUDE.md to fill in any blank fields you skipped"
+      echo "  Each subdir has a README.md explaining what fits and what doesn't."
+      echo "  Muse will see everything on your next chat — no restart needed."
+    fi
+  fi
 fi
 
 # ----- 4. LaunchAgent ----------------------------------------------------

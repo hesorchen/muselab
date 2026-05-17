@@ -78,7 +78,25 @@ Detailed per-OS guide (verify / restart / tail logs / expose to LAN / uninstall)
 ### Advanced — Docker / manual
 
 <details>
-<summary>Docker Compose (recommended for VPS / NAS)</summary>
+<summary>Docker — pre-built image from GHCR</summary>
+
+```bash
+# Pre-built multi-arch image (amd64 + arm64), latest = main branch HEAD
+docker run -d --name muselab \
+  -p 8765:8765 \
+  -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
+  -v $HOME/muselab-archive:/root/muselab-archive \
+  -e MUSELAB_ROOT=/root/muselab-archive \
+  -v $HOME/.claude:/root/.claude \
+  ghcr.io/hesorchen/muselab:latest
+```
+
+Or pin a tag: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
+
+</details>
+
+<details>
+<summary>Docker Compose (recommended if you want compose's ergonomics)</summary>
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
@@ -120,7 +138,6 @@ the FULL agent loop** — not just chat. No proxy process, no translation losses
 | **DeepSeek** (V4 Pro / V4 Flash / R1 / Chat) | `DEEPSEEK_API_KEY` in `.env` or Settings UI | ✅ | ~10× cheaper than Claude for chat-heavy tasks |
 | **智谱 GLM** (GLM-5 / GLM-4-Plus) | `ZHIPUAI_API_KEY` | ✅ | |
 | **MiniMax** (M2.7) | `MINIMAX_API_KEY` | ✅ | |
-| **Kimi** (K2.6) | `MOONSHOT_API_KEY` | ✅ | |
 
 Switching model mid-conversation is one dropdown click — history isn't lost.
 Adding a new provider takes **3 lines** of `endpoints.py` config — see [docs/add-provider.md](docs/add-provider.md).
