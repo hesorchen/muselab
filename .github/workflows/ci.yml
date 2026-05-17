@@ -79,7 +79,7 @@ jobs:
 
       - name: Compute image metadata (tags + labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           # Image name lowercased — ghcr is case-sensitive on /<owner>
           images: ghcr.io/${{ github.repository_owner }}/muselab
