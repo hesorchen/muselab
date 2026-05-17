@@ -229,7 +229,11 @@ EOF
         esc="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
         # BSD sed (macOS) — different in-place flag and no -E 0,/.../ range trick;
         # use a portable awk one-shot instead.
-        awk -v lbl="- $label：" -v val=" $esc" '
+        # NOTE: ${label} / ${esc} braces are REQUIRED — without them, bash 3.2
+        # under `set -u` parses "$label：" as one identifier (the fullwidth
+        # colon's UTF-8 bytes get folded into the variable name) and errors
+        # with "unbound variable" before awk even runs.
+        awk -v lbl="- ${label}：" -v val=" ${esc}" '
           !done && $0 == lbl { print lbl val; done=1; next } { print }
         ' "$ARCHIVE/CLAUDE.md" > "$ARCHIVE/CLAUDE.md.tmp" \
           && mv "$ARCHIVE/CLAUDE.md.tmp" "$ARCHIVE/CLAUDE.md"
@@ -323,8 +327,14 @@ fi
 
 echo
 bold "✓ muselab installed / 安装完成"
-echo  "  Open  / 打开    → http://localhost:$PORT"
-echo  "  Token / 登录口令 → grep MUSELAB_TOKEN .env"
+echo  "  Open / 打开:   http://localhost:$PORT"
+echo
+TOKEN_NOW="$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+if [[ -n "$TOKEN_NOW" ]]; then
+  echo  "  Login token / 登录口令（复制贴进浏览器登录框）:"
+  printf  "    \033[1;36m%s\033[0m\n" "$TOKEN_NOW"
+  echo  "  Saved at / 也存在: $REPO/.env  →  grep MUSELAB_TOKEN .env"
+fi
 echo
 echo  "  Useful commands / 常用命令:"
 echo  "    launchctl list | grep muselab               # check loaded / 查状态"

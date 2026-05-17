@@ -239,7 +239,10 @@ EOF
         # escape | for sed and append after the colon
         local esc
         esc="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
-        sed -i -E "0,/^(- $label：)$/{s||\1 $esc|}" "$ARCHIVE/CLAUDE.md"
+        # ${label} / ${esc} braces required: bash under `set -u` can't tell
+        # where the variable name ends when followed by non-ASCII UTF-8
+        # (the fullwidth colon's bytes get folded into the identifier).
+        sed -i -E "0,/^(- ${label}：)$/{s||\\1 ${esc}|}" "$ARCHIVE/CLAUDE.md"
       }
       _patch "称呼 / 名字（你希望 Muse 叫你什么）" "$INTAKE_NAME"
       _patch "出生年份（年龄段就行，不必精确）"     "$INTAKE_BIRTH"
@@ -316,8 +319,15 @@ fi
 
 echo
 bold "✓ muselab installed / 安装完成"
-echo  "  Open  / 打开    → http://localhost:$PORT"
-echo  "  Token / 登录口令 → grep MUSELAB_TOKEN .env"
+echo  "  Open / 打开:   http://localhost:$PORT"
+echo
+# Read token back from .env (works whether we just wrote it or reused existing)
+TOKEN_NOW="$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+if [[ -n "$TOKEN_NOW" ]]; then
+  echo  "  Login token / 登录口令（复制贴进浏览器登录框）:"
+  printf  "    \033[1;36m%s\033[0m\n" "$TOKEN_NOW"
+  echo  "  Saved at / 也存在: $REPO/.env  →  grep MUSELAB_TOKEN .env"
+fi
 echo
 echo  "  Useful commands / 常用命令:"
 echo  "    systemctl --user status muselab     # check status / 查状态"

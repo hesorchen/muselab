@@ -74,7 +74,9 @@ _patch() {
   [[ -z "$value" ]] && return
   local esc
   esc="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
-  awk -v lbl="- $label：" -v val=" $esc" '
+  # ${label} / ${esc} braces required — bash 3.2 under `set -u` mis-parses
+  # "$label：" as one identifier when fullwidth colon UTF-8 bytes follow.
+  awk -v lbl="- ${label}：" -v val=" ${esc}" '
     !done && $0 == lbl { print lbl val; done=1; next } { print }
   ' "$ARCHIVE/CLAUDE.md" > "$ARCHIVE/CLAUDE.md.tmp" \
     && mv "$ARCHIVE/CLAUDE.md.tmp" "$ARCHIVE/CLAUDE.md"

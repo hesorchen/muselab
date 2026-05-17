@@ -406,8 +406,16 @@ if (-not $ok) {
 
 Write-Host
 Bold "[OK] muselab installed / 安装完成"
-Write-Host "  Open  / 打开    -> http://localhost:$Port"
-Write-Host "  Token / 登录口令 -> Select-String MUSELAB_TOKEN .env"
+Write-Host "  Open / 打开:   http://localhost:$Port"
+Write-Host
+# Read token back from .env so the user can copy without opening files.
+$tokenNow = (Select-String "^MUSELAB_TOKEN=(.+)" $EnvPath -ErrorAction SilentlyContinue).Matches.Groups[1].Value
+if ($tokenNow) {
+  Write-Host "  Login token / 登录口令（复制贴进浏览器登录框）:"
+  Write-Host "    $tokenNow" -ForegroundColor Cyan
+  Write-Host "  Saved at / 也存在: $EnvPath"
+  Write-Host "    再查: Select-String MUSELAB_TOKEN .env"
+}
 Write-Host
 Write-Host "  Useful commands / 常用命令:"
 Write-Host "    Get-ScheduledTask -TaskName Muselab    # check status / 查状态"
