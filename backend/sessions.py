@@ -50,13 +50,15 @@ def _load_index() -> list[dict]:
     if not INDEX.exists():
         return []
     try:
-        return json.loads(INDEX.read_text())
+        return json.loads(INDEX.read_text(encoding="utf-8"))
     except Exception:
         return []
 
 
 def _save_index(items: list[dict]) -> None:
-    INDEX.write_text(json.dumps(items, ensure_ascii=False, indent=2))
+    # encoding="utf-8" REQUIRED — without it, write_text uses the system
+    # codepage (GBK on zh-CN Windows) and crashes on any emoji or rare CJK.
+    INDEX.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def list_sessions() -> list[dict]:
@@ -81,7 +83,8 @@ def create_session(name: str = "", model: str = "", system_prompt: str = "") -> 
     idx = _load_index()
     idx.append(meta)
     _save_index(idx)
-    (SESS_DIR / f"{sid}.json").write_text(json.dumps({"messages": []}, ensure_ascii=False))
+    (SESS_DIR / f"{sid}.json").write_text(
+        json.dumps({"messages": []}, ensure_ascii=False), encoding="utf-8")
     return meta
 
 
@@ -94,7 +97,7 @@ def get_session(sid: str) -> dict | None:
     messages = []
     if p.exists():
         try:
-            messages = json.loads(p.read_text()).get("messages", [])
+            messages = json.loads(p.read_text(encoding="utf-8")).get("messages", [])
         except Exception:
             pass
     return {**meta, "messages": messages}
@@ -129,11 +132,11 @@ def append_messages(sid: str, new_messages: list[dict]) -> None:
     data: dict[str, Any] = {"messages": []}
     if p.exists():
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             pass
     data["messages"].extend(new_messages)
-    p.write_text(json.dumps(data, ensure_ascii=False))
+    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     # bump index
     idx = _load_index()
     for s in idx:

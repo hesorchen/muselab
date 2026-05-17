@@ -167,7 +167,7 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
             if MCP_CONFIG_PATH.exists():
                 try:
-                    cfg = json.loads(MCP_CONFIG_PATH.read_text())
+                    cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
                     for name, spec in (cfg.get("mcpServers") or {}).items():
                         # Skip explicitly disabled servers (UI toggle).
                         if isinstance(spec, dict) and spec.get("disabled"):
@@ -489,7 +489,7 @@ def mcp_status() -> dict:
     if not MCP_CONFIG_PATH.exists():
         return {"configured": False, "servers": []}
     try:
-        cfg = json.loads(MCP_CONFIG_PATH.read_text())
+        cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
         servers = cfg.get("mcpServers", {})
         return {
             "configured": True,
