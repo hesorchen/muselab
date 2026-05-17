@@ -114,15 +114,17 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 登录后自动启动，默认绑定 localhost，耗时约 3 分钟（VPS 较慢时 10 分钟以上）。
 
 ```bash
+# Linux / macOS
 git clone https://github.com/hesorchen/muselab && cd muselab
 
-# macOS — 用户级 LaunchAgent
-bash scripts/install-macos.sh
+bash scripts/install-macos.sh    # macOS — 用户级 LaunchAgent
+bash scripts/install-linux.sh    # Linux — 用户级 systemd
+```
 
-# Linux — 用户级 systemd
-bash scripts/install-linux.sh
-
-# Windows — Task Scheduler
+```powershell
+# Windows — Task Scheduler。PowerShell 5.1 不支持 && — 分两行执行。
+git clone https://github.com/hesorchen/muselab
+cd muselab
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 

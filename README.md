@@ -118,15 +118,17 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 Autostart at login, localhost-only, ~3 min on a decent machine (10+ on slow VPS).
 
 ```bash
+# Linux / macOS
 git clone https://github.com/hesorchen/muselab && cd muselab
 
-# macOS — user LaunchAgent
-bash scripts/install-macos.sh
+bash scripts/install-macos.sh    # macOS — user LaunchAgent
+bash scripts/install-linux.sh    # Linux — user systemd service
+```
 
-# Linux — user systemd service
-bash scripts/install-linux.sh
-
-# Windows — Task Scheduler
+```powershell
+# Windows — Task Scheduler. PowerShell 5.1 doesn't support && — run as two lines.
+git clone https://github.com/hesorchen/muselab
+cd muselab
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
