@@ -424,6 +424,15 @@ window.addEventListener("error", e => {
 
       <div class="session-bar">
         <select x-model="model" @change="onModelChange()" style="flex:1">
+          <!-- Fallback option: if the session's model isn't in availableModels
+               yet (e.g. providers list hasn't loaded, or model belongs to a
+               provider whose key got removed), render it as a single option
+               so <select> can correctly display the bound value. Without this
+               the browser falls back to the first option visually but x-model
+               still carries the bound value → display vs reality mismatch. -->
+          <template x-if="model && !availableModels.some(m => m.model === model)">
+            <option :value="model" x-text="model"></option>
+          </template>
           <template x-for="grp in modelGroups()" :key="grp.name">
             <optgroup :label="grp.name">
               <template x-for="m in grp.items" :key="m.model">
