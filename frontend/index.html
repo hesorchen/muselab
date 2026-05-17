@@ -46,7 +46,19 @@
 </head>
 <body>
 <noscript><div style="padding:40px;color:red;font-size:20px;background:white">需要启用 JavaScript · JavaScript required</div></noscript>
-<div id="loading">加载中… / Loading…</div>
+<!-- Pre-Alpine fallback splash. Uses the same `.splash` styles as the Alpine
+     version so the transition is invisible. Removed by x-init the moment
+     Alpine takes over. -->
+<div id="loading" class="splash">
+  <span class="muse-mascot lg splash-mascot" style="width:72px;height:72px;display:inline-flex">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+         stroke-linecap="round" stroke-linejoin="round" style="width:100%;height:100%;color:#6093ff">
+      <path d="M12 3 L20 7.5 L20 16.5 L12 21 L4 16.5 L4 7.5 Z"/>
+    </svg>
+  </span>
+  <div class="splash-logo">muse<span class="accent">·lab</span></div>
+  <div class="splash-text">正在唤醒 Muse</div>
+</div>
 <div id="jserr"></div>
 <script>
 window.addEventListener("error", e => {

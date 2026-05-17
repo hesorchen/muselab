@@ -148,7 +148,7 @@ html, body {
   -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
 }
 
-#loading { padding: 40px; color: var(--c-fg-3); }
+/* #loading uses .splash styles below — no separate rule needed */
 #jserr {
   display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
   padding: 16px 20px; background: white; color: var(--c-danger);
