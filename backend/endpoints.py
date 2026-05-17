@@ -159,20 +159,31 @@ def env_override(model: str) -> dict[str, str] | None:
     return merged
 
 
+def has_anthropic_auth() -> bool:
+    """True if the claude CLI has a saved Pro/Max OAuth credential. settings.py
+    unsets ANTHROPIC_API_KEY at startup to force Pro-quota usage, so OAuth is
+    the only way Claude works in muselab — without it the Claude group must
+    not appear in the model picker."""
+    return (Path.home() / ".claude" / ".credentials.json").exists()
+
+
 def available_groups() -> list[dict]:
-    """Catalog filtered to providers whose API key is configured.
-    Always returns the Claude group as the first entry. Each item has
-    `label` (short pretty name) + `model` (full id used as dropdown value)."""
-    groups: list[dict] = [{
-        "group": "Claude",
-        "items": [
-            {"label": CLAUDE_LABELS.get(m, m), "model": m} for m in (
-                "claude-sonnet-4-6",
-                "claude-haiku-4-5-20251001",
-                "claude-opus-4-7",
-            )
-        ],
-    }]
+    """Catalog filtered to providers whose API key (or OAuth, for Claude) is
+    configured. Each item has `label` (short pretty name) + `model` (full id
+    used as dropdown value). Returns [] if nothing is configured — UI should
+    treat that as 'no model, open Settings'."""
+    groups: list[dict] = []
+    if has_anthropic_auth():
+        groups.append({
+            "group": "Claude",
+            "items": [
+                {"label": CLAUDE_LABELS.get(m, m), "model": m} for m in (
+                    "claude-sonnet-4-6",
+                    "claude-haiku-4-5-20251001",
+                    "claude-opus-4-7",
+                )
+            ],
+        })
     for p in CATALOG:
         if not os.environ.get(p.env_key):
             continue

@@ -1280,7 +1280,19 @@ function portal() {
     async fetchContextInfo() {
       try {
         const r = await fetch("/api/chat/context-info", { headers: this.hdr() });
-        if (r.ok) this.contextInfo = await r.json();
+        if (r.ok) {
+          this.contextInfo = await r.json();
+          // First successful load: if the user hasn't configured any provider,
+          // pop the Settings drawer so they can fix it before trying to chat.
+          // _providerCheckDone gate ensures we don't re-pop on heartbeat
+          // reconnects or polling refreshes.
+          if (!this._providerCheckDone) {
+            this._providerCheckDone = true;
+            if (!this.contextInfo.has_any_provider && !this.settings.show) {
+              this.openSettings();
+            }
+          }
+        }
       } catch (e) { /* non-fatal */ }
     },
 

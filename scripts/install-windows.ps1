@@ -203,7 +203,9 @@ MUSELAB_MODEL=claude-sonnet-4-6
       $iGoal   = Ask "One main goal for this year / 这一年最想做成的一件事:" ""
       $iHealth = Ask "Top health concern right now (or 'none') / 当前最关心的健康问题（无则填 none）:" ""
 
-      $tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw
+      # Explicit -Encoding UTF8 — PS 5.1 on zh-CN Windows defaults Get-Content
+      # to the system codepage (GBK), which corrupts the Chinese template.
+      $tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw -Encoding UTF8
       $tpl = $tpl -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd")
 
       function Patch-Field($content, $label, $value) {
@@ -225,7 +227,9 @@ MUSELAB_MODEL=claude-sonnet-4-6
                               ($iStage + "`n`n（如：「大三在准备保研」")
       }
 
-      Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8     # utf8 — CJK content
+      # UTF-8 WITHOUT BOM (PS 5.1 `-Encoding utf8` writes WITH BOM; some readers
+      # render BOM as a leading 'ï»¿' artifact).
+      [System.IO.File]::WriteAllText($ClaudeMd, $tpl, (New-Object System.Text.UTF8Encoding $false))
       Ok "CLAUDE.md -> $ClaudeMd (with your intake answers prefilled / 你回答的字段已预填)"
       Write-Host
       Write-Host "  Next steps / 接下来放点你的真实材料 (what fits depends on your life stage):"

@@ -60,7 +60,9 @@ $iStage  = Ask "" ""
 $iGoal   = Ask "One main goal for this year / 这一年最想做成的一件事:" ""
 $iHealth = Ask "Top health concern right now (or 'none') / 当前最关心的健康问题（无则填 none）:" ""
 
-$tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw
+# Explicit -Encoding UTF8 — PS 5.1 on zh-CN Windows defaults Get-Content to
+# the system codepage (GBK), which corrupts the Chinese template into 乱码.
+$tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw -Encoding UTF8
 $tpl = $tpl -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd")
 
 function Patch-Field($content, $label, $value) {
@@ -82,7 +84,10 @@ if (-not [string]::IsNullOrWhiteSpace($iStage)) {
                         ($iStage + "`n`n（如：「大三在准备保研」")
 }
 
-Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8
+# Write UTF-8 WITHOUT BOM — PS 5.1's `-Encoding utf8` writes WITH BOM, which
+# some readers render as a leading 'ï»¿' artifact. SDK + most editors handle
+# either, but BOM-less is cleaner.
+[System.IO.File]::WriteAllText($ClaudeMd, $tpl, (New-Object System.Text.UTF8Encoding $false))
 Ok "CLAUDE.md updated / 已更新"
 Write-Host
 Write-Host "  Next / 下一步: open $ClaudeMd and fill any blanks."
