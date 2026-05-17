@@ -1,4 +1,4 @@
-# muselab doctor (Windows) — same checks as scripts/doctor.sh
+﻿# muselab doctor (Windows) — same checks as scripts/doctor.sh
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1
 $ErrorActionPreference = "Continue"   # don't stop on first failure
 $Repo = (Resolve-Path "$PSScriptRoot\..").Path

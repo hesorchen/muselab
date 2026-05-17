@@ -1,4 +1,4 @@
-# muselab — Windows uninstaller. Removes the scheduled task.
+﻿# muselab — Windows uninstaller. Removes the scheduled task.
 # Leaves .env, sessions\, your archive, and logs untouched.
 #   powershell -ExecutionPolicy Bypass -File scripts\uninstall-windows.ps1
 

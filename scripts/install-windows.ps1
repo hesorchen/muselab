@@ -1,4 +1,4 @@
-# muselab — one-shot Windows installer (Task Scheduler, at logon)
+﻿# muselab — one-shot Windows installer (Task Scheduler, at logon)
 # Run from the repo root in PowerShell:
 #   powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 # (Default ExecutionPolicy 'Restricted' blocks unsigned scripts; -Bypass is per-invocation.)

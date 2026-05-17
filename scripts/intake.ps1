@@ -1,4 +1,4 @@
-# muselab intake (Windows) — (re)run the 7-question profile setup.
+﻿# muselab intake (Windows) — (re)run the 7-question profile setup.
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\intake.ps1
 $ErrorActionPreference = "Stop"
 $Repo = (Resolve-Path "$PSScriptRoot\..").Path
