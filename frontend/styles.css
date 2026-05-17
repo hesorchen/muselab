@@ -1959,3 +1959,40 @@ pre.has-copy-btn .code-copy-btn.copied {
   max-height: 240px; overflow-y: auto;
   white-space: pre-wrap; word-break: break-all;
 }
+
+/* ==========================================================================
+   Session management table — Settings → Sessions section
+   ========================================================================== */
+.session-mgmt-list {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  margin-top: 4px;
+}
+.session-mgmt-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-xs);
+}
+.session-mgmt-table th, .session-mgmt-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--c-border);
+}
+.session-mgmt-table th {
+  background: var(--c-bg-2);
+  color: var(--c-fg-2);
+  font-weight: var(--fw-semibold);
+  position: sticky; top: 0;
+}
+.session-mgmt-table tbody tr:hover { background: var(--c-bg-2); }
+.session-mgmt-table .ellipsis {
+  max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.session-mgmt-table code {
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--c-fg-2);
+}
+.btn-danger.sm { padding: 3px 10px; font-size: var(--fs-xs); }

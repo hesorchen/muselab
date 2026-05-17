@@ -943,6 +943,63 @@ window.addEventListener("error", e => {
             <button class="btn-ghost sm" @click="cleanupEmptySessions()"
                     x-text="t('set.sessions.cleanup_btn')"></button>
           </div>
+          <!-- Per-session delete list — full table of every session with
+               name, model, message count, and a delete button per row.
+               Use selectAll to flip all checkboxes; "删除选中" wipes them.
+               Sessions are also deleted on the CLI side via SDK. -->
+          <div class="settings-row" style="flex-direction: column; align-items: stretch; gap: 6px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <input type="text" class="settings-input"
+                     :placeholder="lang==='zh' ? '搜索会话名…' : 'Search session name…'"
+                     x-model="settings.sessionSearch" />
+              <button class="btn-ghost sm"
+                      @click="settings.sessionSelected = new Set(filteredSessions().map(s => s.id))"
+                      x-text="lang==='zh' ? '全选' : 'Select all'"></button>
+              <button class="btn-ghost sm"
+                      @click="settings.sessionSelected = new Set()"
+                      x-text="lang==='zh' ? '清空' : 'Clear'"></button>
+              <button class="btn-danger sm"
+                      :disabled="settings.sessionSelected.size === 0"
+                      @click="bulkDeleteSelectedSessions()"
+                      x-text="(lang==='zh' ? '删除选中 (' : 'Delete (') + settings.sessionSelected.size + ')'"></button>
+            </div>
+            <div class="session-mgmt-list">
+              <table class="session-mgmt-table">
+                <thead>
+                  <tr>
+                    <th style="width: 24px;"></th>
+                    <th x-text="lang==='zh' ? '名称' : 'Name'"></th>
+                    <th x-text="lang==='zh' ? '模型' : 'Model'"></th>
+                    <th x-text="lang==='zh' ? '消息' : 'Msgs'"></th>
+                    <th x-text="lang==='zh' ? '更新' : 'Updated'"></th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="s in filteredSessions()" :key="s.id">
+                    <tr>
+                      <td>
+                        <input type="checkbox"
+                               :checked="settings.sessionSelected.has(s.id)"
+                               @change="toggleSessionSelect(s.id)" />
+                      </td>
+                      <td class="ellipsis" :title="s.name" x-text="s.name"></td>
+                      <td><code x-text="(s.model || '').replace(/^claude-|^deepseek-|^glm-|^minimax-/, '')"></code></td>
+                      <td x-text="s.message_count"></td>
+                      <td x-text="fmtRelTime(s.updated_at)"></td>
+                      <td>
+                        <button class="btn-ghost sm" @click="deleteSessionById(s.id)"
+                                :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div x-show="filteredSessions().length === 0"
+                   class="settings-hint" style="text-align: center; padding: 12px;"
+                   x-text="lang==='zh' ? '没有匹配的会话' : 'No matching sessions'"></div>
+            </div>
+          </div>
         </div>
 
         <!-- Versions + upgrade — shows current vs latest SDK / CLI, one-click bump. -->
@@ -978,14 +1035,28 @@ window.addEventListener("error", e => {
                     </td>
                   </tr>
                   <tr>
-                    <td>claude CLI</td>
-                    <td><code x-text="settings.versions.current?.cli || (lang==='zh' ? '未安装' : 'not installed')"></code></td>
+                    <td>
+                      <span x-text="lang==='zh' ? 'bundled CLI（随 SDK 自动更新）' : 'bundled CLI (auto with SDK)'"></span>
+                    </td>
+                    <td><code x-text="settings.versions.current?.bundled_cli || '—'"></code></td>
+                    <td>—</td>
+                    <td>
+                      <span class="upgrade-badge ok" x-text="lang==='zh' ? '内置' : 'bundled'"></span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <span x-text="lang==='zh' ? 'system CLI（仅 Pro 登录用）' : 'system CLI (Pro login only)'"></span>
+                    </td>
+                    <td><code x-text="settings.versions.current?.system_cli || (lang==='zh' ? '未安装（可选）' : 'not installed (optional)')"></code></td>
                     <td><code x-text="settings.versions.latest?.cli || '?'"></code></td>
                     <td>
-                      <span x-show="settings.versions.cli_upgrade_available" class="upgrade-badge"
+                      <span x-show="settings.versions.system_cli_upgrade_available" class="upgrade-badge"
                             x-text="lang==='zh' ? '有更新' : 'update'"></span>
-                      <span x-show="!settings.versions.cli_upgrade_available && settings.versions.current?.cli" class="upgrade-badge ok"
+                      <span x-show="!settings.versions.system_cli_upgrade_available && settings.versions.current?.system_cli" class="upgrade-badge ok"
                             x-text="lang==='zh' ? '最新' : 'latest'"></span>
+                      <span x-show="!settings.versions.current?.system_cli" class="upgrade-badge ok"
+                            x-text="lang==='zh' ? '可不装' : 'optional'"></span>
                     </td>
                   </tr>
                   <tr>

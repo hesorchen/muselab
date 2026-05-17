@@ -384,31 +384,61 @@ _LAST_UPGRADE: dict[str, Any] = {}     # cache last upgrade output for UI replay
 
 
 def _current_versions() -> dict:
-    """Currently-installed muselab + SDK + CLI versions."""
+    """Currently-installed muselab + SDK + CLI versions.
+
+    Two distinct CLIs to track:
+      - bundled_cli: ships inside claude-agent-sdk's _bundled/ directory,
+        always present, version follows SDK releases. This is what muselab
+        actually spawns to talk to Anthropic.
+      - system_cli:  optional, installed via `npm install -g
+        @anthropic-ai/claude-code`. Only needed once for `claude login`
+        to create ~/.claude/.credentials.json (Pro/Max OAuth). After
+        login the bundled CLI can read those credentials too.
+
+    The UI should make this distinction clear so users don't think they
+    need to install the system CLI when DeepSeek / API-key paths suffice."""
+    import re
     sdk_version = None
     try:
         from claude_agent_sdk import __version__ as _v
         sdk_version = _v
     except Exception:
         pass
-    cli_version = None
-    cli_bin = shutil.which("claude")
-    if cli_bin:
+
+    def _probe(bin_path: str | None) -> str | None:
+        if not bin_path:
+            return None
         try:
-            out = subprocess.run([cli_bin, "--version"], capture_output=True,
-                                  text=True, timeout=3)
+            out = subprocess.run([bin_path, "--version"],
+                                  capture_output=True, text=True, timeout=3)
             line = (out.stdout.strip().splitlines() or [""])[0]
-            # CLI prints e.g. "2.1.142" or "2.1.142 (Claude Code)"
-            import re
             m = re.search(r"\d+\.\d+\.\d+", line)
-            cli_version = m.group(0) if m else (line or None)
+            return m.group(0) if m else (line or None)
         except Exception:
-            pass
+            return None
+
+    bundled_path = None
+    try:
+        import claude_agent_sdk as _sdk
+        bp = Path(_sdk.__file__).parent / "_bundled" / "claude.exe"
+        if not bp.exists():
+            bp = Path(_sdk.__file__).parent / "_bundled" / "claude"
+        if bp.exists():
+            bundled_path = str(bp)
+    except Exception:
+        pass
+
+    bundled_cli = _probe(bundled_path)
+    system_cli = _probe(shutil.which("claude"))
     return {
         "sdk": sdk_version,
-        "cli": cli_version,
-        "cli_present": cli_version is not None,
+        "bundled_cli": bundled_cli,
+        "system_cli": system_cli,
+        "system_cli_present": system_cli is not None,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        # Legacy field kept for backward-compat with any consumer expecting it.
+        "cli": bundled_cli or system_cli,
+        "cli_present": bool(bundled_cli or system_cli),
     }
 
 
@@ -461,7 +491,12 @@ async def get_versions() -> dict:
         "current": current,
         "latest": latest,
         "sdk_upgrade_available": _semver_gt(latest.get("sdk"), current.get("sdk")),
-        "cli_upgrade_available": _semver_gt(latest.get("cli"), current.get("cli")),
+        # Only relevant if user has system CLI installed (for `claude login`).
+        # Bundled CLI is auto-upgraded when SDK is upgraded.
+        "system_cli_upgrade_available": (
+            current.get("system_cli_present") and
+            _semver_gt(latest.get("cli"), current.get("system_cli"))
+        ),
         "expected_cli_version": _expected_cli_version(),
         "last_upgrade": _LAST_UPGRADE.copy() if _LAST_UPGRADE else None,
     }
