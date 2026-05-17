@@ -23,14 +23,36 @@ Write-Host
 
 # ----- 1. Prerequisites ---------------------------------------------------
 Bold "1/5  Checking prerequisites"
+
+# PowerShell version check — Windows 10/11 ships 5.1, that's fine
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+  Err "PowerShell $($PSVersionTable.PSVersion) is too old. Need >= 5.1 (ships with Win10+)."
+  exit 1
+}
+Ok "PowerShell: $($PSVersionTable.PSVersion)"
+
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $uv) {
   Err "uv not found. Install it first:"
   Write-Host "      powershell -c `"irm https://astral.sh/uv/install.ps1 | iex`""
+  Write-Host "      Then open a new PowerShell window so PATH refreshes."
   exit 1
 }
 $UvPath = $uv.Source
 Ok "uv: $UvPath"
+
+# Port 8765 conflict check
+$portInUse = $false
+try {
+  $listeners = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction Stop
+  if ($listeners) { $portInUse = $true }
+} catch { } # cmdlet not available on older PS, skip
+if ($portInUse) {
+  Err "Port 8765 is already in use:"
+  $listeners | Format-Table LocalAddress, LocalPort, OwningProcess
+  Write-Host "      Stop that process or set MUSELAB_PORT=<other> in .env."
+  exit 1
+}
 
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claude) {

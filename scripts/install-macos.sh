@@ -23,6 +23,13 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+# sudo refusal — LaunchAgent goes under your normal user
+if [[ $EUID -eq 0 ]]; then
+  err "Don't run this with sudo / as root."
+  echo "      muselab runs as a user LaunchAgent (no root needed)."
+  exit 1
+fi
+
 if ! command -v uv >/dev/null 2>&1; then
   err "uv not found. Install it first:"
   echo "      curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -31,6 +38,20 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 UV="$(command -v uv)"
 ok "uv: $UV"
+
+# Python 3.12+ — uv will download if missing
+PYV="$(python3 --version 2>/dev/null | awk '{print $2}' || echo "")"
+if [[ -z "$PYV" ]] || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then
+  warn "system python is < 3.12 (or missing). uv will download Python 3.12 during sync (~50MB extra)."
+fi
+
+# Port 8765 conflict
+if lsof -nP -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1; then
+  err "Port 8765 is already in use:"
+  lsof -nP -iTCP:8765 -sTCP:LISTEN | head -3
+  echo "      Either stop that process, or set MUSELAB_PORT=<other> in .env before re-running."
+  exit 1
+fi
 
 if ! command -v claude >/dev/null 2>&1; then
   warn "claude CLI not found. Anthropic models won't work until you install it"

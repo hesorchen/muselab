@@ -423,17 +423,25 @@ window.addEventListener("error", e => {
             </div>
 
             <!-- Onboarding cards — only one shows at a time, in priority order:
-                 1. no CLAUDE.md     → "Muse doesn't know you yet"
-                 2. archive empty    → "Drop your first document"
-                 3. all set          → suggested first questions / skill chips -->
-            <template x-if="!contextInfo.claude_md_exists">
+                 1. no provider auth → "Set up a model before chatting"
+                 2. no CLAUDE.md     → "Muse doesn't know you yet"
+                 3. archive empty    → "Drop your first document"
+                 4. all set          → suggested first questions / skill chips -->
+            <template x-if="!contextInfo.has_any_provider">
+              <div class="onboard-card warn">
+                <div class="onboard-card-title" x-text="t('onboard.no_provider_title')"></div>
+                <div class="onboard-card-body" x-text="t('onboard.no_provider_body')"></div>
+                <button class="btn-primary" @click="openSettings()" x-text="t('onboard.no_provider_cta')"></button>
+              </div>
+            </template>
+            <template x-if="contextInfo.has_any_provider && !contextInfo.claude_md_exists">
               <div class="onboard-card warn">
                 <div class="onboard-card-title" x-text="t('onboard.no_claude_md_title')"></div>
                 <div class="onboard-card-body" x-text="t('onboard.no_claude_md_body')"></div>
                 <button class="btn-primary" @click="openClaudeMdHelp()" x-text="t('onboard.no_claude_md_cta')"></button>
               </div>
             </template>
-            <template x-if="contextInfo.claude_md_exists && contextInfo.archive_empty">
+            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && contextInfo.archive_empty">
               <div class="onboard-card">
                 <div class="onboard-card-title" x-text="t('onboard.empty_archive_title')"></div>
                 <div class="onboard-card-body" x-text="t('onboard.empty_archive_body')"></div>
@@ -447,7 +455,7 @@ window.addEventListener("error", e => {
                 </div>
               </div>
             </template>
-            <template x-if="contextInfo.claude_md_exists && !contextInfo.archive_empty">
+            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && !contextInfo.archive_empty">
               <div class="onboard-card calm">
                 <div class="onboard-card-title" x-text="t('onboard.ready_title')"></div>
                 <div class="onboard-suggestions">

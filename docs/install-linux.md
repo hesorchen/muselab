@@ -92,6 +92,32 @@ Checks: uv version, claude CLI, MCP runtimes (uvx/npx), `.env` shape,
 state, HTTP probe, token validity, configured provider keys. Returns
 non-zero on blocking failures.
 
+## Accessing from your laptop when muselab runs on a VPS
+
+Default binds to `127.0.0.1:8765` — **deliberately**. Your VPS port 8765 is
+NOT reachable from your laptop's browser even if the firewall is open. Three
+ways to actually use it:
+
+### A. SSH tunnel (recommended — zero extra config)
+
+On your **laptop**:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
+```
+
+Keep that terminal open. Now `http://localhost:8765` in your laptop's
+browser hits the muselab on the VPS. No firewall opens, no auth exposure,
+no extra moving parts.
+
+### B. Tailscale / WireGuard (best for "always on" remote)
+
+Put your VPS and laptop in the same Tailscale net, then visit
+`http://<vps-tailscale-ip>:8765`. The tunnel is end-to-end encrypted and
+auth'd by Tailscale, so binding 127.0.0.1 is fine.
+
+### C. Bind to LAN (only if you trust the network) — see below
+
 ## Expose to LAN (optional)
 
 Default binds to `127.0.0.1` only — your machine, your browser. To let phones /

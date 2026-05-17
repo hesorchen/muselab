@@ -38,15 +38,37 @@ Three panes in one browser page (~100 MB resident):
 
 ## Quick start
 
-### One-shot installers — autostart at login, localhost-only by default
+### 0. Prereqs (one-time, even if you skip everything else)
 
-Pick your OS. Each script installs deps, generates `.env` (with a random token
-and an archive path you choose), and registers an autostart entry so muselab
-comes back after every reboot.
+You need exactly **two** things — pick a model provider (at least one) and
+install `uv`.
+
+#### Pick AT LEAST one model provider
+
+| If you have... | Setup |
+|----------------|-------|
+| **Claude Pro / Max** subscription ($20–100/mo) | Install [`claude` CLI](https://docs.claude.com/claude-code) then `claude login` once. Pro OAuth lives in `~/.claude/.credentials.json` |
+| Just want a free / cheap key | Get a key from one of: [DeepSeek](https://platform.deepseek.com) / [智谱 GLM](https://bigmodel.cn) / [MiniMax (国内站)](https://minimaxi.com). You'll paste it in Settings later — no CLI needed |
+| Both | Use Claude for hard reasoning, DeepSeek for cheap stuff. muselab lets you switch mid-conversation. |
+
+Without any of these, muselab installs fine but the first chat will error.
+The UI explicitly warns "no provider configured — open Settings" so you
+won't be confused.
+
+#### Install `uv` (one line)
+
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows PowerShell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+### 1. One-shot installer — autostart at login, localhost-only by default
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
-claude login   # one-time, for Anthropic models; non-Claude providers need just an API key
 
 # macOS  — user-level LaunchAgent
 bash scripts/install-macos.sh
@@ -58,7 +80,39 @@ bash scripts/install-linux.sh
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
-Then open `http://localhost:8765` and paste the token (in `.env`).
+The installer:
+1. Checks prereqs (uv / claude CLI / npx / uvx / port 8765 free)
+2. `uv sync` — fetches Python deps (first run: 3-10 min depending on CPU)
+3. Generates `.env` with a random `MUSELAB_TOKEN` + the archive path you choose
+4. Walks 7 intake questions (skip with Enter) to seed `CLAUDE.md`
+5. Creates the autostart entry and starts the service
+6. Up to 30s retry loop waiting for the service to respond
+
+### 2. Open it
+
+Local machine: `http://localhost:8765` — paste the token from `.env`.
+
+**Running on a VPS?** Don't open the port to the internet. Use SSH tunnel
+from your laptop:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
+# then visit http://localhost:8765 in your laptop's browser
+```
+
+(Or use [Tailscale](https://tailscale.com) — same effect, no terminal needed.)
+
+### 3. Verify
+
+```bash
+bash scripts/doctor.sh        # Linux / macOS
+powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
+```
+
+Doctor checks every layer (uv, claude CLI, .env shape, MUSELAB_ROOT, service
+state, HTTP probe, token, provider keys) and gives specific advice on any
+failure. Returns non-zero if anything blocks usage — great first step when
+something feels off.
 
 #### After you reboot the laptop?
 

@@ -18,13 +18,42 @@ echo
 
 # ----- 1. Prerequisites ---------------------------------------------------
 bold "1/5  Checking prerequisites"
+
+# Refuse sudo / root — service goes under your normal user
+if [[ $EUID -eq 0 ]]; then
+  err "Don't run this with sudo / as root."
+  echo "      muselab runs as a user-level systemd service (no root needed)."
+  echo "      Run as your normal user: bash scripts/install-linux.sh"
+  exit 1
+fi
+
 if ! command -v uv >/dev/null 2>&1; then
   err "uv not found. Install it first:"
   echo "      curl -LsSf https://astral.sh/uv/install.sh | sh"
+  echo "      Then re-source your shell or open a new terminal."
   exit 1
 fi
 UV="$(command -v uv)"
 ok "uv: $UV"
+
+# Python 3.12+ required (claude-agent-sdk + modern type syntax we use).
+# uv will install one if missing, but warn the user so the slow first sync
+# doesn't surprise them.
+PYV="$(python3 --version 2>/dev/null | awk '{print $2}' || echo "")"
+if [[ -z "$PYV" ]] || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then
+  warn "system python is < 3.12 (or missing). uv will download Python 3.12 during sync (~50MB extra)."
+fi
+
+# Port 8765 conflict check — if something else is listening, service will
+# fail silently. Tell user now so they can free the port or change MUSELAB_PORT.
+if command -v ss >/dev/null 2>&1; then
+  if ss -tlnH "sport = :8765" 2>/dev/null | grep -q LISTEN; then
+    err "Port 8765 is already in use:"
+    ss -tlnp "sport = :8765" 2>&1 | head -3
+    echo "      Either stop that process, or set MUSELAB_PORT=<other> in .env before re-running."
+    exit 1
+  fi
+fi
 
 if ! command -v claude >/dev/null 2>&1; then
   warn "claude CLI not found. Anthropic models won't work until you install it"

@@ -4,6 +4,7 @@ import json
 import asyncio
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
 from sse_starlette.sse import EventSourceResponse
@@ -372,9 +373,20 @@ class BudgetReq(BaseModel):
 @router.get("/context-info", dependencies=[Depends(require_token)])
 def context_info() -> dict:
     """Information about what Muse can see — used by the UI's onboarding
-    hints (does the user have a CLAUDE.md? archive empty? skills loaded?).
-    All paths relative to ROOT for safety."""
+    hints (does the user have a CLAUDE.md? archive empty? skills loaded?
+    has any working auth?). All paths relative to ROOT for safety."""
     claude_md = ROOT / "CLAUDE.md"
+    # Detect "do we have ANY working auth?" — needed so the chat-empty card
+    # can warn "you have no provider set up; configure one before chatting".
+    # Claude OAuth lives in ~/.claude/.credentials.json (Pro/Max).
+    claude_oauth = (Path.home() / ".claude" / ".credentials.json").exists()
+    third_party_configured = [
+        name for env_key, name in (
+            ("DEEPSEEK_API_KEY", "DeepSeek"),
+            ("ZHIPUAI_API_KEY",  "GLM"),
+            ("MINIMAX_API_KEY",  "MiniMax"),
+        ) if os.environ.get(env_key)
+    ]
     info: dict = {
         "archive_root": str(ROOT),
         "claude_md_exists": claude_md.exists(),
@@ -382,6 +394,9 @@ def context_info() -> dict:
         "claude_md_mtime": 0.0,
         "archive_empty": True,
         "subdir_present": {},
+        "has_claude_oauth": claude_oauth,
+        "third_party_configured": third_party_configured,
+        "has_any_provider": claude_oauth or len(third_party_configured) > 0,
     }
     if claude_md.exists():
         try:
