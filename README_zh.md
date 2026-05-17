@@ -102,7 +102,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```powershell
-# Windows PowerShell — 干净 Windows 需要三步一次性配置：
+# Windows PowerShell — 干净 Windows 需要三步一次性配置。
+# 🚨 每一步之后必须关掉当前 PowerShell 窗口，从开始菜单重开一个 🚨
+# Windows 进程启动时 snapshot PATH，不重开就用不上新装的工具
+# 跳过重开 → 下一步会报「无法将"git"/"uv"项识别为 cmdlet」
 
 # (a) 放行 PowerShell 脚本（默认 Restricted 会拒绝 uv）
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
@@ -112,8 +115,6 @@ winget install --id Git.Git -e
 
 # (c) 装 uv
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# 每一步之后开新的 PowerShell 窗口，让 PATH 刷新。
 ```
 
 ### 1. 一键安装

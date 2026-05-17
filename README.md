@@ -107,18 +107,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```powershell
-# Windows PowerShell — clean Windows needs three one-time setups:
+# Windows PowerShell — clean Windows needs three one-time setups.
+# 🚨 CLOSE + REOPEN POWERSHELL AFTER EACH STEP so PATH refreshes 🚨
+# (Skip the reopen and the next step will fail with "'git' / 'uv' is not recognized")
 
-# (a) allow scripts to run (default is Restricted)
+# (a) allow scripts to run (default policy is Restricted)
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-# (b) install git if you don't have it
+# (b) install git (default Windows doesn't have it)
 winget install --id Git.Git -e
 
 # (c) install uv
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Open a new PowerShell window after each, so PATH refreshes.
 ```
 
 ### 1. One-shot installer

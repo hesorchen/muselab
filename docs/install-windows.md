@@ -34,8 +34,14 @@ Clean Windows doesn't ship git.
 winget install --id Git.Git -e
 ```
 
-Or download from https://git-scm.com/download/win. **Open a new PowerShell**
-after install so PATH refreshes — verify with `git --version`.
+Or download from https://git-scm.com/download/win.
+
+> 🚨 **You MUST close this PowerShell window and open a new one** — Windows
+> snapshots PATH at process start; the current window still has the old
+> (no-git) PATH even though git is now installed. Symptom if you skip:
+> `'git' is not recognized as a cmdlet`.
+>
+> Verify in the new window with `git --version`.
 
 (If you'd rather not install git: scroll down to "[No-git install](#no-git-install)".)
 
@@ -45,8 +51,10 @@ after install so PATH refreshes — verify with `git --version`.
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-[Docs](https://docs.astral.sh/uv/getting-started/installation/). Reopen
-PowerShell after — verify with `uv --version`.
+[Docs](https://docs.astral.sh/uv/getting-started/installation/).
+
+> 🚨 **Close + reopen PowerShell again** so uv lands in PATH. Verify
+> `uv --version`.
 
 ### 4. (Optional) `claude` CLI for Anthropic models
 
