@@ -334,22 +334,33 @@ def session_usage(session_id: str, model: str = "") -> dict:
 
 class SeedReq(BaseModel):
     summary: str
+    is_compact: bool = False
+    source_message_count: int = 0
 
 
 @router.post("/sessions/{sid}/seed", dependencies=[Depends(require_token)])
 async def seed_session_api(sid: str, req: SeedReq) -> dict:
     """Persist a summary as the first user message of a (typically just-created
     compact) session. Used by the /compact flow: model summarizes the old
-    session, that summary becomes context for the fresh one."""
+    session, that summary becomes context for the fresh one.
+    When is_compact=True the message carries metadata the frontend uses to
+    render it as a "📦 内容已压缩" marker instead of showing the raw summary."""
     s = sess.get_session(sid)
     if s is None:
         raise HTTPException(404, "session not found")
     if s.get("messages"):
         raise HTTPException(409, "session already has messages; seed only fits empty")
-    sess.append_messages(sid, [{
+    msg: dict[str, Any] = {
         "role": "user",
         "text": f"以下是上一个会话的全部要点摘要，请把它作为我们继续对话的起点：\n\n{req.summary}",
-    }])
+    }
+    if req.is_compact:
+        msg["_compact_marker"] = True
+        msg["_compact_source_count"] = req.source_message_count
+        # Keep the raw summary separately so the frontend can show it on expand
+        # without re-parsing the "请把它作为..." wrapper.
+        msg["_compact_summary"] = req.summary
+    sess.append_messages(sid, [msg])
     return {"ok": True}
 
 

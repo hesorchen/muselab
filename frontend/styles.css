@@ -815,6 +815,39 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 }
 .user-msg-text { white-space: pre-wrap; word-break: break-word; }
 html[data-theme="light"] .msg.user .bubble { color: white; }
+
+/* Compact marker — replaces the user bubble for /compact-seeded sessions.
+   One small line: 📦 + status + collapsible raw summary. Centered, neutral. */
+.compact-marker {
+  align-self: center;
+  display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  max-width: 100%;
+  padding: 6px 14px;
+  background: var(--c-bg-2); color: var(--c-fg-2);
+  border: 1px dashed var(--c-fg-4);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  user-select: none;
+}
+.compact-marker:hover { border-color: var(--c-accent); color: var(--c-fg-1); }
+.compact-marker-icon { font-size: var(--fs-sm); }
+.compact-marker-text { color: var(--c-fg-1); }
+.compact-marker-toggle {
+  color: var(--c-accent); font-size: var(--fs-xs);
+  border-left: 1px solid var(--c-fg-4); padding-left: 8px;
+}
+.compact-marker-body {
+  flex-basis: 100%;
+  margin: 6px 0 0;
+  padding: 10px 14px;
+  background: var(--c-bg-1); color: var(--c-fg-1);
+  border-radius: var(--r-md);
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+  white-space: pre-wrap; word-break: break-word;
+  cursor: default;
+  max-height: 360px; overflow-y: auto;
+}
 .msg.assistant .bubble {
   background: var(--c-assistant-bg); color: var(--c-fg-0);
   border-bottom-left-radius: var(--r-sm);

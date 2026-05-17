@@ -529,7 +529,19 @@ window.addEventListener("error", e => {
           </div>
           <template x-for="(m,i) in messages" :key="m._k || (currentId + '-' + i)">
             <div :class="'msg ' + m.role">
-              <div x-show="m.role==='user'" class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
+              <!-- Compact marker: replaces normal user bubble for seeded
+                   compact-origin messages. Click to expand the raw summary. -->
+              <template x-if="m.role==='user' && m._compact_marker">
+                <div class="compact-marker" @click="m._compact_expanded = !m._compact_expanded">
+                  <span class="compact-marker-icon">📦</span>
+                  <span class="compact-marker-text"
+                        x-text="(lang==='zh' ? '内容已压缩 · 来自前 ' : 'Compacted · from ') + (m._compact_source_count || '?') + (lang==='zh' ? ' 条消息' : ' messages')"></span>
+                  <span class="compact-marker-toggle"
+                        x-text="m._compact_expanded ? (lang==='zh' ? '收起' : 'collapse') : (lang==='zh' ? '查看摘要' : 'view summary')"></span>
+                  <pre x-show="m._compact_expanded" class="compact-marker-body" x-text="m._compact_summary || m.text"></pre>
+                </div>
+              </template>
+              <div x-show="m.role==='user' && !m._compact_marker" class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
               <div x-show="m.role==='assistant'" class="bubble" x-html="m.html"></div>
             <div x-show="m.role==='assistant' && m.model" class="model-tag"
                  :title="m.model"
