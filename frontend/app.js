@@ -1689,6 +1689,8 @@ function portal() {
         // 刷新可用 provider 列表
         const r2 = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r2.ok) this.availableModels = (await r2.json()).models || [];
+        // 也刷新 contextInfo — has_any_provider 变了，否则 "no provider" 卡片不消失
+        this.fetchContextInfo();
       } else {
         this.toast("保存失败：" + (await r.text()), "error", 5000);
       }
