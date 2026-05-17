@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, TextBlock, ThinkingBlock, ResultMessage,
-    ToolUseBlock, ToolResultBlock,
+    ToolUseBlock, ToolResultBlock, StreamEvent,
 )
 from .auth import require_token_query, require_token
 from .settings import ROOT, MODEL, MCP_CONFIG_PATH
@@ -128,6 +128,11 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 # (cwd/CLAUDE.md → the user's archive), and local (.claude/
                 # within cwd). Also enables skill discovery from the same scopes.
                 setting_sources=["user", "project", "local"],
+                # Token-level streaming: SDK emits StreamEvent for each delta
+                # the model produces (text / thinking). Without this, we only
+                # see full blocks at the end → user waits for the whole reply
+                # before seeing anything. With this, each token shows up.
+                include_partial_messages=True,
             )
             # Skills get attached to the system prompt as JSON tool defs.
             # Claude handles a large skill catalog fine; third-party vendors
@@ -242,6 +247,17 @@ async def delete_session_api(sid: str) -> dict:
     return {"ok": True}
 
 
+@router.delete("/sessions", dependencies=[Depends(require_token)])
+async def cleanup_empty_sessions() -> dict:
+    """Bulk-remove all sessions with zero messages (placeholder / abandoned).
+    Exposed in Settings as "清理空会话"."""
+    # Drop in-memory clients for any of them too
+    removed = sess.delete_empty_sessions()
+    for sid in removed:
+        await disconnect_client(sid)
+    return {"ok": True, "removed": removed, "count": len(removed)}
+
+
 class SessionPatchReq(BaseModel):
     name: str | None = None
     system_prompt: str | None = None
@@ -258,18 +274,13 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         # System prompt change invalidates cached SDK clients for this session.
         await disconnect_client(sid)
     if req.model is not None:
-        # One-session-one-model rule (VS Code-aligned): only allow model change
-        # while the session is still virgin. Once any messages exist, swapping
-        # model invites thinking-signature drift / cross-vendor incompat.
-        s = sess.get_session(sid)
-        if s is None:
-            raise HTTPException(404, "session not found")
-        if s.get("message_count", len(s.get("messages") or [])) > 0:
-            raise HTTPException(
-                409,
-                "model is locked once the session has messages. "
-                "Fork this session or create a new one to switch model.",
-            )
+        # Model switch is allowed any time — including mid-session. The next
+        # turn will use the new model (frontend captures `streamingModel`
+        # per-request so old bubbles keep their original model badge).
+        # Caveats (frontend warns about cross-vendor):
+        #   - cross-vendor switches can hit thinking-signature errors on the
+        #     next reply if the prior turn had thinking blocks
+        #   - prompt cache resets when model changes (first turn slower)
         sess.update_model(sid, req.model)
         # Free the old (sid, oldmodel) client so the next send uses the new model
         await disconnect_client(sid)
@@ -356,6 +367,52 @@ async def compact_session_api(sid: str) -> dict:
 
 class BudgetReq(BaseModel):
     budget_usd: float       # 0 = disabled
+
+
+@router.get("/context-info", dependencies=[Depends(require_token)])
+def context_info() -> dict:
+    """Information about what Muse can see — used by the UI's onboarding
+    hints (does the user have a CLAUDE.md? archive empty? skills loaded?).
+    All paths relative to ROOT for safety."""
+    claude_md = ROOT / "CLAUDE.md"
+    info: dict = {
+        "archive_root": str(ROOT),
+        "claude_md_exists": claude_md.exists(),
+        "claude_md_lines": 0,
+        "claude_md_mtime": 0.0,
+        "archive_empty": True,
+        "subdir_present": {},
+    }
+    if claude_md.exists():
+        try:
+            info["claude_md_lines"] = sum(1 for _ in claude_md.open(encoding="utf-8", errors="replace"))
+            info["claude_md_mtime"] = claude_md.stat().st_mtime
+        except OSError:
+            pass
+    # Subdirs the install scripts create — used to nudge "drop a doc into X"
+    for sub in ("health", "work", "money", "people", "notes", "archives"):
+        d = ROOT / sub
+        present = d.exists() and d.is_dir()
+        info["subdir_present"][sub] = present
+        if present:
+            # Count any file other than the README to decide "empty"
+            try:
+                non_readme = [p for p in d.iterdir()
+                              if p.is_file() and p.name.lower() != "readme.md"]
+                if non_readme:
+                    info["archive_empty"] = False
+            except OSError:
+                pass
+    # If the root itself has user docs (not a subdir-only setup), also count
+    if info["archive_empty"]:
+        try:
+            for p in ROOT.iterdir():
+                if p.is_file() and p.name not in ("CLAUDE.md",):
+                    info["archive_empty"] = False
+                    break
+        except OSError:
+            pass
+    return info
 
 
 @router.get("/probe/{model}", dependencies=[Depends(require_token)])
@@ -755,13 +812,33 @@ async def stream(
                     break
                 # kind == "claude"
                 msg = payload
-                if isinstance(msg, AssistantMessage):
+                if isinstance(msg, StreamEvent):
+                    # Token-by-token deltas — emit each as a tiny text/thinking event.
+                    # This is the fast-feedback path; the consolidated AssistantMessage
+                    # below carries the final text but we suppress re-emit there.
+                    ev = msg.event or {}
+                    et = ev.get("type")
+                    if et == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        dt = delta.get("type")
+                        if dt == "text_delta":
+                            chunk = delta.get("text", "")
+                            if chunk:
+                                assistant_acc += chunk
+                                yield {"event": "text", "data": json.dumps({"text": chunk})}
+                        elif dt == "thinking_delta":
+                            chunk = delta.get("thinking", "")
+                            if chunk:
+                                yield {"event": "thinking", "data": json.dumps({"text": chunk})}
+                elif isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
-                            assistant_acc += block.text
-                            yield {"event": "text", "data": json.dumps({"text": block.text})}
+                            # Already streamed via StreamEvent deltas above —
+                            # don't re-emit (would double the assistant bubble).
+                            pass
                         elif isinstance(block, ThinkingBlock):
-                            yield {"event": "thinking", "data": json.dumps({"text": block.thinking})}
+                            # Same: streamed via thinking_delta events.
+                            pass
                         elif isinstance(block, ToolUseBlock):
                             d = _render_tool_use(block)
                             persisted.append({"role": "tool_use", **d})

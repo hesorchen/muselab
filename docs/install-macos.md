@@ -62,6 +62,9 @@ launchctl kickstart -k gui/$UID/com.muselab            # restart (preserves stat
 launchctl unload  ~/Library/LaunchAgents/com.muselab.plist   # stop (until next login)
 launchctl load -w ~/Library/LaunchAgents/com.muselab.plist   # start again
 tail -f ~/Library/Logs/muselab/stderr.log              # tail logs
+
+bash scripts/doctor.sh                                  # re-verify install + probe service
+bash scripts/intake.sh                                  # (re)run profile intake / refresh CLAUDE.md
 ```
 
 ## Expose to LAN (optional)

@@ -54,8 +54,8 @@ if (Get-Command npx -ErrorAction SilentlyContinue) {
 }
 
 # ----- 2. Python deps -----------------------------------------------------
-Bold "2/5  Installing Python dependencies (uv sync)"
-& $UvPath sync --quiet
+Bold "2/5  Installing Python dependencies (uv sync, may take a few minutes first time)"
+& $UvPath sync                       # no --quiet: user wants to see progress
 if ($LASTEXITCODE -ne 0) { Err "uv sync failed"; exit 1 }
 Ok "deps installed"
 
@@ -74,7 +74,23 @@ if (Test-Path $EnvPath) {
   Write-Host "  Archive dir = where Muse can read/write (NEVER point at your user dir or C:\)"
   $defArchive = Join-Path $env:USERPROFILE "muselab-archive"
   $Archive = Ask "Archive dir (absolute path):" $defArchive
-  if (-not (Test-Path $Archive)) { New-Item -ItemType Directory -Path $Archive | Out-Null }
+  if (-not (Test-Path $Archive)) {
+    try {
+      New-Item -ItemType Directory -Path $Archive -Force | Out-Null
+    } catch {
+      Err "Cannot create $Archive — pick a path you have permissions for (e.g. under $env:USERPROFILE)"
+      exit 1
+    }
+  }
+  # Probe writability
+  $probe = Join-Path $Archive ".muselab-write-test"
+  try {
+    Set-Content -Path $probe -Value "x" -ErrorAction Stop
+    Remove-Item $probe -ErrorAction Stop
+  } catch {
+    Err "$Archive exists but isn't writable"
+    exit 1
+  }
 
   $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
   @"
@@ -84,7 +100,7 @@ MUSELAB_ROOT=$($Archive -replace '\\','/')
 MUSELAB_HOST=127.0.0.1
 MUSELAB_PORT=8765
 MUSELAB_MODEL=claude-sonnet-4-6
-"@ | Set-Content -Path $EnvPath -Encoding ascii
+"@ | Set-Content -Path $EnvPath -Encoding utf8     # utf8 — supports Chinese / CJK paths
 
   # Restrict ACL to current user (rough equivalent of `chmod 600`)
   $acl = Get-Acl $EnvPath
@@ -151,7 +167,7 @@ MUSELAB_MODEL=claude-sonnet-4-6
                               ($iStage + "`n`n（如：「大三在准备保研」")
       }
 
-      Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8
+      Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8     # utf8 — CJK content
       Ok "CLAUDE.md -> $ClaudeMd (with your intake answers prefilled)"
       Write-Host
       Write-Host "  Next steps (适合放什么完全看你自己阶段):"
@@ -172,15 +188,24 @@ $TaskName  = "Muselab"
 $LogDir    = Join-Path $env:LOCALAPPDATA "muselab\logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
-# Action: invoke uv with full args via cmd so we can redirect stdout/stderr
-$cmdLine = "/c `"`"$UvPath`" run python -m backend.main >> `"$LogDir\stdout.log`" 2>> `"$LogDir\stderr.log`"`""
-$Action  = New-ScheduledTaskAction -Execute "cmd.exe" -Argument $cmdLine -WorkingDirectory $Repo
+# Wrap the uv command in a small launcher .cmd file so the Scheduled Task can
+# `Execute` it as a plain string — avoids the nested-quote escape hell that
+# breaks when REPO_PATH or LOG_DIR contain spaces (Documents and Settings, etc).
+$LauncherPath = Join-Path $Repo "scripts\muselab-launcher.cmd"
+$launcherBody = @"
+@echo off
+cd /d "$Repo"
+"$UvPath" run python -m backend.main >> "$LogDir\stdout.log" 2>> "$LogDir\stderr.log"
+"@
+Set-Content -Path $LauncherPath -Value $launcherBody -Encoding ascii
+
+$Action  = New-ScheduledTaskAction -Execute $LauncherPath -WorkingDirectory $Repo
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $Settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
   -StartWhenAvailable `
-  -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
+  -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
   -ExecutionTimeLimit (New-TimeSpan -Days 365)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 
@@ -194,16 +219,23 @@ Ok "Scheduled Task '$TaskName' registered (trigger: at logon)"
 
 # Start it now so the user doesn't have to log out/in
 Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 2
 
 # ----- 5. Sanity check ----------------------------------------------------
-Bold "5/5  Sanity check"
-try {
-  $r = Invoke-WebRequest -Uri "http://127.0.0.1:8765/" -UseBasicParsing -TimeoutSec 5
-  Ok "muselab responding at http://localhost:8765"
-} catch {
-  Warn "couldn't reach http://localhost:8765 yet — give it a few more seconds"
-  Warn "  tail logs: Get-Content -Wait `"$LogDir\stderr.log`""
+Bold "5/5  Sanity check (up to 30s for first-boot SDK init)"
+$ok = $false
+for ($i = 0; $i -lt 30; $i++) {
+  try {
+    Invoke-WebRequest -Uri "http://127.0.0.1:8765/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
+    $ok = $true
+    Ok "muselab responding at http://localhost:8765 (took $($i+1)s)"
+    break
+  } catch {
+    Start-Sleep -Seconds 1
+  }
+}
+if (-not $ok) {
+  Warn "didn't respond at http://localhost:8765 in 30s — give it more time or tail logs:"
+  Warn "  Get-Content -Wait `"$LogDir\stderr.log`""
 }
 
 Write-Host

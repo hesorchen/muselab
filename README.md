@@ -184,7 +184,7 @@ CLAUDE.md auto-loads from `~/.claude/CLAUDE.md` (your global rules) AND
         claude-*  ┌───────────┴───────────────┐  others (deepseek-/glm-/...)
                   ▼                           ▼ (env override per request)
         api.anthropic.com               api.deepseek.com/anthropic
-        (Pro OAuth)                     api.minimax.io/anthropic
+        (Pro OAuth)                     api.minimaxi.com/anthropic
                                         open.bigmodel.cn/api/anthropic
                                         api.moonshot.cn/anthropic
 ```

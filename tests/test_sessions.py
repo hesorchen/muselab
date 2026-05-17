@@ -114,16 +114,17 @@ def test_patch_model_allowed_on_empty_session(client, auth, app_module):
     assert sess.get_session(meta["id"])["model"] == "deepseek-v4-flash"
 
 
-def test_patch_model_rejected_after_first_message(client, auth, app_module):
-    """One session = one model (VS Code alignment): once any message exists,
-    PATCH model returns 409. UI nudges user to create a fresh session instead."""
+def test_patch_model_allowed_mid_session(client, auth, app_module):
+    """Mid-session model swap is allowed — frontend shows inline notice that
+    the next turn will use the new model. Each assistant bubble carries its
+    own `model` field so historical badges stay correct."""
     from backend import sessions as sess
     meta = sess.create_session("t", model="claude-opus-4-7")
     sess.append_messages(meta["id"], [{"role": "user", "text": "hi"}])
     r = client.patch(f"/api/chat/sessions/{meta['id']}",
                       json={"model": "deepseek-v4-flash"}, headers=auth)
-    assert r.status_code == 409
-    assert sess.get_session(meta["id"])["model"] == "claude-opus-4-7"
+    assert r.status_code == 200
+    assert sess.get_session(meta["id"])["model"] == "deepseek-v4-flash"
 
 
 def test_seed_persists_summary_as_first_user_message(client, auth, app_module):
@@ -235,9 +236,11 @@ def test_providers_includes_deepseek_after_key_set(client, auth, monkeypatch):
     assert any(m["model"].startswith("deepseek-") for m in models)
     # 现在每个 DeepSeek 条目都有 short label
     ds_models = [m for m in models if m["model"].startswith("deepseek-")]
-    # labels are now full model ids
-    assert any(m["label"] == "deepseek-v4-pro" for m in ds_models)
-    assert any(m["label"] == "deepseek-v4-flash" for m in ds_models)
+    # Pretty labels (short form), full id in `model`
+    assert any(m["label"] == "V4 Pro" and m["model"] == "deepseek-v4-pro"
+                for m in ds_models)
+    assert any(m["label"] == "V4 Flash" and m["model"] == "deepseek-v4-flash"
+                for m in ds_models)
 
 
 def test_reset_session_endpoint(client, auth):

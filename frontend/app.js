@@ -55,22 +55,37 @@ const STRINGS = {
     "empty.preview_tip1": "从左侧选文件 — Muse 看得见",
     "empty.preview_tip2": " 在右侧把文件递给 Muse",
     "empty.preview_tip3": "右键文件查看更多操作",
+    "preview.action_new_note": "新建笔记",
+    "preview.action_upload": "上传文档",
+    "preview.new_note_title": "新建 markdown 笔记",
+    "preview.new_note_body": "文件名（默认放 archive 根目录；可写 health/foo.md 等子路径）",
     // login
-    "login.sub": "Meet Muse — an AI that actually knows you.",
+    "login.sub": "你的私人 AI 助理，同时记得你的所有维度。",
+    "login.tagline": "muse · lab",
     "login.token_placeholder": "MUSELAB_TOKEN",
     "login.go": "进入",
     "login.err": "Token 错误",
+    "login.hint_on_err": "Token 在 muselab 安装目录的 .env 文件里（找 MUSELAB_TOKEN=）。第一次用？跑 scripts/install-{linux,macos,windows}",
     // settings modal
     "set.title": "设置",
     "set.sec.provider": "Provider API Keys",
     "set.sec.appearance": "外观",
     "set.sec.defaults": "新会话默认",
     "set.sec.model_params": "模型参数",
+    "set.sec.sessions": "会话",
+    "set.sessions.cleanup_label": "空会话清理",
+    "set.sessions.cleanup_btn": "清理空会话",
+    "set.sessions.cleanup_confirm_title": "清理空会话",
+    "set.sessions.cleanup_confirm_body": "删除所有 0 条消息的会话（未发过任何消息的占位项）。无法撤销。",
+    "set.sessions.cleanup_done": "已删除 {n} 个空会话",
     "set.probe": "测试",
     "set.probe_tip": "向 vendor 真发一条 ping，看 key 是否真的有效",
     "set.probe_running": "正在测试 key...",
     "set.probe_ok": "key 有效，端点通",
     "set.probe_failed": "测试失败",
+    "set.probe_hint_401": "key 无效，去 vendor 控制台查",
+    "set.probe_hint_403": "可能需要在 vendor 开通对应服务",
+    "set.probe_hint_429": "限流了，等一会再试",
     "set.sec.mcp": "MCP 工具服务器",
     "set.mcp.hint": "MCP 让 Muse 调用外部工具（fetch、time、sequential-thinking 等）。开关控制是否加载；删除会移除配置。",
     "set.mcp.empty": "尚未配置 MCP server。点击下方添加，或从预设安装。",
@@ -94,7 +109,13 @@ const STRINGS = {
     "set.skills.empty": "未发现任何 skill。在 ~/.claude/skills 或本项目 skills/ 下新增 SKILL.md 即可。",
     "slash.hint": "↑↓ 选 · Enter / Tab 选中 · Esc 关",
     "slash.none": "没有匹配的命令",
-    "slash.help_title": "可用的斜杠命令",
+    "slash.help_title": "muselab 帮助",
+    "help.sec_slash": "斜杠命令",
+    "help.sec_keys": "键盘快捷键",
+    "help.keys_list": "- `Enter` — 发送消息\n- `Shift+Enter` — 换行\n- `@` — 引用 archive 里的文件\n- `/` — 斜杠命令面板\n- `↑ ↓` — 在 @ / `/` 面板里选项\n- `Esc` — 关闭面板 / modal / 中止流式\n- `Ctrl+S` — 保存编辑中的文件（CodeMirror 内）",
+    "help.sec_layout": "三栏布局",
+    "help.layout_list": "- **左**：archive 文件树 + 全文搜索（右键文件看更多动作）\n- **中**：预览 / 编辑当前文件（md / 代码 / 图片 / PDF / HTML 沙盒）\n- **右**：聊 Muse（顶部 chip 显示 CLAUDE.md / MCP / cost / 模型）",
+    "help.docs_link": "完整文档",
     "slash.cleared": "已清空当前会话",
     "slash.failed": "命令执行失败",
     "slash.compact_ok": "已创建压缩会话 — 输入框已预填请求语，回车发送",
@@ -115,6 +136,27 @@ const STRINGS = {
     "cost.context": "当前会话 context",
     "cost.budget_warn": "预算告警：已用 {pct}% / ${usd}",
     "ctx.title": "当前会话 context tokens",
+    "ctx.claude_md_tip": "Muse 已加载 {root}/CLAUDE.md（上次修改 {date}）",
+    "ctx.no_claude_md": "{root} 里没有 CLAUDE.md — Muse 不认识你，点击查看怎么配",
+    "ctx.no_claude_md_title": "Muse 还不认识你",
+    "ctx.no_claude_md_body": "你的 archive 在：\n  {root}\n\nMuse 启动时会读 {root}/CLAUDE.md 作为「关于你」的档案。现在没有这个文件，所以 Muse 只能用默认行为，不能基于你的真实情况给建议。\n\n建议：\n  1. 跑 scripts/install-{linux,macos,windows} 里的 intake（推荐）\n  2. 或手动复制：scripts/templates/default-CLAUDE.md → {root}/CLAUDE.md，按提示填\n\n详见 docs/personalize-claude-md.md",
+    "onboard.no_claude_md_title": "👋 Muse 还不认识你",
+    "onboard.no_claude_md_body": "Muse 是一个整体助理 — 同时帮你管身体、做的事、钱、关心的人、生活。在它能给针对性建议之前，需要你先做一份 3 分钟的档案。",
+    "onboard.no_claude_md_cta": "查看怎么设置",
+    "onboard.empty_archive_title": "📂 你的 archive 里还没有文档",
+    "onboard.empty_archive_body": "把真实材料放进对应的子目录，Muse 才能基于它们给建议。下面是已建好的目录：",
+    "onboard.dir_health": "体检报告 / 补剂方案 / 训练记录",
+    "onboard.dir_work":   "在做的事的产物（学业 / 简历 / 作品集 / 项目）",
+    "onboard.dir_money":  "预算 / 持仓 / 学贷 / 保单",
+    "onboard.dir_people": "关心的人的资料",
+    "onboard.dir_notes":  "学习笔记 / 灵感 / 日记",
+    "onboard.ready_title": "💡 试试问 Muse",
+    "onboard.q_health":   "看看我的健康档案，有什么需要注意的",
+    "onboard.q_work":     "帮我看看简历 / 学业材料",
+    "onboard.q_money":    "看一下我的财务状况，给建议",
+    "onboard.q_people":   "我关心的人最近有哪些需要跟进的",
+    "onboard.q_overview": "我的 archive 里有什么？整理一下给我看",
+    "onboard.skill_hint": "或试试这些 skill：",
     "ctx.cache_tip": "缓存命中率 — 越高越省钱。Anthropic prompt cache 在 5 分钟内复用上次的系统提示词 + 上下文。",
     "ctx.normal": "上下文 {used}K / {limit}K · {pct}%",
     "ctx.warn":   "上下文用了 {pct}%（{used}K / {limit}K）· 长对话变贵，可压缩",
@@ -127,10 +169,9 @@ const STRINGS = {
     "ctx.compact_summarize_prompt": "请把这个会话的全部要点压缩成结构化摘要：①事实背景 ②已做决定 ③待办或下一步 ④引用过的具体文件路径。要让一个第一次看到摘要的人能凭它继续对话。",
     "ctx.compact_step1": "Step 1/2: 让模型总结上文...",
     "ctx.compact_done": "压缩完成，已切到新会话",
-    "toast.model_switched": "模型已切：{label}",
     "model.switch_title": "切换模型",
-    "model.switch_body": "切换模型需要新建会话。",
-    "model.switch_new": "新建会话",
+    "model.switch_body": "切换到 {label} 需要新建会话。确认吗？",
+    "model.switch_new": "新建并切换",
     "model.new_session_ok": "已新建 {label} 会话",
     "img.attach": "粘贴 / 拖拽 / 选择图片",
     "attach.title": "粘贴 / 拖拽 / 选择图片或文档（PDF、md、txt、json、代码……）",
@@ -241,20 +282,35 @@ const STRINGS = {
     "empty.preview_tip1": "Pick a file on the left — Muse can see it",
     "empty.preview_tip2": " hand a file to Muse on the right",
     "empty.preview_tip3": "Right-click for more actions",
-    "login.sub": "Meet Muse — an AI that actually knows you.",
+    "preview.action_new_note": "New note",
+    "preview.action_upload": "Upload",
+    "preview.new_note_title": "New markdown note",
+    "preview.new_note_body": "Filename (defaults to archive root; you can write health/foo.md etc.)",
+    "login.sub": "Your personal AI assistant — knows every dimension of your life.",
+    "login.tagline": "muse · lab",
     "login.token_placeholder": "MUSELAB_TOKEN",
     "login.go": "Enter",
     "login.err": "Bad token",
+    "login.hint_on_err": "Token lives in the .env file at your muselab install dir (look for MUSELAB_TOKEN=). First time? Run scripts/install-{linux,macos,windows}",
     "set.title": "Settings",
     "set.sec.provider": "Provider API keys",
     "set.sec.appearance": "Appearance",
     "set.sec.defaults": "New-session defaults",
     "set.sec.model_params": "Model parameters",
+    "set.sec.sessions": "Sessions",
+    "set.sessions.cleanup_label": "Empty sessions",
+    "set.sessions.cleanup_btn": "Clean up empty",
+    "set.sessions.cleanup_confirm_title": "Clean up empty sessions",
+    "set.sessions.cleanup_confirm_body": "Delete every session with 0 messages (abandoned placeholders). Not undoable.",
+    "set.sessions.cleanup_done": "Removed {n} empty sessions",
     "set.probe": "Test",
     "set.probe_tip": "Ping the vendor endpoint with the configured key",
     "set.probe_running": "Testing key…",
     "set.probe_ok": "key works, endpoint reachable",
     "set.probe_failed": "Test failed",
+    "set.probe_hint_401": "key is invalid — check vendor console",
+    "set.probe_hint_403": "may need to enable that service on vendor side",
+    "set.probe_hint_429": "rate-limited, retry shortly",
     "set.sec.mcp": "MCP tool servers",
     "set.mcp.hint": "MCP lets Muse call external tools (fetch, time, sequential-thinking, …). The switch enables / disables; delete removes config entirely.",
     "set.mcp.empty": "No MCP servers configured. Add one below or install from presets.",
@@ -278,7 +334,13 @@ const STRINGS = {
     "set.skills.empty": "No skills discovered. Add a SKILL.md under ~/.claude/skills or this project's skills/.",
     "slash.hint": "↑↓ pick · Enter / Tab to choose · Esc close",
     "slash.none": "no matching command",
-    "slash.help_title": "Available slash commands",
+    "slash.help_title": "muselab help",
+    "help.sec_slash": "Slash commands",
+    "help.sec_keys": "Keyboard shortcuts",
+    "help.keys_list": "- `Enter` — send message\n- `Shift+Enter` — newline\n- `@` — reference a file from archive\n- `/` — slash command palette\n- `↑ ↓` — navigate @ / `/` popup\n- `Esc` — close popup / modal / cancel streaming\n- `Ctrl+S` — save in CodeMirror editor",
+    "help.sec_layout": "Three-column layout",
+    "help.layout_list": "- **Left**: archive file tree + full-text search (right-click for more)\n- **Middle**: preview / edit current file (md / code / image / PDF / sandboxed HTML)\n- **Right**: chat with Muse (top chips show CLAUDE.md / MCP / cost / model)",
+    "help.docs_link": "Full docs",
     "slash.cleared": "Cleared current session",
     "slash.failed": "Command failed",
     "slash.compact_ok": "New compact session created — request is pre-filled, hit enter to send",
@@ -299,6 +361,27 @@ const STRINGS = {
     "cost.context": "Current session context",
     "cost.budget_warn": "Budget warning: used {pct}% of ${usd}",
     "ctx.title": "Current session context tokens",
+    "ctx.claude_md_tip": "Muse loaded {root}/CLAUDE.md (last modified {date})",
+    "ctx.no_claude_md": "No CLAUDE.md in {root} — Muse doesn't know you; click to learn how to set up",
+    "ctx.no_claude_md_title": "Muse doesn't know you yet",
+    "ctx.no_claude_md_body": "Your archive lives at:\n  {root}\n\nMuse reads {root}/CLAUDE.md on startup as your profile. Without it, Muse uses default behavior and can't tailor advice to your real situation.\n\nTo set up:\n  1. Run scripts/install-{linux,macos,windows} (with intake — recommended)\n  2. Or copy scripts/templates/default-CLAUDE.md → {root}/CLAUDE.md and edit\n\nDetails: docs/personalize-claude-md.md",
+    "onboard.no_claude_md_title": "👋 Muse doesn't know you yet",
+    "onboard.no_claude_md_body": "Muse is one assistant for your whole life — body, work, money, people, daily stuff. Before it can give tailored advice, it needs a 3-minute intake of your profile.",
+    "onboard.no_claude_md_cta": "Show me how",
+    "onboard.empty_archive_title": "📂 No documents in your archive yet",
+    "onboard.empty_archive_body": "Drop real material into the right subdir so Muse can work with it. These are ready for you:",
+    "onboard.dir_health": "checkup reports / supplement plan / training log",
+    "onboard.dir_work":   "what you spend time on (school / resume / portfolio / projects)",
+    "onboard.dir_money":  "budget / positions / loans / insurance",
+    "onboard.dir_people": "people you care about",
+    "onboard.dir_notes":  "study notes / ideas / journal",
+    "onboard.ready_title": "💡 Try asking Muse",
+    "onboard.q_health":   "Look at my health files and tell me what to watch",
+    "onboard.q_work":     "Help me review my resume / school materials",
+    "onboard.q_money":    "Take a look at my finances and suggest changes",
+    "onboard.q_people":   "Who do I need to follow up with lately?",
+    "onboard.q_overview": "What's in my archive? Give me a tour",
+    "onboard.skill_hint": "Or try a skill:",
     "ctx.cache_tip": "Cache hit rate — higher is cheaper. Anthropic prompt cache reuses the last system prompt + context within 5 minutes.",
     "ctx.normal": "Context {used}K / {limit}K · {pct}%",
     "ctx.warn":   "Context at {pct}% ({used}K / {limit}K) · Long chats get expensive — consider compacting",
@@ -311,10 +394,9 @@ const STRINGS = {
     "ctx.compact_summarize_prompt": "Compress this entire conversation into a structured summary: (1) facts / background (2) decisions made (3) open todos or next steps (4) specific file paths referenced. Make it complete enough that someone reading only the summary can pick up where we left off.",
     "ctx.compact_step1": "Step 1/2: Asking the model to summarize…",
     "ctx.compact_done": "Compacted — jumped to the new session",
-    "toast.model_switched": "Model switched: {label}",
     "model.switch_title": "Switch model",
-    "model.switch_body": "Switching model requires a new session.",
-    "model.switch_new": "New session",
+    "model.switch_body": "Switching to {label} needs a new session. Confirm?",
+    "model.switch_new": "Create & switch",
     "model.new_session_ok": "New session with {label}",
     "img.attach": "Attach image (paste / drag / pick)",
     "attach.title": "Attach image or document (PDF / md / txt / json / source…)",
@@ -429,9 +511,25 @@ function portal() {
     input: "", streaming: false, es: null,
     // 锁定当前在跑的那条请求用的模型——dropdown 切到别的，pending bubble 不能跟着变。
     streamingModel: "",
+    // Elapsed seconds since send() — pending bubble shows it after 1s so the
+    // user knows the system isn't stuck.
+    streamElapsed: 0,
+    _streamTimer: null,
+    _streamStartedAt: 0,
     pendingImages: [],    // [{id, mime, preview (data URL), uploading, error}]
     pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
     dragHover: false,
+
+    // What Muse can see — populated from /api/chat/context-info on login.
+    // Drives the onboarding hints (claude_md chip, "drop a doc here" cards).
+    contextInfo: {
+      archive_root: "",
+      claude_md_exists: false,
+      claude_md_lines: 0,
+      claude_md_mtime: 0,
+      archive_empty: true,
+      subdir_present: {},
+    },
 
     // ===== slash commands =====
     slashShow: false,
@@ -509,6 +607,7 @@ function portal() {
       mcpExamples: [],
       mcpDraft: { show: false, name: "", command: "", argsStr: "" },
       skills: [],   // discovered skill list (read-only browse)
+      probeResults: {},   // env_key -> {ok, text} from last "Test" click
     },
 
     _pendingExpanded: null,
@@ -569,6 +668,7 @@ function portal() {
         this.loadRoot();
         this.initSessions();
         this.fetchStats();
+        this.fetchContextInfo();
       }
     },
 
@@ -1059,6 +1159,13 @@ function portal() {
       } catch {}
     },
 
+    async fetchContextInfo() {
+      try {
+        const r = await fetch("/api/chat/context-info", { headers: this.hdr() });
+        if (r.ok) this.contextInfo = await r.json();
+      } catch (e) { /* non-fatal */ }
+    },
+
     async fetchStats() {
       try {
         const r = await fetch("/api/chat/usage", { headers: this.hdr() });
@@ -1077,19 +1184,19 @@ function portal() {
       } catch {}
     },
 
-    // Model switch — VS Code rule "one session, one model":
-    //  - virgin session (0 messages): persist the new model silently
-    //  - already-used session: prompt the user to start a new session with the
-    //    new model. If they decline, bounce the dropdown back.
+    // Model switch:
+    //   - empty session: PATCH model in place (no point in creating an empty fork)
+    //   - session with messages: confirm modal "切换模型需要新建会话" —
+    //     confirm → create new session with chosen model, jump to it.
+    //     cancel  → revert dropdown.
     async onModelChange() {
       const newM = this.model;
       if (!this.currentId) return;
-
       const cur = this.sessions.find(s => s.id === this.currentId);
       const oldM = cur ? cur.model : "";
-      if (newM === oldM) return;          // no-op (might happen after a bounce)
+      if (newM === oldM) return;
 
-      // Empty session — just persist.
+      // Empty session — silent switch.
       if (this.messages.length === 0) {
         try {
           const r = await fetch("/api/chat/sessions/" + this.currentId, {
@@ -1098,14 +1205,12 @@ function portal() {
             body: JSON.stringify({ model: newM }),
           });
           if (!r.ok) {
-            this.model = oldM;            // safety bounce on any failure
+            this.model = oldM;
             this.toast(this.t("slash.failed"), "error");
             return;
           }
           await this.refreshSessions();
           this.savePrefs();
-          this.toast(this.t("toast.model_switched", { label: this.currentModelLabel() }),
-                      "info", 1800);
         } catch (e) {
           this.model = oldM;
           this.toast(this.t("slash.failed"), "error");
@@ -1113,18 +1218,17 @@ function portal() {
         return;
       }
 
-      // Session has history → ask whether to start a new one.
+      // Session has history — confirm + create new.
+      const label = this.modelLabel(newM);
       const ok = await this.confirm({
         title: this.t("model.switch_title"),
-        body: this.t("model.switch_body", { label: this.currentModelLabel() }),
+        body: this.t("model.switch_body", { label }),
         okText: this.t("model.switch_new"),
       });
       if (!ok) {
-        // User declined — bounce dropdown back to session's locked model.
-        this.model = oldM;
+        this.model = oldM;     // revert dropdown
         return;
       }
-      // Create a fresh session with the new model and jump to it.
       try {
         const r = await fetch("/api/chat/sessions", {
           method: "POST",
@@ -1141,8 +1245,7 @@ function portal() {
         this.currentId = meta.id;
         await this.loadSession(meta.id);
         this.savePrefs();
-        this.toast(this.t("model.new_session_ok", { label: this.currentModelLabel() }),
-                    "success", 2000);
+        this.toast(this.t("model.new_session_ok", { label }), "success", 2000);
       } catch (e) {
         this.model = oldM;
         this.toast(this.t("slash.failed"), "error");
@@ -1350,21 +1453,63 @@ function portal() {
       };
       const m = ENV_TO_MODEL[envKey];
       if (!m) return;
-      this.toast(this.t("set.probe_running"), "info", 1500);
+      this.settings.probeResults[envKey] = { ok: null, text: this.t("set.probe_running") };
       try {
         const r = await fetch(`/api/chat/probe/${encodeURIComponent(m)}`,
                                  { headers: this.hdr() });
         const d = await r.json();
         if (d.ok) {
-          this.toast(`${d.vendor}: ${this.t("set.probe_ok")} (${d.key_hint})`,
-                      "success", 4000);
+          this.settings.probeResults[envKey] = {
+            ok: true,
+            text: `${this.t("set.probe_ok")} · ${d.key_hint}`,
+          };
         } else {
-          const detail = (d.vendor_response_excerpt || d.reason || "").slice(0, 200);
-          this.toast(`${d.vendor || envKey}: HTTP ${d.status || "?"} · ${detail}`,
-                      "error", 8000);
+          const status = d.status ? `HTTP ${d.status}` : (d.reason || "error");
+          // Extract a single-line vendor message if there is one
+          let detail = "";
+          try {
+            const ex = d.vendor_response_excerpt ?
+              JSON.parse(d.vendor_response_excerpt) : null;
+            detail = ex?.error?.message || ex?.error?.type || "";
+          } catch { detail = (d.vendor_response_excerpt || "").slice(0, 120); }
+          // Tack on a hint based on common error shapes
+          let hint = "";
+          if (d.status === 401) hint = " · " + this.t("set.probe_hint_401");
+          else if (d.status === 403) hint = " · " + this.t("set.probe_hint_403");
+          else if (d.status === 429) hint = " · " + this.t("set.probe_hint_429");
+          this.settings.probeResults[envKey] = {
+            ok: false,
+            text: `${status}: ${detail || "—"}${hint}`,
+          };
         }
       } catch (e) {
-        this.toast(this.t("set.probe_failed") + ": " + e.message, "error", 5000);
+        this.settings.probeResults[envKey] = {
+          ok: false, text: this.t("set.probe_failed") + ": " + e.message,
+        };
+      }
+    },
+
+    async cleanupEmptySessions() {
+      const ok = await this.confirm({
+        title: this.t("set.sessions.cleanup_confirm_title"),
+        body:  this.t("set.sessions.cleanup_confirm_body"),
+        okText: this.t("set.sessions.cleanup_btn"),
+        danger: true,
+      });
+      if (!ok) return;
+      const r = await fetch("/api/chat/sessions", { method: "DELETE", headers: this.hdr() });
+      if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
+      const d = await r.json();
+      await this.refreshSessions();
+      this.toast(this.t("set.sessions.cleanup_done", { n: d.count }), "success", 2500);
+      // If current session was among removed ones, jump to first remaining or fresh
+      if (!this.sessions.find(s => s.id === this.currentId)) {
+        if (this.sessions.length) {
+          this.currentId = this.sessions[0].id;
+          await this.loadSession(this.currentId);
+        } else {
+          await this.newSession();
+        }
       }
     },
 
@@ -1960,10 +2105,24 @@ function portal() {
       arg = (arg || "").trim();
       switch (cmd) {
         case "help": {
-          const lines = this.SLASH_CMDS
+          const cmds = this.SLASH_CMDS
             .map(c => `**/${c.name}** — ${c.desc[this.lang] || c.desc.zh}`)
             .join("\n");
-          this._injectAssistantNote(this.t("slash.help_title") + "\n\n" + lines);
+          const md = [
+            `## ${this.t("slash.help_title")}`,
+            "",
+            `### ${this.t("help.sec_slash")}`,
+            cmds,
+            "",
+            `### ${this.t("help.sec_keys")}`,
+            this.t("help.keys_list"),
+            "",
+            `### ${this.t("help.sec_layout")}`,
+            this.t("help.layout_list"),
+            "",
+            `${this.t("help.docs_link")} → [docs/personalize-claude-md.md](docs/personalize-claude-md.md)`,
+          ].join("\n");
+          this._injectAssistantNote(md);
           return;
         }
         case "clear": {
@@ -2051,6 +2210,128 @@ function portal() {
         cost: "", model: "muselab", _ephemeral: true,
       });
       this.scrollToBottom(true);
+    },
+
+    // Suggest a few subdirs the user could fill in first, based on what's
+    // missing. Order: health → work → money → people → notes (most common
+    // first for a personal-archive use case).
+    onboardingSubdirs() {
+      const sp = this.contextInfo.subdir_present || {};
+      const hints = {
+        health: this.t("onboard.dir_health"),
+        work:   this.t("onboard.dir_work"),
+        money:  this.t("onboard.dir_money"),
+        people: this.t("onboard.dir_people"),
+        notes:  this.t("onboard.dir_notes"),
+      };
+      return ["health", "work", "money", "people", "notes"]
+        .filter(k => sp[k])     // only show subdirs that actually exist
+        .map(k => ({ name: k, hint: hints[k] }));
+    },
+
+    // Suggested first questions when the user has set things up but hasn't
+    // chatted yet. Tailored a bit to what data they've dropped in.
+    // Skill chips for the onboarding card — give a short, friendly example
+    // prompt that triggers each known skill (matches the 7 presets in skills/).
+    SKILL_TRIGGERS: [
+      { name: "web-search",         label_zh: "查时效数据",  label_en: "live web fact",     prompt_zh: "查一下今天 USD 兑 CNY 的汇率，给出处" },
+      { name: "markdown-formatter", label_zh: "整理 markdown", label_en: "clean markdown",   prompt_zh: "帮我把这段 markdown 整理一下" },
+      { name: "mermaid-helper",     label_zh: "画架构图",    label_en: "draw a diagram",   prompt_zh: "画一张三栏 web 应用的架构图" },
+      { name: "code-reviewer",      label_zh: "code review", label_en: "code review",      prompt_zh: "帮我 review 这段代码：" },
+      { name: "citation-formatter", label_zh: "格式化引用",  label_en: "format a citation", prompt_zh: "把 DOI 10.1038/nature12345 格式化为 APA" },
+      { name: "task-decomposer",    label_zh: "拆任务",      label_en: "decompose a goal", prompt_zh: "帮我把「6 个月内换工作」拆成可执行任务" },
+      { name: "summary-distiller",  label_zh: "长文摘要",    label_en: "summarize",         prompt_zh: "总结这篇文章的要点" },
+    ],
+
+    skillSuggestions() {
+      const loaded = new Set(this.settings.skills.map(s => s.name));
+      const lang = this.lang;
+      return this.SKILL_TRIGGERS
+        .filter(t => loaded.has(t.name))
+        .map(t => ({
+          name: t.name,
+          label: lang === "zh" ? t.label_zh : t.label_en,
+          prompt: t.prompt_zh,   // prompt always Chinese (Muse responds in user's lang)
+          description: lang === "zh" ? "触发 skill: " + t.name : "Triggers skill: " + t.name,
+        }))
+        .slice(0, 6);
+    },
+
+    onboardingPrompts() {
+      const sp = this.contextInfo.subdir_present || {};
+      const ps = [];
+      if (sp.health) ps.push(this.t("onboard.q_health"));
+      if (sp.work)   ps.push(this.t("onboard.q_work"));
+      if (sp.money)  ps.push(this.t("onboard.q_money"));
+      if (sp.people) ps.push(this.t("onboard.q_people"));
+      ps.push(this.t("onboard.q_overview"));
+      return ps.slice(0, 4);
+    },
+
+    async quickNewNote() {
+      const name = await this.prompt({
+        title: this.t("preview.new_note_title"),
+        body: this.t("preview.new_note_body"),
+        value: "untitled.md",
+      });
+      if (!name) return;
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      // Create empty file at archive root
+      const r = await fetch("/api/files/write", {
+        method: "PUT",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ path: trimmed, content: "# " + trimmed.replace(/\.md$/, "") + "\n\n" }),
+      });
+      if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
+      await this.loadRoot();
+      await this.openFile({ path: trimmed, name: trimmed });
+      this.editing = true;
+      this.toast(this.t("toast.saved"), "success", 1200);
+    },
+
+    useSuggestedPrompt(q) {
+      this.input = q;
+      if (this.$refs.chatInput) {
+        this.$refs.chatInput.focus();
+        this.autoGrow(this.$refs.chatInput);
+      }
+    },
+
+    claudeMdChipTitle() {
+      const i = this.contextInfo;
+      if (!i.claude_md_exists) {
+        return this.t("ctx.no_claude_md", { root: i.archive_root });
+      }
+      const d = i.claude_md_mtime ? new Date(i.claude_md_mtime * 1000).toLocaleDateString() : "";
+      return this.t("ctx.claude_md_tip", { root: i.archive_root, date: d });
+    },
+    openClaudeMdHelp() {
+      this.modal = {
+        show: true,
+        title: this.t("ctx.no_claude_md_title"),
+        body: this.t("ctx.no_claude_md_body", { root: this.contextInfo.archive_root }),
+        input: null, danger: false,
+        okText: this.t("btn.confirm"),
+        confirm: () => { this.modal.show = false; },
+        cancel: () => { this.modal.show = false; },
+      };
+    },
+
+    // Pretty-print a USD amount for the cost badge.
+    //   0          → "$0"
+    //   0.0023     → "0.23¢"   (cents form for sub-dollar)
+    //   0.45       → "45¢"
+    //   1.234      → "$1.23"
+    //   12.34      → "$12.34"
+    fmtCost(usd) {
+      if (!usd || usd < 0) return "$0";
+      if (usd < 0.01) {
+        const c = usd * 100;
+        return (c < 0.1 ? c.toFixed(2) : c.toFixed(1)) + "¢";
+      }
+      if (usd < 1) return Math.round(usd * 100) + "¢";
+      return "$" + usd.toFixed(2);
     },
 
     costBadgeTitle() {
@@ -2252,6 +2533,13 @@ function portal() {
       this.mentionShow = false;
       this.streaming = true;
       this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
+      // Tick elapsed time so user sees "thinking · 3.2s" when first token is slow.
+      this._streamStartedAt = Date.now();
+      this.streamElapsed = 0;
+      if (this._streamTimer) clearInterval(this._streamTimer);
+      this._streamTimer = setInterval(() => {
+        this.streamElapsed = (Date.now() - this._streamStartedAt) / 1000;
+      }, 200);
       this.atBottom = true;
       this.scrollToBottom(true);
 
@@ -2341,6 +2629,10 @@ function portal() {
         });
         this.scrollToBottom(false);
       });
+      const _stopTimer = () => {
+        if (this._streamTimer) { clearInterval(this._streamTimer); this._streamTimer = null; }
+        this.streamElapsed = 0;
+      };
       es.addEventListener("done", ev => {
         const d = JSON.parse(ev.data);
         if (d.total_cost_usd != null && curIdx !== -1) {
@@ -2354,7 +2646,7 @@ function portal() {
           this.toast(this.t("cost.budget_warn", { pct: d.budget_used_pct, usd: d.budget_usd }),
                       "warn", 5000);
         }
-        es.close(); this.streaming = false; this.es = null;
+        es.close(); this.streaming = false; this.es = null; _stopTimer();
         this.refreshSessions();
         this.$nextTick(() => this.highlightCode(".chat-body"));
       });
@@ -2363,14 +2655,14 @@ function portal() {
           const d = JSON.parse(ev.data);
           this.toast("Claude 出错：" + d.error, "error", 6000);
         } catch { this.toast("流式连接失败", "error"); }
-        es.close(); this.streaming = false; this.es = null;
+        es.close(); this.streaming = false; this.es = null; _stopTimer();
       });
       es.addEventListener("cancelled", () => {
         this.toast("已中断", "warn", 2000);
-        es.close(); this.streaming = false; this.es = null;
+        es.close(); this.streaming = false; this.es = null; _stopTimer();
       });
       es.onerror = () => {
-        if (es.readyState === EventSource.CLOSED) { this.streaming = false; this.es = null; }
+        if (es.readyState === EventSource.CLOSED) { this.streaming = false; this.es = null; _stopTimer(); }
       };
     },
     stop() {

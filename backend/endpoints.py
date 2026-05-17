@@ -36,32 +36,62 @@ CATALOG: tuple[Provider, ...] = (
         base_url="https://api.deepseek.com/anthropic",
         env_key="DEEPSEEK_API_KEY",
         display="DeepSeek",
-        models=tuple((m, m) for m in (
-            "deepseek-v4-pro", "deepseek-v4-flash",
-            "deepseek-chat", "deepseek-reasoner",
-        )),
+        models=(
+            ("deepseek-v4-pro",    "V4 Pro"),
+            ("deepseek-v4-flash",  "V4 Flash"),
+            ("deepseek-chat",      "Chat"),
+            ("deepseek-reasoner",  "Reasoner (R1)"),
+        ),
     ),
     Provider(
         prefix="glm-",
         base_url="https://open.bigmodel.cn/api/anthropic",
         env_key="ZHIPUAI_API_KEY",
         display="智谱 GLM",
-        models=tuple((m, m) for m in (
-            "glm-5", "glm-5-air", "glm-4.7", "glm-4-plus",
-        )),
+        models=(
+            ("glm-5",       "GLM 5"),
+            ("glm-5-air",   "GLM 5 Air"),
+            ("glm-4.7",     "GLM 4.7"),
+            ("glm-4-plus",  "GLM 4 Plus"),
+        ),
     ),
     Provider(
         prefix="minimax-",
-        base_url="https://api.minimax.io/anthropic",
+        # ⚠ 务必用 minimaxi.com (中国主站)；minimax.io 是海外站，
+        # 用同一把 key 测试时返回 401。
+        base_url="https://api.minimaxi.com/anthropic",
         env_key="MINIMAX_API_KEY",
         display="MiniMax",
-        models=tuple((m, m) for m in (
-            "minimax-m2.7", "minimax-m2.7-highspeed", "minimax-m2.5",
-        )),
+        models=(
+            ("minimax-m2.7",            "M2.7"),
+            ("minimax-m2.7-highspeed",  "M2.7 Highspeed"),
+            ("minimax-m2.5",            "M2.5"),
+        ),
     ),
     # Kimi (Moonshot) removed 2026-05-17 — vendor's anthropic endpoint
     # behavior was inconsistent in muselab testing; add back when verified.
 )
+
+
+# Pretty labels for Claude (Pro OAuth) models — the IDs themselves are ugly
+# (e.g. "claude-haiku-4-5-20251001") so we display human-friendly names.
+CLAUDE_LABELS: dict[str, str] = {
+    "claude-opus-4-7":              "Opus 4.7",
+    "claude-sonnet-4-6":            "Sonnet 4.6",
+    "claude-haiku-4-5-20251001":    "Haiku 4.5",
+}
+
+
+def label_for(model: str) -> str:
+    """Friendly label for any model id we know about; falls back to the id."""
+    if model in CLAUDE_LABELS:
+        return CLAUDE_LABELS[model]
+    p = lookup(model)
+    if p is not None:
+        for mid, lab in p.models:
+            if mid == model:
+                return lab
+    return model
 
 
 def lookup(model: str) -> Provider | None:
@@ -131,11 +161,12 @@ def env_override(model: str) -> dict[str, str] | None:
 
 def available_groups() -> list[dict]:
     """Catalog filtered to providers whose API key is configured.
-    Always returns the Claude group as the first entry."""
+    Always returns the Claude group as the first entry. Each item has
+    `label` (short pretty name) + `model` (full id used as dropdown value)."""
     groups: list[dict] = [{
-        "group": "Claude (Pro OAuth)",
+        "group": "Claude",
         "items": [
-            {"label": m, "model": m} for m in (
+            {"label": CLAUDE_LABELS.get(m, m), "model": m} for m in (
                 "claude-sonnet-4-6",
                 "claude-haiku-4-5-20251001",
                 "claude-opus-4-7",

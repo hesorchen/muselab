@@ -64,6 +64,9 @@ Get-ScheduledTask    -TaskName Muselab     # check state
 Start-ScheduledTask  -TaskName Muselab     # start
 Stop-ScheduledTask   -TaskName Muselab     # stop
 Get-Content -Wait "$env:LOCALAPPDATA\muselab\logs\stderr.log"   # tail logs
+
+powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # re-verify install + probe
+powershell -ExecutionPolicy Bypass -File scripts\intake.ps1   # (re)run profile intake
 ```
 
 ## Expose to LAN (optional)

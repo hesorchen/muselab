@@ -120,12 +120,17 @@ window.addEventListener("error", e => {
 
   <!-- 登录 -->
   <div class="login" x-show="!authed">
+    <span class="muse-mascot lg" :class="{'greet': mascotGreet}">
+      <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+    </span>
     <h2 class="login-logo">muse<span class="accent">lab</span></h2>
+    <p class="login-tagline" x-text="t('login.tagline')"></p>
     <p class="login-sub" x-html="t('login.sub')"></p>
     <input type="password" :placeholder="t('login.token_placeholder')" x-model="tokenInput"
            @keydown.enter="login()" autofocus />
     <button @click="login()" class="btn-primary" x-text="t('login.go')"></button>
     <p class="err" x-text="loginErr"></p>
+    <p class="login-hint" x-show="loginErr" x-text="t('login.hint_on_err')"></p>
   </div>
 
   <!-- 主界面 -->
@@ -300,6 +305,17 @@ window.addEventListener("error", e => {
           </span>
           <div class="brand-logo">muse<span class="accent">·lab</span></div>
           <div class="brand-tagline" x-text="t('empty.preview_tagline')"></div>
+          <!-- Quick actions — surface the most useful things when no file is selected -->
+          <div class="preview-quick-actions">
+            <button class="preview-action" @click="quickNewNote()">
+              <span class="icon"><svg><use href="#i-edit"/></svg></span>
+              <span x-text="t('preview.action_new_note')"></span>
+            </button>
+            <button class="preview-action" @click="$refs.uploadInput?.click()">
+              <span class="icon"><svg><use href="#i-upload"/></svg></span>
+              <span x-text="t('preview.action_upload')"></span>
+            </button>
+          </div>
           <div class="brand-tips">
             <div class="brand-tip" x-text="t('empty.preview_tip1')"></div>
             <div class="brand-tip"><span class="kbd">@</span><span x-text="t('empty.preview_tip2')"></span></div>
@@ -323,6 +339,14 @@ window.addEventListener("error", e => {
           <span x-text="t('pane.chat')"></span>
         </span>
         <span class="spacer"></span>
+        <!-- CLAUDE.md status chip — green tick when loaded, orange warn when missing -->
+        <span class="ctx-chip"
+              :class="contextInfo.claude_md_exists ? 'ok' : 'warn'"
+              :title="claudeMdChipTitle()"
+              @click="!contextInfo.claude_md_exists && openClaudeMdHelp()">
+          <span x-show="contextInfo.claude_md_exists">📋 CLAUDE.md · <span x-text="contextInfo.claude_md_lines + (lang==='zh'?'行':' lines')"></span></span>
+          <span x-show="!contextInfo.claude_md_exists" x-text="lang==='zh' ? '⚠ 未配档案' : '⚠ no archive'"></span>
+        </span>
         <span x-show="mcp.servers.length" class="mcp-badge"
               :title="(lang==='zh'?'MCP 服务: ':'MCP servers: ') + mcp.servers.map(s=>s.name).join(', ')">
           🔌 <span x-text="mcp.servers.length"></span>
@@ -330,7 +354,7 @@ window.addEventListener("error", e => {
         <span class="cost-badge"
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
-              x-text="'$'+stats.total_cost_usd.toFixed(4)"></span>
+              x-text="fmtCost(stats.total_cost_usd)"></span>
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
 
@@ -397,6 +421,58 @@ window.addEventListener("error", e => {
               <span class="muse-domain" x-text="lang==='zh' ? mascot().domain.zh : mascot().domain.en"></span>
               · <span x-text="t('chat.runs_on')"></span> <span x-text="currentModelLabel()"></span>
             </div>
+
+            <!-- Onboarding cards — only one shows at a time, in priority order:
+                 1. no CLAUDE.md     → "Muse doesn't know you yet"
+                 2. archive empty    → "Drop your first document"
+                 3. all set          → suggested first questions / skill chips -->
+            <template x-if="!contextInfo.claude_md_exists">
+              <div class="onboard-card warn">
+                <div class="onboard-card-title" x-text="t('onboard.no_claude_md_title')"></div>
+                <div class="onboard-card-body" x-text="t('onboard.no_claude_md_body')"></div>
+                <button class="btn-primary" @click="openClaudeMdHelp()" x-text="t('onboard.no_claude_md_cta')"></button>
+              </div>
+            </template>
+            <template x-if="contextInfo.claude_md_exists && contextInfo.archive_empty">
+              <div class="onboard-card">
+                <div class="onboard-card-title" x-text="t('onboard.empty_archive_title')"></div>
+                <div class="onboard-card-body" x-text="t('onboard.empty_archive_body')"></div>
+                <div class="onboard-subdirs">
+                  <template x-for="sub in onboardingSubdirs()" :key="sub.name">
+                    <div class="onboard-subdir">
+                      <span class="onboard-subdir-name mono" x-text="sub.name + '/'"></span>
+                      <span class="onboard-subdir-hint" x-text="sub.hint"></span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+            <template x-if="contextInfo.claude_md_exists && !contextInfo.archive_empty">
+              <div class="onboard-card calm">
+                <div class="onboard-card-title" x-text="t('onboard.ready_title')"></div>
+                <div class="onboard-suggestions">
+                  <template x-for="(q, i) in onboardingPrompts()" :key="i">
+                    <button class="onboard-suggestion" @click="useSuggestedPrompt(q)" x-text="q"></button>
+                  </template>
+                </div>
+                <!-- Skill triggers — surface what the loaded skills can do -->
+                <template x-if="settings.skills.length">
+                  <div class="onboard-skills">
+                    <div class="onboard-skills-label" x-text="t('onboard.skill_hint')"></div>
+                    <div class="onboard-skills-chips">
+                      <template x-for="sk in skillSuggestions()" :key="sk.name">
+                        <button class="skill-chip" @click="useSuggestedPrompt(sk.prompt)"
+                                :title="sk.description">
+                          <span class="skill-chip-icon">🧩</span>
+                          <span x-text="sk.label"></span>
+                        </button>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+
             <div class="brand-tips">
               <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span></div>
               <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
@@ -547,7 +623,11 @@ window.addEventListener("error", e => {
           <div x-show="streaming" class="msg assistant">
             <div class="bubble pending">
               <span class="thinking-dots"><span></span><span></span><span></span></span>
-              <span class="thinking-label" x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
+              <span class="thinking-label">
+                <span x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
+                <span x-show="streamElapsed > 1" class="stream-elapsed"
+                      x-text="' · ' + streamElapsed.toFixed(1) + 's'"></span>
+              </span>
             </div>
           </div>
         </div>
@@ -724,7 +804,7 @@ window.addEventListener("error", e => {
           <div class="settings-section-title" x-text="t('set.sec.provider')"></div>
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
           <template x-for="p in settings.providers" :key="p.env_key">
-            <div class="settings-row">
+            <div class="settings-row provider-row">
               <label x-text="p.display + ' (' + p.env_key + ')'"></label>
               <div class="settings-input-wrap">
                 <input type="password" class="settings-input"
@@ -734,6 +814,15 @@ window.addEventListener("error", e => {
                 <button x-show="p.configured" class="btn-ghost sm"
                         @click="probeProvider(p.env_key)" :title="t('set.probe_tip')"
                         x-text="t('set.probe')"></button>
+              </div>
+              <!-- Inline result of last test, persisted until next test -->
+              <div x-show="settings.probeResults[p.env_key]"
+                   class="probe-result"
+                   :class="{ ok: settings.probeResults[p.env_key]?.ok,
+                              err: !settings.probeResults[p.env_key]?.ok }">
+                <span x-show="settings.probeResults[p.env_key]?.ok">✅</span>
+                <span x-show="!settings.probeResults[p.env_key]?.ok">❌</span>
+                <span x-text="settings.probeResults[p.env_key]?.text"></span>
               </div>
             </div>
           </template>
@@ -754,6 +843,15 @@ window.addEventListener("error", e => {
               <input type="color" :value="accent" @input="setAccent($event.target.value)"
                      class="accent-custom" :title="lang==='zh' ? '自定义' : 'Custom'" />
             </div>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title" x-text="t('set.sec.sessions')"></div>
+          <div class="settings-row">
+            <label x-text="t('set.sessions.cleanup_label')"></label>
+            <button class="btn-ghost sm" @click="cleanupEmptySessions()"
+                    x-text="t('set.sessions.cleanup_btn')"></button>
           </div>
         </div>
 

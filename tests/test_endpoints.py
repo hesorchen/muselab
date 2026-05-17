@@ -67,7 +67,7 @@ def test_available_groups_only_lists_configured(monkeypatch):
     })
     groups = ep.available_groups()
     names = {g["group"] for g in groups}
-    assert "Claude (Pro OAuth)" in names
+    assert "Claude" in names
     assert "DeepSeek" in names
     assert "智谱 GLM" not in names
     assert "MiniMax" not in names
@@ -76,7 +76,7 @@ def test_available_groups_only_lists_configured(monkeypatch):
 @pytest.mark.parametrize("model,expected_host", [
     ("deepseek-v4-pro", "api.deepseek.com"),
     ("glm-5", "bigmodel.cn"),
-    ("minimax-m2.7", "minimax.io"),
+    ("minimax-m2.7", "minimaxi.com"),
 ])
 def test_all_providers_route_to_correct_host(monkeypatch, model, expected_host):
     """Each catalog entry's base_url contains the expected vendor domain."""
@@ -135,4 +135,4 @@ def test_all_catalog_providers_have_valid_fields(monkeypatch):
 def test_available_groups_claude_always_first(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "x"})
     groups = ep.available_groups()
-    assert groups[0]["group"] == "Claude (Pro OAuth)"
+    assert groups[0]["group"] == "Claude"

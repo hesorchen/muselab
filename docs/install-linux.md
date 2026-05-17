@@ -64,7 +64,33 @@ systemctl --user stop     muselab     # stop without disabling
 systemctl --user disable  muselab     # disable autostart (keeps unit file)
 journalctl --user -u muselab -f       # tail logs
 journalctl --user -u muselab -n 200   # last 200 lines
+
+bash scripts/doctor.sh                # re-verify install + probe service
+bash scripts/intake.sh                # (re)run profile intake / update CLAUDE.md
 ```
+
+## Re-run intake / refresh profile
+
+The 7-question profile intake from the installer can be re-run any time:
+
+```bash
+bash scripts/intake.sh
+```
+
+Useful after life changes (job / move / new family member) or if you skipped
+intake at install time. Existing `CLAUDE.md` gets backed up to `CLAUDE.md.bak`
+before overwrite.
+
+## Verify install / debug weirdness
+
+```bash
+bash scripts/doctor.sh
+```
+
+Checks: uv version, claude CLI, MCP runtimes (uvx/npx), `.env` shape,
+`MUSELAB_ROOT` writability, CLAUDE.md presence, `uv sync` status, service
+state, HTTP probe, token validity, configured provider keys. Returns
+non-zero on blocking failures.
 
 ## Expose to LAN (optional)
 
