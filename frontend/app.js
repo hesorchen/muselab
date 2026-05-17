@@ -1500,7 +1500,15 @@ function portal() {
       this.toast(this.t("toast.created"), "success");
       return meta;
     },
-    async switchSession() { this.savePrefs(); await this.loadSession(this.currentId); },
+    async switchSession() {
+      // Cancel any in-flight stream — the bubble was for the OLD session and
+      // the user isn't looking at it anymore. Otherwise late events would
+      // either crash trying to write to a stale bubble ref (already guarded)
+      // or silently waste bandwidth/tokens.
+      if (this.es) { try { this.es.close(); } catch {} this.es = null; this.streaming = false; }
+      this.savePrefs();
+      await this.loadSession(this.currentId);
+    },
     async loadSession(sid) {
       if (!sid) return;
       const r = await fetch("/api/chat/sessions/" + sid, { headers: this.hdr() });
@@ -2958,23 +2966,29 @@ function portal() {
       // Active assistant bubble pointer (-1 = none). Text events open / extend
       // it; tool/thinking events close it so subsequent text starts a fresh
       // bubble — preserves the actual event order visually.
-      let curIdx = -1;
+      let curBubble = null;     // direct object reference — survives array shifts
       let acc = "";
-      const modelForBubble = this.model;   // 锁定本次消息用的 model（避免中途切换造成 badge 错位）
+      const streamSessionId = this.currentId;   // capture: if user switches session
+                                                 // mid-stream, future events become no-ops
+      const modelForBubble = this.model;
       const openAsst = () => {
-        if (curIdx !== -1) return;
-        this.messages.push({ role: "assistant", text: "", html: "", cost: "", model: modelForBubble });
-        curIdx = this.messages.length - 1;
+        if (curBubble) return;
+        // Guard: don't push if we've drifted to a different session view.
+        if (this.currentId !== streamSessionId) return;
+        const bubble = { role: "assistant", text: "", html: "", cost: "", model: modelForBubble };
+        this.messages.push(bubble);
+        curBubble = bubble;
         acc = "";
       };
-      const closeAsst = () => { curIdx = -1; acc = ""; };
+      const closeAsst = () => { curBubble = null; acc = ""; };
 
       es.addEventListener("text", ev => {
         const d = JSON.parse(ev.data);
         openAsst();
+        if (!curBubble) return;           // session switched mid-stream → drop
         acc += d.text;
-        this.messages[curIdx].text = acc;
-        this.messages[curIdx].html = this.mdRender(acc);
+        curBubble.text = acc;
+        curBubble.html = this.mdRender(acc);
         this.scrollToBottom(false);
       });
       es.addEventListener("thinking", ev => {
@@ -3036,8 +3050,8 @@ function portal() {
       };
       es.addEventListener("done", ev => {
         const d = JSON.parse(ev.data);
-        if (d.total_cost_usd != null && curIdx !== -1) {
-          this.messages[curIdx].cost = "$" + d.total_cost_usd.toFixed(4);
+        if (d.total_cost_usd != null && curBubble) {
+          curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) this.sessionUsage = d.session_usage;
