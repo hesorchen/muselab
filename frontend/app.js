@@ -1352,9 +1352,18 @@ function portal() {
       const oldM = cur ? cur.model : "";
       if (newM === oldM) return;
 
+      // Decide empty vs has-messages from the PERSISTED message_count, not
+      // this.messages.length. The in-memory array can be temporarily empty
+      // during a race (session metadata loaded before messages stream in),
+      // which would wrongly take the silent path on a session that actually
+      // has history.
+      const persistedCount = (cur && typeof cur.message_count === "number")
+        ? cur.message_count
+        : this.messages.length;
+
       // Empty session — switch in place (no point creating an empty fork).
       // Still toast so the user gets visual confirmation the switch happened.
-      if (this.messages.length === 0) {
+      if (persistedCount === 0) {
         try {
           const r = await fetch("/api/chat/sessions/" + this.currentId, {
             method: "PATCH",
