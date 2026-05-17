@@ -945,6 +945,97 @@ window.addEventListener("error", e => {
           </div>
         </div>
 
+        <!-- Versions + upgrade — shows current vs latest SDK / CLI, one-click bump. -->
+        <div class="settings-section">
+          <div class="settings-section-title">
+            <span x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
+            <button class="btn-ghost sm" @click="loadVersions()"
+                    :disabled="settings.versionsLoading"
+                    style="margin-left: 8px;"
+                    x-text="settings.versionsLoading ? (lang==='zh' ? '检查中…' : 'Checking…') : (lang==='zh' ? '检查更新' : 'Check')"></button>
+          </div>
+          <template x-if="settings.versions">
+            <div>
+              <table class="version-table">
+                <thead>
+                  <tr>
+                    <th x-text="lang==='zh' ? '组件' : 'Component'"></th>
+                    <th x-text="lang==='zh' ? '已安装' : 'Installed'"></th>
+                    <th x-text="lang==='zh' ? '最新' : 'Latest'"></th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>claude-agent-sdk</td>
+                    <td><code x-text="settings.versions.current?.sdk || '—'"></code></td>
+                    <td><code x-text="settings.versions.latest?.sdk || '?'"></code></td>
+                    <td>
+                      <span x-show="settings.versions.sdk_upgrade_available" class="upgrade-badge"
+                            x-text="lang==='zh' ? '有更新' : 'update'"></span>
+                      <span x-show="!settings.versions.sdk_upgrade_available && settings.versions.current?.sdk" class="upgrade-badge ok"
+                            x-text="lang==='zh' ? '最新' : 'latest'"></span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>claude CLI</td>
+                    <td><code x-text="settings.versions.current?.cli || (lang==='zh' ? '未安装' : 'not installed')"></code></td>
+                    <td><code x-text="settings.versions.latest?.cli || '?'"></code></td>
+                    <td>
+                      <span x-show="settings.versions.cli_upgrade_available" class="upgrade-badge"
+                            x-text="lang==='zh' ? '有更新' : 'update'"></span>
+                      <span x-show="!settings.versions.cli_upgrade_available && settings.versions.current?.cli" class="upgrade-badge ok"
+                            x-text="lang==='zh' ? '最新' : 'latest'"></span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>python</td>
+                    <td><code x-text="settings.versions.current?.python || '—'"></code></td>
+                    <td>—</td>
+                    <td></td>
+                  </tr>
+                </tbody>
+              </table>
+              <div x-show="settings.versions.expected_cli_version && settings.versions.current?.cli &&
+                            settings.versions.expected_cli_version !== settings.versions.current?.cli"
+                   class="settings-hint warn">
+                <span x-text="(lang==='zh' ? '⚠ SDK 期望 CLI 版本 ' : '⚠ SDK expects CLI ') + (settings.versions.expected_cli_version || '?')"></span>
+              </div>
+              <div class="settings-row" style="margin-top: 10px;">
+                <button class="btn-primary sm" @click="runUpgrade()"
+                        :disabled="settings.upgradeRunning ||
+                                    (!settings.versions.sdk_upgrade_available && !settings.versions.cli_upgrade_available)"
+                        x-text="settings.upgradeRunning ? (lang==='zh' ? '升级中… (可能需要 30s)' : 'Upgrading… (30s)') : (lang==='zh' ? '一键升级' : 'Upgrade now')"></button>
+              </div>
+              <template x-if="settings.upgradeResult">
+                <div class="upgrade-result" :class="{ ok: settings.upgradeResult.ok, err: !settings.upgradeResult.ok }">
+                  <div x-show="settings.upgradeResult.ok"
+                       x-text="lang==='zh' ? '✅ 升级完成' : '✅ Upgrade complete'"></div>
+                  <div x-show="!settings.upgradeResult.ok"
+                       x-text="lang==='zh' ? '❌ 升级失败 — 查看下方步骤' : '❌ Upgrade failed — see steps below'"></div>
+                  <div x-show="settings.upgradeResult.needs_restart" class="restart-hint">
+                    <div x-text="lang==='zh' ? '需要重启服务以加载新版 SDK：' : 'Restart service to load new SDK:'"></div>
+                    <pre x-text="settings.upgradeResult.restart_hint"></pre>
+                  </div>
+                  <details>
+                    <summary x-text="lang==='zh' ? '查看升级日志' : 'View upgrade log'"></summary>
+                    <template x-for="(s, i) in settings.upgradeResult.steps" :key="i">
+                      <div class="upgrade-step">
+                        <div class="upgrade-step-name" x-text="s.step + (s.rc != null ? ' (rc=' + s.rc + ')' : '')"></div>
+                        <pre x-show="s.output" x-text="s.output"></pre>
+                      </div>
+                    </template>
+                  </details>
+                </div>
+              </template>
+            </div>
+          </template>
+          <template x-if="!settings.versions && !settings.versionsLoading">
+            <div class="settings-hint"
+                 x-text="lang==='zh' ? '点击「检查更新」查询 PyPI + npm 上的最新版本。' : 'Click Check to query PyPI + npm for the latest versions.'"></div>
+          </template>
+        </div>
+
         <div class="settings-section">
           <div class="settings-section-title" x-text="t('set.sec.defaults')"></div>
           <div class="settings-row">

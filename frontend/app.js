@@ -653,6 +653,11 @@ function portal() {
       mcpDraft: { show: false, name: "", command: "", argsStr: "" },
       skills: [],   // discovered skill list (read-only browse)
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
+      // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
+      versions: null,
+      versionsLoading: false,
+      upgradeRunning: false,
+      upgradeResult: null,
     },
 
     // Per-provider help hints rendered under the API-key input. Anthropic
@@ -1723,6 +1728,56 @@ function portal() {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
       }
     },
+
+    // ===== Versions + upgrade =====
+    async loadVersions() {
+      this.settings.versionsLoading = true;
+      try {
+        const r = await fetch("/api/settings/versions", { headers: this.hdr() });
+        if (r.ok) this.settings.versions = await r.json();
+        else this.toast(this.lang === "zh" ? "版本检查失败" : "Version check failed", "error", 3000);
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "版本检查失败：" : "Check failed: ") + e.message, "error", 3000);
+      } finally {
+        this.settings.versionsLoading = false;
+      }
+    },
+    async runUpgrade() {
+      if (!this.settings.versions) return;
+      const targets = [];
+      if (this.settings.versions.sdk_upgrade_available) targets.push("sdk");
+      if (this.settings.versions.cli_upgrade_available) targets.push("cli");
+      if (targets.length === 0) {
+        this.toast(this.lang === "zh" ? "无需升级" : "Nothing to upgrade", "info", 2000);
+        return;
+      }
+      this.settings.upgradeRunning = true;
+      this.settings.upgradeResult = null;
+      try {
+        const r = await fetch("/api/settings/upgrade", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ targets }),
+        });
+        if (r.ok) {
+          this.settings.upgradeResult = await r.json();
+          if (this.settings.upgradeResult.ok) {
+            this.toast(this.lang === "zh" ? "升级完成" : "Upgrade complete", "success", 3000);
+            // Refresh the versions table so user sees the new numbers
+            await this.loadVersions();
+          } else {
+            this.toast(this.lang === "zh" ? "升级失败 — 查看日志" : "Upgrade failed — see log", "error", 5000);
+          }
+        } else {
+          this.toast((this.lang === "zh" ? "请求失败：" : "Request failed: ") + r.status, "error", 4000);
+        }
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "升级出错：" : "Upgrade error: ") + e.message, "error", 5000);
+      } finally {
+        this.settings.upgradeRunning = false;
+      }
+    },
+
     async saveSettings() {
       const body = {
         default_model: this.settings.draftDefaults.model,

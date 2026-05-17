@@ -1898,3 +1898,64 @@ pre.has-copy-btn .code-copy-btn.copied {
 .markdown pre code.hljs, .bubble pre code.hljs {
   background: transparent !important; padding: 0 !important;
 }
+
+/* ==========================================================================
+   Versions + upgrade — Settings panel section
+   ========================================================================== */
+.version-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 4px;
+  font-size: var(--fs-sm);
+}
+.version-table th, .version-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--c-border);
+}
+.version-table th { color: var(--c-fg-2); font-weight: var(--fw-semibold); }
+.version-table code {
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+  background: var(--c-bg-2); padding: 1px 6px; border-radius: var(--r-sm);
+}
+.upgrade-badge {
+  display: inline-block;
+  padding: 1px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: var(--fw-semibold);
+  background: var(--c-accent-soft); color: var(--c-accent);
+}
+.upgrade-badge.ok { background: var(--c-bg-2); color: var(--c-fg-3); }
+.settings-hint.warn { color: var(--c-warning, #b45309); margin-top: 8px; }
+
+.upgrade-result {
+  margin-top: 12px; padding: 10px 14px;
+  border-radius: var(--r-md);
+  background: var(--c-bg-1); border-left: 3px solid var(--c-accent);
+  font-size: var(--fs-sm);
+}
+.upgrade-result.err { border-left-color: var(--c-danger); }
+.upgrade-result .restart-hint { margin-top: 8px; }
+.upgrade-result .restart-hint pre {
+  margin: 4px 0 0 0; padding: 8px 10px;
+  background: var(--c-bg-0); color: var(--c-fg-1);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+  white-space: pre-wrap; word-break: break-all;
+}
+.upgrade-result details { margin-top: 8px; }
+.upgrade-result details summary {
+  cursor: pointer; color: var(--c-accent); font-size: var(--fs-xs);
+}
+.upgrade-step { margin-top: 8px; }
+.upgrade-step-name {
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+  color: var(--c-fg-2);
+}
+.upgrade-step pre {
+  margin: 4px 0 0 0; padding: 6px 10px;
+  background: var(--c-bg-0); color: var(--c-fg-2);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.4;
+  max-height: 240px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all;
+}

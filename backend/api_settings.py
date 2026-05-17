@@ -369,3 +369,204 @@ def list_skills() -> dict:
     skills = (_list_skills_in(SKILL_PROJECT_DIR, "project") +
               _list_skills_in(SKILL_USER_DIR, "user"))
     return {"skills": skills}
+
+
+# ====== Upgrade / version check ======
+
+import asyncio
+import shutil
+import subprocess
+import sys
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_UPGRADE_LOCK = asyncio.Lock()        # serialize upgrades — never run two at once
+_LAST_UPGRADE: dict[str, Any] = {}     # cache last upgrade output for UI replay
+
+
+def _current_versions() -> dict:
+    """Currently-installed muselab + SDK + CLI versions."""
+    sdk_version = None
+    try:
+        from claude_agent_sdk import __version__ as _v
+        sdk_version = _v
+    except Exception:
+        pass
+    cli_version = None
+    cli_bin = shutil.which("claude")
+    if cli_bin:
+        try:
+            out = subprocess.run([cli_bin, "--version"], capture_output=True,
+                                  text=True, timeout=3)
+            line = (out.stdout.strip().splitlines() or [""])[0]
+            # CLI prints e.g. "2.1.142" or "2.1.142 (Claude Code)"
+            import re
+            m = re.search(r"\d+\.\d+\.\d+", line)
+            cli_version = m.group(0) if m else (line or None)
+        except Exception:
+            pass
+    return {
+        "sdk": sdk_version,
+        "cli": cli_version,
+        "cli_present": cli_version is not None,
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    }
+
+
+async def _latest_versions() -> dict:
+    """Query PyPI + npm for the latest released versions of SDK / CLI.
+    Returns {sdk: str|None, cli: str|None, errors: [str]}."""
+    import httpx
+    errors: list[str] = []
+    sdk_latest = None
+    cli_latest = None
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        try:
+            r = await client.get("https://pypi.org/pypi/claude-agent-sdk/json")
+            if r.status_code == 200:
+                sdk_latest = r.json().get("info", {}).get("version")
+            else:
+                errors.append(f"pypi HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"pypi: {type(e).__name__}: {e}")
+        try:
+            r = await client.get("https://registry.npmjs.org/@anthropic-ai/claude-code/latest")
+            if r.status_code == 200:
+                cli_latest = r.json().get("version")
+            else:
+                errors.append(f"npm HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"npm: {type(e).__name__}: {e}")
+    return {"sdk": sdk_latest, "cli": cli_latest, "errors": errors}
+
+
+def _semver_gt(a: str | None, b: str | None) -> bool:
+    """True if a > b (both 'X.Y.Z' style). Missing → False (don't suggest upgrade)."""
+    if not a or not b:
+        return False
+    try:
+        ta = tuple(int(p) for p in a.split(".")[:3])
+        tb = tuple(int(p) for p in b.split(".")[:3])
+        return ta > tb
+    except (ValueError, AttributeError):
+        return False
+
+
+@router.get("/versions", dependencies=[Depends(require_token)])
+async def get_versions() -> dict:
+    """Current + latest versions for SDK and CLI; flags whether an upgrade
+    is available. Used by the Settings panel's "版本与升级" section."""
+    current = _current_versions()
+    latest = await _latest_versions()
+    return {
+        "current": current,
+        "latest": latest,
+        "sdk_upgrade_available": _semver_gt(latest.get("sdk"), current.get("sdk")),
+        "cli_upgrade_available": _semver_gt(latest.get("cli"), current.get("cli")),
+        "expected_cli_version": _expected_cli_version(),
+        "last_upgrade": _LAST_UPGRADE.copy() if _LAST_UPGRADE else None,
+    }
+
+
+def _expected_cli_version() -> str | None:
+    """SDK bundles a string indicating the CLI version it was built against.
+    If user's installed CLI is older, --session-id and other recent flags fail."""
+    try:
+        from claude_agent_sdk._cli_version import __cli_version__
+        return __cli_version__
+    except Exception:
+        return None
+
+
+class UpgradeReq(BaseModel):
+    targets: list[str] = Field(default_factory=lambda: ["sdk", "cli"])
+    """Which packages to upgrade. Default: both."""
+
+
+@router.post("/upgrade", dependencies=[Depends(require_token)])
+async def trigger_upgrade(req: UpgradeReq) -> dict:
+    """Run the upgrade flow in-process. Returns step-by-step output for the
+    UI to render. Does NOT restart muselab — the running Python process keeps
+    serving the old SDK in memory until you restart it (Scheduled Task /
+    systemd / launchctl). UI shows the restart command after upgrade ends."""
+    if _UPGRADE_LOCK.locked():
+        raise HTTPException(409, "upgrade already in progress")
+    async with _UPGRADE_LOCK:
+        steps: list[dict] = []
+        before = _current_versions()
+        steps.append({"step": "before", "versions": before})
+
+        if "sdk" in req.targets:
+            # uv lock --upgrade-package claude-agent-sdk, then uv sync
+            try:
+                p1 = await asyncio.create_subprocess_exec(
+                    "uv", "lock", "--upgrade-package", "claude-agent-sdk",
+                    cwd=str(_REPO_ROOT),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                out1, _ = await p1.communicate()
+                steps.append({"step": "uv lock", "rc": p1.returncode,
+                              "output": (out1 or b"").decode(errors="replace")[-2000:]})
+                if p1.returncode != 0:
+                    raise RuntimeError("uv lock failed")
+
+                p2 = await asyncio.create_subprocess_exec(
+                    "uv", "sync", "--frozen",
+                    cwd=str(_REPO_ROOT),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                out2, _ = await p2.communicate()
+                steps.append({"step": "uv sync", "rc": p2.returncode,
+                              "output": (out2 or b"").decode(errors="replace")[-2000:]})
+                if p2.returncode != 0:
+                    raise RuntimeError("uv sync failed")
+            except FileNotFoundError:
+                steps.append({"step": "uv lock", "rc": -1, "output": "uv binary not found in PATH"})
+            except Exception as e:
+                steps.append({"step": "sdk upgrade aborted", "rc": -1, "output": f"{type(e).__name__}: {e}"})
+
+        if "cli" in req.targets and shutil.which("npm"):
+            try:
+                p3 = await asyncio.create_subprocess_exec(
+                    "npm", "install", "-g", "@anthropic-ai/claude-code@latest",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                out3, _ = await p3.communicate()
+                steps.append({"step": "npm install -g claude-code", "rc": p3.returncode,
+                              "output": (out3 or b"").decode(errors="replace")[-2000:]})
+            except Exception as e:
+                steps.append({"step": "cli upgrade aborted", "rc": -1, "output": f"{type(e).__name__}: {e}"})
+        elif "cli" in req.targets:
+            steps.append({"step": "npm not found", "rc": -1, "output": "skipped — install Node.js + npm first"})
+
+        # Re-read post-upgrade versions
+        after = _current_versions()
+        steps.append({"step": "after", "versions": after})
+
+        # Detect changes
+        sdk_changed = before.get("sdk") != after.get("sdk")
+        cli_changed = before.get("cli") != after.get("cli")
+        all_ok = all(s.get("rc", 0) == 0 for s in steps if "rc" in s)
+        result = {
+            "ok": all_ok,
+            "steps": steps,
+            "sdk_changed": sdk_changed,
+            "cli_changed": cli_changed,
+            "needs_restart": sdk_changed,   # SDK loaded in-process → restart to pick up
+            "restart_hint": _restart_hint(),
+        }
+        _LAST_UPGRADE.clear()
+        _LAST_UPGRADE.update(result)
+        return result
+
+
+def _restart_hint() -> str:
+    """Platform-specific command to restart muselab so the new SDK is loaded."""
+    import platform
+    sysname = platform.system()
+    if sysname == "Windows":
+        return ("Stop-ScheduledTask -TaskName Muselab; "
+                "Get-Process python,uv -EA SilentlyContinue | Stop-Process -Force; "
+                "Start-ScheduledTask -TaskName Muselab")
+    if sysname == "Darwin":
+        return "launchctl kickstart -k gui/$UID/com.muselab"
+    return "systemctl --user restart muselab"
