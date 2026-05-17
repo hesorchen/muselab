@@ -1336,8 +1336,25 @@ function portal() {
       } catch {}
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r.ok) this.availableModels = (await r.json()).models || [];
+        if (r.ok) {
+          this.availableModels = (await r.json()).models || [];
+          this._rebindModelSelect();
+        }
       } catch {}
+    },
+
+    // After availableModels changes, the <select x-model="model"> doesn't
+    // re-pick the displayed option if its DOM value was set against an
+    // earlier-rendered set of options (the fallback option). Force a re-bind
+    // by tickling this.model — set it to '' then back, in successive ticks.
+    // No-op'd when model is empty (avoid clearing intent).
+    async _rebindModelSelect() {
+      const cur = this.model;
+      if (!cur) return;
+      await this.$nextTick();
+      this.model = "";
+      await this.$nextTick();
+      this.model = cur;
     },
 
     // Model switch:
@@ -1730,7 +1747,10 @@ function portal() {
         this.toast(`已保存 ${d.updated.length} 项设置`, "success");
         // 刷新可用 provider 列表
         const r2 = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r2.ok) this.availableModels = (await r2.json()).models || [];
+        if (r2.ok) {
+          this.availableModels = (await r2.json()).models || [];
+          this._rebindModelSelect();
+        }
         // 也刷新 contextInfo — has_any_provider 变了，否则 "no provider" 卡片不消失
         this.fetchContextInfo();
       } else {
