@@ -7,7 +7,17 @@ admin needed.
 ## Prerequisites
 
 - Windows 10 or 11 (PowerShell 5+ included by default)
-- `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/)):
+- **Set PowerShell ExecutionPolicy once** (Windows defaults to `Restricted`,
+  which blocks both uv's installer wrapper and uv itself from running):
+  ```powershell
+  Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+  ```
+  Answer `Y`. This only affects your user. Then **open a new PowerShell window**.
+  Skip this step and you'll see:
+  ```
+  Error: PowerShell requires an execution policy in [Unrestricted, RemoteSigned, Bypass] to run uv.
+  ```
+- Install `uv` ([docs](https://docs.astral.sh/uv/getting-started/installation/)):
   ```powershell
   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
   ```

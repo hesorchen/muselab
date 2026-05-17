@@ -104,8 +104,12 @@ be left confused.
 ```bash
 # Linux / macOS
 curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-# Windows PowerShell
+```powershell
+# Windows PowerShell — first allow scripts (default is Restricted),
+# then install uv. Reopen PowerShell after the policy change.
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 

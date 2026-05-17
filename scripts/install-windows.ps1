@@ -31,6 +31,24 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 }
 Ok "PowerShell: $($PSVersionTable.PSVersion)"
 
+# ExecutionPolicy — install-windows.ps1 itself runs because the user passed
+# -ExecutionPolicy Bypass on the invocation. But the *Scheduled Task* we
+# register will spawn cmd.exe → launcher.cmd → uv.exe, and uv itself refuses
+# to run under Restricted policy ("PowerShell requires an execution policy in
+# [Unrestricted, RemoteSigned, Bypass] to run uv"). So check the persistent
+# CurrentUser policy and tell the user to fix it now, not after first reboot.
+$policy = Get-ExecutionPolicy -Scope CurrentUser
+if ($policy -eq "Restricted" -or $policy -eq "AllSigned" -or $policy -eq "Undefined") {
+  Warn "Your CurrentUser ExecutionPolicy is '$policy'."
+  Write-Host "      uv refuses to run under this policy. Run once:"
+  Write-Host "        Set-ExecutionPolicy RemoteSigned -Scope CurrentUser"
+  Write-Host "      Then re-open PowerShell and re-run this installer."
+  $cont = Ask "Continue anyway (the service will fail at first boot)? [y/N]:" "N"
+  if ($cont -notmatch "^[Yy]") { exit 1 }
+} else {
+  Ok "ExecutionPolicy: $policy (uv will work)"
+}
+
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $uv) {
   Err "uv not found. Install it first:"
