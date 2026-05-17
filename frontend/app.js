@@ -1352,7 +1352,8 @@ function portal() {
       const oldM = cur ? cur.model : "";
       if (newM === oldM) return;
 
-      // Empty session — silent switch.
+      // Empty session — switch in place (no point creating an empty fork).
+      // Still toast so the user gets visual confirmation the switch happened.
       if (this.messages.length === 0) {
         try {
           const r = await fetch("/api/chat/sessions/" + this.currentId, {
@@ -1367,6 +1368,11 @@ function portal() {
           }
           await this.refreshSessions();
           this.savePrefs();
+          const label = this.modelLabel(newM);
+          this.toast(this.lang === "zh"
+            ? `已切到 ${label}（空会话，无需新建）`
+            : `Switched to ${label} (empty session, no fork needed)`,
+            "success", 1800);
         } catch (e) {
           this.model = oldM;
           this.toast(this.t("slash.failed"), "error");
