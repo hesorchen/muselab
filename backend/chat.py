@@ -107,12 +107,25 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             # and kill the message reader silently — the chat then "hangs forever"
             # because no more chunks arrive. Bump to 32 MB; configurable via env.
             max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
+            # Critical SDK option distinction:
+            #   `session_id=X`  → force a NEW session to use UUID X
+            #   `resume=X`      → resume an EXISTING session by UUID X
+            # If we always use `resume` (even for sessions that have no JSONL
+            # yet), CLI silently generates a fresh UUID and writes to a
+            # different file — muselab's session_id is then orphaned and any
+            # subsequent get_session_messages(muselab_uuid) returns empty.
+            # So: detect whether the JSONL exists and pick the right one.
+            try:
+                from claude_agent_sdk._internal.sessions import _find_project_dir, _canonicalize_path
+                proj_dir = _find_project_dir(_canonicalize_path(str(ROOT)))
+                jsonl_exists = proj_dir is not None and (proj_dir / f"{session_id}.jsonl").exists()
+            except Exception:
+                jsonl_exists = False
             opts_kwargs = dict(
                 cwd=str(ROOT),
                 model=model,
                 permission_mode=permission,
                 system_prompt=sp,
-                resume=session_id,
                 max_buffer_size=max_buf,
                 # Block harness-only tools the SDK exposes by default. AskUserQuestion
                 # is intentionally NOT blocked: we re-implement it via in-process MCP
@@ -132,6 +145,9 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 # (cwd/CLAUDE.md → the user's archive), and local (.claude/
                 # within cwd). Also enables skill discovery from the same scopes.
                 setting_sources=["user", "project", "local"],
+                # Bind THIS session to muselab's chosen UUID — either as a new
+                # session (session_id=) or by resuming the existing one (resume=).
+                **({"resume": session_id} if jsonl_exists else {"session_id": session_id}),
                 # Token-level streaming: SDK emits StreamEvent for each delta
                 # the model produces (text / thinking). Without this, we only
                 # see full blocks at the end → user waits for the whole reply
