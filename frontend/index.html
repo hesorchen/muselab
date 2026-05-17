@@ -536,6 +536,15 @@ window.addEventListener("error", e => {
           </div>
           <template x-for="(m,i) in messages" :key="m._k || (currentId + '-' + i)">
             <div :class="'msg ' + m.role">
+              <!-- Compact-summary pill: SDK returns the post-/compact summary as
+                   a regular user/assistant message; we mark its UUID via the
+                   _is_compact_summary flag (detected by reading isCompactSummary
+                   from the raw CLI JSONL). Render as a centered pill above the
+                   message text so the user sees "this is the summary, not the
+                   original history." -->
+              <div x-show="m._is_compact_summary" class="compact-summary-pill">
+                <span x-text="lang==='zh' ? '📦 上方对话已压缩 · 以下为摘要' : '📦 Conversation compacted · summary below'"></span>
+              </div>
               <div x-show="m.role==='user'" class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
               <div x-show="m.role==='assistant'" class="bubble" x-html="m.html"></div>
             <div x-show="m.role==='assistant' && m.model" class="model-tag"

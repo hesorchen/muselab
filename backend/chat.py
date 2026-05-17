@@ -235,21 +235,27 @@ def create_session_api(req: CreateReq) -> dict:
     return meta
 
 
-def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict]) -> list[dict]:
+def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
+                          compact_uuids: set[str] | None = None) -> list[dict]:
     """Convert SDK SessionMessage list into muselab's flat UI message list.
     Each SessionMessage may explode into multiple UI bubbles because the
     frontend renders tool_use / tool_result / thinking blocks as separate
     messages from the text bubble. Annotations (cost, model, images) attach
-    by message UUID to the primary text bubble."""
+    by message UUID to the primary text bubble. UUIDs in `compact_uuids`
+    get an `_is_compact_summary` flag so the UI can render a "📦 已压缩" pill."""
+    compact_uuids = compact_uuids or set()
     out: list[dict] = []
     for sm in sm_list:
         ann = annotations.get(sm.uuid, {})
+        is_compact = sm.uuid in compact_uuids
         msg = sm.message or {}
         content = msg.get("content")
 
         # Simple shape: content is a single string.
         if isinstance(content, str):
             entry = {"role": sm.type, "text": content, "uuid": sm.uuid}
+            if is_compact:
+                entry["_is_compact_summary"] = True
             entry.update(ann)   # cost / model / images / etc.
             out.append(entry)
             continue
@@ -264,6 +270,8 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict]) -> list[dic
             if not text_buf and not image_refs:
                 return
             entry = {"role": sm.type, "text": text_buf, "uuid": sm.uuid}
+            if is_compact:
+                entry["_is_compact_summary"] = True
             if image_refs:
                 # CLI JSONL stores image source dicts; convert minimal info for UI.
                 # If sidecar has full base64 (uploaded via muselab), it wins
@@ -348,6 +356,39 @@ def _summarize_tool_input(name: str | None, inp: dict) -> str:
     return ""
 
 
+def _compact_summary_uuids(sid: str) -> set[str]:
+    """Scan raw CLI JSONL for entries with isCompactSummary:true and return
+    their UUIDs. SDK get_session_messages strips this flag, so to render a
+    "📦 已压缩" indicator we have to detect it ourselves at the JSONL level."""
+    from claude_agent_sdk._internal.sessions import (
+        _find_project_dir, _canonicalize_path, _sanitize_path,
+    )
+    try:
+        # Resolve the CLI's project dir for our cwd; then find <sid>.jsonl in it.
+        # Falls back gracefully if SDK internals shift.
+        canon = _canonicalize_path(str(ROOT))
+        proj_dir = _find_project_dir(canon)
+        if proj_dir is None:
+            return set()
+        jsonl_path = proj_dir / f"{sid}.jsonl"
+        if not jsonl_path.exists():
+            return set()
+        uuids: set[str] = set()
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"isCompactSummary":true' not in line and '"isCompactSummary": true' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if entry.get("isCompactSummary") and entry.get("uuid"):
+                    uuids.add(entry["uuid"])
+        return uuids
+    except Exception:
+        return set()
+
+
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
 def get_session_api(sid: str) -> dict:
     """Read session: metadata from muselab sidecar + transcript from CLI JSONL
@@ -361,7 +402,8 @@ def get_session_api(sid: str) -> dict:
     except Exception:
         sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
-    messages = _sdk_messages_to_ui(sdk_msgs, annotations)
+    compact_uuids = _compact_summary_uuids(sid)
+    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
     return {**meta, "messages": messages}
 
 
