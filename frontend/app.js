@@ -655,6 +655,32 @@ function portal() {
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
     },
 
+    // Per-provider help hints rendered under the API-key input. Anthropic
+    // gets the most because it has two valid paths (Pro OAuth or API key);
+    // others are just a link to where to get the key.
+    PROVIDER_HELP: {
+      ANTHROPIC_API_KEY: {
+        url: "https://console.anthropic.com/settings/keys",
+        zh: "两种路径：(1) Pro/Max 订阅 → 终端跑 `claude login`（免费配额，无需在此填）；(2) API 按量付费 → 去 console.anthropic.com 拿 key 填这里。两个都配 → CLI 自动用 Pro，不会重复扣费。",
+        en: "Two paths: (1) Pro/Max subscription → run `claude login` in terminal (free quota, leave this blank); (2) pay-per-use API → grab a key from console.anthropic.com and paste it here. With both configured, CLI prefers Pro automatically — you won't double-bill.",
+      },
+      DEEPSEEK_API_KEY: {
+        url: "https://platform.deepseek.com/api_keys",
+        zh: "去 platform.deepseek.com 控制台创建 API key（注册送 5 元额度）。",
+        en: "Create an API key at platform.deepseek.com (free trial credit on signup).",
+      },
+      ZHIPUAI_API_KEY: {
+        url: "https://open.bigmodel.cn/usercenter/apikeys",
+        zh: "去 open.bigmodel.cn 控制台创建 API key。注意是国内站，不是 zhipuai.com.cn。",
+        en: "Create an API key at open.bigmodel.cn (China mainland site).",
+      },
+      MINIMAX_API_KEY: {
+        url: "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+        zh: "去 platform.minimaxi.com（国内站）创建 API key。注意是 minimaxi.com 不是 minimax.io（后者是海外站，用同 key 401）。",
+        en: "Create an API key at platform.minimaxi.com (the .com - .io is overseas and rejects the same key).",
+      },
+    },
+
     _pendingExpanded: null,
 
     // ===== init =====

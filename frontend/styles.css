@@ -1089,6 +1089,22 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .provider-row .probe-result.ok  { background: var(--c-accent-soft); color: var(--c-accent); }
 .provider-row .probe-result.err { background: rgba(220, 53, 69, 0.10); color: var(--c-danger); }
 
+/* Per-provider help text (where to get key, alt paths) */
+.provider-row .provider-help {
+  grid-column: 2;
+  margin-top: 4px;
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  line-height: 1.55;
+}
+.provider-row .provider-help a {
+  margin-left: 6px;
+  color: var(--c-accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.provider-row .provider-help a:hover { text-decoration: underline; }
+
 /* Onboarding cards in chat empty state */
 .onboard-card {
   margin: var(--sp-4) 0 var(--sp-3);

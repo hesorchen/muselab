@@ -872,6 +872,14 @@ window.addEventListener("error", e => {
                         @click="probeProvider(p.env_key)" :title="t('set.probe_tip')"
                         x-text="t('set.probe')"></button>
               </div>
+              <!-- Per-provider help text + console link -->
+              <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
+                <span x-text="PROVIDER_HELP[p.env_key]?.[lang]"></span>
+                <a x-show="PROVIDER_HELP[p.env_key]?.url"
+                   :href="PROVIDER_HELP[p.env_key]?.url"
+                   target="_blank" rel="noopener"
+                   x-text="lang==='zh' ? '打开控制台 ↗' : 'Open console ↗'"></a>
+              </div>
               <!-- Inline result of last test, persisted until next test -->
               <div x-show="settings.probeResults[p.env_key]"
                    class="probe-result"

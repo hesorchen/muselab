@@ -44,16 +44,8 @@ if [[ -z "$PYV" ]] || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >
   warn "system python is < 3.12 (or missing). uv will download Python 3.12 during sync (~50MB extra)."
 fi
 
-# Port 8765 conflict check — if something else is listening, service will
-# fail silently. Tell user now so they can free the port or change MUSELAB_PORT.
-if command -v ss >/dev/null 2>&1; then
-  if ss -tlnH "sport = :8765" 2>/dev/null | grep -q LISTEN; then
-    err "Port 8765 is already in use:"
-    ss -tlnp "sport = :8765" 2>&1 | head -3
-    echo "      Either stop that process, or set MUSELAB_PORT=<other> in .env before re-running."
-    exit 1
-  fi
-fi
+# Port pick + conflict check now happen at the .env step after the user can
+# choose a non-default port.
 
 if ! command -v claude >/dev/null 2>&1; then
   warn "claude CLI not found. Anthropic models won't work until you install it"
@@ -120,6 +112,24 @@ else
   done
 
   echo
+  echo "  HTTP port = where the web UI listens. Default 8765 is usually free."
+  echo "  HTTP 端口 = Web UI 监听端口。默认 8765 通常没被占用。"
+  while true; do
+    read -r -p "  Port / 端口 [8765]: " PORT_INPUT
+    if [[ -z "$PORT_INPUT" ]]; then PORT=8765; break; fi
+    if [[ "$PORT_INPUT" =~ ^[0-9]+$ ]] && (( PORT_INPUT >= 1024 && PORT_INPUT <= 65535 )); then
+      PORT="$PORT_INPUT"; break
+    fi
+    warn "port must be 1024-65535 / 端口范围 1024-65535"
+  done
+  if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
+    err "Port $PORT is already in use:"
+    ss -tlnp "sport = :$PORT" 2>&1 | head -3
+    exit 1
+  fi
+  ok "port $PORT available / 端口 $PORT 可用"
+
+  echo
   echo "  Archive dir = where Muse can read/write (NEVER point at \$HOME or /)"
   ARCHIVE="$(ask 'Archive dir (absolute path):' "$HOME/muselab-archive")"
   ARCHIVE="${ARCHIVE/#\~/$HOME}"
@@ -138,7 +148,7 @@ else
 MUSELAB_TOKEN=$TOKEN
 MUSELAB_ROOT=$ARCHIVE
 MUSELAB_HOST=127.0.0.1
-MUSELAB_PORT=8765
+MUSELAB_PORT=$PORT
 MUSELAB_MODEL=claude-sonnet-4-6
 EOF
   chmod 600 .env
@@ -234,6 +244,11 @@ EOF
   fi
 fi
 
+# Reload PORT from .env (may be non-default if user picked one, or from a
+# pre-existing .env in the "keeping as is" branch).
+PORT="$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+PORT="${PORT:-8765}"
+
 # ----- 4. systemd user service -------------------------------------------
 bold "4/5  Installing systemd --user service / 注册 systemd 用户服务"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -271,7 +286,7 @@ fi
 
 echo
 bold "✓ muselab installed / 安装完成"
-echo  "  Open  / 打开    → http://localhost:8765"
+echo  "  Open  / 打开    → http://localhost:$PORT"
 echo  "  Token / 登录口令 → grep MUSELAB_TOKEN .env"
 echo
 echo  "  Useful commands / 常用命令:"

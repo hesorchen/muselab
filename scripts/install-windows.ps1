@@ -68,18 +68,8 @@ if (-not $uv) {
 $UvPath = $uv.Source
 Ok "uv: $UvPath"
 
-# Port 8765 conflict check
-$portInUse = $false
-try {
-  $listeners = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction Stop
-  if ($listeners) { $portInUse = $true }
-} catch { } # cmdlet not available on older PS, skip
-if ($portInUse) {
-  Err "Port 8765 is already in use:"
-  $listeners | Format-Table LocalAddress, LocalPort, OwningProcess
-  Write-Host "      Stop that process or set MUSELAB_PORT=<other> in .env."
-  exit 1
-}
+# Port pick + conflict check now happen at the .env step, after the user can
+# choose a non-default port. Keep the earlier prereq block focused on tools.
 
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claude) {
@@ -140,6 +130,30 @@ if (Test-Path $EnvPath) {
   }
 
   Write-Host
+  Write-Host "  HTTP port = where the web UI listens. Default 8765 is usually free."
+  Write-Host "  HTTP 端口 = Web UI 监听端口。默认 8765 通常没被占用。"
+  while ($true) {
+    $PortInput = Read-Host "  Port / 端口 [8765]"
+    if ([string]::IsNullOrWhiteSpace($PortInput)) { $Port = 8765; break }
+    $parsed = 0
+    if ([int]::TryParse($PortInput, [ref]$parsed) -and $parsed -ge 1024 -and $parsed -le 65535) {
+      $Port = $parsed; break
+    }
+    Warn "port must be 1024-65535 / 端口范围 1024-65535"
+  }
+  # Check the chosen port is free
+  try {
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
+    if ($listeners) {
+      Err "Port $Port is already in use:"
+      $listeners | Format-Table LocalAddress, LocalPort, OwningProcess
+      Write-Host "      Stop that process or re-run and pick a different port."
+      exit 1
+    }
+  } catch { } # cmdlet missing on older PS — skip soft
+  Ok "port $Port available / 端口 $Port 可用"
+
+  Write-Host
   Write-Host "  Archive dir = where Muse can read/write (NEVER point at your user dir or C:\)"
   Write-Host "  档案目录 = Muse 能读写的地方（不要指向你的用户目录或 C:\ 整个盘）"
   $defArchive = Join-Path $env:USERPROFILE "muselab-archive"
@@ -168,7 +182,7 @@ if (Test-Path $EnvPath) {
 MUSELAB_TOKEN=$Token
 MUSELAB_ROOT=$($Archive -replace '\\','/')
 MUSELAB_HOST=127.0.0.1
-MUSELAB_PORT=8765
+MUSELAB_PORT=$Port
 MUSELAB_MODEL=claude-sonnet-4-6
 "@ | Set-Content -Path $EnvPath -Encoding utf8     # utf8 — supports Chinese / CJK paths
 
@@ -269,6 +283,11 @@ MUSELAB_MODEL=claude-sonnet-4-6
   }
 }
 
+# Reload port from .env (may be different from default 8765 if user picked,
+# or from a pre-existing .env in the "keeping as is" branch).
+$envText = Get-Content $EnvPath -Raw -Encoding utf8
+$Port = if ($envText -match "MUSELAB_PORT=(\d+)") { [int]$matches[1] } else { 8765 }
+
 # ----- 4. Scheduled Task --------------------------------------------------
 Bold "4/5  Registering Scheduled Task / 注册开机自启计划任务 (runs at logon, S4U)"
 $TaskName  = "Muselab"
@@ -339,22 +358,22 @@ Bold "5/5  Sanity check / 启动自检 (up to 30s for first-boot SDK init)"
 $ok = $false
 for ($i = 0; $i -lt 30; $i++) {
   try {
-    Invoke-WebRequest -Uri "http://127.0.0.1:8765/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
+    Invoke-WebRequest -Uri "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
     $ok = $true
-    Ok "muselab responding at http://localhost:8765 (took $($i+1)s)"
+    Ok "muselab responding at http://localhost:$Port (took $($i+1)s)"
     break
   } catch {
     Start-Sleep -Seconds 1
   }
 }
 if (-not $ok) {
-  Warn "didn't respond at http://localhost:8765 in 30s — give it more time or tail logs:"
+  Warn "didn't respond at http://localhost:$Port in 30s — give it more time or tail logs:"
   Warn "  Get-Content -Wait `"$LogDir\stderr.log`""
 }
 
 Write-Host
 Bold "[OK] muselab installed / 安装完成"
-Write-Host "  Open  / 打开    -> http://localhost:8765"
+Write-Host "  Open  / 打开    -> http://localhost:$Port"
 Write-Host "  Token / 登录口令 -> Select-String MUSELAB_TOKEN .env"
 Write-Host
 Write-Host "  Useful commands / 常用命令:"

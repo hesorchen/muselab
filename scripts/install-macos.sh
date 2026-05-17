@@ -45,13 +45,8 @@ if [[ -z "$PYV" ]] || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >
   warn "system python is < 3.12 (or missing). uv will download Python 3.12 during sync (~50MB extra)."
 fi
 
-# Port 8765 conflict
-if lsof -nP -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1; then
-  err "Port 8765 is already in use:"
-  lsof -nP -iTCP:8765 -sTCP:LISTEN | head -3
-  echo "      Either stop that process, or set MUSELAB_PORT=<other> in .env before re-running."
-  exit 1
-fi
+# Port pick + conflict check now happen at the .env step after the user can
+# choose a non-default port.
 
 if ! command -v claude >/dev/null 2>&1; then
   warn "claude CLI not found. Anthropic models won't work until you install it"
@@ -110,6 +105,24 @@ else
   done
 
   echo
+  echo "  HTTP port = where the web UI listens. Default 8765 is usually free."
+  echo "  HTTP 端口 = Web UI 监听端口。默认 8765 通常没被占用。"
+  while true; do
+    read -r -p "  Port / 端口 [8765]: " PORT_INPUT
+    if [[ -z "$PORT_INPUT" ]]; then PORT=8765; break; fi
+    if [[ "$PORT_INPUT" =~ ^[0-9]+$ ]] && (( PORT_INPUT >= 1024 && PORT_INPUT <= 65535 )); then
+      PORT="$PORT_INPUT"; break
+    fi
+    warn "port must be 1024-65535 / 端口范围 1024-65535"
+  done
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    err "Port $PORT is already in use:"
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | head -3
+    exit 1
+  fi
+  ok "port $PORT available / 端口 $PORT 可用"
+
+  echo
   echo "  Archive dir = where Muse can read/write (NEVER point at \$HOME or /)"
   echo "  档案目录 = Muse 能读写的地方（不要指向 \$HOME 或 / 根目录）"
   ARCHIVE="$(ask 'Archive dir / 档案目录 (absolute path / 绝对路径):' "$HOME/muselab-archive")"
@@ -128,7 +141,7 @@ else
 MUSELAB_TOKEN=$TOKEN
 MUSELAB_ROOT=$ARCHIVE
 MUSELAB_HOST=127.0.0.1
-MUSELAB_PORT=8765
+MUSELAB_PORT=$PORT
 MUSELAB_MODEL=claude-sonnet-4-6
 EOF
   chmod 600 .env
@@ -221,6 +234,9 @@ EOF
 fi
 
 # ----- 4. LaunchAgent ----------------------------------------------------
+PORT="$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+PORT="${PORT:-8765}"
+
 bold "4/5  Installing LaunchAgent / 注册 LaunchAgent"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="$HOME/Library/Logs/muselab"
@@ -261,19 +277,19 @@ bold "5/5  Sanity check / 启动自检"
 # Up to 30s for HTTP to come up (first-boot SDK init)
 WAITED=0
 while (( WAITED < 30 )); do
-  if curl -fs -o /dev/null -m 3 http://127.0.0.1:8765/ 2>/dev/null; then break; fi
+  if curl -fs -o /dev/null -m 3 http://127.0.0.1:$PORT/ 2>/dev/null; then break; fi
   sleep 1; WAITED=$((WAITED+1))
 done
-if curl -fs -o /dev/null -m 3 http://127.0.0.1:8765/ 2>/dev/null; then
-  ok "muselab responding at http://localhost:8765 (took ${WAITED}s)"
+if curl -fs -o /dev/null -m 3 http://127.0.0.1:$PORT/ 2>/dev/null; then
+  ok "muselab responding at http://localhost:$PORT (took ${WAITED}s)"
 else
-  warn "didn't respond at http://localhost:8765 in 30s — give it more time or tail logs:"
+  warn "didn't respond at http://localhost:$PORT in 30s — give it more time or tail logs:"
   warn "  tail -f $LOG_DIR/stderr.log"
 fi
 
 echo
 bold "✓ muselab installed / 安装完成"
-echo  "  Open  / 打开    → http://localhost:8765"
+echo  "  Open  / 打开    → http://localhost:$PORT"
 echo  "  Token / 登录口令 → grep MUSELAB_TOKEN .env"
 echo
 echo  "  Useful commands / 常用命令:"
