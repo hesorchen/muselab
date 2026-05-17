@@ -884,6 +884,42 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 }
 .bubble code { background: var(--c-bg-0); padding: 1px 5px; border-radius: var(--r-sm); font-size: 0.9em; }
 .bubble pre code { background: transparent; padding: 0; }
+
+/* Code block copy button — hover-revealed on the <pre> ancestor of any
+   <code class="language-*">. Attached by app.js _attachCopyBtn at highlight
+   time. Works inside chat bubbles AND the markdown preview pane. */
+pre.has-copy-btn { position: relative; }
+pre.has-copy-btn .code-copy-btn {
+  position: absolute; top: 6px; right: 6px;
+  padding: 3px 9px;
+  background: var(--c-bg-2); color: var(--c-fg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  font-size: 11px; font-family: var(--font-mono);
+  cursor: pointer;
+  opacity: 0;                   /* hidden by default */
+  transition: opacity .15s ease, background .15s ease, color .15s ease;
+}
+pre.has-copy-btn:hover .code-copy-btn,
+pre.has-copy-btn:focus-within .code-copy-btn,
+pre.has-copy-btn .code-copy-btn:focus {
+  opacity: 1;                   /* reveal on hover or keyboard focus */
+}
+pre.has-copy-btn .code-copy-btn:hover {
+  background: var(--c-accent-soft); color: var(--c-accent);
+  border-color: var(--c-accent);
+}
+pre.has-copy-btn .code-copy-btn.copied {
+  opacity: 1;
+  background: var(--c-accent-soft); color: var(--c-accent);
+  border-color: var(--c-accent);
+}
+/* On mobile (no hover), always show but smaller + low-key */
+@media (hover: none) {
+  pre.has-copy-btn .code-copy-btn { opacity: .55; }
+  pre.has-copy-btn .code-copy-btn:active { opacity: 1; }
+}
+
 .bubble ul, .bubble ol { padding-left: 1.4em; margin: 0.4em 0; }
 .bubble li { margin: 2px 0; }
 .bubble a { color: var(--c-accent-hover); text-decoration: underline; }

@@ -2108,7 +2108,49 @@ function portal() {
           el.innerHTML = r.value;
           el.classList.add("hljs");
         } catch (e) { console.warn("[muselab] highlight failed:", e); }
+        // Attach copy button to every <pre> wrapping a code block — only once.
+        this._attachCopyBtn(el);
       });
+    },
+
+    // Wraps a fenced-code-block <code> with a hover-revealed copy button on
+    // its enclosing <pre>. Idempotent (data-copybtn marker).
+    _attachCopyBtn(codeEl) {
+      const pre = codeEl.parentElement;
+      if (!pre || pre.tagName !== "PRE") return;       // inline `code`, skip
+      if (pre.dataset.copybtn === "1") return;          // already attached
+      pre.dataset.copybtn = "1";
+      pre.classList.add("has-copy-btn");
+      const btn = document.createElement("button");
+      btn.className = "code-copy-btn";
+      btn.type = "button";
+      const labelCopy = this.lang === "zh" ? "复制" : "Copy";
+      const labelOk   = this.lang === "zh" ? "已复制" : "Copied";
+      btn.textContent = labelCopy;
+      btn.setAttribute("aria-label", labelCopy);
+      btn.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        try {
+          // textContent strips the hljs <span> tags, gives clean source
+          const raw = codeEl.textContent || "";
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(raw);
+          } else {
+            // Fallback for http://localhost where clipboard API needs a permission
+            const ta = document.createElement("textarea");
+            ta.value = raw; ta.style.position = "fixed"; ta.style.left = "-9999px";
+            document.body.appendChild(ta); ta.select();
+            document.execCommand("copy"); document.body.removeChild(ta);
+          }
+          btn.textContent = labelOk;
+          btn.classList.add("copied");
+          setTimeout(() => { btn.textContent = labelCopy; btn.classList.remove("copied"); }, 1500);
+        } catch (e) {
+          btn.textContent = this.lang === "zh" ? "失败" : "Failed";
+          setTimeout(() => { btn.textContent = labelCopy; }, 1500);
+        }
+      });
+      pre.appendChild(btn);
     },
 
     // ===== search =====
