@@ -246,7 +246,7 @@ MUSELAB_MODEL=claude-sonnet-4-6
 }
 
 # ----- 4. Scheduled Task --------------------------------------------------
-Bold "4/5  Registering Scheduled Task / 注册开机自启计划任务 (runs at logon)"
+Bold "4/5  Registering Scheduled Task / 注册开机自启计划任务 (runs at logon, S4U)"
 $TaskName  = "Muselab"
 $LogDir    = Join-Path $env:LOCALAPPDATA "muselab\logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -262,26 +262,53 @@ cd /d "$Repo"
 "@
 Set-Content -Path $LauncherPath -Value $launcherBody -Encoding ascii
 
-$Action  = New-ScheduledTaskAction -Execute $LauncherPath -WorkingDirectory $Repo
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$Settings = New-ScheduledTaskSettingsSet `
-  -AllowStartIfOnBatteries `
-  -DontStopIfGoingOnBatteries `
-  -StartWhenAvailable `
-  -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-  -ExecutionTimeLimit (New-TimeSpan -Days 365)
-$Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+# LogonType=S4U — task has no interactive console (a conhost.exe window getting
+# closed by the user used to kill uvicorn) and survives logout. Trade-off:
+# registering S4U needs admin, so if we're not elevated, spawn one UAC prompt
+# for just the Register-ScheduledTask step.
+$User = $env:USERNAME
+$RegisterScript = @"
+`$ErrorActionPreference = 'Stop'
+`$Action = New-ScheduledTaskAction -Execute '$LauncherPath' -WorkingDirectory '$Repo'
+`$Trigger = New-ScheduledTaskTrigger -AtLogOn -User '$User'
+`$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365)
+`$Principal = New-ScheduledTaskPrincipal -UserId '$User' -LogonType S4U
+if (Get-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false }
+Register-ScheduledTask -TaskName '$TaskName' -Action `$Action -Trigger `$Trigger -Settings `$Settings -Principal `$Principal | Out-Null
+Start-ScheduledTask -TaskName '$TaskName'
+"@
 
-# Remove any prior version
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if ($isAdmin) {
+  Invoke-Expression $RegisterScript
+} else {
+  Write-Host "  Registering a system service needs admin rights — UAC will pop up once."
+  Write-Host "  注册后台服务需要管理员权限，接下来会弹一次 UAC，请点 [是]。"
+  $TmpReg = Join-Path $env:TEMP "muselab-register-$(Get-Random).ps1"
+  # Write with UTF-8 BOM so PowerShell on Chinese-locale Windows reads it as UTF-8
+  $bom  = [System.Text.Encoding]::UTF8.GetPreamble()
+  $body = [System.Text.Encoding]::UTF8.GetBytes($RegisterScript)
+  [System.IO.File]::WriteAllBytes($TmpReg, $bom + $body)
+  try {
+    $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @(
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$TmpReg`""
+    )
+    if ($p.ExitCode -ne 0) {
+      Err "elevated registration failed (exit $($p.ExitCode))"
+      Err "  re-run this installer from an Admin PowerShell to register the task"
+      Remove-Item $TmpReg -ErrorAction SilentlyContinue
+      exit 1
+    }
+  } catch {
+    Err "UAC denied or elevation cancelled — service NOT registered"
+    Err "  UAC 被拒或取消 — 服务未注册。请以管理员身份重跑此脚本。"
+    Remove-Item $TmpReg -ErrorAction SilentlyContinue
+    exit 1
+  }
+  Remove-Item $TmpReg -ErrorAction SilentlyContinue
 }
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
-  -Settings $Settings -Principal $Principal | Out-Null
-Ok "Scheduled Task '$TaskName' registered (trigger: at logon)"
-
-# Start it now so the user doesn't have to log out/in
-Start-ScheduledTask -TaskName $TaskName
+Ok "Scheduled Task '$TaskName' registered (S4U, hidden, restart-on-crash)"
 
 # ----- 5. Sanity check ----------------------------------------------------
 Bold "5/5  Sanity check / 启动自检 (up to 30s for first-boot SDK init)"

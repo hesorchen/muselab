@@ -11,15 +11,42 @@ function Warn($s) { Write-Host "  [!] $s" -ForegroundColor Yellow }
 Write-Host "muselab — uninstall (Windows)"
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($task) {
-  if ($task.State -eq 'Running') {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Ok "task stopped"
-  }
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-  Ok "task removed: $TaskName"
-} else {
+if (-not $task) {
   Warn "no scheduled task '$TaskName' — nothing to remove"
+} else {
+  # S4U tasks need admin to unregister (mirror install). If not elevated,
+  # spawn one UAC prompt to do the stop + unregister.
+  $RemoveScript = @"
+`$ErrorActionPreference = 'Stop'
+`$t = Get-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue
+if (`$t) {
+  if (`$t.State -eq 'Running') { Stop-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue }
+  Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false
+}
+"@
+  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if ($isAdmin) {
+    Invoke-Expression $RemoveScript
+  } else {
+    Write-Host "  Removing the service needs admin rights — UAC will pop up once."
+    Write-Host "  卸载后台服务需要管理员权限，接下来会弹一次 UAC，请点 [是]。"
+    $TmpRm = Join-Path $env:TEMP "muselab-unregister-$(Get-Random).ps1"
+    $bom  = [System.Text.Encoding]::UTF8.GetPreamble()
+    $body = [System.Text.Encoding]::UTF8.GetBytes($RemoveScript)
+    [System.IO.File]::WriteAllBytes($TmpRm, $bom + $body)
+    try {
+      $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$TmpRm`""
+      )
+      if ($p.ExitCode -ne 0) {
+        Warn "elevated unregister failed (exit $($p.ExitCode)) — task may still exist"
+      }
+    } catch {
+      Warn "UAC denied — task NOT removed; re-run from an Admin PowerShell"
+    }
+    Remove-Item $TmpRm -ErrorAction SilentlyContinue
+  }
+  Ok "task removed: $TaskName"
 }
 
 Write-Host
