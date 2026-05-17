@@ -47,7 +47,7 @@ boring tech you can fully see beats clever tech you can't.
 - 💸 Reuse your `$20–100/mo` Pro / Max subscription via OAuth — zero per-token bill
 - 🌏 Or bring **DeepSeek / GLM / MiniMax** keys — same SDK loop, no proxy needed
 - 🚀 One installer per OS (Linux / macOS / Windows) or `docker run` from GHCR
-- ⚡ ~4.4 k lines · 148 tests · runs on a 1 GB VPS
+- ⚡ ~8 k lines · 148 tests · runs on a 1 GB VPS
 
 > 📸 *Demo gif: coming soon. In the meantime, scroll to [Architecture](#under-the-hood) for a mermaid diagram of the data flow, or jump straight to [Quick start](#quick-start) — 3 commands to running locally.*
 
@@ -239,7 +239,7 @@ session with the new model (avoids cross-vendor thinking-signature drift).
 | HTML / PDF / image preview | ✅ first-class | ⚠️ | ⚠️ | ⚠️ | ❌ |
 | **Full agent SDK on every model** | ✅ | ⚠️ Claude-mostly | ❌ chat only | ❌ RAG focus | ✅ Claude only |
 | Reuse Claude Pro subscription | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Lines of code | ~4.4 k | tens of k | hundreds of k | ~150 k | closed |
+| Lines of code | ~8 k | tens of k | hundreds of k | ~150 k | closed |
 | Install command count | 3 | many | docker compose | docker | brew/npm |
 
 If you want **IDE breadth**, pick claudecodeui or code-server.
@@ -298,11 +298,11 @@ your real profile — see [docs/personalize-claude-md.md](docs/personalize-claud
 
 ```mermaid
 flowchart TB
-  subgraph Browser["Browser · ~3.2k LOC vanilla HTML + Alpine.js + CSS"]
+  subgraph Browser["Browser · ~5.8k LOC vanilla HTML + Alpine.js + CSS"]
     F[📁 files] --- P[📄 preview + tabs] --- C[💬 chat + multi-model]
   end
   Browser ==>|HTTP / SSE| BE
-  subgraph BE["Backend · FastAPI ~1.2k LOC"]
+  subgraph BE["Backend · FastAPI ~2.6k LOC"]
     A["/api/files/*<br/>safe-resolve · read/write/grep"]
     B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model)"]
   end
