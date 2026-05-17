@@ -404,7 +404,7 @@ window.addEventListener("error", e => {
         </div>
         <div class="ctx-meter-text">
           <span class="ctx-meter-label" x-text="ctxMeterLabel()"></span>
-          <button class="ctx-meter-action" x-show="sessionUsage.context_used_pct >= 70"
+          <button class="ctx-meter-action"
                   @click="runCompact()"
                   x-text="t('ctx.compact_btn')"></button>
         </div>
