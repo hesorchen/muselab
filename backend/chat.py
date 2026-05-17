@@ -121,12 +121,23 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 jsonl_exists = proj_dir is not None and (proj_dir / f"{session_id}.jsonl").exists()
             except Exception:
                 jsonl_exists = False
+            # CLI stderr capture — without this, ProcessError just says
+            # "Check stderr output for details" with no actual details and
+            # we can't tell whether the CLI rejected --session-id, hit an
+            # auth error, or something else. Pipe every line into muselab's
+            # stderr.log so the next failure is debuggable.
+            import sys as _sys
+            def _cli_stderr(line: str) -> None:
+                _sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
+                _sys.stderr.flush()
+
             opts_kwargs = dict(
                 cwd=str(ROOT),
                 model=model,
                 permission_mode=permission,
                 system_prompt=sp,
                 max_buffer_size=max_buf,
+                stderr=_cli_stderr,
                 # Block harness-only tools the SDK exposes by default. AskUserQuestion
                 # is intentionally NOT blocked: we re-implement it via in-process MCP
                 # (mcp__muselab__ask_user_question) — see backend/ask_user_question.py.
