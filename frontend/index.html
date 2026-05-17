@@ -370,14 +370,14 @@ window.addEventListener("error", e => {
           <span x-text="t('pane.chat')"></span>
         </span>
         <span class="spacer"></span>
-        <!-- CLAUDE.md status chip — green tick when loaded, orange warn when missing -->
-        <span class="ctx-chip"
-              :class="contextInfo.claude_md_exists ? 'ok' : 'warn'"
+        <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
+             by default, so the "present" state is implicit). When missing,
+             clicking opens a help dialog with how-to-fix instructions. -->
+        <span class="ctx-chip warn"
+              x-show="!contextInfo.claude_md_exists"
               :title="claudeMdChipTitle()"
-              @click="!contextInfo.claude_md_exists && openClaudeMdHelp()">
-          <span x-show="contextInfo.claude_md_exists">📋 CLAUDE.md · <span x-text="contextInfo.claude_md_lines + (lang==='zh'?'行':' lines')"></span></span>
-          <span x-show="!contextInfo.claude_md_exists" x-text="lang==='zh' ? '⚠ 未配档案' : '⚠ no archive'"></span>
-        </span>
+              @click="openClaudeMdHelp()"
+              x-text="lang==='zh' ? '⚠ 未配档案' : '⚠ no archive'"></span>
         <span x-show="mcp.servers.length" class="mcp-badge"
               :title="(lang==='zh'?'MCP 服务: ':'MCP servers: ') + mcp.servers.map(s=>s.name).join(', ')">
           🔌 <span x-text="mcp.servers.length"></span>
