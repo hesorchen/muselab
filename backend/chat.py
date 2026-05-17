@@ -631,8 +631,38 @@ class BudgetReq(BaseModel):
 def context_info() -> dict:
     """Information about what Muse can see — used by the UI's onboarding
     hints (does the user have a CLAUDE.md? archive empty? skills loaded?
-    has any working auth?). All paths relative to ROOT for safety."""
-    claude_md = ROOT / "CLAUDE.md"
+    has any working auth?). All paths relative to ROOT for safety.
+
+    SDK options pass `setting_sources=["user", "project", "local"]`, so
+    "Muse knows you" if EITHER the project-scope CLAUDE.md (ROOT/CLAUDE.md)
+    OR the user-scope global one (~/.claude/CLAUDE.md) exists. We track
+    both and surface the union — UI hides the "Muse doesn't know you yet"
+    nag whenever any source is present."""
+    project_claude_md = ROOT / "CLAUDE.md"
+    user_claude_md = Path.home() / ".claude" / "CLAUDE.md"
+
+    sources: list[dict] = []
+    if project_claude_md.exists():
+        try:
+            sources.append({
+                "scope": "project",
+                "path": str(project_claude_md),
+                "lines": sum(1 for _ in project_claude_md.open(encoding="utf-8", errors="replace")),
+                "mtime": project_claude_md.stat().st_mtime,
+            })
+        except OSError:
+            pass
+    if user_claude_md.exists():
+        try:
+            sources.append({
+                "scope": "user",
+                "path": str(user_claude_md),
+                "lines": sum(1 for _ in user_claude_md.open(encoding="utf-8", errors="replace")),
+                "mtime": user_claude_md.stat().st_mtime,
+            })
+        except OSError:
+            pass
+
     # Detect "do we have ANY working auth?" — needed so the chat-empty card
     # can warn "you have no provider set up; configure one before chatting".
     # Claude OAuth lives in ~/.claude/.credentials.json (Pro/Max).
@@ -644,23 +674,24 @@ def context_info() -> dict:
             ("MINIMAX_API_KEY",  "MiniMax"),
         ) if os.environ.get(env_key)
     ]
+    # Back-compat: keep claude_md_exists / lines / mtime fields for any
+    # consumer that hasn't migrated to the new claude_md_sources list.
+    # Reflect "ANY source present" + union total lines + latest mtime so
+    # the existing UI keeps working without changes.
+    total_lines = sum(s["lines"] for s in sources)
+    latest_mtime = max((s["mtime"] for s in sources), default=0.0)
     info: dict = {
         "archive_root": str(ROOT),
-        "claude_md_exists": claude_md.exists(),
-        "claude_md_lines": 0,
-        "claude_md_mtime": 0.0,
+        "claude_md_exists": len(sources) > 0,
+        "claude_md_lines": total_lines,
+        "claude_md_mtime": latest_mtime,
+        "claude_md_sources": sources,
         "archive_empty": True,
         "subdir_present": {},
         "has_claude_oauth": claude_oauth,
         "third_party_configured": third_party_configured,
         "has_any_provider": claude_oauth or len(third_party_configured) > 0,
     }
-    if claude_md.exists():
-        try:
-            info["claude_md_lines"] = sum(1 for _ in claude_md.open(encoding="utf-8", errors="replace"))
-            info["claude_md_mtime"] = claude_md.stat().st_mtime
-        except OSError:
-            pass
     # Subdirs the install scripts create — used to nudge "drop a doc into X"
     for sub in ("health", "work", "money", "people", "notes", "archives"):
         d = ROOT / sub
