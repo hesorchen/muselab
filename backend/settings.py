@@ -5,9 +5,11 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-# 优先用 Claude CLI 的 Pro OAuth 凭据走订阅配额，
-# 而不是 ANTHROPIC_API_KEY 走 console 按量账单
-os.environ.pop("ANTHROPIC_API_KEY", None)
+# 不再主动 pop ANTHROPIC_API_KEY —— claude CLI 的优先级已经正确：
+# 若 ~/.claude/.credentials.json 存在则用 OAuth（Pro 配额，免费），
+# 否则 fallback 到 ANTHROPIC_API_KEY（按量计费）。
+# 之前 pop 是过度防御，会把"只有 API key 没 Pro"的用户彻底堵死。
+# AUTH_TOKEN 仍清理，避免某些场景下被误当成 OAuth bearer 发出去。
 os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 

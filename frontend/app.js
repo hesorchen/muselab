@@ -145,7 +145,7 @@ const STRINGS = {
     "ctx.no_claude_md_title": "Muse 还不认识你",
     "ctx.no_claude_md_body": "你的 archive 在：\n  {root}\n\nMuse 启动时会读 {root}/CLAUDE.md 作为「关于你」的档案。现在没有这个文件，所以 Muse 只能用默认行为，不能基于你的真实情况给建议。\n\n建议：\n  1. 跑 scripts/install-{linux,macos,windows} 里的 intake（推荐）\n  2. 或手动复制：scripts/templates/default-CLAUDE.md → {root}/CLAUDE.md，按提示填\n\n详见 docs/personalize-claude-md.md",
     "onboard.no_provider_title": "🔑 还没配置模型，无法对话",
-    "onboard.no_provider_body": "Muse 需要至少一个模型 provider。可选：\n  • Claude（Pro/Max 订阅）：终端跑 `claude login` 一次\n  • DeepSeek / GLM / MiniMax：去对应控制台拿 API key，在 Settings 填入",
+    "onboard.no_provider_body": "Muse 需要至少一个模型 provider。可选：\n  • Claude（Pro/Max 订阅）：终端跑 `claude login` 一次（免费配额）\n  • Claude（API 按量）：去 console.anthropic.com 拿 key 填到 Settings\n  • DeepSeek / GLM / MiniMax：去对应控制台拿 API key 填到 Settings",
     "onboard.no_provider_cta": "打开 Settings",
     "onboard.no_claude_md_title": "👋 Muse 还不认识你",
     "onboard.no_claude_md_body": "Muse 是一个整体助理 — 同时帮你管身体、做的事、钱、关心的人、生活。在它能给针对性建议之前，需要你先做一份 3 分钟的档案。",
@@ -381,7 +381,7 @@ const STRINGS = {
     "ctx.no_claude_md_title": "Muse doesn't know you yet",
     "ctx.no_claude_md_body": "Your archive lives at:\n  {root}\n\nMuse reads {root}/CLAUDE.md on startup as your profile. Without it, Muse uses default behavior and can't tailor advice to your real situation.\n\nTo set up:\n  1. Run scripts/install-{linux,macos,windows} (with intake — recommended)\n  2. Or copy scripts/templates/default-CLAUDE.md → {root}/CLAUDE.md and edit\n\nDetails: docs/personalize-claude-md.md",
     "onboard.no_provider_title": "🔑 No model configured — can't chat yet",
-    "onboard.no_provider_body": "Muse needs at least one provider. Either:\n  • Claude (Pro/Max subscription): run `claude login` once in terminal\n  • DeepSeek / GLM / MiniMax: grab a key from their console, paste into Settings",
+    "onboard.no_provider_body": "Muse needs at least one provider. Either:\n  • Claude (Pro/Max subscription): run `claude login` in terminal (free quota)\n  • Claude (pay-per-use API): grab a key from console.anthropic.com, paste into Settings\n  • DeepSeek / GLM / MiniMax: grab a key from their console, paste into Settings",
     "onboard.no_provider_cta": "Open Settings",
     "onboard.no_claude_md_title": "👋 Muse doesn't know you yet",
     "onboard.no_claude_md_body": "Muse is one assistant for your whole life — body, work, money, people, daily stuff. Before it can give tailored advice, it needs a 3-minute intake of your profile.",
@@ -1669,6 +1669,7 @@ function portal() {
       };
       // 字段名按后端转 snake_case
       const k2f = {
+        ANTHROPIC_API_KEY: "anthropic_api_key",
         DEEPSEEK_API_KEY: "deepseek_api_key",
         ZHIPUAI_API_KEY: "zhipuai_api_key",
         MINIMAX_API_KEY: "minimax_api_key",

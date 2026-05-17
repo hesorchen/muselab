@@ -26,6 +26,9 @@ ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 # compatible Messages API endpoints (so Claude SDK can call them directly).
 # 小米 MiMo / Qwen / Doubao 暂只支持 OpenAI 协议，等他们出 /anthropic 端点再加。
 PROVIDER_KEYS = [
+    # Anthropic 排第一 — 是 muselab 的默认/推荐 provider。
+    # 用户也可以走 `claude login`（Pro/Max OAuth），那种情况下这一栏可以留空。
+    ("ANTHROPIC_API_KEY", "Anthropic (Claude API)"),
     ("DEEPSEEK_API_KEY", "DeepSeek"),
     ("ZHIPUAI_API_KEY", "智谱 GLM"),
     ("MINIMAX_API_KEY", "MiniMax"),
@@ -51,6 +54,7 @@ def _mask(v: str) -> str:
 
 class SettingsIn(BaseModel):
     # Provider keys — empty string = "don't change", explicit null = remove.
+    anthropic_api_key: str | None = None
     deepseek_api_key: str | None = None
     zhipuai_api_key: str | None = None
     minimax_api_key: str | None = None
@@ -148,6 +152,7 @@ def put_settings(req: SettingsIn) -> dict:
     # Provider keys: empty string means "keep current"; we ignore them.
     # Explicit non-empty string writes; "_delete_" sentinel removes.
     key_map = {
+        "anthropic_api_key": "ANTHROPIC_API_KEY",
         "deepseek_api_key": "DEEPSEEK_API_KEY",
         "zhipuai_api_key": "ZHIPUAI_API_KEY",
         "minimax_api_key": "MINIMAX_API_KEY",

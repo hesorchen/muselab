@@ -160,11 +160,16 @@ def env_override(model: str) -> dict[str, str] | None:
 
 
 def has_anthropic_auth() -> bool:
-    """True if the claude CLI has a saved Pro/Max OAuth credential. settings.py
-    unsets ANTHROPIC_API_KEY at startup to force Pro-quota usage, so OAuth is
-    the only way Claude works in muselab — without it the Claude group must
-    not appear in the model picker."""
-    return (Path.home() / ".claude" / ".credentials.json").exists()
+    """True if Claude is reachable, via either:
+      - ~/.claude/.credentials.json  (claude CLI Pro/Max OAuth, free quota), OR
+      - ANTHROPIC_API_KEY env var    (pay-per-use console.anthropic.com).
+    If neither, the Claude group hides from the model picker so the UI doesn't
+    offer a model that's guaranteed to 401 on first send."""
+    if (Path.home() / ".claude" / ".credentials.json").exists():
+        return True
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return True
+    return False
 
 
 def available_groups() -> list[dict]:
