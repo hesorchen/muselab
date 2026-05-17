@@ -6,56 +6,72 @@
 own archive — health reports, career notes, investment log, papers — and lets
 **Muse** (the AI persona inside) help you across all of them, in one assistant.
 
-- 💸 Reuse your `$20–100/mo` **Pro / Max** subscription via OAuth — no per-token API bill
-- 🌏 Or bring **DeepSeek / GLM / MiniMax** keys for the cheap stuff — same UI, same agent loop
-- 🏛 Sits **permanently** next to your personal archive (not a coding sidebar)
-- ⚡ ~4.4 k lines, no npm, no bundler, runs on a 1 GB VPS
-- 🚀 One installer command per OS (Linux / macOS / Windows) or `docker run` from GHCR
-- 🧠 Full agent stack — MCP servers, Skills, Subagents, plan mode, file edits — for free
-
-[中文 → README_zh.md](README_zh.md) · [Changelog](CHANGELOG.md) · [Add a new provider](docs/add-provider.md) · [Security](SECURITY.md)
-
-> 📸 Demo gif: in progress — record your own with the install scripts in 2 min, or watch this repo for the official one.
+[![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-148_passing-brightgreen.svg)](tests/)
+[![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
+[![中文](https://img.shields.io/badge/lang-中文-red)](README_zh.md)
 
 ---
 
-## Why muselab
+- 💸 **Reuse your `$20–100/mo` Pro / Max subscription** via OAuth — zero per-token bill
+- 🌏 Or bring **DeepSeek / GLM / MiniMax** keys for the cheap stuff — same agent loop
+- 🏛 Sits **permanently** next to your personal archive (not a coding sidebar)
+- ⚡ ~4.4 k lines, no npm, no bundler, runs on a 1 GB VPS
+- 🚀 One installer per OS (Linux / macOS / Windows) or `docker run` from GHCR
+- 🧠 Full agent stack — MCP, Skills, Subagents, plan mode, file edits — for every model
 
-| | |
-|---|---|
-| 🏛 **Built to live** | Not a coding sidebar. muselab sits permanently next to your archive — health records, career notes, finance plans, papers — and helps you read, write, and reason over them. |
-| ⚡ **Honestly tiny** | ~1.2 k lines of Python + ~3.2 k lines of vanilla HTML / JS / CSS. No bundler, no npm. You can read every line in an afternoon. |
-| 🚀 **Trivial to deploy** | Docker Compose: 3 commands from `git clone` to running on your VPS. Native install (uv) is one more command. |
-| 🧠 **Full agent power** | Uses Claude Agent SDK as the only chat backend — so MCP servers, Skills, Subagents, CLAUDE.md auto-load, plan mode, tool use all work out of the box. Multi-provider dispatch via vendor's Anthropic-compatible endpoints, **no protocol-translation router required**. |
+> 📸 *Demo gif: coming soon. In the meantime, scroll to [Architecture](#under-the-hood) for a structural overview, or jump straight to [Quick start](#quick-start) — 3 commands to running locally.*
 
-## What it is
+---
 
-Three panes in one browser page (~100 MB resident):
+## Table of contents
 
-- 📁 **Files** — tree of your archive root: list, multi-tab preview, drag-drop upload, full-text search, in-browser editor with syntax highlighting
-- 💬 **Chat** — streaming agent with tools (Read / Edit / Bash / Glob / Grep / WebFetch / TodoWrite / Task / MCP servers), session history persisted to disk, switch model mid-conversation
-- ⚙ **Settings** — configure providers, themes, accent color, **interface language (中文 / English)**, defaults — all from the UI, no editing `.env`
+- [Is this for me?](#is-this-for-me)
+- [Quick start](#quick-start) — 3 commands
+- [Use any model](#use-any-model) — provider matrix
+- [How it compares](#how-it-compares) — vs claude-code-ui, LobeChat, AnythingLLM, others
+- [A day with muselab](#a-day-with-muselab) — concrete examples
+- [Under the hood](#under-the-hood) — architecture
+- [Security model](#security-model) — what's baked in, what's on you
+- [The nine Muses](#the-nine-muses) — naming + mascot system
+- [Status & contributing](#status--contributing)
+
+---
+
+## Is this for me?
+
+| You... | muselab? |
+|--------|----------|
+| ✅ Have a Claude Pro / Max sub and want to stop paying API fees on top | **Yes** |
+| ✅ Keep notes / health records / finance log in a flat directory and want AI to actually read them | **Yes** |
+| ✅ Self-host on a VPS / mini-PC and want one tool you can read end-to-end | **Yes** |
+| ✅ Want the same agent loop (MCP, Skills, tools) across Claude *and* DeepSeek/GLM/MiniMax | **Yes** |
+| ❌ Want a coding IDE with Claude integration | Use [claudecodeui](https://github.com/siteboon/claudecodeui) or [code-server + Cline](https://github.com/cline/cline) instead |
+| ❌ Want chat over crawled / RAG'd public docs | Use [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm) |
+| ❌ Want a hosted SaaS, no install | muselab is self-host only; pick [LobeChat Cloud](https://lobehub.com) |
+
+---
 
 ## Quick start
 
-### 0. Prereqs (one-time, even if you skip everything else)
+### 0. Prereqs (3 minutes)
 
-You need exactly **two** things — pick a model provider (at least one) and
-install `uv`.
+Need exactly two things:
 
-#### Pick AT LEAST one model provider
+#### Pick at least one model provider
 
-| If you have... | Setup |
+| If you have… | Setup |
 |----------------|-------|
-| **Claude Pro / Max** subscription ($20–100/mo) | Install [`claude` CLI](https://docs.claude.com/claude-code) then `claude login` once. Pro OAuth lives in `~/.claude/.credentials.json` |
-| Just want a free / cheap key | Get a key from one of: [DeepSeek](https://platform.deepseek.com) / [智谱 GLM](https://bigmodel.cn) / [MiniMax (国内站)](https://minimaxi.com). You'll paste it in Settings later — no CLI needed |
-| Both | Use Claude for hard reasoning, DeepSeek for cheap stuff. muselab lets you switch mid-conversation. |
+| **Claude Pro / Max** sub ($20–100/mo) | Install [`claude` CLI](https://docs.claude.com/claude-code) then run `claude login` once. Pro OAuth lives in `~/.claude/.credentials.json` |
+| Just want a cheap key | Get one from [DeepSeek](https://platform.deepseek.com) / [智谱 GLM](https://bigmodel.cn) / [MiniMax 国内站](https://minimaxi.com). Paste it in Settings later — no CLI |
+| Both | Use Claude for hard reasoning, DeepSeek for cheap. Switch model in a dropdown click |
 
-Without any of these, muselab installs fine but the first chat will error.
-The UI explicitly warns "no provider configured — open Settings" so you
-won't be confused.
+Without any of these, muselab installs fine but **the first chat will error**.
+The UI explicitly warns "no provider configured — open Settings" so you won't
+be left confused.
 
-#### Install `uv` (one line)
+#### Install `uv`
 
 ```bash
 # Linux / macOS
@@ -65,42 +81,39 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-### 1. One-shot installer — autostart at login, localhost-only by default
+### 1. One-shot installer
+
+Autostart at login, localhost-only, ~3 min on a decent machine (10+ on slow VPS).
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
 
-# macOS  — user-level LaunchAgent
+# macOS — user LaunchAgent
 bash scripts/install-macos.sh
 
-# Linux  — user-level systemd service
+# Linux — user systemd service
 bash scripts/install-linux.sh
 
-# Windows — Task Scheduler (PowerShell)
+# Windows — Task Scheduler
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
-The installer:
-1. Checks prereqs (uv / claude CLI / npx / uvx / port 8765 free)
-2. `uv sync` — fetches Python deps (first run: 3-10 min depending on CPU)
-3. Generates `.env` with a random `MUSELAB_TOKEN` + the archive path you choose
-4. Walks 7 intake questions (skip with Enter) to seed `CLAUDE.md`
-5. Creates the autostart entry and starts the service
-6. Up to 30s retry loop waiting for the service to respond
+What it does: pre-flight checks → `uv sync` → write `.env` with random token →
+7-question profile intake → register autostart → wait up to 30s for service.
 
 ### 2. Open it
 
-Local machine: `http://localhost:8765` — paste the token from `.env`.
+Local machine: `http://localhost:8765` → paste the token from `.env`.
 
-**Running on a VPS?** Don't open the port to the internet. Use SSH tunnel
-from your laptop:
+**Running on a VPS?** Don't open the port to the internet. SSH tunnel from
+your laptop:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
 # then visit http://localhost:8765 in your laptop's browser
 ```
 
-(Or use [Tailscale](https://tailscale.com) — same effect, no terminal needed.)
+Or use [Tailscale](https://tailscale.com) — same effect, no terminal.
 
 ### 3. Verify
 
@@ -109,38 +122,27 @@ bash scripts/doctor.sh        # Linux / macOS
 powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
 ```
 
-Doctor checks every layer (uv, claude CLI, .env shape, MUSELAB_ROOT, service
-state, HTTP probe, token, provider keys) and gives specific advice on any
-failure. Returns non-zero if anything blocks usage — great first step when
+`doctor` checks every layer (uv / claude CLI / .env / service / HTTP / token /
+provider keys) and gives specific advice on any failure. Run it when
 something feels off.
 
-#### After you reboot the laptop?
+#### Survives reboot?
 
-| OS | Reboot → log back in | Reboot → never log in (lid closed, ssh-only, ...) |
-|----|---------------------|----------------------------------------------------|
-| **macOS** | ✓ auto-starts | n/a (you always log in on a Mac after reboot) |
-| **Linux** | ✓ auto-starts | ✗ needs one-time `sudo loginctl enable-linger $USER` to survive logout / no-login reboots |
-| **Windows** | ✓ auto-starts | n/a (Task Scheduler trigger is "At Logon") |
+| OS | Reboot → log back in | Reboot → never log in |
+|----|---------------------|------------------------|
+| **macOS** | ✅ auto-starts | n/a (always log in on Mac) |
+| **Linux** | ✅ auto-starts | ⚠️ needs one-time `sudo loginctl enable-linger $USER` |
+| **Windows** | ✅ auto-starts | n/a (Task Scheduler is "At Logon") |
 
-For a personal laptop where you log in after each reboot, **all three just work** —
-the installer registers the autostart entry and the OS handles it.
-
-For a desktop / mini-PC you may not actively log into (Linux), enable linger:
-```bash
-sudo loginctl enable-linger $USER
-```
-The Linux installer reminds you of this at the end if it's not already enabled.
-
-Detailed per-OS guide (verify / restart / tail logs / expose to LAN / uninstall):
+Per-OS detail (verify / restart / tail logs / expose to LAN / uninstall):
 [macOS](docs/install-macos.md) · [Linux](docs/install-linux.md) · [Windows](docs/install-windows.md).
 
-### Advanced — Docker / manual
+### Alternative — Docker
 
 <details>
-<summary>Docker — pre-built image from GHCR</summary>
+<summary><b>Pre-built image from GHCR (multi-arch amd64 + arm64)</b></summary>
 
 ```bash
-# Pre-built multi-arch image (amd64 + arm64), latest = main branch HEAD
 docker run -d --name muselab \
   -p 8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
@@ -150,153 +152,173 @@ docker run -d --name muselab \
   ghcr.io/hesorchen/muselab:latest
 ```
 
-Or pin a tag: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
-
+Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 </details>
 
 <details>
-<summary>Docker Compose (recommended if you want compose's ergonomics)</summary>
+<summary><b>Docker Compose</b></summary>
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
-cp .env.example .env && $EDITOR .env   # set MUSELAB_TOKEN, ARCHIVE_DIR
-claude login                            # host-side; container reuses OAuth
+cp .env.example .env && $EDITOR .env    # set MUSELAB_TOKEN, ARCHIVE_DIR
+claude login                              # host-side; container reuses OAuth
 docker compose up -d
 ```
-
-`docker-compose.yml` ships with `restart: unless-stopped`, so the container
-survives host reboots without any extra autostart wiring.
-
 </details>
 
 <details>
-<summary>Native (uv, no service)</summary>
-
-For when you want to run muselab manually in a terminal — dev, debug, or
-ephemeral use.
+<summary><b>Native dev (uv, no service)</b></summary>
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
 cd muselab && uv sync
 cp .env.example .env && $EDITOR .env
 claude login
-uv run python -m backend.main          # binds MUSELAB_HOST:MUSELAB_PORT from .env
+uv run python -m backend.main             # binds MUSELAB_HOST:MUSELAB_PORT
 ```
-
 </details>
+
+---
 
 ## Use any model
 
-muselab uses Claude Agent SDK as the single chat backend, then per-request env override
-routes non-Claude models to their vendor's Anthropic-compatible endpoint. **All providers get
-the FULL agent loop** — not just chat. No proxy process, no translation losses.
+muselab uses the **Claude Agent SDK** as the single chat backend. For non-Claude
+models, a per-session env override routes the SDK at the vendor's
+Anthropic-compatible endpoint. **Every provider gets the full agent loop** —
+not just chat. No proxy, no protocol translation.
 
-| Provider | How to enable | Tool use | Notes |
+| Provider | How to enable | Tool use | Cost note |
 |---|---|---|---|
-| **Anthropic Claude** (Sonnet/Haiku/Opus) | `claude login` once | ✅ | Reuses Pro/Max OAuth — no API key, no per-token cost |
-| **DeepSeek** (V4 Pro / V4 Flash / R1 / Chat) | `DEEPSEEK_API_KEY` in `.env` or Settings UI | ✅ | ~10× cheaper than Claude for chat-heavy tasks |
-| **智谱 GLM** (GLM-5 / GLM-4-Plus) | `ZHIPUAI_API_KEY` | ✅ | |
-| **MiniMax** (M2.7) | `MINIMAX_API_KEY` | ✅ | |
+| **Anthropic Claude** (Opus / Sonnet / Haiku) | `claude login` once | ✅ | Reuses Pro/Max OAuth — no API key, no per-token bill |
+| **DeepSeek** (V4 Pro / V4 Flash / Chat / Reasoner) | `DEEPSEEK_API_KEY` in Settings | ✅ | ~10× cheaper than Claude for chat-heavy tasks |
+| **智谱 GLM** (GLM-5 / GLM-5 Air / GLM-4.7 / 4 Plus) | `ZHIPUAI_API_KEY` | ✅ | Free tier on bigmodel.cn |
+| **MiniMax** (M2.7 / M2.7 Highspeed / M2.5) | `MINIMAX_API_KEY` | ✅ | Note: returns thinking blocks by default |
 
-Switching model mid-conversation is one dropdown click — history isn't lost.
-Adding a new provider takes **3 lines** of `endpoints.py` config — see [docs/add-provider.md](docs/add-provider.md).
+**Switching model mid-conversation**: dropdown → confirm modal → spawns a fresh
+session with the new model (avoids cross-vendor thinking-signature drift).
 
-## A typical day with muselab
+**Adding a new provider** takes 3 lines in `backend/endpoints.py` — see
+[docs/add-provider.md](docs/add-provider.md).
 
-```
-Morning  | Ask Claude to summarize what's new in archives/papers/this-week/
-         | Switch to DeepSeek to translate that summary to English
-         |
-Noon     | Drop a PDF into investment/research/ via drag-and-drop
-         | Use @investment/portfolio.md in chat — Claude reads it,
-         |   suggests rebalances per your CLAUDE.md investment rules
-         |
-Evening  | Edit health/training-log.md inline (CodeMirror)
-         | Ctrl+S to save; toast confirms
-         | Ask Claude to spot trends across last 3 months' entries
-```
+---
 
-CLAUDE.md auto-loads from `~/.claude/CLAUDE.md` (your global rules) AND
-`<archive-root>/CLAUDE.md` (per-archive rules) — applied to every model uniformly.
+## How it compares
 
-## Architecture in 60 seconds
-
-```
-┌────────────────────────────────────────────────────────────┐
-│ Browser: ~3200 lines vanilla HTML + Alpine.js + CSS        │
-│   ┌──────────┬─────────────────┬───────────────────────┐   │
-│   │ files    │  preview + tabs │  chat + multi-model    │   │
-│   └──────────┴─────────────────┴───────────────────────┘   │
-└────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ HTTP / SSE
-┌────────────────────────────────────────────────────────────┐
-│ Backend: FastAPI (~1200 lines)                              │
-│   ┌──────────────────────┐   ┌─────────────────────────┐   │
-│   │ /api/files/*         │   │ /api/chat/*             │   │
-│   │   safe path resolve  │   │   ClaudeSDKClient pool  │   │
-│   │   read/write/grep    │   │   per (session, model)  │   │
-│   │   sensitive blocks   │   │   model prefix dispatch │   │
-│   └──────────────────────┘   └─────────────────────────┘   │
-└────────────────────────────────────────────────────────────┘
-                              │
-        claude-*  ┌───────────┴───────────────┐  others (deepseek-/glm-/...)
-                  ▼                           ▼ (env override per request)
-        api.anthropic.com               api.deepseek.com/anthropic
-        (Pro OAuth)                     api.minimaxi.com/anthropic
-                                        open.bigmodel.cn/api/anthropic
-                                        api.moonshot.cn/anthropic
-```
-
-**No bundler. No build step.** Edit a file, refresh, done.
-
-## How muselab compares
-
-|  | muselab | claudecodeui | code-server + Cline | Obsidian + AI | Claude Code CLI |
+|  | muselab | claudecodeui | LobeChat | AnythingLLM | Claude Code CLI |
 |---|---|---|---|---|---|
-| Primary purpose | Archive + AI chat | IDE for multi-CLI agents | Web VS Code with AI | Local knowledge base | Terminal coding agent |
-| Self-hosted | ✅ | ✅ | ✅ | ❌ local-only | ❌ |
-| Browser access | ✅ | ✅ | ✅ | ❌ | ❌ |
-| HTML/PDF/image preview | ✅ first-class | ⚠️ | ✅ via plugin | ⚠️ plugin | ❌ |
-| **All agent features for ANY model** | ✅ | ⚠️ Claude-mostly | varies | varies | ✅ Claude only |
-| Lines of code | ~4.4 k | tens of k | hundreds of k | closed | closed |
-| Install command count | 3 | many | docker compose (heavier) | one-click | brew/npm |
+| Primary purpose | Archive + AI chat | IDE for multi-CLI agents | Multi-model chat + plugin store | RAG over your docs | Terminal coding agent |
+| Self-hosted | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Browser access | ✅ | ✅ | ✅ | ✅ | ❌ |
+| HTML / PDF / image preview | ✅ first-class | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| **Full agent SDK on every model** | ✅ | ⚠️ Claude-mostly | ❌ chat only | ❌ RAG focus | ✅ Claude only |
+| Reuse Claude Pro subscription | ✅ | ✅ | ❌ | ❌ | ✅ |
+| Lines of code | ~4.4 k | tens of k | hundreds of k | ~150 k | closed |
+| Install command count | 3 | many | docker compose | docker | brew/npm |
 
-If you want IDE breadth, pick claudecodeui or code-server. muselab's pitch is opposite:
-**the smallest readable archive + AI surface that gives every model Claude's full agent power.**
+If you want **IDE breadth**, pick claudecodeui or code-server.
+If you want a **plugin marketplace**, LobeChat.
+If you want **chat over crawled docs**, AnythingLLM.
 
-## Security
+muselab's pitch is opposite: **the smallest readable archive + AI surface that
+gives every model Claude's full agent power**.
 
-⚠️ **A leaked `MUSELAB_TOKEN` ≈ shell access on `MUSELAB_ROOT`.** Chat sessions run with
-`permission_mode="bypassPermissions"` by design — Claude can read/write any file under
-that root without per-call confirmation.
+---
 
-What's baked in:
+## A day with muselab
+
+Real examples from a working session:
+
+```
+Morning  →  @health/2026-04-checkup.pdf 解读这份体检报告，对比去年同期，
+            重点说骨密度趋势。 (Muse cites the Endocrine Society guideline,
+            quotes specific numbers, suggests next steps)
+
+Noon     →  Drag-drop investment/research/HSTU-paper.pdf into Files pane
+         →  @investment/HSTU-paper.pdf @investment/portfolio.md
+            这个新策略适合纳入我现有持仓吗？ (Muse cross-references both,
+            answers based on CLAUDE.md's investment guardrails)
+
+Evening  →  Open health/training-log.md in CodeMirror, add today's entry, Ctrl+S
+         →  分析最近 3 个月的训练频率和强度变化 (Muse spots the pattern)
+
+Anytime  →  Type / in chat → see slash commands: /help /compact /clear /resume
+         →  Type @ → autocomplete from your archive's file tree
+         →  Switch model dropdown → confirm → fresh session with new model
+```
+
+**CLAUDE.md auto-loads** from `~/.claude/CLAUDE.md` (your global rules) AND
+`<archive-root>/CLAUDE.md` (per-archive rules), so Muse knows you in every
+session. The installer's 7-question intake seeds your archive's CLAUDE.md with
+your real profile — see [docs/personalize-claude-md.md](docs/personalize-claude-md.md).
+
+---
+
+## Under the hood
+
+```mermaid
+flowchart TB
+  subgraph Browser["Browser · ~3.2k LOC vanilla HTML + Alpine.js + CSS"]
+    F[📁 files] --- P[📄 preview + tabs] --- C[💬 chat + multi-model]
+  end
+  Browser ==>|HTTP / SSE| BE
+  subgraph BE["Backend · FastAPI ~1.2k LOC"]
+    A["/api/files/*<br/>safe-resolve · read/write/grep"]
+    B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model)"]
+  end
+  BE ==> SDK[Claude Agent SDK<br/>spawns claude CLI subprocess]
+  SDK -->|claude-* models<br/>via Pro OAuth| AN[api.anthropic.com]
+  SDK -->|env override per request| V[Vendor Anthropic-compat endpoints]
+  V --> DS[api.deepseek.com/anthropic]
+  V --> GL[open.bigmodel.cn/api/anthropic]
+  V --> MM[api.minimaxi.com/anthropic]
+```
+
+**Key design choices**:
+
+- **SDK > raw API**. We use Claude Agent SDK (same engine as Claude Code), so MCP / Skills / Subagents / plan mode / CLAUDE.md auto-load work uniformly across providers. Adding a new provider = 3 lines, not 300.
+- **`env=` override per session**. SDK passes a fresh env dict to its subprocess. For DeepSeek/GLM/MiniMax we set `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` and an isolated `CLAUDE_CONFIG_DIR` (otherwise the CLI silently falls back to Pro OAuth → bills Anthropic).
+- **No bundler, no transpiler**. Edit a file, refresh, done. `vendor/` carries vetted runtime (Alpine, marked, DOMPurify, KaTeX, hljs) so install never hits npm.
+- **Session = `(session_id, model)`** cached client. Switching model spawns a fresh client; per-message `model` field on assistant bubbles keeps badges accurate after reload.
+
+---
+
+## Security model
+
+⚠️ **A leaked `MUSELAB_TOKEN` ≈ shell-level read/write on `MUSELAB_ROOT`.**
+Chat sessions run with `permission_mode="bypassPermissions"` by default —
+Claude can read/write any file under that root without per-call confirmation.
+
+**Baked in**:
 
 - `MUSELAB_ROOT` blocklist: refuses `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot`, `$HOME`
-- `MUSELAB_TOKEN` minimum 16 chars
-- Path-traversal protection (`safe_resolve`)
-- Sensitive-file blocking: `.env*`, `id_rsa`, `*.pem`, `credentials*` etc. — even with valid token
-- XSS protection: all markdown rendering goes through DOMPurify
-- HTML/SVG preview in `iframe sandbox=""` + strict CSP
+- `MUSELAB_TOKEN` minimum 16 chars enforced at startup
+- Path traversal & **symlink escape** protection (`safe_resolve` checks resolved real path)
+- Sensitive filename blocking: `.env*`, `id_rsa`, `*.pem`, `credentials*` — refused for read **and** upload
+- Upload size cap (100 MB, configurable) + executable extension blocklist
+- XSS protection: all markdown rendering passes through DOMPurify
+- HTML / SVG preview in `iframe sandbox="allow-scripts"` + strict CSP (no token leak from sandbox)
+- File preview: blacklist + content sniff (no whitelist that needs updating per new file type)
 
-What you must do at the ops layer:
+**You handle**:
 
-- Run as an unprivileged user (not `root`, not your login user)
-- Point `MUSELAB_ROOT` at a dedicated directory
-- Long random token, rotate on suspicion of leak
-- HTTPS + nginx basic auth if reachable beyond your LAN
+- Run as your normal user — installer refuses `sudo`
+- Point `MUSELAB_ROOT` at a dedicated directory, not your home
+- Keep the token random and out of git
+- For LAN exposure: HTTPS + nginx basic auth on top
+- For VPS: SSH tunnel or Tailscale, **not** open port 8765 to the internet
 
-See [SECURITY.md](SECURITY.md) for the threat model + how to report a vulnerability.
+See [SECURITY.md](SECURITY.md) for the threat model + responsible disclosure.
 
-## A note on the name
+---
 
-muselab takes its name from the **nine Muses** of Greek mythology — the goddesses
-who inspire art and learning. **Muse** is the AI inside; **muselab** is the open
-workshop she lives in.
+## The nine Muses
 
-Each session boots a different muse (hashed from date + hour, so she changes
-hourly but stays stable within the hour). Over time you'll meet all nine:
+muselab takes its name from the **nine Muses** of Greek mythology — the
+goddesses who inspire art and learning. **Muse** is the AI persona inside;
+**muselab** is the workshop she lives in.
+
+Each session boots a different muse (hashed from date + hour — stable within
+an hour, rotates daily). Click the mascot in the chat header to cycle.
+The favicon follows along — your browser tab quietly carries today's muse.
 
 | Muse | Domain | Geometric form |
 |---|---|---|
@@ -310,16 +332,20 @@ hourly but stays stable within the hour). Over time you'll meet all nine:
 | Thalia | Comedy | Spark |
 | Urania | Astronomy | Orbit |
 
-Click the mascot in the chat header to cycle through the rest. The favicon
-follows along — your browser tab quietly carries today's muse.
+---
 
-## Status
+## Status & contributing
 
-Pre-1.0, personal project. I use it daily. PRs welcome; the maintainer reserves the
-right to reject features that bloat the codebase beyond "readable in an afternoon".
+**Pre-1.0**, personal project, used daily by the author. PRs welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). The maintainer reserves the right to
+reject features that bloat the codebase beyond *"readable in an afternoon"*.
 
-Roadmap and known issues live in [TODO.md](TODO.md).
+- 🐛 **Bugs**: open an issue using the [bug template](.github/ISSUE_TEMPLATE/bug_report.md)
+- 💡 **Features**: use the [feature template](.github/ISSUE_TEMPLATE/feature_request.md)
+- 🔌 **Provider not working**: use the [provider template](.github/ISSUE_TEMPLATE/provider_issue.md) (paste sanitized vendor response)
+- 📋 **Roadmap / known issues**: [TODO.md](TODO.md)
+- 🔒 **Security**: don't open a public issue — see [SECURITY.md](SECURITY.md)
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — do what you want, no warranty.
