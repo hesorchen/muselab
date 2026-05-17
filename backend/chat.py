@@ -892,10 +892,18 @@ async def stream(
                         "cache_read_tokens": 0, "cache_creation_tokens": 0,
                         "total_cost_usd": 0.0, "last_turn_at": 0.0,
                     })
-                    sess_u["input_tokens"] = in_t        # current context, not accumulated
-                    sess_u["output_tokens"] += out_t
-                    sess_u["cache_read_tokens"] += cr_t
-                    sess_u["cache_creation_tokens"] += cc_t
+                    # Per-session snapshot. context window math needs PER-TURN
+                    # values for input/cache_read/cache_creation — accumulating
+                    # them would make ctx_used = sum over all turns, which
+                    # overflows the 128K limit after a handful of turns even
+                    # when the live context is only ~10K. (Bug seen 2026-05-17:
+                    # session showed 105.9% / 135.6K after a few turns.)
+                    # Accumulated totals live in _stats above for global
+                    # cache_hit_pct etc.
+                    sess_u["input_tokens"] = in_t
+                    sess_u["cache_read_tokens"] = cr_t
+                    sess_u["cache_creation_tokens"] = cc_t
+                    sess_u["output_tokens"] += out_t   # still accumulated — per-turn output isn't a useful display
                     sess_u["total_cost_usd"] += cost
                     sess_u["last_turn_at"] = time.time()
 
