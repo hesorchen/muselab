@@ -385,7 +385,7 @@ window.addEventListener("error", e => {
         <span class="cost-badge"
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
-              x-text="fmtCost(stats.total_cost_usd)"></span>
+              x-text="tokenBadgeText()"></span>
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
 

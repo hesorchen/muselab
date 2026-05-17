@@ -2513,15 +2513,28 @@ function portal() {
       return "$" + usd.toFixed(2);
     },
 
+    // Header badge: show accumulated input/output tokens instead of $.
+    // 1.2K / 350 format — concise, intuitive (in / out). Use M for ≥1M.
+    fmtTokens(n) {
+      n = n || 0;
+      if (n < 1000) return n.toString();
+      if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "K";
+      return (n / 1_000_000).toFixed(2) + "M";
+    },
+    tokenBadgeText() {
+      const s = this.stats;
+      return `↓ ${this.fmtTokens(s.total_input_tokens)} · ↑ ${this.fmtTokens(s.total_output_tokens)}`;
+    },
+
     costBadgeTitle() {
       const s = this.stats;
       const parts = [
+        `${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out  ·  ${s.total_messages} msg`,
+        `cache hit ${s.cache_hit_pct}%  ·  cache_read ${s.total_cache_read_tokens.toLocaleString()}`,
         `${this.t("cost.total")}: $${s.total_cost_usd.toFixed(4)}`,
-        `${s.total_messages} msg / ${s.total_input_tokens.toLocaleString()} in / ${s.total_output_tokens.toLocaleString()} out`,
-        `cache hit ${s.cache_hit_pct}%`,
       ];
       if (s.budget_usd > 0) parts.push(`${this.t("cost.budget")} ${s.budget_used_pct}% of $${s.budget_usd}`);
-      return parts.join("  ·  ");
+      return parts.join("\n");
     },
     ctxMeterTitle() {
       const u = this.sessionUsage;
