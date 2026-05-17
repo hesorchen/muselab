@@ -2606,65 +2606,28 @@ function portal() {
         return;
       }
 
-      // Implicit flow: no confirm dialog, no visible prompt-and-reply in
-      // chat history. We still need to invoke the model to summarize (no
-      // backend endpoint does this without persisting), but we hide the
-      // mechanics from the user — input box stays empty, toast shows
-      // "正在压缩...", and we switch to the new session as soon as it's
-      // ready. The summarized content lives only in the new session's
-      // compact marker (collapsed by default).
-      const sourceCount = this.messages.filter(m => m.role !== "thinking").length;
-      const preCount = this.messages.filter(m => m.role === "assistant" && m.text).length;
-      const oldId = this.currentId;
-
+      // Native compact: send "/compact" to CLI via SDK, which writes
+      // compact_boundary + isCompactSummary to the session JSONL. Lossless,
+      // preserves tool use history, same session ID. Old self-implemented
+      // summarize-and-fork is gone — it was lossy and unnecessary once we
+      // realized the SDK forwards slash commands to CLI natively.
       this._compacting = true;
-      this.toast(this.lang === "zh" ? "📦 正在压缩历史..." : "📦 Compacting history...", "info", 60_000);
+      this.toast(this.lang === "zh" ? "📦 正在压缩历史..." : "📦 Compacting history...", "info", 120_000);
 
       try {
-        // Step 1: ask the current session for a summary. send() will push
-        // the prompt + assistant reply to messages — we accept that for the
-        // OLD session; the user typically won't navigate back, and if they
-        // do, they see the explicit summarize Q&A which is fine.
-        this.input = this.t("ctx.compact_summarize_prompt");
-        await this.send();
-        await new Promise((resolve, reject) => {
-          const started = Date.now();
-          const check = () => {
-            if (!this.streaming) return resolve();
-            if (Date.now() - started > 60_000) return reject(new Error("compact timeout"));
-            setTimeout(check, 200);
-          };
-          check();
-        });
-
-        const asstMsgs = this.messages.filter(m => m.role === "assistant" && m.text);
-        if (asstMsgs.length <= preCount) {
-          this.toast(this.t("ctx.compact_no_reply"), "error", 4000);
+        const r = await fetch(`/api/chat/sessions/${this.currentId}/native-compact`,
+                                { method: "POST", headers: this.hdr() });
+        if (!r.ok) {
+          const txt = await r.text();
+          this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + txt, "error", 5000);
           return;
         }
-        const summary = asstMsgs[asstMsgs.length - 1].text;
-
-        const r = await fetch(`/api/chat/sessions/${oldId}/compact`,
-                                { method: "POST", headers: this.hdr() });
-        if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
-        const meta = await r.json();
-
-        await fetch(`/api/chat/sessions/${meta.id}/seed`, {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({
-            summary,
-            is_compact: true,                        // new flag → render as marker
-            source_message_count: sourceCount,
-          }),
-        });
+        // Reload current session so the new compact-marker shows up.
+        await this.loadSession(this.currentId);
         await this.refreshSessions();
-        this.currentId = meta.id;
-        await this.loadSession(meta.id);
-        // Clear the long-running progress toast and show success briefly.
         this.toast(this.lang === "zh" ? "📦 压缩完成" : "📦 Compacted", "success", 2000);
       } catch (e) {
-        this.toast(this.t("ctx.compact_timeout"), "error", 4000);
+        this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + e.message, "error", 5000);
       } finally {
         this._compacting = false;
       }

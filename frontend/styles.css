@@ -837,6 +837,14 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   color: var(--c-accent); font-size: var(--fs-xs);
   border-left: 1px solid var(--c-fg-4); padding-left: 8px;
 }
+.compact-marker-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  background: var(--c-accent-soft); color: var(--c-accent);
+  border-radius: 999px;
+  font-size: 10px; font-weight: var(--fw-semibold);
+  letter-spacing: 0.3px;
+}
 .compact-marker-body {
   flex-basis: 100%;
   margin: 6px 0 0;

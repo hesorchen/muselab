@@ -539,11 +539,17 @@ window.addEventListener("error", e => {
               <!-- Compact marker: replaces normal user bubble for seeded
                    compact-origin messages. Click to expand the raw summary. -->
               <template x-if="m.role==='user' && m._compact_marker">
-                <div class="compact-marker" @click="m._compact_expanded = !m._compact_expanded">
+                <div class="compact-marker"
+                     @click="(m._compact_summary || m.text) && (m._compact_expanded = !m._compact_expanded)">
                   <span class="compact-marker-icon">📦</span>
                   <span class="compact-marker-text"
-                        x-text="(lang==='zh' ? '内容已压缩 · 来自前 ' : 'Compacted · from ') + (m._compact_source_count || '?') + (lang==='zh' ? ' 条消息' : ' messages')"></span>
-                  <span class="compact-marker-toggle"
+                        x-text="(lang==='zh' ? '内容已压缩 · 前 ' : 'Compacted · ') + (m._compact_source_count || '?') + (lang==='zh' ? ' 条消息' : ' messages')"></span>
+                  <span x-show="m._compact_native" class="compact-marker-badge"
+                        x-text="lang==='zh' ? '原生无损' : 'lossless'"></span>
+                  <!-- Only show toggle when there's something to expand (legacy fork-based
+                       compact stores the summary; native compact stores it in CLI's JSONL). -->
+                  <span x-show="m._compact_summary || (m.text && !m._compact_native)"
+                        class="compact-marker-toggle"
                         x-text="m._compact_expanded ? (lang==='zh' ? '收起' : 'collapse') : (lang==='zh' ? '查看摘要' : 'view summary')"></span>
                   <pre x-show="m._compact_expanded" class="compact-marker-body" x-text="m._compact_summary || m.text"></pre>
                 </div>
