@@ -185,6 +185,23 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             env_ovr = endpoints.env_override(model)
             if env_ovr is not None:
                 opts_kwargs["env"] = env_ovr
+            else:
+                # No env_override == this is Claude (or unknown model). CLI needs
+                # ONE of: ~/.claude/.credentials.json (Pro OAuth), ANTHROPIC_API_KEY
+                # in env, or ANTHROPIC_AUTH_TOKEN. If none of those are present, CLI
+                # exits 1 with "Not logged in" BEFORE producing any stderr — leaving
+                # only a useless ProcessError. Pre-check and raise a clean message
+                # so the UI can surface "请先配置 Anthropic API key 或运行 claude login"
+                # instead of a generic stream-failure.
+                from claude_agent_sdk._errors import ClaudeSDKError as _SDKErr
+                cred_file = Path.home() / ".claude" / ".credentials.json"
+                if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
+                        and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                    raise _SDKErr(
+                        f"Claude model '{model}' requires auth: either run "
+                        f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
+                        f"Settings. CLI would exit 1 silently otherwise."
+                    )
                 # Capture CLI stderr so vendor 401 / network errors surface
                 # in /tmp/muselab-restart.log instead of vanishing silently.
                 import sys as _sys
@@ -927,7 +944,16 @@ async def stream(
         model_to_use = model or MODEL
         sess.update_model(session_id, model_to_use)
 
-    client = await get_client(session_id, model_to_use, permission, show_thinking)
+    # Wrap get_client so SDK / auth pre-check errors surface as SSE error
+    # events instead of bubbling up as a 500 (which the frontend can only
+    # render as the generic "stream connection failed" toast).
+    try:
+        client = await get_client(session_id, model_to_use, permission, show_thinking)
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}"
+        async def _early_err_gen():
+            yield {"event": "error", "data": json.dumps({"error": err_msg})}
+        return EventSourceResponse(_early_err_gen())
 
     # Pull attachments from the in-memory store; build content blocks for the
     # SDK. Consume them — same attachment won't be re-sent on retry.
