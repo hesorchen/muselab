@@ -138,6 +138,19 @@ def test_settings_put_reflects_in_context_info(client, auth):
 # (used by frontend to render the 📦 marker pill).
 # ============================================================================
 
+def test_context_breakdown_returns_409_for_session_without_client(client, auth):
+    """SDK audit takeaway: prefer client.get_context_usage() over manual
+    arithmetic for breakdown info. This endpoint surfaces the SDK call.
+    A session that hasn't run a turn yet has no live client → 409, not
+    fake data. Forces the frontend to fall back to /usage cleanly."""
+    r = client.post("/api/chat/sessions",
+                     headers={**auth, "Content-Type": "application/json"},
+                     json={"name": "no client yet", "model": "deepseek-v4-flash"})
+    sid = r.json()["id"]
+    r = client.get(f"/api/chat/context-breakdown/{sid}", headers=auth)
+    assert r.status_code == 409, f"expected 409 (no live client), got {r.status_code}: {r.text}"
+
+
 def test_seed_with_compact_flag_persists_marker(client, auth):
     """POST /sessions/{sid}/seed with is_compact=true must persist
     _compact_marker, _compact_source_count, _compact_summary in the

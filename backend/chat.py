@@ -310,7 +310,12 @@ def usage() -> dict:
 
 @router.get("/usage/{session_id}", dependencies=[Depends(require_token)])
 def session_usage(session_id: str, model: str = "") -> dict:
-    """Per-session context meter — what fraction of the model's window we're at."""
+    """Per-session context meter — what fraction of the model's window we're at.
+
+    Note: this is the cheap path — reads cached per-turn usage values.
+    For a true breakdown (per CLAUDE.md file, per MCP tool, per skill),
+    use /context-breakdown/{session_id} which invokes
+    ClaudeSDKClient.get_context_usage() against the live session."""
     u = _session_usage.get(session_id, {
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
@@ -318,10 +323,6 @@ def session_usage(session_id: str, model: str = "") -> dict:
     })
     m = model or MODEL
     limit = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
-    # Real context window usage = input + cache_read + cache_creation.
-    # With prompt caching, replayed history shows up under cache_read, not
-    # input_tokens — using input alone makes the meter "shrink" between turns
-    # when really the window is still mostly full.
     ctx_used = u["input_tokens"] + u.get("cache_read_tokens", 0) + u.get("cache_creation_tokens", 0)
     return {
         **u,
@@ -330,6 +331,34 @@ def session_usage(session_id: str, model: str = "") -> dict:
         "context_used": ctx_used,
         "context_used_pct": round(ctx_used / limit * 100, 1) if limit else 0,
     }
+
+
+@router.get("/context-breakdown/{session_id}", dependencies=[Depends(require_token)])
+async def context_breakdown(session_id: str, model: str = "") -> dict:
+    """Detailed context breakdown via SDK — answers "where did my 100K go?".
+    Calls ClaudeSDKClient.get_context_usage() which returns the same data
+    the CLI's /context command shows: tokens per category (memory files,
+    MCP tools, agents, system tools, system prompt sections), with
+    per-file and per-tool breakdowns.
+
+    Returns 404 if the session doesn't have a live SDK client yet — that
+    happens for newly-created sessions that haven't run a turn."""
+    s = sess.get_session(session_id)
+    if s is None:
+        raise HTTPException(404, "session not found")
+    m = (model or s.get("model") or MODEL).strip()
+    key = (session_id, m)
+    if key not in _clients:
+        # No live client → can't ask CLI for breakdown. Surface this rather
+        # than returning fake data; frontend can fall back to /usage.
+        raise HTTPException(409, "no live client for this session — send a message first")
+    try:
+        breakdown = await _clients[key].get_context_usage()
+        # Pass through the SDK's response shape directly. Frontend can pick
+        # whichever fields it wants to render.
+        return dict(breakdown)
+    except Exception as e:
+        raise HTTPException(500, f"get_context_usage failed: {e}")
 
 
 class SeedReq(BaseModel):
