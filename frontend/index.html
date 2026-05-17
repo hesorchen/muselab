@@ -118,8 +118,27 @@ window.addEventListener("error", e => {
 
 <div id="app" x-data="portal()" x-init="document.getElementById('loading').remove(); init()" x-cloak>
 
+  <!-- Splash — first load / hard refresh, before initial data arrives -->
+  <div class="splash" x-show="!appReady" x-transition.opacity.duration.300ms x-cloak>
+    <span class="muse-mascot lg splash-mascot">
+      <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+    </span>
+    <div class="splash-logo">muse<span class="accent">·lab</span></div>
+    <div class="splash-text" x-text="t('splash.greet')"></div>
+    <div class="splash-hint" x-show="splashHint" x-text="splashHint"></div>
+  </div>
+
+  <!-- Connection banner — slim sticky bar when backend is briefly unreachable -->
+  <div class="conn-banner" x-show="connState !== 'ok'"
+       :class="{ reconnecting: connState === 'reconnecting',
+                  reconnected:  connState === 'reconnected' }"
+       x-transition.opacity x-cloak>
+    <span x-show="connState === 'reconnecting'" x-text="t('conn.reconnecting')"></span>
+    <span x-show="connState === 'reconnected'"  x-text="t('conn.reconnected')"></span>
+  </div>
+
   <!-- 登录 -->
-  <div class="login" x-show="!authed">
+  <div class="login" x-show="!authed && appReady">
     <span class="muse-mascot lg" :class="{'greet': mascotGreet}">
       <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
     </span>

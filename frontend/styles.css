@@ -212,6 +212,77 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 }
 
 /* ==========================================================================
+   Splash — full-screen loading on initial app boot
+   ========================================================================== */
+[x-cloak] { display: none !important; }
+.splash {
+  position: fixed; inset: 0; z-index: 10000;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 18px;
+  background: radial-gradient(ellipse at center, var(--c-bg-1) 0%, var(--c-bg-0) 100%);
+}
+.splash-mascot {
+  animation: splash-breath 1.8s ease-in-out infinite;
+  color: var(--c-accent);
+  filter: drop-shadow(0 0 18px var(--c-accent-soft));
+}
+@keyframes splash-breath {
+  0%, 100% { transform: scale(1);    opacity: 0.92; }
+  50%      { transform: scale(1.08); opacity: 1; }
+}
+.splash-logo {
+  font-size: 28px; font-weight: var(--fw-semibold);
+  letter-spacing: -0.5px; color: var(--c-fg-0);
+}
+.splash-logo .accent { color: var(--c-accent); }
+.splash-text {
+  font-size: var(--fs-md); color: var(--c-fg-2);
+  letter-spacing: 0.3px;
+}
+.splash-text::after {
+  content: ""; display: inline-block; width: 0;
+  animation: splash-dots 1.4s steps(4, end) infinite;
+  overflow: hidden; vertical-align: bottom;
+  /* Trick: width animation makes 1/2/3 dots cycle without changing layout */
+}
+@keyframes splash-dots {
+  0%   { width: 0;    content: "."; }
+  33%  { width: 6px;  content: "."; }
+  66%  { width: 12px; content: ".."; }
+  100% { width: 18px; content: "..."; }
+}
+.splash-hint {
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  max-width: 320px; text-align: center; line-height: 1.5;
+  margin-top: 8px;
+  animation: splash-fade-in .4s ease;
+}
+@keyframes splash-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ==========================================================================
+   Connection banner — slim sticky bar when backend pings start failing
+   ========================================================================== */
+.conn-banner {
+  position: fixed; top: 0; left: 0; right: 0;
+  z-index: 9000;
+  padding: 8px 16px;
+  text-align: center;
+  font-size: var(--fs-sm); font-weight: var(--fw-medium);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+.conn-banner.reconnecting {
+  background: #fef3c7;            /* amber-100 */
+  color: #92400e;                 /* amber-900 */
+}
+.conn-banner.reconnected {
+  background: var(--c-accent-soft);
+  color: var(--c-accent);
+}
+
+/* ==========================================================================
    Login
    ========================================================================== */
 .login {

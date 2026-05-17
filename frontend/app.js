@@ -60,6 +60,10 @@ const STRINGS = {
     "preview.new_note_title": "新建 markdown 笔记",
     "preview.new_note_body": "文件名（默认放 archive 根目录；可写 health/foo.md 等子路径）",
     // login
+    "splash.greet": "正在唤醒 Muse...",
+    "splash.slow": "还在启动，请稍等（首次加载会久一点）",
+    "conn.reconnecting": "🔄 muselab 失联中 — 正在重试...",
+    "conn.reconnected": "✓ 已重连",
     "login.sub": "你的私人 AI 助理，同时记得你的所有维度。",
     "login.tagline": "muse · lab",
     "login.token_placeholder": "MUSELAB_TOKEN",
@@ -293,6 +297,10 @@ const STRINGS = {
     "preview.action_upload": "Upload",
     "preview.new_note_title": "New markdown note",
     "preview.new_note_body": "Filename (defaults to archive root; you can write health/foo.md etc.)",
+    "splash.greet": "Waking up Muse…",
+    "splash.slow": "Still loading — first boot takes a moment",
+    "conn.reconnecting": "🔄 muselab is unreachable — retrying…",
+    "conn.reconnected": "✓ Reconnected",
     "login.sub": "Your personal AI assistant — knows every dimension of your life.",
     "login.tagline": "muse · lab",
     "login.token_placeholder": "MUSELAB_TOKEN",
@@ -501,6 +509,21 @@ function portal() {
   return {
     // ===== auth =====
     authed: false, tokenInput: "", token: "", loginErr: "",
+    // App-readiness layers:
+    //   appReady=false → full-screen splash (initial load / hard refresh).
+    //     Cleared once contextInfo + sessions list have arrived OR after
+    //     a hard 8s timeout (avoid splashing forever on backend dead).
+    //   connState: 'ok' | 'reconnecting' | 'reconnected'
+    //     drives the slim top banner shown when fetches start failing
+    //     (backend restarted, network blipped). 'reconnected' briefly
+    //     flashes green then auto-clears.
+    appReady: false,
+    splashHint: "",          // "still warming up..." appears after 3s
+    connState: "ok",
+    _connFails: 0,
+    _connHeartbeat: null,
+    _splashHintTimer: null,
+    _splashHardTimeout: null,
 
     // ===== file tree =====
     visible: [], expanded: new Set(), childCache: {},
@@ -686,11 +709,84 @@ function portal() {
       const t = localStorage.getItem("muselab_token");
       if (t) {
         this.token = t; this.authed = true;
-        this.loadPrefs();
-        this.loadRoot();
-        this.initSessions();
-        this.fetchStats();
-        this.fetchContextInfo();
+        this._bootApp();
+      } else {
+        // No token saved → skip splash, jump straight to login.
+        this.appReady = true;
+      }
+    },
+
+    // First-load splash + initial fetch sequence. Sets appReady=true once
+    // contextInfo + sessions both come back, OR after 8s hard timeout (so
+    // a dead backend doesn't leave the user on a splash forever — we surface
+    // the issue via the reconnect banner instead).
+    async _bootApp() {
+      // Splash hint after 3s ("still warming up...")
+      this._splashHintTimer = setTimeout(() => {
+        this.splashHint = this.t("splash.slow");
+      }, 3000);
+      // Hard timeout — if 8s pass without a successful fetch, drop splash
+      // and let the reconnect banner take over.
+      this._splashHardTimeout = setTimeout(() => {
+        if (!this.appReady) {
+          this.appReady = true;
+          this.connState = "reconnecting";
+        }
+      }, 8000);
+
+      this.loadPrefs();
+      this.loadRoot();
+      this.initSessions();
+      this.fetchStats();
+      // Block readiness on context-info (the most important one for the
+      // onboarding cards). Others come along in parallel.
+      try {
+        await this.fetchContextInfo();
+        this._markReady();
+      } catch (e) {
+        // Will retry via heartbeat
+      }
+      this._startHeartbeat();
+    },
+
+    _markReady() {
+      if (this.appReady) return;
+      this.appReady = true;
+      clearTimeout(this._splashHintTimer);
+      clearTimeout(this._splashHardTimeout);
+      this.splashHint = "";
+    },
+
+    // 10s heartbeat — pings /api/meta. If 2 consecutive fails, flag reconnecting;
+    // when one comes back, flash "reconnected" then auto-clear.
+    _startHeartbeat() {
+      if (this._connHeartbeat) clearInterval(this._connHeartbeat);
+      this._connHeartbeat = setInterval(() => this._pingHealth(), 10_000);
+    },
+    async _pingHealth() {
+      try {
+        const r = await fetch("/api/meta", { headers: this.hdr() });
+        if (!r.ok) throw new Error("status " + r.status);
+        // Healthy
+        if (this.connState === "reconnecting") {
+          this.connState = "reconnected";
+          // After a 1.5s flash of green, drop back to silent ok.
+          setTimeout(() => {
+            if (this.connState === "reconnected") this.connState = "ok";
+          }, 1500);
+          // Also refresh sessions / context — they may be stale post-restart
+          this.refreshSessions();
+          this.fetchContextInfo();
+        } else {
+          this.connState = "ok";
+        }
+        this._connFails = 0;
+      } catch (e) {
+        this._connFails++;
+        if (this._connFails >= 2) this.connState = "reconnecting";
+        // Splash → if we never managed to ready up, force ready so user sees
+        // the banner (otherwise they stare at splash with no feedback).
+        if (!this.appReady) this._markReady();
       }
     },
 
