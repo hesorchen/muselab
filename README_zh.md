@@ -102,11 +102,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```powershell
-# Windows PowerShell — Windows 默认 ExecutionPolicy 是 Restricted，会阻止
-# 运行任何 PowerShell 脚本（包括 uv 自己的 wrapper）。先放行：
+# Windows PowerShell — 干净 Windows 需要三步一次性配置：
+
+# (a) 放行 PowerShell 脚本（默认 Restricted 会拒绝 uv）
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-# 然后**重开一个 PowerShell 窗口**，再装 uv：
+
+# (b) 装 git（干净 Windows 不带）
+winget install --id Git.Git -e
+
+# (c) 装 uv
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 每一步之后开新的 PowerShell 窗口，让 PATH 刷新。
 ```
 
 ### 1. 一键安装

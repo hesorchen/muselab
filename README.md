@@ -107,10 +107,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```powershell
-# Windows PowerShell — first allow scripts (default is Restricted),
-# then install uv. Reopen PowerShell after the policy change.
+# Windows PowerShell — clean Windows needs three one-time setups:
+
+# (a) allow scripts to run (default is Restricted)
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# (b) install git if you don't have it
+winget install --id Git.Git -e
+
+# (c) install uv
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Open a new PowerShell window after each, so PATH refreshes.
 ```
 
 ### 1. One-shot installer

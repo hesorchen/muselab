@@ -49,6 +49,15 @@ if ($policy -eq "Restricted" -or $policy -eq "AllSigned" -or $policy -eq "Undefi
   Ok "ExecutionPolicy: $policy (uv will work)"
 }
 
+# git — needed if user got here via `git clone` already; warn if missing so
+# they know how to pull future updates
+$git = Get-Command git -ErrorAction SilentlyContinue
+if ($git) { Ok "git: $($git.Source)" }
+else {
+  Warn "git not found — you got here via zip download. For future updates use:"
+  Write-Host "      winget install --id Git.Git -e   (then reopen PowerShell)"
+}
+
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $uv) {
   Err "uv not found. Install it first:"

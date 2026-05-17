@@ -6,27 +6,56 @@ admin needed.
 
 ## Prerequisites
 
-- Windows 10 or 11 (PowerShell 5+ included by default)
-- **Set PowerShell ExecutionPolicy once** (Windows defaults to `Restricted`,
-  which blocks both uv's installer wrapper and uv itself from running):
-  ```powershell
-  Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-  ```
-  Answer `Y`. This only affects your user. Then **open a new PowerShell window**.
-  Skip this step and you'll see:
-  ```
-  Error: PowerShell requires an execution policy in [Unrestricted, RemoteSigned, Bypass] to run uv.
-  ```
-- Install `uv` ([docs](https://docs.astral.sh/uv/getting-started/installation/)):
-  ```powershell
-  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-  ```
-- (For Anthropic models) `claude` CLI logged in once:
-  ```powershell
-  claude login
-  ```
-  Stored under `%USERPROFILE%\.claude\`. Non-Claude providers (DeepSeek / GLM /
-  MiniMax) just need API keys, set later in Settings UI.
+Three things to install once on a clean Windows. Do them in this order — each
+step depends on the previous one being present in PATH.
+
+### 1. Set PowerShell ExecutionPolicy
+
+Windows defaults to `Restricted`, which blocks every PowerShell script —
+including uv's install wrapper AND uv itself once installed.
+
+```powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+Answer `Y`. Only affects your user. **Open a new PowerShell window after.**
+
+Skip this and you'll see:
+```
+Error: PowerShell requires an execution policy in [Unrestricted, RemoteSigned, Bypass] to run uv.
+```
+
+### 2. Install `git`
+
+Clean Windows doesn't ship git.
+
+```powershell
+# Recommended: winget (built in to Win10 1809+ / Win11)
+winget install --id Git.Git -e
+```
+
+Or download from https://git-scm.com/download/win. **Open a new PowerShell**
+after install so PATH refreshes — verify with `git --version`.
+
+(If you'd rather not install git: scroll down to "[No-git install](#no-git-install)".)
+
+### 3. Install `uv`
+
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+[Docs](https://docs.astral.sh/uv/getting-started/installation/). Reopen
+PowerShell after — verify with `uv --version`.
+
+### 4. (Optional) `claude` CLI for Anthropic models
+
+```powershell
+claude login
+```
+
+Stored under `%USERPROFILE%\.claude\`. Non-Claude providers (DeepSeek / GLM /
+MiniMax) just need API keys, set later in the Settings UI.
 
 ## Install
 
@@ -35,6 +64,19 @@ git clone https://github.com/hesorchen/muselab
 cd muselab
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
+
+### No-git install
+
+If you skipped step 2 above:
+
+```powershell
+Invoke-WebRequest https://github.com/hesorchen/muselab/archive/refs/heads/main.zip -OutFile muselab.zip
+Expand-Archive muselab.zip
+cd muselab\muselab-main
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+Trade-off: future upgrades require re-downloading the zip instead of `git pull`.
 
 > **Why `-ExecutionPolicy Bypass`?** Default Windows policy is `Restricted`
 > which blocks unsigned scripts. `Bypass` applies only to this invocation; it
