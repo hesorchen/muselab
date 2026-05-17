@@ -114,10 +114,30 @@ $EnvPath = Join-Path $Repo ".env"
 if (Test-Path $EnvPath) {
   Ok ".env already exists — keeping it as is"
 } else {
-  # 64 hex chars (256-bit token) — uses crypto-grade RNG
-  $bytes = New-Object 'System.Byte[]' 32
-  [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-  $Token = ($bytes | ForEach-Object { "{0:x2}" -f $_ }) -join ""
+  # Token: random 64-hex (256-bit) by default, but let the user pick a memorable
+  # password if they prefer (>= 16 chars enforced — backend rejects shorter).
+  Write-Host
+  Write-Host "  Login token = your password for the web UI. Stored in .env + browser localStorage."
+  Write-Host "  登录口令 = 浏览器登录用的密码。会写进 .env，浏览器记住后不用反复输入。"
+  Write-Host "  Press Enter to auto-generate a 64-char random token (recommended)."
+  Write-Host "  直接回车 = 随机生成 64 位（推荐）；想自己设密码就直接输入（≥16 字符）。"
+  while ($true) {
+    $TokenInput = Read-Host "  Token (Enter for random / 回车随机)"
+    if ([string]::IsNullOrWhiteSpace($TokenInput)) {
+      $bytes = New-Object 'System.Byte[]' 32
+      [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+      $Token = ($bytes | ForEach-Object { "{0:x2}" -f $_ }) -join ""
+      Ok "auto-generated 64-char random token / 已生成 64 位随机口令"
+      break
+    } elseif ($TokenInput.Length -lt 16) {
+      Warn "token must be >= 16 chars / 口令至少 16 字符（输入了 $($TokenInput.Length) 个）"
+      continue
+    } else {
+      $Token = $TokenInput
+      Ok "using your token / 使用你提供的口令 ($($Token.Length) chars)"
+      break
+    }
+  }
 
   Write-Host
   Write-Host "  Archive dir = where Muse can read/write (NEVER point at your user dir or C:\)"

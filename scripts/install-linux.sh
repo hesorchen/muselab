@@ -92,12 +92,32 @@ bold "3/5  Configuring .env / 写入 .env 配置"
 if [[ -f .env ]]; then
   ok ".env already exists — keeping it as is"
 else
-  # Token: prefer openssl, fall back to /dev/urandom
-  if command -v openssl >/dev/null 2>&1; then
-    TOKEN="$(openssl rand -hex 32)"
-  else
-    TOKEN="$(head -c 32 /dev/urandom | xxd -p -c 999)"
-  fi
+  # Token: random 64-hex (256-bit) by default; user can pick a memorable
+  # password instead (>= 16 chars — backend rejects shorter).
+  echo
+  echo "  Login token = your password for the web UI. Stored in .env + browser localStorage."
+  echo "  登录口令 = 浏览器登录用的密码。会写进 .env，浏览器记住后不用反复输入。"
+  echo "  Press Enter to auto-generate a 64-char random token (recommended)."
+  echo "  直接回车 = 随机生成 64 位（推荐）；想自己设密码就直接输入（≥16 字符）。"
+  while true; do
+    read -r -p "  Token (Enter for random / 回车随机): " TOKEN_INPUT
+    if [[ -z "$TOKEN_INPUT" ]]; then
+      if command -v openssl >/dev/null 2>&1; then
+        TOKEN="$(openssl rand -hex 32)"
+      else
+        TOKEN="$(head -c 32 /dev/urandom | xxd -p -c 999)"
+      fi
+      ok "auto-generated 64-char random token / 已生成 64 位随机口令"
+      break
+    elif (( ${#TOKEN_INPUT} < 16 )); then
+      warn "token must be >= 16 chars / 口令至少 16 字符（输入了 ${#TOKEN_INPUT} 个）"
+      continue
+    else
+      TOKEN="$TOKEN_INPUT"
+      ok "using your token / 使用你提供的口令 (${#TOKEN} chars)"
+      break
+    fi
+  done
 
   echo
   echo "  Archive dir = where Muse can read/write (NEVER point at \$HOME or /)"
