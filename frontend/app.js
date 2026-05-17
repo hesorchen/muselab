@@ -588,7 +588,7 @@ function portal() {
     // Per-session context meter snapshot, updated on every SSE `done` event
     sessionUsage: { input_tokens: 0, output_tokens: 0,
                      cache_read_tokens: 0, cache_creation_tokens: 0,
-                     context_limit: 128000, context_used_pct: 0 },
+                     context_limit: 128000, context_used: 0, context_used_pct: 0 },
     stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0,
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
@@ -2516,7 +2516,14 @@ function portal() {
     },
     ctxMeterLabel() {
       const pct = this.sessionUsage.context_used_pct;
-      const usedK = (this.sessionUsage.input_tokens / 1000).toFixed(1);
+      // Real context = input + cache_read + cache_creation. Backend sends
+      // pre-computed `context_used`; fall back to summing if absent.
+      const usedTokens = (this.sessionUsage.context_used != null)
+        ? this.sessionUsage.context_used
+        : (this.sessionUsage.input_tokens || 0)
+          + (this.sessionUsage.cache_read_tokens || 0)
+          + (this.sessionUsage.cache_creation_tokens || 0);
+      const usedK = (usedTokens / 1000).toFixed(1);
       const limitK = (this.sessionUsage.context_limit / 1000).toFixed(0);
       if (pct >= 90) return this.t("ctx.danger", { used: usedK, limit: limitK, pct });
       if (pct >= 70) return this.t("ctx.warn",   { used: usedK, limit: limitK, pct });

@@ -318,11 +318,17 @@ def session_usage(session_id: str, model: str = "") -> dict:
     })
     m = model or MODEL
     limit = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
+    # Real context window usage = input + cache_read + cache_creation.
+    # With prompt caching, replayed history shows up under cache_read, not
+    # input_tokens — using input alone makes the meter "shrink" between turns
+    # when really the window is still mostly full.
+    ctx_used = u["input_tokens"] + u.get("cache_read_tokens", 0) + u.get("cache_creation_tokens", 0)
     return {
         **u,
         "model": m,
         "context_limit": limit,
-        "context_used_pct": round(u["input_tokens"] / limit * 100, 1) if limit else 0,
+        "context_used": ctx_used,
+        "context_used_pct": round(ctx_used / limit * 100, 1) if limit else 0,
     }
 
 
@@ -920,7 +926,8 @@ async def stream(
                         "session_usage": {
                             **_session_usage[session_id],
                             "context_limit": limit,
-                            "context_used_pct": round(in_t / limit * 100, 1) if limit else 0,
+                            "context_used": in_t + cr_t + cc_t,
+                            "context_used_pct": round((in_t + cr_t + cc_t) / limit * 100, 1) if limit else 0,
                         },
                         "budget_usd": _budget_usd(),
                         "budget_used_pct": (
