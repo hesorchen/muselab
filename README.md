@@ -1,6 +1,9 @@
 # muselab
 
-### A web harness for **Anthropic's Claude Agent SDK**, pointed at **your own files**, running **entirely on your machine** — and built in **plain HTML**.
+### Meet **Muse** — an AI assistant that actually knows you.
+*muselab is the open, self-hosted lab where Muse lives — alongside your archive.*
+
+> A web **harness for Anthropic's Claude Agent SDK**, pointed at **your own files**, running **entirely on your machine**, written in **plain HTML**.
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)

@@ -1,6 +1,9 @@
 # muselab
 
-### **Anthropic Claude Agent SDK** 的 web harness，指向**你自己的档案**，**完全本地跑**，用**纯 HTML** 写。
+### 见见 **Muse** —— 真的认识你的 AI 助理。
+*muselab 是 Muse 居住的自托管"工坊"，跟你的档案为邻。*
+
+> **Anthropic Claude Agent SDK** 的 web harness，指向**你自己的档案**，**完全本地跑**，用**纯 HTML** 写。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
