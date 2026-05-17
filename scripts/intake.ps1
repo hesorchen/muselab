@@ -16,7 +16,7 @@ function Ask($q, $def="") {
 
 $envPath = Join-Path $Repo ".env"
 if (-not (Test-Path $envPath)) { Err ".env not found — run scripts\install-windows.ps1 first"; exit 1 }
-$envText = Get-Content $envPath -Raw
+$envText = Get-Content $envPath -Raw -Encoding UTF8
 if ($envText -notmatch "MUSELAB_ROOT=(\S+)") { Err "MUSELAB_ROOT missing in .env"; exit 1 }
 $Archive = $matches[1]
 if (-not (Test-Path $Archive)) { Err "MUSELAB_ROOT=$Archive but dir doesn't exist"; exit 1 }

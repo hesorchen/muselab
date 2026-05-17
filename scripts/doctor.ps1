@@ -35,7 +35,7 @@ Bold "2. Configuration"
 $envPath = Join-Path $Repo ".env"
 if (Test-Path $envPath) {
   Ok ".env present"
-  $envText = Get-Content $envPath -Raw
+  $envText = Get-Content $envPath -Raw -Encoding UTF8
   $token = if ($envText -match "MUSELAB_TOKEN=(\S+)") { $matches[1] } else { "" }
   $root  = if ($envText -match "MUSELAB_ROOT=(\S+)")  { $matches[1] } else { "" }
   $port  = if ($envText -match "MUSELAB_PORT=(\S+)")  { $matches[1] } else { "8765" }
@@ -47,7 +47,7 @@ if (Test-Path $envPath) {
   else {
     Ok "MUSELAB_ROOT = $root"
     if (Test-Path (Join-Path $root "CLAUDE.md")) {
-      $lines = (Get-Content (Join-Path $root "CLAUDE.md") | Measure-Object -Line).Lines
+      $lines = (Get-Content (Join-Path $root "CLAUDE.md") -Encoding UTF8 | Measure-Object -Line).Lines
       Ok "  CLAUDE.md present ($lines lines)"
     } else {
       Warn "  no CLAUDE.md at $root — run scripts\intake.ps1 to add"

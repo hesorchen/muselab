@@ -412,6 +412,13 @@ window.addEventListener("error", e => {
 
       <div class="session-bar">
         <select class="session-sel" x-model="currentId" @change="switchSession()">
+          <!-- Fallback for the race where currentId is set (from localStorage)
+               before sessions[] has been loaded — without an <option> matching
+               the bound value, the browser displays the first option and the
+               user sees the wrong session name. -->
+          <template x-if="currentId && !sessions.some(s => s.id === currentId)">
+            <option :value="currentId" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></option>
+          </template>
           <template x-for="s in sessions" :key="s.id">
             <option :value="s.id" x-text="s.name + ' · ' + s.message_count"></option>
           </template>

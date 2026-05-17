@@ -16,11 +16,16 @@ if (-not $task) {
 } else {
   # S4U tasks need admin to unregister (mirror install). If not elevated,
   # spawn one UAC prompt to do the stop + unregister.
+  # Stop-ScheduledTask sends a signal to the launcher.cmd but on Windows that
+  # often doesn't propagate to the uvicorn (python) subprocess — so add an
+  # explicit Stop-Process pass to release the port + kill leftover children.
   $RemoveScript = @"
 `$ErrorActionPreference = 'Stop'
 `$t = Get-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue
 if (`$t) {
   if (`$t.State -eq 'Running') { Stop-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue }
+  Get-Process -Name python, uv -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 1
   Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false
 }
 "@

@@ -1343,19 +1343,8 @@ function portal() {
       } catch {}
     },
 
-    // After availableModels changes, the <select x-model="model"> doesn't
-    // re-pick the displayed option if its DOM value was set against an
-    // earlier-rendered set of options (the fallback option). Force a re-bind
-    // by tickling this.model — set it to '' then back, in successive ticks.
-    // No-op'd when model is empty (avoid clearing intent).
-    async _rebindModelSelect() {
-      const cur = this.model;
-      if (!cur) return;
-      await this.$nextTick();
-      this.model = "";
-      await this.$nextTick();
-      this.model = cur;
-    },
+    // Backwards-compat wrapper — call _rebindSelect("model") directly.
+    async _rebindModelSelect() { await this._rebindSelect("model"); },
 
     // Model switch:
     //   - empty session: PATCH model in place (no point in creating an empty fork)
@@ -1470,7 +1459,24 @@ function portal() {
     },
     async refreshSessions() {
       const r = await fetch("/api/chat/sessions", { headers: this.hdr() });
-      if (r.ok) this.sessions = (await r.json()).sessions;
+      if (r.ok) {
+        this.sessions = (await r.json()).sessions;
+        // Same Alpine-x-model-on-dynamic-options race as model dropdown:
+        // <select x-model="currentId"> needs a tickle so the displayed option
+        // syncs to the real bound value once sessions populate.
+        await this._rebindSelect("currentId");
+      }
+    },
+
+    // Generic select-rebind tickle (model + currentId share this). Flipping
+    // to '' then back across two ticks forces Alpine to re-evaluate x-model.
+    async _rebindSelect(field) {
+      const cur = this[field];
+      if (!cur) return;
+      await this.$nextTick();
+      this[field] = "";
+      await this.$nextTick();
+      this[field] = cur;
     },
     async newSession() {
       const r = await fetch("/api/chat/sessions", {
