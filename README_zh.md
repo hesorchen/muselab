@@ -1,10 +1,6 @@
 # muselab
 
-### **在浏览器里复用你的 Claude Pro / Max 订阅。** 跟自己的档案对话。
-
-`muselab` 是一个自托管 web UI，把 **Claude Agent SDK** 指向你自己的 archive
-——体检报告 / 简历 / 投资记录 / 论文笔记——让 **Muse**（里面的 AI 人格）
-作为**一个**助理同时帮你处理所有维度。
+### **Anthropic Claude Agent SDK** 的 web harness，指向**你自己的档案**，**完全本地跑**，用**纯 HTML** 写。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -14,14 +10,40 @@
 
 ---
 
-- 💸 **复用 ¥150–700/月的 Pro / Max 订阅**走 OAuth——不按 token 付费
-- 🌏 也可填 **DeepSeek / GLM / MiniMax** key 走更便宜的厂商——同一套 agent loop
-- 🏛 **常驻**在你的个人档案旁边（不是写代码用的 sidebar）
-- ⚡ ~4.4 k 行，无 npm / 无 bundler，1 GB 内存 VPS 跑得动
-- 🚀 三个 OS 一条 install 命令，或 `docker run` 拉 GHCR 镜像
-- 🧠 完整 agent 能力——MCP / Skills / Subagent / plan / 改文件——所有模型都行
+### `muselab` 真正的三个亮点
 
-> 📸 *Demo gif 还在录中。先看 [架构](#架构原理) 了解结构，或直接 [Quick start](#quick-start) 3 行命令跑起来。*
+**🧠 直接基于 Anthropic 官方 Claude Agent SDK 的 harness**
+完整 agent 能力（MCP / Skills / Subagent / plan / 工具调用 / CLAUDE.md
+自动加载）——跟 Claude Code 同款引擎，但通过浏览器暴露 + 指向你的个人
+archive。大多数所谓的 "Claude UI" 是 wrap CLI 进程，或直接 raw API；
+muselab 直接用官方 SDK，**Anthropic 出新功能自动亮起**。同一套 agent
+loop 通过 anthropic-compatible 端点也跑在 DeepSeek / GLM / MiniMax 上
+——中间无协议翻译。
+
+**🏠 本地自部署，数据不离机**
+整个应用占 ~150 MB 内存，默认只绑 `127.0.0.1`，archive 在你指定的路径。
+Anthropic / DeepSeek / GLM 只看到你真发给它们的消息；archive 文件 /
+session 历史 / intake 答案 / CLAUDE.md 都**永远不离开机器**。VPS 部署
+用 SSH tunnel 从笔记本访问；想"一直在线"用 Tailscale；**永远不要**把
+8765 端口裸开到公网。
+
+**🛠 HTML-native，零 JavaScript 构建链**
+纯 HTML + [Alpine.js](https://alpinejs.dev) + 原生 CSS，静态文件服务。
+无 npm 无 webpack 无 transpiler 无 React 无 Vue 无 Svelte。**前端能一晚
+读完**。这跟 [htmx](https://htmx.org) / [11ty](https://www.11ty.dev) /
+[Hotwire](https://hotwired.dev) / [Pieter Levels 用 PHP+jQuery 做到
+$1M/年的 indie 案例](https://twitter.com/levelsio) / 及更大的[反对 web
+逐年变胖](https://infrequently.org/2024/01/performance-inequality-gap-2024/)
+潮流是同一直觉——**能完全看清的笨办法，胜过看不清的聪明办法**。
+
+---
+
+- 💸 复用 ¥150–700/月的 Pro / Max 订阅走 OAuth——不按 token 付费
+- 🌏 也可填 **DeepSeek / GLM / MiniMax** key——同一套 SDK loop，无需 proxy
+- 🚀 三个 OS 一条 install 命令，或 `docker run` 拉 GHCR 镜像
+- ⚡ ~4.4 k 行 · 148 tests · 1 GB 内存 VPS 跑得动
+
+> 📸 *Demo gif 还在录中。先看 [架构](#架构原理) 看数据流的 mermaid 图，或直接 [Quick start](#quick-start) 3 行命令跑起来。*
 
 ---
 
@@ -208,6 +230,19 @@ agent loop**——不只是 chat。无 proxy，无协议翻译。
 要 **IDE 全能**选 claudecodeui / code-server；要 **插件市场**选 LobeChat；要 **爬 RAG**选 AnythingLLM。
 
 muselab 走反方向：**最小可读、给所有模型 Claude 完整 agent 能力的档案 + AI 界面**。
+
+### 跟其他 Claude harness 具体怎么比
+
+| | muselab | Claude Code CLI | Claude Desktop | claudecodeui | claude-code-router |
+|---|---|---|---|---|---|
+| 用官方 **Claude Agent SDK** | ✅ 直接 | ✅ (官方实现本体) | ✅ | ❌ wrap CLI 进程 | ❌ 协议翻译器 |
+| 浏览器 web UI | ✅ | ❌ TTY | ❌ 桌面 | ✅ | ❌ |
+| 个人档案场景 | ✅ | ❌ 编程 | ❌ 通用 | ❌ 编程 | ❌ |
+| **非 Claude 模型也有同套 agent loop** | ✅ 走 vendor anthropic-compat | ❌ 只 Anthropic | ❌ 只 Anthropic | partial | ⚠ 翻译会丢功能 |
+| 自托管友好 | ✅ | n/a（你已经有了）| ❌ 闭源 binary | ✅ | ✅ |
+| 开源 | ✅ MIT | ❌ | ❌ | ✅ MIT | ✅ MIT |
+
+最短的精确一句话：**"muselab 之于你的 archive，就像 Claude Code 之于你的代码库。"**
 
 ---
 

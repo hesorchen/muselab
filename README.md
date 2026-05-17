@@ -1,10 +1,6 @@
 # muselab
 
-### **Reuse your Claude Pro / Max seat from a browser.** Talk to your own files.
-
-`muselab` is a self-hosted web UI that points the **Claude Agent SDK** at your
-own archive — health reports, career notes, investment log, papers — and lets
-**Muse** (the AI persona inside) help you across all of them, in one assistant.
+### A web harness for **Anthropic's Claude Agent SDK**, pointed at **your own files**, running **entirely on your machine** — and built in **plain HTML**.
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -14,14 +10,43 @@ own archive — health reports, career notes, investment log, papers — and let
 
 ---
 
-- 💸 **Reuse your `$20–100/mo` Pro / Max subscription** via OAuth — zero per-token bill
-- 🌏 Or bring **DeepSeek / GLM / MiniMax** keys for the cheap stuff — same agent loop
-- 🏛 Sits **permanently** next to your personal archive (not a coding sidebar)
-- ⚡ ~4.4 k lines, no npm, no bundler, runs on a 1 GB VPS
-- 🚀 One installer per OS (Linux / macOS / Windows) or `docker run` from GHCR
-- 🧠 Full agent stack — MCP, Skills, Subagents, plan mode, file edits — for every model
+### Three things `muselab` actually is
 
-> 📸 *Demo gif: coming soon. In the meantime, scroll to [Architecture](#under-the-hood) for a structural overview, or jump straight to [Quick start](#quick-start) — 3 commands to running locally.*
+**🧠 A first-class Claude Agent SDK harness**
+The full agent loop (MCP servers, Skills, Subagents, plan mode, tool use,
+CLAUDE.md auto-load) — the same engine that powers Claude Code, but exposed
+through a browser and pointed at your personal archive. Most "Claude UIs"
+wrap the CLI or speak raw API; muselab uses the official SDK directly, so
+when Anthropic ships a feature it lights up automatically. The same agent
+loop also runs against DeepSeek / GLM / MiniMax through their
+Anthropic-compatible endpoints — no protocol translator in between.
+
+**🏠 Local self-host, data stays put**
+The whole app fits in ~150 MB RAM, binds to `127.0.0.1` by default, and
+your archive lives at a path you control. Anthropic / DeepSeek / GLM see
+the messages you actually send them; everything else — files, sessions,
+intake answers, CLAUDE.md — never leaves the machine. SSH tunnel from your
+laptop if you self-host on a VPS; Tailscale for "always on" personal
+servers; never open port 8765 to the public web.
+
+**🛠 HTML-native, no JavaScript build chain**
+Vanilla HTML + [Alpine.js](https://alpinejs.dev) + plain CSS, served as
+static files. No npm, no webpack, no transpiler, no React, no Vue, no
+Svelte. You can read every line of the frontend in an afternoon. This is
+the same instinct behind [htmx](https://htmx.org), [11ty](https://www.11ty.dev),
+[Hotwire](https://hotwired.dev), [Pieter Levels' $1M/yr PHP+jQuery
+indie-hacker case](https://twitter.com/levelsio), and the broader pushback
+against [the web getting fatter year over year](https://infrequently.org/2024/01/performance-inequality-gap-2024/) —
+boring tech you can fully see beats clever tech you can't.
+
+---
+
+- 💸 Reuse your `$20–100/mo` Pro / Max subscription via OAuth — zero per-token bill
+- 🌏 Or bring **DeepSeek / GLM / MiniMax** keys — same SDK loop, no proxy needed
+- 🚀 One installer per OS (Linux / macOS / Windows) or `docker run` from GHCR
+- ⚡ ~4.4 k lines · 148 tests · runs on a 1 GB VPS
+
+> 📸 *Demo gif: coming soon. In the meantime, scroll to [Architecture](#under-the-hood) for a mermaid diagram of the data flow, or jump straight to [Quick start](#quick-start) — 3 commands to running locally.*
 
 ---
 
@@ -220,6 +245,20 @@ If you want **chat over crawled docs**, AnythingLLM.
 
 muselab's pitch is opposite: **the smallest readable archive + AI surface that
 gives every model Claude's full agent power**.
+
+### Compared specifically to other Claude harnesses
+
+| | muselab | Claude Code CLI | Claude Desktop | claudecodeui | claude-code-router |
+|---|---|---|---|---|---|
+| Uses official **Claude Agent SDK** | ✅ direct | ✅ (the canonical impl) | ✅ | ❌ wraps CLI process | ❌ protocol translator |
+| Web UI in browser | ✅ | ❌ TTY | ❌ desktop | ✅ | ❌ |
+| Personal-archive focus | ✅ | ❌ coding | ❌ general | ❌ coding | ❌ |
+| **Same agent loop on non-Claude models** | ✅ via vendor anthropic-compat | ❌ Anthropic only | ❌ Anthropic only | partial | ⚠ via translation, drops features |
+| Self-host friendly | ✅ | n/a (you already have it) | ❌ closed binary | ✅ | ✅ |
+| Open source | ✅ MIT | ❌ | ❌ | ✅ MIT | ✅ MIT |
+
+"muselab is to your archive what Claude Code is to your codebase" is the
+shortest accurate one-liner.
 
 ---
 
