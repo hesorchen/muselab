@@ -108,19 +108,29 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             # because no more chunks arrive. Bump to 32 MB; configurable via env.
             max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
             # Critical SDK option distinction:
-            #   `session_id=X`  → force a NEW session to use UUID X
+            #   `session_id=X`  → force a NEW session to use UUID X (fails if
+            #                     CLI already has a JSONL for X)
             #   `resume=X`      → resume an EXISTING session by UUID X
-            # If we always use `resume` (even for sessions that have no JSONL
-            # yet), CLI silently generates a fresh UUID and writes to a
-            # different file — muselab's session_id is then orphaned and any
-            # subsequent get_session_messages(muselab_uuid) returns empty.
-            # So: detect whether the JSONL exists and pick the right one.
+            # If we always use `resume` for un-streamed sessions, CLI generates
+            # a fresh UUID and orphans ours. If we always use `session_id`,
+            # any session that's ever streamed errors with "already in use".
+            # Detect JSONL existence by RECURSIVELY scanning the CLI's projects
+            # root — SDK's _find_project_dir relies on path-hash matching that
+            # was unreliable on Windows in practice (user's CLI saw the JSONL
+            # but the SDK helper didn't).
+            jsonl_exists = False
             try:
-                from claude_agent_sdk._internal.sessions import _find_project_dir, _canonicalize_path
-                proj_dir = _find_project_dir(_canonicalize_path(str(ROOT)))
-                jsonl_exists = proj_dir is not None and (proj_dir / f"{session_id}.jsonl").exists()
-            except Exception:
-                jsonl_exists = False
+                projects_root = Path.home() / ".claude" / "projects"
+                if projects_root.exists():
+                    # Glob is faster than recursive walk and matches any sub-
+                    # project dir layout. Fine for muselab's session counts.
+                    for hit in projects_root.glob(f"*/{session_id}.jsonl"):
+                        if hit.is_file():
+                            jsonl_exists = True
+                            break
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(f"[muselab] jsonl_exists check failed for {session_id}: {e}\n")
             # CLI stderr capture — without this, ProcessError just says
             # "Check stderr output for details" with no actual details and
             # we can't tell whether the CLI rejected --session-id, hit an
@@ -403,19 +413,20 @@ def _summarize_tool_input(name: str | None, inp: dict) -> str:
 def _compact_summary_uuids(sid: str) -> set[str]:
     """Scan raw CLI JSONL for entries with isCompactSummary:true and return
     their UUIDs. SDK get_session_messages strips this flag, so to render a
-    "📦 已压缩" indicator we have to detect it ourselves at the JSONL level."""
-    from claude_agent_sdk._internal.sessions import (
-        _find_project_dir, _canonicalize_path, _sanitize_path,
-    )
+    "📦 已压缩" indicator we have to detect it ourselves at the JSONL level.
+
+    Glob-based JSONL lookup — same pattern as get_client's existence check.
+    SDK's _find_project_dir was unreliable on Windows."""
     try:
-        # Resolve the CLI's project dir for our cwd; then find <sid>.jsonl in it.
-        # Falls back gracefully if SDK internals shift.
-        canon = _canonicalize_path(str(ROOT))
-        proj_dir = _find_project_dir(canon)
-        if proj_dir is None:
+        projects_root = Path.home() / ".claude" / "projects"
+        if not projects_root.exists():
             return set()
-        jsonl_path = proj_dir / f"{sid}.jsonl"
-        if not jsonl_path.exists():
+        jsonl_path = None
+        for hit in projects_root.glob(f"*/{sid}.jsonl"):
+            if hit.is_file():
+                jsonl_path = hit
+                break
+        if jsonl_path is None:
             return set()
         uuids: set[str] = set()
         with jsonl_path.open("r", encoding="utf-8") as f:
