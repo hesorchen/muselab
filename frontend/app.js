@@ -165,9 +165,9 @@ const STRINGS = {
     "onboard.q_overview": "我的 archive 里有什么？整理一下给我看",
     "onboard.skill_hint": "或试试这些 skill：",
     "ctx.cache_tip": "缓存命中率 — 越高越省钱。Anthropic prompt cache 在 5 分钟内复用上次的系统提示词 + 上下文。",
-    "ctx.normal": "上下文 {used}K / {limit}K · {pct}%",
-    "ctx.warn":   "上下文用了 {pct}%（{used}K / {limit}K）· 长对话变贵，可压缩",
-    "ctx.danger": "上下文已用 {pct}%（{used}K / {limit}K）· 即将截断 · 立即压缩",
+    "ctx.normal": "上下文 {used}K / {limit}K · {pct}% · 缓存 {cached}K",
+    "ctx.warn":   "上下文用了 {pct}%（{used}K / {limit}K · 缓存 {cached}K）· 长对话变贵，可压缩",
+    "ctx.danger": "上下文已用 {pct}%（{used}K / {limit}K · 缓存 {cached}K）· 即将截断 · 立即压缩",
     "ctx.compact_btn": "压缩历史",
     "ctx.tip_line1": "每次回答都把整段历史送给模型 → token 越多越贵越慢",
     "ctx.tip_line2": "压缩 = Muse 总结上文 → 新会话只带摘要起步，省钱也变快",
@@ -401,9 +401,9 @@ const STRINGS = {
     "onboard.q_overview": "What's in my archive? Give me a tour",
     "onboard.skill_hint": "Or try a skill:",
     "ctx.cache_tip": "Cache hit rate — higher is cheaper. Anthropic prompt cache reuses the last system prompt + context within 5 minutes.",
-    "ctx.normal": "Context {used}K / {limit}K · {pct}%",
-    "ctx.warn":   "Context at {pct}% ({used}K / {limit}K) · Long chats get expensive — consider compacting",
-    "ctx.danger": "Context at {pct}% ({used}K / {limit}K) · About to truncate — compact now",
+    "ctx.normal": "Context {used}K / {limit}K · {pct}% · cached {cached}K",
+    "ctx.warn":   "Context {pct}% ({used}K / {limit}K · cached {cached}K) · Long chats get expensive — compact?",
+    "ctx.danger": "Context {pct}% ({used}K / {limit}K · cached {cached}K) · About to truncate — compact now",
     "ctx.compact_btn": "Compact",
     "ctx.tip_line1": "Every reply sends the full history to the model — more tokens means slower and pricier",
     "ctx.tip_line2": "Compact = Muse summarizes the past, new session starts from that summary",
@@ -2551,11 +2551,15 @@ function portal() {
         : (this.sessionUsage.input_tokens || 0)
           + (this.sessionUsage.cache_read_tokens || 0)
           + (this.sessionUsage.cache_creation_tokens || 0);
+      const cachedTokens = (this.sessionUsage.cache_read_tokens || 0)
+                         + (this.sessionUsage.cache_creation_tokens || 0);
       const usedK = (usedTokens / 1000).toFixed(1);
+      const cachedK = (cachedTokens / 1000).toFixed(1);
       const limitK = (this.sessionUsage.context_limit / 1000).toFixed(0);
-      if (pct >= 90) return this.t("ctx.danger", { used: usedK, limit: limitK, pct });
-      if (pct >= 70) return this.t("ctx.warn",   { used: usedK, limit: limitK, pct });
-      return this.t("ctx.normal", { used: usedK, limit: limitK, pct });
+      const args = { used: usedK, limit: limitK, pct, cached: cachedK };
+      if (pct >= 90) return this.t("ctx.danger", args);
+      if (pct >= 70) return this.t("ctx.warn",   args);
+      return this.t("ctx.normal", args);
     },
     // Real compact: a) make sure the OLD session has been summarized in chat,
     // b) fork it, c) the fork inherits the summary as starting context.
