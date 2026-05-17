@@ -1,14 +1,21 @@
 # muselab
 
-### 见见 **Muse** —— 真的认识你的 AI 助理。
-*muselab 是 Muse 居住的自托管"工坊"，跟你的档案为邻。*
+### **在浏览器里复用你的 Claude Pro / Max 订阅。** 跟自己的档案对话。
 
-> ⚡ ~4.4 k 行 · 不用 npm · 不用 bundler · 1 GB 内存的 VPS 跑得动
-> 🚀 一条 `docker compose up`，搞定
-> 🧠 跑在 **Anthropic 官方 Claude Agent SDK** 上——跟 Claude Code 同一个引擎，
-> MCP / Skills / Subagents / CLAUDE.md 在所有模型上都可用。
+`muselab` 是一个自托管 web UI，把 **Claude Agent SDK** 指向你自己的 archive
+——体检报告 / 简历 / 投资记录 / 论文笔记——让 **Muse**（里面的 AI 人格）
+作为**一个**助理同时帮你处理所有维度。
+
+- 💸 复用 `¥150–700/月` 的 **Pro / Max 订阅**走 OAuth——不按 token 付费
+- 🌏 也可以填 **DeepSeek / GLM / MiniMax** key 走更便宜的厂商——同一套 UI / agent loop
+- 🏛 **常驻**在你的个人档案旁边（不是写代码用的 sidebar）
+- ⚡ ~4.4 k 行，不用 npm / bundler，1 GB 内存的 VPS 跑得动
+- 🚀 三个 OS 各一条 install 命令，或 `docker run` 拉 GHCR 镜像
+- 🧠 完整 agent 能力——MCP 服务 / Skills / Subagent / plan 模式 / 改文件——自动可用
 
 [English → README.md](README.md) · [更新日志](CHANGELOG.md) · [加新模型](docs/add-provider.md) · [安全](SECURITY.md)
+
+> 📸 Demo gif 还在录中。你跑完 install 脚本 2 分钟就能自录一份，或盯本仓库等官方版。
 
 ---
 

@@ -169,6 +169,10 @@ const STRINGS = {
     "ctx.compact_summarize_prompt": "请把这个会话的全部要点压缩成结构化摘要：①事实背景 ②已做决定 ③待办或下一步 ④引用过的具体文件路径。要让一个第一次看到摘要的人能凭它继续对话。",
     "ctx.compact_step1": "Step 1/2: 让模型总结上文...",
     "ctx.compact_done": "压缩完成，已切到新会话",
+    "ctx.compact_wait_streaming": "Muse 还在回复中，等这一轮结束再压缩",
+    "ctx.compact_empty": "当前会话还没有 Muse 的回复，没什么可压缩的",
+    "ctx.compact_timeout": "压缩超时（60s）— Muse 可能在处理长历史，再试一次",
+    "ctx.compact_no_reply": "模型没返回摘要 — 检查 Muse 是不是出错了，再重试",
     "model.switch_title": "切换模型",
     "model.switch_body": "切换到 {label} 需要新建会话。确认吗？",
     "model.switch_new": "新建并切换",
@@ -394,6 +398,10 @@ const STRINGS = {
     "ctx.compact_summarize_prompt": "Compress this entire conversation into a structured summary: (1) facts / background (2) decisions made (3) open todos or next steps (4) specific file paths referenced. Make it complete enough that someone reading only the summary can pick up where we left off.",
     "ctx.compact_step1": "Step 1/2: Asking the model to summarize…",
     "ctx.compact_done": "Compacted — jumped to the new session",
+    "ctx.compact_wait_streaming": "Muse is still replying — wait for this turn to finish",
+    "ctx.compact_empty": "No assistant replies yet in this session — nothing to compact",
+    "ctx.compact_timeout": "Compact timed out (60s) — Muse may be processing a long history, try again",
+    "ctx.compact_no_reply": "Model didn't return a summary — check for errors and retry",
     "model.switch_title": "Switch model",
     "model.switch_body": "Switching to {label} needs a new session. Confirm?",
     "model.switch_new": "Create & switch",
@@ -2377,6 +2385,21 @@ function portal() {
     // summarize-and-fork workflow.
     async runCompact() {
       if (!this.currentId) return;
+      // Guard: don't run while a turn is already in flight. send() would be a
+      // no-op (input never sent), then the wait-loop would sample the OLD
+      // turn's last assistant message — and we'd fork using the wrong content.
+      if (this.streaming) {
+        this.toast(this.t("ctx.compact_wait_streaming"), "warn", 2500);
+        return;
+      }
+      // And: need at least one assistant message to compact (an empty session
+      // has nothing to summarize).
+      const hasContent = this.messages.some(m => m.role === "assistant" && m.text);
+      if (!hasContent) {
+        this.toast(this.t("ctx.compact_empty"), "warn", 2500);
+        return;
+      }
+
       const ok = await this.confirm({
         title: this.t("ctx.compact_confirm_title"),
         body: this.t("ctx.compact_confirm_body"),
@@ -2384,33 +2407,45 @@ function portal() {
       });
       if (!ok) return;
 
+      // Snapshot the latest assistant message BEFORE we send the summary
+      // prompt — we'll diff against it to grab the NEW (summary) reply only.
+      const preCount = this.messages.filter(m => m.role === "assistant" && m.text).length;
+
       // Step 1: tell the CURRENT session to produce a self-contained summary.
-      // Model sees full history, writes a structured note we'll seed the new session with.
       this.input = this.t("ctx.compact_summarize_prompt");
       this.toast(this.t("ctx.compact_step1"), "info", 2500);
       await this.send();
-      // Wait for the streaming to finish so we can grab the assistant reply
-      await new Promise(resolve => {
+      // Wait for streaming to actually end (with a 60s timeout — Opus on a
+      // long history can take 30s+).
+      await new Promise((resolve, reject) => {
+        const started = Date.now();
         const check = () => {
           if (!this.streaming) return resolve();
+          if (Date.now() - started > 60_000) return reject(new Error("compact timeout"));
           setTimeout(check, 200);
         };
         check();
+      }).catch(e => {
+        this.toast(this.t("ctx.compact_timeout"), "error", 5000);
+        throw e;
       });
 
-      // Step 2: take the last assistant message (the summary) and create a
-      // fresh fork session whose first user message IS that summary as
-      // background context.
-      const lastAsst = [...this.messages].reverse().find(m => m.role === "assistant" && m.text);
-      if (!lastAsst) { this.toast(this.t("slash.failed"), "error"); return; }
-      const summary = lastAsst.text;
+      // Step 2: grab the NEW assistant message (the summary). Use the count
+      // delta to ensure we don't accidentally read an old one if streaming
+      // returned 0 content.
+      const asstMsgs = this.messages.filter(m => m.role === "assistant" && m.text);
+      if (asstMsgs.length <= preCount) {
+        this.toast(this.t("ctx.compact_no_reply"), "error", 4000);
+        return;
+      }
+      const summary = asstMsgs[asstMsgs.length - 1].text;
 
       const r = await fetch(`/api/chat/sessions/${this.currentId}/compact`,
                               { method: "POST", headers: this.hdr() });
       if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
       const meta = await r.json();
-      // Seed the new session with the summary as a real persisted user message
-      // so subsequent turns have it as established context.
+      // Seed the new session with the summary as a persisted user message so
+      // subsequent turns have it as established context.
       await fetch(`/api/chat/sessions/${meta.id}/seed`, {
         method: "POST",
         headers: { ...this.hdr(), "Content-Type": "application/json" },

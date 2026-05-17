@@ -1,16 +1,21 @@
 # muselab
 
-### Meet **Muse** — an AI assistant that actually knows you.
-*muselab is the open, self-hosted lab where Muse lives — alongside your archive.*
+### **Reuse your Claude Pro / Max seat from a browser.** Talk to your own files.
 
-> ⚡ ~4.4 k lines · no npm · no bundler · runs on a 1 GB VPS
-> 🚀 One `docker compose up`. Done.
-> 🧠 Powered by Anthropic's official **Claude Agent SDK** — the same engine as Claude Code,
-> with full MCP / Skills / Subagents / CLAUDE.md support across **all** providers.
+`muselab` is a self-hosted web UI that points the **Claude Agent SDK** at your
+own archive — health reports, career notes, investment log, papers — and lets
+**Muse** (the AI persona inside) help you across all of them, in one assistant.
+
+- 💸 Reuse your `$20–100/mo` **Pro / Max** subscription via OAuth — no per-token API bill
+- 🌏 Or bring **DeepSeek / GLM / MiniMax** keys for the cheap stuff — same UI, same agent loop
+- 🏛 Sits **permanently** next to your personal archive (not a coding sidebar)
+- ⚡ ~4.4 k lines, no npm, no bundler, runs on a 1 GB VPS
+- 🚀 One installer command per OS (Linux / macOS / Windows) or `docker run` from GHCR
+- 🧠 Full agent stack — MCP servers, Skills, Subagents, plan mode, file edits — for free
 
 [中文 → README_zh.md](README_zh.md) · [Changelog](CHANGELOG.md) · [Add a new provider](docs/add-provider.md) · [Security](SECURITY.md)
 
-<!-- 📸 Demo gif coming soon — see docs/assets/README.md if you want to contribute one -->
+> 📸 Demo gif: in progress — record your own with the install scripts in 2 min, or watch this repo for the official one.
 
 ---
 
