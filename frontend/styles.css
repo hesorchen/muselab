@@ -263,6 +263,67 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 
 .pane-hidden { display: none !important; }
 
+/* Mobile tab bar — hidden on desktop, shown by the @media block below. */
+.mobile-tab-bar {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: 52px; z-index: 100;
+  background: var(--c-bg-1);
+  border-top: 1px solid var(--c-border);
+  box-shadow: 0 -2px 8px rgba(0,0,0,0.05);
+}
+.mobile-tab-bar button {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 2px; background: transparent; border: none;
+  color: var(--c-fg-3); font-size: var(--fs-xs);
+  cursor: pointer; padding: 4px 0;
+  transition: color var(--t-fast);
+}
+.mobile-tab-bar button.active { color: var(--c-accent); }
+.mobile-tab-bar button .icon svg { width: 22px; height: 22px; }
+
+/* ==========================================================================
+   Mobile responsive: < 900px collapses the 3-column grid into a single
+   visible pane chosen by the bottom tab bar.
+   ========================================================================== */
+@media (max-width: 900px) {
+  /* Force single-column grid regardless of inline :style="layoutStyle()". */
+  .layout {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: 1fr 52px !important;
+  }
+  /* Hide every pane by default; show only the one matching the active tab. */
+  .layout .pane { display: none; }
+  .layout[data-mobile-tab="files"]   .pane.files   { display: flex; grid-column: 1; }
+  .layout[data-mobile-tab="preview"] .pane.preview { display: flex; grid-column: 1; }
+  .layout[data-mobile-tab="chat"]    .pane.chat    { display: flex; grid-column: 1; }
+  /* Drop the resizer bars (they belong to columns we no longer render) */
+  .layout .resizer { display: none; }
+  /* Show the tab bar */
+  .mobile-tab-bar { display: flex; }
+  /* Pane height: viewport - tab bar */
+  .pane { height: calc(100vh - 52px); }
+  /* Chat textarea / context meter / session bar sometimes overflow on tiny
+     screens — trim padding so they fit. */
+  .session-bar { padding: 6px var(--sp-1); gap: 4px; min-height: 36px; }
+  .session-bar select { font-size: var(--fs-sm); padding: 0 6px; }
+  .pane-head { padding: 6px var(--sp-2); }
+  .pane-head .pane-title { font-size: var(--fs-sm); }
+  .login { padding: 0 16px; }
+  .login input { width: calc(100% - 32px); max-width: 320px; }
+  /* Tabs in preview pane — already scrollable horizontally; force on mobile */
+  .tab-bar { overflow-x: auto; }
+}
+@media (max-width: 480px) {
+  /* Phones — hide some header chips that crowd the chat header */
+  .pane.chat .pane-head .ctx-chip,
+  .pane.chat .pane-head .mcp-badge { display: none; }
+  /* Brand title shorter */
+  .brand-logo { font-size: 22px; }
+}
+
 .resizer {
   background: var(--c-border);
   cursor: col-resize;

@@ -587,6 +587,11 @@ function portal() {
     rightWidth: 440,
     showHidden: false,
 
+    // Mobile: viewport < 900px collapses the 3 panes into a single visible
+    // tab. Default "chat" since that's the primary action; auto-switches to
+    // "preview" when user opens a file, and "chat" when they @-mention one.
+    mobileTab: "chat",
+
     // ===== @ mention =====
     mentionShow: false, mentionResults: [], mentionIdx: 0, mentionAnchor: -1,
 
@@ -1782,6 +1787,9 @@ function portal() {
       }
       this.selected = n.path;
       this.editing = false;
+      // Mobile: opening a file should jump to the preview pane (otherwise
+      // the user is still on `files` tab and sees nothing change).
+      if (window.innerWidth <= 900) this.mobileTab = "preview";
       const name = n.name || n.path.split("/").pop();
       const ext = name.split(".").pop().toLowerCase();
       if (["md", "markdown"].includes(ext)) {
@@ -2063,6 +2071,8 @@ function portal() {
       this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       this.toast(this.t("toast.mention_added", { path }), "success", 1500);
+      // Mobile: @ mention is a chat-side action, jump to the chat pane
+      if (window.innerWidth <= 900) this.mobileTab = "chat";
     },
     autoGrow(ta) {
       // 撑高到内容 + 上限（避免无限增长把 chat 区挤没）

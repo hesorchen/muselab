@@ -134,7 +134,7 @@ window.addEventListener("error", e => {
   </div>
 
   <!-- 主界面 -->
-  <div class="layout" x-show="authed" :style="layoutStyle()">
+  <div class="layout" x-show="authed" :style="layoutStyle()" :data-mobile-tab="mobileTab">
 
     <!-- ============ 左：文件树 ============ -->
     <aside class="pane files" :class="{'pane-hidden': !leftOpen}">
@@ -724,6 +724,24 @@ window.addEventListener("error", e => {
         </div>
       </div>
     </aside>
+
+    <!-- Mobile tab bar — only shown via CSS @media on narrow viewports.
+         Sits as a sibling of the panes in the same grid; on mobile, the panes
+         become full-width and we swap which one is visible via mobileTab. -->
+    <nav class="mobile-tab-bar" x-show="authed">
+      <button :class="{active: mobileTab==='files'}" @click="mobileTab='files'">
+        <span class="icon"><svg><use href="#i-folder"/></svg></span>
+        <span x-text="t('pane.files')"></span>
+      </button>
+      <button :class="{active: mobileTab==='preview'}" @click="mobileTab='preview'">
+        <span class="icon"><svg><use href="#i-file-text"/></svg></span>
+        <span x-text="t('pane.preview')"></span>
+      </button>
+      <button :class="{active: mobileTab==='chat'}" @click="mobileTab='chat'">
+        <span class="icon"><svg><use href="#i-brain"/></svg></span>
+        <span x-text="t('pane.chat')"></span>
+      </button>
+    </nav>
 
   </div>
 
