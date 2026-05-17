@@ -411,18 +411,31 @@ window.addEventListener("error", e => {
       </div>
 
       <div class="session-bar">
-        <select class="session-sel" x-model="currentId" @change="switchSession()">
-          <!-- Fallback for the race where currentId is set (from localStorage)
-               before sessions[] has been loaded — without an <option> matching
-               the bound value, the browser displays the first option and the
-               user sees the wrong session name. -->
-          <template x-if="currentId && !sessions.some(s => s.id === currentId)">
-            <option :value="currentId" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></option>
-          </template>
-          <template x-for="s in sessions" :key="s.id">
-            <option :value="s.id" x-text="s.name + ' · ' + s.message_count"></option>
-          </template>
-        </select>
+        <!-- Custom session picker — replaces native <select> so each row can
+             have a delete button. Click trigger to open list; click row to
+             switch; click × to delete (with confirm). -->
+        <div class="session-picker" @click.outside="sessionPickerOpen = false" style="flex:1; position: relative;">
+          <button class="session-sel-btn" @click="sessionPickerOpen = !sessionPickerOpen" type="button">
+            <span class="ellipsis"
+                  x-text="(sessions.find(s => s.id === currentId)?.name || (lang==='zh' ? '加载中…' : 'Loading…')) + ' · ' + (sessions.find(s => s.id === currentId)?.message_count ?? 0)"></span>
+            <span class="caret">▾</span>
+          </button>
+          <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
+               class="session-picker-pop">
+            <template x-for="s in sessions" :key="s.id">
+              <div class="session-picker-row" :class="{active: s.id === currentId}"
+                   @click="currentId = s.id; sessionPickerOpen = false; switchSession()">
+                <span class="ellipsis" x-text="s.name"></span>
+                <span class="session-picker-count" x-text="s.message_count"></span>
+                <button class="session-picker-del"
+                        @click.stop="deleteSessionById(s.id)"
+                        :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+              </div>
+            </template>
+            <div x-show="sessions.length === 0" class="session-picker-empty"
+                 x-text="lang==='zh' ? '暂无会话' : 'No sessions'"></div>
+          </div>
+        </div>
         <button @click="newSession()" class="icon-btn sm" :title="t('btn.new_session')"><svg><use href="#i-plus"/></svg></button>
         <button @click="renameSession()" class="icon-btn sm" :title="t('btn.rename')"><svg><use href="#i-edit"/></svg></button>
         <button @click="editSessionPrompt()" class="icon-btn sm" :title="t('btn.edit_prompt')"><svg><use href="#i-brain"/></svg></button>
@@ -942,63 +955,6 @@ window.addEventListener("error", e => {
             <label x-text="t('set.sessions.cleanup_label')"></label>
             <button class="btn-ghost sm" @click="cleanupEmptySessions()"
                     x-text="t('set.sessions.cleanup_btn')"></button>
-          </div>
-          <!-- Per-session delete list — full table of every session with
-               name, model, message count, and a delete button per row.
-               Use selectAll to flip all checkboxes; "删除选中" wipes them.
-               Sessions are also deleted on the CLI side via SDK. -->
-          <div class="settings-row" style="flex-direction: column; align-items: stretch; gap: 6px;">
-            <div style="display:flex; align-items:center; gap:8px;">
-              <input type="text" class="settings-input"
-                     :placeholder="lang==='zh' ? '搜索会话名…' : 'Search session name…'"
-                     x-model="settings.sessionSearch" />
-              <button class="btn-ghost sm"
-                      @click="settings.sessionSelected = new Set(filteredSessions().map(s => s.id))"
-                      x-text="lang==='zh' ? '全选' : 'Select all'"></button>
-              <button class="btn-ghost sm"
-                      @click="settings.sessionSelected = new Set()"
-                      x-text="lang==='zh' ? '清空' : 'Clear'"></button>
-              <button class="btn-danger sm"
-                      :disabled="settings.sessionSelected.size === 0"
-                      @click="bulkDeleteSelectedSessions()"
-                      x-text="(lang==='zh' ? '删除选中 (' : 'Delete (') + settings.sessionSelected.size + ')'"></button>
-            </div>
-            <div class="session-mgmt-list">
-              <table class="session-mgmt-table">
-                <thead>
-                  <tr>
-                    <th style="width: 24px;"></th>
-                    <th x-text="lang==='zh' ? '名称' : 'Name'"></th>
-                    <th x-text="lang==='zh' ? '模型' : 'Model'"></th>
-                    <th x-text="lang==='zh' ? '消息' : 'Msgs'"></th>
-                    <th x-text="lang==='zh' ? '更新' : 'Updated'"></th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <template x-for="s in filteredSessions()" :key="s.id">
-                    <tr>
-                      <td>
-                        <input type="checkbox"
-                               :checked="settings.sessionSelected.has(s.id)"
-                               @change="toggleSessionSelect(s.id)" />
-                      </td>
-                      <td class="ellipsis" :title="s.name" x-text="s.name"></td>
-                      <td><code x-text="(s.model || '').replace(/^claude-|^deepseek-|^glm-|^minimax-/, '')"></code></td>
-                      <td x-text="s.message_count"></td>
-                      <td x-text="fmtRelTime(s.updated_at)"></td>
-                      <td>
-                        <button class="btn-ghost sm" @click="deleteSessionById(s.id)"
-                                :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
-                      </td>
-                    </tr>
-                  </template>
-                </tbody>
-              </table>
-              <div x-show="filteredSessions().length === 0"
-                   class="settings-hint" style="text-align: center; padding: 12px;"
-                   x-text="lang==='zh' ? '没有匹配的会话' : 'No matching sessions'"></div>
-            </div>
           </div>
         </div>
 

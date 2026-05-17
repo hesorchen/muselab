@@ -658,10 +658,11 @@ function portal() {
       versionsLoading: false,
       upgradeRunning: false,
       upgradeResult: null,
-      // Session management — bulk delete + filter
-      sessionSearch: "",
-      sessionSelected: new Set(),
     },
+
+    // Session picker dropdown open state (replaces native <select> so each
+    // row can have an inline delete button).
+    sessionPickerOpen: false,
 
     // Per-provider help hints rendered under the API-key input. Anthropic
     // gets the most because it has two valid paths (Pro OAuth or API key);
@@ -1740,25 +1741,7 @@ function portal() {
       }
     },
 
-    // ===== Session management =====
-    filteredSessions() {
-      const q = (this.settings.sessionSearch || "").trim().toLowerCase();
-      if (!q) return this.sessions;
-      return this.sessions.filter(s => (s.name || "").toLowerCase().includes(q));
-    },
-    toggleSessionSelect(sid) {
-      const next = new Set(this.settings.sessionSelected);
-      if (next.has(sid)) next.delete(sid); else next.add(sid);
-      this.settings.sessionSelected = next;
-    },
-    fmtRelTime(ts) {
-      if (!ts) return "—";
-      const d = (Date.now() / 1000) - ts;
-      if (d < 60) return this.lang === "zh" ? "刚刚" : "just now";
-      if (d < 3600) return Math.floor(d / 60) + (this.lang === "zh" ? "分钟前" : "m ago");
-      if (d < 86400) return Math.floor(d / 3600) + (this.lang === "zh" ? "小时前" : "h ago");
-      return Math.floor(d / 86400) + (this.lang === "zh" ? "天前" : "d ago");
-    },
+    // Delete any session from the picker dropdown's inline × button.
     async deleteSessionById(sid) {
       const s = this.sessions.find(x => x.id === sid);
       const ok = await this.confirm({
@@ -1774,41 +1757,6 @@ function portal() {
       await this.refreshSessions();
       // If user just nuked the current session, jump to the next one (or new).
       if (this.currentId === sid) {
-        if (this.sessions.length === 0) {
-          const m = await this.newSession();
-          this.currentId = m.id;
-        } else {
-          this.currentId = this.sessions[0].id;
-        }
-        await this.loadSession(this.currentId);
-        this.savePrefs();
-      }
-    },
-    async bulkDeleteSelectedSessions() {
-      const ids = Array.from(this.settings.sessionSelected);
-      if (ids.length === 0) return;
-      const ok = await this.confirm({
-        title: this.lang === "zh" ? "批量删除会话" : "Bulk delete",
-        body: this.lang === "zh"
-          ? `确定删除选中的 ${ids.length} 个会话？此操作不可恢复（含 CLI 历史）。`
-          : `Delete ${ids.length} sessions? Irreversible (clears CLI history).`,
-        danger: true,
-        okText: this.lang === "zh" ? "删除" : "Delete",
-      });
-      if (!ok) return;
-      const wasCurrent = ids.includes(this.currentId);
-      // Fire deletes in parallel — but cap concurrency to avoid hammering.
-      const chunks = [];
-      for (let i = 0; i < ids.length; i += 5) chunks.push(ids.slice(i, i + 5));
-      for (const batch of chunks) {
-        await Promise.all(batch.map(sid =>
-          fetch(`/api/chat/sessions/${sid}`, { method: "DELETE", headers: this.hdr() })
-        ));
-      }
-      this.settings.sessionSelected = new Set();
-      await this.refreshSessions();
-      this.toast(this.lang === "zh" ? `已删除 ${ids.length} 个会话` : `Deleted ${ids.length}`, "success", 2500);
-      if (wasCurrent) {
         if (this.sessions.length === 0) {
           const m = await this.newSession();
           this.currentId = m.id;

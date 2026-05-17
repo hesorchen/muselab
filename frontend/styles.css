@@ -776,6 +776,53 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-bar select:focus { border-color: var(--c-accent); outline: none; box-shadow: 0 0 0 2px var(--c-accent-soft); }
 .session-sel { flex: 1; min-width: 0; }
 .session-bar .icon-btn.sm { height: 28px; width: 28px; padding: 0; }
+
+/* Custom session picker — replaces <select> so each row has an inline delete. */
+.session-sel-btn {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; min-width: 0;
+  padding: 6px 10px;
+  background: var(--c-bg-2); color: var(--c-fg-0);
+  border: 1px solid var(--c-border); border-radius: var(--r-md);
+  font-size: var(--fs-sm);
+  cursor: pointer; text-align: left;
+}
+.session-sel-btn:hover { border-color: var(--c-accent); }
+.session-sel-btn .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-sel-btn .caret { color: var(--c-fg-3); margin-left: 6px; }
+.session-picker-pop {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+  max-height: 320px; overflow-y: auto;
+  background: var(--c-bg-1); border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  box-shadow: 0 4px 16px rgba(0,0,0,.18);
+  z-index: 1000;
+}
+.session-picker-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--c-border);
+}
+.session-picker-row:last-child { border-bottom: none; }
+.session-picker-row:hover { background: var(--c-bg-2); }
+.session-picker-row.active { background: var(--c-accent-soft); color: var(--c-accent); }
+.session-picker-row .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-picker-count {
+  font-size: 11px; color: var(--c-fg-3); padding: 1px 6px;
+  background: var(--c-bg-2); border-radius: 999px;
+}
+.session-picker-row.active .session-picker-count { background: var(--c-accent); color: #fff; }
+.session-picker-del {
+  background: none; border: none; color: var(--c-fg-3); cursor: pointer;
+  width: 22px; height: 22px; line-height: 18px; font-size: 16px;
+  border-radius: var(--r-sm); padding: 0;
+}
+.session-picker-del:hover { background: var(--c-danger); color: #fff; }
+.session-picker-empty {
+  padding: 14px; text-align: center; color: var(--c-fg-3); font-size: var(--fs-xs);
+}
 .chk {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: var(--fs-xs); color: var(--c-fg-2);
@@ -1960,39 +2007,5 @@ pre.has-copy-btn .code-copy-btn.copied {
   white-space: pre-wrap; word-break: break-all;
 }
 
-/* ==========================================================================
-   Session management table — Settings → Sessions section
-   ========================================================================== */
-.session-mgmt-list {
-  max-height: 320px;
-  overflow-y: auto;
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-md);
-  margin-top: 4px;
-}
-.session-mgmt-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--fs-xs);
-}
-.session-mgmt-table th, .session-mgmt-table td {
-  text-align: left;
-  padding: 5px 8px;
-  border-bottom: 1px solid var(--c-border);
-}
-.session-mgmt-table th {
-  background: var(--c-bg-2);
-  color: var(--c-fg-2);
-  font-weight: var(--fw-semibold);
-  position: sticky; top: 0;
-}
-.session-mgmt-table tbody tr:hover { background: var(--c-bg-2); }
-.session-mgmt-table .ellipsis {
-  max-width: 260px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.session-mgmt-table code {
-  font-family: var(--font-mono); font-size: 11px;
-  color: var(--c-fg-2);
-}
-.btn-danger.sm { padding: 3px 10px; font-size: var(--fs-xs); }
+/* (Session management table removed — delete now lives inline in the chat
+   header's session picker, not in Settings.) */
