@@ -21,7 +21,7 @@ if ($envText -notmatch "MUSELAB_ROOT=(\S+)") { Err "MUSELAB_ROOT missing in .env
 $Archive = $matches[1]
 if (-not (Test-Path $Archive)) { Err "MUSELAB_ROOT=$Archive but dir doesn't exist"; exit 1 }
 
-Bold "muselab intake — archive at $Archive"
+Bold "muselab intake / 入门问答 — archive at $Archive"
 Write-Host
 
 $ClaudeMd = Join-Path $Archive "CLAUDE.md"
@@ -47,14 +47,18 @@ foreach ($sub in @("health","work","money","people","notes","archives")) {
 }
 
 Write-Host
-Write-Host "  --- Quick intake (press Enter to skip any) ---"
-$iName   = Ask "How should Muse address you?" ""
-$iBirth  = Ask "Birth year (or just an age range):" ""
-$iCity   = Ask "Where do you live?" ""
-$iDoing  = Ask "What occupies most of your week? (study / job / freelance / care / retirement / ...)" ""
-$iStage  = Ask "One sentence about your life stage right now:" ""
-$iGoal   = Ask "One main goal for this year:" ""
-$iHealth = Ask "Top health concern right now (or 'none'):" ""
+Write-Host "  --- Quick intake / 入门问答 (press Enter to skip any / 任意题回车跳过) ---"
+$iName   = Ask "How should Muse address you? / Muse 该怎么称呼你？" ""
+$iBirth  = Ask "Birth year (or age range) / 出生年份（或大致年龄段）:" ""
+$iCity   = Ask "Where do you live? / 你现在住在哪？" ""
+Write-Host "  What occupies most of your week? (study / job / freelance / care / retirement / ...)"
+Write-Host "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
+$iDoing  = Ask "" ""
+Write-Host "  One sentence about your life stage right now"
+Write-Host "  用一句话描述你当下的人生阶段"
+$iStage  = Ask "" ""
+$iGoal   = Ask "One main goal for this year / 这一年最想做成的一件事:" ""
+$iHealth = Ask "Top health concern right now (or 'none') / 当前最关心的健康问题（无则填 none）:" ""
 
 $tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw
 $tpl = $tpl -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd")
@@ -79,6 +83,7 @@ if (-not [string]::IsNullOrWhiteSpace($iStage)) {
 }
 
 Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8
-Ok "CLAUDE.md updated"
+Ok "CLAUDE.md updated / 已更新"
 Write-Host
-Write-Host "  Next: open $ClaudeMd and fill any blanks. Muse picks it up on next chat (no restart)."
+Write-Host "  Next / 下一步: open $ClaudeMd and fill any blanks."
+Write-Host "  打开上面那个文件把空字段填完。Muse 下一次 chat 会自动加载（不用重启服务）。"

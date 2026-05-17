@@ -83,12 +83,12 @@ fi
 ok "systemctl present"
 
 # ----- 2. Python deps ----------------------------------------------------
-bold "2/5  Installing Python dependencies (uv sync, may take a few minutes first time)"
+bold "2/5  Installing Python dependencies / 安装 Python 依赖 (uv sync, may take a few minutes first time)"
 uv sync                              # no --quiet: user wants to see progress
 ok "deps installed"
 
 # ----- 3. .env -----------------------------------------------------------
-bold "3/5  Configuring .env"
+bold "3/5  Configuring .env / 写入 .env 配置"
 if [[ -f .env ]]; then
   ok ".env already exists — keeping it as is"
 else
@@ -134,7 +134,11 @@ EOF
     echo "  investment / family / life — simultaneously. To do that well, it"
     echo "  needs your basic profile and somewhere to find your real documents."
     echo "  This is a 2-minute intake; you can skip any question (press Enter)."
-    REPLY="$(ask 'Set up archive skeleton + CLAUDE.md now? [Y/n]:' 'Y')"
+    echo
+    echo "  Muse 是一个同时管你健康 / 职业 / 投资 / 家庭 / 生活的助手。"
+    echo "  它需要先认识你（基本档案）+ 知道去哪里查你的真实材料。"
+    echo "  下面是 2 分钟的入门问题，任意一题可以直接回车跳过。"
+    REPLY="$(ask 'Set up archive skeleton + CLAUDE.md now / 现在生成档案目录骨架 + CLAUDE.md？ [Y/n]:' 'Y')"
     if [[ "$REPLY" =~ ^[Yy] ]]; then
       # 1) Copy subdirectory skeleton (health/ career/ investment/ family/
       #    notes/ archives/, each with a README explaining what to put there).
@@ -151,14 +155,18 @@ EOF
       # All questions are open-ended so they fit students / employees / freelancers /
       # parents / retirees alike. Press Enter to skip any.
       echo
-      echo "  --- Quick intake (press Enter to skip any) ---"
-      INTAKE_NAME="$(ask 'How should Muse address you?' '')"
-      INTAKE_BIRTH="$(ask 'Birth year (or just an age range):' '')"
-      INTAKE_CITY="$(ask 'Where do you live?' '')"
-      INTAKE_DOING="$(ask 'What occupies most of your week? (study / job / freelance / care / retirement / …)' '')"
-      INTAKE_STAGE="$(ask 'One sentence about your life stage right now:' '')"
-      INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
-      INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
+      echo "  --- Quick intake / 入门问答 (press Enter to skip any / 任意题回车跳过) ---"
+      INTAKE_NAME="$(ask 'How should Muse address you? / Muse 该怎么称呼你？' '')"
+      INTAKE_BIRTH="$(ask 'Birth year (or age range) / 出生年份（或大致年龄段）:' '')"
+      INTAKE_CITY="$(ask 'Where do you live? / 你现在住在哪？' '')"
+      echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
+      echo "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
+      INTAKE_DOING="$(ask '' '')"
+      echo "  One sentence about your life stage right now"
+      echo "  用一句话描述你当下的人生阶段"
+      INTAKE_STAGE="$(ask '' '')"
+      INTAKE_GOAL="$(ask 'One main goal for this year / 这一年最想做成的一件事:' '')"
+      INTAKE_HEALTH="$(ask 'Top health concern right now (or "none") / 当前最关心的健康问题（无则填 none）:' '')"
 
       # 3) Write CLAUDE.md with the intake values prefilled.
       sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
@@ -187,22 +195,27 @@ EOF
           "$ARCHIVE/CLAUDE.md"
       fi
 
-      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (with your intake answers prefilled)"
+      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (with your intake answers prefilled / 你填的字段已预填)"
       echo
-      echo "  📋 Next steps (放什么完全看你自己阶段):"
-      echo "    • Health: 体检 / 补剂 / 训练记录 → $ARCHIVE/health/"
-      echo "    • Work:   学业材料 / 简历 / 作品集 / 项目 → $ARCHIVE/work/"
-      echo "    • Money:  预算 / 持仓 / 学贷 / 保单 → $ARCHIVE/money/"
-      echo "    • People: 关心的人的资料 → $ARCHIVE/people/"
-      echo "    • Open $ARCHIVE/CLAUDE.md to fill in any blank fields you skipped"
-      echo "  Each subdir has a README.md explaining what fits and what doesn't."
-      echo "  Muse will see everything on your next chat — no restart needed."
+      echo "  Next steps / 接下来放点真实材料 (what fits depends on your life stage):"
+      echo "    • Health / 健康:  checkups / supplements / training logs → $ARCHIVE/health/"
+      echo "                      体检 / 补剂 / 训练记录"
+      echo "    • Work   / 工作:  resume / portfolio / study material    → $ARCHIVE/work/"
+      echo "                      简历 / 作品集 / 学业材料"
+      echo "    • Money  / 财务:  budget / holdings / loans / insurance  → $ARCHIVE/money/"
+      echo "                      预算 / 持仓 / 学贷 / 保单"
+      echo "    • People / 人:    profiles of people you care about      → $ARCHIVE/people/"
+      echo "                      你关心的人的资料"
+      echo "    • Open / 编辑 $ARCHIVE/CLAUDE.md  to fill in any blank fields / 把剩下的空字段填完"
+      echo "  Each subdir has a README.md / 每个子目录里都有 README.md 说明放什么。"
+      echo "  Muse picks all of this up on your next chat — no restart needed."
+      echo "  下次 chat 时 Muse 会自动看到这些 — 不用重启服务。"
     fi
   fi
 fi
 
 # ----- 4. systemd user service -------------------------------------------
-bold "4/5  Installing systemd --user service"
+bold "4/5  Installing systemd --user service / 注册 systemd 用户服务"
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
 sed -e "s|{{REPO_PATH}}|$REPO|g" \
@@ -227,7 +240,7 @@ else
 fi
 
 # ----- 5. Linger (so service runs even when you're not logged in) --------
-bold "5/5  Enable user lingering (so service survives logout / reboot)"
+bold "5/5  Enable user lingering / 启用用户级常驻 (so service survives logout / reboot)"
 if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
   ok "linger already enabled for $USER"
 else
@@ -237,12 +250,12 @@ else
 fi
 
 echo
-bold "✓ muselab installed"
-echo  "  Open  → http://localhost:8765"
-echo  "  Token → grep MUSELAB_TOKEN .env"
+bold "✓ muselab installed / 安装完成"
+echo  "  Open  / 打开    → http://localhost:8765"
+echo  "  Token / 登录口令 → grep MUSELAB_TOKEN .env"
 echo
-echo  "  Useful commands:"
-echo  "    systemctl --user status muselab     # check status"
-echo  "    systemctl --user restart muselab    # restart"
-echo  "    journalctl --user -u muselab -f     # tail logs"
-echo  "    bash scripts/uninstall-linux.sh     # remove autostart"
+echo  "  Useful commands / 常用命令:"
+echo  "    systemctl --user status muselab     # check status / 查状态"
+echo  "    systemctl --user restart muselab    # restart / 重启"
+echo  "    journalctl --user -u muselab -f     # tail logs / 看日志"
+echo  "    bash scripts/uninstall-linux.sh     # remove autostart / 卸载"

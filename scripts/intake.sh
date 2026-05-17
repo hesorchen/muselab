@@ -27,7 +27,7 @@ if [[ -z "$ARCHIVE" || ! -d "$ARCHIVE" ]]; then
   exit 1
 fi
 
-bold "muselab intake — archive at $ARCHIVE"
+bold "muselab intake / 入门问答 — archive at $ARCHIVE"
 echo
 
 # Confirm overwrite if CLAUDE.md already exists
@@ -52,14 +52,18 @@ for sub in health work money people notes archives; do
 done
 
 echo
-echo "  --- Quick intake (press Enter to skip any) ---"
-INTAKE_NAME="$(ask 'How should Muse address you?' '')"
-INTAKE_BIRTH="$(ask 'Birth year (or just an age range):' '')"
-INTAKE_CITY="$(ask 'Where do you live?' '')"
-INTAKE_DOING="$(ask 'What occupies most of your week? (study / job / freelance / care / retirement / …)' '')"
-INTAKE_STAGE="$(ask 'One sentence about your life stage right now:' '')"
-INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
-INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
+echo "  --- Quick intake / 入门问答 (press Enter to skip any / 任意题回车跳过) ---"
+INTAKE_NAME="$(ask 'How should Muse address you? / Muse 该怎么称呼你？' '')"
+INTAKE_BIRTH="$(ask 'Birth year (or age range) / 出生年份（或大致年龄段）:' '')"
+INTAKE_CITY="$(ask 'Where do you live? / 你现在住在哪？' '')"
+echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
+echo "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
+INTAKE_DOING="$(ask '' '')"
+echo "  One sentence about your life stage right now"
+echo "  用一句话描述你当下的人生阶段"
+INTAKE_STAGE="$(ask '' '')"
+INTAKE_GOAL="$(ask 'One main goal for this year / 这一年最想做成的一件事:' '')"
+INTAKE_HEALTH="$(ask 'Top health concern right now (or "none") / 当前最关心的健康问题（无则填 none）:' '')"
 
 sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
   scripts/templates/default-CLAUDE.md > "$ARCHIVE/CLAUDE.md"
@@ -91,6 +95,7 @@ if [[ -n "$INTAKE_STAGE" ]]; then
   fi
 fi
 
-ok "CLAUDE.md updated"
+ok "CLAUDE.md updated / 已更新"
 echo
-echo "  Next: open $ARCHIVE/CLAUDE.md and fill any blanks. Muse picks it up on next chat (no restart)."
+echo "  Next / 下一步: open $ARCHIVE/CLAUDE.md and fill any blanks."
+echo "  打开上面那个文件把空字段填完。Muse 下一次 chat 会自动加载（不用重启服务）。"

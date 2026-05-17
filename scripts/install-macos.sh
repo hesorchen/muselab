@@ -77,12 +77,12 @@ else
 fi
 
 # ----- 2. Python deps ----------------------------------------------------
-bold "2/5  Installing Python dependencies (uv sync, may take a few minutes first time)"
+bold "2/5  Installing Python dependencies / 安装 Python 依赖 (uv sync, may take a few minutes first time)"
 uv sync                              # no --quiet: user wants to see progress
 ok "deps installed"
 
 # ----- 3. .env -----------------------------------------------------------
-bold "3/5  Configuring .env"
+bold "3/5  Configuring .env / 写入 .env 配置"
 if [[ -f .env ]]; then
   ok ".env already exists — keeping it as is"
 else
@@ -90,7 +90,8 @@ else
 
   echo
   echo "  Archive dir = where Muse can read/write (NEVER point at \$HOME or /)"
-  ARCHIVE="$(ask 'Archive dir (absolute path):' "$HOME/muselab-archive")"
+  echo "  档案目录 = Muse 能读写的地方（不要指向 \$HOME 或 / 根目录）"
+  ARCHIVE="$(ask 'Archive dir / 档案目录 (absolute path / 绝对路径):' "$HOME/muselab-archive")"
   ARCHIVE="${ARCHIVE/#\~/$HOME}"
   if ! mkdir -p "$ARCHIVE" 2>/dev/null; then
     err "cannot create $ARCHIVE (permission denied?). Pick a path under your home."
@@ -122,7 +123,11 @@ EOF
     echo "  investment / family / life — simultaneously. To do that well, it"
     echo "  needs your basic profile and somewhere to find your real documents."
     echo "  This is a 2-minute intake; you can skip any question (press Enter)."
-    REPLY="$(ask 'Set up archive skeleton + CLAUDE.md now? [Y/n]:' 'Y')"
+    echo
+    echo "  Muse 是一个同时管你健康 / 职业 / 投资 / 家庭 / 生活的助手。"
+    echo "  它需要先认识你（基本档案）+ 知道去哪里查你的真实材料。"
+    echo "  下面是 2 分钟的入门问题，任意一题可以直接回车跳过。"
+    REPLY="$(ask 'Set up archive skeleton + CLAUDE.md now / 现在生成档案目录骨架 + CLAUDE.md？ [Y/n]:' 'Y')"
     if [[ "$REPLY" =~ ^[Yy] ]]; then
       for sub in health work money people notes archives; do
         if [[ ! -d "$ARCHIVE/$sub" ]]; then
@@ -134,14 +139,18 @@ EOF
       ok "archive skeleton created under $ARCHIVE/"
 
       echo
-      echo "  --- Quick intake (press Enter to skip any) ---"
-      INTAKE_NAME="$(ask 'How should Muse address you?' '')"
-      INTAKE_BIRTH="$(ask 'Birth year (or just an age range):' '')"
-      INTAKE_CITY="$(ask 'Where do you live?' '')"
-      INTAKE_DOING="$(ask 'What occupies most of your week? (study / job / freelance / care / retirement / …)' '')"
-      INTAKE_STAGE="$(ask 'One sentence about your life stage right now:' '')"
-      INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
-      INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
+      echo "  --- Quick intake / 入门问答 (press Enter to skip any / 任意题回车跳过) ---"
+      INTAKE_NAME="$(ask 'How should Muse address you? / Muse 该怎么称呼你？' '')"
+      INTAKE_BIRTH="$(ask 'Birth year (or age range) / 出生年份（或大致年龄段）:' '')"
+      INTAKE_CITY="$(ask 'Where do you live? / 你现在住在哪？' '')"
+      echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
+      echo "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
+      INTAKE_DOING="$(ask '' '')"
+      echo "  One sentence about your life stage right now"
+      echo "  用一句话描述你当下的人生阶段"
+      INTAKE_STAGE="$(ask '' '')"
+      INTAKE_GOAL="$(ask 'One main goal for this year / 这一年最想做成的一件事:' '')"
+      INTAKE_HEALTH="$(ask 'Top health concern right now (or "none") / 当前最关心的健康问题（无则填 none）:' '')"
 
       sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
         scripts/templates/default-CLAUDE.md > "$ARCHIVE/CLAUDE.md"
@@ -171,22 +180,27 @@ EOF
           "$ARCHIVE/CLAUDE.md"
       fi
 
-      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (with your intake answers prefilled)"
+      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (with your intake answers prefilled / 你填的字段已预填)"
       echo
-      echo "  📋 Next steps (放什么完全看你自己阶段):"
-      echo "    • Health: 体检 / 补剂 / 训练记录 → $ARCHIVE/health/"
-      echo "    • Work:   学业材料 / 简历 / 作品集 / 项目 → $ARCHIVE/work/"
-      echo "    • Money:  预算 / 持仓 / 学贷 / 保单 → $ARCHIVE/money/"
-      echo "    • People: 关心的人的资料 → $ARCHIVE/people/"
-      echo "    • Open $ARCHIVE/CLAUDE.md to fill in any blank fields you skipped"
-      echo "  Each subdir has a README.md explaining what fits and what doesn't."
-      echo "  Muse will see everything on your next chat — no restart needed."
+      echo "  Next steps / 接下来放点真实材料 (what fits depends on your life stage):"
+      echo "    • Health / 健康:  checkups / supplements / training logs → $ARCHIVE/health/"
+      echo "                      体检 / 补剂 / 训练记录"
+      echo "    • Work   / 工作:  resume / portfolio / study material    → $ARCHIVE/work/"
+      echo "                      简历 / 作品集 / 学业材料"
+      echo "    • Money  / 财务:  budget / holdings / loans / insurance  → $ARCHIVE/money/"
+      echo "                      预算 / 持仓 / 学贷 / 保单"
+      echo "    • People / 人:    profiles of people you care about      → $ARCHIVE/people/"
+      echo "                      你关心的人的资料"
+      echo "    • Open / 编辑 $ARCHIVE/CLAUDE.md  to fill in any blank fields / 把剩下的空字段填完"
+      echo "  Each subdir has a README.md / 每个子目录里都有 README.md 说明放什么。"
+      echo "  Muse picks all of this up on your next chat — no restart needed."
+      echo "  下次 chat 时 Muse 会自动看到这些 — 不用重启服务。"
     fi
   fi
 fi
 
 # ----- 4. LaunchAgent ----------------------------------------------------
-bold "4/5  Installing LaunchAgent"
+bold "4/5  Installing LaunchAgent / 注册 LaunchAgent"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="$HOME/Library/Logs/muselab"
 mkdir -p "$AGENT_DIR" "$LOG_DIR"
@@ -222,7 +236,7 @@ else
 fi
 
 # ----- 5. Sanity check ---------------------------------------------------
-bold "5/5  Sanity check"
+bold "5/5  Sanity check / 启动自检"
 # Up to 30s for HTTP to come up (first-boot SDK init)
 WAITED=0
 while (( WAITED < 30 )); do
@@ -237,12 +251,12 @@ else
 fi
 
 echo
-bold "✓ muselab installed"
-echo  "  Open  → http://localhost:8765"
-echo  "  Token → grep MUSELAB_TOKEN .env"
+bold "✓ muselab installed / 安装完成"
+echo  "  Open  / 打开    → http://localhost:8765"
+echo  "  Token / 登录口令 → grep MUSELAB_TOKEN .env"
 echo
-echo  "  Useful commands:"
-echo  "    launchctl list | grep muselab          # check loaded"
-echo  "    launchctl kickstart -k gui/\$UID/com.muselab    # restart"
-echo  "    tail -f $LOG_DIR/stderr.log            # tail logs"
-echo  "    bash scripts/uninstall-macos.sh        # remove autostart"
+echo  "  Useful commands / 常用命令:"
+echo  "    launchctl list | grep muselab               # check loaded / 查状态"
+echo  "    launchctl kickstart -k gui/\$UID/com.muselab # restart / 重启"
+echo  "    tail -f $LOG_DIR/stderr.log                 # tail logs / 看日志"
+echo  "    bash scripts/uninstall-macos.sh             # remove autostart / 卸载"

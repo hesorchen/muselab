@@ -103,13 +103,13 @@ if (Get-Command npx -ErrorAction SilentlyContinue) {
 }
 
 # ----- 2. Python deps -----------------------------------------------------
-Bold "2/5  Installing Python dependencies (uv sync, may take a few minutes first time)"
+Bold "2/5  Installing Python dependencies / 安装 Python 依赖 (uv sync, may take a few minutes first time)"
 & $UvPath sync                       # no --quiet: user wants to see progress
 if ($LASTEXITCODE -ne 0) { Err "uv sync failed"; exit 1 }
 Ok "deps installed"
 
 # ----- 3. .env ------------------------------------------------------------
-Bold "3/5  Configuring .env"
+Bold "3/5  Configuring .env / 写入 .env 配置"
 $EnvPath = Join-Path $Repo ".env"
 if (Test-Path $EnvPath) {
   Ok ".env already exists — keeping it as is"
@@ -121,8 +121,9 @@ if (Test-Path $EnvPath) {
 
   Write-Host
   Write-Host "  Archive dir = where Muse can read/write (NEVER point at your user dir or C:\)"
+  Write-Host "  档案目录 = Muse 能读写的地方（不要指向你的用户目录或 C:\ 整个盘）"
   $defArchive = Join-Path $env:USERPROFILE "muselab-archive"
-  $Archive = Ask "Archive dir (absolute path):" $defArchive
+  $Archive = Ask "Archive dir / 档案目录 (absolute path / 绝对路径):" $defArchive
   if (-not (Test-Path $Archive)) {
     try {
       New-Item -ItemType Directory -Path $Archive -Force | Out-Null
@@ -172,7 +173,11 @@ MUSELAB_MODEL=claude-sonnet-4-6
     Write-Host "  investment / family / life simultaneously. It needs your basic"
     Write-Host "  profile and somewhere to find your real documents."
     Write-Host "  This is a 2-minute intake; you can skip any question (press Enter)."
-    $DoSetup = Ask "Set up archive skeleton + CLAUDE.md now? [Y/n]:" "Y"
+    Write-Host
+    Write-Host "  Muse 是一个同时管你健康 / 职业 / 投资 / 家庭 / 生活的助手。"
+    Write-Host "  它需要先认识你（基本档案）+ 知道去哪里查你的真实材料。"
+    Write-Host "  下面是 2 分钟的入门问题，任意一题可以直接回车跳过。"
+    $DoSetup = Ask "Set up archive skeleton + CLAUDE.md now / 现在生成档案目录骨架 + CLAUDE.md？ [Y/n]:" "Y"
     if ($DoSetup -match "^[Yy]") {
       $skel = Join-Path $Repo "scripts\templates\archive-skeleton"
       foreach ($sub in @("health", "work", "money", "people", "notes", "archives")) {
@@ -185,14 +190,18 @@ MUSELAB_MODEL=claude-sonnet-4-6
       Ok "archive skeleton created under $Archive"
 
       Write-Host
-      Write-Host "  --- Quick intake (press Enter to skip any) ---"
-      $iName   = Ask "How should Muse address you?" ""
-      $iBirth  = Ask "Birth year (or just an age range):" ""
-      $iCity   = Ask "Where do you live?" ""
-      $iDoing  = Ask "What occupies most of your week? (study / job / freelance / care / retirement / ...)" ""
-      $iStage  = Ask "One sentence about your life stage right now:" ""
-      $iGoal   = Ask "One main goal for this year:" ""
-      $iHealth = Ask "Top health concern right now (or 'none'):" ""
+      Write-Host "  --- Quick intake / 入门问答 (press Enter to skip any / 任意题回车跳过) ---"
+      $iName   = Ask "How should Muse address you? / Muse 该怎么称呼你？" ""
+      $iBirth  = Ask "Birth year (or age range) / 出生年份（或大致年龄段）:" ""
+      $iCity   = Ask "Where do you live? / 你现在住在哪？" ""
+      Write-Host "  What occupies most of your week? (study / job / freelance / care / retirement / ...)"
+      Write-Host "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
+      $iDoing  = Ask "" ""
+      Write-Host "  One sentence about your life stage right now"
+      Write-Host "  用一句话描述你当下的人生阶段"
+      $iStage  = Ask "" ""
+      $iGoal   = Ask "One main goal for this year / 这一年最想做成的一件事:" ""
+      $iHealth = Ask "Top health concern right now (or 'none') / 当前最关心的健康问题（无则填 none）:" ""
 
       $tpl = Get-Content (Join-Path $Repo "scripts\templates\default-CLAUDE.md") -Raw
       $tpl = $tpl -replace "%DATE%", (Get-Date -Format "yyyy-MM-dd")
@@ -217,22 +226,27 @@ MUSELAB_MODEL=claude-sonnet-4-6
       }
 
       Set-Content -Path $ClaudeMd -Value $tpl -Encoding utf8     # utf8 — CJK content
-      Ok "CLAUDE.md -> $ClaudeMd (with your intake answers prefilled)"
+      Ok "CLAUDE.md -> $ClaudeMd (with your intake answers prefilled / 你回答的字段已预填)"
       Write-Host
-      Write-Host "  Next steps (适合放什么完全看你自己阶段):"
-      Write-Host "    * Health: 体检 / 补剂 / 训练记录 -> $Archive\health\"
-      Write-Host "    * Work:   学业材料 / 简历 / 作品集 -> $Archive\work\"
-      Write-Host "    * Money:  预算 / 持仓 / 学贷 / 保单 -> $Archive\money\"
-      Write-Host "    * People: 关心的人的资料 -> $Archive\people\"
-      Write-Host "    * Open $ClaudeMd to fill in any blank fields"
-      Write-Host "  Each subdir has a README.md explaining what fits there."
-      Write-Host "  Muse will see all of this on your next chat - no restart needed."
+      Write-Host "  Next steps / 接下来放点你的真实材料 (what fits depends on your life stage):"
+      Write-Host "    * Health / 健康:  checkups / supplements / training logs -> $Archive\health\"
+      Write-Host "                      体检 / 补剂 / 训练记录"
+      Write-Host "    * Work   / 工作:  resume / portfolio / study material    -> $Archive\work\"
+      Write-Host "                      简历 / 作品集 / 学业材料"
+      Write-Host "    * Money  / 财务:  budget / holdings / loans / insurance  -> $Archive\money\"
+      Write-Host "                      预算 / 持仓 / 学贷 / 保单"
+      Write-Host "    * People / 人:    profiles of people you care about      -> $Archive\people\"
+      Write-Host "                      你关心的人的资料"
+      Write-Host "    * Open / 编辑 $ClaudeMd  to fill in any blank fields / 把剩下的空字段填完"
+      Write-Host "  Each subdir has a README.md / 每个子目录里都有 README.md 说明放什么。"
+      Write-Host "  Muse picks all of this up on your next chat - no restart needed."
+      Write-Host "  下次 chat 时 Muse 会自动看到这些 - 不用重启服务。"
     }
   }
 }
 
 # ----- 4. Scheduled Task --------------------------------------------------
-Bold "4/5  Registering Scheduled Task (runs at logon)"
+Bold "4/5  Registering Scheduled Task / 注册开机自启计划任务 (runs at logon)"
 $TaskName  = "Muselab"
 $LogDir    = Join-Path $env:LOCALAPPDATA "muselab\logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -270,7 +284,7 @@ Ok "Scheduled Task '$TaskName' registered (trigger: at logon)"
 Start-ScheduledTask -TaskName $TaskName
 
 # ----- 5. Sanity check ----------------------------------------------------
-Bold "5/5  Sanity check (up to 30s for first-boot SDK init)"
+Bold "5/5  Sanity check / 启动自检 (up to 30s for first-boot SDK init)"
 $ok = $false
 for ($i = 0; $i -lt 30; $i++) {
   try {
@@ -288,13 +302,13 @@ if (-not $ok) {
 }
 
 Write-Host
-Bold "[OK] muselab installed"
-Write-Host "  Open  -> http://localhost:8765"
-Write-Host "  Token -> Select-String MUSELAB_TOKEN .env"
+Bold "[OK] muselab installed / 安装完成"
+Write-Host "  Open  / 打开    -> http://localhost:8765"
+Write-Host "  Token / 登录口令 -> Select-String MUSELAB_TOKEN .env"
 Write-Host
-Write-Host "  Useful commands:"
-Write-Host "    Get-ScheduledTask -TaskName Muselab    # check status"
-Write-Host "    Stop-ScheduledTask  -TaskName Muselab  # stop"
-Write-Host "    Start-ScheduledTask -TaskName Muselab  # start"
-Write-Host "    Get-Content -Wait `"$LogDir\stderr.log`"   # tail logs"
-Write-Host "    powershell -ExecutionPolicy Bypass -File scripts\uninstall-windows.ps1"
+Write-Host "  Useful commands / 常用命令:"
+Write-Host "    Get-ScheduledTask -TaskName Muselab    # check status / 查状态"
+Write-Host "    Stop-ScheduledTask  -TaskName Muselab  # stop / 停止"
+Write-Host "    Start-ScheduledTask -TaskName Muselab  # start / 启动"
+Write-Host "    Get-Content -Wait `"$LogDir\stderr.log`"   # tail logs / 看日志"
+Write-Host "    powershell -ExecutionPolicy Bypass -File scripts\uninstall-windows.ps1  # uninstall / 卸载"
