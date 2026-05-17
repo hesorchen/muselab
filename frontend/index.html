@@ -363,7 +363,7 @@ window.addEventListener("error", e => {
     <aside class="pane chat" :class="{'pane-hidden': !rightOpen}">
       <header class="pane-head">
         <span class="pane-title">
-          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'thinking': streaming}"
+          <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'is-streaming': streaming}"
                 @click="cycleMascot()" :title="mascotLabel() + (lang==='zh'?'（点击换一位）':' (click for next muse)')">
             <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
           </span>
