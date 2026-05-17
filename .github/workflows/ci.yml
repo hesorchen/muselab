@@ -32,7 +32,7 @@ jobs:
           uv run pytest tests/ -v
 
   lint:
-    name: ruff
+    name: ruff + muselab-lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +41,11 @@ jobs:
         run: |
           uv tool install ruff
           uv tool run ruff check backend/ tests/ || true   # non-blocking for now
+      - name: muselab lint (encoding / BOM / class collisions)
+        # Catches the bug classes we've shipped historically — Python file
+        # I/O without encoding, .ps1 files missing BOM, etc. See
+        # scripts/lint.sh for the rule list.
+        run: bash scripts/lint.sh
 
   # Builds the Dockerfile on every PR (smoke), and on push to main / tags it
   # publishes a multi-arch image to GitHub Container Registry.

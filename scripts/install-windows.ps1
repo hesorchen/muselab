@@ -141,14 +141,47 @@ if (Test-Path $EnvPath) {
     }
     Warn "port must be 1024-65535 / 端口范围 1024-65535"
   }
-  # Check the chosen port is free
+  # Check the chosen port is free. If a previous muselab install is holding
+  # the port (python child of an existing Scheduled Task), offer to clean it
+  # up in place rather than make the user run kill commands by hand.
   try {
     $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop
     if ($listeners) {
-      Err "Port $Port is already in use:"
-      $listeners | Format-Table LocalAddress, LocalPort, OwningProcess
-      Write-Host "      Stop that process or re-run and pick a different port."
-      exit 1
+      $owningPid = ($listeners | Select-Object -First 1).OwningProcess
+      $proc = Get-Process -Id $owningPid -ErrorAction SilentlyContinue
+      $existingTask = Get-ScheduledTask -TaskName "Muselab" -ErrorAction SilentlyContinue
+      $looksLikeMuselab = ($proc -and ($proc.ProcessName -match "^(python|uv)$")) -and $existingTask
+
+      if ($looksLikeMuselab) {
+        Warn "Port $Port is held by an existing muselab install (PID $owningPid, $($proc.ProcessName))"
+        Warn "  端口被已有的 muselab 占着 — 可以一键清理后继续"
+        $clean = Ask "Clean it up and continue / 清理后继续? [Y/n]:" "Y"
+        if ($clean -match "^[Yy]") {
+          Stop-ScheduledTask -TaskName "Muselab" -ErrorAction SilentlyContinue
+          Get-Process -Name python, uv -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          # The new install registers a fresh task; remove the old one.
+          # Unregister requires admin if the prior was S4U — try, fall back to letting the
+          # admin UAC at the Scheduled Task step take care of it.
+          try { Unregister-ScheduledTask -TaskName "Muselab" -Confirm:$false -ErrorAction Stop } catch {}
+          # Re-check
+          $still = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+          if ($still) {
+            Err "Cleanup didn't free the port. PID still holding: $(($still | Select-Object -First 1).OwningProcess)"
+            Err "  Open Admin PowerShell and run: Stop-Process -Id <PID> -Force"
+            exit 1
+          }
+          Ok "cleaned up — port $Port now free"
+        } else {
+          Err "Aborted by user. Re-run when the port is free."
+          exit 1
+        }
+      } else {
+        Err "Port $Port is already in use (PID $owningPid, $($proc.ProcessName))"
+        Err "  端口被别的进程占着，不是 muselab — 请先停掉它或重跑选别的端口"
+        $listeners | Format-Table LocalAddress, LocalPort, OwningProcess
+        exit 1
+      }
     }
   } catch { } # cmdlet missing on older PS — skip soft
   Ok "port $Port available / 端口 $Port 可用"

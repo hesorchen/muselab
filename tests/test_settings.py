@@ -139,10 +139,12 @@ def test_get_settings_requires_auth(client):
 
 
 def test_settings_provider_count_matches_catalog(client, auth):
-    """Settings UI should expose exactly the providers that have Anthropic-compat
-    endpoints (4 today). New ones must be added to both PROVIDER_KEYS and CATALOG."""
+    """Settings UI should expose the four providers: Anthropic (Claude API)
+    plus the three Anthropic-compat third parties (DeepSeek / GLM / MiniMax).
+    New ones must be added to both PROVIDER_KEYS and CATALOG."""
     r = client.get("/api/settings", headers=auth)
     d = r.json()
-    assert len(d["providers"]) == 3
+    assert len(d["providers"]) == 4
     keys = {p["env_key"] for p in d["providers"]}
-    assert keys == {"DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY"}
+    assert keys == {"ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
+                     "ZHIPUAI_API_KEY", "MINIMAX_API_KEY"}

@@ -115,10 +115,44 @@ else
     fi
     warn "port must be 1024-65535 / 端口范围 1024-65535"
   done
+  # Smart port check: detect "port held by previous muselab LaunchAgent" and
+  # offer one-click cleanup instead of forcing manual kill.
   if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    err "Port $PORT is already in use:"
-    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | head -3
-    exit 1
+    HOLDER_PID="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
+    HOLDER_NAME=""
+    if [[ -n "$HOLDER_PID" ]]; then
+      HOLDER_NAME="$(ps -p "$HOLDER_PID" -o comm= 2>/dev/null | xargs basename 2>/dev/null)"
+    fi
+    HAS_OLD_AGENT=""
+    if launchctl list 2>/dev/null | grep -q com.muselab; then HAS_OLD_AGENT=1; fi
+
+    if [[ "$HOLDER_NAME" =~ ^(python|python3|uv)$ ]] && [[ -n "$HAS_OLD_AGENT" ]]; then
+      warn "Port $PORT is held by an existing muselab install (PID $HOLDER_PID, $HOLDER_NAME)"
+      warn "  端口被已有的 muselab 占着 — 可以一键清理后继续"
+      REPLY="$(ask 'Clean it up and continue / 清理后继续? [Y/n]:' 'Y')"
+      if [[ "$REPLY" =~ ^[Yy] ]]; then
+        launchctl unload "$HOME/Library/LaunchAgents/com.muselab.plist" 2>/dev/null || true
+        kill -TERM "$HOLDER_PID" 2>/dev/null || true
+        sleep 2
+        if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+          kill -KILL "$HOLDER_PID" 2>/dev/null || true
+          sleep 1
+        fi
+        if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+          err "Cleanup didn't free port — kill manually then re-run."
+          exit 1
+        fi
+        ok "cleaned up — port $PORT now free"
+      else
+        err "Aborted by user."
+        exit 1
+      fi
+    else
+      err "Port $PORT is already in use (PID ${HOLDER_PID:-?}, ${HOLDER_NAME:-unknown})"
+      err "  端口被别的进程占着，不是 muselab — 先停掉它或重跑选别的端口"
+      lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | head -3
+      exit 1
+    fi
   fi
   ok "port $PORT available / 端口 $PORT 可用"
 

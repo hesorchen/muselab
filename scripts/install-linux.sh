@@ -122,10 +122,40 @@ else
     fi
     warn "port must be 1024-65535 / 端口范围 1024-65535"
   done
+  # Check port free; if held by an existing muselab systemd service, offer
+  # one-click cleanup instead of making the user run commands by hand.
   if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
-    err "Port $PORT is already in use:"
-    ss -tlnp "sport = :$PORT" 2>&1 | head -3
-    exit 1
+    HOLDER_PID="$(ss -tlnpH "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
+    HOLDER_NAME=""
+    if [[ -n "$HOLDER_PID" ]]; then
+      HOLDER_NAME="$(ps -p "$HOLDER_PID" -o comm= 2>/dev/null | tr -d ' ')"
+    fi
+    HAS_OLD_UNIT=""
+    if systemctl --user is-enabled muselab.service >/dev/null 2>&1; then HAS_OLD_UNIT=1; fi
+
+    if [[ "$HOLDER_NAME" =~ ^(python|uv)$ ]] && [[ -n "$HAS_OLD_UNIT" ]]; then
+      warn "Port $PORT is held by an existing muselab install (PID $HOLDER_PID, $HOLDER_NAME)"
+      warn "  端口被已有的 muselab 占着 — 可以一键清理后继续"
+      REPLY="$(ask 'Clean it up and continue / 清理后继续? [Y/n]:' 'Y')"
+      if [[ "$REPLY" =~ ^[Yy] ]]; then
+        systemctl --user stop muselab.service 2>/dev/null || true
+        systemctl --user disable muselab.service 2>/dev/null || true
+        sleep 2
+        if ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
+          err "Cleanup didn't free port — process may not be ours. Kill manually then re-run."
+          exit 1
+        fi
+        ok "cleaned up — port $PORT now free"
+      else
+        err "Aborted by user."
+        exit 1
+      fi
+    else
+      err "Port $PORT is already in use (PID ${HOLDER_PID:-?}, ${HOLDER_NAME:-unknown})"
+      err "  端口被别的进程占着，不是 muselab — 先停掉它或重跑选别的端口"
+      ss -tlnp "sport = :$PORT" 2>&1 | head -3
+      exit 1
+    fi
   fi
   ok "port $PORT available / 端口 $PORT 可用"
 
