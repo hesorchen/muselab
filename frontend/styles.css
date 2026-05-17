@@ -603,9 +603,15 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   letter-spacing: 0.5px;
 }
 .muse-mascot.greet { animation: muse-bounce .9s ease; }
-/* `.thinking` 类不再触发任何动画 — mascot 保持静止。流式状态由
-   pending bubble 的 thinking-dots 已经表达，mascot 动反而分散注意。 */
-.muse-mascot.thinking { color: var(--c-accent); }
+/* `.thinking` 类不触发任何动画 — mascot 保持完全静止（无 animation / 无
+   transition / 无 hover 缩放），避免在流式期间出现细微抖动或闪烁。
+   流式状态由 pending bubble 的 thinking-dots 表达，mascot 动反而分散。 */
+.muse-mascot.thinking {
+  color: var(--c-accent);
+  animation: none !important;
+  transition: none;
+}
+.muse-mascot.thinking:hover { transform: none; }
 
 @keyframes muse-bounce {
   0%   { transform: scale(1)    rotate(0deg); }
