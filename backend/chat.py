@@ -13,6 +13,9 @@ from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, TextBlock, ThinkingBlock, ResultMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
+    get_session_messages,
+    delete_session as sdk_delete_session,
+    rename_session as sdk_rename_session,
 )
 from .auth import require_token_query, require_token
 from .settings import ROOT, MODEL, MCP_CONFIG_PATH
@@ -232,17 +235,144 @@ def create_session_api(req: CreateReq) -> dict:
     return meta
 
 
+def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict]) -> list[dict]:
+    """Convert SDK SessionMessage list into muselab's flat UI message list.
+    Each SessionMessage may explode into multiple UI bubbles because the
+    frontend renders tool_use / tool_result / thinking blocks as separate
+    messages from the text bubble. Annotations (cost, model, images) attach
+    by message UUID to the primary text bubble."""
+    out: list[dict] = []
+    for sm in sm_list:
+        ann = annotations.get(sm.uuid, {})
+        msg = sm.message or {}
+        content = msg.get("content")
+
+        # Simple shape: content is a single string.
+        if isinstance(content, str):
+            entry = {"role": sm.type, "text": content, "uuid": sm.uuid}
+            entry.update(ann)   # cost / model / images / etc.
+            out.append(entry)
+            continue
+        if not isinstance(content, list):
+            continue
+
+        text_buf = ""
+        image_refs = []   # placeholder for inline image blocks (if any in JSONL)
+
+        def flush_text():
+            nonlocal text_buf, image_refs
+            if not text_buf and not image_refs:
+                return
+            entry = {"role": sm.type, "text": text_buf, "uuid": sm.uuid}
+            if image_refs:
+                # CLI JSONL stores image source dicts; convert minimal info for UI.
+                # If sidecar has full base64 (uploaded via muselab), it wins
+                # — already merged via ann["images"].
+                entry.setdefault("images", image_refs)
+            entry.update(ann)
+            out.append(entry)
+            text_buf = ""
+            image_refs = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                text_buf += block.get("text", "")
+            elif bt == "thinking":
+                flush_text()
+                out.append({"role": "thinking", "text": block.get("thinking", ""),
+                            "uuid": sm.uuid})
+            elif bt == "tool_use":
+                flush_text()
+                tu = {
+                    "role": "tool_use",
+                    "uuid": sm.uuid,
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "input": block.get("input") or {},
+                    # Compact summary that the frontend usually shows in the bubble
+                    "summary": _summarize_tool_input(block.get("name"), block.get("input") or {}),
+                }
+                out.append(tu)
+            elif bt == "tool_result":
+                flush_text()
+                tr_text = ""
+                tr_content = block.get("content")
+                if isinstance(tr_content, str):
+                    tr_text = tr_content
+                elif isinstance(tr_content, list):
+                    parts = []
+                    for p in tr_content:
+                        if isinstance(p, dict):
+                            parts.append(p.get("text", str(p)))
+                        else:
+                            parts.append(str(p))
+                    tr_text = "\n".join(parts)
+                out.append({
+                    "role": "tool_result", "uuid": sm.uuid,
+                    "id": block.get("tool_use_id"),
+                    "preview": tr_text[:500],
+                    "truncated": len(tr_text) > 500,
+                    "is_error": bool(block.get("is_error", False)),
+                })
+            elif bt == "image":
+                # Inline image block in user content — record a reference.
+                # Real base64 lives in the sidecar (annotations["images"]) for
+                # images the user uploaded via muselab's upload flow.
+                src = block.get("source") or {}
+                image_refs.append({"mime": src.get("media_type") or ""})
+            # Other block types (server_tool_use, etc.) — skip silently for now.
+        flush_text()
+    return out
+
+
+def _summarize_tool_input(name: str | None, inp: dict) -> str:
+    """Same summarization used by _render_tool_use, factored to also work for
+    raw dict input (post-JSONL parse, no ToolUseBlock instance)."""
+    if not name:
+        return ""
+    if name in ("Read", "Edit", "Write"):
+        return inp.get("file_path", "")
+    if name == "Bash":
+        return (inp.get("command") or "")[:200]
+    if name in ("Glob", "Grep"):
+        return (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
+    if name == "WebFetch":
+        return inp.get("url", "")
+    if name == "WebSearch":
+        return inp.get("query", "")
+    if name == "TodoWrite":
+        return f"{len(inp.get('todos') or [])} todos"
+    return ""
+
+
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
 def get_session_api(sid: str) -> dict:
-    s = sess.get_session(sid)
-    if s is None:
+    """Read session: metadata from muselab sidecar + transcript from CLI JSONL
+    via SDK. Merges per-message annotations (cost, model, images) into the
+    transcript so the UI gets one flat list of bubbles."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
         raise HTTPException(404, "session not found")
-    return s
+    try:
+        sdk_msgs = get_session_messages(sid, directory=str(ROOT))
+    except Exception:
+        sdk_msgs = []
+    annotations = sess.get_message_annotations(sid)
+    messages = _sdk_messages_to_ui(sdk_msgs, annotations)
+    return {**meta, "messages": messages}
 
 
 @router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
 async def delete_session_api(sid: str) -> dict:
     await disconnect_client(sid)
+    # SDK delete first (removes CLI JSONL); then muselab sidecar.
+    try:
+        sdk_delete_session(sid, directory=str(ROOT))
+    except (FileNotFoundError, ValueError):
+        pass   # JSONL never existed (session never streamed) — that's fine
     if not sess.delete_session(sid):
         raise HTTPException(404, "session not found")
     return {"ok": True}
@@ -270,6 +400,12 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
     ok = False
     if req.name is not None:
         ok = sess.rename_session(sid, req.name) or ok
+        # Also propagate to CLI's JSONL so list_sessions() / manual claude
+        # CLI runs see the new title. Silent no-op if JSONL doesn't exist yet.
+        try:
+            sdk_rename_session(sid, req.name, directory=str(ROOT))
+        except (FileNotFoundError, ValueError):
+            pass
     if req.system_prompt is not None:
         ok = sess.update_system_prompt(sid, req.system_prompt) or ok
         # System prompt change invalidates cached SDK clients for this session.
@@ -361,97 +497,33 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
         raise HTTPException(500, f"get_context_usage failed: {e}")
 
 
-class SeedReq(BaseModel):
-    summary: str
-    is_compact: bool = False
-    source_message_count: int = 0
-
-
-@router.post("/sessions/{sid}/seed", dependencies=[Depends(require_token)])
-async def seed_session_api(sid: str, req: SeedReq) -> dict:
-    """Persist a summary as the first user message of a (typically just-created
-    compact) session. Used by the /compact flow: model summarizes the old
-    session, that summary becomes context for the fresh one.
-    When is_compact=True the message carries metadata the frontend uses to
-    render it as a "📦 内容已压缩" marker instead of showing the raw summary."""
-    s = sess.get_session(sid)
-    if s is None:
-        raise HTTPException(404, "session not found")
-    if s.get("messages"):
-        raise HTTPException(409, "session already has messages; seed only fits empty")
-    msg: dict[str, Any] = {
-        "role": "user",
-        "text": f"以下是上一个会话的全部要点摘要，请把它作为我们继续对话的起点：\n\n{req.summary}",
-    }
-    if req.is_compact:
-        msg["_compact_marker"] = True
-        msg["_compact_source_count"] = req.source_message_count
-        # Keep the raw summary separately so the frontend can show it on expand
-        # without re-parsing the "请把它作为..." wrapper.
-        msg["_compact_summary"] = req.summary
-    sess.append_messages(sid, [msg])
-    return {"ok": True}
-
-
-@router.post("/sessions/{sid}/compact", dependencies=[Depends(require_token)])
-async def compact_session_api(sid: str) -> dict:
-    """LEGACY fork-based compact endpoint — kept for backward compat. New code
-    should use /native-compact below, which is lossless (CLI does it natively
-    via /compact slash command and writes compact_boundary into the JSONL)."""
-    src = sess.get_session(sid)
-    if src is None:
-        raise HTTPException(404, "session not found")
-    name = f"{src.get('name', 'session')} (compact)"
-    new_meta = sess.create_session(name=name, model=src.get("model", ""),
-                                    system_prompt=src.get("system_prompt", ""))
-    return new_meta
-
-
 @router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
 async def native_compact_session_api(sid: str) -> dict:
-    """Compact a session using the CLI's NATIVE /compact slash command (via the
-    Agent SDK). This is lossless — the CLI writes compact_boundary + an
-    isCompactSummary entry into its session JSONL, and subsequent reads
-    automatically use the summary in place of the pre-compaction history. Tool
-    use history is preserved, file references stay accurate, the session ID
-    stays the same.
+    """Compact a session using the CLI's native /compact slash command via SDK.
+    Lossless — CLI writes compact_boundary + isCompactSummary into the session
+    JSONL. Subsequent get_session_messages() returns the summary in place of
+    pre-compaction history, so the UI automatically reflects the compacted
+    state on next loadSession — no muselab-side marker needed.
 
-    Returns immediately after the compact response has been drained. Muselab's
-    own sessions.json gets a single _compact_marker message appended so the
-    frontend can render a "📦 已压缩" pill in the chat view; the user's actual
-    pre-compaction Q&A stays in muselab's display history (the CLI's JSONL is
-    what matters for context — muselab's store is just for UI replay)."""
-    src = sess.get_session(sid)
-    if src is None:
+    Session ID stays the same; tool_use history is preserved in the summary."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
         raise HTTPException(404, "session not found")
-    model = (src.get("model") or "").strip() or MODEL
-    source_count = len(src.get("messages") or [])
-
-    # Re-use the existing client cache so the prompt cache stays warm.
+    model = (meta.get("model") or "").strip() or MODEL
     client = await get_client(sid, model, "bypassPermissions", show_thinking=False)
-
-    # Send /compact as a slash command prompt. The CLI intercepts and runs
-    # native compaction; the model gets nothing here, just the meta-message
-    # back. We drain whatever it emits and discard — the actual artefact is
-    # the JSONL mutation on disk.
     try:
         await client.query("/compact")
         async for _ in client.receive_response():
             pass
     except Exception as e:
         raise HTTPException(500, f"native /compact failed: {e}")
-
-    # Append a marker message to muselab's local store so the chat view shows
-    # "📦 已压缩" at the boundary. Use is_compact_marker shape so the existing
-    # frontend renderer picks it up.
-    sess.append_messages(sid, [{
-        "role": "user",
-        "text": "",   # marker, no body
-        "_compact_marker": True,
-        "_compact_source_count": source_count,
-        "_compact_native": True,
-    }])
-    return {"ok": True, "source_count": source_count}
+    # Refresh message_count so the sidebar reflects the compacted size.
+    try:
+        new_msgs = get_session_messages(sid, directory=str(ROOT))
+        sess.bump_session(sid, message_count=len(new_msgs))
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 class BudgetReq(BaseModel):
@@ -835,12 +907,10 @@ async def stream(
             parts.append(f"\n\n--- Attached file: {name} ---\n```\n{body}\n```\n--- end {name} ---")
         prompt = "\n".join(parts).lstrip()
 
-    persisted_user = {"role": "user", "text": prompt}
-    if persisted_imgs:
-        persisted_user["images"] = persisted_imgs
-    if persisted_docs:
-        persisted_user["docs"] = persisted_docs
-    persisted: list[dict] = [persisted_user]
+    # New architecture: CLI's JSONL is the transcript source-of-truth. We no
+    # longer accumulate `persisted` into a parallel local store. Instead, after
+    # the stream completes we ask SDK for the latest message UUIDs and write
+    # per-message annotations (cost / model / images) keyed by those UUIDs.
     assistant_acc = ""
 
     async def event_gen():
@@ -943,13 +1013,11 @@ async def stream(
                             # Same: streamed via thinking_delta events.
                             pass
                         elif isinstance(block, ToolUseBlock):
-                            d = _render_tool_use(block)
-                            persisted.append({"role": "tool_use", **d})
-                            yield {"event": "tool_use", "data": json.dumps(d)}
+                            # Just emit to UI for live render — transcript is
+                            # in CLI's JSONL, no parallel persistence here.
+                            yield {"event": "tool_use", "data": json.dumps(_render_tool_use(block))}
                         elif isinstance(block, ToolResultBlock):
-                            d = _render_tool_result(block)
-                            persisted.append({"role": "tool_result", **d})
-                            yield {"event": "tool_result", "data": json.dumps(d)}
+                            yield {"event": "tool_result", "data": json.dumps(_render_tool_result(block))}
                 elif isinstance(msg, ResultMessage):
                     cost = getattr(msg, "total_cost_usd", None) or 0.0
                     u = getattr(msg, "usage", {}) or {}
@@ -989,17 +1057,49 @@ async def stream(
                     sess_u["total_cost_usd"] += cost
                     sess_u["last_turn_at"] = time.time()
 
-                    if assistant_acc:
-                        persisted.append({
-                            "role": "assistant",
-                            "text": assistant_acc,
-                            "cost": f"${cost:.4f}",
-                            # Persist which model produced this reply, so the bubble
-                            # badge stays accurate after session reload / model switch.
-                            # Without this, switching models silently loses provenance.
-                            "model": model_to_use,
-                        })
-                    sess.append_messages(session_id, persisted)
+                    # Pull latest transcript from SDK to discover the UUIDs the
+                    # CLI just wrote for the user message + assistant reply. We
+                    # write per-message annotations (cost / model / image base64)
+                    # against those UUIDs in muselab's sidecar — the CLI doesn't
+                    # track these fields.
+                    try:
+                        all_msgs = get_session_messages(session_id, directory=str(ROOT))
+                    except Exception:
+                        all_msgs = []
+                    # Walk back from the end to find the latest assistant + user.
+                    new_asst_uuid = None
+                    new_user_uuid = None
+                    for sm in reversed(all_msgs):
+                        if sm.type == "assistant" and not new_asst_uuid:
+                            new_asst_uuid = sm.uuid
+                        elif sm.type == "user" and not new_user_uuid:
+                            new_user_uuid = sm.uuid
+                        if new_asst_uuid and new_user_uuid:
+                            break
+                    if new_asst_uuid and assistant_acc:
+                        sess.set_message_annotation(
+                            session_id, new_asst_uuid,
+                            cost=f"${cost:.4f}", model=model_to_use)
+                    if new_user_uuid and (persisted_imgs or persisted_docs):
+                        sess.set_message_annotation(
+                            session_id, new_user_uuid,
+                            images=persisted_imgs or None,
+                            docs=persisted_docs or None)
+                    # message_count = total transcript size; auto-rename hint
+                    # from the FIRST user message text if session is still auto-named.
+                    first_user_text = ""
+                    for sm in all_msgs:
+                        if sm.type == "user":
+                            c = (sm.message or {}).get("content")
+                            if isinstance(c, str):
+                                first_user_text = c
+                            elif isinstance(c, list):
+                                for b in c:
+                                    if isinstance(b, dict) and b.get("type") == "text":
+                                        first_user_text = b.get("text", ""); break
+                            break
+                    sess.bump_session(session_id, message_count=len(all_msgs),
+                                       auto_rename_from=first_user_text or prompt)
                     sess.update_model(session_id, model_to_use)
                     limit = MODEL_CONTEXT_LIMITS.get(model_to_use, DEFAULT_CONTEXT_LIMIT)
                     yield {"event": "done", "data": json.dumps({

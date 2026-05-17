@@ -151,27 +151,7 @@ def test_context_breakdown_returns_409_for_session_without_client(client, auth):
     assert r.status_code == 409, f"expected 409 (no live client), got {r.status_code}: {r.text}"
 
 
-def test_seed_with_compact_flag_persists_marker(client, auth):
-    """POST /sessions/{sid}/seed with is_compact=true must persist
-    _compact_marker, _compact_source_count, _compact_summary in the
-    message metadata."""
-    r = client.post("/api/chat/sessions",
-                     headers={**auth, "Content-Type": "application/json"},
-                     json={"name": "seed test", "model": "deepseek-v4-flash"})
-    sid = r.json()["id"]
-
-    r = client.post(f"/api/chat/sessions/{sid}/seed",
-                     headers={**auth, "Content-Type": "application/json"},
-                     json={"summary": "key facts go here",
-                            "is_compact": True,
-                            "source_message_count": 17})
-    assert r.status_code == 200, r.text
-
-    # Fetch and verify
-    r = client.get(f"/api/chat/sessions/{sid}", headers=auth)
-    msgs = r.json()["messages"]
-    assert len(msgs) == 1
-    m = msgs[0]
-    assert m.get("_compact_marker") is True
-    assert m.get("_compact_source_count") == 17
-    assert m.get("_compact_summary") == "key facts go here"
+# Removed test_seed_with_compact_flag_persists_marker — the /seed endpoint
+# was deleted in the 2026-05-17 refactor. CLI's native /compact writes
+# isCompactSummary into the JSONL; SDK get_session_messages returns it as a
+# normal message, so no muselab-side marker is needed.
