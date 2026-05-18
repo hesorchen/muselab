@@ -353,6 +353,7 @@ window.addEventListener("error", e => {
                @drop.prevent="onPreviewTabDrop($event, t.path)"
                @dragend="onPreviewTabDragEnd()"
                @click="switchTab(t.path)"
+               @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                @auxclick.prevent="closeTab(t.path)"
                :title="t.path">
             <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
@@ -361,6 +362,37 @@ window.addEventListener("error", e => {
           </div>
         </template>
       </div>
+
+      <!-- Preview tab right-click menu. Uses a fullscreen overlay to catch
+           "outside" clicks instead of Alpine's @click.outside — the latter
+           was firing on the same right-click event sequence and dismissing
+           the menu instantly. -->
+      <template x-if="previewTabCtxMenu">
+        <div class="ctx-menu-overlay"
+             @click="previewTabCtxMenu = null"
+             @contextmenu.prevent="previewTabCtxMenu = null"
+             @keydown.escape.window="previewTabCtxMenu = null">
+          <div class="tab-ctx-menu"
+               :style="previewTabCtxMenuStyle()"
+               @click.stop @contextmenu.prevent.stop>
+            <button @click="previewTabMenuAction('close')"
+                    x-text="lang==='zh' ? '关闭' : 'Close'"></button>
+            <button @click="previewTabMenuAction('closeOthers')"
+                    x-text="lang==='zh' ? '关闭其他' : 'Close others'"></button>
+            <button @click="previewTabMenuAction('closeRight')"
+                    x-text="lang==='zh' ? '关闭右侧标签' : 'Close to the right'"></button>
+            <button @click="previewTabMenuAction('closeAll')"
+                    x-text="lang==='zh' ? '关闭全部' : 'Close all'"></button>
+            <hr/>
+            <button @click="previewTabMenuAction('reveal')"
+                    x-text="lang==='zh' ? '在文件树定位' : 'Reveal in tree'"></button>
+            <button @click="previewTabMenuAction('mention')"
+                    x-text="lang==='zh' ? '@ 引用到 chat' : '@-mention in chat'"></button>
+            <button @click="previewTabMenuAction('copyPath')"
+                    x-text="lang==='zh' ? '复制路径' : 'Copy path'"></button>
+          </div>
+        </div>
+      </template>
 
       <div class="preview-body"
            :class="{ 'drag-hover': previewDragHover }"
@@ -1045,14 +1077,26 @@ window.addEventListener("error", e => {
                     :title="lang==='zh' ? '显示推理过程' : 'Show reasoning'">
               <svg><use href="#i-brain"/></svg>
             </button>
-            <!-- Context ring — tiny SVG donut showing pct used. Click for
-                 SDK breakdown popup; title carries the numbers for hover. -->
+            <!-- Breakdown button — magnifier; opens SDK get_context_usage()
+                 popup with per-category token counts. -->
+            <button class="chat-toolbar-btn"
+                    x-show="currentId"
+                    @click="showCtxBreakdown()"
+                    :title="lang==='zh' ? 'Context 拆分详情' : 'Context breakdown'">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="7"/>
+                <line x1="21" y1="21" x2="16.5" y2="16.5"/>
+              </svg>
+            </button>
+            <!-- Context ring — % used. Click to compact (primary action;
+                 the breakdown magnifier above is the secondary action). -->
             <button class="chat-toolbar-ring"
                     :class="{
                       warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
                       danger: sessionUsage.context_used_pct >= 90,
                     }"
-                    @click="showCtxBreakdown()"
+                    @click="runCompact()"
+                    @contextmenu.prevent="showCtxBreakdown()"
                     :title="ctxRingTitle()">
               <svg viewBox="0 0 20 20" width="18" height="18">
                 <circle cx="10" cy="10" r="7" fill="none"
@@ -1065,11 +1109,6 @@ window.addEventListener("error", e => {
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>
-            <!-- Compact button — only when > 70% -->
-            <button x-show="sessionUsage.context_used_pct >= 70 && !_compacting"
-                    class="chat-toolbar-btn warn"
-                    @click="runCompact()"
-                    x-text="t('ctx.compact_btn')"></button>
             <span class="chat-toolbar-spacer"></span>
             <!-- Send / Stop -->
             <button x-show="!streaming" @click="send()"

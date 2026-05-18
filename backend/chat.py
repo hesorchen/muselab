@@ -736,6 +736,15 @@ def session_usage(session_id: str, model: str = "") -> dict:
     stored = int(u.get("context_limit", 0) or 0)
     hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
     limit = max(stored, hardcoded)
+    # Diagnostic: every /usage call writes which value won. Lets you confirm
+    # in stderr.log whether your meter is showing hardcoded fallback, stored
+    # SDK value, or whether the model name even resolves in the table.
+    import sys as _sys
+    in_table = m in MODEL_CONTEXT_LIMITS
+    _sys.stderr.write(
+        f"[usage] sid={session_id[:8]} model={m!r} in_table={in_table} "
+        f"stored={stored} hardcoded={hardcoded} → limit={limit}\n")
+    _sys.stderr.flush()
     # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
     # handler. Fall back to the legacy estimate only if no turn has completed
     # yet (in which case `context_used` is 0 anyway → 0% display, correct).

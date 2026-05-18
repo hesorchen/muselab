@@ -46,6 +46,8 @@ function portal() {
     // ===== preview =====
     // Drag-and-drop visual state for the preview pane.
     previewDragHover: false,
+    // Right-click context menu on a preview tab. { path, x, y } when open.
+    previewTabCtxMenu: null,
     // Image lightbox (click chat-bubble image to enlarge).
     lightbox: { show: false, src: "" },
     // Whether the "Open files" sidebar section is collapsed. Persists to
@@ -1705,7 +1707,12 @@ function portal() {
       const limit_s = limit >= 1_000_000
         ? (limit / 1_000_000).toFixed(0) + "M"
         : (limit / 1000).toFixed(0) + "K";
-      return `${used_s} / ${limit_s} (${pct}%)`;
+      const meta = (this.availableModels || []).find(m => m.model === this.model);
+      const modelLabel = meta ? meta.label : this.model;
+      const hint = this.lang === "zh"
+        ? "（点击压缩 · 右键看拆分）"
+        : "(click to compact · right-click for breakdown)";
+      return `${used_s} / ${limit_s} (${pct}%) · ${modelLabel}\n${hint}`;
     },
     compactStatusLabel() {
       // Single method instead of an inline template-literal expression in
@@ -1803,6 +1810,59 @@ function portal() {
     // on `tabs` array instead of openTabIds and on file paths as the id).
     _draggingPreviewTabPath: "",
     previewDragOverPath: "",
+    showPreviewTabMenu(ev, path) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      const cx = (ev && ev.clientX) || 100;
+      const cy = (ev && ev.clientY) || 100;
+      // Overlay catches outside-clicks reliably; no need to defer mount.
+      this.previewTabCtxMenu = {
+        path,
+        x: Math.min(cx, window.innerWidth - 220),
+        y: Math.min(cy, window.innerHeight - 280),
+      };
+    },
+    previewTabCtxMenuStyle() {
+      if (!this.previewTabCtxMenu) return "";
+      return `position: fixed; top: ${this.previewTabCtxMenu.y}px; left: ${this.previewTabCtxMenu.x}px;`;
+    },
+    async previewTabMenuAction(action) {
+      const m = this.previewTabCtxMenu;
+      if (!m) return;
+      const path = m.path;
+      this.previewTabCtxMenu = null;
+      switch (action) {
+        case "close":
+          this.closeTab(path);
+          break;
+        case "closeOthers":
+          this.tabs = this.tabs.filter(t => t.path === path);
+          if (this.selected !== path) await this.switchTab(path);
+          this.savePrefs();
+          break;
+        case "closeRight": {
+          const idx = this.tabs.findIndex(t => t.path === path);
+          if (idx >= 0) this.tabs = this.tabs.slice(0, idx + 1);
+          this.savePrefs();
+          break;
+        }
+        case "closeAll":
+          this.tabs = []; this.selected = ""; this.savePrefs();
+          break;
+        case "reveal":
+          await this.revealInTree(path);
+          break;
+        case "mention":
+          this.insertFileMention(path);
+          break;
+        case "copyPath":
+          navigator.clipboard?.writeText(path).then(
+            () => this.toast(this.t("toast.copied") + ": " + path, "success", 1500),
+            () => this.toast("复制失败（需要 HTTPS）", "error"));
+          break;
+      }
+    },
+
     async onPreviewDrop(ev) {
       this.previewDragHover = false;
       const files = (ev.dataTransfer && ev.dataTransfer.files) || [];
@@ -3372,8 +3432,15 @@ function portal() {
         this.toast(this.t("ctx.compact_wait_streaming"), "warn", 2500);
         return;
       }
-      const hasContent = this.messages.some(m => m.role === "assistant" && m.text);
-      if (!hasContent) {
+      // Empty-session guard. Frontend `messages` may be transiently empty
+      // right after a page refresh (loadSession is still running async),
+      // so fall back to the session metadata's message_count from the
+      // backend — that survives reloads.
+      const hasFrontendContent = this.messages.some(
+        m => m.role === "assistant" && m.text);
+      const meta = this.sessions.find(s => s.id === this.currentId);
+      const backendCount = (meta && meta.message_count) || 0;
+      if (!hasFrontendContent && backendCount < 2) {
         this.toast(this.t("ctx.compact_empty"), "warn", 2500);
         return;
       }

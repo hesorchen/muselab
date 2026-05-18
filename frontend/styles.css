@@ -1067,6 +1067,15 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .icon-btn.retry-btn { color: var(--c-danger, #dc3545); }
 .icon-btn.retry-btn:hover { color: var(--c-accent); }
 
+/* Fullscreen transparent overlay used by right-click menus to catch
+   click-outside without relying on Alpine's @click.outside (which sometimes
+   fires on the trailing event of a right-click sequence). The menu itself
+   sits inside the overlay and uses @click.stop to keep clicks contained. */
+.ctx-menu-overlay {
+  position: fixed; inset: 0; z-index: 999;
+  background: transparent;
+}
+
 /* Image lightbox — fullscreen overlay over any pane. ESC and outside-click
    both dismiss; the <img> stops propagation so clicking the image itself
    doesn't close. */
