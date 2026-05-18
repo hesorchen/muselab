@@ -1,509 +1,19 @@
 // ==========================================================================
-// i18n — 中英双语字符串表。新增条目时两边都要加，否则 t() 回退到 key 暴露缺漏。
+// i18n — dictionary is loaded by /static/i18n/index.js (plain <script> tag in
+// index.html, before app.js). Kept out of this file so the file stays focused
+// on app logic and editing translations doesn't require diffing 470 lines.
+// Falls back to an empty dict if the i18n script failed to load — t() then
+// returns the key, making the breakage visible instead of silently broken.
 // ==========================================================================
-const STRINGS = {
-  zh: {
-    // panes / titles
-    "pane.files": "Files",
-    "pane.preview": "Preview",
-    "pane.chat": "Muse",
-    // sidebar / toggles
-    "btn.hide_left": "隐藏文件区",  "btn.show_left": "显示文件区",
-    "btn.hide_right": "隐藏 Muse", "btn.show_right": "显示 Muse",
-    "btn.show_hidden": "显示隐藏文件", "btn.hide_hidden": "不显示隐藏文件",
-    "btn.refresh": "刷新",
-    "btn.upload": "上传到当前目录",
-    "btn.new_file": "新建文件",
-    "btn.new_dir": "新建子目录",
-    "btn.search": "全文搜索",
-    "btn.theme_light": "切到浅色", "btn.theme_dark": "切到深色",
-    "btn.settings": "设置",
-    "btn.logout": "退出",
-    "btn.stop": "停止",
-    "btn.send": "发送",
-    "btn.save": "保存",
-    "btn.cancel": "取消",
-    "btn.confirm": "确定",
-    "btn.edit": "编辑",
-    "btn.delete": "删除",
-    "btn.rename": "重命名",
-    "btn.download": "下载",
-    "btn.copy_path": "复制路径",
-    "btn.preview": "预览",
-    "btn.at_mention": "@ 引用到 chat",
-    "btn.new_session": "新会话",
-    "btn.edit_prompt": "编辑系统提示词",
-    "btn.close": "关闭",
-    // file pane / search
-    "files.empty": "目录为空，拖文件进来或点 + 新建",
-    "files.empty_search": "没有匹配",
-    "files.searching": "搜索中…",
-    "files.search_more": "（结果已截断，请细化关键词）",
-    "files.search_placeholder": "搜索文件名和内容…",
-    // chat
-    "chat.placeholder": "和 Muse 聊点什么…（@ 引用文件，Shift+Enter 换行）",
-    "chat.thinking": "Muse 正在思考…",
-    "chat.empty_tip1": "输入消息按",
-    "chat.empty_tip2": " 把文件递给 Muse",
-    "chat.empty_tip3": "换模型不丢历史",
-    "chat.runs_on": "runs on",
-    "chat.no_session": "还没选会话，点左下「+ 新会话」开始",
-    "chat.session_prompt": "本会话系统提示词（叠加在 muselab 默认 + CLAUDE.md 之上）",
-    "chat.attach_files": "已附带文件（点 × 移除）",
-    // preview empty state
-    "empty.preview_tagline": "Meet Muse — an AI that actually knows you.",
-    "empty.preview_tip1": "从左侧选文件 — Muse 看得见",
-    "empty.preview_tip2": " 在右侧把文件递给 Muse",
-    "empty.preview_tip3": "右键文件查看更多操作",
-    "preview.action_new_note": "新建笔记",
-    "preview.action_upload": "上传文档",
-    "preview.new_note_title": "新建 markdown 笔记",
-    "preview.new_note_body": "文件名（默认放 archive 根目录；可写 health/foo.md 等子路径）",
-    // login
-    "splash.greet": "正在唤醒 Muse...",
-    "splash.slow": "还在启动，请稍等（首次加载会久一点）",
-    "conn.reconnecting": "🔄 muselab 失联中 — 正在重试...",
-    "conn.reconnected": "✓ 已重连",
-    "login.sub": "你的私人 AI 助理，同时记得你的所有维度。",
-    "login.tagline": "muse · lab",
-    "login.token_placeholder": "MUSELAB_TOKEN",
-    "login.go": "进入",
-    "login.err": "Token 错误",
-    "login.hint_on_err": "Token 在 muselab 安装目录的 .env 文件里（找 MUSELAB_TOKEN=）。第一次用？跑 scripts/install-{linux,macos,windows}",
-    // settings modal
-    "set.title": "设置",
-    "set.sec.provider": "Provider API Keys",
-    "set.sec.appearance": "外观",
-    "set.sec.defaults": "新会话默认",
-    "set.sec.model_params": "模型参数",
-    "set.sec.sessions": "会话",
-    "set.sessions.cleanup_label": "空会话清理",
-    "set.sessions.cleanup_btn": "清理空会话",
-    "set.sessions.cleanup_confirm_title": "清理空会话",
-    "set.sessions.cleanup_confirm_body": "删除所有 0 条消息的会话（未发过任何消息的占位项）。无法撤销。",
-    "set.sessions.cleanup_done": "已删除 {n} 个空会话",
-    "set.probe": "测试",
-    "set.probe_tip": "向 vendor 真发一条 ping，看 key 是否真的有效",
-    "set.probe_running": "正在测试 key...",
-    "set.probe_ok": "key 有效，端点通",
-    "set.probe_failed": "测试失败",
-    "set.probe_hint_401": "key 无效，去 vendor 控制台查",
-    "set.probe_hint_403": "可能需要在 vendor 开通对应服务",
-    "set.probe_hint_429": "限流了，等一会再试",
-    "set.sec.mcp": "MCP 工具服务器",
-    "set.mcp.hint": "MCP 让 Muse 调用外部工具（fetch、time、sequential-thinking 等）。开关控制是否加载；删除会移除配置。",
-    "set.mcp.empty": "尚未配置 MCP server。点击下方添加，或从预设安装。",
-    "set.mcp.disabled": "已禁用",
-    "set.mcp.toggle_title": "启用 / 禁用此 server",
-    "set.mcp.delete": "删除",
-    "set.mcp.presets": "预设：",
-    "set.mcp.add": "添加 MCP server",
-    "set.mcp.name": "名字",
-    "set.mcp.command": "命令",
-    "set.mcp.args": "参数（空格分隔）",
-    "set.mcp.added": "已添加",
-    "set.mcp.deleted": "已删除",
-    "set.mcp.installed": "已从预设安装",
-    "set.mcp.toggle_saved": "已切换",
-    "set.mcp.save_failed": "保存失败",
-    "set.mcp.delete_failed": "删除失败",
-    "set.mcp.name_command_required": "名字和命令都不能为空",
-    "set.sec.skills": "Skills（模型可发现的能力包）",
-    "set.skills.hint": "Muse 启动时从 ~/.claude/skills 和 muselab/skills 加载。模型按任务自动调用，无需手动启用。",
-    "set.skills.empty": "未发现任何 skill。在 ~/.claude/skills 或本项目 skills/ 下新增 SKILL.md 即可。",
-    "slash.hint": "↑↓ 选 · Enter / Tab 选中 · Esc 关",
-    "slash.none": "没有匹配的命令",
-    "slash.help_title": "muselab 帮助",
-    "help.sec_slash": "斜杠命令",
-    "help.sec_keys": "键盘快捷键",
-    "help.keys_list": "- `Enter` — 发送消息\n- `Shift+Enter` — 换行\n- `@` — 引用 archive 里的文件\n- `/` — 斜杠命令面板\n- `↑ ↓` — 在 @ / `/` 面板里选项\n- `Esc` — 关闭面板 / modal / 中止流式\n- `Ctrl+S` — 保存编辑中的文件（CodeMirror 内）",
-    "help.sec_layout": "三栏布局",
-    "help.layout_list": "- **左**：archive 文件树 + 全文搜索（右键文件看更多动作）\n- **中**：预览 / 编辑当前文件（md / 代码 / 图片 / PDF / HTML 沙盒）\n- **右**：聊 Muse（顶部 chip 显示 CLAUDE.md / MCP / cost / 模型）",
-    "help.docs_link": "完整文档",
-    "slash.cleared": "已清空当前会话",
-    "slash.failed": "命令执行失败",
-    "slash.compact_ok": "已创建压缩会话 — 输入框已预填请求语，回车发送",
-    "slash.compact_prompt": "请把上一个会话的所有内容压缩成结构化的简短摘要，保留：关键事实 / 已做决定 / 待办 / 引用过的具体文件路径。摘要将作为新会话的起点。",
-    "slash.model_list_title": "可选模型（点 dropdown 切换更直观）",
-    "slash.model_unknown": "找不到模型：{id}",
-    "slash.model_switched": "已切到 {id}",
-    "slash.resume_list_title": "最近 10 个会话（带 ID 前缀和消息数）",
-    "slash.resume_no_match": "没找到匹配的会话",
-    "slash.resumed": "已跳到「{name}」",
-    "slash.cost_title": "当前用量",
-    "slash.unknown": "未知命令：/{cmd}（输入 /help 查看全部）",
-    "cost.total": "总成本",
-    "cost.in_out": "输入/输出 tokens",
-    "cost.cache_hit": "缓存命中",
-    "cost.budget": "预算",
-    "cost.no_budget": "未设预算（可在 Settings 加 MUSELAB_BUDGET_USD）",
-    "cost.context": "当前会话 context",
-    "cost.budget_warn": "预算告警：已用 {pct}% / ${usd}",
-    "ctx.title": "当前会话 context tokens",
-    "ctx.claude_md_tip": "Muse 已加载 {root}/CLAUDE.md（上次修改 {date}）",
-    "ctx.no_claude_md": "{root} 里没有 CLAUDE.md — Muse 不认识你，点击查看怎么配",
-    "ctx.no_claude_md_title": "Muse 还不认识你",
-    "ctx.no_claude_md_body": "你的 archive 在：\n  {root}\n\nMuse 启动时会读 {root}/CLAUDE.md 作为「关于你」的档案。现在没有这个文件，所以 Muse 只能用默认行为，不能基于你的真实情况给建议。\n\n建议：\n  1. 跑 scripts/install-{linux,macos,windows} 里的 intake（推荐）\n  2. 或手动复制：scripts/templates/default-CLAUDE.md → {root}/CLAUDE.md，按提示填\n\n详见 docs/personalize-claude-md.md",
-    "onboard.no_provider_title": "🔑 还没配置模型，无法对话",
-    "onboard.no_provider_body": "Muse 需要至少一个模型 provider。可选：\n  • Claude（Pro/Max 订阅）：终端跑 `claude login` 一次（免费配额）\n  • Claude（API 按量）：去 console.anthropic.com 拿 key 填到 Settings\n  • DeepSeek / GLM / MiniMax：去对应控制台拿 API key 填到 Settings",
-    "onboard.no_provider_cta": "打开 Settings",
-    "onboard.no_claude_md_title": "👋 Muse 还不认识你",
-    "onboard.no_claude_md_body": "Muse 是一个整体助理 — 同时帮你管身体、做的事、钱、关心的人、生活。在它能给针对性建议之前，需要你先做一份 3 分钟的档案。",
-    "onboard.no_claude_md_cta": "查看怎么设置",
-    "onboard.empty_archive_title": "📂 你的 archive 里还没有文档",
-    "onboard.empty_archive_body": "把真实材料放进对应的子目录，Muse 才能基于它们给建议。下面是已建好的目录：",
-    "onboard.dir_health": "体检报告 / 补剂方案 / 训练记录",
-    "onboard.dir_work":   "在做的事的产物（学业 / 简历 / 作品集 / 项目）",
-    "onboard.dir_money":  "预算 / 持仓 / 学贷 / 保单",
-    "onboard.dir_people": "关心的人的资料",
-    "onboard.dir_notes":  "学习笔记 / 灵感 / 日记",
-    "onboard.ready_title": "💡 试试问 Muse",
-    "onboard.q_health":   "看看我的健康档案，有什么需要注意的",
-    "onboard.q_work":     "帮我看看简历 / 学业材料",
-    "onboard.q_money":    "看一下我的财务状况，给建议",
-    "onboard.q_people":   "我关心的人最近有哪些需要跟进的",
-    "onboard.q_overview": "我的 archive 里有什么？整理一下给我看",
-    "onboard.skill_hint": "或试试这些 skill：",
-    "ctx.cache_tip": "缓存命中率 — 越高越省钱。Anthropic prompt cache 在 5 分钟内复用上次的系统提示词 + 上下文。",
-    "ctx.normal": "上下文 {used}K / {limit}K · {pct}% · 缓存 {cached}K",
-    "ctx.warn":   "上下文用了 {pct}%（{used}K / {limit}K · 缓存 {cached}K）· 长对话变贵，可压缩",
-    "ctx.danger": "上下文已用 {pct}%（{used}K / {limit}K · 缓存 {cached}K）· 即将截断 · 立即压缩",
-    "ctx.compact_btn": "压缩历史",
-    "ctx.tip_line1": "每次回答都把整段历史送给模型 → token 越多越贵越慢",
-    "ctx.tip_line2": "压缩 = Muse 总结上文 → 新会话只带摘要起步，省钱也变快",
-    "ctx.compact_confirm_title": "压缩这个会话",
-    "ctx.compact_confirm_body": "Muse 会先让模型把全部历史总结一段，然后用这段摘要新建一个会话作为起点。原会话不动，可以随时切回。",
-    "ctx.compact_summarize_prompt": "请把这个会话的全部要点压缩成结构化摘要：①事实背景 ②已做决定 ③待办或下一步 ④引用过的具体文件路径。要让一个第一次看到摘要的人能凭它继续对话。",
-    "ctx.compact_step1": "Step 1/2: 让模型总结上文...",
-    "ctx.compact_done": "压缩完成，已切到新会话",
-    "ctx.compact_wait_streaming": "Muse 还在回复中，等这一轮结束再压缩",
-    "ctx.compact_empty": "当前会话还没有 Muse 的回复，没什么可压缩的",
-    "ctx.compact_timeout": "压缩超时（60s）— Muse 可能在处理长历史，再试一次",
-    "ctx.compact_no_reply": "模型没返回摘要 — 检查 Muse 是不是出错了，再重试",
-    "model.switch_title": "切换模型",
-    "model.switch_body": "切换到 {label} 需要新建会话。确认吗？",
-    "model.switch_new": "新建并切换",
-    "model.new_session_ok": "已新建 {label} 会话",
-    "img.attach": "粘贴 / 拖拽 / 选择图片",
-    "attach.title": "粘贴 / 拖拽 / 选择图片或文档（PDF、md、txt、json、代码……）",
-    "attach.bad_type": "不支持的文件类型",
-    "img.remove": "移除",
-    "img.bad_type": "不支持的图片格式（png/jpg/gif/webp）",
-    "img.too_big": "图片超过 10MB",
-    "img.upload_failed": "图片上传失败",
-    "img.wait_upload": "等图片上传完再发送",
-    "todo.title": "任务清单",
-    "todo.doing": "进行中",
-    "subagent.label": "派子 agent",
-    "subagent.prompt_toggle": "展开 prompt",
-    "plan.title": "Muse 提出的计划",
-    "set.sec.lang": "语言",
-    "set.label.lang": "界面语言",
-    "set.label.theme": "主题",
-    "set.label.accent": "主题色",
-    "set.label.default_model": "默认模型",
-    "set.label.default_permission": "默认权限",
-    "set.label.show_thinking_default": "默认显示 thinking 块",
-    "set.label.thinking_budget": "思考预算（tokens）",
-    "set.label.max_turns": "最多工具回合",
-    "set.lang.zh": "中文", "set.lang.en": "English",
-    "set.theme.light": "浅色", "set.theme.dark": "深色",
-    "set.key_set": "已配置", "set.key_unset": "未配置",
-    "set.placeholder_key": "输入 API Key 并保存",
-    // toasts
-    "toast.saved": "已保存",
-    "toast.save_failed": "保存失败",
-    "toast.deleted": "已删除",
-    "toast.delete_failed": "删除失败",
-    "toast.copied": "已复制",
-    "toast.uploaded": "上传完成",
-    "toast.upload_failed": "上传失败",
-    "toast.renamed": "重命名完成",
-    "toast.rename_failed": "重命名失败",
-    "toast.created": "已创建",
-    "toast.token_required": "请填 Token",
-    "toast.model_switched": "已切到 {label}，下条消息立刻用新模型（不用新建会话）",
-    "toast.muse_back": "Muse 回来啦",
-    "toast.mention_added": "已把 {path} 递给 Muse",
-    "toast.lang_switched": "已切换到中文",
-    "ask.title": "Muse 在等你选",
-    "ask.submitted": "已提交",
-    "ask.multi": "可多选",
-    "ask.submit": "提交",
-    "ask.unanswered": "还有问题没选",
-    "ask.submit_failed": "提交答案失败",
-    "perm.title": "Muse 想用一个工具",
-    "perm.allow": "允许",
-    "perm.deny": "拒绝",
-    "perm.always": "本次会话总是允许",
-    "perm.decision_allow": "已允许",
-    "perm.decision_deny": "已拒绝",
-    "perm.decision_always": "已加白",
-    "perm.submit_failed": "提交决定失败",
-    // modal generic
-    "modal.confirm_delete": "确认删除 {name}？此操作不可恢复。",
-    "modal.input_required": "请输入内容",
-    "modal.dirty_save": "当前文件有未保存改动，先保存吗？",
-  },
-  en: {
-    "pane.files": "Files",
-    "pane.preview": "Preview",
-    "pane.chat": "Muse",
-    "btn.hide_left": "Hide files",  "btn.show_left": "Show files",
-    "btn.hide_right": "Hide Muse",  "btn.show_right": "Show Muse",
-    "btn.show_hidden": "Show hidden files", "btn.hide_hidden": "Hide hidden files",
-    "btn.refresh": "Refresh",
-    "btn.upload": "Upload to current dir",
-    "btn.new_file": "New file",
-    "btn.new_dir": "New folder",
-    "btn.search": "Full-text search",
-    "btn.theme_light": "Light mode", "btn.theme_dark": "Dark mode",
-    "btn.settings": "Settings",
-    "btn.logout": "Log out",
-    "btn.stop": "Stop",
-    "btn.send": "Send",
-    "btn.save": "Save",
-    "btn.cancel": "Cancel",
-    "btn.confirm": "OK",
-    "btn.edit": "Edit",
-    "btn.delete": "Delete",
-    "btn.rename": "Rename",
-    "btn.download": "Download",
-    "btn.copy_path": "Copy path",
-    "btn.preview": "Preview",
-    "btn.at_mention": "@-mention in chat",
-    "btn.new_session": "New session",
-    "btn.edit_prompt": "Edit system prompt",
-    "btn.close": "Close",
-    "files.empty": "Empty folder — drop files here or click + to create",
-    "files.empty_search": "No matches",
-    "files.searching": "Searching…",
-    "files.search_more": "(results truncated — refine keywords)",
-    "files.search_placeholder": "Search names and contents…",
-    "chat.placeholder": "Talk to Muse… (@ for files, Shift+Enter for newline)",
-    "chat.thinking": "Muse is thinking…",
-    "chat.empty_tip1": "Press",
-    "chat.empty_tip2": " hand a file to Muse",
-    "chat.empty_tip3": "Switch model anytime — history kept",
-    "chat.runs_on": "runs on",
-    "chat.no_session": "No session selected — click \"+ New\" at bottom-left",
-    "chat.session_prompt": "Per-session system prompt (layered above muselab default + CLAUDE.md)",
-    "chat.attach_files": "Attached files (× to remove)",
-    "empty.preview_tagline": "Meet Muse — an AI that actually knows you.",
-    "empty.preview_tip1": "Pick a file on the left — Muse can see it",
-    "empty.preview_tip2": " hand a file to Muse on the right",
-    "empty.preview_tip3": "Right-click for more actions",
-    "preview.action_new_note": "New note",
-    "preview.action_upload": "Upload",
-    "preview.new_note_title": "New markdown note",
-    "preview.new_note_body": "Filename (defaults to archive root; you can write health/foo.md etc.)",
-    "splash.greet": "Waking up Muse…",
-    "splash.slow": "Still loading — first boot takes a moment",
-    "conn.reconnecting": "🔄 muselab is unreachable — retrying…",
-    "conn.reconnected": "✓ Reconnected",
-    "login.sub": "Your personal AI assistant — knows every dimension of your life.",
-    "login.tagline": "muse · lab",
-    "login.token_placeholder": "MUSELAB_TOKEN",
-    "login.go": "Enter",
-    "login.err": "Bad token",
-    "login.hint_on_err": "Token lives in the .env file at your muselab install dir (look for MUSELAB_TOKEN=). First time? Run scripts/install-{linux,macos,windows}",
-    "set.title": "Settings",
-    "set.sec.provider": "Provider API keys",
-    "set.sec.appearance": "Appearance",
-    "set.sec.defaults": "New-session defaults",
-    "set.sec.model_params": "Model parameters",
-    "set.sec.sessions": "Sessions",
-    "set.sessions.cleanup_label": "Empty sessions",
-    "set.sessions.cleanup_btn": "Clean up empty",
-    "set.sessions.cleanup_confirm_title": "Clean up empty sessions",
-    "set.sessions.cleanup_confirm_body": "Delete every session with 0 messages (abandoned placeholders). Not undoable.",
-    "set.sessions.cleanup_done": "Removed {n} empty sessions",
-    "set.probe": "Test",
-    "set.probe_tip": "Ping the vendor endpoint with the configured key",
-    "set.probe_running": "Testing key…",
-    "set.probe_ok": "key works, endpoint reachable",
-    "set.probe_failed": "Test failed",
-    "set.probe_hint_401": "key is invalid — check vendor console",
-    "set.probe_hint_403": "may need to enable that service on vendor side",
-    "set.probe_hint_429": "rate-limited, retry shortly",
-    "set.sec.mcp": "MCP tool servers",
-    "set.mcp.hint": "MCP lets Muse call external tools (fetch, time, sequential-thinking, …). The switch enables / disables; delete removes config entirely.",
-    "set.mcp.empty": "No MCP servers configured. Add one below or install from presets.",
-    "set.mcp.disabled": "disabled",
-    "set.mcp.toggle_title": "Enable / disable this server",
-    "set.mcp.delete": "Delete",
-    "set.mcp.presets": "Presets:",
-    "set.mcp.add": "Add MCP server",
-    "set.mcp.name": "Name",
-    "set.mcp.command": "Command",
-    "set.mcp.args": "Args (space-separated)",
-    "set.mcp.added": "Added",
-    "set.mcp.deleted": "Deleted",
-    "set.mcp.installed": "Installed from preset",
-    "set.mcp.toggle_saved": "Toggled",
-    "set.mcp.save_failed": "Save failed",
-    "set.mcp.delete_failed": "Delete failed",
-    "set.mcp.name_command_required": "Both name and command required",
-    "set.sec.skills": "Skills (model-discoverable capability packs)",
-    "set.skills.hint": "Muse loads skills from ~/.claude/skills and muselab/skills at startup. The model picks them automatically by task; no manual enable/disable.",
-    "set.skills.empty": "No skills discovered. Add a SKILL.md under ~/.claude/skills or this project's skills/.",
-    "slash.hint": "↑↓ pick · Enter / Tab to choose · Esc close",
-    "slash.none": "no matching command",
-    "slash.help_title": "muselab help",
-    "help.sec_slash": "Slash commands",
-    "help.sec_keys": "Keyboard shortcuts",
-    "help.keys_list": "- `Enter` — send message\n- `Shift+Enter` — newline\n- `@` — reference a file from archive\n- `/` — slash command palette\n- `↑ ↓` — navigate @ / `/` popup\n- `Esc` — close popup / modal / cancel streaming\n- `Ctrl+S` — save in CodeMirror editor",
-    "help.sec_layout": "Three-column layout",
-    "help.layout_list": "- **Left**: archive file tree + full-text search (right-click for more)\n- **Middle**: preview / edit current file (md / code / image / PDF / sandboxed HTML)\n- **Right**: chat with Muse (top chips show CLAUDE.md / MCP / cost / model)",
-    "help.docs_link": "Full docs",
-    "slash.cleared": "Cleared current session",
-    "slash.failed": "Command failed",
-    "slash.compact_ok": "New compact session created — request is pre-filled, hit enter to send",
-    "slash.compact_prompt": "Summarize the prior conversation into a concise structured note. Preserve: key facts / decisions made / open todos / specific file paths referenced. This summary becomes the seed of the new session.",
-    "slash.model_list_title": "Available models (use the dropdown for an easier switch)",
-    "slash.model_unknown": "Unknown model: {id}",
-    "slash.model_switched": "Switched to {id}",
-    "slash.resume_list_title": "Last 10 sessions (with ID prefix + message count)",
-    "slash.resume_no_match": "No matching session",
-    "slash.resumed": "Jumped to \"{name}\"",
-    "slash.cost_title": "Current usage",
-    "slash.unknown": "Unknown command: /{cmd} (type /help to list all)",
-    "cost.total": "Total cost",
-    "cost.in_out": "Input / output tokens",
-    "cost.cache_hit": "Cache hit",
-    "cost.budget": "Budget",
-    "cost.no_budget": "No budget set (add MUSELAB_BUDGET_USD in Settings)",
-    "cost.context": "Current session context",
-    "cost.budget_warn": "Budget warning: used {pct}% of ${usd}",
-    "ctx.title": "Current session context tokens",
-    "ctx.claude_md_tip": "Muse loaded {root}/CLAUDE.md (last modified {date})",
-    "ctx.no_claude_md": "No CLAUDE.md in {root} — Muse doesn't know you; click to learn how to set up",
-    "ctx.no_claude_md_title": "Muse doesn't know you yet",
-    "ctx.no_claude_md_body": "Your archive lives at:\n  {root}\n\nMuse reads {root}/CLAUDE.md on startup as your profile. Without it, Muse uses default behavior and can't tailor advice to your real situation.\n\nTo set up:\n  1. Run scripts/install-{linux,macos,windows} (with intake — recommended)\n  2. Or copy scripts/templates/default-CLAUDE.md → {root}/CLAUDE.md and edit\n\nDetails: docs/personalize-claude-md.md",
-    "onboard.no_provider_title": "🔑 No model configured — can't chat yet",
-    "onboard.no_provider_body": "Muse needs at least one provider. Either:\n  • Claude (Pro/Max subscription): run `claude login` in terminal (free quota)\n  • Claude (pay-per-use API): grab a key from console.anthropic.com, paste into Settings\n  • DeepSeek / GLM / MiniMax: grab a key from their console, paste into Settings",
-    "onboard.no_provider_cta": "Open Settings",
-    "onboard.no_claude_md_title": "👋 Muse doesn't know you yet",
-    "onboard.no_claude_md_body": "Muse is one assistant for your whole life — body, work, money, people, daily stuff. Before it can give tailored advice, it needs a 3-minute intake of your profile.",
-    "onboard.no_claude_md_cta": "Show me how",
-    "onboard.empty_archive_title": "📂 No documents in your archive yet",
-    "onboard.empty_archive_body": "Drop real material into the right subdir so Muse can work with it. These are ready for you:",
-    "onboard.dir_health": "checkup reports / supplement plan / training log",
-    "onboard.dir_work":   "what you spend time on (school / resume / portfolio / projects)",
-    "onboard.dir_money":  "budget / positions / loans / insurance",
-    "onboard.dir_people": "people you care about",
-    "onboard.dir_notes":  "study notes / ideas / journal",
-    "onboard.ready_title": "💡 Try asking Muse",
-    "onboard.q_health":   "Look at my health files and tell me what to watch",
-    "onboard.q_work":     "Help me review my resume / school materials",
-    "onboard.q_money":    "Take a look at my finances and suggest changes",
-    "onboard.q_people":   "Who do I need to follow up with lately?",
-    "onboard.q_overview": "What's in my archive? Give me a tour",
-    "onboard.skill_hint": "Or try a skill:",
-    "ctx.cache_tip": "Cache hit rate — higher is cheaper. Anthropic prompt cache reuses the last system prompt + context within 5 minutes.",
-    "ctx.normal": "Context {used}K / {limit}K · {pct}% · cached {cached}K",
-    "ctx.warn":   "Context {pct}% ({used}K / {limit}K · cached {cached}K) · Long chats get expensive — compact?",
-    "ctx.danger": "Context {pct}% ({used}K / {limit}K · cached {cached}K) · About to truncate — compact now",
-    "ctx.compact_btn": "Compact",
-    "ctx.tip_line1": "Every reply sends the full history to the model — more tokens means slower and pricier",
-    "ctx.tip_line2": "Compact = Muse summarizes the past, new session starts from that summary",
-    "ctx.compact_confirm_title": "Compact this session",
-    "ctx.compact_confirm_body": "Muse will summarize the full history first, then create a new session seeded with that summary. The original is preserved.",
-    "ctx.compact_summarize_prompt": "Compress this entire conversation into a structured summary: (1) facts / background (2) decisions made (3) open todos or next steps (4) specific file paths referenced. Make it complete enough that someone reading only the summary can pick up where we left off.",
-    "ctx.compact_step1": "Step 1/2: Asking the model to summarize…",
-    "ctx.compact_done": "Compacted — jumped to the new session",
-    "ctx.compact_wait_streaming": "Muse is still replying — wait for this turn to finish",
-    "ctx.compact_empty": "No assistant replies yet in this session — nothing to compact",
-    "ctx.compact_timeout": "Compact timed out (60s) — Muse may be processing a long history, try again",
-    "ctx.compact_no_reply": "Model didn't return a summary — check for errors and retry",
-    "model.switch_title": "Switch model",
-    "model.switch_body": "Switching to {label} needs a new session. Confirm?",
-    "model.switch_new": "Create & switch",
-    "model.new_session_ok": "New session with {label}",
-    "img.attach": "Attach image (paste / drag / pick)",
-    "attach.title": "Attach image or document (PDF / md / txt / json / source…)",
-    "attach.bad_type": "Unsupported file type",
-    "img.remove": "Remove",
-    "img.bad_type": "Unsupported image type (png/jpg/gif/webp)",
-    "img.too_big": "Image exceeds 10 MB",
-    "img.upload_failed": "Image upload failed",
-    "img.wait_upload": "Wait for images to finish uploading",
-    "todo.title": "Task list",
-    "todo.doing": "in progress",
-    "subagent.label": "Subagent dispatched",
-    "subagent.prompt_toggle": "show prompt",
-    "plan.title": "Plan from Muse",
-    "set.sec.lang": "Language",
-    "set.label.lang": "Interface language",
-    "set.label.theme": "Theme",
-    "set.label.accent": "Accent color",
-    "set.label.default_model": "Default model",
-    "set.label.default_permission": "Default permission",
-    "set.label.show_thinking_default": "Show thinking block by default",
-    "set.label.thinking_budget": "Thinking budget (tokens)",
-    "set.label.max_turns": "Max tool turns",
-    "set.lang.zh": "中文", "set.lang.en": "English",
-    "set.theme.light": "Light", "set.theme.dark": "Dark",
-    "set.key_set": "Configured", "set.key_unset": "Not set",
-    "set.placeholder_key": "Paste API key and save",
-    "toast.saved": "Saved",
-    "toast.save_failed": "Save failed",
-    "toast.deleted": "Deleted",
-    "toast.delete_failed": "Delete failed",
-    "toast.copied": "Copied",
-    "toast.uploaded": "Upload complete",
-    "toast.upload_failed": "Upload failed",
-    "toast.renamed": "Renamed",
-    "toast.rename_failed": "Rename failed",
-    "toast.created": "Created",
-    "toast.token_required": "Token required",
-    "toast.model_switched": "Switched to {label} — next message uses the new model (no new session needed)",
-    "toast.muse_back": "Muse is back",
-    "toast.mention_added": "Handed {path} to Muse",
-    "toast.lang_switched": "Switched to English",
-    "ask.title": "Muse needs your input",
-    "ask.submitted": "Submitted",
-    "ask.multi": "multi-select",
-    "ask.submit": "Submit",
-    "ask.unanswered": "Some questions still unanswered",
-    "ask.submit_failed": "Submit failed",
-    "perm.title": "Muse wants to use a tool",
-    "perm.allow": "Allow",
-    "perm.deny": "Deny",
-    "perm.always": "Always allow (this session)",
-    "perm.decision_allow": "Allowed",
-    "perm.decision_deny": "Denied",
-    "perm.decision_always": "Whitelisted",
-    "perm.submit_failed": "Decision failed",
-    "modal.confirm_delete": "Delete {name}? This cannot be undone.",
-    "modal.input_required": "Input required",
-    "modal.dirty_save": "Unsaved changes — save first?",
-  },
-};
+const STRINGS = (typeof window !== "undefined" && window.MUSELAB_STRINGS)
+                  || { zh: {}, en: {} };
 
-// Preset accent colors offered in Settings. Each entry has bilingual names; the
-// UI tooltip picks the right side via `lang`.
-const ACCENT_PRESETS = [
-  { name: { zh: "默认蓝", en: "Classic blue" }, value: "#6093ff" },
-  { name: { zh: "紫罗兰", en: "Violet" },        value: "#a78bfa" },
-  { name: { zh: "翠绿",   en: "Emerald" },       value: "#34d399" },
-  { name: { zh: "暖橙",   en: "Warm orange" },   value: "#fb923c" },
-  { name: { zh: "玫红",   en: "Rose" },          value: "#f472b6" },
-  { name: { zh: "石板灰", en: "Slate" },         value: "#94a3b8" },
-];
 
-// Editable file extensions (matches backend TEXT_EXT). Kept outside the reactive
-// component so Alpine doesn't try to wrap the Set in a Proxy.
-const EDITABLE_EXT = new Set([
-  "md", "markdown", "txt", "html", "htm", "json", "yaml", "yml",
-  "py", "js", "ts", "tsx", "jsx", "mjs", "css", "scss", "less",
-  "sh", "bash", "zsh", "toml", "ini", "cfg", "csv", "xml", "log",
-  "sql", "rs", "go", "java", "cpp", "c", "h", "hpp", "rb", "php",
-  "lua", "kt", "swift", "vue", "svelte", "tex", "rst", "env",
-  "dockerfile", "makefile", "conf", "properties", "gitignore",
-  "containerfile", "rakefile", "gemfile", "vagrantfile",
-  "license", "licence", "readme", "changelog",
-]);
+// Static UI data lives in /static/data/constants.js (loaded by index.html
+// before this file). These aliases keep the existing references in this file
+// working without code changes elsewhere.
+const ACCENT_PRESETS = window.MUSELAB_ACCENT_PRESETS || [];
+const EDITABLE_EXT = window.MUSELAB_EDITABLE_EXT || new Set();
 
 function portal() {
   return {
@@ -534,13 +44,56 @@ function portal() {
     grepHits: [], grepTruncated: false,
 
     // ===== preview =====
+    // Drag-and-drop visual state for the preview pane.
+    previewDragHover: false,
+    // Image lightbox (click chat-bubble image to enlarge).
+    lightbox: { show: false, src: "" },
+    // Whether the "Open files" sidebar section is collapsed. Persists to
+    // localStorage via savePrefs/loadPrefs so the user's preference sticks.
+    openFilesCollapsed: false,
+    // User-override height (px). null = auto: 1 file → 1 row, 2 → 2, ...,
+    // capped at 5 rows + header. Once the user drags the splitter we set a
+    // concrete pixel value and stop auto-fitting.
+    openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // Bumped whenever an assistant tool_use edits a file. Used as a cache
+    // buster on iframe / read URLs so the preview reflects the new content
+    // without the user needing to manually refresh the page.
+    previewVersion: 0,
+    // Compact orchestration: _compacting marks the window where the CLI is
+    // busy summarising history; user messages typed during that window queue
+    // up and dispatch when compact finishes.
+    _compacting: false,
+    _compactQueue: [],
+    // SDK get_context_usage() breakdown popup. Shows per-category token
+    // counts (system prompt / tools / memory files / messages / mcp / skills)
+    // so the user can see which slice is using their context window.
+    ctxBreakdown: { show: false, loading: false, data: null, error: "" },
     editing: false, editText: "",
     cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, mode: "plaintext", dirty: false },
     tabs: [],   // open file tabs: [{path, name}]
 
     // ===== chat =====
     sessions: [], currentId: "",
+    // Tab strip — VS Code-Claude style. `openTabIds` is the visible order; each
+    // entry is a session id (also present in `sessions`). currentId is the
+    // active tab. Tabs can be opened from the session picker, closed via × on
+    // the tab, or created by the "+ new" button.
+    openTabIds: [],
+    renamingTabId: "",   // session id whose name is currently being inline-edited
+    renameDraft: "",     // current value of the inline rename <input>
+    tabCtxMenu: null,    // {id, x, y} for the right-click tab menu, or null
+                          // (kept separate from the file-tree's `ctxMenu` which
+                          //  has a different shape — overlapping names crash
+                          //  Alpine when one side reads .show on the other's null)
+    // Per-tab runtime state. Keyed by session id. Each entry is a "snapshot"
+    // of {messages, sessionUsage, streaming, es, streamingModel, ...} that the
+    // active tab mirrors into root state (this.messages, this.es, etc.) via
+    // _activateTabState(). Background tabs' stream callbacks write to their
+    // own tabState[sid] so switching away doesn't lose / mis-route events.
+    // The active tab's `this.messages` and `tabState[currentId].messages` are
+    // the SAME array reference — we mutate in place, never replace.
+    tabState: {},
     messages: [],
     model: "claude-sonnet-4-6",
     permission: "bypassPermissions",
@@ -567,28 +120,27 @@ function portal() {
       archive_empty: true,
       subdir_present: {},
       has_claude_oauth: false,
+      has_anthropic_api: false,
       third_party_configured: [],
       has_any_provider: false,
+      // Guard so onboarding chips ("⚠ 未配档案" / "no provider") don't
+      // flash to the user while the first contextInfo fetch is still in
+      // flight. UI conditions check `_fetched && !X` rather than `!X`.
+      _fetched: false,
     },
 
     // ===== slash commands =====
     slashShow: false,
     slashIdx: 0,
     slashAnchor: -1,      // input position where the leading '/' is
-    SLASH_CMDS: [
-      { name: "help",    desc: { zh: "查看所有可用斜杠命令", en: "List all slash commands" } },
-      { name: "clear",   desc: { zh: "清空当前会话", en: "Reset / clear current session" } },
-      { name: "compact", desc: { zh: "压缩历史 — 把上下文摘要成新会话", en: "Compact: summarize history into a new session" } },
-      { name: "model",   desc: { zh: "/model <id> 切换模型，留空看可选项", en: "/model <id> — switch model (no arg = list)" } },
-      { name: "resume",  desc: { zh: "/resume <名字> 跳到名字匹配的旧会话", en: "/resume <name> — jump to a session by name" } },
-      { name: "cost",    desc: { zh: "显示当前用量 / 预算 / 缓存命中率", en: "Show current usage / budget / cache hit rate" } },
-      { name: "config",  desc: { zh: "打开 Settings 面板", en: "Open Settings panel" } },
-      { name: "stop",    desc: { zh: "中断当前流式响应", en: "Stop the current streaming reply" } },
-    ],
+    // Defined in /static/data/constants.js (window.MUSELAB_SLASH_CMDS). Kept
+    // as a component property so `this.SLASH_CMDS` references throughout the
+    // file keep working without changes.
+    SLASH_CMDS: window.MUSELAB_SLASH_CMDS || [],
     // Per-session context meter snapshot, updated on every SSE `done` event
     sessionUsage: { input_tokens: 0, output_tokens: 0,
                      cache_read_tokens: 0, cache_creation_tokens: 0,
-                     context_limit: 128000, context_used: 0, context_used_pct: 0 },
+                     context_limit: 0, context_used: 0, context_used_pct: 0 },
     stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0,
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
@@ -702,9 +254,50 @@ function portal() {
         }
         return;
       }
+      // Chat-tab keybindings (Ctrl/Cmd as the modifier; Mac users get Cmd):
+      //   Ctrl+T          new chat tab
+      //   Ctrl+W          close current chat tab
+      //   Ctrl+Tab        next tab    (Shift+Tab = previous)
+      //   Ctrl+1..9       jump to Nth tab
+      // We hijack Ctrl+T and Ctrl+W from the browser. The user is inside a
+      // single-page web app — we own these. (Mobile Safari ignores them.)
+      if ((ev.ctrlKey || ev.metaKey) && !ev.altKey) {
+        if (ev.key === "t" || ev.key === "T") {
+          ev.preventDefault();
+          this.newSession();
+          return;
+        }
+        if (ev.key === "w" || ev.key === "W") {
+          if (this.currentId) {
+            ev.preventDefault();
+            this.closeChatTab(this.currentId);
+          }
+          return;
+        }
+        if (ev.key === "Tab") {
+          if (!this.openTabIds.length) return;
+          ev.preventDefault();
+          const cur = Math.max(0, this.openTabIds.indexOf(this.currentId));
+          const next = ev.shiftKey
+            ? (cur - 1 + this.openTabIds.length) % this.openTabIds.length
+            : (cur + 1) % this.openTabIds.length;
+          this.activateTab(this.openTabIds[next]);
+          return;
+        }
+        // Ctrl+1..9
+        if (/^[1-9]$/.test(ev.key)) {
+          const i = parseInt(ev.key, 10) - 1;
+          if (i < this.openTabIds.length) {
+            ev.preventDefault();
+            this.activateTab(this.openTabIds[i]);
+          }
+          return;
+        }
+      }
       if (ev.key === "Escape") {
         if (this.mentionShow) { this.mentionShow = false; return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
+        if (this.tabCtxMenu) { this.closeTabMenu(); return; }
         if (this.settings.show) { this.settings.show = false; return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
         if (this.editing) { this.editing = false; return; }   // 退出编辑
@@ -773,6 +366,27 @@ function portal() {
       this.loadRoot();
       this.initSessions();
       this.fetchStats();
+      // First-run hint — surface key shortcuts so the user doesn't have to
+      // hunt for them. Flagged in localStorage so it only fires once. Short
+      // delay lets the splash clear first.
+      if (!localStorage.getItem("muselab_seen_help")) {
+        setTimeout(() => {
+          this.toast(
+            this.lang === "zh"
+              ? "Tip：输入 / 看斜杠命令，@ 引用文件，↑ 回滚上一条"
+              : "Tip: type / for slash commands, @ to reference files, ↑ to recall last message",
+            "info", 7000);
+          localStorage.setItem("muselab_seen_help", "1");
+        }, 1500);
+      }
+      // Same preview-file restore that login() does — covers the
+      // already-authed boot path (page refresh with saved token).
+      if (this._pendingPreviewSelected) {
+        const path = this._pendingPreviewSelected;
+        this._pendingPreviewSelected = null;
+        this.openFile({ path, name: path.split("/").pop() })
+            .catch(() => { /* file gone — silent */ });
+      }
       // Block readiness on context-info (the most important one for the
       // onboarding cards). Others come along in parallel.
       try {
@@ -923,6 +537,20 @@ function portal() {
       if (savedAccent) this.accent = savedAccent;
       this.applyTheme();
       this.applyAccent();
+      // Reactive system-theme tracking: when the OS flips between light/dark
+      // and the user hasn't explicitly overridden, follow along. Once they
+      // toggle muselab's theme manually (writes muselab_theme), this listener
+      // becomes a no-op for them.
+      if (window.matchMedia) {
+        const mq = window.matchMedia("(prefers-color-scheme: dark)");
+        const onSysFlip = (ev) => {
+          if (localStorage.getItem("muselab_theme")) return;
+          this.theme = ev.matches ? "dark" : "light";
+          this.applyTheme();
+        };
+        if (mq.addEventListener) mq.addEventListener("change", onSysFlip);
+        else if (mq.addListener) mq.addListener(onSysFlip);   // legacy Safari
+      }
     },
     applyTheme() {
       document.documentElement.setAttribute("data-theme", this.theme);
@@ -987,6 +615,10 @@ function portal() {
     },
     mascot() { return this.MASCOTS[this.mascotIdx]; },
     mascotHref() { return "#m-" + this.mascot().id; },
+    // Short label shown inside the user-side message avatar. Muselab has no
+    // identity layer (single-user, token-auth), so we just stamp "我" / "U"
+    // by language. Cheap, requires no extra SVG asset.
+    userAvatarText() { return this.lang === "zh" ? "我" : "U"; },
     // 显示文案：英文界面 "Muse · Urania · Astronomy"；中文界面 "Muse · 乌拉尼亚 · 天文"（保留希腊名作 hint）
     mascotLabel() {
       const m = this.mascot();
@@ -1185,6 +817,47 @@ function portal() {
       const meta = (this.availableModels || []).find(m => m.model === id);
       return meta ? meta.label : id;
     },
+    // Normalize a model-emitted path into something openByPathToasted can hand
+    // to /api/files/list. Handles three things the model commonly does wrong:
+    //   - absolute path under ROOT  →  strip ROOT prefix
+    //   - "~/..." path              →  return "" (we don't know HOME-vs-ROOT)
+    //   - path prefixed by ROOT's basename (e.g. "claude_space/health/x.md"
+    //     when ROOT itself is /home/u/claude_space) → strip the duplicate
+    // Returns "" for paths we can't safely open (would 403 / 404 on backend).
+    _normalizeArchivePath(p) {
+      if (!p) return "";
+      const root = (this.contextInfo && this.contextInfo.archive_root) || "";
+      if (p.startsWith("/")) {
+        if (root && (p === root || p.startsWith(root + "/"))) {
+          return p.slice(root.length).replace(/^\/+/, "");
+        }
+        return "";
+      }
+      if (p.startsWith("~/")) return "";
+      // Model often writes "claude_space/foo/bar.md" thinking the archive root
+      // is the parent of claude_space. Strip the basename of ROOT if it's the
+      // first segment and stripping leaves a non-empty remainder.
+      if (root) {
+        const base = root.split("/").pop();
+        if (base && p.startsWith(base + "/")) {
+          return p.slice(base.length + 1);
+        }
+      }
+      return p;
+    },
+
+    // For file-centric tools (Read / Edit / Write / NotebookEdit), extract the
+    // file path from the tool input so the bubble can render it as a clickable
+    // .file-link instead of plain summary text. Returns "" when the tool is
+    // not file-centric or the path is empty/system-path we wouldn't open.
+    toolFilePath(m) {
+      if (!m || m.role !== "tool_use") return "";
+      const FILE_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit", "MultiEdit"]);
+      if (!FILE_TOOLS.has(m.name)) return "";
+      const inp = m.input || {};
+      const path = inp.file_path || inp.notebook_path || "";
+      return this._normalizeArchivePath(path);
+    },
     // Render mcp__<server>__<tool> nicely: drop the mcp__ prefix, replace __ with " · "
     renderToolName(name) {
       if (!name) return "";
@@ -1206,9 +879,9 @@ function portal() {
       });
       // Math: render $...$ / $$...$$ via KaTeX auto-render. KaTeX runs after
       // DOMPurify (its output is trusted vendor HTML, no need to re-sanitize).
+      const tmp = document.createElement("div");
+      tmp.innerHTML = safe;
       if (window.renderMathInElement && window.katex) {
-        const tmp = document.createElement("div");
-        tmp.innerHTML = safe;
         try {
           window.renderMathInElement(tmp, {
             delimiters: [
@@ -1221,9 +894,128 @@ function portal() {
             ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
           });
         } catch (e) { /* malformed math falls through as plain text */ }
-        return tmp.innerHTML;
       }
-      return safe;
+      this._linkifyFilePaths(tmp);
+      return tmp.innerHTML;
+    },
+
+    // Path-shaped strings inside inline <code> become clickable `.file-link`
+    // anchors. Click is handled by chat-body delegation -> openByPathToasted.
+    // Aggressive match (anything ending in .ext) — 404 on click degrades to a
+    // toast, no need to be conservative here. Skips fenced code (<pre><code>)
+    // since those are usually whole-file snippets, not references.
+    _linkifyFilePaths(rootEl) {
+      // path/with/slashes.ext  OR  bare.ext  (+ optional :line[:col])
+      // Ext must START with a letter to avoid eating version strings like 1.2.3.
+      // \p{L}\p{N} (unicode flag) so Chinese/Japanese filenames also match.
+      const RE = /^([\p{L}\p{N}_@./~+-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
+      const toRel = (p) => this._normalizeArchivePath(p);
+      // 1) inline <code> whose text looks like a path
+      const codes = rootEl.querySelectorAll("code");
+      for (const code of codes) {
+        if (code.closest("pre")) continue;
+        if (code.querySelector("a")) continue;
+        const raw = (code.textContent || "").trim();
+        if (!raw || raw.length > 200) continue;
+        const m = raw.match(RE);
+        if (!m) continue;
+        const path = toRel(m[1]);
+        if (!path) continue;
+        const a = document.createElement("a");
+        a.className = "file-link";
+        a.href = "#";
+        a.dataset.path = path;
+        if (m[2]) a.dataset.line = m[2];
+        a.textContent = raw;
+        code.textContent = "";
+        code.appendChild(a);
+        code.classList.add("has-file-link");
+      }
+      // 2) markdown links — [label](path/to/file.md) — marked renders as <a>.
+      // Convert to .file-link if href is relative (no protocol) and matches the
+      // path regex; otherwise leave the anchor alone (real URLs stay clickable).
+      const anchors = rootEl.querySelectorAll("a[href]");
+      for (const a of anchors) {
+        if (a.classList.contains("file-link")) continue;
+        let href = a.getAttribute("href") || "";
+        if (!href || href.startsWith("#")) continue;
+        if (/^[a-z]+:/i.test(href)) continue;          // http: / https: / mailto: / etc.
+        // marked / the model may URL-encode the href (e.g. Chinese filenames
+        // come through as %E8%B5%84...). Decode so the regex + backend list
+        // lookup operate on the raw UTF-8 form.
+        try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
+        const m = href.match(RE);
+        if (!m) continue;
+        const path = toRel(m[1]);
+        if (!path) continue;
+        a.classList.add("file-link");
+        a.setAttribute("href", "#");
+        a.dataset.path = path;
+        if (m[2]) a.dataset.line = m[2];
+      }
+    },
+
+    // Delegated click handler on the chat body for `.file-link` anchors
+    // produced by _linkifyFilePaths or the tool-bubble template.
+    onChatClick(ev) {
+      const a = ev.target.closest && ev.target.closest("a[href]");
+      if (!a) return;
+      // .file-link → open via archive preview
+      if (a.classList.contains("file-link")) {
+        ev.preventDefault();
+        const path = a.dataset.path || "";
+        if (path) this.openByPathToasted(path);
+        return;
+      }
+      // Safety net: any other anchor with a relative href shouldn't trigger
+      // a same-origin navigation (which would unload the SPA). Try to treat
+      // it as a file path; fall back to a toast if we can't parse.
+      let href = a.getAttribute("href") || "";
+      if (!href || href.startsWith("#")) return;
+      if (/^[a-z]+:/i.test(href)) return;             // real protocol → let browser handle
+      try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
+      ev.preventDefault();
+      // Try ROOT-relative normalization first (absolute under ROOT, or ROOT
+      // basename duplicated as prefix). If that returns "" (e.g. /etc/passwd),
+      // fall back to the raw href minus leading slash so the user at least
+      // gets a "not found" toast instead of silent navigation.
+      let p = this._normalizeArchivePath(href);
+      if (!p) p = href.replace(/^\/+/, "");
+      this.openByPathToasted(p);
+    },
+
+    // openFile silently no-ops on 404 (designed for tree clicks where the
+    // entry came from the API). For chat-link clicks the path comes from
+    // model output and may not exist — surface the failure as a toast.
+    async openByPathToasted(path) {
+      // HEAD-equivalent check via list on the parent dir is fragile (binary
+      // files, images etc. don't go through /api/files/read). Just delegate
+      // to openFile and let it set previewMode='unsupported' / pdf / img,
+      // but pre-check existence with a cheap list on the parent so we can
+      // toast cleanly when the path is fabricated.
+      const parent = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
+      const name = path.split("/").pop();
+      try {
+        const r = await fetch("/api/files/list?path=" + encodeURIComponent(parent),
+          { headers: this.hdr() });
+        if (!r.ok) {
+          this.toast(this.lang === "zh" ? `文件不存在：${path}` : `Not found: ${path}`, "warn");
+          return;
+        }
+        const d = await r.json();
+        const hit = (d.entries || []).find(e => e.name === name);
+        if (!hit) {
+          this.toast(this.lang === "zh" ? `文件不存在：${path}` : `Not found: ${path}`, "warn");
+          return;
+        }
+        if (hit.is_dir) {
+          this.toast(this.lang === "zh" ? `这是目录：${path}` : `Is a directory: ${path}`, "warn");
+          return;
+        }
+        await this.openFile({ path, name });
+      } catch (e) {
+        this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+      }
     },
 
     async login() {
@@ -1238,6 +1030,15 @@ function portal() {
         await this.loadRoot();
         await this.initSessions();
         this.fetchStats();
+        // Restore the preview file the user was looking at before refresh.
+        // openFile is idempotent on tabs[] (won't duplicate); if the file
+        // no longer exists we silently no-op (no toast — refresh restoration).
+        if (this._pendingPreviewSelected) {
+          const path = this._pendingPreviewSelected;
+          this._pendingPreviewSelected = null;
+          this.openFile({ path, name: path.split("/").pop() })
+              .catch(() => { /* file went away — nothing to do */ });
+        }
       } catch (e) { this.loginErr = e.message; }
     },
 
@@ -1248,13 +1049,80 @@ function portal() {
 
     hdr() { return { "X-Auth-Token": this.token }; },
 
+    // ===== unified fetch wrapper =====
+    // Consolidates the ~60 hand-written fetch calls. Auto-attaches token
+    // header, JSON-encodes bodies, decodes JSON / text response, and returns
+    // a shape the caller can destructure regardless of success. On non-OK
+    // response or network failure, returns { ok: false, status, error } —
+    // callers that want auto-toast use api(..., { toastError: true }).
+    //
+    // Signature:
+    //   api(path, opts?)              — GET by default
+    //   api(path, { method, json })   — JSON POST/PUT/PATCH with auto serialize
+    //   api(path, { method, body })   — raw body (FormData / string / blob)
+    //   api(path, { method, query })  — object → ?k=v&... appended to path
+    //   api(path, { headers })        — merged on top of token header
+    //   api(path, { responseType })   — "json" (default) | "text" | "blob"
+    //   api(path, { toastError })     — true → on failure pop an error toast
+    async api(path, opts = {}) {
+      const method = (opts.method || "GET").toUpperCase();
+      const headers = { ...this.hdr(), ...(opts.headers || {}) };
+      let body = opts.body;
+      if (opts.json !== undefined) {
+        headers["Content-Type"] = headers["Content-Type"] || "application/json";
+        body = JSON.stringify(opts.json);
+      }
+      let url = path;
+      if (opts.query) {
+        const qs = new URLSearchParams(
+          Object.entries(opts.query).filter(([_, v]) => v != null && v !== "")
+        ).toString();
+        if (qs) url += (url.includes("?") ? "&" : "?") + qs;
+      }
+      let r;
+      try {
+        r = await fetch(url, { method, headers, body });
+      } catch (e) {
+        if (opts.toastError) this.toast(
+          (this.lang === "zh" ? "网络错误：" : "Network error: ") + e.message,
+          "error", 4000);
+        return { ok: false, status: 0, error: e.message };
+      }
+      const rt = opts.responseType || "json";
+      let data;
+      try {
+        if (rt === "json") data = await r.json();
+        else if (rt === "text") data = await r.text();
+        else if (rt === "blob") data = await r.blob();
+        else data = null;
+      } catch {
+        data = null;
+      }
+      if (!r.ok) {
+        if (opts.toastError) {
+          const msg = (data && data.detail) || r.statusText || `HTTP ${r.status}`;
+          this.toast(
+            (this.lang === "zh" ? "请求失败：" : "Request failed: ") + msg,
+            "error", 4000);
+        }
+        return { ok: false, status: r.status, data, error: (data && data.detail) || r.statusText };
+      }
+      return { ok: true, status: r.status, data };
+    },
+
     // ===== toast =====
-    toast(msg, type = "info", timeout = 3000) {
+    // `action` is optional: { label: "撤销", onClick: () => {...} } — renders
+    // a button inside the toast. Clicking it runs onClick and dismisses.
+    toast(msg, type = "info", timeout = 3000, action = null) {
       const id = ++this._toastId;
-      this.toasts.push({ id, msg, type });
+      this.toasts.push({ id, msg, type, action });
       if (timeout) setTimeout(() => this.dismissToast(id), timeout);
     },
     dismissToast(id) { this.toasts = this.toasts.filter(t => t.id !== id); },
+    runToastAction(t) {
+      try { t.action && t.action.onClick && t.action.onClick(); }
+      finally { this.dismissToast(t.id); }
+    },
 
     // ===== modal =====
     confirm({ title, body = "", okText, cancelText, danger = false }) {
@@ -1287,13 +1155,21 @@ function portal() {
 
     // ===== prefs =====
     savePrefs() {
+      // Preview-pane state (tabs, selected) persists too so a refresh restores
+      // the exact files the user was looking at — matches the chat-tab strip's
+      // behavior via openTabIds.
       localStorage.setItem("muselab_prefs", JSON.stringify({
         model: this.model, permission: this.permission,
         showThinking: this.showThinking, currentId: this.currentId,
+        openTabIds: this.openTabIds,
+        previewTabs: this.tabs.map(t => ({ path: t.path, name: t.name })),
+        previewSelected: this.selected,
         expanded: Array.from(this.expanded),
         leftOpen: this.leftOpen, rightOpen: this.rightOpen,
         leftWidth: this.leftWidth, rightWidth: this.rightWidth,
         showHidden: this.showHidden,
+        openFilesCollapsed: this.openFilesCollapsed,
+        openFilesHeight: this.openFilesHeight,
       }));
     },
     loadPrefs() {
@@ -1308,27 +1184,38 @@ function portal() {
         if (typeof p.rightWidth === "number") this.rightWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
+        if (Array.isArray(p.openTabIds)) this.openTabIds = p.openTabIds;
+        // Preview tabs — restore the strip; the actual content fetch happens
+        // lazily when the user clicks back to one (or via restorePreviewSelected
+        // which runs once after login).
+        if (Array.isArray(p.previewTabs)) this.tabs = p.previewTabs;
+        if (typeof p.previewSelected === "string") this._pendingPreviewSelected = p.previewSelected;
+        if (typeof p.openFilesCollapsed === "boolean") this.openFilesCollapsed = p.openFilesCollapsed;
+        // null = auto-fit; only restore an explicit user override.
+        if (typeof p.openFilesHeight === "number" && p.openFilesHeight > 60) {
+          this.openFilesHeight = p.openFilesHeight;
+        } else if (p.openFilesHeight === null) {
+          this.openFilesHeight = null;
+        }
         this._pendingExpanded = p.expanded || [];
       } catch {}
     },
 
     async fetchContextInfo() {
-      try {
-        const r = await fetch("/api/chat/context-info", { headers: this.hdr() });
-        if (r.ok) {
-          this.contextInfo = await r.json();
-          // First successful load: if the user hasn't configured any provider,
-          // pop the Settings drawer so they can fix it before trying to chat.
-          // _providerCheckDone gate ensures we don't re-pop on heartbeat
-          // reconnects or polling refreshes.
-          if (!this._providerCheckDone) {
-            this._providerCheckDone = true;
-            if (!this.contextInfo.has_any_provider && !this.settings.show) {
-              this.openSettings();
-            }
-          }
+      const { ok, data } = await this.api("/api/chat/context-info");
+      if (!ok || !data) return;
+      data._fetched = true;
+      this.contextInfo = data;
+      // First successful load: if the user hasn't configured any provider,
+      // pop the Settings drawer so they can fix it before trying to chat.
+      // _providerCheckDone gate ensures we don't re-pop on heartbeat
+      // reconnects or polling refreshes.
+      if (!this._providerCheckDone) {
+        this._providerCheckDone = true;
+        if (!data.has_any_provider && !this.settings.show) {
+          this.openSettings();
         }
-      } catch (e) { /* non-fatal */ }
+      }
     },
 
     async fetchStats() {
@@ -1428,8 +1315,15 @@ function portal() {
         }
         const meta = await r.json();
         await this.refreshSessions();
+        // Model-fork creates a brand-new session — wire it up as a tab the
+        // same way newSession() does (tabState + openTabIds + activate).
         this.currentId = meta.id;
-        await this.loadSession(meta.id);
+        const newSt = this._ensureTabState(meta.id);
+        newSt.messages.length = 0;
+        newSt._loaded = true;
+        this._activateTabState(meta.id);
+        if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+        this._fetchTabUsage(meta.id);
         this.savePrefs();
         this.toast(this.t("model.new_session_ok", { label }), "success", 2000);
       } catch (e) {
@@ -1455,6 +1349,70 @@ function portal() {
     },
 
     // ===== sessions =====
+    // A fresh per-tab state slot. Object refs (messages, sessionUsage) live
+    // forever — we mutate in place so Alpine's reactivity stays bound.
+    _blankTabState() {
+      return {
+        messages: [],
+        sessionUsage: { input_tokens: 0, output_tokens: 0,
+                         cache_read_tokens: 0, cache_creation_tokens: 0,
+                         context_limit: 0, context_used: 0, context_used_pct: 0 },
+        streaming: false,
+        es: null,
+        streamingModel: "",
+        streamElapsed: 0,
+        _streamTimer: null,
+        _streamStartedAt: 0,
+        _loaded: false,   // set true after first loadSession populates messages
+      };
+    },
+    _ensureTabState(id) {
+      if (!this.tabState[id]) this.tabState[id] = this._blankTabState();
+      return this.tabState[id];
+    },
+    // Pull the per-session context meter (input/output tokens, limit, %)
+    // from the backend and merge it into tabState[sid].sessionUsage. Limit
+    // is model-specific (opus/sonnet/haiku → 200k, others → 128k default),
+    // so we MUST refresh whenever the active model could differ from what
+    // last produced the cached numbers — that includes brand-new sessions
+    // which would otherwise sit at the _blankTabState default of 128k.
+    async _fetchTabUsage(sid) {
+      if (!sid) return;
+      const st = this._ensureTabState(sid);
+      // Prefer the model that's currently bound to the session on the server
+      // (sessions list metadata); fall back to root this.model if absent.
+      const sessMeta = this.sessions.find(s => s.id === sid);
+      const model = (sessMeta && sessMeta.model) || this.model || "";
+      try {
+        const ur = await fetch(`/api/chat/usage/${sid}?model=${encodeURIComponent(model)}`,
+                                 { headers: this.hdr() });
+        if (!ur.ok) return;
+        const u = await ur.json();
+        Object.assign(st.sessionUsage, u);
+        if (sid === this.currentId) this.sessionUsage = st.sessionUsage;
+      } catch (e) { /* non-fatal */ }
+    },
+
+    // Mirror this tab's state into root fields so the UI sees it. Object refs
+    // (messages, sessionUsage) are shared — mutations from anywhere reflect.
+    // Primitives (streaming, es, ...) must be copied; they get re-synced as
+    // the active stream progresses.
+    _activateTabState(id) {
+      const st = this._ensureTabState(id);
+      this.messages = st.messages;
+      this.sessionUsage = st.sessionUsage;
+      this.streaming = st.streaming;
+      this.es = st.es;
+      this.streamingModel = st.streamingModel;
+      this.streamElapsed = st.streamElapsed;
+      this._streamTimer = st._streamTimer;
+      this._streamStartedAt = st._streamStartedAt;
+      // Tab cache may hold an out-of-date sessionUsage (e.g. backend table
+      // updated since we last polled). Fire-and-forget a re-fetch so the
+      // meter reflects current truth without blocking the UI swap.
+      this._fetchTabUsage(id);
+    },
+
     async initSessions() {
       await this.refreshSessions();
       if (!this.sessions.length) {
@@ -1463,18 +1421,34 @@ function portal() {
       } else if (!this.sessions.find(x => x.id === this.currentId)) {
         this.currentId = this.sessions[0].id;
       }
-      await this.loadSession(this.currentId);
+      // Reconcile openTabIds (restored from prefs) with what still exists on
+      // the server: drop tabs whose session was deleted, then ensure currentId
+      // is in the list. Other tabs are lazy-loaded on first switch.
+      const validIds = new Set(this.sessions.map(s => s.id));
+      this.openTabIds = (this.openTabIds || []).filter(id => validIds.has(id));
+      if (!this.openTabIds.includes(this.currentId)) {
+        this.openTabIds.push(this.currentId);
+      }
+      this._activateTabState(this.currentId);
+      const st = this._ensureTabState(this.currentId);
+      if (!st._loaded) {
+        await this.loadSession(this.currentId);
+        st._loaded = true;
+      }
       this.savePrefs();
     },
     async refreshSessions() {
-      const r = await fetch("/api/chat/sessions", { headers: this.hdr() });
-      if (r.ok) {
-        this.sessions = (await r.json()).sessions;
-        // Same Alpine-x-model-on-dynamic-options race as model dropdown:
-        // <select x-model="currentId"> needs a tickle so the displayed option
-        // syncs to the real bound value once sessions populate.
-        await this._rebindSelect("currentId");
-      }
+      const { ok, data } = await this.api("/api/chat/sessions");
+      if (!ok) return;
+      const raw = (data && data.sessions) || [];
+      // Defensive: drop any entry without a usable id. Alpine x-for :key
+      // bindings (session-picker, history popup) use `s.id`; an undefined
+      // key crashes alpine morph with "Cannot read properties of undefined
+      // (reading 'after')".
+      this.sessions = raw.filter(s => s && typeof s.id === "string" && s.id);
+      // <select x-model="currentId"> needs a tickle to sync display when
+      // sessions populate (same Alpine-x-model-on-dynamic-options race).
+      await this._rebindSelect("currentId");
     },
 
     // Generic select-rebind tickle (model + currentId share this). Flipping
@@ -1488,6 +1462,8 @@ function portal() {
       this[field] = cur;
     },
     async newSession() {
+      // No longer stops streams in OTHER tabs — each tab has its own ES in
+      // tabState[id].es. The new session starts fresh in its own tab.
       const r = await fetch("/api/chat/sessions", {
         method: "POST",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
@@ -1496,42 +1472,546 @@ function portal() {
       const meta = await r.json();
       await this.refreshSessions();
       this.currentId = meta.id;
-      this.messages = [];
+      // Initialize a fresh tabState slot for this brand-new session; mark
+      // _loaded so switchSession won't try to fetch (it's empty by design).
+      const st = this._ensureTabState(meta.id);
+      st.messages.length = 0;
+      st._loaded = true;
+      this._activateTabState(meta.id);
+      if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+      // Fetch the correct context_limit for this session's model so the meter
+      // doesn't sit at the 128k default from _blankTabState (opus/sonnet → 200k).
+      this._fetchTabUsage(meta.id);
       this.savePrefs();
       this.toast(this.t("toast.created"), "success");
       return meta;
     },
-    async switchSession() {
-      // Cancel any in-flight stream — the bubble was for the OLD session and
-      // the user isn't looking at it anymore. Otherwise late events would
-      // either crash trying to write to a stale bubble ref (already guarded)
-      // or silently waste bandwidth/tokens.
-      if (this.es) { try { this.es.close(); } catch {} this.es = null; this.streaming = false; }
+
+    // ===== tabs =====
+    // Switch to (and if needed open) a tab. Used by the picker dropdown to
+    // promote a history session into a tab.
+    async openTab(id, makeCurrent = true) {
+      if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      if (makeCurrent && id !== this.currentId) {
+        this.currentId = id;
+        await this.switchSession();
+      }
       this.savePrefs();
-      await this.loadSession(this.currentId);
+    },
+
+    // Close a tab. If it was active, hop to a neighbor; if the strip would be
+    // empty, create a fresh session so the user always has somewhere to type.
+    // Also closes any in-flight stream for the closed tab and drops its
+    // tabState entry — leaving it around would leak EventSources.
+    // NOTE: do NOT rename to closeTab — that name is taken by the file-preview
+    // tab strip's closer (see line ~2640). JS object literals: later definition
+    // wins, so when this was named closeTab, file-preview's overrode ours and
+    // every × click in the chat tab strip silently no-op'd.
+    async closeChatTab(id, ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      const idx = this.openTabIds.indexOf(id);
+      if (idx < 0) return;
+      const wasActive = this.currentId === id;
+      const st = this.tabState[id];
+      // Don't offer undo for a tab whose stream is in flight — we'd have to
+      // re-attach to a live EventSource which gets hairy fast. Tearing it
+      // down and silently swallowing the in-flight reply is the lesser evil
+      // (and the user clicked × explicitly).
+      const wasStreaming = !!(st && st.streaming);
+      if (st) {
+        if (st.es) { try { st.es.close(); } catch {} }
+        if (st._streamTimer) clearInterval(st._streamTimer);
+      }
+      this.openTabIds.splice(idx, 1);
+      if (wasActive) {
+        if (this.openTabIds.length) {
+          const nextIdx = Math.min(idx, this.openTabIds.length - 1);
+          this.currentId = this.openTabIds[nextIdx];
+          await this.switchSession();
+        } else {
+          await this.newSession();
+        }
+      }
+      if (this.tabState[id]) delete this.tabState[id];
+      this.savePrefs();
+      // Undo: re-add to openTabIds at the original index, switch back. The
+      // tab state will rehydrate lazily via switchSession → loadSession (we
+      // don't preserve the in-memory messages snapshot — they'll be fetched
+      // from the server's authoritative session JSONL).
+      if (!wasStreaming) {
+        const sessionName = (this.sessions.find(s => s.id === id) || {}).name
+                             || (this.lang === "zh" ? "会话" : "session");
+        this.toast(
+          this.lang === "zh" ? `已关闭「${sessionName}」` : `Closed "${sessionName}"`,
+          "info", 5000,
+          {
+            label: this.lang === "zh" ? "撤销" : "Undo",
+            onClick: async () => {
+              if (this.openTabIds.includes(id)) return;
+              this.openTabIds.splice(Math.min(idx, this.openTabIds.length), 0, id);
+              this.currentId = id;
+              await this.switchSession();
+              this.savePrefs();
+            },
+          }
+        );
+      }
+    },
+
+    // Inline rename — tab name -> <input>. Enter saves, Esc cancels, blur saves.
+    startRenameTab(id) {
+      const s = this.sessions.find(x => x.id === id);
+      if (!s) return;
+      this.renamingTabId = id;
+      this.renameDraft = s.name || "";
+      this.$nextTick(() => {
+        // x-show keeps every tab's <input> mounted — scope the selector to
+        // THIS tab's data-tid so we focus the right one.
+        const el = document.querySelector(
+          `.chat-tab-rename-input[data-tid="${CSS.escape(id)}"]`);
+        if (el) { el.focus(); el.select(); }
+      });
+    },
+    async commitRenameTab() {
+      const id = this.renamingTabId;
+      const name = (this.renameDraft || "").trim();
+      this.renamingTabId = "";
+      const draft = this.renameDraft;
+      this.renameDraft = "";
+      if (!id || !name) return;
+      const cur = this.sessions.find(x => x.id === id);
+      if (!cur || cur.name === name) return;
+      const r = await fetch("/api/chat/sessions/" + id, {
+        method: "PATCH",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (r.ok) { await this.refreshSessions(); this.toast(this.t("toast.renamed"), "success"); }
+      else { this.toast(this.lang === "zh" ? "重命名失败" : "Rename failed", "error"); }
+    },
+    cancelRenameTab() { this.renamingTabId = ""; this.renameDraft = ""; },
+
+    // Defensive helpers used by inline templates — keep them tiny so Alpine
+    // never has to re-parse complex expressions on every reactive tick.
+    isTabStreaming(tid) {
+      const st = this.tabState[tid];
+      return !!(st && st.streaming);
+    },
+    tabCtxMenuStyle() {
+      const m = this.tabCtxMenu;
+      return m ? `left:${m.x}px; top:${m.y}px` : "";
+    },
+    tabTitle(tid) {
+      const s = this.sessions.find(x => x.id === tid);
+      return s ? (s.name || "") : "";
+    },
+    // <title> driver — wired via x-effect on the root #app element. Re-runs
+    // whenever any read reactive (currentId / sessions / streaming) changes.
+    pageTitle() {
+      const cur = this.sessions.find(s => s.id === this.currentId);
+      const name = (cur && cur.name) || "";
+      const prefix = this.streaming ? "● " : "";
+      return name ? `${prefix}${name} · muselab` : "muselab — Meet Muse";
+    },
+    // ===== thinking / tool_result collapse =====
+    // Default-collapse historical thinking + tool_result blocks so a long
+    // session doesn't drown the user in wall-of-text. The currently-streaming
+    // last-rendered block stays expanded so the user can watch live progress.
+    // User can click to override either direction.
+    isMsgExpanded(i, m) {
+      if (!m) return true;
+      if (m._userExpanded != null) return m._userExpanded;
+      // Live-streaming last-rendered block stays expanded by default.
+      const msgs = this.messages || [];
+      return !!this.streaming && i === msgs.length - 1;
+    },
+    toggleMsgExpanded(m) {
+      if (!m) return;
+      const cur = this.isMsgExpanded((this.messages || []).indexOf(m), m);
+      m._userExpanded = !cur;
+    },
+    toolResultClass(i, m) {
+      let cls = "tool-result";
+      if (m && m.is_error) cls += " err";
+      if (!this.isMsgExpanded(i, m)) cls += " collapsed";
+      return cls;
+    },
+    toolResultSummary(m) {
+      const text = (m && m.preview) || "";
+      const lines = text.split("\n").length;
+      return lines + (this.lang === "zh" ? " 行输出" : " lines");
+    },
+    thinkingClass(i, m) {
+      return this.isMsgExpanded(i, m) ? "thinking" : "thinking collapsed";
+    },
+    thinkingPreview(m) {
+      const text = (m && m.text) || "";
+      const firstLine = text.split("\n")[0] || "";
+      const trimmed = firstLine.slice(0, 80);
+      return trimmed + (text.length > 80 ? "…" : "");
+    },
+    async _refreshCtxMeter() {
+      // Pull SDK ContextUsageResponse via /context-breakdown so the meter
+      // shows post-compact (or any other out-of-band) state without waiting
+      // for the next stream's 'done' event.
+      if (!this.currentId) return;
+      const { ok, data } = await this.api(
+        `/api/chat/context-breakdown/${this.currentId}`);
+      if (!ok || !data) return;
+      const used = Math.max(0, Number(data.totalTokens || 0));
+      const maxT = Math.max(0, Number(data.maxTokens
+                                       || this.sessionUsage.context_limit
+                                       || 200000));
+      this.sessionUsage = {
+        ...this.sessionUsage,
+        context_used: used,
+        context_limit: maxT,
+        context_used_pct: maxT
+          ? Math.round(used / maxT * 1000) / 10
+          : 0,
+      };
+    },
+
+    async showCtxBreakdown() {
+      if (!this.currentId) return;
+      this.ctxBreakdown = { show: true, loading: true, data: null, error: "" };
+      const { ok, data, error, status } = await this.api(
+        `/api/chat/context-breakdown/${this.currentId}`);
+      this.ctxBreakdown.loading = false;
+      if (ok && data) {
+        this.ctxBreakdown.data = data;
+      } else {
+        // 409 = no live client yet (session hasn't streamed a turn).
+        this.ctxBreakdown.error = status === 409
+          ? (this.lang === "zh"
+              ? "需要先发一条消息才能查 breakdown（SDK 要求 live client）"
+              : "Send a message first — SDK breakdown needs a live client")
+          : (error || (this.lang === "zh" ? "查询失败" : "Fetch failed"));
+      }
+    },
+
+    ctxRingTitle() {
+      const u = this.sessionUsage || {};
+      const used = u.context_used || 0;
+      const limit = u.context_limit || 0;
+      const pct = u.context_used_pct || 0;
+      if (this._compacting) {
+        return this.lang === "zh"
+          ? `📦 压缩进行中，已排队 ${this._compactQueue.length} 条`
+          : `📦 Compact in progress (${this._compactQueue.length} queued)`;
+      }
+      if (!limit) return this.lang === "zh" ? "上下文 …" : "Context …";
+      const used_s = (used / 1000).toFixed(1) + "K";
+      const limit_s = limit >= 1_000_000
+        ? (limit / 1_000_000).toFixed(0) + "M"
+        : (limit / 1000).toFixed(0) + "K";
+      return `${used_s} / ${limit_s} (${pct}%)`;
+    },
+    compactStatusLabel() {
+      // Single method instead of an inline template-literal expression in
+      // x-text — Alpine error handling for templated attribute expressions
+      // is brittle (a thrown evaluation can corrupt reactive state and
+      // surface as "Cannot read properties of undefined (reading 'after')"
+      // when the next morph/transition runs). Centralising here keeps the
+      // expression in real JS where defensive guards are normal.
+      if (!this._compacting) {
+        try { return this.ctxMeterLabel(); }
+        catch { return ""; }
+      }
+      const q = (this._compactQueue && this._compactQueue.length) || 0;
+      if (this.lang === "zh") {
+        return q ? `📦 压缩中… 消息队列 ${q}` : "📦 压缩中…";
+      }
+      return q ? `📦 Compacting… queued ${q}` : "📦 Compacting…";
+    },
+
+    activateTab(tid) {
+      if (tid === this.currentId) return;
+      this.currentId = tid;
+      this.switchSession();
+      // Scroll the newly-active tab into view — when the strip overflows
+      // horizontally (many sessions open), keyboard shortcuts / programmatic
+      // activation would otherwise leave the active tab hidden off-screen.
+      this.$nextTick(() => this._scrollTabIntoView(tid));
+    },
+    _scrollTabIntoView(tid) {
+      const strip = document.querySelector(".chat-tabs-list");
+      if (!strip) return;
+      const tab = strip.querySelector(`.chat-tab[data-tid="${tid}"]`)
+                  || Array.from(strip.querySelectorAll(".chat-tab"))[
+                       this.openTabIds.indexOf(tid)];
+      if (!tab) return;
+      // `inline: nearest` preserves vertical scroll, only scrolls horizontally
+      // if the tab isn't already visible. `block: nearest` likewise vertical.
+      tab.scrollIntoView({ inline: "nearest", block: "nearest" });
+    },
+    onTabAuxClick(ev, tid) {
+      // 1 = middle-click — close the tab.
+      if (ev.button === 1) this.closeChatTab(tid);
+    },
+
+    // Long-press handlers used to live here. Removed: they ate mobile taps
+    // (touchstart→timer→touchend→cleared, but the synthetic click after a
+    // long-press window collided with @click.outside on the menu and
+    // sometimes blocked legitimate taps on history rows). Mobile users get
+    // the same actions via the inline ⋮ kebab button on each tab / row.
+    onChatTabsWheel(ev) {
+      // Horizontal scroll the tab strip via the vertical wheel — like editors do.
+      if (ev.deltaY !== 0) ev.currentTarget.scrollLeft += ev.deltaY;
+    },
+
+    // ===== drag-to-reorder chat tabs (desktop only — HTML5 drag-and-drop) =====
+    // Mobile would need a touch-based fallback; keeping scope tight for now.
+    // We track which tab is being dragged in `_draggingTabId` and which tab
+    // the mouse is currently over in `tabDragOverId` (drives a visual hint).
+    _draggingTabId: "",
+    tabDragOverId: "",
+    onTabDragStart(ev, tid) {
+      this._draggingTabId = tid;
+      // dataTransfer must be set for Firefox to fire drag events at all.
+      try {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", tid);
+      } catch (_) {}
+    },
+    onTabDragOver(ev, tid) {
+      if (!this._draggingTabId || tid === this._draggingTabId) return;
+      ev.dataTransfer.dropEffect = "move";
+      this.tabDragOverId = tid;
+    },
+    onTabDragLeave(tid) {
+      if (this.tabDragOverId === tid) this.tabDragOverId = "";
+    },
+    onTabDrop(ev, tid) {
+      const src = this._draggingTabId;
+      this._draggingTabId = "";
+      this.tabDragOverId = "";
+      if (!src || src === tid) return;
+      const from = this.openTabIds.indexOf(src);
+      const to = this.openTabIds.indexOf(tid);
+      if (from < 0 || to < 0) return;
+      this.openTabIds.splice(from, 1);
+      this.openTabIds.splice(to, 0, src);
+      this.savePrefs();
+    },
+    onTabDragEnd() {
+      this._draggingTabId = "";
+      this.tabDragOverId = "";
+    },
+
+    // ===== drag-to-reorder preview tabs (mirrors chat-tab drag, but operates
+    // on `tabs` array instead of openTabIds and on file paths as the id).
+    _draggingPreviewTabPath: "",
+    previewDragOverPath: "",
+    async onPreviewDrop(ev) {
+      this.previewDragHover = false;
+      const files = (ev.dataTransfer && ev.dataTransfer.files) || [];
+      if (!files.length) return;
+      // Upload each file to ROOT (or the current preview dir if we can
+      // determine one). uploadFileTo handles toasts + tree refresh.
+      for (const f of files) {
+        try { await this.uploadFileTo("", f); } catch {}
+      }
+    },
+    onPreviewTabDragStart(ev, path) {
+      this._draggingPreviewTabPath = path;
+      try {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", path);
+      } catch (_) {}
+    },
+    onPreviewTabDragOver(ev, path) {
+      if (!this._draggingPreviewTabPath
+          || path === this._draggingPreviewTabPath) return;
+      ev.dataTransfer.dropEffect = "move";
+      this.previewDragOverPath = path;
+    },
+    onPreviewTabDragLeave(path) {
+      if (this.previewDragOverPath === path) this.previewDragOverPath = "";
+    },
+    onPreviewTabDrop(ev, path) {
+      const src = this._draggingPreviewTabPath;
+      this._draggingPreviewTabPath = "";
+      this.previewDragOverPath = "";
+      if (!src || src === path) return;
+      const from = this.tabs.findIndex(t => t.path === src);
+      const to = this.tabs.findIndex(t => t.path === path);
+      if (from < 0 || to < 0) return;
+      const [moved] = this.tabs.splice(from, 1);
+      this.tabs.splice(to, 0, moved);
+      this.savePrefs();
+    },
+    onPreviewTabDragEnd() {
+      this._draggingPreviewTabPath = "";
+      this.previewDragOverPath = "";
+    },
+    historyRowClass(sid) {
+      return { active: sid === this.currentId, open: this.openTabIds.includes(sid) };
+    },
+    // The history picker popup escapes its container via position: fixed
+    // (the parent .chat-tabs has overflow-x: auto which forces overflow-y to
+    // also clip — an absolute-positioned popup gets cut off). We compute the
+    // viewport-anchored position from the 📁 button's bounding rect at click
+    // time so the popup floats just below it.
+    historyPickerStyle: "",
+    sessionPickerSearch: "",
+    filteredSessions() {
+      const q = (this.sessionPickerSearch || "").trim().toLowerCase();
+      if (!q) return this.sessions;
+      return this.sessions.filter(s =>
+        (s.name && s.name.toLowerCase().includes(q))
+        || (s.first_prompt && s.first_prompt.toLowerCase().includes(q))
+      );
+    },
+    toggleHistoryPicker(ev) {
+      if (this.sessionPickerOpen) { this.sessionPickerOpen = false; return; }
+      const btn = ev && ev.currentTarget;
+      const rect = btn ? btn.getBoundingClientRect() : null;
+      if (rect) {
+        const popW = Math.min(320, window.innerWidth - 16);
+        // Right-align under the button, but stay inside the viewport edges.
+        let left = Math.round(rect.right - popW);
+        if (left < 8) left = 8;
+        const top = Math.round(rect.bottom + 4);
+        this.historyPickerStyle =
+          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
+      } else {
+        this.historyPickerStyle = "";
+      }
+      this.sessionPickerOpen = true;
+    },
+    pickerOpenSession(sid) {
+      this.sessionPickerOpen = false;
+      this.openTab(sid);
+    },
+    pickerRowMenu(ev, sid) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      this.sessionPickerOpen = false;
+      this.showTabMenu(ev, sid);
+    },
+    async pickerDeleteSession(sid, ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      const s = this.sessions.find(x => x.id === sid);
+      const name = (s && s.name) || sid.slice(0, 8);
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "删除会话" : "Delete session",
+        body: this.lang === "zh"
+          ? `要删除「${name}」吗？此操作不可恢复（CLI JSONL 也会被删除）。`
+          : `Delete "${name}"? Not undoable — the CLI JSONL will be removed too.`,
+        okText: this.lang === "zh" ? "删除" : "Delete",
+        danger: true,
+      });
+      if (!ok) return;
+      await this.deleteSessionById(sid);
+      this.openTabIds = this.openTabIds.filter(x => x !== sid);
+      if (this.tabState[sid]) delete this.tabState[sid];
+      this.savePrefs();
+    },
+
+    // Right-click context menu on a tab (or a row in the session picker).
+    // Also called by the mobile ⋮ kebab button (which uses normal click).
+    // We DEFER the actual menu open by one tick — otherwise the click that
+    // triggered showTabMenu propagates to the document during the same
+    // synchronous flow, and the newly-mounted menu's @click.outside listener
+    // (or any other ancestor click handler) immediately closes / re-acts on
+    // the same event. setTimeout(0) lets the trigger event finish first.
+    showTabMenu(ev, id) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      const cx = (ev && (ev.clientX || (ev.touches && ev.touches[0] && ev.touches[0].clientX))) || 100;
+      const cy = (ev && (ev.clientY || (ev.touches && ev.touches[0] && ev.touches[0].clientY))) || 100;
+      const x = Math.min(cx, window.innerWidth - 220);
+      const y = Math.min(cy, window.innerHeight - 200);
+      setTimeout(() => {
+        this.sessionPickerOpen = false;
+        this.tabCtxMenu = { id, x, y };
+      }, 0);
+    },
+    closeTabMenu() { this.tabCtxMenu = null; },
+    async menuRename(id) {
+      this.closeTabMenu();
+      // Inline rename input lives inside the tab DOM, so the tab must be open
+      // for the input to appear. If the user right-clicked a session from the
+      // history picker that isn't a tab yet, promote it first.
+      if (!this.openTabIds.includes(id)) await this.openTab(id);
+      this.startRenameTab(id);
+    },
+    async menuEditPrompt(id) {
+      this.closeTabMenu();
+      // editSessionPrompt() reads currentId. Borrow it briefly to target this
+      // tab's session without forcing a full switch.
+      const orig = this.currentId;
+      this.currentId = id;
+      try { await this.editSessionPrompt(); }
+      finally { this.currentId = orig; }
+    },
+    async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
+    async menuDelete(id) {
+      this.closeTabMenu();
+      // Close side effects (ES / interval) on the dying tab BEFORE the
+      // server delete, but defer tabState[id] cleanup until after we've
+      // removed the tab from openTabIds (so x-for unmounts its DOM first).
+      const st = this.tabState[id];
+      if (st) {
+        if (st.es) { try { st.es.close(); } catch {} }
+        if (st._streamTimer) clearInterval(st._streamTimer);
+      }
+      // deleteSessionById handles server delete + sessions-list refresh AND
+      // bumps the user to a remaining session if id was current.
+      await this.deleteSessionById(id);
+      this.openTabIds = this.openTabIds.filter(x => x !== id);
+      if (!this.openTabIds.includes(this.currentId)) {
+        this.openTabIds.push(this.currentId);
+      }
+      if (this.tabState[id]) delete this.tabState[id];
+      this.savePrefs();
+    },
+    async switchSession() {
+      // Switch the visible tab. We do NOT touch other tabs' streams — each
+      // tab's ES is in its own tabState[id], and stream callbacks write
+      // there directly. Switching is just "show that tab".
+      this._activateTabState(this.currentId);
+      this.savePrefs();
+      const st = this._ensureTabState(this.currentId);
+      if (!st._loaded) {
+        await this.loadSession(this.currentId);
+        st._loaded = true;
+      } else {
+        // Already loaded — just re-bind UI state. messages reference unchanged.
+        if (this.model) {
+          // Stay on the current root model; no auto-update needed.
+        }
+        this.atBottom = true;
+        this.scrollToBottom(true);
+        this.$nextTick(() => this.highlightCode(".chat-body"));
+      }
     },
     async loadSession(sid) {
       if (!sid) return;
+      const st = this._ensureTabState(sid);
       const r = await fetch("/api/chat/sessions/" + sid, { headers: this.hdr() });
-      if (!r.ok) { this.messages = []; return; }
+      if (!r.ok) {
+        st.messages.length = 0;
+        if (sid === this.currentId) this.messages = st.messages;
+        return;
+      }
       const s = await r.json();
-      // 用 sid 拼 key，确保切 session 时 Alpine 重新挂载所有节点
-      this.messages = (s.messages || []).map((m, i) => {
+      const next = (s.messages || []).map((m, i) => {
         const out = { ...m, _k: sid + "-" + i };
         if (m.role === "assistant" && m.text) out.html = this.mdRender(m.text);
         return out;
       });
-      if (s.model) this.model = s.model;
-      this.atBottom = true;
-      this.scrollToBottom(true);
-      this.$nextTick(() => this.highlightCode(".chat-body"));
-      // Refresh per-session context meter — won't have anything yet if the
-      // process restarted, but will once a new turn fires.
-      try {
-        const ur = await fetch(`/api/chat/usage/${sid}?model=${encodeURIComponent(this.model || "")}`,
-                                 { headers: this.hdr() });
-        if (ur.ok) this.sessionUsage = await ur.json();
-      } catch (e) { /* non-fatal */ }
+      // Mutate in place — preserves the Array reference Alpine is watching.
+      st.messages.length = 0;
+      st.messages.push(...next);
+      if (sid === this.currentId) {
+        this.messages = st.messages;
+        if (s.model) this.model = s.model;
+        this.atBottom = true;
+        this.scrollToBottom(true);
+        this.$nextTick(() => this.highlightCode(".chat-body"));
+      }
+      await this._fetchTabUsage(sid);
     },
     async renameSession() {
       const cur = this.sessions.find(x => x.id === this.currentId);
@@ -1700,30 +2180,6 @@ function portal() {
       }
     },
 
-    async cleanupEmptySessions() {
-      const ok = await this.confirm({
-        title: this.t("set.sessions.cleanup_confirm_title"),
-        body:  this.t("set.sessions.cleanup_confirm_body"),
-        okText: this.t("set.sessions.cleanup_btn"),
-        danger: true,
-      });
-      if (!ok) return;
-      const r = await fetch("/api/chat/sessions", { method: "DELETE", headers: this.hdr() });
-      if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
-      const d = await r.json();
-      await this.refreshSessions();
-      this.toast(this.t("set.sessions.cleanup_done", { n: d.count }), "success", 2500);
-      // If current session was among removed ones, jump to first remaining or fresh
-      if (!this.sessions.find(s => s.id === this.currentId)) {
-        if (this.sessions.length) {
-          this.currentId = this.sessions[0].id;
-          await this.loadSession(this.currentId);
-        } else {
-          await this.newSession();
-        }
-      }
-    },
-
     async installMcpPreset(ex) {
       const r = await fetch(`/api/settings/mcp/${encodeURIComponent(ex.name)}`, {
         method: "PUT",
@@ -1753,17 +2209,24 @@ function portal() {
         okText: this.lang === "zh" ? "删除" : "Delete",
       });
       if (!ok) return;
+      // Tear down per-tab cached state before we forget about the session.
+      const dyingTab = this.tabState[sid];
+      if (dyingTab) {
+        if (dyingTab.es) { try { dyingTab.es.close(); } catch {} }
+        if (dyingTab._streamTimer) clearInterval(dyingTab._streamTimer);
+        delete this.tabState[sid];
+      }
       await fetch(`/api/chat/sessions/${sid}`, { method: "DELETE", headers: this.hdr() });
       await this.refreshSessions();
-      // If user just nuked the current session, jump to the next one (or new).
       if (this.currentId === sid) {
         if (this.sessions.length === 0) {
-          const m = await this.newSession();
-          this.currentId = m.id;
+          // newSession already pushes to openTabIds + activates tab state.
+          await this.newSession();
         } else {
           this.currentId = this.sessions[0].id;
+          this._activateTabState(this.currentId);
+          await this.switchSession();
         }
-        await this.loadSession(this.currentId);
         this.savePrefs();
       }
     },
@@ -1781,11 +2244,17 @@ function portal() {
         this.settings.versionsLoading = false;
       }
     },
-    async runUpgrade() {
+    async runUpgrade(only = null) {
+      // only = "sdk" | "cli" | null. When null, upgrade everything available.
       if (!this.settings.versions) return;
-      const targets = [];
-      if (this.settings.versions.sdk_upgrade_available) targets.push("sdk");
-      if (this.settings.versions.system_cli_upgrade_available) targets.push("cli");
+      let targets;
+      if (only) {
+        targets = [only];
+      } else {
+        targets = [];
+        if (this.settings.versions.sdk_upgrade_available) targets.push("sdk");
+        if (this.settings.versions.system_cli_upgrade_available) targets.push("cli");
+      }
       if (targets.length === 0) {
         this.toast(this.lang === "zh" ? "无需升级" : "Nothing to upgrade", "info", 2000);
         return;
@@ -2076,6 +2545,8 @@ function portal() {
       }
       this.selected = n.path;
       this.editing = false;
+      // Persist preview-pane state so a refresh restores tabs + selected.
+      this.savePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
       if (window.innerWidth <= 900) this.mobileTab = "preview";
@@ -2150,26 +2621,86 @@ function portal() {
     async switchTab(path) {
       // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容
       await this.openFile({ path, name: path.split("/").pop() });
+      await this.revealInTree(path);
+    },
+    async revealInTree(path) {
+      // Expand every ancestor directory so the file's row exists in `visible`,
+      // then scroll its <li> into view. Skips no-op when the file is already
+      // visible (`scrollIntoView({block:"nearest"})` won't scroll if visible).
+      if (!path) return;
+      const parts = path.split("/");
+      parts.pop();   // drop the filename, keep only directory chain
+      const dirPath = parts.join("/");
+      if (dirPath) await this.expandPath(dirPath);
+      this.$nextTick(() => {
+        const el = document.querySelector(
+          `.filelist li[data-path="${(window.CSS && CSS.escape) ? CSS.escape(path) : path}"]`);
+        if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      });
     },
     closeTab(path) {
       const idx = this.tabs.findIndex(t => t.path === path);
       if (idx < 0) return;
       this.tabs.splice(idx, 1);
-      if (this.selected !== path) return;
-      // 关掉的是当前 tab，切到旁边
-      if (this.tabs.length === 0) {
-        this.selected = "";
-        this.previewMode = "";
-        this.rawText = "";
-        this.renderedMd = "";
-        this.editing = false;
-      } else {
-        const next = this.tabs[Math.min(idx, this.tabs.length - 1)];
-        this.openByPath(next.path);
+      if (this.selected === path) {
+        // 关掉的是当前 tab，切到旁边
+        if (this.tabs.length === 0) {
+          this.selected = "";
+          this.previewMode = "";
+          this.rawText = "";
+          this.renderedMd = "";
+          this.editing = false;
+        } else {
+          const next = this.tabs[Math.min(idx, this.tabs.length - 1)];
+          this.openByPath(next.path);
+          return;   // openByPath → openFile → savePrefs runs there
+        }
       }
+      this.savePrefs();
     },
 
-    rawUrl(p) { return "/api/files/raw?path=" + encodeURIComponent(p) + "&token=" + encodeURIComponent(this.token); },
+    rawUrl(p) {
+      const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
+      return "/api/files/raw?path=" + encodeURIComponent(p)
+              + "&token=" + encodeURIComponent(this.token) + v;
+    },
+    async _maybeReloadPreview(toolFilePath) {
+      // Called from the tool_use SSE handler when a write-style tool fires.
+      // Refresh the preview pane if the tool's target path matches what's
+      // currently being previewed. Path matching is by basename + suffix
+      // match against this.selected (which may be absolute or ROOT-relative);
+      // false-positives across same-named files in different dirs are
+      // acceptable (we'd over-refresh, which is harmless) vs missing a real
+      // hit by being too strict on path normalization.
+      if (!this.selected || !toolFilePath) return;
+      const selBase = this.selected.split("/").pop();
+      const toolBase = toolFilePath.split("/").pop();
+      if (selBase !== toolBase) return;
+      // Same basename → cache-bust. For html/img/pdf/iframe the new
+      // previewVersion flows through rawUrl on next render; for md/text we
+      // also need to re-fetch since rawText is cached in the component.
+      this.previewVersion = Date.now();
+      if (this.previewMode === "md" || this.previewMode === "text") {
+        const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
+                     + "&_v=" + this.previewVersion;
+        try {
+          const r = await fetch(url, { headers: this.hdr() });
+          if (r.ok) {
+            this.rawText = await r.text();
+            if (this.previewMode === "md") {
+              this.renderedMd = this.mdRender(this.rawText);
+              this.$nextTick(() => this.highlightCode(".markdown"));
+            } else {
+              this.$nextTick(() => {
+                document.querySelectorAll(".text code")
+                  .forEach(el => { delete el.dataset.hl; });
+                this.highlightCode(".text");
+              });
+            }
+          }
+        } catch (e) { /* network blip — manual refresh still possible */ }
+      }
+    },
     downloadUrl(p) { return "/api/files/download?path=" + encodeURIComponent(p) + "&token=" + encodeURIComponent(this.token); },
 
     iconRef(n) {
@@ -2181,6 +2712,32 @@ function portal() {
       if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) return "#i-image";
       if (["py", "js", "ts", "go", "rs", "java", "cpp", "c", "sh", "json", "yaml", "yml", "toml"].includes(ext)) return "#i-code";
       return "#i-file";
+    },
+    // Coarse category string used as a data-ext CSS hook for icon tinting.
+    // Keeps the SVG sprite small (no new icons needed) — colors do the
+    // disambiguation work.
+    fileExtClass(n) {
+      if (!n || n.is_dir) return "";
+      const name = (n.name || n.path.split("/").pop() || "").toLowerCase();
+      const ext = name.includes(".") ? name.split(".").pop() : "";
+      if (["md", "markdown", "rst", "txt"].includes(ext)) return "doc";
+      if (["py", "ipynb"].includes(ext))                  return "py";
+      if (["js", "mjs", "cjs", "jsx"].includes(ext))      return "js";
+      if (["ts", "tsx"].includes(ext))                    return "ts";
+      if (["go", "rs", "java", "kt", "swift"].includes(ext)) return "compiled";
+      if (["c", "cpp", "h", "hpp", "cc", "cxx"].includes(ext)) return "cstyle";
+      if (["sh", "bash", "zsh", "fish"].includes(ext))    return "shell";
+      if (["json", "yaml", "yml", "toml", "ini", "conf"].includes(ext)) return "config";
+      if (["html", "htm", "css", "scss", "less", "vue", "svelte"].includes(ext)) return "web";
+      if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) return "image";
+      if (["pdf"].includes(ext))                          return "pdf";
+      if (["zip", "tar", "gz", "tgz", "bz2", "7z", "rar"].includes(ext)) return "archive";
+      if (["csv", "tsv", "xls", "xlsx"].includes(ext))    return "data";
+      if (["mp3", "wav", "ogg", "flac", "m4a"].includes(ext)) return "audio";
+      if (["mp4", "mkv", "mov", "webm", "avi"].includes(ext)) return "video";
+      if (["sql"].includes(ext))                          return "data";
+      if (["log"].includes(ext))                          return "log";
+      return "";
     },
     fmtSize(n) {
       if (n < 1024) return n + "B";
@@ -2340,13 +2897,64 @@ function portal() {
       if (this.rightOpen) cols.push("4px", this.rightWidth + "px");
       return { gridTemplateColumns: cols.join(" ") };
     },
+    // computedOpenFilesHeight() removed — auto-fit now relies on CSS
+    // (.open-files-list max-height + .open-files height: auto). Splitter
+    // drag still sets a pixel value, which wins via inline style.
+    startOpenFilesResize(ev) {
+      // Drag the splitter at the bottom of .open-files to resize. Reuses the
+      // same fullscreen overlay trick as the pane resizer so iframe / video
+      // children don't eat the mousemove.
+      ev.preventDefault();
+      const startY = ev.clientY;
+      // openFilesHeight now controls the LIST height (not the container).
+      // Snapshot the currently-rendered list height so the drag picks up
+      // smoothly from wherever CSS auto-fit put it.
+      const listEl = ev.currentTarget.parentElement.querySelector(".open-files-list");
+      const startH = this.openFilesHeight
+                       || (listEl ? listEl.offsetHeight : 100);
+      const splitter = ev.currentTarget;
+      splitter.classList.add("active");
+      document.body.style.cursor = "ns-resize";
+      document.body.style.userSelect = "none";
+      const overlay = document.createElement("div");
+      overlay.style.cssText =
+        "position:fixed;inset:0;z-index:99999;cursor:ns-resize;background:transparent;";
+      document.body.appendChild(overlay);
+      const onMove = (e) => {
+        const delta = e.clientY - startY;
+        // min ~1 row, max ~70% viewport.
+        this.openFilesHeight = Math.max(28, Math.min(window.innerHeight * 0.7, startH + delta));
+      };
+      const onUp = () => {
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        splitter.classList.remove("active");
+        overlay.remove();
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        this.savePrefs();
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+
     startResize(which, ev) {
       ev.preventDefault();
       const startX = ev.clientX;
       const startW = which === "left" ? this.leftWidth : this.rightWidth;
+      const target = ev.currentTarget;
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
-      ev.target.classList.add("active");
+      target.classList.add("active");
+      // 关键修复：拖动时鼠标经过 HTML 预览的 sandboxed iframe（或其他
+      // 嵌入元素）时，mousemove 事件被 iframe 吞掉，分隔条跟不上鼠标，
+      // 释放后还会"跳脱"到错位置。覆盖一个全屏透明 overlay 在 iframe
+      // 上方接管事件命中区，但不 stopPropagation —— mousemove 仍冒泡
+      // 到 document 让 onMove 接收。
+      const overlay = document.createElement("div");
+      overlay.style.cssText =
+        "position:fixed;inset:0;z-index:99999;cursor:col-resize;background:transparent;";
+      document.body.appendChild(overlay);
       const onMove = (e) => {
         const delta = which === "left" ? (e.clientX - startX) : (startX - e.clientX);
         const w = Math.max(180, Math.min(700, startW + delta));
@@ -2356,7 +2964,8 @@ function portal() {
       const onUp = () => {
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
-        ev.target.classList.remove("active");
+        target.classList.remove("active");
+        overlay.remove();
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
         this.savePrefs();
@@ -2406,9 +3015,10 @@ function portal() {
       if (window.innerWidth <= 900) this.mobileTab = "chat";
     },
     autoGrow(ta) {
-      // 撑高到内容 + 上限（避免无限增长把 chat 区挤没）
+      // 撑高到内容 + 上限（避免无限增长把 chat 区挤没）。max 与 .chat-input
+      // textarea CSS 的 max-height 保持一致 (200px)。
       ta.style.height = "auto";
-      const max = 240;   // px
+      const max = 200;
       ta.style.height = Math.min(ta.scrollHeight, max) + "px";
     },
 
@@ -2468,12 +3078,20 @@ function portal() {
         }
         case "clear": {
           if (!this.currentId) return;
-          await fetch(`/api/chat/reset?token=${encodeURIComponent(this.token)}&session_id=${encodeURIComponent(this.currentId)}`,
+          const oldId = this.currentId;
+          await fetch(`/api/chat/reset?token=${encodeURIComponent(this.token)}&session_id=${encodeURIComponent(oldId)}`,
                        { method: "POST" });
-          await fetch(`/api/chat/sessions/${this.currentId}`, { method: "DELETE", headers: this.hdr() });
+          await fetch(`/api/chat/sessions/${oldId}`, { method: "DELETE", headers: this.hdr() });
           await this.refreshSessions();
-          this.messages = [];
-          // start a fresh session so the dropdown isn't empty
+          // Drop the old session's tab + cached state, then open a fresh one
+          // in its slot. newSession() handles tabState + openTabIds + switch.
+          const oldStreamState = this.tabState[oldId];
+          if (oldStreamState) {
+            if (oldStreamState.es) { try { oldStreamState.es.close(); } catch {} }
+            if (oldStreamState._streamTimer) clearInterval(oldStreamState._streamTimer);
+            delete this.tabState[oldId];
+          }
+          this.openTabIds = this.openTabIds.filter(x => x !== oldId);
           await this.newSession();
           this.toast(this.t("slash.cleared"), "success", 1500);
           return;
@@ -2531,7 +3149,7 @@ function portal() {
             s.budget_usd > 0
               ? `- ${this.t("cost.budget")}: $${s.budget_usd} (${s.budget_used_pct}% used)`
               : `- ${this.t("cost.no_budget")}`,
-            `- ${this.t("cost.context")}: ${(this.sessionUsage.input_tokens/1000).toFixed(1)}K / ${(this.sessionUsage.context_limit/1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
+            `- ${this.t("cost.context")}: ${((this.sessionUsage.context_used || this.sessionUsage.input_tokens || 0)/1000).toFixed(1)}K / ${(this.sessionUsage.context_limit/1000).toFixed(0)}K (${this.sessionUsage.context_used_pct}%)`,
           ];
           this._injectAssistantNote(lines.join("\n"));
           return;
@@ -2647,6 +3265,22 @@ function portal() {
       const d = i.claude_md_mtime ? new Date(i.claude_md_mtime * 1000).toLocaleDateString() : "";
       return this.t("ctx.claude_md_tip", { root: i.archive_root, date: d });
     },
+    async openMyArchiveFile() {
+      // Quick shortcut from Settings to open ROOT/CLAUDE.md for editing.
+      // If it doesn't exist, prompt the user (a click-through into the help
+      // dialog is friendlier than silently creating an empty file).
+      this.settings.show = false;
+      const path = "CLAUDE.md";
+      const { ok } = await this.api(
+        "/api/files/read?path=" + encodeURIComponent(path));
+      if (!ok) {
+        this.openClaudeMdHelp();
+        return;
+      }
+      await this.openByPath(path);
+      this.$nextTick(() => { if (this.isEditable(path)) this.toggleEdit(); });
+    },
+
     openClaudeMdHelp() {
       this.modal = {
         show: true,
@@ -2701,13 +3335,15 @@ function portal() {
     ctxMeterTitle() {
       const u = this.sessionUsage;
       return `${this.t("ctx.tip_line1")}\n` +
-             `${u.input_tokens.toLocaleString()} / ${u.context_limit.toLocaleString()} tokens (${u.context_used_pct}%)\n\n` +
+             `${(u.context_used || u.input_tokens || 0).toLocaleString()} / ${u.context_limit.toLocaleString()} tokens (${u.context_used_pct}%)\n\n` +
              `${this.t("ctx.tip_line2")}`;
     },
     ctxMeterLabel() {
-      const pct = this.sessionUsage.context_used_pct;
-      // Real context = input + cache_read + cache_creation. Backend sends
-      // pre-computed `context_used`; fall back to summing if absent.
+      const limit = this.sessionUsage.context_limit || 0;
+      // Pre-fetch state — backend hasn't told us the real limit yet.
+      // Show a placeholder rather than rendering "0K / 0K · NaN%".
+      if (!limit) return this.lang === "zh" ? "上下文 …" : "Context …";
+      const pct = this.sessionUsage.context_used_pct || 0;
       const usedTokens = (this.sessionUsage.context_used != null)
         ? this.sessionUsage.context_used
         : (this.sessionUsage.input_tokens || 0)
@@ -2717,7 +3353,7 @@ function portal() {
                          + (this.sessionUsage.cache_creation_tokens || 0);
       const usedK = (usedTokens / 1000).toFixed(1);
       const cachedK = (cachedTokens / 1000).toFixed(1);
-      const limitK = (this.sessionUsage.context_limit / 1000).toFixed(0);
+      const limitK = (limit / 1000).toFixed(0);
       const args = { used: usedK, limit: limitK, pct, cached: cachedK };
       if (pct >= 90) return this.t("ctx.danger", args);
       if (pct >= 70) return this.t("ctx.warn",   args);
@@ -2748,7 +3384,10 @@ function portal() {
       // summarize-and-fork is gone — it was lossy and unnecessary once we
       // realized the SDK forwards slash commands to CLI natively.
       this._compacting = true;
-      this.toast(this.lang === "zh" ? "📦 正在压缩历史..." : "📦 Compacting history...", "info", 120_000);
+      // ctx-meter shows a persistent pulsing banner while _compacting is true
+      // (CSS-only, see .ctx-meter.compacting). A short toast confirms the kick
+      // — the long banner is what the user actually watches, not a 2-min toast.
+      this.toast(this.lang === "zh" ? "📦 开始压缩..." : "📦 Compacting…", "info", 2000);
 
       try {
         const r = await fetch(`/api/chat/sessions/${this.currentId}/native-compact`,
@@ -2761,12 +3400,80 @@ function portal() {
         // Reload current session so the new compact-marker shows up.
         await this.loadSession(this.currentId);
         await this.refreshSessions();
+        // Refresh ctx-meter — sessionUsage is only auto-updated on stream
+        // 'done' events, so without this the meter shows the pre-compact
+        // (large) value until the user sends a new message.
+        await this._refreshCtxMeter();
         this.toast(this.lang === "zh" ? "📦 压缩完成" : "📦 Compacted", "success", 2000);
       } catch (e) {
         this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + e.message, "error", 5000);
       } finally {
         this._compacting = false;
+        // Queued messages: ask the user before flushing. Auto-sending all
+        // queued messages was surprising — the user could end up with 3
+        // unexpected user-bubbles when they thought compact would let them
+        // re-evaluate context first.
+        if (this._compactQueue.length > 0) {
+          const n = this._compactQueue.length;
+          const previewLines = this._compactQueue
+            .map((q, i) => `${i + 1}. ${(q.text || "").slice(0, 50)}`)
+            .join("\n");
+          const ok = await this.confirm({
+            title: this.lang === "zh"
+              ? `压缩期间排队了 ${n} 条消息`
+              : `${n} message(s) queued during compact`,
+            body: this.lang === "zh"
+              ? `要依次发送吗？取消会全部丢弃。\n\n${previewLines}`
+              : `Send them sequentially? Cancel discards all.\n\n${previewLines}`,
+            okText: this.lang === "zh" ? `发送 ${n} 条` : `Send ${n}`,
+            cancelText: this.lang === "zh" ? "丢弃" : "Discard",
+          });
+          if (ok) {
+            while (this._compactQueue.length > 0) {
+              const q = this._compactQueue.shift();
+              this.input = q.text;
+              this.pendingImages = q.pendingImages || [];
+              this.pendingDocs = q.pendingDocs || [];
+              await this.send();
+            }
+          } else {
+            this._compactQueue.length = 0;
+          }
+        }
       }
+    },
+
+    onChatArrowUp(ev) {
+      // 1. If a mention/slash popup is open, ↑ navigates it (preserves
+      //    the prior keymap).
+      if (this.mentionShow || this.slashShow) {
+        this._navPop(-1);
+        ev.preventDefault();
+        return;
+      }
+      // 2. Empty input → recall the most recent user message so the user
+      //    can edit + re-send (Slack/Cursor/iTerm/zsh style).
+      if (!this.input.trim()) {
+        const msgs = this.messages || [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i];
+          if (m && m.role === "user" && m.text) {
+            this.input = m.text;
+            ev.preventDefault();
+            this.$nextTick(() => {
+              const ta = this.$refs.chatInput;
+              if (ta) {
+                ta.focus();
+                const len = this.input.length;
+                ta.setSelectionRange(len, len);
+                this.autoGrow(ta);
+              }
+            });
+            return;
+          }
+        }
+      }
+      // Otherwise let the browser handle ↑ (cursor up inside textarea).
     },
 
     onChatInput(ev) {
@@ -2832,6 +3539,25 @@ function portal() {
       if (ev.isComposing || ev.keyCode === 229) return;
       if (this.mentionShow) { this.pickMention(); return; }
       if (ev.shiftKey) { this.input += "\n"; return; }
+      // Mobile / touch screens: Enter inserts a newline; send is via the
+      // button only. Desktop users get the keyboard-first flow.
+      const isTouch = (window.matchMedia
+                        && window.matchMedia("(pointer: coarse)").matches)
+                      || window.innerWidth < 768;
+      if (isTouch) {
+        const ta = this.$refs.chatInput;
+        if (ta) {
+          const s = ta.selectionStart, e = ta.selectionEnd;
+          this.input = this.input.slice(0, s) + "\n" + this.input.slice(e);
+          this.$nextTick(() => {
+            ta.setSelectionRange(s + 1, s + 1);
+            this.autoGrow(ta);
+          });
+        } else {
+          this.input += "\n";
+        }
+        return;
+      }
       this.send();
     },
     onChatScroll() {
@@ -2866,6 +3592,26 @@ function portal() {
       const readyDocs = this.pendingDocs.filter(d => d.id && !d.error);
       if ((!text && !readyImages.length && !readyDocs.length)
           || this.streaming || !this.currentId) return;
+      // Compact in progress → queue the message, drained when compact finishes.
+      // Users keep typing & sending without waiting; the message stays out of
+      // the visible transcript until it's actually dispatched (avoids the
+      // "sent but no response" UX where the bubble sits there for 90 s).
+      if (this._compacting) {
+        this._compactQueue.push({
+          text,
+          pendingImages: this.pendingImages.slice(),
+          pendingDocs: this.pendingDocs.slice(),
+        });
+        this.pendingImages = [];
+        this.pendingDocs = [];
+        this.input = "";
+        this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
+        this.toast(this.lang === "zh"
+                    ? `📦 压缩中，消息已排队（${this._compactQueue.length}）`
+                    : `📦 Compact in progress, message queued (${this._compactQueue.length})`,
+                    "info", 2200);
+        return;
+      }
       // If anything still uploading, wait.
       if (this.pendingImages.some(im => im.uploading)
           || this.pendingDocs.some(d => d.uploading)) {
@@ -2885,104 +3631,151 @@ function portal() {
       this.pendingImages = [];
       this.pendingDocs = [];
       this.input = "";
-      // 发送后 textarea 重置高度
-      this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
+      // 发送后 textarea 重置高度 + 重新 focus (支持连续发送，免得用户手动点回输入框)
+      this.$nextTick(() => {
+        const ta = this.$refs.chatInput;
+        if (ta) { this.autoGrow(ta); ta.focus(); }
+      });
       this.mentionShow = false;
-      this.streaming = true;
+      // Capture per-stream tab state once at send time. All event handlers
+      // below write to streamState (the ORIGIN tab) instead of `this`, so the
+      // stream keeps targeting the right tab even if the user switches to a
+      // different tab mid-reply. Root state (`this.streaming` etc.) is only
+      // mirrored when the origin tab is still the active one.
+      const streamSid = this.currentId;
+      const streamState = this._ensureTabState(streamSid);
+
+      streamState.streaming = true; this.streaming = true;
+      streamState.streamingModel = this.model;
       this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
       // Tick elapsed time so user sees "thinking · 3.2s" when first token is slow.
-      this._streamStartedAt = Date.now();
-      this.streamElapsed = 0;
-      if (this._streamTimer) clearInterval(this._streamTimer);
-      this._streamTimer = setInterval(() => {
-        this.streamElapsed = (Date.now() - this._streamStartedAt) / 1000;
+      streamState._streamStartedAt = Date.now();
+      this._streamStartedAt = streamState._streamStartedAt;
+      streamState.streamElapsed = 0; this.streamElapsed = 0;
+      if (streamState._streamTimer) clearInterval(streamState._streamTimer);
+      streamState._streamTimer = setInterval(() => {
+        const elapsed = (Date.now() - streamState._streamStartedAt) / 1000;
+        streamState.streamElapsed = elapsed;
+        if (this.currentId === streamSid) this.streamElapsed = elapsed;
       }, 200);
+      this._streamTimer = streamState._streamTimer;
       this.atBottom = true;
       this.scrollToBottom(true);
 
       const url = "/api/chat/stream"
         + "?prompt=" + encodeURIComponent(text)
-        + "&session_id=" + encodeURIComponent(this.currentId)
+        + "&session_id=" + encodeURIComponent(streamSid)
         + "&model=" + encodeURIComponent(this.model)
         + "&permission=" + encodeURIComponent(this.permission)
         + "&show_thinking=" + (this.showThinking ? "true" : "false")
         + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
         + "&token=" + encodeURIComponent(this.token);
       const es = new EventSource(url);
-      this.es = es;
+      streamState.es = es; this.es = es;
 
-      // Active assistant bubble pointer (-1 = none). Text events open / extend
-      // it; tool/thinking events close it so subsequent text starts a fresh
-      // bubble — preserves the actual event order visually.
-      let curBubble = null;     // direct object reference — survives array shifts
+      // Active assistant bubble pointer. Text events open / extend it; tool /
+      // thinking events close it so subsequent text starts a fresh bubble.
+      // curBubble is a direct OBJECT reference — survives tab switches because
+      // it lives inside streamState.messages (same array regardless of which
+      // tab is active).
+      let curBubble = null;
       let acc = "";
-      const streamSessionId = this.currentId;   // capture: if user switches session
-                                                 // mid-stream, future events become no-ops
       const modelForBubble = this.model;
+      // Scroll only if the active tab is the one receiving the stream;
+      // otherwise we'd yank the user away from whatever they're reading.
+      const _scrollIfActive = () => {
+        if (this.currentId === streamSid) this.scrollToBottom(false);
+      };
       const openAsst = () => {
         if (curBubble) return;
-        // Guard: don't push if we've drifted to a different session view.
-        if (this.currentId !== streamSessionId) return;
         const bubble = { role: "assistant", text: "", html: "", cost: "", model: modelForBubble };
-        this.messages.push(bubble);
+        streamState.messages.push(bubble);
         curBubble = bubble;
         acc = "";
       };
-      const closeAsst = () => { curBubble = null; acc = ""; };
+      // Throttle markdown rendering during fast token streams. mdRender is
+      // O(content length) and re-runs on every chunk; on long replies that's
+      // hundreds of full re-parses. 80ms cap keeps UI smooth while still
+      // feeling realtime. flushRender() forces a final render on close/done.
+      const RENDER_MIN_INTERVAL = 80;
+      let lastRender = 0;
+      let pendingTimer = null;
+      const renderNow = () => {
+        if (!curBubble) { pendingTimer = null; return; }
+        curBubble.html = this.mdRender(acc);
+        lastRender = Date.now();
+        pendingTimer = null;
+      };
+      const scheduleRender = () => {
+        const since = Date.now() - lastRender;
+        if (since >= RENDER_MIN_INTERVAL) {
+          renderNow();
+        } else if (!pendingTimer) {
+          pendingTimer = setTimeout(renderNow, RENDER_MIN_INTERVAL - since);
+        }
+      };
+      const flushRender = () => {
+        if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+        if (curBubble) renderNow();
+      };
+      const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
 
       es.addEventListener("text", ev => {
         const d = JSON.parse(ev.data);
         openAsst();
-        if (!curBubble) return;           // session switched mid-stream → drop
         acc += d.text;
         curBubble.text = acc;
-        curBubble.html = this.mdRender(acc);
-        this.scrollToBottom(false);
+        scheduleRender();
+        _scrollIfActive();
       });
       es.addEventListener("thinking", ev => {
         if (!this.showThinking) return;
         closeAsst();
         const d = JSON.parse(ev.data);
-        this.messages.push({ role: "thinking", text: d.text });
-        this.scrollToBottom(false);
+        streamState.messages.push({ role: "thinking", text: d.text });
+        _scrollIfActive();
       });
       es.addEventListener("tool_use", ev => {
         closeAsst();
         const d = JSON.parse(ev.data);
-        const msg = { role: "tool_use", name: d.name, summary: d.summary };
-        // Carry through structured payloads for dedicated UIs
+        const msg = { role: "tool_use", name: d.name, summary: d.summary, input: d.input };
         if (d.todos != null) msg.todos = d.todos;
         if (d.task != null) msg.task = d.task;
         if (d.plan != null) msg.plan = d.plan;
-        this.messages.push(msg);
-        this.scrollToBottom(false);
+        streamState.messages.push(msg);
+        // File-mutating tools invalidate any open preview of the same file.
+        // Bump previewVersion → rawUrl picks up a new ?_v= → iframe reloads;
+        // _reloadPreviewIfDirty re-fetches md/text contents inline.
+        if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(d.name)) {
+          const fp = (d.input && (d.input.file_path
+                                    || d.input.notebook_path)) || "";
+          this._maybeReloadPreview(fp);
+        }
+        _scrollIfActive();
       });
       es.addEventListener("tool_result", ev => {
         const d = JSON.parse(ev.data);
-        this.messages.push({ role: "tool_result", preview: d.preview, truncated: d.truncated, is_error: d.is_error });
-        this.scrollToBottom(false);
+        streamState.messages.push({
+          role: "tool_result", preview: d.preview, truncated: d.truncated, is_error: d.is_error,
+        });
+        _scrollIfActive();
       });
-      // ask_user_question: Muse 用 mcp__muselab__ask_user_question 工具问选项。
-      // 在 chat 里插入特殊 bubble，每个 option 一个按钮。点击 → POST 答案 → 工具
-      // handler 解 future → 模型继续。pendingQId / pendingAnswers 用于 multiSelect 收集中间态。
       es.addEventListener("ask_user_question", ev => {
         closeAsst();
         const d = JSON.parse(ev.data);
-        this.messages.push({
+        streamState.messages.push({
           role: "ask_user_question",
           id: d.id,
           questions: d.questions,
-          pendingAnswers: {},   // multi-select intermediate; single click submits immediately
+          pendingAnswers: {},
           submitted: false,
         });
-        this.scrollToBottom(false);
+        _scrollIfActive();
       });
-      // permission_request: muselab's can_use_tool bridge. Shows Allow / Deny /
-      // Always-allow buttons; click POSTs decision, backend resolves the SDK callback.
       es.addEventListener("permission_request", ev => {
         closeAsst();
         const d = JSON.parse(ev.data);
-        this.messages.push({
+        streamState.messages.push({
           role: "permission_request",
           id: d.id,
           tool: d.tool,
@@ -2990,48 +3783,102 @@ function portal() {
           resolved: false,
           decision: null,
         });
-        this.scrollToBottom(false);
+        _scrollIfActive();
       });
       const _stopTimer = () => {
-        if (this._streamTimer) { clearInterval(this._streamTimer); this._streamTimer = null; }
-        this.streamElapsed = 0;
+        if (streamState._streamTimer) {
+          clearInterval(streamState._streamTimer);
+          streamState._streamTimer = null;
+        }
+        streamState.streamElapsed = 0;
+        if (this.currentId === streamSid) {
+          this._streamTimer = null;
+          this.streamElapsed = 0;
+        }
+      };
+      // Mark the stream done for the ORIGIN tab. If the user is on a
+      // different tab, we still update tabState[streamSid] silently — they'll
+      // see the final state when they switch back.
+      const _markDone = () => {
+        streamState.streaming = false;
+        streamState.es = null;
+        if (this.currentId === streamSid) {
+          this.streaming = false;
+          this.es = null;
+          // textarea was :disabled while streaming → focus during stream was
+          // a no-op. Re-focus now so the user can immediately type the next
+          // message (supports rapid-fire conversation).
+          this.$nextTick(() => {
+            const ta = this.$refs.chatInput;
+            if (ta && !ta.disabled) ta.focus();
+          });
+        }
       };
       es.addEventListener("done", ev => {
+        flushRender();
         const d = JSON.parse(ev.data);
         if (d.total_cost_usd != null && curBubble) {
           curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
-        if (d.session_usage) this.sessionUsage = d.session_usage;
-        // Budget warn on every turn that crosses the threshold (don't spam if already over)
+        if (d.session_usage) {
+          Object.assign(streamState.sessionUsage, d.session_usage);
+          if (this.currentId === streamSid) this.sessionUsage = streamState.sessionUsage;
+        }
         if (d.budget_usd > 0 && d.budget_used_pct >= 90 && !this._budgetWarned) {
           this._budgetWarned = true;
           this.toast(this.t("cost.budget_warn", { pct: d.budget_used_pct, usd: d.budget_usd }),
                       "warn", 5000);
         }
-        es.close(); this.streaming = false; this.es = null; _stopTimer();
+        es.close(); _markDone(); _stopTimer();
         this.refreshSessions();
-        this.$nextTick(() => this.highlightCode(".chat-body"));
+        if (this.currentId === streamSid) {
+          this.$nextTick(() => this.highlightCode(".chat-body"));
+        }
       });
       es.addEventListener("error", ev => {
+        flushRender();
         try {
           const d = JSON.parse(ev.data);
-          this.toast("Claude 出错：" + d.error, "error", 6000);
-        } catch { this.toast("流式连接失败", "error"); }
-        es.close(); this.streaming = false; this.es = null; _stopTimer();
+          this.toast(this._humanizeStreamError(d.error), "error", 6000);
+        } catch {
+          this.toast(this.lang === "zh"
+                      ? "和 Muse 的连接断开了，重试一下"
+                      : "Lost connection to Muse — try again",
+                      "error");
+        }
+        // Mark the latest user bubble in this stream's messages as failed
+        // so the UI can render a ↻ retry button next to it.
+        for (let i = streamState.messages.length - 1; i >= 0; i--) {
+          const m = streamState.messages[i];
+          if (m.role === "user") { m._failed = true; break; }
+        }
+        es.close(); _markDone(); _stopTimer();
       });
       es.addEventListener("cancelled", () => {
+        flushRender();
         this.toast("已中断", "warn", 2000);
-        es.close(); this.streaming = false; this.es = null; _stopTimer();
+        es.close(); _markDone(); _stopTimer();
       });
       es.onerror = () => {
-        if (es.readyState === EventSource.CLOSED) { this.streaming = false; this.es = null; _stopTimer(); }
+        if (es.readyState === EventSource.CLOSED) { _markDone(); _stopTimer(); }
       };
     },
     stop() {
-      if (this.es) { this.es.close(); this.es = null; }
-      this.streaming = false;
-      fetch("/api/chat/reset?token=" + encodeURIComponent(this.token) + "&session_id=" + encodeURIComponent(this.currentId),
+      // Stop only the active tab's stream — other tabs keep running their
+      // own. Uses tabState[currentId] as the authoritative source for what
+      // ES to close. Backend uses SDK's client.interrupt() — keeps the
+      // client / CLI subprocess alive so the next message continues the
+      // same conversation without reloading CLAUDE.md / MCP / system prompt.
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      if (st.es) { try { st.es.close(); } catch {} st.es = null; }
+      st.streaming = false;
+      this.streaming = false; this.es = null;
+      if (st._streamTimer) { clearInterval(st._streamTimer); st._streamTimer = null; }
+      this._streamTimer = null; this.streamElapsed = 0;
+      fetch("/api/chat/interrupt?token=" + encodeURIComponent(this.token)
+            + "&session_id=" + encodeURIComponent(sid),
             { method: "POST" });
     },
 
@@ -3121,10 +3968,95 @@ function portal() {
       }
     },
 
+    rootDisplay() {
+      const root = (this.contextInfo && this.contextInfo.archive_root) || "";
+      if (!root) return "—";
+      // Best-effort tilde-substitute the user's $HOME prefix (POSIX). The
+      // backend doesn't ship HOME so this is heuristic — strip the prefix
+      // before the user's name (assumes /home/<user> or /Users/<user>).
+      const m = root.match(/^(\/home\/[^/]+|\/Users\/[^/]+)(.*)$/);
+      return m ? "~" + m[2] : root;
+    },
+    copyRootPath() {
+      const root = (this.contextInfo && this.contextInfo.archive_root) || "";
+      if (!root) return;
+      navigator.clipboard?.writeText(root).then(
+        () => this.toast(this.t("toast.copied") + ": " + root, "success", 1500),
+        () => {});
+    },
+
+    async togglePinSession(sid) {
+      const s = this.sessions.find(x => x.id === sid);
+      if (!s) return;
+      const newPinned = !s.pinned;
+      // Optimistic UI update so the row jumps to the top instantly.
+      s.pinned = newPinned;
+      this.sessions = [...this.sessions];   // trigger sort re-render
+      const { ok } = await this.api(`/api/chat/sessions/${sid}`, {
+        method: "PATCH", json: { pinned: newPinned },
+      });
+      if (!ok) {
+        s.pinned = !newPinned;   // revert
+        this.toast(this.lang === "zh" ? "操作失败" : "Failed", "error");
+        return;
+      }
+      await this.refreshSessions();
+    },
+
+    openLightbox(src) {
+      if (!src) return;
+      this.lightbox = { show: true, src };
+    },
+
+    retryFailedMessage(m) {
+      if (!m || m.role !== "user" || !m._failed) return;
+      // Drop the failed bubble, put text back in input, and send.
+      const idx = this.messages.indexOf(m);
+      if (idx >= 0) this.messages.splice(idx, 1);
+      this.input = m.text || "";
+      // pendingImages/Docs we don't have here (preview state) — re-prompt
+      // user to re-attach if they had files. Acceptable: error retry is rare.
+      this.$nextTick(() => {
+        const ta = this.$refs.chatInput;
+        if (ta) { ta.focus(); this.autoGrow(ta); }
+        this.send();
+      });
+    },
+
+    _humanizeStreamError(raw) {
+      // Translate the raw SDK / vendor error strings into something the user
+      // can act on. Falls through to the raw text if no pattern matches —
+      // better to show something technical than swallow useful info.
+      const zh = this.lang === "zh";
+      const s = String(raw || "");
+      if (/401|unauthorized|invalid.api.key/i.test(s))
+        return zh ? "API key 无效，去 Settings 检查" : "Invalid API key — check Settings";
+      if (/429|rate.?limit|too many/i.test(s))
+        return zh ? "请求频率超限，等几秒再试" : "Rate limit hit — wait a few seconds";
+      if (/quota|credit|insufficient.*balance/i.test(s))
+        return zh ? "账户额度不足，去 vendor 控制台充值" : "Out of credit — top up at vendor console";
+      if (/timeout|timed out/i.test(s))
+        return zh ? "请求超时，可能模型在长上下文上忙，重试一下" : "Timed out — retry";
+      if (/network|connection|ECONNREFUSED|fetch/i.test(s))
+        return zh ? "网络断开，检查连接后重试" : "Network down — check connection";
+      if (/context.*length|maximum.*tokens|too long/i.test(s))
+        return zh ? "对话太长了，先压缩历史再试" : "Conversation too long — compact then retry";
+      if (/ProcessError/i.test(s))
+        return zh ? "Claude Code CLI 报错，看后端日志细节" : "CLI subprocess error — check backend logs";
+      // Default: prefix + raw, so technical detail isn't lost but framed.
+      return (zh ? "Muse 出错：" : "Muse error: ") + s;
+    },
     copyMsg(m) {
       const text = m.text || "";
       navigator.clipboard?.writeText(text).then(
-        () => this.toast(this.t("toast.copied"), "success", 1500),
+        () => {
+          this.toast(this.t("toast.copied"), "success", 1500);
+          // Inline ✓ feedback on the message — sets a flag the template
+          // reads to swap the copy icon to a check for 1.2s. Faster signal
+          // than the toast, which appears at the screen edge.
+          m._copied = true;
+          setTimeout(() => { m._copied = false; }, 1200);
+        },
         () => this.toast("复制失败（需要 HTTPS）", "error")
       );
     },

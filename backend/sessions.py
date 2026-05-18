@@ -28,11 +28,21 @@ to be invisible in the UI after native /compact ran.
 """
 import json
 import re
+import sys
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# SDK-native session enumeration. CLI's JSONL is the truth for transcript +
+# last-modified + custom_title; muselab index.json is the truth for
+# model / system_prompt / auto_named flag and for "pre-first-query" sessions
+# (CLI doesn't create the JSONL until the first query, but UI needs to show
+# the session immediately after create_session).
+from claude_agent_sdk import list_sessions as sdk_list_sessions
+from claude_agent_sdk import get_session_info as sdk_get_session_info
+from .settings import ROOT
 
 
 def _default_session_name() -> str:
@@ -104,8 +114,93 @@ def _save_sidecar(sid: str, data: dict) -> None:
 # Session-level CRUD (metadata only — no transcript handling)
 # ============================================================================
 
+def _merge_sdk_with_index(info: Any, m: dict) -> dict:
+    """Build a muselab-shaped session dict from a SDKSessionInfo + the
+    muselab index entry (may be empty for sessions created outside muselab)."""
+    name = (info.custom_title
+             or m.get("name")
+             or title_from_message(info.first_prompt or "")
+             or _default_session_name())
+    return {
+        "id": info.session_id,
+        "name": name,
+        "model": m.get("model", ""),
+        "system_prompt": m.get("system_prompt", ""),
+        # Auto-named flag stays True only if neither SDK custom_title nor
+        # an explicit muselab rename has happened yet.
+        "auto_named": (m.get("auto_named", True)
+                        and not info.custom_title),
+        # SDK stores ms since epoch — convert to seconds to stay
+        # consistent with muselab's pre-existing time.time() style.
+        "created_at": (info.created_at / 1000.0
+                        if info.created_at
+                        else m.get("created_at", 0)),
+        "updated_at": (info.last_modified / 1000.0
+                        if info.last_modified
+                        else m.get("updated_at", 0)),
+        # message_count not in SDKSessionInfo (would need a full JSONL
+        # scan per session). bump_session writes it to index after each
+        # turn, so fall back there. New sessions show 0 until first turn.
+        "message_count": m.get("message_count", 0),
+        "first_prompt": info.first_prompt or "",
+        "tag": info.tag or m.get("tag"),
+        "pinned": bool(m.get("pinned", False)),
+    }
+
+
+def toggle_pin(sid: str) -> bool:
+    """Flip the `pinned` flag on a session in the index. Returns the new state.
+    Frontend's session picker sorts pinned sessions to the top."""
+    idx = _load_index()
+    for s in idx:
+        if s["id"] == sid:
+            s["pinned"] = not bool(s.get("pinned", False))
+            _save_index(idx)
+            return s["pinned"]
+    # Session exists only in CLI JSONL (no muselab index entry yet) — create
+    # a minimal entry to hold the pin flag.
+    now = time.time()
+    idx.append({
+        "id": sid, "name": "", "model": "", "system_prompt": "",
+        "created_at": now, "updated_at": now,
+        "message_count": 0, "auto_named": True, "pinned": True,
+    })
+    _save_index(idx)
+    return True
+
+
 def list_sessions() -> list[dict]:
-    return sorted(_load_index(), key=lambda s: s.get("updated_at", 0), reverse=True)
+    """List sessions, preferring SDK truth (CLI JSONL last_modified +
+    custom_title) and falling back to muselab index for muselab-specific
+    fields and pre-first-query sessions."""
+    index = _load_index()
+    index_by_id = {s["id"]: s for s in index}
+    sdk_list: list[Any] = []
+    if ROOT is not None:
+        try:
+            sdk_list = sdk_list_sessions(directory=str(ROOT))
+        except Exception as e:
+            sys.stderr.write(
+                f"[sessions] sdk_list_sessions failed, "
+                f"falling back to index.json only: "
+                f"{type(e).__name__}: {e}\n")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for info in sdk_list:
+        m = index_by_id.get(info.session_id, {})
+        out.append(_merge_sdk_with_index(info, m))
+        seen.add(info.session_id)
+    # Append muselab-only entries (no JSONL on disk yet — usually because
+    # the user just created the session but hasn't sent the first message).
+    for s in index:
+        if s["id"] not in seen:
+            out.append(s)
+    # Sort: pinned sessions first (descending), then by updated_at desc.
+    return sorted(
+        out,
+        key=lambda s: (1 if s.get("pinned") else 0, s.get("updated_at", 0)),
+        reverse=True,
+    )
 
 
 def create_session(name: str = "", model: str = "", system_prompt: str = "") -> dict:
@@ -131,9 +226,25 @@ def create_session(name: str = "", model: str = "", system_prompt: str = "") -> 
 
 def get_session_meta(sid: str) -> dict | None:
     """Returns just the session-level metadata. For full session view (with
-    transcript), use chat.py's combined read path that pulls from SDK."""
+    transcript), use chat.py's combined read path that pulls from SDK.
+
+    Merges SDK truth (custom_title, last_modified, created_at, tag) with
+    muselab index (model, system_prompt, auto_named). Falls back to
+    index-only if SDK can't see the session (e.g. CLI hasn't created
+    the JSONL yet) or if SDK is unavailable."""
     idx = _load_index()
-    return next((s for s in idx if s["id"] == sid), None)
+    m = next((s for s in idx if s["id"] == sid), None)
+    info = None
+    if ROOT is not None:
+        try:
+            info = sdk_get_session_info(sid, directory=str(ROOT))
+        except Exception as e:
+            sys.stderr.write(
+                f"[sessions] sdk_get_session_info({sid}) failed: "
+                f"{type(e).__name__}: {e}\n")
+    if info is not None:
+        return _merge_sdk_with_index(info, m or {})
+    return m
 
 
 # Back-compat alias — some code calls get_session() expecting metadata.
@@ -185,24 +296,6 @@ def update_system_prompt(sid: str, system_prompt: str) -> bool:
             _save_index(idx)
             return True
     return False
-
-
-def delete_empty_sessions() -> list[str]:
-    """Bulk-delete sessions with message_count == 0."""
-    idx = _load_index()
-    keep, removed = [], []
-    for s in idx:
-        if s.get("message_count", 0) == 0:
-            removed.append(s["id"])
-            p = _sidecar_path(s["id"])
-            if p.exists():
-                try: p.unlink()
-                except OSError: pass
-        else:
-            keep.append(s)
-    if removed:
-        _save_index(keep)
-    return removed
 
 
 # ============================================================================

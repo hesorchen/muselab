@@ -2,6 +2,7 @@ import os
 import base64
 import json
 import asyncio
+import re
 import time
 import uuid
 from pathlib import Path
@@ -16,6 +17,8 @@ from claude_agent_sdk import (
     get_session_messages,
     delete_session as sdk_delete_session,
     rename_session as sdk_rename_session,
+    tag_session as sdk_tag_session,
+    fork_session as sdk_fork_session,
 )
 from .auth import require_token_query, require_token
 from .settings import ROOT, MODEL, MCP_CONFIG_PATH
@@ -33,7 +36,36 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # switching model mid-session creates a fresh client for that model (which
 # uses resume=session_id to inherit the conversation history from disk).
 _clients: dict[tuple[str, str], ClaudeSDKClient] = {}
+# Tracks the permission_mode currently active on each cached client. SDK
+# doesn't expose a getter, so we shadow what we asked for. Lets a cached
+# client whose mode no longer matches the request swap via
+# client.set_permission_mode() instead of needing a full rebuild.
+_client_permission: dict[tuple[str, str], str] = {}
+# LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
+# muselab leaks memory as users open more sessions. New clients append to
+# the tail; on cache miss with len > cap, oldest gets disconnected.
+_client_lru: list[tuple[str, str]] = []
+_CLIENT_POOL_CAP = int(os.environ.get("MUSELAB_CLIENT_POOL_CAP", "3"))
 _lock = asyncio.Lock()
+
+
+async def _evict_lru_if_needed():
+    """If pool overflows, disconnect the oldest non-active client.
+    Caller must hold _lock OR call this when no active stream depends on
+    the evicted client (callers do — get_client adds AFTER any current
+    stream finishes acquiring its handle)."""
+    while len(_client_lru) > _CLIENT_POOL_CAP:
+        old_key = _client_lru.pop(0)
+        c = _clients.pop(old_key, None)
+        _client_permission.pop(old_key, None)
+        if c is None:
+            continue
+        try:
+            await c.disconnect()
+        except Exception as e:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[client-pool] evict {old_key} disconnect err: {e}\n")
 
 # Global aggregate stats (across all sessions). cache_read / cache_creation
 # come from the Anthropic prompt cache — high cache_read ratio means subsequent
@@ -51,18 +83,37 @@ _session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
                                           #         cache_creation_tokens,
                                           #         total_cost_usd, last_turn_at}
 
-# Approximate context window per model (input + output cap). Used to render
-# the meter as a percentage. Conservative defaults — adjust as vendors update.
+# Per-model context windows. Used as the meter's denominator when a SDK
+# get_context_usage() truth isn't available (first turn of a session, or
+# any third-party model where CLI's tokenizer / window inference is
+# unreliable). Numbers verified 2026-05-18 from each vendor's docs:
+#   - Anthropic:   tygartmedia.com / anthropic.com (Opus/Sonnet 4.6+ default
+#                  to 1M on Pro/Max/Enterprise; Haiku 4.5 stays 200K)
+#   - DeepSeek V4: api-docs.deepseek.com (V4 series ships 1M native context)
+#   - Zhipu GLM:   glm-5.org / docs.z.ai (GLM-5 + GLM-4.7 both 200K context)
+#   - MiniMax:     platform.minimax.io (M2.5 / M2.7 both 204_800, cline #10007
+#                  PR fixed the prior 192K/245K misinformation)
 MODEL_CONTEXT_LIMITS = {
-    "claude-opus-4-7":            200_000,
-    "claude-sonnet-4-6":          200_000,
-    "claude-haiku-4-5-20251001":  200_000,
-    "deepseek-v4-pro":            128_000,
-    "deepseek-v4-flash":          128_000,
-    "deepseek-chat":              128_000,
-    "deepseek-reasoner":          128_000,
-    "glm-5":                      128_000,
-    "minimax-m2.7":               245_000,
+    # Anthropic — 1M on Pro/Max plans (auto-upgrade, no flag needed). Haiku
+    # stayed at the older 200K since it's the speed/cost tier.
+    "claude-opus-4-7":            1_000_000,
+    "claude-sonnet-4-6":          1_000_000,
+    "claude-haiku-4-5-20251001":    200_000,
+    # DeepSeek V4 series — 1M native, all SKUs.
+    "deepseek-v4-pro":            1_000_000,
+    "deepseek-v4-flash":          1_000_000,
+    # DeepSeek V3 chat/reasoner SKUs — older 128K window kept.
+    "deepseek-chat":                128_000,
+    "deepseek-reasoner":            128_000,
+    # Zhipu GLM 5 series — 200K context, 128K output cap.
+    "glm-5":                        200_000,
+    "glm-5-air":                    200_000,
+    "glm-4.7":                      200_000,
+    "glm-4-plus":                   128_000,   # older 4-plus stayed 128K
+    # MiniMax — 204_800 exactly, per platform.minimax.io spec.
+    "minimax-m2.7":                 204_800,
+    "minimax-m2.7-highspeed":       204_800,
+    "minimax-m2.5":                 204_800,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
 
@@ -247,14 +298,46 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             try:
                 client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
                 await client.connect()
-            except Exception:
-                # resume failed (probably no prior on-disk session). Retry with
-                # session_id to create a fresh one tied to our id.
-                opts_kwargs.pop("resume", None)
-                opts_kwargs["session_id"] = session_id
+            except Exception as e:
+                # Two failure modes we recover from by swapping session_id ⇔ resume:
+                #   - tried `resume=` but CLI has no on-disk session for it
+                #     → swap to `session_id=` (create fresh tied to our UUID)
+                #   - tried `session_id=` but CLI reports "already in use"
+                #     (its internal lock leaked, or a JSONL appeared between
+                #     our glob check and the spawn) → swap to `resume=`
+                err_text = str(e).lower()
+                used_session_id = "session_id" in opts_kwargs
+                if used_session_id and "already in use" in err_text:
+                    opts_kwargs.pop("session_id", None)
+                    opts_kwargs["resume"] = session_id
+                else:
+                    opts_kwargs.pop("resume", None)
+                    opts_kwargs["session_id"] = session_id
                 client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
                 await client.connect()
             _clients[key] = client
+            _client_permission[key] = permission
+            _client_lru.append(key)
+            await _evict_lru_if_needed()
+        else:
+            # Touch LRU — most-recently-used moves to the tail.
+            if key in _client_lru:
+                _client_lru.remove(key)
+            _client_lru.append(key)
+        # Cached client may have been created with a different permission_mode
+        # (the cache key is (sid, model), not (sid, model, permission)). Sync
+        # to the requested mode via SDK's set_permission_mode rather than
+        # rebuilding — saves a CLI subprocess restart.
+        current_perm = _client_permission.get(key)
+        if current_perm != permission:
+            try:
+                await _clients[key].set_permission_mode(permission)
+                _client_permission[key] = permission
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat] set_permission_mode {current_perm}→{permission} "
+                    f"failed for {key}: {type(e).__name__}: {e}\n")
         return _clients[key]
 
 
@@ -264,6 +347,9 @@ async def disconnect_client(session_id: str) -> None:
         keys = [k for k in _clients if k[0] == session_id]
         for k in keys:
             c = _clients.pop(k, None)
+            _client_permission.pop(k, None)
+            if k in _client_lru:
+                _client_lru.remove(k)
             if c is not None:
                 try:
                     await c.disconnect()
@@ -289,6 +375,24 @@ def create_session_api(req: CreateReq) -> dict:
     return meta
 
 
+# CLI wraps slash commands as pseudo-user messages with these tags so it can
+# round-trip through the conversation log. They're internal protocol detail
+# and should never reach the user's chat UI as a regular bubble.
+_CLI_SLASH_TAGS_RE = re.compile(
+    r"<(command-name|command-message|command-args|"
+    r"local-command-stdout|local-command-stderr)>.*?</\1>",
+    re.DOTALL,
+)
+
+
+def _strip_cli_slash_wrapper(text: str) -> str:
+    """Remove CLI slash-command protocol tags. Returns cleaned text (may be
+    empty — caller should skip rendering when empty)."""
+    if not text:
+        return text
+    return _CLI_SLASH_TAGS_RE.sub("", text).strip()
+
+
 def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                           compact_uuids: set[str] | None = None) -> list[dict]:
     """Convert SDK SessionMessage list into muselab's flat UI message list.
@@ -307,7 +411,13 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
 
         # Simple shape: content is a single string.
         if isinstance(content, str):
-            entry = {"role": sm.type, "text": content, "uuid": sm.uuid}
+            text = _strip_cli_slash_wrapper(content)
+            # CLI's slash-command wrapper (<command-name>/compact</command-name>
+            # …) round-trips through the conversation log as a "user" turn;
+            # hide it from the UI rather than rendering a confusing bubble.
+            if not text:
+                continue
+            entry = {"role": sm.type, "text": text, "uuid": sm.uuid}
             if is_compact:
                 entry["_is_compact_summary"] = True
             entry.update(ann)   # cost / model / images / etc.
@@ -321,9 +431,15 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
 
         def flush_text():
             nonlocal text_buf, image_refs
-            if not text_buf and not image_refs:
+            # Strip CLI slash wrapper before deciding if there's anything to
+            # render. Pure-wrapper messages produce empty text + no images
+            # → drop the bubble entirely.
+            cleaned = _strip_cli_slash_wrapper(text_buf)
+            if not cleaned and not image_refs:
+                text_buf = ""
+                image_refs = []
                 return
-            entry = {"role": sm.type, "text": text_buf, "uuid": sm.uuid}
+            entry = {"role": sm.type, "text": cleaned, "uuid": sm.uuid}
             if is_compact:
                 entry["_is_compact_summary"] = True
             if image_refs:
@@ -475,21 +591,15 @@ async def delete_session_api(sid: str) -> dict:
     return {"ok": True}
 
 
-@router.delete("/sessions", dependencies=[Depends(require_token)])
-async def cleanup_empty_sessions() -> dict:
-    """Bulk-remove all sessions with zero messages (placeholder / abandoned).
-    Exposed in Settings as "清理空会话"."""
-    # Drop in-memory clients for any of them too
-    removed = sess.delete_empty_sessions()
-    for sid in removed:
-        await disconnect_client(sid)
-    return {"ok": True, "removed": removed, "count": len(removed)}
-
-
 class SessionPatchReq(BaseModel):
     name: str | None = None
     system_prompt: str | None = None
     model: str | None = None
+    # SDK-native session tag — written to CLI JSONL so other tools (and
+    # manual `claude` CLI runs) see it. Pass empty string to clear.
+    tag: str | None = None
+    # Pin to top of the session picker. None = no change, True/False = set.
+    pinned: bool | None = None
 
 
 @router.patch("/sessions/{sid}", dependencies=[Depends(require_token)])
@@ -503,6 +613,34 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             sdk_rename_session(sid, req.name, directory=str(ROOT))
         except (FileNotFoundError, ValueError):
             pass
+    if req.tag is not None:
+        # Empty string → clear tag. SDK accepts None or str.
+        try:
+            sdk_tag_session(sid, req.tag or None, directory=str(ROOT))
+            ok = True
+        except (FileNotFoundError, ValueError) as e:
+            # JSONL doesn't exist yet → tag has nowhere to live until first
+            # query. Surface as a 409 so the FE can wait for first turn.
+            raise HTTPException(409, f"cannot tag session before first turn: {e}")
+    if req.pinned is not None:
+        # Pin is muselab-local (not stored in CLI JSONL). Always idempotent.
+        idx = sess._load_index()
+        found = False
+        for s in idx:
+            if s["id"] == sid:
+                s["pinned"] = bool(req.pinned)
+                found = True
+                break
+        if not found:
+            import time as _time
+            idx.append({
+                "id": sid, "name": "", "model": "", "system_prompt": "",
+                "created_at": _time.time(), "updated_at": _time.time(),
+                "message_count": 0, "auto_named": True,
+                "pinned": bool(req.pinned),
+            })
+        sess._save_index(idx)
+        ok = True
     if req.system_prompt is not None:
         ok = sess.update_system_prompt(sid, req.system_prompt) or ok
         # System prompt change invalidates cached SDK clients for this session.
@@ -516,8 +654,42 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         #     next reply if the prior turn had thinking blocks
         #   - prompt cache resets when model changes (first turn slower)
         sess.update_model(sid, req.model)
-        # Free the old (sid, oldmodel) client so the next send uses the new model
-        await disconnect_client(sid)
+        # SDK-native swap if same provider — `client.set_model()` reuses the
+        # CLI subprocess (and its loaded CLAUDE.md / MCP / system prompt).
+        # Cross-provider switch (e.g. Claude → DeepSeek) needs full rebuild
+        # because env_override / base_url differ.
+        async with _lock:
+            live = [(k, c) for k, c in _clients.items() if k[0] == sid]
+        pa = endpoints.lookup(req.model)
+        same_provider = (
+            len(live) == 1
+            and ((pa is None and endpoints.lookup(live[0][0][1]) is None)
+                 or (pa is not None
+                     and endpoints.lookup(live[0][0][1]) is not None
+                     and endpoints.lookup(live[0][0][1]).prefix == pa.prefix)))
+        if same_provider:
+            (old_key, client) = live[0]
+            try:
+                await client.set_model(req.model)
+                async with _lock:
+                    _clients.pop(old_key, None)
+                    perm = _client_permission.pop(old_key, "bypassPermissions")
+                    if old_key in _client_lru:
+                        _client_lru.remove(old_key)
+                    new_key = (sid, req.model)
+                    _clients[new_key] = client
+                    _client_permission[new_key] = perm
+                    _client_lru.append(new_key)
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat] set_model {old_key[1]}→{req.model} failed: "
+                    f"{type(e).__name__}: {e}; rebuilding on next turn\n")
+                await disconnect_client(sid)
+        else:
+            # Cross-provider, or no/multiple live clients — disconnect; the
+            # next send() rebuilds with the new model.
+            await disconnect_client(sid)
         ok = True
     if not ok:
         raise HTTPException(404, "session not found or no changes")
@@ -553,16 +725,37 @@ def session_usage(session_id: str, model: str = "") -> dict:
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
         "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
     })
     m = model or MODEL
-    limit = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
-    ctx_used = u["input_tokens"] + u.get("cache_read_tokens", 0) + u.get("cache_creation_tokens", 0)
+    # Take the MAX of (stored sess_u value, hardcoded table). This way when
+    # MODEL_CONTEXT_LIMITS gets bumped (e.g. Opus 200K → 1M), an existing
+    # session that stored the old 200K still picks up the new ceiling on the
+    # next /usage poll — no need to wait for the user to send a new message.
+    # SDK truth (from ResultMessage handler) overrides on next stream done.
+    stored = int(u.get("context_limit", 0) or 0)
+    hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
+    limit = max(stored, hardcoded)
+    # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
+    # handler. Fall back to the legacy estimate only if no turn has completed
+    # yet (in which case `context_used` is 0 anyway → 0% display, correct).
+    if u.get("context_used"):
+        ctx_used = int(u["context_used"])
+        # Recompute pct against possibly-bumped limit so it doesn't show stale
+        # high percentage (e.g. 14.2% if computed against 200K but limit is 1M).
+        ctx_pct = round(ctx_used / limit * 100, 1) if limit else 0.0
+    else:
+        # Conservative fallback: per-turn input only (not summed with cache,
+        # because cache_read/cache_creation in SDK usage are cumulative and
+        # would inflate the meter — see ResultMessage handler comment).
+        ctx_used = int(u.get("input_tokens", 0) or 0)
+        ctx_pct = round(ctx_used / limit * 100, 1) if limit else 0
     return {
         **u,
         "model": m,
         "context_limit": limit,
         "context_used": ctx_used,
-        "context_used_pct": round(ctx_used / limit * 100, 1) if limit else 0,
+        "context_used_pct": ctx_pct,
     }
 
 
@@ -665,8 +858,16 @@ def context_info() -> dict:
 
     # Detect "do we have ANY working auth?" — needed so the chat-empty card
     # can warn "you have no provider set up; configure one before chatting".
-    # Claude OAuth lives in ~/.claude/.credentials.json (Pro/Max).
+    # Three valid Anthropic-side auth sources:
+    #   1. Pro/Max OAuth (~/.claude/.credentials.json)
+    #   2. ANTHROPIC_API_KEY  → x-api-key header
+    #   3. ANTHROPIC_AUTH_TOKEN → Authorization: Bearer (OAuth/enterprise)
+    # has_any_provider previously only checked #1 + third-party vendors,
+    # so users who configured ANTHROPIC_API_KEY in Settings got a stuck
+    # "no provider configured" warning (observed after clear-localStorage).
     claude_oauth = (Path.home() / ".claude" / ".credentials.json").exists()
+    anthropic_api = bool(os.environ.get("ANTHROPIC_API_KEY")
+                          or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
     third_party_configured = [
         name for env_key, name in (
             ("DEEPSEEK_API_KEY", "DeepSeek"),
@@ -689,8 +890,11 @@ def context_info() -> dict:
         "archive_empty": True,
         "subdir_present": {},
         "has_claude_oauth": claude_oauth,
+        "has_anthropic_api": anthropic_api,
         "third_party_configured": third_party_configured,
-        "has_any_provider": claude_oauth or len(third_party_configured) > 0,
+        "has_any_provider": (
+            claude_oauth or anthropic_api or len(third_party_configured) > 0
+        ),
     }
     # Subdirs the install scripts create — used to nudge "drop a doc into X"
     for sub in ("health", "work", "money", "people", "notes", "archives"):
@@ -784,6 +988,27 @@ def mcp_status() -> dict:
         return {"configured": False, "servers": [], "error": str(e)}
 
 
+@router.post("/interrupt", dependencies=[Depends(require_token_query)])
+async def interrupt(session_id: str) -> dict:
+    """Stop the current turn via SDK control protocol. Keeps the client
+    connected so the next message continues the same conversation without
+    re-spawning the CLI / re-loading CLAUDE.md / re-initializing MCP."""
+    async with _lock:
+        targets = [(k, c) for k, c in _clients.items() if k[0] == session_id]
+    if not targets:
+        return {"ok": True, "interrupted": [], "note": "no live client"}
+    interrupted: list[str] = []
+    for k, c in targets:
+        try:
+            await c.interrupt()
+            interrupted.append(f"{k[0]}@{k[1]}")
+        except Exception as e:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[chat-interrupt] {k} failed: {type(e).__name__}: {e}\n")
+    return {"ok": True, "interrupted": interrupted}
+
+
 @router.post("/reset", dependencies=[Depends(require_token_query)])
 async def reset(session_id: str | None = None) -> dict:
     if session_id:
@@ -830,7 +1055,19 @@ def _render_tool_use(block: ToolUseBlock) -> dict:
     else:
         summary = json.dumps(inp, ensure_ascii=False)[:200]
 
-    out: dict = {"name": name, "summary": summary, "id": block.id}
+    # Slim input — drop bulky fields (Write/Edit's `content`, `new_string`
+    # etc. could be a whole file). FE uses `input.file_path` to drive the
+    # clickable file-link chip and the preview auto-refresh on edit; without
+    # this passthrough both silently no-op'd (toolFilePath always returned "",
+    # _maybeReloadPreview never matched). 2026-05-18 audit fix.
+    _SLIM_INPUT_FIELDS = {
+        "file_path", "notebook_path", "path",
+        "command", "pattern", "url", "query",
+        "name", "skill", "subagent_type", "description", "todos",
+    }
+    slim_input = {k: v for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
+    out: dict = {"name": name, "summary": summary, "id": block.id,
+                  "input": slim_input}
     # Pass full structured payloads through for tools that have dedicated UIs.
     if name == "TodoWrite":
         out["todos"] = inp.get("todos") or []
@@ -1049,9 +1286,13 @@ async def stream(
     # the stream completes we ask SDK for the latest message UUIDs and write
     # per-message annotations (cost / model / images) keyed by those UUIDs.
     assistant_acc = ""
+    # Mirror of frontend's per-bubble `acc`. Reset on tool_use (FE
+    # closeAsst). Lets us tail-emit any TextBlock suffix the SDK didn't
+    # send as text_delta — see TextBlock branch below for context.
+    streamed_in_bubble = ""
 
     async def event_gen():
-        nonlocal assistant_acc
+        nonlocal assistant_acc, streamed_in_bubble
         # Subscribe to the session's side-channel queue. The MCP ask_user_question
         # handler publishes here; we merge those events into the SSE stream so the
         # UI can render the question UI while the SDK tool handler is await-ing.
@@ -1104,6 +1345,248 @@ async def stream(
             except asyncio.CancelledError:
                 pass
 
+        # ====== message-type-specific handlers ======
+        # Three nested async generators, one per SDK message type. They share
+        # closure state (assistant_acc + streamed_in_bubble via nonlocal,
+        # other locals read-only). Keeps the main loop a ~15-line dispatch
+        # instead of a 200-line elif chain.
+
+        async def _handle_stream_event(msg):
+            """Token-by-token deltas → tiny text / thinking events. Fast
+            feedback path; the AssistantMessage handler suppresses re-emit."""
+            nonlocal assistant_acc, streamed_in_bubble
+            ev = msg.event or {}
+            if ev.get("type") != "content_block_delta":
+                return
+            delta = ev.get("delta") or {}
+            dt = delta.get("type")
+            if dt == "text_delta":
+                chunk = delta.get("text", "")
+                if chunk:
+                    assistant_acc += chunk
+                    streamed_in_bubble += chunk
+                    yield {"event": "text", "data": json.dumps({"text": chunk})}
+            elif dt == "thinking_delta":
+                chunk = delta.get("thinking", "")
+                if chunk:
+                    yield {"event": "thinking", "data": json.dumps({"text": chunk})}
+
+        async def _handle_assistant_message(msg):
+            """Per-turn AssistantMessage:
+              1. Snapshot per-turn usage (msg.usage is raw Anthropic per-call
+                 dict; populate sess_u truthfully for the context meter).
+              2. Iterate content blocks — tail-emit TextBlock suffix the
+                 stream may have skipped; forward tool_use / tool_result.
+            """
+            nonlocal assistant_acc, streamed_in_bubble
+            a_usage = getattr(msg, "usage", None) or {}
+            if a_usage:
+                in_t = int(a_usage.get("input_tokens", 0) or 0)
+                cr_t = int(a_usage.get("cache_read_input_tokens", 0) or 0)
+                cc_t = int(a_usage.get("cache_creation_input_tokens", 0) or 0)
+                out_t = int(a_usage.get("output_tokens", 0) or 0)
+                ctx_used = in_t + cr_t + cc_t
+                sess_u = _session_usage.setdefault(session_id, {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                    "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                    "context_used": 0, "context_used_pct": 0.0,
+                    "context_limit": 0,
+                })
+                # Prefer the SDK-authoritative limit set by a prior turn's
+                # ResultMessage handler (real maxTokens, may be 1M). Fallback
+                # to the hardcoded estimate on the very first turn before
+                # any get_context_usage() has run.
+                limit = sess_u.get("context_limit") or MODEL_CONTEXT_LIMITS.get(
+                    model_to_use, DEFAULT_CONTEXT_LIMIT)
+                sess_u["input_tokens"] = in_t
+                sess_u["cache_read_tokens"] = cr_t
+                sess_u["cache_creation_tokens"] = cc_t
+                sess_u["output_tokens"] = out_t
+                sess_u["context_used"] = ctx_used
+                sess_u["context_used_pct"] = (
+                    round(ctx_used / limit * 100, 1) if limit else 0.0)
+                # Only write context_limit when it's still 0 (first turn).
+                # Otherwise keep the SDK-authoritative value the prior turn's
+                # ResultMessage handler wrote.
+                if not sess_u.get("context_limit"):
+                    sess_u["context_limit"] = limit
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    # Defensive tail-emit (see message_parser.py:279-290 — SDK
+                    # forwards CLI stream events 1:1 in theory, but FE was
+                    # observed truncating mid-word "CSS 变量切" 2026-05-18).
+                    # Diagnostic log only fires when diff > 0 (no spam).
+                    full = (getattr(block, "text", "") or "")
+                    if full and full != streamed_in_bubble:
+                        tail = (full[len(streamed_in_bubble):]
+                                 if full.startswith(streamed_in_bubble)
+                                 else full)
+                        if tail:
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f"[chat-stream] sid={session_id} "
+                                f"TextBlock tail-emit: streamed="
+                                f"{len(streamed_in_bubble)} chars, "
+                                f"block.text={len(full)} chars, "
+                                f"emitting tail={len(tail)} chars "
+                                f"(prefix_match="
+                                f"{full.startswith(streamed_in_bubble)})\n")
+                            _sys.stderr.flush()
+                            assistant_acc += tail
+                            streamed_in_bubble += tail
+                            yield {"event": "text",
+                                   "data": json.dumps({"text": tail})}
+                elif isinstance(block, ThinkingBlock):
+                    # Already streamed via thinking_delta events.
+                    pass
+                elif isinstance(block, ToolUseBlock):
+                    yield {"event": "tool_use",
+                           "data": json.dumps(_render_tool_use(block))}
+                    # FE closeAsst()'s the bubble on tool_use; reset mirror.
+                    streamed_in_bubble = ""
+                elif isinstance(block, ToolResultBlock):
+                    yield {"event": "tool_result",
+                           "data": json.dumps(_render_tool_result(block))}
+
+        async def _handle_result_message(msg):
+            """ResultMessage = turn complete. Update cumulative cost / stats,
+            write per-message sidecar annotations, bump session metadata, then
+            yield the consolidated 'done' SSE event the FE awaits."""
+            cost = getattr(msg, "total_cost_usd", None) or 0.0
+            u = getattr(msg, "usage", {}) or {}
+            in_t = int(u.get("input_tokens", 0) or 0)
+            out_t = int(u.get("output_tokens", 0) or 0)
+            cr_t = int(u.get("cache_read_input_tokens", 0)
+                        or u.get("cache_read_tokens", 0) or 0)
+            cc_t = int(u.get("cache_creation_input_tokens", 0)
+                        or u.get("cache_creation_tokens", 0) or 0)
+            _stats["total_cost_usd"] += cost
+            _stats["total_messages"] += 1
+            _stats["total_input_tokens"] += in_t
+            _stats["total_output_tokens"] += out_t
+            _stats["total_cache_read_tokens"] += cr_t
+            _stats["total_cache_creation_tokens"] += cc_t
+
+            # Per-turn input/cache_* + context_used populated from
+            # AssistantMessage.usage in _handle_assistant_message above.
+            # ResultMessage.usage is CUMULATIVE per session — if we += it
+            # into _stats we'd double-count (known bug, out-of-scope here).
+            sess_u = _session_usage.setdefault(session_id, {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0,
+                "context_limit": 0,
+            })
+            sess_u["total_cost_usd"] += cost
+            sess_u["last_turn_at"] = time.time()
+
+            # Pull authoritative max-window from SDK so the meter reflects the
+            # ACTUAL effective limit (which may be 1M for Pro/Max subscribers,
+            # not the hardcoded 200K in MODEL_CONTEXT_LIMITS). One control
+            # round-trip per turn — small price for accurate denominator.
+            #
+            # Third-party caveat: CLI's get_context_usage uses Claude's
+            # tokenizer + doesn't know DeepSeek/GLM/MiniMax context windows,
+            # so for those vendors we trust our hardcoded MODEL_CONTEXT_LIMITS
+            # table instead. It's not perfect either but at least matches the
+            # vendor's documented window. AssistantMessage.usage already
+            # populated context_used / pct against that limit a few lines up.
+            if endpoints.is_third_party(model_to_use):
+                # Re-anchor context_limit to muselab's table in case a prior
+                # turn (under a different model) left a Claude-style 1M
+                # value behind.
+                sess_u["context_limit"] = MODEL_CONTEXT_LIMITS.get(
+                    model_to_use, DEFAULT_CONTEXT_LIMIT)
+                # Recompute pct against the corrected limit.
+                if sess_u["context_limit"]:
+                    sess_u["context_used_pct"] = round(
+                        sess_u.get("context_used", 0)
+                        / sess_u["context_limit"] * 100, 1)
+            else:
+                try:
+                    cu = await client.get_context_usage()
+                    real_max = int(cu.get("maxTokens") or 0)
+                    real_total = int(cu.get("totalTokens") or 0)
+                    if real_max:
+                        sess_u["context_limit"] = real_max
+                    if real_total:
+                        sess_u["context_used"] = real_total
+                    if real_max and real_total:
+                        sess_u["context_used_pct"] = round(
+                            real_total / real_max * 100, 1)
+                except Exception as _e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat-stream] get_context_usage skipped for "
+                        f"sid={session_id}: {type(_e).__name__}\n")
+
+            # Sidecar annotations: pull latest transcript from SDK to find
+            # new user/assistant UUIDs, then write cost / model / images /
+            # docs against those rows in muselab's per-session sidecar.
+            try:
+                all_msgs = get_session_messages(session_id, directory=str(ROOT))
+            except Exception:
+                all_msgs = []
+            new_asst_uuid = None
+            new_user_uuid = None
+            for sm in reversed(all_msgs):
+                if sm.type == "assistant" and not new_asst_uuid:
+                    new_asst_uuid = sm.uuid
+                elif sm.type == "user" and not new_user_uuid:
+                    new_user_uuid = sm.uuid
+                if new_asst_uuid and new_user_uuid:
+                    break
+            if new_asst_uuid and assistant_acc:
+                sess.set_message_annotation(
+                    session_id, new_asst_uuid,
+                    cost=f"${cost:.4f}", model=model_to_use)
+            if new_user_uuid and (persisted_imgs or persisted_docs):
+                sess.set_message_annotation(
+                    session_id, new_user_uuid,
+                    images=persisted_imgs or None,
+                    docs=persisted_docs or None)
+            # message_count = total transcript size; auto-rename from first
+            # user message text if session is still auto-named.
+            first_user_text = ""
+            for sm in all_msgs:
+                if sm.type == "user":
+                    c = (sm.message or {}).get("content")
+                    if isinstance(c, str):
+                        first_user_text = c
+                    elif isinstance(c, list):
+                        for b in c:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                first_user_text = b.get("text", "")
+                                break
+                    break
+            sess.bump_session(session_id, message_count=len(all_msgs),
+                               auto_rename_from=first_user_text or prompt)
+            sess.update_model(session_id, model_to_use)
+            limit = MODEL_CONTEXT_LIMITS.get(model_to_use, DEFAULT_CONTEXT_LIMIT)
+            yield {"event": "done", "data": json.dumps({
+                "duration_ms": getattr(msg, "duration_ms", None),
+                "total_cost_usd": cost,
+                "model": model_to_use,
+                "stats": _stats,
+                # turn_usage: cumulative (ResultMessage.usage). FE should
+                # prefer session_usage.context_* for window display. Will be
+                # removed once FE is fully migrated.
+                "turn_usage": {
+                    "input_tokens": in_t,
+                    "output_tokens": out_t,
+                    "cache_read_tokens": cr_t,
+                    "cache_creation_tokens": cc_t,
+                },
+                "session_usage": _session_usage[session_id],
+                "budget_usd": _budget_usd(),
+                "budget_used_pct": (
+                    round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
+                    if _budget_usd() > 0 else 0
+                ),
+            })}
+
         claude_task = asyncio.create_task(pump_claude())
         side_task = asyncio.create_task(pump_side_q(side_q))
         perm_task = asyncio.create_task(pump_side_q(perm_q))
@@ -1120,148 +1603,19 @@ async def stream(
                     break
                 if kind == "done":
                     break
-                # kind == "claude"
+                # kind == "claude" — dispatch by SDK message type to the
+                # per-type helper async generators defined above. Each
+                # helper yields zero-or-more SSE events; we forward them.
                 msg = payload
                 if isinstance(msg, StreamEvent):
-                    # Token-by-token deltas — emit each as a tiny text/thinking event.
-                    # This is the fast-feedback path; the consolidated AssistantMessage
-                    # below carries the final text but we suppress re-emit there.
-                    ev = msg.event or {}
-                    et = ev.get("type")
-                    if et == "content_block_delta":
-                        delta = ev.get("delta") or {}
-                        dt = delta.get("type")
-                        if dt == "text_delta":
-                            chunk = delta.get("text", "")
-                            if chunk:
-                                assistant_acc += chunk
-                                yield {"event": "text", "data": json.dumps({"text": chunk})}
-                        elif dt == "thinking_delta":
-                            chunk = delta.get("thinking", "")
-                            if chunk:
-                                yield {"event": "thinking", "data": json.dumps({"text": chunk})}
+                    async for ev in _handle_stream_event(msg):
+                        yield ev
                 elif isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            # Already streamed via StreamEvent deltas above —
-                            # don't re-emit (would double the assistant bubble).
-                            pass
-                        elif isinstance(block, ThinkingBlock):
-                            # Same: streamed via thinking_delta events.
-                            pass
-                        elif isinstance(block, ToolUseBlock):
-                            # Just emit to UI for live render — transcript is
-                            # in CLI's JSONL, no parallel persistence here.
-                            yield {"event": "tool_use", "data": json.dumps(_render_tool_use(block))}
-                        elif isinstance(block, ToolResultBlock):
-                            yield {"event": "tool_result", "data": json.dumps(_render_tool_result(block))}
+                    async for ev in _handle_assistant_message(msg):
+                        yield ev
                 elif isinstance(msg, ResultMessage):
-                    cost = getattr(msg, "total_cost_usd", None) or 0.0
-                    u = getattr(msg, "usage", {}) or {}
-                    in_t   = int(u.get("input_tokens", 0) or 0)
-                    out_t  = int(u.get("output_tokens", 0) or 0)
-                    cr_t   = int(u.get("cache_read_input_tokens", 0)
-                                  or u.get("cache_read_tokens", 0) or 0)
-                    cc_t   = int(u.get("cache_creation_input_tokens", 0)
-                                  or u.get("cache_creation_tokens", 0) or 0)
-                    _stats["total_cost_usd"] += cost
-                    _stats["total_messages"] += 1
-                    _stats["total_input_tokens"]  += in_t
-                    _stats["total_output_tokens"] += out_t
-                    _stats["total_cache_read_tokens"]     += cr_t
-                    _stats["total_cache_creation_tokens"] += cc_t
-
-                    # Snapshot per-session usage. input_tokens of the most-recent
-                    # turn ≈ current context window occupancy, which is what the
-                    # meter shows.
-                    sess_u = _session_usage.setdefault(session_id, {
-                        "input_tokens": 0, "output_tokens": 0,
-                        "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                        "total_cost_usd": 0.0, "last_turn_at": 0.0,
-                    })
-                    # Per-session snapshot. context window math needs PER-TURN
-                    # values for input/cache_read/cache_creation — accumulating
-                    # them would make ctx_used = sum over all turns, which
-                    # overflows the 128K limit after a handful of turns even
-                    # when the live context is only ~10K. (Bug seen 2026-05-17:
-                    # session showed 105.9% / 135.6K after a few turns.)
-                    # Accumulated totals live in _stats above for global
-                    # cache_hit_pct etc.
-                    sess_u["input_tokens"] = in_t
-                    sess_u["cache_read_tokens"] = cr_t
-                    sess_u["cache_creation_tokens"] = cc_t
-                    sess_u["output_tokens"] += out_t   # still accumulated — per-turn output isn't a useful display
-                    sess_u["total_cost_usd"] += cost
-                    sess_u["last_turn_at"] = time.time()
-
-                    # Pull latest transcript from SDK to discover the UUIDs the
-                    # CLI just wrote for the user message + assistant reply. We
-                    # write per-message annotations (cost / model / image base64)
-                    # against those UUIDs in muselab's sidecar — the CLI doesn't
-                    # track these fields.
-                    try:
-                        all_msgs = get_session_messages(session_id, directory=str(ROOT))
-                    except Exception:
-                        all_msgs = []
-                    # Walk back from the end to find the latest assistant + user.
-                    new_asst_uuid = None
-                    new_user_uuid = None
-                    for sm in reversed(all_msgs):
-                        if sm.type == "assistant" and not new_asst_uuid:
-                            new_asst_uuid = sm.uuid
-                        elif sm.type == "user" and not new_user_uuid:
-                            new_user_uuid = sm.uuid
-                        if new_asst_uuid and new_user_uuid:
-                            break
-                    if new_asst_uuid and assistant_acc:
-                        sess.set_message_annotation(
-                            session_id, new_asst_uuid,
-                            cost=f"${cost:.4f}", model=model_to_use)
-                    if new_user_uuid and (persisted_imgs or persisted_docs):
-                        sess.set_message_annotation(
-                            session_id, new_user_uuid,
-                            images=persisted_imgs or None,
-                            docs=persisted_docs or None)
-                    # message_count = total transcript size; auto-rename hint
-                    # from the FIRST user message text if session is still auto-named.
-                    first_user_text = ""
-                    for sm in all_msgs:
-                        if sm.type == "user":
-                            c = (sm.message or {}).get("content")
-                            if isinstance(c, str):
-                                first_user_text = c
-                            elif isinstance(c, list):
-                                for b in c:
-                                    if isinstance(b, dict) and b.get("type") == "text":
-                                        first_user_text = b.get("text", ""); break
-                            break
-                    sess.bump_session(session_id, message_count=len(all_msgs),
-                                       auto_rename_from=first_user_text or prompt)
-                    sess.update_model(session_id, model_to_use)
-                    limit = MODEL_CONTEXT_LIMITS.get(model_to_use, DEFAULT_CONTEXT_LIMIT)
-                    yield {"event": "done", "data": json.dumps({
-                        "duration_ms": getattr(msg, "duration_ms", None),
-                        "total_cost_usd": cost,
-                        "model": model_to_use,
-                        "stats": _stats,
-                        "turn_usage": {
-                            "input_tokens": in_t,
-                            "output_tokens": out_t,
-                            "cache_read_tokens": cr_t,
-                            "cache_creation_tokens": cc_t,
-                        },
-                        "session_usage": {
-                            **_session_usage[session_id],
-                            "context_limit": limit,
-                            "context_used": in_t + cr_t + cc_t,
-                            "context_used_pct": round((in_t + cr_t + cc_t) / limit * 100, 1) if limit else 0,
-                        },
-                        "budget_usd": _budget_usd(),
-                        "budget_used_pct": (
-                            round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
-                            if _budget_usd() > 0 else 0
-                        ),
-                    })}
+                    async for ev in _handle_result_message(msg):
+                        yield ev
         except asyncio.CancelledError:
             yield {"event": "cancelled", "data": "{}"}
             raise

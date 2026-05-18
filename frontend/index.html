@@ -15,6 +15,11 @@
 <script defer src="/static/vendor/hljs-langs/protobuf.min.js"></script>
 <script defer src="/static/vendor/hljs-langs/accesslog.min.js"></script>
 <script defer src="/static/vendor/hljs-langs/graphql.min.js"></script>
+<!-- i18n + static UI data must load BEFORE app.js (which reads
+     window.MUSELAB_* at module top-level). `defer` preserves order for
+     same-attribute scripts. -->
+<script defer src="/static/i18n/index.js"></script>
+<script defer src="/static/data/constants.js"></script>
 <script defer src="/static/app.js"></script>
 <script defer src="/static/vendor/marked.min.js"></script>
 <script defer src="/static/vendor/purify.min.js"></script>
@@ -73,6 +78,7 @@ window.addEventListener("error", e => {
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
 <defs>
   <symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
   <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
   <symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></symbol>
   <symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
@@ -128,7 +134,8 @@ window.addEventListener("error", e => {
 </defs>
 </svg>
 
-<div id="app" x-data="portal()" x-init="document.getElementById('loading').remove(); init()" x-cloak>
+<div id="app" x-data="portal()" x-init="document.getElementById('loading').remove(); init()"
+     x-effect="document.title = pageTitle()" x-cloak>
 
   <!-- Splash — first load / hard refresh, before initial data arrives -->
   <div class="splash" x-show="!appReady" x-transition.opacity.duration.300ms x-cloak>
@@ -195,11 +202,63 @@ window.addEventListener("error", e => {
         <button x-show="searchMode" @click="clearSearch()" class="icon-btn" :title="lang==='zh'?'清空':'Clear'"><svg><use href="#i-x"/></svg></button>
       </div>
 
-      <!-- 正常树 -->
-      <ul class="filelist" x-show="!searchMode">
+      <!-- "打开的文件" — 当前打开的 preview tab 列表。
+           Row layout: grid (icon · name · ×) — name 中段 truncate，× 不重叠。
+           高度调节：底部 splitter bar（draggable），不依赖 CSS resize 手柄。 -->
+      <div class="open-files" x-show="!searchMode && tabs.length > 0">
+        <div class="open-files-head">
+          <button class="open-files-toggle"
+                  :title="openFilesCollapsed ? (lang==='zh'?'展开':'Expand') : (lang==='zh'?'折叠':'Collapse')"
+                  @click="openFilesCollapsed = !openFilesCollapsed">
+            <svg x-show="!openFilesCollapsed"><use href="#i-chevron-down"/></svg>
+            <svg x-show="openFilesCollapsed"><use href="#i-chevron-right"/></svg>
+          </button>
+          <span class="open-files-label"
+                x-text="(lang==='zh'?'打开的文件 ':'Open ') + '(' + tabs.length + ')'"></span>
+          <button class="open-files-close-all icon-btn sm"
+                  @click="tabs = []; selected = ''; savePrefs()"
+                  :title="lang==='zh'?'关闭全部':'Close all'"><svg><use href="#i-x"/></svg></button>
+        </div>
+        <ul class="open-files-list" x-show="!openFilesCollapsed"
+            :style="openFilesHeight ? `height: ${openFilesHeight}px; max-height: none` : ''">
+          <template x-for="t in tabs" :key="'opf-' + t.path">
+            <li :class="{sel: selected === t.path}"
+                :data-ext="fileExtClass({path: t.path, name: t.name, is_dir: false})"
+                @click="switchTab(t.path)"
+                :title="t.path">
+              <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+              <span class="name" x-text="t.name"></span>
+              <button class="open-files-x"
+                      @click.stop="closeTab(t.path)"
+                      :title="lang==='zh'?'关闭':'Close'">×</button>
+            </li>
+          </template>
+        </ul>
+        <!-- Splitter — drag to resize the list height. -->
+        <div class="open-files-splitter"
+             x-show="!openFilesCollapsed"
+             @mousedown="startOpenFilesResize($event)"
+             :title="lang==='zh'?'拖动调整高度':'Drag to resize'"></div>
+      </div>
+
+      <!-- File tree — wrapped so the root-path bar can sticky at the top of
+           the scrollable area (always visible while user scrolls deep into
+           subdirs). The wrap + bar also act as a visual divider against the
+           "Open files" section above. -->
+      <div class="filelist-wrap" x-show="!searchMode">
+        <div class="filelist-sticky-root"
+             :title="contextInfo.archive_root || ''"
+             @click="copyRootPath()">
+          <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
+          <span class="path" x-text="rootDisplay()"></span>
+        </div>
+      <ul class="filelist">
         <template x-for="n in visible" :key="n.path">
           <li :class="{file: !n.is_dir, dir: n.is_dir, sel: selected===n.path, 'drag-over': dragOver===n.path}"
-              :style="`padding-left:${10 + n.depth*14}px`"
+              :style="`padding-left:${10 + n.depth*14}px; --depth: ${n.depth}`"
+              :data-path="n.path"
+              :data-depth="n.depth"
+              :data-ext="fileExtClass(n)"
               @click="onNodeClick(n)"
               @contextmenu.prevent="openCtxMenu($event, n)"
               @dragover.prevent="n.is_dir && (dragOver=n.path)"
@@ -215,6 +274,7 @@ window.addEventListener("error", e => {
           </li>
         </template>
       </ul>
+      </div>
 
       <!-- 搜索结果 -->
       <div class="search-results" x-show="searchMode">
@@ -284,7 +344,14 @@ window.addEventListener("error", e => {
       <!-- Tab bar (VSCode-style multi-file) -->
       <div class="tab-bar" x-show="tabs.length">
         <template x-for="t in tabs" :key="t.path">
-          <div :class="'tab' + (selected===t.path ? ' active' : '')"
+          <div :class="'tab' + (selected===t.path ? ' active' : '') + (previewDragOverPath===t.path ? ' drag-over' : '')"
+               draggable="true"
+               :data-path="t.path"
+               @dragstart="onPreviewTabDragStart($event, t.path)"
+               @dragover.prevent="onPreviewTabDragOver($event, t.path)"
+               @dragleave="onPreviewTabDragLeave(t.path)"
+               @drop.prevent="onPreviewTabDrop($event, t.path)"
+               @dragend="onPreviewTabDragEnd()"
                @click="switchTab(t.path)"
                @auxclick.prevent="closeTab(t.path)"
                :title="t.path">
@@ -295,7 +362,21 @@ window.addEventListener("error", e => {
         </template>
       </div>
 
-      <div class="preview-body">
+      <div class="preview-body"
+           :class="{ 'drag-hover': previewDragHover }"
+           @dragover.prevent="previewDragHover = true"
+           @dragenter.prevent="previewDragHover = true"
+           @dragleave.prevent="previewDragHover = false"
+           @drop.prevent="onPreviewDrop($event)">
+        <!-- Drag overlay — visible when user drags a file in from OS. -->
+        <div class="preview-drop-overlay" x-show="previewDragHover" x-transition.opacity>
+          <div class="preview-drop-inner">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+            </svg>
+            <div x-text="lang==='zh' ? '放下以上传 / 打开' : 'Drop to upload / open'"></div>
+          </div>
+        </div>
         <div x-show="editing" class="editor-wrap">
           <div x-ref="cmHost" class="editor-cm"></div>
           <div class="editor-status">
@@ -374,7 +455,7 @@ window.addEventListener("error", e => {
              by default, so the "present" state is implicit). When missing,
              clicking opens a help dialog with how-to-fix instructions. -->
         <span class="ctx-chip warn"
-              x-show="!contextInfo.claude_md_exists"
+              x-show="contextInfo._fetched && !contextInfo.claude_md_exists"
               :title="claudeMdChipTitle()"
               @click="openClaudeMdHelp()"
               x-text="lang==='zh' ? '⚠ 未配档案' : '⚠ no archive'"></span>
@@ -389,89 +470,180 @@ window.addEventListener("error", e => {
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
 
-      <!-- Context meter — always visible, even at 0%. Low values render in a
-           muted style so they don't add noise. Compact button only appears at
-           70%+, where the action is actually relevant. -->
-      <div class="ctx-meter"
+      <!-- Hairline progress bar (was the prominent ctx-meter strip). The
+           text + actions moved into the chat-input toolbar below. Bar stays
+           for at-a-glance percentage. Color shifts warn → danger via class. -->
+      <div class="ctx-progress"
            :class="{
-             idle: sessionUsage.context_used_pct < 30,
              warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
              danger: sessionUsage.context_used_pct >= 90,
+             compacting: _compacting,
            }"
            :title="ctxMeterTitle()">
-        <div class="ctx-meter-bar">
-          <div class="ctx-meter-fill" :style="`width: ${Math.min(100, sessionUsage.context_used_pct)}%`"></div>
-        </div>
-        <div class="ctx-meter-text">
-          <span class="ctx-meter-label" x-text="ctxMeterLabel()"></span>
-          <button class="ctx-meter-action"
-                  @click="runCompact()"
-                  x-text="t('ctx.compact_btn')"></button>
-        </div>
+        <div class="ctx-progress-fill"
+             :style="`width: ${Math.min(100, sessionUsage.context_used_pct || 0)}%`"></div>
       </div>
 
-      <div class="session-bar">
-        <!-- Custom session picker — replaces native <select> so each row can
-             have a delete button. Click trigger to open list; click row to
-             switch; click × to delete (with confirm). -->
-        <div class="session-picker" @click.outside="sessionPickerOpen = false" style="flex:1; position: relative;">
-          <button class="session-sel-btn" @click="sessionPickerOpen = !sessionPickerOpen" type="button">
-            <span class="ellipsis"
-                  x-text="(sessions.find(s => s.id === currentId)?.name || (lang==='zh' ? '加载中…' : 'Loading…')) + ' · ' + (sessions.find(s => s.id === currentId)?.message_count ?? 0)"></span>
-            <span class="caret">▾</span>
-          </button>
-          <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
-               class="session-picker-pop">
-            <template x-for="s in sessions" :key="s.id">
-              <div class="session-picker-row" :class="{active: s.id === currentId}"
-                   @click="currentId = s.id; sessionPickerOpen = false; switchSession()">
-                <span class="ellipsis" x-text="s.name"></span>
-                <span class="session-picker-count" x-text="s.message_count"></span>
-                <button class="session-picker-del"
-                        @click.stop="deleteSessionById(s.id)"
-                        :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+      <!-- Context breakdown popup — shows SDK get_context_usage() output
+           with per-category token counts so the user can see which slice
+           (system prompt / tools / memory / messages / mcp) is dominating. -->
+      <div x-show="ctxBreakdown.show"
+           @click.outside="ctxBreakdown.show = false"
+           x-transition.opacity
+           class="ctx-breakdown-pop">
+        <div class="ctx-breakdown-head">
+          <span x-text="lang==='zh' ? 'Context 拆分（SDK 真值）' : 'Context breakdown'"></span>
+          <button class="icon-btn sm"
+                  :title="lang==='zh' ? '关闭' : 'Close'"
+                  @click="ctxBreakdown.show = false">×</button>
+        </div>
+        <div x-show="ctxBreakdown.loading" class="ctx-breakdown-body"
+             x-text="lang==='zh' ? '查询中…' : 'Loading…'"></div>
+        <div x-show="ctxBreakdown.error && !ctxBreakdown.loading"
+             class="ctx-breakdown-body err" x-text="ctxBreakdown.error"></div>
+        <template x-if="ctxBreakdown.data && !ctxBreakdown.loading">
+          <div class="ctx-breakdown-body">
+            <div class="ctx-breakdown-summary"
+                 x-text="((ctxBreakdown.data.totalTokens||0)/1000).toFixed(1) + 'K / ' + ((ctxBreakdown.data.maxTokens||0)/1000).toFixed(0) + 'K (' + (ctxBreakdown.data.percentage||0).toFixed(1) + '%)'"></div>
+            <template x-for="cat in (ctxBreakdown.data.categories || [])" :key="cat.name">
+              <div class="ctx-breakdown-row">
+                <span class="ctx-breakdown-name" x-text="cat.name"></span>
+                <span class="ctx-breakdown-tokens"
+                      x-text="cat.tokens >= 1000
+                                ? (cat.tokens/1000).toFixed(1) + 'K'
+                                : cat.tokens + ''"></span>
               </div>
             </template>
-            <div x-show="sessions.length === 0" class="session-picker-empty"
-                 x-text="lang==='zh' ? '暂无会话' : 'No sessions'"></div>
+            <div class="ctx-breakdown-hint"
+                 x-text="lang==='zh' ? '说明：tools / system prompt 是 Claude Code CLI 内置；memoryFiles 是 CLAUDE.md union；messages 含所有历史 + tool_result' : 'Note: tools / system_prompt are CLI built-in; memoryFiles is CLAUDE.md union; messages include full history + tool results'"></div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Tab strip — like VS Code Claude. Each tab is an open session;
+           click switches, double-click renames inline, right-click opens
+           the context menu (rename / edit prompt / close / delete).
+           The picker on the right is the "history" entry point: clicking a
+           row promotes that session into a tab. -->
+      <!-- Two-container layout: .chat-tabs-list scrolls horizontally when tabs
+           overflow; .chat-tabs-actions stays pinned right (new-session + history
+           picker always visible regardless of how many tabs are open). -->
+      <div class="chat-tabs-wrap">
+        <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
+          <template x-for="tid in openTabIds" :key="tid">
+            <div class="chat-tab" :class="{active: tid === currentId, 'drag-over': tabDragOverId === tid}"
+                 :data-tid="tid"
+                 draggable="true"
+                 @dragstart="onTabDragStart($event, tid)"
+                 @dragover.prevent="onTabDragOver($event, tid)"
+                 @dragleave="onTabDragLeave(tid)"
+                 @drop.prevent="onTabDrop($event, tid)"
+                 @dragend="onTabDragEnd()"
+                 @click="activateTab(tid)"
+                 @dblclick="startRenameTab(tid)"
+                 @contextmenu.prevent="showTabMenu($event, tid)"
+                 @auxclick="onTabAuxClick($event, tid)"
+                 :title="tabTitle(tid)">
+              <span class="chat-tab-stream-dot"
+                    x-show="isTabStreaming(tid)"
+                    :title="lang==='zh' ? '该会话正在生成…' : 'Streaming…'"></span>
+              <!-- x-show, not x-if — keeps both nodes mounted so a blur on the
+                   <input> doesn't unmount the very element dispatching the
+                   event (which trips an Alpine null.node bug). -->
+              <span class="chat-tab-name ellipsis"
+                    x-show="renamingTabId !== tid"
+                    x-text="(sessions.find(s => s.id === tid)?.name) || '…'"></span>
+              <input class="chat-tab-rename-input" type="text" x-model="renameDraft"
+                     :data-tid="tid"
+                     x-show="renamingTabId === tid"
+                     @click.stop @dblclick.stop
+                     @blur="commitRenameTab()"
+                     @keydown.enter.prevent="commitRenameTab()"
+                     @keydown.escape.prevent="cancelRenameTab()" />
+              <!-- Kebab menu — only shown on mobile (CSS @media). Desktop uses
+                   right-click which mobile browsers don't reliably synthesize. -->
+              <button class="chat-tab-kebab" @click="showTabMenu($event, tid)"
+                      :title="lang==='zh' ? '更多操作' : 'More'">⋮</button>
+              <button class="chat-tab-close" @click="closeChatTab(tid, $event)"
+                      :title="lang==='zh' ? '关闭 tab（中键也可）' : 'Close tab (middle-click also)'">×</button>
+            </div>
+          </template>
+        </div>
+        <div class="chat-tabs-actions">
+          <button class="chat-tab-new" @click="newSession()"
+                  :title="t('btn.new_session')">+</button>
+          <!-- History picker — collapses old sessions into a dropdown to avoid
+               a wall of tabs. Clicking a row opens it as a tab via openTab(). -->
+          <div class="session-picker chat-tab-history" @click.outside="sessionPickerOpen = false">
+            <button class="chat-tab-history-btn" @click="toggleHistoryPicker($event)" type="button"
+                    :title="lang==='zh' ? '打开历史会话' : 'Open history session'">
+              <svg><use href="#i-folder"/></svg>
+            </button>
+            <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
+                 class="session-picker-pop"
+                 :style="historyPickerStyle">
+              <input class="session-picker-search"
+                     type="text"
+                     x-model="sessionPickerSearch"
+                     x-ref="sessionPickerSearchInput"
+                     :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
+                     @keydown.escape="sessionPickerOpen = false" />
+              <template x-for="s in filteredSessions()" :key="s.id">
+                <div class="session-picker-row"
+                     :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
+                     @click="pickerOpenSession(s.id)"
+                     @contextmenu.prevent="pickerRowMenu($event, s.id)">
+                  <button class="session-picker-pin"
+                          :class="{ active: s.pinned }"
+                          @click.stop="togglePinSession(s.id)"
+                          :title="s.pinned ? (lang==='zh'?'取消置顶':'Unpin') : (lang==='zh'?'置顶':'Pin to top')">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                      <line x1="12" y1="17" x2="12" y2="22"/>
+                      <path d="M5 17h14l-1.5-5H6.5L5 17z"/>
+                      <path d="M9 12V5h6v7"/>
+                    </svg>
+                  </button>
+                  <span class="ellipsis" x-text="s.name"></span>
+                  <span class="session-picker-count" x-text="s.message_count"></span>
+                  <button class="session-picker-kebab"
+                          @click="pickerRowMenu($event, s.id)"
+                          :title="lang==='zh' ? '更多操作' : 'More'">⋮</button>
+                  <button class="session-picker-del"
+                          @click="pickerDeleteSession(s.id, $event)"
+                          :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+                </div>
+              </template>
+              <div x-show="filteredSessions().length === 0" class="session-picker-empty"
+                   x-text="lang==='zh' ? (sessionPickerSearch ? '没有匹配' : '暂无会话') : (sessionPickerSearch ? 'No match' : 'No sessions')"></div>
+            </div>
           </div>
         </div>
-        <button @click="newSession()" class="icon-btn sm" :title="t('btn.new_session')"><svg><use href="#i-plus"/></svg></button>
-        <button @click="renameSession()" class="icon-btn sm" :title="t('btn.rename')"><svg><use href="#i-edit"/></svg></button>
-        <button @click="editSessionPrompt()" class="icon-btn sm" :title="t('btn.edit_prompt')"><svg><use href="#i-brain"/></svg></button>
-        <button @click="deleteSession()" class="icon-btn sm" :title="t('btn.delete')"><svg><use href="#i-trash"/></svg></button>
       </div>
 
-      <div class="session-bar">
-        <select x-model="model" @change="onModelChange()" style="flex:1">
-          <!-- Fallback option: if the session's model isn't in availableModels
-               yet (e.g. providers list hasn't loaded, or model belongs to a
-               provider whose key got removed), render it as a single option
-               so <select> can correctly display the bound value. Without this
-               the browser falls back to the first option visually but x-model
-               still carries the bound value → display vs reality mismatch. -->
-          <template x-if="model && !availableModels.some(m => m.model === model)">
-            <option :value="model" x-text="model"></option>
-          </template>
-          <template x-for="grp in modelGroups()" :key="grp.name">
-            <optgroup :label="grp.name">
-              <template x-for="m in grp.items" :key="m.model">
-                <option :value="m.model" x-text="m.label"></option>
-              </template>
-            </optgroup>
-          </template>
-        </select>
-        <select x-model="permission" :title="t('set.label.default_permission')" style="flex:1">
-          <option value="bypassPermissions">bypass</option>
-          <option value="acceptEdits">acceptEdits</option>
-          <option value="default">default</option>
-          <option value="plan">plan</option>
-        </select>
-        <label class="chk" :title="lang==='zh'?'显示推理过程':'Show reasoning'"><input type="checkbox" x-model="showThinking"> <span class="icon" style="color:#9ab2d6"><svg><use href="#i-brain"/></svg></span></label>
-      </div>
+      <!-- Tab context menu (right-click). Stored in `tabCtxMenu` to avoid
+           clashing with the file-tree's `ctxMenu` data (different shape). -->
+      <template x-if="tabCtxMenu">
+        <div class="tab-ctx-menu"
+             :style="tabCtxMenuStyle()"
+             @click.outside="closeTabMenu()"
+             @keydown.escape.window="closeTabMenu()">
+          <button @click="menuRename(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '重命名' : 'Rename'"></button>
+          <button @click="menuEditPrompt(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '编辑 system prompt' : 'Edit system prompt'"></button>
+          <button @click="menuClose(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '关闭 tab' : 'Close tab'"></button>
+          <hr/>
+          <button class="danger" @click="menuDelete(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '删除会话' : 'Delete session'"></button>
+        </div>
+      </template>
+
+      <!-- The legacy .session-bar (model + permission + thinking selectors)
+           moved to the chat-input toolbar at the bottom (VSCode-style). -->
 
       <div class="chat-scroll-wrap">
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()">
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @click="onChatClick($event)">
           <div x-show="!messages.length" class="brand-empty chat-empty">
             <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
               <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
@@ -487,14 +659,14 @@ window.addEventListener("error", e => {
                  2. no CLAUDE.md     → "Muse doesn't know you yet"
                  3. archive empty    → "Drop your first document"
                  4. all set          → suggested first questions / skill chips -->
-            <template x-if="!contextInfo.has_any_provider">
+            <template x-if="contextInfo._fetched && !contextInfo.has_any_provider">
               <div class="onboard-card warn">
                 <div class="onboard-card-title" x-text="t('onboard.no_provider_title')"></div>
                 <div class="onboard-card-body" x-text="t('onboard.no_provider_body')"></div>
                 <button class="btn-primary" @click="openSettings()" x-text="t('onboard.no_provider_cta')"></button>
               </div>
             </template>
-            <template x-if="contextInfo.has_any_provider && !contextInfo.claude_md_exists">
+            <template x-if="contextInfo._fetched && contextInfo.has_any_provider && !contextInfo.claude_md_exists">
               <div class="onboard-card warn">
                 <div class="onboard-card-title" x-text="t('onboard.no_claude_md_title')"></div>
                 <div class="onboard-card-body" x-text="t('onboard.no_claude_md_body')"></div>
@@ -547,7 +719,7 @@ window.addEventListener("error", e => {
               <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
             </div>
           </div>
-          <template x-for="(m,i) in messages" :key="m._k || (currentId + '-' + i)">
+          <template x-for="(m,i) in messages" :key="m._k || ((currentId || 'init') + '-' + i)">
             <div :class="'msg ' + m.role">
               <!-- Compact-summary pill: SDK returns the post-/compact summary as
                    a regular user/assistant message; we mark its UUID via the
@@ -558,8 +730,16 @@ window.addEventListener("error", e => {
               <div x-show="m._is_compact_summary" class="compact-summary-pill">
                 <span x-text="lang==='zh' ? '📦 上方对话已压缩 · 以下为摘要' : '📦 Conversation compacted · summary below'"></span>
               </div>
-              <div x-show="m.role==='user'" class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
-              <div x-show="m.role==='assistant'" class="bubble" x-html="m.html"></div>
+              <div x-show="m.role==='user'" class="msg-row">
+                <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
+                <div class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" @click="openLightbox(im.preview)" :title="lang==='zh'?'点击放大':'Click to enlarge'" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
+              </div>
+              <div x-show="m.role==='assistant'" class="msg-row">
+                <span class="msg-avatar assistant-avatar" :title="mascotLabel()">
+                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                </span>
+                <div class="bubble" x-html="m.html"></div>
+              </div>
             <div x-show="m.role==='assistant' && m.model" class="model-tag"
                  :title="m.model"
                  x-text="modelLabel(m.model)"></div>
@@ -616,15 +796,34 @@ window.addEventListener("error", e => {
                   <span x-show="m.name==='Skill'" class="tool-prefix-icon">🧩</span>
                   <span x-text="renderToolName(m.name)"></span>
                 </span>
-                <span class="tool-arg" x-text="m.summary"></span>
+                <template x-if="toolFilePath(m)">
+                  <a class="tool-arg file-link" href="#"
+                     :data-path="toolFilePath(m)"
+                     :title="toolFilePath(m)"
+                     x-text="toolFilePath(m)"></a>
+                </template>
+                <template x-if="!toolFilePath(m)">
+                  <span class="tool-arg" x-text="m.summary"></span>
+                </template>
               </div>
-              <div x-show="m.role==='tool_result'" :class="'tool-result' + (m.is_error?' err':'')">
+              <div x-show="m.role==='tool_result'"
+                   :class="toolResultClass(i, m)"
+                   @click="toggleMsgExpanded(m)"
+                   :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
                 <pre x-text="m.preview"></pre>
+                <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
+                      x-text="toolResultSummary(m)"></span>
               </div>
               <!-- Inline system note (e.g. "model switched to X") — small, centered. -->
               <div x-show="m.role==='system_note'" class="sys-note" x-text="m.text"></div>
-              <div x-show="m.role==='thinking'" class="thinking">
-                <span class="thinking-label"><span class="icon"><svg><use href="#i-brain"/></svg></span>thinking</span>
+              <div x-show="m.role==='thinking'"
+                   :class="thinkingClass(i, m)"
+                   @click="toggleMsgExpanded(m)"
+                   :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
+                <span class="thinking-label"><span class="icon"><svg><use href="#i-brain"/></svg></span>thinking
+                  <span x-show="!isMsgExpanded(i, m)" class="thinking-preview"
+                        x-text="thinkingPreview(m)"></span>
+                </span>
                 <pre x-text="m.text"></pre>
               </div>
               <!-- Muse asks user a structured question (mcp__muselab__ask_user_question).
@@ -692,19 +891,39 @@ window.addEventListener("error", e => {
                 </div>
               </div></template>
               <div class="msg-actions" x-show="m.role==='assistant' || m.role==='user'">
-                <button @click="copyMsg(m)" class="icon-btn sm" :title="lang==='zh'?'复制':'Copy'"><svg><use href="#i-copy"/></svg></button>
+                <button @click="copyMsg(m)" class="icon-btn sm"
+                        :class="{ 'copied-flash': m._copied }"
+                        :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
+                  <svg x-show="!m._copied"><use href="#i-copy"/></svg>
+                  <svg x-show="m._copied"><use href="#i-check"/></svg>
+                </button>
+                <button x-show="m.role==='user' && m._failed"
+                        @click="retryFailedMessage(m)" class="icon-btn sm retry-btn"
+                        :title="lang==='zh' ? '重试发送' : 'Retry'">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/>
+                  </svg>
+                </button>
               </div>
-              <div x-show="m.cost" class="meta" x-text="m.cost"></div>
+              <!-- Per-message cost annotation removed 2026-05-18: SDK's
+                   ResultMessage.total_cost_usd is cumulative-per-session, so
+                   each row showing "$X" was misleading (felt wrong because
+                   it was). Total cost still in /cost slash + session usage. -->
             </div>
           </template>
           <div x-show="streaming" class="msg assistant">
-            <div class="bubble pending">
-              <span class="thinking-dots"><span></span><span></span><span></span></span>
-              <span class="thinking-label">
-                <span x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
-                <span x-show="streamElapsed > 1" class="stream-elapsed"
-                      x-text="' · ' + streamElapsed.toFixed(1) + 's'"></span>
+            <div class="msg-row">
+              <span class="msg-avatar assistant-avatar" :title="mascotLabel()">
+                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
               </span>
+              <div class="bubble pending">
+                <span class="thinking-dots"><span></span><span></span><span></span></span>
+                <span class="thinking-label">
+                  <span x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
+                  <span x-show="streamElapsed > 1" class="stream-elapsed"
+                        x-text="' · ' + streamElapsed.toFixed(1) + 's'"></span>
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -729,11 +948,12 @@ window.addEventListener("error", e => {
           <div class="mention-hint" x-html="lang==='zh' ? '<span class=&quot;kbd&quot;>↑↓</span> 选 · <span class=&quot;kbd&quot;>Enter</span> 插入 · <span class=&quot;kbd&quot;>Esc</span> 关' : '<span class=&quot;kbd&quot;>↑↓</span> nav · <span class=&quot;kbd&quot;>Enter</span> insert · <span class=&quot;kbd&quot;>Esc</span> close'"></div>
           <template x-for="(f, i) in mentionResults" :key="f.path">
             <div :class="'mention-item ' + (mentionIdx===i?'sel':'')"
+                 :title="f.path"
                  @mousedown.prevent="pickMention(i)" @mouseenter="mentionIdx=i">
               <span class="icon"><svg><use :href="iconRef(f)"/></svg></span>
               <div class="body">
-                <div class="name" x-text="f.name"></div>
-                <div class="path-hint" x-text="f.path"></div>
+                <div class="name ellipsis" x-text="f.name"></div>
+                <div class="path-hint ellipsis" x-text="f.path"></div>
               </div>
             </div>
           </template>
@@ -767,8 +987,11 @@ window.addEventListener("error", e => {
             </div>
           </template>
         </div>
-        <!-- Horizontal row: attach button (left) + textarea + send/stop (right). -->
-        <div class="chat-input-row"
+        <!-- VSCode-Claude–style layout:
+             row 1: textarea (full width, no neighbors)
+             row 2: bottom toolbar with all controls — attach / model /
+                    permission / thinking / ctx chip / send -->
+        <div class="chat-input-wrap"
              @dragover.prevent="dragHover=true"
              @dragleave="dragHover=false"
              @drop.prevent="dragHover=false; onAttachDrop($event)"
@@ -776,25 +999,85 @@ window.addEventListener("error", e => {
           <input type="file" x-ref="attachInput"
                  accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,text/x-python,text/x-yaml,text/x-toml,text/x-shellscript,text/javascript,text/typescript,text/html,text/css,text/xml,.md,.markdown,.txt,.csv,.json,.yaml,.yml,.toml,.py,.sh,.js,.ts,.tsx,.jsx,.html,.css,.xml,.log,.ini,.conf"
                  multiple style="display:none" @change="onAttachPicked($event)" />
-          <button @click="$refs.attachInput.click()" class="chat-attach-btn"
-                  :disabled="streaming" :title="t('attach.title')">
-            <svg><use href="#i-paperclip"/></svg>
-          </button>
           <textarea x-model="input" x-ref="chatInput"
+                    class="chat-input-textarea"
                     @keydown.enter.prevent.stop="onEnter($event)"
                     @keydown.escape="mentionShow=false; slashShow=false"
-                    @keydown.up="(mentionShow || slashShow) && _navPop(-1) && $event.preventDefault()"
+                    @keydown.up="onChatArrowUp($event)"
                     @keydown.down="(mentionShow || slashShow) && _navPop(1) && $event.preventDefault()"
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
                     :placeholder="t('chat.placeholder')" :disabled="streaming"></textarea>
-          <div class="chat-btns">
+          <div class="chat-toolbar">
+            <!-- Attach button -->
+            <button @click="$refs.attachInput.click()"
+                    class="chat-toolbar-btn"
+                    :disabled="streaming" :title="t('attach.title')">
+              <svg><use href="#i-paperclip"/></svg>
+            </button>
+            <!-- Model selector -->
+            <select x-model="model" @change="onModelChange()"
+                    class="chat-toolbar-select"
+                    :title="lang==='zh' ? '切换模型' : 'Switch model'">
+              <template x-if="model && !availableModels.some(m => m.model === model)">
+                <option :value="model" x-text="model"></option>
+              </template>
+              <template x-for="grp in modelGroups()" :key="grp.name">
+                <optgroup :label="grp.name">
+                  <template x-for="m in grp.items" :key="m.model">
+                    <option :value="m.model" x-text="m.label"></option>
+                  </template>
+                </optgroup>
+              </template>
+            </select>
+            <!-- Permission mode -->
+            <select x-model="permission" class="chat-toolbar-select"
+                    :title="t('set.label.default_permission')">
+              <option value="bypassPermissions">bypass</option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="default">default</option>
+              <option value="plan">plan</option>
+            </select>
+            <!-- Thinking toggle -->
+            <button @click="showThinking = !showThinking"
+                    class="chat-toolbar-btn"
+                    :class="{ active: showThinking }"
+                    :title="lang==='zh' ? '显示推理过程' : 'Show reasoning'">
+              <svg><use href="#i-brain"/></svg>
+            </button>
+            <!-- Context ring — tiny SVG donut showing pct used. Click for
+                 SDK breakdown popup; title carries the numbers for hover. -->
+            <button class="chat-toolbar-ring"
+                    :class="{
+                      warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
+                      danger: sessionUsage.context_used_pct >= 90,
+                    }"
+                    @click="showCtxBreakdown()"
+                    :title="ctxRingTitle()">
+              <svg viewBox="0 0 20 20" width="18" height="18">
+                <circle cx="10" cy="10" r="7" fill="none"
+                        stroke="var(--c-bg-4)" stroke-width="2.5"/>
+                <circle cx="10" cy="10" r="7" fill="none"
+                        stroke="currentColor" stroke-width="2.5"
+                        stroke-linecap="round"
+                        stroke-dasharray="43.98"
+                        :stroke-dashoffset="43.98 * (1 - Math.min(100, sessionUsage.context_used_pct||0) / 100)"
+                        transform="rotate(-90 10 10)"/>
+              </svg>
+            </button>
+            <!-- Compact button — only when > 70% -->
+            <button x-show="sessionUsage.context_used_pct >= 70 && !_compacting"
+                    class="chat-toolbar-btn warn"
+                    @click="runCompact()"
+                    x-text="t('ctx.compact_btn')"></button>
+            <span class="chat-toolbar-spacer"></span>
+            <!-- Send / Stop -->
             <button x-show="!streaming" @click="send()"
                     :disabled="!input.trim() && !pendingImages.length && !pendingDocs.length"
-                    class="btn-primary" :title="t('btn.send')">
+                    class="btn-primary chat-toolbar-send" :title="t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
             </button>
-            <button x-show="streaming" @click="stop()" class="btn-danger" :title="t('btn.stop') + ' (Esc)'">
+            <button x-show="streaming" @click="stop()" class="btn-danger chat-toolbar-send" :title="t('btn.stop') + ' (Esc)'">
               <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
             </button>
           </div>
@@ -822,6 +1105,18 @@ window.addEventListener("error", e => {
 
   </div>
 
+  <!-- ============ Image lightbox ============ -->
+  <div class="lightbox"
+       x-show="lightbox.show"
+       x-transition.opacity
+       @click="lightbox.show = false"
+       @keydown.escape.window="lightbox.show = false">
+    <img :src="lightbox.src" class="lightbox-img" @click.stop alt="" />
+    <button class="lightbox-close"
+            :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'"
+            @click.stop="lightbox.show = false">×</button>
+  </div>
+
   <!-- ============ Toast ============ -->
   <div class="toast-stack">
     <template x-for="t in toasts" :key="t.id">
@@ -833,7 +1128,11 @@ window.addEventListener("error", e => {
           <svg x-show="!t.type || t.type==='info'"><use href="#i-info"/></svg>
         </span>
         <div class="body" x-text="t.msg"></div>
-        <button class="close" @click="dismissToast(t.id)"><svg style="width:14px;height:14px"><use href="#i-x"/></svg></button>
+        <button x-show="t.action" class="toast-action"
+                @click="runToastAction(t)" x-text="t.action && t.action.label"></button>
+        <button class="close"
+                :title="lang==='zh' ? '关闭' : 'Dismiss'"
+                @click="dismissToast(t.id)"><svg style="width:14px;height:14px"><use href="#i-x"/></svg></button>
       </div>
     </template>
   </div>
@@ -896,6 +1195,18 @@ window.addEventListener("error", e => {
         </div>
 
         <div class="settings-section">
+          <div class="settings-section-title"
+               x-text="lang==='zh' ? '我的档案' : 'My profile'"></div>
+          <div class="settings-hint"
+               x-text="lang==='zh' ? 'CLAUDE.md 是 Muse 启动时读的「关于你」档案。改完不用重启 muselab，下条消息自动用新内容。' : 'CLAUDE.md is the profile Muse reads on startup. Edits take effect on the next message — no restart needed.'"></div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '当前项目 (ROOT/CLAUDE.md)' : 'Project (ROOT/CLAUDE.md)'"></label>
+            <button class="btn-ghost sm" @click="openMyArchiveFile()"
+                    x-text="lang==='zh' ? '打开编辑' : 'Open & edit'"></button>
+          </div>
+        </div>
+
+        <div class="settings-section">
           <div class="settings-section-title" x-text="t('set.sec.provider')"></div>
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
           <template x-for="p in settings.providers" :key="p.env_key">
@@ -949,15 +1260,6 @@ window.addEventListener("error", e => {
           </div>
         </div>
 
-        <div class="settings-section">
-          <div class="settings-section-title" x-text="t('set.sec.sessions')"></div>
-          <div class="settings-row">
-            <label x-text="t('set.sessions.cleanup_label')"></label>
-            <button class="btn-ghost sm" @click="cleanupEmptySessions()"
-                    x-text="t('set.sessions.cleanup_btn')"></button>
-          </div>
-        </div>
-
         <!-- Versions + upgrade — shows current vs latest SDK / CLI, one-click bump. -->
         <div class="settings-section">
           <div class="settings-section-title">
@@ -988,6 +1290,11 @@ window.addEventListener("error", e => {
                             x-text="lang==='zh' ? '有更新' : 'update'"></span>
                       <span x-show="!settings.versions.sdk_upgrade_available && settings.versions.current?.sdk" class="upgrade-badge ok"
                             x-text="lang==='zh' ? '最新' : 'latest'"></span>
+                      <button x-show="settings.versions.sdk_upgrade_available"
+                              class="btn-ghost xs"
+                              :disabled="settings.upgradeRunning"
+                              @click="runUpgrade('sdk')"
+                              x-text="lang==='zh' ? '升级' : 'Upgrade'"></button>
                     </td>
                   </tr>
                   <tr>
@@ -1013,6 +1320,11 @@ window.addEventListener("error", e => {
                             x-text="lang==='zh' ? '最新' : 'latest'"></span>
                       <span x-show="!settings.versions.current?.system_cli" class="upgrade-badge ok"
                             x-text="lang==='zh' ? '可不装' : 'optional'"></span>
+                      <button x-show="settings.versions.system_cli_upgrade_available"
+                              class="btn-ghost xs"
+                              :disabled="settings.upgradeRunning"
+                              @click="runUpgrade('cli')"
+                              x-text="lang==='zh' ? '升级' : 'Upgrade'"></button>
                     </td>
                   </tr>
                   <tr>
@@ -1031,8 +1343,8 @@ window.addEventListener("error", e => {
               <div class="settings-row" style="margin-top: 10px;">
                 <button class="btn-primary sm" @click="runUpgrade()"
                         :disabled="settings.upgradeRunning ||
-                                    (!settings.versions.sdk_upgrade_available && !settings.versions.cli_upgrade_available)"
-                        x-text="settings.upgradeRunning ? (lang==='zh' ? '升级中… (可能需要 30s)' : 'Upgrading… (30s)') : (lang==='zh' ? '一键升级' : 'Upgrade now')"></button>
+                                    (!settings.versions.sdk_upgrade_available && !settings.versions.system_cli_upgrade_available)"
+                        x-text="settings.upgradeRunning ? (lang==='zh' ? '升级中… (可能需要 30s)' : 'Upgrading… (30s)') : (lang==='zh' ? '一键全部升级' : 'Upgrade all')"></button>
               </div>
               <template x-if="settings.upgradeResult">
                 <div class="upgrade-result" :class="{ ok: settings.upgradeResult.ok, err: !settings.upgradeResult.ok }">

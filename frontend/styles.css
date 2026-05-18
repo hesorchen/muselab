@@ -181,6 +181,9 @@ button.btn-danger { background: var(--c-danger); border-color: var(--c-danger); 
 button.btn-danger:hover { background: var(--c-danger-hover); }
 button.btn-ghost { background: transparent; border-color: transparent; color: var(--c-fg-2); }
 button.btn-ghost:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+button.btn-ghost.xs, button.btn-primary.xs {
+  padding: 2px 8px; font-size: var(--fs-xs); margin-left: 6px;
+}
 button:disabled { opacity: 0.35; cursor: not-allowed; }
 
 a { color: var(--c-accent); text-decoration: none; }
@@ -320,14 +323,21 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 .layout {
   display: grid;
   grid-template-columns: 280px 1fr 440px;
+  /* dvh = dynamic viewport height — matches the actually-visible area on
+     mobile Safari (where the address bar collapses/expands), preventing the
+     chat input from getting hidden behind browser chrome. Falls back to vh
+     in browsers that don't support dvh. */
   grid-template-rows: 100vh;
-  height: 100vh; width: 100vw; overflow: hidden;
+  grid-template-rows: 100dvh;
+  height: 100vh; height: 100dvh;
+  width: 100vw; overflow: hidden;
 }
 .pane {
   display: flex; flex-direction: column;
   border-right: 1px solid var(--c-border);
   min-width: 0; min-height: 0;
-  height: 100vh; overflow: hidden;
+  height: 100vh; height: 100dvh;
+  overflow: hidden;
   background: var(--c-bg-1);
 }
 .pane:last-child { border-right: 0; }
@@ -374,8 +384,8 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .layout .resizer { display: none; }
   /* Show the tab bar */
   .mobile-tab-bar { display: flex; }
-  /* Pane height: viewport - tab bar */
-  .pane { height: calc(100vh - 52px); }
+  /* Pane height: viewport - tab bar. dvh for mobile Safari address-bar collapse. */
+  .pane { height: calc(100vh - 52px); height: calc(100dvh - 52px); }
   /* Chat textarea / context meter / session bar sometimes overflow on tiny
      screens — trim padding so they fit. */
   .session-bar { padding: 6px var(--sp-1); gap: 4px; min-height: 36px; }
@@ -386,6 +396,64 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .login input { width: calc(100% - 32px); max-width: 320px; }
   /* Tabs in preview pane — already scrollable horizontally; force on mobile */
   .tab-bar { overflow-x: auto; }
+
+  /* ===== Chat tab strip — mobile tuning ===== */
+  .chat-tabs {
+    /* Squeezing into a narrow viewport — tighter padding, smaller height. */
+    padding: 0 2px;
+    min-height: 32px;
+  }
+  .chat-tab {
+    max-width: 140px; min-width: 56px;
+    padding: 0 4px 0 8px;
+    font-size: var(--fs-xs);
+    gap: 4px;
+  }
+  .chat-tab-name { padding: 6px 0; }
+  /* Touch devices have no hover — keep × always visible so the user can
+     actually close a tab. */
+  .chat-tab-close { opacity: 0.9; width: 26px; height: 26px; }
+  .chat-tab-close:active { opacity: 1; background: var(--c-bg-3); }
+  /* Show the kebab on mobile (replaces desktop right-click for opening
+     the per-tab action menu). */
+  .chat-tab-kebab {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 26px;
+  }
+  .chat-tab-kebab:active { background: var(--c-bg-3); }
+  .session-picker-kebab {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px;
+    color: var(--c-fg-2);
+  }
+  .session-picker-kebab:active { background: var(--c-bg-3); }
+  /* Make sure chat-tabs strip doesn't grow vertically and squeeze chat-body. */
+  .chat-tabs { flex-shrink: 0; }
+  .chat-tab-new { padding: 0 8px; font-size: 16px; }
+  .chat-tab-history-btn { padding: 0 8px; }
+  .chat-tab-history-btn svg { width: 14px; height: 14px; }
+
+  /* History popup position is set inline by JS — but cap the height on
+     mobile so it doesn't overlap the bottom tab bar. */
+  .chat-tab-history .session-picker-pop { max-height: 50vh; }
+  .session-picker-row { padding: 10px 12px; }   /* easier tap target */
+
+  /* Right-click / long-press context menu — bigger buttons for touch. */
+  .tab-ctx-menu { min-width: 200px; }
+  .tab-ctx-menu button { padding: 10px 16px; }
+
+  /* Ctx meter and pane heads breathe less on phones */
+  .ctx-meter { padding: 4px 8px; }
+  .pane.chat .pane-head { gap: 4px; }
+
+  /* Chat input area — keep input large enough to tap, send button reachable */
+  .chat-input-wrap { padding: 8px; }
+}
+@media (hover: none) {
+  /* On touch (incl. tablets with hover:none) the × button should be visible
+     without requiring hover. Mirrors the same rule we added under 900px. */
+  .chat-tab-close { opacity: 0.6; }
+  .chat-tab-close:active { opacity: 1; }
 }
 @media (max-width: 480px) {
   /* Phones — hide some header chips that crowd the chat header */
@@ -442,16 +510,161 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 }
 .searchbar-icon svg { width: 14px; height: 14px; }
 
+/* Filetree wrapper — owns the scroll area. The sticky root row sits at the
+   top of this scroll area so it stays visible no matter how deep into the
+   tree the user has scrolled. Also doubles as the visual divider against
+   the "Open files" section above. */
+.filelist-wrap {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.filelist-sticky-root {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-2);
+  background: var(--c-bg-1);
+  /* Strong divider so the boundary between the (transient) open-files area
+     and the (persistent) tree is unmistakable. */
+  border-bottom: 1px solid var(--c-border-strong);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+  flex-shrink: 0;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  position: sticky; top: 0; z-index: 2;
+}
+.filelist-sticky-root:hover { background: var(--c-bg-2); color: var(--c-fg-0); }
+.filelist-sticky-root .icon { display: inline-flex; color: var(--c-accent); flex-shrink: 0; }
+.filelist-sticky-root .path { overflow: hidden; text-overflow: ellipsis; }
+
+/* "Open files" section — list shrink-wraps content by default (1 file = 1
+   row tall, 2 = 2 rows, ...). max-height kicks in at 5 rows + enables
+   scroll. User dragging the splitter sets an inline `height` on the
+   .open-files-list which wins over max-height. */
+.open-files {
+  display: flex; flex-direction: column;
+  border-bottom: 2px solid var(--c-border-strong);   /* hard divider vs tree */
+  background: var(--c-bg-1);
+  font-size: var(--fs-sm);
+  flex-shrink: 0;
+}
+.open-files-head {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 8px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+}
+.open-files-toggle {
+  background: none; border: 0; padding: 2px; cursor: pointer;
+  color: var(--c-fg-3); display: inline-flex; align-items: center;
+}
+.open-files-toggle svg { width: 10px; height: 10px; }
+.open-files-label { flex: 1; }
+.open-files-close-all { width: 18px; height: 18px; }
+.open-files-close-all svg { width: 10px; height: 10px; }
+.open-files-list {
+  list-style: none; margin: 0; padding: 2px 0;
+  /* `flex: 0 0 auto` so the list shrink-wraps content (1 file → 1 row,
+     2 → 2 rows, …). `flex: 1` previously made it grow uncapped in an
+     auto-height parent and max-height was silently ignored. Cap at 5 rows;
+     beyond that the inner scrollbar takes over. User dragging the splitter
+     sets inline `height: Npx; max-height: none` which wins. */
+  flex: 0 0 auto;
+  max-height: calc(28px * 5);
+  overflow-y: auto;
+}
+/* Match the unobtrusive scrollbar style of the tab strips. */
+.open-files-list { scrollbar-width: thin; scrollbar-color: rgba(128,128,128,0.25) transparent; }
+.open-files-list:hover { scrollbar-color: var(--c-fg-4) transparent; }
+.open-files-list::-webkit-scrollbar { width: 6px; }
+.open-files-list::-webkit-scrollbar-track { background: transparent; }
+.open-files-list::-webkit-scrollbar-thumb {
+  background: transparent; border-radius: 3px;
+  transition: background var(--t-fast);
+}
+.open-files-list:hover::-webkit-scrollbar-thumb { background: var(--c-fg-4); }
+.open-files-list:hover::-webkit-scrollbar-thumb:hover { background: var(--c-fg-3); }
+/* Row layout: 3-column grid — icon (auto) · name (1fr ellipsis) · × (auto).
+   Replaces the prior flex layout where the .name (flex:1) + absolutely-tiny
+   .open-files-x button visually overlapped on narrow widths. */
+.open-files-list li {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 18px;
+  align-items: center; gap: 6px;
+  padding: 4px 8px 4px 22px;
+  cursor: pointer;
+  color: var(--c-fg-1);
+}
+.open-files-list li:hover { background: var(--c-bg-2); }
+.open-files-list li.sel {
+  background: var(--c-bg-3); color: var(--c-fg-0);
+}
+.open-files-list li .icon { color: var(--c-fg-2); display: flex; align-items: center; }
+.open-files-list li .icon svg { width: 13px; height: 13px; }
+.open-files-list li .name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0;
+}
+.open-files-x {
+  background: transparent; border: 0; cursor: pointer;
+  color: var(--c-fg-3); width: 18px; height: 18px;
+  padding: 0; line-height: 16px;
+  border-radius: var(--r-sm);
+}
+.open-files-x:hover { background: var(--c-bg-4); color: var(--c-fg-0); }
+/* Splitter bar at bottom — drag to resize the entire .open-files section.
+   Subtle by default, accent on hover/drag. 4px hit area on a 1px visual
+   line gives a comfortable target without taking real estate. */
+.open-files-splitter {
+  height: 4px; cursor: ns-resize;
+  background: var(--c-border);
+  flex-shrink: 0;
+  transition: background var(--t-fast);
+}
+.open-files-splitter:hover,
+.open-files-splitter.active { background: var(--c-accent); }
+/* Reuse extension tinting from .filelist — keep colors consistent across
+   the two lists. */
+.open-files-list li[data-ext="doc"]     .icon { color: #6093ff; }
+.open-files-list li[data-ext="py"]      .icon { color: #3776ab; }
+.open-files-list li[data-ext="js"]      .icon { color: #f7df1e; }
+.open-files-list li[data-ext="ts"]      .icon { color: #3178c6; }
+.open-files-list li[data-ext="config"]  .icon { color: #d6b370; }
+.open-files-list li[data-ext="web"]     .icon { color: #e34c26; }
+.open-files-list li[data-ext="image"]   .icon { color: #b07cf2; }
+.open-files-list li[data-ext="pdf"]     .icon { color: #dc3545; }
+.open-files-list li.sel .icon,
+.open-files-list li:hover .icon { color: var(--c-accent) !important; }
+
 .filelist {
   list-style: none; margin: 0; padding: var(--sp-1) 0;
   overflow-y: auto; flex: 1;
 }
 .filelist li {
   display: flex; align-items: center; gap: var(--sp-1);
-  padding: 4px 10px; min-height: 26px;
+  /* VSCode-tight: was 26px → 22px. Saves vertical space, matches what
+     users expect from a file tree. */
+  padding: 2px 10px; min-height: 22px;
   cursor: pointer; user-select: none;
   color: var(--c-fg-1);
   transition: background var(--t-fast);
+  position: relative;
+}
+/* Indent guide — single vertical line at the current depth so nested files
+   feel anchored to their parent. Hidden at depth 0 (top-level has no parent
+   to point to). 50% opacity keeps it subtle. */
+.filelist li[data-depth]:not([data-depth="0"])::before {
+  content: ""; position: absolute;
+  left: calc(var(--depth, 0) * 14px + 7px);
+  top: 0; bottom: 0; width: 1px;
+  background: var(--c-border);
+  opacity: 0.5; pointer-events: none;
 }
 .filelist li:hover { background: var(--c-bg-2); }
 .filelist li.sel {
@@ -464,6 +677,28 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 .filelist .caret svg { width: 11px; height: 11px; }
 .filelist .icon { color: var(--c-fg-2); transition: color var(--t-fast); }
 .filelist li:hover .icon { color: var(--c-accent); }   /* hover 行图标变主色 */
+/* Per-extension icon tinting — quick visual disambiguation without expanding
+   the SVG sprite. data-ext is set by fileExtClass(). Tints are subtle:
+   sel / hover state still overrides via inherited color → accent. */
+.filelist li[data-ext="doc"]      .icon { color: #6093ff; }
+.filelist li[data-ext="py"]       .icon { color: #3776ab; }
+.filelist li[data-ext="js"]       .icon { color: #f7df1e; }
+.filelist li[data-ext="ts"]       .icon { color: #3178c6; }
+.filelist li[data-ext="compiled"] .icon { color: #00ad8f; }
+.filelist li[data-ext="cstyle"]   .icon { color: #5b9bd5; }
+.filelist li[data-ext="shell"]    .icon { color: #9aa0a6; }
+.filelist li[data-ext="config"]   .icon { color: #d6b370; }
+.filelist li[data-ext="web"]      .icon { color: #e34c26; }
+.filelist li[data-ext="image"]    .icon { color: #b07cf2; }
+.filelist li[data-ext="pdf"]      .icon { color: #dc3545; }
+.filelist li[data-ext="archive"]  .icon { color: #8e8e8e; }
+.filelist li[data-ext="data"]     .icon { color: #34a853; }
+.filelist li[data-ext="audio"]    .icon { color: #c084fc; }
+.filelist li[data-ext="video"]    .icon { color: #f87171; }
+.filelist li[data-ext="log"]      .icon { color: #fcd34d; }
+/* Selected / hover still overrides — keeps the active row's color unified. */
+.filelist li.sel .icon,
+.filelist li:hover .icon { color: var(--c-accent) !important; }
 .filelist .name {
   flex: 1; font-size: var(--fs-base);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -511,8 +746,22 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   display: flex; align-items: stretch;
   background: var(--c-bg-1); border-bottom: 1px solid var(--c-border);
   overflow-x: auto; flex-shrink: 0;
+  min-width: 0; max-width: 100%;
+  /* Overlay-style scrollbar — invisible at rest, fades in on hover. Matches
+     .chat-tabs-list so both tab strips feel the same. */
   scrollbar-width: thin;
+  scrollbar-color: rgba(128,128,128,0.25) transparent;
 }
+.tab-bar:hover { scrollbar-color: var(--c-fg-4) transparent; }
+.tab-bar::-webkit-scrollbar { height: 3px; }
+.tab-bar::-webkit-scrollbar-track { background: transparent; }
+.tab-bar::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+  transition: background var(--t-fast);
+}
+.tab-bar:hover::-webkit-scrollbar-thumb { background: var(--c-fg-4); }
+.tab-bar:hover::-webkit-scrollbar-thumb:hover { background: var(--c-fg-3); }
 .tab {
   display: flex; align-items: center; gap: 6px;
   padding: 6px 10px 6px 12px; max-width: 200px;
@@ -529,6 +778,13 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   border-bottom: 2px solid var(--c-accent); padding-bottom: 4px;
 }
 .tab.active .icon { color: var(--c-accent); }
+/* Drag-over hint — matches chat-tab.drag-over: 2px accent bar at the leading
+   edge marks the insertion point as the cursor crosses tabs during reorder. */
+.tab.drag-over::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 2px; background: var(--c-accent);
+}
+.tab { position: relative; }
 .tab .icon { color: inherit; }
 .tab .icon svg { width: 13px; height: 13px; }
 .tab .tab-name { overflow: hidden; text-overflow: ellipsis; }
@@ -629,6 +885,21 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
    Preview pane
    ========================================================================== */
 .preview-body { flex: 1; overflow: auto; position: relative; background: var(--c-bg-0); }
+.preview-body.drag-hover { outline: 2px dashed var(--c-accent); outline-offset: -8px; }
+.preview-drop-overlay {
+  position: absolute; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;   /* let drag events bubble to parent */
+  color: #fff;
+}
+.preview-drop-inner {
+  background: var(--c-accent); color: #fff;
+  padding: 24px 36px; border-radius: var(--r-lg);
+  font-size: var(--fs-md); font-weight: var(--fw-semibold);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
 .editor {
   width: 100%; height: 100%; padding: var(--sp-5);
   border: 0; background: var(--c-bg-0); color: var(--c-fg-0);
@@ -788,6 +1059,40 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   cursor: pointer; text-align: left;
 }
 .session-sel-btn:hover { border-color: var(--c-accent); }
+/* Generic ellipsis utility — single-line truncation. */
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* Copy-button just-flashed state — accent color + slight scale to make the
+   icon change feel intentional. .icon-btn already has the base style. */
+.icon-btn.copied-flash { color: var(--c-accent); transform: scale(1.05); transition: transform 120ms; }
+.icon-btn.retry-btn { color: var(--c-danger, #dc3545); }
+.icon-btn.retry-btn:hover { color: var(--c-accent); }
+
+/* Image lightbox — fullscreen overlay over any pane. ESC and outside-click
+   both dismiss; the <img> stops propagation so clicking the image itself
+   doesn't close. */
+.lightbox {
+  position: fixed; inset: 0; z-index: 10000;
+  background: rgba(0,0,0,0.85);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.lightbox-img {
+  max-width: 100%; max-height: 100%;
+  border-radius: var(--r-md);
+  box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+  cursor: zoom-out;
+}
+.lightbox-close {
+  position: absolute; top: 16px; right: 16px;
+  width: 36px; height: 36px;
+  background: rgba(255,255,255,0.1); color: #fff;
+  border: 1px solid rgba(255,255,255,0.3);
+  border-radius: 50%; cursor: pointer;
+  font-size: 18px; line-height: 1;
+}
+.lightbox-close:hover { background: rgba(255,255,255,0.2); }
+.user-msg-img { cursor: zoom-in; transition: transform 100ms; }
+.user-msg-img:hover { transform: scale(1.02); }
 .session-sel-btn .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-sel-btn .caret { color: var(--c-fg-3); margin-left: 6px; }
 .session-picker-pop {
@@ -798,6 +1103,29 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   box-shadow: 0 4px 16px rgba(0,0,0,.18);
   z-index: 1000;
 }
+.session-picker-search {
+  display: block; width: 100%;
+  padding: 6px 10px;
+  border: 0; border-bottom: 1px solid var(--c-border);
+  background: var(--c-bg-2); color: var(--c-fg-0);
+  font-size: var(--fs-sm);
+  outline: none;
+  position: sticky; top: 0;
+  z-index: 1;
+}
+.session-picker-search:focus { background: var(--c-bg-1); box-shadow: inset 0 -2px 0 var(--c-accent); }
+/* Pin button — pinned rows show active accent color; pinned rows also get
+   a subtle background nudge so they're recognizable at a glance. */
+.session-picker-pin {
+  background: transparent; border: 0; cursor: pointer;
+  color: var(--c-fg-4); width: 20px; height: 20px;
+  padding: 0; display: flex; align-items: center; justify-content: center;
+  border-radius: var(--r-sm);
+  opacity: 0.5; transition: opacity var(--t-fast), color var(--t-fast);
+}
+.session-picker-row:hover .session-picker-pin { opacity: 1; }
+.session-picker-pin.active { color: var(--c-accent); opacity: 1; }
+.session-picker-row.pinned { background: rgba(96, 147, 255, 0.05); }
 .session-picker-row {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 10px;
@@ -823,6 +1151,195 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-picker-empty {
   padding: 14px; text-align: center; color: var(--c-fg-3); font-size: var(--fs-xs);
 }
+.session-picker-row.open:not(.active) {
+  /* Visual marker so users can tell which sessions are already open as tabs. */
+  background: var(--c-bg-2);
+  font-weight: 500;
+}
+
+/* ====== Tab strip (VS Code Claude-style multi-session) ====== */
+/* Two-row layout: list (overflow-x: auto, fills available width) + actions
+   (flex-shrink: 0, pinned right). Replaces the old single-container .chat-tabs
+   where the + and history buttons would scroll out of view when too many tabs
+   were open. */
+.chat-tabs-wrap {
+  display: flex; align-items: stretch;
+  background: var(--c-bg-1);
+  border-bottom: 1px solid var(--c-border);
+  min-height: 34px;
+  min-width: 0; max-width: 100%;
+}
+.chat-tabs-list {
+  display: flex; align-items: stretch;
+  flex: 1; min-width: 0;
+  overflow-x: auto; overflow-y: hidden;
+  padding-left: 4px;
+  scrollbar-width: thin;
+  /* Firefox: thumb / track colors (dark-theme aware via CSS vars). */
+  scrollbar-color: var(--c-fg-4) transparent;
+}
+.chat-tabs-actions {
+  display: flex; align-items: stretch;
+  flex-shrink: 0;
+  border-left: 1px solid var(--c-border);
+  padding-right: 4px;
+  background: var(--c-bg-1);
+}
+/* Overlay-style horizontal scrollbar: invisible by default, fades in on
+   hover. Keeps the tab strip visually clean while still providing a handle
+   when the strip overflows. */
+.chat-tabs-list::-webkit-scrollbar { height: 3px; }
+.chat-tabs-list::-webkit-scrollbar-track { background: transparent; }
+.chat-tabs-list::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+  transition: background var(--t-fast);
+}
+.chat-tabs-list:hover::-webkit-scrollbar-thumb {
+  background: var(--c-fg-4);
+}
+.chat-tabs-list:hover::-webkit-scrollbar-thumb:hover {
+  background: var(--c-fg-3);
+}
+/* Firefox: doesn't support per-state scrollbar-color, so use a subtle
+   semi-transparent thumb always (less heavy than the prior solid). */
+.chat-tabs-list { scrollbar-color: rgba(128,128,128,0.25) transparent; }
+.chat-tabs-list:hover { scrollbar-color: var(--c-fg-4) transparent; }
+/* Back-compat alias — some older selectors reference .chat-tabs directly. */
+.chat-tabs { display: contents; }
+.chat-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 8px 0 10px;
+  max-width: 200px; min-width: 0;
+  background: var(--c-bg-1);
+  /* Non-active tabs use muted text. Active tab pops via fg-0 + accent
+     stripe + slightly different bg below. Was c-fg-2 = barely muted,
+     made too easy to confuse active with inactive when scanning. */
+  color: var(--c-fg-3);
+  border-right: 1px solid var(--c-border);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  position: relative;
+  flex-shrink: 0;
+}
+/* Touch-action on every interactive child too — kills the 300ms tap delay
+   on iOS Safari and prevents pinch-zoom hijacking taps on buttons. */
+.chat-tab-close, .chat-tab-kebab, .chat-tab-new, .chat-tab-history-btn,
+.session-picker-row, .session-picker-del, .session-picker-kebab {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.chat-tab:hover { background: var(--c-bg-2); color: var(--c-fg-0); }
+.chat-tab.active {
+  background: var(--c-bg-0);
+  color: var(--c-fg-0);
+  font-weight: var(--fw-semibold);
+}
+.chat-tab.active::after {
+  /* Top accent stripe to highlight the active tab */
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: var(--c-accent);
+}
+/* Drop target during a drag-reorder — left edge bar shows where it'll land. */
+.chat-tab.drag-over::before {
+  content: ""; position: absolute; top: 4px; bottom: 4px; left: -1px;
+  width: 2px; background: var(--c-accent);
+  border-radius: 2px;
+}
+.chat-tab-name {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding: 7px 0;
+}
+/* Small pulsing dot shown on a tab whose session is currently streaming a
+   reply. Stays visible on inactive tabs so the user knows where activity is. */
+.chat-tab-stream-dot {
+  display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  flex-shrink: 0;
+  animation: tab-pulse 1.4s ease-in-out infinite;
+}
+@keyframes tab-pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50%      { opacity: 1;   transform: scale(1); }
+}
+.chat-tab-rename-input {
+  background: var(--c-bg-0); color: var(--c-fg-0);
+  border: 1px solid var(--c-accent); border-radius: var(--r-sm);
+  padding: 2px 6px; font-size: var(--fs-sm);
+  width: 150px; outline: none;
+  font-family: inherit;
+}
+.chat-tab-close {
+  background: none; border: none; cursor: pointer;
+  color: var(--c-fg-3); font-size: 16px; line-height: 1;
+  width: 18px; height: 18px; border-radius: var(--r-sm);
+  padding: 0; display: flex; align-items: center; justify-content: center;
+  opacity: 0;
+  transition: opacity .12s ease;
+  flex-shrink: 0;
+}
+/* Kebab "⋮" — hidden on desktop (right-click works), shown on mobile in the
+   @media block below as the only way to reach the per-tab action menu. */
+.chat-tab-kebab,
+.session-picker-kebab {
+  display: none;
+  background: none; border: none; cursor: pointer;
+  color: var(--c-fg-2); font-size: 16px; line-height: 1;
+  padding: 0; border-radius: var(--r-sm);
+  flex-shrink: 0;
+}
+.chat-tab:hover .chat-tab-close,
+.chat-tab.active .chat-tab-close { opacity: 0.7; }
+.chat-tab-close:hover { background: var(--c-danger); color: #fff; opacity: 1; }
+.chat-tab-new {
+  background: none; border: none; cursor: pointer;
+  color: var(--c-fg-2); font-size: 18px; line-height: 1;
+  padding: 0 10px;
+  flex-shrink: 0;
+}
+.chat-tab-new:hover { color: var(--c-accent); }
+
+/* "Open history" folder button at end of tab strip */
+.chat-tab-history {
+  position: relative; flex-shrink: 0;
+  margin-left: auto;            /* push to right end of the strip */
+}
+.chat-tab-history-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--c-fg-2);
+  padding: 0 10px; height: 100%;
+  display: flex; align-items: center;
+}
+.chat-tab-history-btn:hover { color: var(--c-accent); }
+.chat-tab-history-btn svg { width: 16px; height: 16px; }
+/* Position / size set inline from JS (toggleHistoryPicker) so the popup
+   escapes the parent .chat-tabs overflow: auto clip. Just bump z-index. */
+.chat-tab-history .session-picker-pop { z-index: 1500; }
+
+/* ====== Tab right-click context menu ====== */
+.tab-ctx-menu {
+  position: fixed; z-index: 2000;
+  background: var(--c-bg-1); border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  box-shadow: 0 6px 20px rgba(0,0,0,.25);
+  padding: 4px 0;
+  min-width: 180px;
+}
+.tab-ctx-menu button {
+  display: block; width: 100%; text-align: left;
+  background: none; border: none;
+  padding: 7px 14px; font-size: var(--fs-sm);
+  color: var(--c-fg-0); cursor: pointer;
+}
+.tab-ctx-menu button:hover { background: var(--c-bg-2); }
+.tab-ctx-menu button.danger { color: var(--c-danger); }
+.tab-ctx-menu button.danger:hover { background: var(--c-danger); color: #fff; }
+.tab-ctx-menu hr { border: none; border-top: 1px solid var(--c-border); margin: 4px 0; }
 .chk {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: var(--fs-xs); color: var(--c-fg-2);
@@ -843,6 +1360,49 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 .msg.user { align-items: flex-end; }
 .msg.assistant, .msg.tool_use, .msg.tool_result, .msg.thinking { align-items: stretch; }
+
+/* Avatar + bubble side-by-side. user is right-aligned with avatar on the
+   right; assistant is left-aligned with avatar on the left. Tool/thinking
+   bubbles intentionally don't get an avatar (less visual noise for the
+   procedural blocks). */
+.msg-row {
+  display: flex; align-items: flex-start; gap: 8px;
+  min-width: 0; max-width: 100%;
+}
+.msg.user .msg-row {
+  flex-direction: row-reverse;
+  max-width: min(86%, 760px);
+}
+.msg-avatar {
+  flex-shrink: 0;
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  user-select: none;
+  overflow: hidden;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+}
+.msg-avatar svg { width: 22px; height: 22px; }
+.assistant-avatar { color: var(--c-accent); }
+.user-avatar {
+  background: var(--c-accent); color: white; border: none;
+  font-weight: var(--fw-semibold); font-size: 13px;
+  letter-spacing: 0;
+}
+/* Bubble inside the row no longer needs its own align-self / max-width —
+   the row container handles alignment, and bubble fills the rest. */
+.msg.user .msg-row .bubble,
+.msg.assistant .msg-row .bubble {
+  align-self: flex-start;
+  max-width: none;
+}
+@media (max-width: 480px) {
+  .msg-avatar { width: 26px; height: 26px; }
+  .msg-avatar svg { width: 18px; height: 18px; }
+  .user-avatar { font-size: 12px; }
+  .msg.user .msg-row { max-width: 92%; }
+}
 
 .bubble {
   padding: 9px 13px; border-radius: var(--r-lg);
@@ -908,6 +1468,30 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .bubble code { background: var(--c-bg-0); padding: 1px 5px; border-radius: var(--r-sm); font-size: 0.9em; }
 .bubble pre code { background: transparent; padding: 0; }
 
+/* Inline `<code>` whose text was recognized as a file path by mdRender's
+   _linkifyFilePaths post-processor. Click is handled by chat-body delegation. */
+.bubble code.has-file-link { padding: 0; background: transparent; }
+.file-link {
+  color: var(--c-accent);
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--c-bg-0);
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+}
+.file-link:hover { color: var(--c-accent-hover); background: var(--c-accent-soft); }
+.tool-arg.file-link {
+  font-size: inherit;
+  /* Long absolute paths used to wrap onto 3-4 lines and push the bubble
+     full-width. Cap with ellipsis; hover title shows full path. */
+  display: inline-block; max-width: 100%; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  vertical-align: middle;
+}
+
 /* Code block copy button — hover-revealed on the <pre> ancestor of any
    <code class="language-*">. Attached by app.js _attachCopyBtn at highlight
    time. Works inside chat bubbles AND the markdown preview pane. */
@@ -947,6 +1531,27 @@ pre.has-copy-btn .code-copy-btn.copied {
 .bubble li { margin: 2px 0; }
 .bubble a { color: var(--c-accent-hover); text-decoration: underline; }
 
+/* Indent non-bubble blocks (tool / tool_result / thinking) by avatar width
+   so their left edge aligns with the assistant bubble's content. Without
+   this they ran flush-left while user/assistant text bubbles were offset
+   by the 32px avatar + 8px gap, looking misaligned. */
+.msg.tool_use > .tool,
+.msg.tool_use > .todo-card,
+.msg.tool_use > .subagent-card,
+.msg.tool_use > .plan-card,
+.msg.tool_result > .tool-result,
+.msg.thinking > .thinking {
+  margin-left: 40px;
+}
+@media (max-width: 480px) {
+  /* Avatar shrinks on mobile — match the indent. */
+  .msg.tool_use > .tool, .msg.tool_use > .todo-card,
+  .msg.tool_use > .subagent-card, .msg.tool_use > .plan-card,
+  .msg.tool_result > .tool-result, .msg.thinking > .thinking {
+    margin-left: 32px;
+  }
+}
+
 .tool {
   display: flex; gap: 8px; align-items: baseline;
   background: var(--c-tool-bg); color: var(--c-tool-fg);
@@ -973,9 +1578,17 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-left: 2px solid var(--c-accent);
   padding: 6px 12px; border-radius: 0 var(--r-md) var(--r-md) 0;
   font-family: var(--font-mono); font-size: var(--fs-xs);
+  cursor: pointer;
 }
 .thinking-label { font-weight: var(--fw-semibold); display: flex; align-items: center; gap: 4px; opacity: 0.85; margin-bottom: 4px; }
 .thinking pre { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; }
+.thinking.collapsed { padding: 4px 12px; }
+.thinking.collapsed pre { display: none; }
+.thinking.collapsed .thinking-label { margin-bottom: 0; }
+.thinking-preview { color: var(--c-fg-3); margin-left: 8px; font-size: var(--fs-xs); }
+.tool-result { cursor: pointer; }
+.tool-result.collapsed pre { max-height: 1.6em; overflow: hidden; opacity: 0.7; }
+.tool-result-summary { color: var(--c-fg-3); font-size: var(--fs-xs); margin-left: 4px; }
 
 /* ==========================================================================
    ask_user_question — Muse asks the user with structured options (mcp tool)
@@ -1130,6 +1743,75 @@ pre.has-copy-btn .code-copy-btn.copied {
 .ctx-meter.danger .ctx-meter-fill { background: var(--c-danger, #dc3545); }
 .ctx-meter.warn .ctx-meter-label { color: #f59e0b; }
 .ctx-meter.danger .ctx-meter-label { color: var(--c-danger, #dc3545); font-weight: var(--fw-semibold); }
+/* Context breakdown popup — anchored top-right of viewport, fixed so it
+   floats over any pane. Shows SDK get_context_usage() per-category data. */
+.ctx-breakdown-pop {
+  position: fixed; top: 56px; right: 12px;
+  width: 340px; max-width: calc(100vw - 24px);
+  background: var(--c-bg-0);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  z-index: 1000;
+  font-size: var(--fs-sm);
+}
+.ctx-breakdown-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--c-border);
+  font-weight: var(--fw-semibold);
+}
+.ctx-breakdown-body { padding: 10px 14px; max-height: 60vh; overflow-y: auto; }
+.ctx-breakdown-body.err { color: var(--c-danger); }
+.ctx-breakdown-summary {
+  font-weight: var(--fw-semibold); margin-bottom: 8px;
+  font-family: var(--font-mono);
+}
+.ctx-breakdown-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 4px 0; gap: 12px;
+  border-bottom: 1px dashed var(--c-border);
+}
+.ctx-breakdown-row:last-child { border-bottom: 0; }
+.ctx-breakdown-name {
+  color: var(--c-fg-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ctx-breakdown-tokens {
+  font-family: var(--font-mono);
+  color: var(--c-fg-1);
+  flex-shrink: 0;
+}
+.ctx-breakdown-hint {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--c-border);
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+/* While compact is running: indeterminate progress shimmer in the bar +
+   pulsing label. Replaces the old 120-second toast. */
+.ctx-meter.compacting .ctx-meter-fill {
+  width: 100% !important;
+  background: linear-gradient(90deg,
+    var(--c-accent) 0%, rgba(255,255,255,0.4) 50%, var(--c-accent) 100%);
+  background-size: 200% 100%;
+  animation: ctx-meter-shimmer 1.2s linear infinite;
+}
+.ctx-meter.compacting .ctx-meter-label {
+  color: var(--c-accent);
+  animation: ctx-meter-pulse 1.4s ease-in-out infinite;
+}
+@keyframes ctx-meter-shimmer {
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+@keyframes ctx-meter-pulse {
+  0%, 100% { opacity: 0.7; }
+  50%      { opacity: 1; }
+}
 .ctx-meter-text { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
 .ctx-meter-label {
   flex: 1; min-width: 0; white-space: nowrap;
@@ -1512,34 +2194,174 @@ pre.has-copy-btn .code-copy-btn.copied {
 .jump-bottom:hover { background: var(--c-accent-hover); transform: scale(1.05); }
 .jump-bottom svg { width: 18px; height: 18px; }
 
+/* Hairline progress bar under the chat header — replaces the older
+   .ctx-meter strip. Just shows raw percentage; text/actions moved to
+   the chat-input toolbar below. */
+.ctx-progress {
+  height: 2px; background: var(--c-bg-2);
+  flex-shrink: 0; overflow: hidden;
+}
+.ctx-progress-fill {
+  height: 100%; background: var(--c-accent);
+  transition: width var(--t-base), background var(--t-base);
+}
+.ctx-progress.warn .ctx-progress-fill { background: #f59e0b; }
+.ctx-progress.danger .ctx-progress-fill { background: var(--c-danger, #dc3545); }
+.ctx-progress.compacting .ctx-progress-fill {
+  width: 100% !important;
+  background: linear-gradient(90deg,
+    var(--c-accent) 0%, rgba(255,255,255,0.4) 50%, var(--c-accent) 100%);
+  background-size: 200% 100%;
+  animation: ctx-meter-shimmer 1.2s linear infinite;
+}
+
+/* VSCode-Claude style bottom input area:
+     row 1: pending attachments (when any)
+     row 2: textarea (full width)
+     row 3: chat-toolbar — every control compactly stacked here */
 .chat-input {
   display: flex; flex-direction: column;
-  gap: var(--sp-2); padding: var(--sp-3);
+  gap: 6px; padding: 8px;
   border-top: 1px solid var(--c-border); background: var(--c-bg-1);
   position: relative;
 }
-.chat-input-row {
-  display: flex; gap: var(--sp-2);
-  align-items: stretch;     /* chat-btns 跟 textarea 同高 */
-  border-radius: var(--r-md);
-  transition: outline-color var(--t-fast);
-  outline: 2px dashed transparent; outline-offset: -2px;
+/* The whole input area is one visual unit. Subtle 1px border, soft radius,
+   focus-within nudges border-color to accent. Internal hairline separates
+   textarea from toolbar — no extra padding / colors making it feel busy. */
+.chat-input-wrap {
+  display: flex; flex-direction: column;
+  border: 1px solid var(--c-border-strong);
+  border-radius: 10px;
+  background: var(--c-bg-2);
+  overflow: hidden;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
-.chat-input-row.drag-hover {
-  outline-color: var(--c-accent);
+.chat-input-wrap:focus-within {
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 3px rgba(96, 147, 255, 0.12);
+}
+.chat-input-wrap.drag-hover {
+  border-color: var(--c-accent);
   background: var(--c-accent-soft);
 }
-.chat-input textarea {
-  flex: 1; resize: none;
-  min-height: 64px; max-height: 240px; height: 64px;   /* JS autoGrow 动态调 */
+.chat-input-textarea {
+  width: 100%;
+  resize: none;
+  min-height: 42px; max-height: 200px; height: 42px;
   overflow-y: auto;
-  background: var(--c-bg-2); font-size: var(--fs-base); padding: 8px 12px;
-  border-radius: var(--r-md);
+  background: transparent;
+  font-size: var(--fs-base);
+  padding: 10px 14px 6px 14px;
+  border: 0; outline: none;
+  color: var(--c-fg-0);
+  line-height: 1.5;
 }
+.chat-input-textarea::placeholder { color: var(--c-fg-3); }
+.chat-input-textarea:focus::placeholder { opacity: 0.35; transition: opacity 120ms; }
+
+/* Toolbar — hairline separator above, very tight spacing, ALL controls
+   share the same 26px height + same hover behavior. */
+.chat-toolbar {
+  display: flex; align-items: center; gap: 2px;
+  padding: 4px 6px;
+  border-top: 1px solid var(--c-border);
+  background: var(--c-bg-1);
+}
+.chat-toolbar-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; flex-shrink: 0;
+  background: transparent; border: 0; cursor: pointer;
+  color: var(--c-fg-3);
+  border-radius: 6px;
+  padding: 0;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.chat-toolbar-btn:hover:not(:disabled) {
+  background: var(--c-bg-3); color: var(--c-fg-0);
+}
+.chat-toolbar-btn.active { color: var(--c-accent); background: var(--c-accent-soft); }
+.chat-toolbar-btn.warn {
+  width: auto; padding: 0 8px;
+  color: #f59e0b; font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+.chat-toolbar-btn.warn:hover { background: rgba(245, 158, 11, 0.15); }
+.chat-toolbar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.chat-toolbar-btn svg { width: 14px; height: 14px; }
+/* Selects styled as borderless pills — feel like buttons not form inputs. */
+.chat-toolbar-select {
+  height: 26px;
+  max-width: 150px;
+  padding: 0 22px 0 8px;
+  background-color: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+  appearance: none;
+  /* Chevron rendered via SVG data URI — crisper than CSS triangles. */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none'><path d='M2 3.5L5 6.5L8 3.5' stroke='%239a9a9a' stroke-width='1.5' stroke-linecap='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  transition: background-color var(--t-fast), color var(--t-fast);
+  flex-shrink: 1; min-width: 0;
+  text-overflow: ellipsis;
+}
+.chat-toolbar-select:hover { background-color: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-toolbar-select:focus {
+  background-color: var(--c-bg-3); color: var(--c-fg-0);
+  box-shadow: 0 0 0 2px var(--c-accent-soft);
+}
+.chat-toolbar-select option { background: var(--c-bg-1); color: var(--c-fg-0); }
+/* Context donut ring — replaces the earlier monospace chip. Just 18×18 SVG
+   showing percentage used; numeric details live in the tooltip. Color
+   shifts accent → warn (orange) → danger (red) at 70 / 90 %. */
+.chat-toolbar-ring {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  background: transparent; border: 0; cursor: pointer;
+  color: var(--c-accent);
+  border-radius: 6px;
+  padding: 0;
+  transition: background var(--t-fast);
+}
+.chat-toolbar-ring:hover { background: var(--c-bg-3); }
+.chat-toolbar-ring.warn { color: #f59e0b; }
+.chat-toolbar-ring.danger { color: var(--c-danger, #dc3545); }
+.chat-toolbar-ring svg { display: block; }
+.chat-toolbar-ring svg circle:nth-child(2) {
+  transition: stroke-dashoffset var(--t-base), stroke var(--t-base);
+}
+.chat-toolbar-spacer { flex: 1; }
+/* Send button — primary accent, icon-only (compact). Streaming state
+   swaps to a danger-style stop button automatically. */
+.chat-toolbar-send {
+  height: 26px; width: 26px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 6px; cursor: pointer;
+  background: var(--c-accent); color: white;
+  transition: background var(--t-fast), opacity var(--t-fast), transform 80ms;
+}
+.chat-toolbar-send:hover:not(:disabled) { background: var(--c-accent-hover); }
+.chat-toolbar-send:active:not(:disabled) { transform: scale(0.95); }
+.chat-toolbar-send:disabled { opacity: 0.35; cursor: not-allowed; }
+.chat-toolbar-send svg { width: 14px; height: 14px; }
+.chat-toolbar-send.btn-danger { background: var(--c-danger, #dc3545); }
+.chat-toolbar-send.btn-danger:hover { background: #b91c2c; }
+/* The Send label inside the button — hidden by default (icon-only).
+   .show-label class would expose it for users who want the wider button. */
+.chat-toolbar-send > span:last-child { display: none; }
+/* Legacy .chat-input-row + .chat-input textarea + .chat-btns removed —
+   replaced by .chat-input-wrap / .chat-input-textarea / .chat-toolbar
+   above (2026-05-18 VSCode-style layout refactor). Old class names left
+   unstyled; any straggler will simply fall back to default browser styling. */
 /* Attach button sits to the left of the textarea, same height as one btn-primary. */
 .chat-attach-btn {
   flex: 0 0 auto;
-  width: 40px; min-height: 40px; max-height: 100px;
+  width: 36px; min-height: 40px; max-height: 100px;
   display: inline-flex; align-items: center; justify-content: center;
   background: var(--c-bg-2); color: var(--c-fg-1);
   border: 1px solid var(--c-border-strong);
@@ -1592,14 +2414,14 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .doc-chip-x svg { width: 10px; height: 10px; }
 .chat-btns {
-  display: flex; flex-direction: column; gap: 6px;
+  display: flex; flex-direction: column; gap: 4px;
   align-items: stretch; justify-content: stretch;
 }
 .chat-btns button {
-  padding: 8px 18px; font-size: var(--fs-sm);
+  padding: 6px 14px; font-size: var(--fs-sm);
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   flex: 1;                     /* 填满 chat-btns 高度 = textarea 高度 */
-  max-height: 100px;           /* textarea 长到 240px 时按钮不无限拉高 */
+  max-height: 100px;
   min-height: 40px;
 }
 .chat-btns button .icon svg { display: block; }
@@ -1659,6 +2481,15 @@ pre.has-copy-btn .code-copy-btn.copied {
 .toast .icon { padding-top: 1px; }
 .toast .close { background: transparent; border: 0; color: var(--c-fg-3); cursor: pointer; padding: 0; }
 .toast .close:hover { color: var(--c-fg-0); }
+/* Optional action button inside a toast (e.g. "撤销" after closing a tab). */
+.toast-action {
+  background: transparent; border: 1px solid var(--c-border-strong);
+  color: var(--c-accent); cursor: pointer;
+  padding: 2px 10px; border-radius: var(--r-sm);
+  font-size: 12px; font-family: inherit;
+  margin-right: 4px;
+}
+.toast-action:hover { background: var(--c-accent-soft); border-color: var(--c-accent); }
 
 /* ==========================================================================
    Context menu

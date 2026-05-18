@@ -67,21 +67,56 @@ def test_claude_appears_with_api_key(client, auth, monkeypatch):
 
 
 # ============================================================================
-# Bug 3: Context meter used only input_tokens, which under prompt caching
-# shrinks back to ~zero each turn while real window is mostly cache. And the
-# per-session snapshot was accumulating cache_read/cache_creation — meter
-# overflowed 100% after a few turns.
-# Fix: context_used = input + cache_read + cache_creation; per-turn snapshot
-# replaces (doesn't accumulate) the cache fields.
+# Bug 3 (rev 2026-05-18): Context meter previously summed input + cache_read +
+# cache_creation, on the assumption those were per-turn values. The CLI's
+# ResultMessage.usage is actually CUMULATIVE for the session (per SDK doc on
+# ContextUsageResponse.apiUsage), so summing them grew unboundedly — meter
+# read e.g. 796.6% on a fresh 200K window. New rule: trust SDK-authoritative
+# `context_used` populated by client.get_context_usage(); if absent (no turn
+# yet), fall back to per-turn `input_tokens` only — NEVER sum the cache fields.
 # ============================================================================
 
-def test_context_used_sums_input_plus_cache(client, auth):
-    """/usage/{sid} must return context_used as sum of input + cache_read +
-    cache_creation, not just input."""
-    # Create a session, fake-fill its usage stats (bypassing SDK)
+def test_context_used_prefers_sdk_authoritative_value(client, auth):
+    """When the stream handler has populated `context_used` from
+    client.get_context_usage(), /usage must return it as-is."""
     r = client.post("/api/chat/sessions",
                      headers={**auth, "Content-Type": "application/json"},
                      json={"name": "ctx test", "model": "deepseek-v4-flash"})
+    sid = r.json()["id"]
+
+    from backend import chat as chat_mod
+    chat_mod._session_usage[sid] = {
+        "input_tokens": 500,
+        "output_tokens": 100,
+        "cache_read_tokens": 40_000,         # cumulative, must NOT be summed in
+        "cache_creation_tokens": 2_000,      # cumulative, must NOT be summed in
+        "total_cost_usd": 0.01,
+        "last_turn_at": 0.0,
+        "context_used": 12_500,              # authoritative live-window value
+        "context_used_pct": 6.3,             # stale, /usage recomputes
+        "context_limit": 200_000,            # stale (table now says 1M for v4-flash)
+    }
+
+    r = client.get(f"/api/chat/usage/{sid}?model=deepseek-v4-flash", headers=auth)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["context_used"] == 12_500, \
+        f"must use SDK-populated context_used, got {body['context_used']}"
+    # /usage takes max(stored, hardcoded) for context_limit, so a stale
+    # stored 200K loses to the new MODEL_CONTEXT_LIMITS["deepseek-v4-flash"]
+    # = 1_000_000 (2026-05-18 update). pct recomputes against the new limit.
+    assert body["context_limit"] == 1_000_000
+    assert body["context_used_pct"] == round(12_500 / 1_000_000 * 100, 1)
+    # Regression guard: must NOT be the legacy sum that produced 796.6%
+    assert body["context_used"] != 500 + 40_000 + 2_000
+
+
+def test_context_used_fallback_when_sdk_value_missing(client, auth):
+    """Pre-first-turn (no SDK call yet) → fallback is per-turn input_tokens only,
+    NOT summed with the cumulative cache fields."""
+    r = client.post("/api/chat/sessions",
+                     headers={**auth, "Content-Type": "application/json"},
+                     json={"name": "ctx fallback", "model": "deepseek-v4-flash"})
     sid = r.json()["id"]
 
     from backend import chat as chat_mod
@@ -92,16 +127,15 @@ def test_context_used_sums_input_plus_cache(client, auth):
         "cache_creation_tokens": 2_000,
         "total_cost_usd": 0.01,
         "last_turn_at": 0.0,
+        # context_used absent / 0 → fallback path
     }
 
     r = client.get(f"/api/chat/usage/{sid}?model=deepseek-v4-flash", headers=auth)
     assert r.status_code == 200
     body = r.json()
-    expected = 500 + 40_000 + 2_000
-    assert body["context_used"] == expected, \
-        f"context_used should be input+cache_read+cache_creation, got {body['context_used']}"
-    # Pct should be 42500 / context_limit * 100 (whatever the limit is)
-    assert body["context_used_pct"] > 0
+    assert body["context_used"] == 500, \
+        f"fallback must be input_tokens only, got {body['context_used']}"
+    assert body["context_used"] != 42_500   # explicitly NOT the cumulative sum
 
 
 # ============================================================================

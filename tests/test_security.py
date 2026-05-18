@@ -52,7 +52,7 @@ def test_portal_root_blocklist(monkeypatch, bad, tmp_path):
     monkeypatch.setenv("MUSELAB_ROOT", bad)
     for n in [m for m in list(sys.modules) if m.startswith("backend")]:
         del sys.modules[n]
-    with pytest.raises(RuntimeError, match="too broad|does not exist"):
+    with pytest.raises(RuntimeError, match="system / cross-user path|does not exist"):
         import backend.settings  # type: ignore[import]  # noqa: F401
 
 

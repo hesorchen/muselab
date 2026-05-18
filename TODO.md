@@ -3,17 +3,18 @@
 > 状态：核心可用，开源前所有 P0 / P1 已清。剩 demo gif 和小幅打磨。
 > 排序原则：开源前必修 → 强化亮点 → 体验打磨。
 
-最后更新：2026-05-17
+最后更新：2026-05-18（multi-tab 收尾 + e2e 脚手架）
 
 ---
 
 ## 📈 现状速览
 
-- **148 tests passing**（pytest）
+- **151 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
 - **多模型**：Claude (Pro OAuth) + DeepSeek + GLM + MiniMax
 - **三个 OS 一键安装**（systemd / launchd / Task Scheduler）+ `doctor` / `intake` 工具
 - **multi-arch Docker** 镜像通过 GH Actions 自动发到 `ghcr.io/hesorchen/muselab`
-- **移动端响应式**：< 900px 折叠成 3-tab 单 pane
+- **多会话 tab**（VS Code 风格）：tab 条 / 右键菜单 / 双击改名 / 后台流式不断 / 持久化 / mobile 长 ⋮ kebab
+- **移动端响应式**：< 900px 折叠成 3-tab 单 pane；`100dvh` 修 iOS 地址栏挡输入框
 - **完整 Agent SDK 能力**：MCP / Skills（7 个预置）/ Subagent / plan / ImageBlock / partial streaming
 - **首次进入引导**：检测 CLAUDE.md / archive 状态，给针对性 onboarding
 
@@ -31,7 +32,26 @@
 | 开源物料 | LICENSE / SECURITY / CONTRIBUTING / 3 个 Issue templates / PR template / GH Actions CI（pytest + ruff + docker multi-arch publish）|
 | 安装器 | install-{linux,macos,windows} 三脚本 + 7 问 intake + archive 骨架（health/work/money/people/notes/archives）|
 
-### 2026-05-17：UX 大改 + bug 清扫
+### 2026-05-17 下半场：multi-tab + mobile 适配 + 缓存升级
+
+| 类 | 完成 |
+|---|------|
+| Multi-tab chat | VS Code 风格 tab 条 / inline 双击改名 / 中键关 / 右键 context menu / 历史 picker / `openTabIds` 持久化 |
+| 后台流式 | per-tab `tabState[id]`（messages / es / streaming / sessionUsage）；切走继续接收，回来看完整结果 |
+| 头像 | assistant 用当前 mascot SVG；user 用通用 glyph |
+| 浏览器标题 | document.title 跟随当前 session 名，流式时加 ● |
+| 缓存策略 | `index.html` 渲染时把 `/static/X` 改成 `/static/X?v=<mtime>`；带 `?v=` 长缓存 immutable，不带的 no-cache 兜底 |
+| Mobile | `100vh` → `100dvh` 避免 iOS Safari 地址栏挡输入框；touch-action: manipulation 去 tap delay；⋮ kebab 替代 right-click |
+| ROOT=$HOME | 解锁 guard，agent 反正能写 FS；SENSITIVE_NAMES 补 `.bash_history` 等防 token 泄露场景 |
+| CLI 兜底 | "Session ID already in use" 错误时 fallback 到 `resume=` 让用户消息能发出去 |
+| Sanity test | scan app.js 重复方法定义（防 closeTab 那种沉默 shadow）|
+| Undo toast | 关 tab 后 5s 内可点"撤销"恢复（按原 index）|
+| 键盘快捷键 | Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+1..9 / Esc |
+| 拖动重排 | HTML5 drag&drop 改 tab 顺序，2px accent 指示落点 |
+| mdRender 节流 | 流式中 ≥80ms coalesce；done/error/cancelled/close 强制 flush |
+| e2e 脚手架 | tests/e2e/ 用 pytest-playwright 草稿；RUN_E2E=1 启用，详见 e2e/README.md |
+
+### 2026-05-17 上半场：UX 大改 + bug 清扫
 
 | 类 | 完成 |
 |---|------|
@@ -64,8 +84,14 @@
 - [ ] **Sessions 搜索**：list > 20 时加搜索框 + 按日期分组（今天 / 本周 / 更早）
 - [ ] **会话导出**：右键 session → 下载 markdown
 - [ ] **消息重发 / 编辑**：用户消息上鼠标悬停显示编辑按钮
-- [ ] **全局快捷键**：Ctrl+K 文件搜索 / Ctrl+/ 聚焦输入框 / Ctrl+B 折叠侧栏
-- [ ] **Mobile Safari 100vh bug**：用 `100dvh` 兜底（输入框被浏览器底栏遮的问题）
+- [x] **Mobile Safari 100vh bug**：~~用 `100dvh` 兜底~~ ✅ 2026-05-17
+- [x] **Chat 多会话 tab**：~~VS Code 风格~~ ✅ 2026-05-17
+- [x] **Tab 持久化**：~~刷新保留 openTabIds / 预览 tab~~ ✅ 2026-05-17
+- [x] **全局快捷键**：~~Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+1..9 / Esc~~ ✅ 2026-05-18（Ctrl+K 文件搜索 + Ctrl+/ 输入框聚焦 留作未来）
+- [x] **拖动 tab 重排序**：~~HTML5 native drag~~ ✅ 2026-05-18（mobile 仍留待未来）
+- [x] **关 tab undo toast**：~~5s 内可恢复~~ ✅ 2026-05-18
+- [x] **mdRender 流式节流**：~~done/error/cancelled/close 强制 flush~~ ✅ 2026-05-18（80ms coalesce）
+- [x] **前端 e2e 测试**（playwright headless）：~~脚手架就位~~ ✅ 2026-05-18（默认 skip；首次启用见 tests/e2e/README.md）
 - [ ] **CodeMirror Ctrl+S 保存快捷键** + auto-save 草稿
 - [ ] **进度可视化**：调 claude.ai 接口拉本周期 Pro/Max 用量（看是否有非官方 API）
 

@@ -10,6 +10,10 @@ sessions/
 sessions.bak-*/
 mcp.json
 data/
+# frontend/data/ ships tracked static JS modules (i18n alternatives, slash
+# commands, etc.); carve out from the generic data/ rule above.
+!frontend/data/
+!frontend/data/**
 *.egg-info/
 dist/
 build/

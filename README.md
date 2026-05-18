@@ -7,7 +7,7 @@
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-148_passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-152_passing-brightgreen.svg)](tests/)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
 [![中文](https://img.shields.io/badge/lang-中文-red)](README_zh.md)
 
@@ -46,8 +46,9 @@ boring tech you can fully see beats clever tech you can't.
 
 - 💸 Reuse your `$20–100/mo` Pro / Max subscription via OAuth — zero per-token bill
 - 🌏 Or bring **DeepSeek / GLM / MiniMax** keys — same SDK loop, no proxy needed
+- 🗂 **VS Code–style multi-tab chat**: hop between sessions without losing in-flight streams; double-click a tab name to rename inline; right-click (or ⋮ on mobile) for the full menu
 - 🚀 One installer per OS (Linux / macOS / Windows) or `docker run` from GHCR
-- ⚡ ~8 k lines · 148 tests · runs on a 1 GB VPS
+- ⚡ ~8 k lines · 152 tests · runs on a 1 GB VPS
 
 > 📸 *Demo gif: coming soon. In the meantime, scroll to [Architecture](#under-the-hood) for a mermaid diagram of the data flow, or jump straight to [Quick start](#quick-start) — 3 commands to running locally.*
 

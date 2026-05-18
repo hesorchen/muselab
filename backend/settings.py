@@ -62,13 +62,16 @@ if ROOT is None:
 if not ROOT.exists():
     raise RuntimeError(f"MUSELAB_ROOT does not exist: {ROOT}")
 
-# Reject roots that grant the service write access to OS-critical or auth-sensitive
-# locations. Combined with bypassPermissions in chat.py, anyone with the auth token
-# could otherwise write ~/.ssh/authorized_keys or ~/.bashrc and pivot to RCE.
+# Reject roots that point at system / cross-user paths — those are almost
+# always misconfiguration (single-user muselab has no business browsing /etc
+# or another user's $HOME). $HOME is allowed: the agent runs with
+# bypassPermissions and already has full FS write access regardless of ROOT,
+# so restricting ROOT to a subdir was security theatre — it only crippled
+# the UI without changing the actual blast radius.
 _FORBIDDEN_ROOTS = {Path("/"), Path("/etc"), Path("/root"), Path("/home"),
-                    Path("/var"), Path("/usr"), Path("/boot"), Path.home()}
+                    Path("/var"), Path("/usr"), Path("/boot")}
 if ROOT in _FORBIDDEN_ROOTS:
     raise RuntimeError(
-        f"MUSELAB_ROOT={ROOT} is too broad. Point it at a dedicated sub-directory "
-        f"(e.g. ~/archive), never at $HOME or system paths."
+        f"MUSELAB_ROOT={ROOT} is a system / cross-user path. Point it at "
+        f"your $HOME or a sub-directory you own."
     )

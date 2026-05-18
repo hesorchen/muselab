@@ -289,13 +289,75 @@ class MCPToggleReq(BaseModel):
 
 
 @router.patch("/mcp/{name}/toggle", dependencies=[Depends(require_token)])
-def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
+async def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
     cfg = _load_mcp()
     if name not in (cfg.get("mcpServers") or {}):
         raise HTTPException(404, f"MCP server not found: {name}")
     cfg["mcpServers"][name]["disabled"] = req.disabled
     _save_mcp(cfg)
-    return {"ok": True, "name": name, "disabled": req.disabled}
+    # Apply to every live SDK client too — otherwise the toggle would only
+    # take effect on the next client rebuild, leaving the user staring at a
+    # toggled-off server that still answers tool calls. SDK exposes
+    # client.toggle_mcp_server() for exactly this case.
+    from . import chat as _chat
+    enabled = not req.disabled
+    propagated: list[str] = []
+    errors: list[str] = []
+    async with _chat._lock:
+        live = list(_chat._clients.items())
+    for key, client in live:
+        try:
+            await client.toggle_mcp_server(name, enabled)
+            propagated.append(f"{key[0]}@{key[1]}")
+        except Exception as e:
+            errors.append(f"{key}: {type(e).__name__}: {e}")
+    return {
+        "ok": True, "name": name, "disabled": req.disabled,
+        "propagated": propagated,
+        "errors": errors,
+    }
+
+
+@router.post("/mcp/{name}/reconnect", dependencies=[Depends(require_token)])
+async def reconnect_mcp_server(name: str) -> dict:
+    """Force every live SDK client to re-establish the MCP connection for this
+    server. Useful when an MCP process died / network blip — SDK's
+    client.reconnect_mcp_server() restarts the transport without rebuilding
+    the whole client."""
+    from . import chat as _chat
+    reconnected: list[str] = []
+    errors: list[str] = []
+    async with _chat._lock:
+        live = list(_chat._clients.items())
+    if not live:
+        return {"ok": True, "reconnected": [], "errors": [], "note": "no live client"}
+    for key, client in live:
+        try:
+            await client.reconnect_mcp_server(name)
+            reconnected.append(f"{key[0]}@{key[1]}")
+        except Exception as e:
+            errors.append(f"{key}: {type(e).__name__}: {e}")
+    return {"ok": True, "reconnected": reconnected, "errors": errors}
+
+
+@router.get("/mcp/status", dependencies=[Depends(require_token)])
+async def mcp_status() -> dict:
+    """Aggregate MCP server status from every live SDK client (each may have
+    its own connection state). Returns per-client breakdown so the UI can
+    show which session's MCP is borked when reconnect is needed."""
+    from . import chat as _chat
+    async with _chat._lock:
+        live = list(_chat._clients.items())
+    out: list[dict] = []
+    for key, client in live:
+        sid, model = key
+        try:
+            status = await client.get_mcp_status()
+            out.append({"session_id": sid, "model": model, "status": status})
+        except Exception as e:
+            out.append({"session_id": sid, "model": model,
+                         "error": f"{type(e).__name__}: {e}"})
+    return {"clients": out}
 
 
 # ====== Skill discovery ======

@@ -130,7 +130,11 @@ def test_session_usage_endpoint_returns_meter_data(client, auth, app_module):
                     headers=auth)
     assert r.status_code == 200
     d = r.json()
-    assert d["context_limit"] == 200_000
+    # 2026-05-18: Claude Opus 4.7 ships with 1M context on Pro/Max/Enterprise
+    # plans (verified at anthropic.com / Claude Code docs). Test value
+    # follows MODEL_CONTEXT_LIMITS — bump together if Anthropic changes
+    # default tier.
+    assert d["context_limit"] == 1_000_000
     assert d["context_used_pct"] == 0
     assert d["input_tokens"] == 0
 

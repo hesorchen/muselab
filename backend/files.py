@@ -75,6 +75,12 @@ SENSITIVE_NAMES = {
     "credentials", "credentials.json", "service-account.json",
     "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
     "authorized_keys", "known_hosts",
+    # Shell / language history files — frequently contain pasted tokens,
+    # one-off commands with secrets. Added when MUSELAB_ROOT=$HOME became
+    # supported (2026-05-17) so a token leak doesn't expose them.
+    ".bash_history", ".zsh_history", ".python_history", ".node_repl_history",
+    ".sqlite_history", ".lesshst", ".viminfo", ".wget-hsts",
+    ".npm-debug.log", ".yarn-error.log",
 }
 # Extension suffixes treated as sensitive — private keys, cert bundles, and
 # `.env`-style files regardless of basename (prod.env, staging.env, etc.).
