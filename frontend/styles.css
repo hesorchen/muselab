@@ -2048,6 +2048,35 @@ pre.has-copy-btn .code-copy-btn.copied {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* ===== User-message inline edit ===== */
+.user-bubble { position: relative; }
+.user-msg-edit-btn {
+  position: absolute; top: 4px; right: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px;
+  background: rgba(0,0,0,0.18); border: 0; border-radius: var(--r-sm);
+  color: rgba(255,255,255,0.85); cursor: pointer; padding: 0;
+  opacity: 0; transition: opacity var(--t-fast), background var(--t-fast);
+}
+.user-msg-edit-btn svg { width: 12px; height: 12px; }
+@media (hover: hover) {
+  .user-bubble:hover .user-msg-edit-btn { opacity: 1; }
+  .user-msg-edit-btn:hover { background: rgba(0,0,0,0.34); }
+}
+/* Touch devices: always visible (no hover), small enough not to clutter */
+@media (hover: none) {
+  .user-msg-edit-btn { opacity: 0.55; }
+}
+.user-msg-edit { display: flex; flex-direction: column; gap: 8px; min-width: 280px; }
+.user-msg-edit-ta {
+  width: 100%; min-height: 80px; resize: vertical;
+  background: rgba(255,255,255,0.95); color: var(--c-fg-0);
+  border: 1px solid var(--c-border); border-radius: var(--r-sm);
+  padding: 8px 10px; font: inherit; font-size: var(--fs-sm); line-height: 1.5;
+  box-sizing: border-box;
+}
+.user-msg-edit-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 /* ===== Context meter ===== */
 .ctx-meter {
   display: flex; align-items: center; gap: 10px;

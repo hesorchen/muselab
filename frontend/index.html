@@ -917,7 +917,20 @@ window.addEventListener("error", e => {
                    is internal CLI protocol — users shouldn't see it. -->
               <div x-show="m.role==='user' && !m._is_compact_summary" class="msg-row">
                 <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
-                <div class="bubble"><template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" @click="openLightbox(im.preview)" :title="lang==='zh'?'点击放大':'Click to enlarge'" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template><span class="user-msg-text" x-text="m.text"></span></div>
+                <div class="bubble user-bubble">
+                  <template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" @click="openLightbox(im.preview)" :title="lang==='zh'?'点击放大':'Click to enlarge'" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template>
+                  <template x-if="editingMsgUuid !== m.uuid"><span class="user-msg-text" x-text="m.text"></span></template>
+                  <template x-if="editingMsgUuid === m.uuid">
+                    <div class="user-msg-edit">
+                      <textarea class="user-msg-edit-ta" x-model="editingMsgDraft" @keydown.escape.stop="cancelEditMsg()" @keydown.ctrl.enter.prevent.stop="saveEditMsg()" @keydown.meta.enter.prevent.stop="saveEditMsg()"></textarea>
+                      <div class="user-msg-edit-actions">
+                        <button class="btn-text" @click="cancelEditMsg()" x-text="t('btn.cancel')"></button>
+                        <button class="btn-primary" :disabled="editingMsgSaving" @click="saveEditMsg()" x-text="editingMsgSaving ? t('msg.edit_saving') : t('msg.edit_save')"></button>
+                      </div>
+                    </div>
+                  </template>
+                  <button class="user-msg-edit-btn" x-show="m.uuid && editingMsgUuid !== m.uuid && !streaming" @click="startEditMsg(m, i)" :title="t('msg.edit_hint')"><svg><use href="#i-edit"/></svg></button>
+                </div>
               </div>
               <div x-show="m.role==='assistant' && !m._is_compact_summary" class="msg-row">
                 <span class="msg-avatar assistant-avatar" :title="mascotLabel()">

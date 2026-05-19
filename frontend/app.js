@@ -168,6 +168,12 @@ function portal() {
     pendingImages: [],    // [{id, mime, preview (data URL), uploading, error}]
     pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
     dragHover: false,
+    // Inline edit-and-resend on a previously-sent user message. Only one
+    // bubble is editable at a time. editingMsgUuid = "" when nothing is
+    // being edited.
+    editingMsgUuid: "",
+    editingMsgDraft: "",
+    editingMsgSaving: false,
 
     // What Muse can see — populated from /api/chat/context-info on login.
     // Drives the onboarding hints (claude_md chip, "drop a doc here" cards).
@@ -4022,6 +4028,61 @@ function portal() {
       });
     },
 
+    // ===== message edit-and-resend =====
+    // Branch off any previously-sent user message: edit the text, then
+    // fork_session at the assistant message that came BEFORE this one and
+    // resend the new text in the new branch. The original session is
+    // untouched. Streaming sessions and pending (un-uuid'd) bubbles are
+    // not editable.
+    startEditMsg(m) {
+      if (this.streaming) return;
+      if (!m || !m.uuid) return;
+      this.editingMsgUuid = m.uuid;
+      this.editingMsgDraft = m.text || "";
+    },
+    cancelEditMsg() {
+      this.editingMsgUuid = ""; this.editingMsgDraft = "";
+      this.editingMsgSaving = false;
+    },
+    async saveEditMsg() {
+      const text = (this.editingMsgDraft || "").trim();
+      if (!text) { this.toast(this.t("msg.edit_empty"), "warn", 2000); return; }
+      if (this.streaming || this.editingMsgSaving) return;
+      this.editingMsgSaving = true;
+      try {
+        const idx = this.messages.findIndex(mm => mm.uuid === this.editingMsgUuid);
+        if (idx < 0) throw new Error("message not found");
+        // Walk backwards to find the most recent assistant message — that's
+        // the inclusive fork point. If there is none (this user msg is the
+        // very first turn), pass null so the fork starts empty.
+        let upTo = null;
+        for (let j = idx - 1; j >= 0; j--) {
+          if (this.messages[j].role === "assistant" && this.messages[j].uuid) {
+            upTo = this.messages[j].uuid; break;
+          }
+        }
+        const r = await fetch(`/api/chat/sessions/${this.currentId}/fork`, {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ up_to_message_id: upTo }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const data = await r.json();
+        const newSid = data.session_id;
+        this.editingMsgUuid = ""; this.editingMsgDraft = "";
+        await this.refreshSessions();
+        await this.openTab(newSid);
+        this.input = text;
+        this.toast(this.t("msg.edit_done"), "success", 1800);
+        await this.send();
+      } catch (e) {
+        this.toast(this.t("msg.edit_failed", { err: (e && e.message) || e }),
+                    "error", 5000);
+      } finally {
+        this.editingMsgSaving = false;
+      }
+    },
+
     async send() {
       const text = this.input.trim();
       // Slash command: intercept BEFORE hitting the SDK. /word or /word arg
@@ -4284,6 +4345,19 @@ function portal() {
           this._budgetWarned = true;
           this.toast(this.t("cost.budget_warn", { pct: d.budget_used_pct, usd: d.budget_usd }),
                       "warn", 5000);
+        }
+        // Context window warning at 85% — once per session per warned-tier,
+        // until user dismisses or compacts. _ctxWarned keys by streamSid so a
+        // new session starts fresh.
+        this._ctxWarned = this._ctxWarned || {};
+        const ctxPct = d.session_usage && d.session_usage.context_used_pct;
+        if (ctxPct >= 85 && ctxPct < 100 && !this._ctxWarned[streamSid]) {
+          this._ctxWarned[streamSid] = true;
+          this.toast(
+            this.t("ctx.window_warn", { pct: Math.round(ctxPct) }),
+            "warn", 8000,
+            { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact() },
+          );
         }
         es.close(); _markDone(); _stopTimer();
         this.refreshSessions();

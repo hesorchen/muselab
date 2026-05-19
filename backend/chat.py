@@ -845,6 +845,50 @@ async def native_compact_session_api(sid: str) -> dict:
     return {"ok": True}
 
 
+class ForkReq(BaseModel):
+    # Inclusive — fork copies the transcript up to and including this
+    # message UUID. To branch BEFORE a user message (e.g. for an edit-and-
+    # retry), pass the UUID of the previous assistant message.
+    # Omit / null = no truncation, copy the full transcript.
+    up_to_message_id: str | None = None
+    title: str | None = None
+
+
+@router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
+def fork_session_api(sid: str, req: ForkReq) -> dict:
+    """Branch a session at an arbitrary message UUID. SDK copies the JSONL
+    transcript up to that point into a fresh session file with new UUIDs;
+    muselab mirrors the new sid into index.json so it surfaces in the
+    picker immediately. Use case: user edits one of their messages — UI
+    forks at the previous assistant message, then resends the new text."""
+    src_meta = sess.get_session_meta(sid)
+    if src_meta is None:
+        raise HTTPException(404, "session not found")
+    try:
+        result = sdk_fork_session(
+            sid,
+            directory=str(ROOT),
+            up_to_message_id=req.up_to_message_id,
+            title=req.title,
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "source transcript not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"fork failed: {e}")
+    new_sid = result.session_id
+    new_name = req.title or ((src_meta.get("name") or "会话") + " (分支)")
+    sess.register_session(
+        new_sid,
+        name=new_name,
+        model=src_meta.get("model") or MODEL,
+        system_prompt=src_meta.get("system_prompt") or "",
+        auto_named=False,
+    )
+    return {"session_id": new_sid, "name": new_name}
+
+
 class BudgetReq(BaseModel):
     budget_usd: float       # 0 = disabled
 

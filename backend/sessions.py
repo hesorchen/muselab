@@ -203,7 +203,16 @@ def list_sessions() -> list[dict]:
 
 
 def create_session(name: str = "", model: str = "", system_prompt: str = "") -> dict:
-    sid = str(uuid.uuid4())
+    return register_session(str(uuid.uuid4()), name=name, model=model,
+                            system_prompt=system_prompt, auto_named=True)
+
+
+def register_session(sid: str, *, name: str = "", model: str = "",
+                     system_prompt: str = "", auto_named: bool = True,
+                     message_count: int = 0) -> dict:
+    """Add a session that already has a UUID (e.g. one minted by SDK
+    fork_session) to the muselab index. Same shape as create_session
+    but without generating a fresh UUID."""
     now = time.time()
     meta = {
         "id": sid,
@@ -212,13 +221,12 @@ def create_session(name: str = "", model: str = "", system_prompt: str = "") -> 
         "system_prompt": system_prompt,
         "created_at": now,
         "updated_at": now,
-        "message_count": 0,
-        "auto_named": True,
+        "message_count": message_count,
+        "auto_named": auto_named,
     }
     idx = _load_index()
     idx.append(meta)
     _save_index(idx)
-    # Initialize empty sidecar so reads don't have to special-case missing file.
     _save_sidecar(sid, {"messages": {}})
     return meta
 
