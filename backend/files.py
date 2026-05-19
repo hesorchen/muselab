@@ -204,7 +204,17 @@ def raw_file(path: str = Query(...)) -> FileResponse:
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     suffix = target.suffix.lower()
-    base_headers = {"X-Content-Type-Options": "nosniff"}
+    # `no-cache` (NOT no-store) — let browsers cache but force a conditional
+    # GET (If-None-Match / If-Modified-Since) every time. FileResponse still
+    # sends ETag + Last-Modified, so unchanged files return 304 cheaply; the
+    # moment mtime changes, the etag flips and the browser pulls the new
+    # body. Without this, browsers happily served the disk-cached version on
+    # every page reload (URLs identical) and edits never showed until users
+    # hit the manual reload button — see 2026-05-18 dark-mode HTML report bug.
+    base_headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-cache",
+    }
     # RFC 5987: non-ASCII filenames must be URL-encoded in filename* attribute.
     # HTTP headers are latin-1 only; Chinese / emoji filenames break encode().
     from urllib.parse import quote
