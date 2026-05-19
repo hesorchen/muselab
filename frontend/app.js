@@ -1599,10 +1599,20 @@ function portal() {
     async newSession() {
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
+      // Default name uses the user's BROWSER-LOCAL clock — the backend
+      // generated it from datetime.now() which is the VPS's UTC, so users
+      // in non-UTC timezones saw "新会话 05-19 08:26" when their wall
+      // clock said 16:26. Generating the timestamp client-side fixes that
+      // for every user without a server-side timezone config.
+      const now = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      const stamp = `${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
+                    `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      const prefix = this.lang === "zh" ? "新会话 " : "New chat ";
       const r = await fetch("/api/chat/sessions", {
         method: "POST",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "", model: this.model }),
+        body: JSON.stringify({ name: prefix + stamp, model: this.model }),
       });
       const meta = await r.json();
       await this.refreshSessions();
