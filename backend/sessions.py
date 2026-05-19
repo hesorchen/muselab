@@ -294,6 +294,18 @@ def update_model(sid: str, model: str) -> None:
             return
 
 
+# effort is one of: "" (auto/SDK default) | "low" | "medium" | "high" | "xhigh" | "max"
+# Empty string means "let the SDK pick" — same as no override. Stored on the
+# session so picking a deep-research effort on one tab doesn't leak into others.
+def update_effort(sid: str, effort: str) -> None:
+    idx = _load_index()
+    for s in idx:
+        if s["id"] == sid:
+            s["effort"] = effort
+            _save_index(idx)
+            return
+
+
 def update_system_prompt(sid: str, system_prompt: str) -> bool:
     idx = _load_index()
     for s in idx:

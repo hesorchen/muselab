@@ -156,6 +156,10 @@ function portal() {
     messages: [],
     model: "claude-sonnet-4-6",
     permission: "bypassPermissions",
+    // Reasoning effort override for the current session — "" means let the
+    // SDK pick adaptively (the existing default). Persisted on the session
+    // via PATCH so each tab keeps its own setting across reloads.
+    effort: "",
     // Always render thinking blocks. Toggle removed 2026-05-19 — adaptive
     // thinking was causing invisible mid-reply stalls when hidden; now we
     // always enable thinking on the backend AND always display it.
@@ -1531,6 +1535,30 @@ function portal() {
       }
     },
 
+    // Effort changes don't fork or corrupt the transcript (they only affect
+    // future-turn budget), so no confirm modal — PATCH in place, toast, done.
+    // Backend disconnects the cached client so the next turn rebuilds with
+    // the new value.
+    async onEffortChange() {
+      if (!this.currentId) return;
+      const e = this.effort || "";
+      try {
+        const r = await fetch("/api/chat/sessions/" + this.currentId, {
+          method: "PATCH",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ effort: e }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const label = this.t("effort." + (e || "auto"));
+        this.toast(this.t("effort.changed", { label }), "info", 1800);
+        // Mirror into the session list cache so tab-switch sees the right value.
+        const cur = this.sessions.find(s => s.id === this.currentId);
+        if (cur) cur.effort = e;
+      } catch (err) {
+        this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+      }
+    },
+
     modelGroups() {
       const map = {};
       for (const m of this.availableModels) {
@@ -2341,6 +2369,9 @@ function portal() {
         if (isCurrent) {
           this.messages = st.messages;
           if (s.model) this.model = s.model;
+          // effort defaults to "" (adaptive); always assign so switching from
+          // a high-effort tab to a fresh one doesn't leave the old value visible.
+          this.effort = s.effort || "";
           this.atBottom = true;
           this.scrollToBottom(true);
           this.$nextTick(() => this.highlightCode(".chat-body"));

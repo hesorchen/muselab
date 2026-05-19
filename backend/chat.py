@@ -46,7 +46,7 @@ _client_permission: dict[tuple[str, str], str] = {}
 # LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
 # muselab leaks memory as users open more sessions. New clients append to
 # the tail; on cache miss with len > cap, oldest gets disconnected.
-_client_lru: list[tuple[str, str]] = []
+_client_lru: list[tuple[str, str, str]] = []   # (session_id, model, effort)
 _CLIENT_POOL_CAP = int(os.environ.get("MUSELAB_CLIENT_POOL_CAP", "3"))
 _lock = asyncio.Lock()
 
@@ -141,11 +141,15 @@ SYSTEM_PROMPT = (
 
 
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
-                     show_thinking: bool = False) -> ClaudeSDKClient:
-    """Create or fetch a ClaudeSDKClient for a (session, model) pair. Switching
-    model in the UI yields a fresh client; resume=session_id loads the same
-    on-disk conversation history into the new model."""
-    key = (session_id, model)
+                     show_thinking: bool = False,
+                     effort: str = "") -> ClaudeSDKClient:
+    """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
+    Switching model OR effort in the UI yields a fresh client; resume=session_id
+    loads the same on-disk conversation history into the new client.
+
+    effort: "" (SDK adaptive) / "low" / "medium" / "high" / "xhigh" / "max".
+    Anything else is ignored — invalid values fall back to the SDK default."""
+    key = (session_id, model, effort)
     async with _lock:
         if key not in _clients:
             # Use session's custom system prompt if set, else fall back to muselab default.
@@ -303,6 +307,13 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             # KeyError('type') in subprocess_cli.py:376. Set it explicitly.
             opts_kwargs["thinking"] = ThinkingConfigEnabled(
                 type="enabled", budget_tokens=budget)
+            # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
+            # picks an effort automatically; this override lets users force a
+            # deeper budget on specific tabs (e.g. xhigh for research). SDK
+            # rejects unknown strings, so guard the literal set.
+            _VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
+            if effort and effort in _VALID_EFFORT:
+                opts_kwargs["effort"] = effort
             # When permission_mode is not bypassPermissions, wire the SDK's
             # can_use_tool callback to muselab's permission_request UI bridge.
             if permission != "bypassPermissions":
@@ -684,6 +695,10 @@ class SessionPatchReq(BaseModel):
     tag: str | None = None
     # Pin to top of the session picker. None = no change, True/False = set.
     pinned: bool | None = None
+    # Reasoning effort knob — "" / "low" / "medium" / "high" / "xhigh" / "max".
+    # Empty string clears the override (SDK picks adaptive). Changing effort
+    # invalidates cached clients so the next turn rebuilds with the new value.
+    effort: str | None = None
 
 
 @router.patch("/sessions/{sid}", dependencies=[Depends(require_token)])
@@ -729,6 +744,18 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         ok = sess.update_system_prompt(sid, req.system_prompt) or ok
         # System prompt change invalidates cached SDK clients for this session.
         await disconnect_client(sid)
+    if req.effort is not None:
+        # Validate against SDK literal set; empty string is a deliberate
+        # "clear override" signal so the user can revert to adaptive.
+        valid = {"", "low", "medium", "high", "xhigh", "max"}
+        if req.effort not in valid:
+            raise HTTPException(400, f"invalid effort: {req.effort}")
+        sess.update_effort(sid, req.effort)
+        # Effort is baked into ClaudeAgentOptions at construction time, so a
+        # change requires rebuilding the client. The next stream() call will
+        # pick up the new value via sess.get_session().
+        await disconnect_client(sid)
+        ok = True
     if req.model is not None:
         # Model switch is allowed any time — including mid-session. The next
         # turn will use the new model (frontend captures `streamingModel`
@@ -760,7 +787,10 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
                     perm = _client_permission.pop(old_key, "bypassPermissions")
                     if old_key in _client_lru:
                         _client_lru.remove(old_key)
-                    new_key = (sid, req.model)
+                    # Preserve the effort dimension when remapping under the
+                    # new model — set_model() keeps the SDK options object,
+                    # which still has the prior effort baked in.
+                    new_key = (sid, req.model, old_key[2])
                     _clients[new_key] = client
                     _client_permission[new_key] = perm
                     _client_lru.append(new_key)
@@ -866,11 +896,14 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
     if s is None:
         raise HTTPException(404, "session not found")
     m = (model or s.get("model") or MODEL).strip()
-    key = (session_id, m)
-    if key not in _clients:
+    # The context-breakdown call is read-only and effort-independent — find
+    # ANY live client for this (sid, model) pair regardless of effort key.
+    matched = [k for k in _clients if k[0] == session_id and k[1] == m]
+    if not matched:
         # No live client → can't ask CLI for breakdown. Surface this rather
         # than returning fake data; frontend can fall back to /usage.
         raise HTTPException(409, "no live client for this session — send a message first")
+    key = matched[0]
     try:
         breakdown = await _clients[key].get_context_usage()
         # Pass through the SDK's response shape directly. Frontend can pick
@@ -1455,11 +1488,15 @@ async def stream(
         model_to_use = model or MODEL
         sess.update_model(session_id, model_to_use)
 
+    # Effort is per-session; read from metadata (settable via PATCH). Empty
+    # string = SDK adaptive default, which is what the existing behavior was.
+    effort_to_use = (s.get("effort") or "").strip()
     # Wrap get_client so SDK / auth pre-check errors surface as SSE error
     # events instead of bubbling up as a 500 (which the frontend can only
     # render as the generic "stream connection failed" toast).
     try:
-        client = await get_client(session_id, model_to_use, permission, show_thinking)
+        client = await get_client(session_id, model_to_use, permission,
+                                    show_thinking, effort=effort_to_use)
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
         async def _early_err_gen():

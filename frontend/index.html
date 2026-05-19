@@ -1284,6 +1284,19 @@ window.addEventListener("error", e => {
               <option value="default">default</option>
               <option value="plan">plan</option>
             </select>
+            <!-- Reasoning effort. Empty = SDK adaptive default (Opus 4.7's
+                 adaptive thinking picks per turn). Overrides apply session-
+                 wide and trigger a client rebuild on next turn. -->
+            <select x-model="effort" @change="onEffortChange()"
+                    class="chat-toolbar-select"
+                    :title="t('effort.title')">
+              <option value="" x-text="t('effort.auto')"></option>
+              <option value="low" x-text="t('effort.low')"></option>
+              <option value="medium" x-text="t('effort.medium')"></option>
+              <option value="high" x-text="t('effort.high')"></option>
+              <option value="xhigh" x-text="t('effort.xhigh')"></option>
+              <option value="max" x-text="t('effort.max')"></option>
+            </select>
             <!-- Context ring — % used. Click to compact. Right-click
                  opens the SDK breakdown popup (the dedicated magnifier
                  button was removed per user request). -->
