@@ -87,6 +87,12 @@ function portal() {
     // see "Muse · Calliope / empty chat" for the second a big session
     // takes to fetch.
     messagesLoading: false,
+
+    // ===== command palette (Cmd/Ctrl+K) =====
+    // Single fuzzy-search dropdown across: quick actions, open sessions,
+    // and any files currently in the tree view. Action items have a `run`
+    // closure; selecting an item fires it and closes the palette.
+    palette: { show: false, query: "", activeIndex: 0 },
     // Tab strip — VS Code-Claude style. `openTabIds` is the visible order; each
     // entry is a session id (also present in `sessions`). currentId is the
     // active tab. Tabs can be opened from the session picker, closed via × on
@@ -261,6 +267,21 @@ function portal() {
 
     // ===== init =====
     onGlobalKeyDown(ev) {
+      // ---- Command palette ----
+      // Cmd/Ctrl+K from anywhere opens it. While open, palette owns
+      // ↑/↓/Enter; everything else falls through to the input.
+      if ((ev.ctrlKey || ev.metaKey) && (ev.key === "k" || ev.key === "K")) {
+        ev.preventDefault();
+        this.openPalette();
+        return;
+      }
+      if (this.palette.show) {
+        if (ev.key === "ArrowDown") { ev.preventDefault(); this.paletteMove(1); return; }
+        if (ev.key === "ArrowUp")   { ev.preventDefault(); this.paletteMove(-1); return; }
+        if (ev.key === "Enter")     { ev.preventDefault(); this.onPaletteEnter(); return; }
+        if (ev.key === "Escape")    { ev.preventDefault(); this.closePalette(); return; }
+        // Don't return — let typed chars reach the palette input naturally.
+      }
       // Ctrl/Cmd+S → 保存（编辑模式下）；Esc → 关 modal/menu/停止流式
       if ((ev.ctrlKey || ev.metaKey) && ev.key === "s") {
         if (this.editing && this.selected) {
@@ -4316,6 +4337,107 @@ function portal() {
 
     escape(s) {
       return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    },
+
+    // ===== command palette =====
+    openPalette() {
+      this.palette.query = "";
+      this.palette.activeIndex = 0;
+      this.palette.show = true;
+      this.$nextTick(() => {
+        const el = document.querySelector(".cmd-palette-input");
+        if (el) el.focus();
+      });
+    },
+    closePalette() { this.palette.show = false; },
+    // Build the item list freshly each render — cheap (few hundred entries
+    // at most) and keeps logic out of x-show templates. Item shape:
+    //   { type, label, hint, run }
+    paletteItems() {
+      const zh = this.lang === "zh";
+      const q = this.palette.query.trim().toLowerCase();
+      const items = [];
+
+      // 1) Quick actions — always available
+      const actions = [
+        { type: "act", label: zh ? "新建会话" : "New session",
+          hint: "Ctrl+T", run: () => this.newSession() },
+        { type: "act", label: zh ? "打开设置" : "Open settings",
+          hint: "⚙", run: () => this.openSettings() },
+        { type: "act", label: zh ? "切换主题（深/浅）" : "Toggle theme",
+          hint: "", run: () => this.toggleTheme() },
+        { type: "act", label: zh ? "切换语言到 English" : "Switch language to 中文",
+          hint: "", run: () => this.setLang(zh ? "en" : "zh") },
+        { type: "act", label: zh ? "刷新文件树" : "Refresh file tree",
+          hint: "", run: () => this.reloadTree() },
+        { type: "act", label: zh ? "压缩当前会话历史" : "Compact session history",
+          hint: "", run: () => this.runCompact() },
+        { type: "act", label: zh ? "退出登录" : "Logout",
+          hint: "", run: () => this.logout() },
+      ];
+      items.push(...actions);
+
+      // 2) Open sessions — switch to any session
+      for (const s of (this.sessions || [])) {
+        items.push({
+          type: "session",
+          label: s.name || "(untitled)",
+          hint: zh ? "会话" : "session",
+          run: () => this.activateTab(s.id),
+          _searchExtra: (s.first_prompt || "").slice(0, 100),
+        });
+      }
+
+      // 3) Currently-loaded file tree rows — opens preview. We only scan
+      // what's visible (not a full archive scan) because the tree is lazy
+      // and a full server-side fuzzy file index is a separate feature.
+      // 500 cap is plenty — beyond that the user should use the in-tree
+      // search (the search bar above the tree) instead.
+      for (const n of (this.visible || []).slice(0, 500)) {
+        if (n.is_dir) continue;
+        items.push({
+          type: "file",
+          label: n.name,
+          hint: n.path,
+          run: () => this.openFile(n),
+        });
+      }
+
+      // Fuzzy filter — substring match over label + hint + _searchExtra.
+      // Empty query returns first 30 items (so opening the palette without
+      // typing still shows something useful — most-recent sessions, etc).
+      if (!q) return items.slice(0, 30);
+      const matched = [];
+      for (const it of items) {
+        const hay = (it.label + " " + (it.hint || "") + " " + (it._searchExtra || "")).toLowerCase();
+        const i = hay.indexOf(q);
+        if (i >= 0) matched.push({ it, score: i + (it.type === "act" ? -100 : 0) });
+      }
+      matched.sort((a, b) => a.score - b.score);
+      return matched.slice(0, 40).map(m => m.it);
+    },
+    paletteMove(delta) {
+      const list = this.paletteItems();
+      if (!list.length) return;
+      this.palette.activeIndex =
+        (this.palette.activeIndex + delta + list.length) % list.length;
+    },
+    paletteRun(item) {
+      if (!item || !item.run) return;
+      this.closePalette();
+      // Defer the run so the modal close transition can paint before any
+      // heavy action (e.g. activateTab triggering loadSession's fetch).
+      this.$nextTick(() => { try { item.run(); } catch (e) { console.error(e); } });
+    },
+    onPaletteEnter() {
+      const list = this.paletteItems();
+      const idx = Math.min(this.palette.activeIndex, list.length - 1);
+      this.paletteRun(list[idx]);
+    },
+
+    paletteIcon(type) {
+      // Tiny svg id mapping; falls back to a dot if unknown.
+      return ({ act: "#i-settings", session: "#i-file-text", file: "#i-file" })[type] || "#i-circle";
     },
   };
 }
