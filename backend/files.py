@@ -162,6 +162,84 @@ def list_dir(path: str = "", show_hidden: bool = False) -> dict:
     return {"root": str(ROOT), "path": path, "entries": entries, "truncated": truncated}
 
 
+# xlsx preview caps. Read-only mode + capped per-sheet rows/cols so a
+# 1M-cell spreadsheet doesn't OOM the SSE event loop or blow up the JSON
+# payload over the wire. Truncation is signaled to the FE so it can hint
+# the user instead of silently dropping data.
+XLSX_MAX_SHEETS = 20
+XLSX_MAX_ROWS = 500
+XLSX_MAX_COLS = 50
+XLSX_CELL_MAX_CHARS = 500   # one obnoxious cell shouldn't blow the page
+
+
+@router.get("/xlsx", dependencies=[Depends(require_token)])
+def xlsx_preview(path: str) -> dict:
+    """Read-only xlsx preview as structured JSON.
+
+    Returns each sheet's first XLSX_MAX_ROWS×XLSX_MAX_COLS cells as
+    strings. Formulas are NOT evaluated — `data_only=True` returns the
+    cached value the spreadsheet app last wrote. If a file was created
+    programmatically without ever being opened in Excel/LibreOffice,
+    formula cells will be null and surface as empty strings.
+    """
+    target = safe_resolve(path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    if target.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        raise HTTPException(status_code=415, detail="not an xlsx-family file")
+    try:
+        import openpyxl  # local import — openpyxl is only loaded on demand
+    except ImportError:
+        raise HTTPException(status_code=500,
+                            detail="openpyxl not installed — run `uv sync`")
+    try:
+        wb = openpyxl.load_workbook(target, read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"failed to parse xlsx: {type(e).__name__}: {e}")
+    try:
+        sheets: list[dict] = []
+        sheet_names = wb.sheetnames
+        sheets_truncated = len(sheet_names) > XLSX_MAX_SHEETS
+        for sheet_name in sheet_names[:XLSX_MAX_SHEETS]:
+            ws = wb[sheet_name]
+            rows: list[list[str]] = []
+            rows_truncated = False
+            cols_truncated = False
+            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if r_idx >= XLSX_MAX_ROWS:
+                    rows_truncated = True
+                    break
+                cells: list[str] = []
+                for c_idx, val in enumerate(row):
+                    if c_idx >= XLSX_MAX_COLS:
+                        cols_truncated = True
+                        break
+                    if val is None:
+                        cells.append("")
+                    else:
+                        s = str(val)
+                        if len(s) > XLSX_CELL_MAX_CHARS:
+                            s = s[:XLSX_CELL_MAX_CHARS] + "…"
+                        cells.append(s)
+                rows.append(cells)
+            sheets.append({
+                "name": sheet_name,
+                "rows": rows,
+                "rows_truncated": rows_truncated,
+                "cols_truncated": cols_truncated,
+            })
+        return {
+            "path": path,
+            "sheets": sheets,
+            "sheets_truncated": sheets_truncated,
+            "limits": {"max_rows": XLSX_MAX_ROWS, "max_cols": XLSX_MAX_COLS,
+                       "max_sheets": XLSX_MAX_SHEETS},
+        }
+    finally:
+        wb.close()
+
+
 @router.get("/read", dependencies=[Depends(require_token)])
 def read_file(path: str) -> PlainTextResponse:
     target = safe_resolve(path)

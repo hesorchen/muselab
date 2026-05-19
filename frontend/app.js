@@ -58,6 +58,11 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // xlsx preview state. previewMode==='xlsx' uses xlsxSheets (array of
+    // {name, rows, rows_truncated, cols_truncated}). xlsxActive picks the
+    // sheet tab. xlsxLimits carries the server's row/col caps for the UI
+    // hint when truncation happens.
+    xlsxSheets: [], xlsxActive: "", xlsxLimits: null, xlsxSheetsTruncated: false,
     // Bumped whenever an assistant tool_use edits a file. Used as a cache
     // buster on iframe / read URLs so the preview reflects the new content
     // without the user needing to manually refresh the page.
@@ -2730,6 +2735,23 @@ function portal() {
       }
       else if (["png", "jpg", "jpeg", "gif", "webp", "ico", "bmp"].includes(ext)) this.previewMode = "img";
       else if (ext === "pdf") this.previewMode = "pdf";
+      else if (["xlsx", "xlsm", "xltx", "xltm"].includes(ext)) {
+        // xlsx preview: backend serializes the workbook into capped per-sheet
+        // string matrices so the frontend just renders <table>s. No formula
+        // evaluation; cells show the last-cached value.
+        const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
+                              { headers: this.hdr() });
+        if (r.ok) {
+          const data = await r.json();
+          this.previewMode = "xlsx";
+          this.xlsxSheets = data.sheets || [];
+          this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
+          this.xlsxLimits = data.limits || null;
+          this.xlsxSheetsTruncated = !!data.sheets_truncated;
+        } else {
+          this.previewMode = "unsupported";
+        }
+      }
       else {
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
         if (r.ok) {

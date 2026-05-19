@@ -3063,6 +3063,95 @@ pre.has-copy-btn .code-copy-btn.copied {
   white-space: pre-wrap; word-break: break-all;
 }
 
+/* ==========================================================================
+   xlsx preview — sheet tabs + scrollable table. Capped server-side so
+   the DOM payload is bounded; full feature parity with a spreadsheet
+   app is explicitly NOT a goal.
+   ========================================================================== */
+.xlsx-preview {
+  display: flex; flex-direction: column;
+  height: 100%;
+  background: var(--c-bg-1);
+}
+.xlsx-tabs {
+  display: flex; gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--c-border);
+  background: var(--c-bg-2);
+  overflow-x: auto;
+  flex-shrink: 0;
+  align-items: center;
+}
+.xlsx-tab {
+  padding: 5px 12px;
+  background: transparent;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  color: var(--c-fg-2);
+  font-size: var(--fs-sm);
+  font-family: var(--font-sans);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.xlsx-tab:hover { color: var(--c-fg-0); border-color: var(--c-border-strong); }
+.xlsx-tab.active {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+.xlsx-trunc-note {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.xlsx-sheet-wrap {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.xlsx-scroll {
+  flex: 1; min-height: 0;
+  overflow: auto;
+}
+.xlsx-table {
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: var(--c-bg-1);
+}
+.xlsx-table td {
+  border: 1px solid var(--c-border);
+  padding: 4px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+  color: var(--c-fg-0);
+  vertical-align: top;
+}
+.xlsx-table tr:hover td { background: var(--c-bg-2); }
+.xlsx-table td.xlsx-rownum {
+  position: sticky; left: 0;
+  background: var(--c-bg-2);
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  text-align: right;
+  min-width: 36px;
+  user-select: none;
+  z-index: 1;
+}
+.xlsx-table tr:hover td.xlsx-rownum { background: var(--c-bg-3); }
+.xlsx-meta {
+  padding: 6px 10px;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  background: var(--c-bg-2);
+  border-top: 1px solid var(--c-border);
+  display: flex; gap: 12px;
+  flex-shrink: 0;
+}
+
 /* (Session management table removed — delete now lives inline in the chat
    header's session picker, not in Settings.) */
 
