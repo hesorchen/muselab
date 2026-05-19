@@ -3161,12 +3161,97 @@ function portal() {
         this.toast(`已上传 ${file.name} 到 /${dirPath || ""}`, "success");
       } else this.toast("上传失败：" + (await r.text()), "error");
     },
+    // Custom MIME so tree-internal drags don't collide with OS file drops.
+    // Reading getData with this type during dragover would force a stale
+    // permissions roundtrip; we use ev.dataTransfer.types.includes() to
+    // detect an internal drag without actually pulling the payload until
+    // drop fires.
+    _DRAG_MIME_INTERNAL: "application/x-muselab-path",
+
+    onTreeNodeDragStart(ev, n) {
+      // Stamp both our custom mime (used in onDrop to know "this is a
+      // tree-internal move, not an OS upload") and text/plain (broad
+      // compatibility — some browsers strip custom types in certain
+      // scenarios). text/plain doubles as fallback.
+      ev.dataTransfer.setData(this._DRAG_MIME_INTERNAL, n.path);
+      ev.dataTransfer.setData("text/plain", n.path);
+      ev.dataTransfer.effectAllowed = "move";
+      this._dragSrcPath = n.path;
+    },
+    onTreeNodeDragOver(ev, n) {
+      // Only highlight directories. For an internal drag, also prevent
+      // illegal targets (a node onto itself or into its own subtree)
+      // by clearing dropEffect — the cursor shows "no entry" and onDrop
+      // simply no-ops.
+      if (!n.is_dir) { ev.dataTransfer.dropEffect = "none"; return; }
+      const src = this._dragSrcPath || "";
+      if (src && (src === n.path || (n.path + "/").startsWith(src + "/"))) {
+        ev.dataTransfer.dropEffect = "none";
+        return;
+      }
+      this.dragOver = n.path;
+      ev.dataTransfer.dropEffect = "move";
+    },
     async onDrop(ev, n) {
       this.dragOver = "";
+      const wasSrc = this._dragSrcPath;
+      this._dragSrcPath = null;
       if (!n.is_dir) return;
+
+      // Tree-internal drag → move via /api/files/rename. We check
+      // dataTransfer.types first so we don't accidentally trip on plain
+      // text from elsewhere on the page.
+      const types = Array.from(ev.dataTransfer?.types || []);
+      const isInternal = types.includes(this._DRAG_MIME_INTERNAL);
+      if (isInternal) {
+        const src = ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL) || wasSrc;
+        await this.moveTreeItem(src, n.path);
+        return;
+      }
+
+      // OS file upload (the original behavior).
       const files = ev.dataTransfer?.files || [];
       if (!files.length) return;
       for (const f of files) await this.uploadFileTo(n.path, f);
+    },
+    async moveTreeItem(srcPath, targetDir) {
+      if (!srcPath) return;
+      const srcName = srcPath.split("/").pop();
+      const srcParent = srcPath.split("/").slice(0, -1).join("/");
+      // Same-parent drop = no-op (user dragged a file inside its own
+      // directory without changing anything).
+      if (srcParent === targetDir) return;
+      // Dropping a directory onto itself or anywhere in its own subtree
+      // would create a cycle. Backend would 422 on rename but we'd
+      // rather not even attempt it — feedback is faster client-side.
+      if (srcPath === targetDir
+          || (targetDir + "/").startsWith(srcPath + "/")) {
+        this.toast(this.lang === "zh"
+          ? "不能把目录拖进自己的子目录"
+          : "Can't move a folder into its own subtree", "warn", 2500);
+        return;
+      }
+      const newPath = targetDir ? `${targetDir}/${srcName}` : srcName;
+      const r = await fetch("/api/files/rename", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ src: srcPath, dst: newPath }),
+      });
+      if (!r.ok) {
+        const err = await r.text();
+        this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ") + err,
+          "error", 4000);
+        return;
+      }
+      this.toast(this.lang === "zh"
+        ? `已移动到 /${targetDir || "(根)"}`
+        : `Moved to /${targetDir || "(root)"}`, "success", 2000);
+      // Refresh the tree and reroute selected/preview if we just moved
+      // the currently-open file.
+      if (this.selected === srcPath) this.selected = newPath;
+      const openTab = this.tabs.find(t => t.path === srcPath);
+      if (openTab) openTab.path = newPath;
+      await this.reloadTree();
     },
     async mkdirPrompt() {
       const name = await this.prompt({

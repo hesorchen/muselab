@@ -286,9 +286,12 @@ window.addEventListener("error", e => {
               :data-path="n.path"
               :data-depth="n.depth"
               :data-ext="fileExtClass(n)"
+              draggable="true"
+              @dragstart="onTreeNodeDragStart($event, n)"
+              @dragend="dragOver=''"
               @click="onNodeClick(n)"
               @contextmenu.prevent="openCtxMenu($event, n)"
-              @dragover.prevent="n.is_dir && (dragOver=n.path)"
+              @dragover.prevent="onTreeNodeDragOver($event, n)"
               @dragleave="dragOver=''"
               @drop.prevent="onDrop($event, n)">
             <span class="caret">
