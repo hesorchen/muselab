@@ -486,12 +486,55 @@ def _current_versions() -> dict:
         pass
 
     bundled_cli = _probe(bundled_path)
-    system_cli = _probe(shutil.which("claude"))
+
+    # System claude lookup — check multiple common install locations and
+    # pick the one with the highest version. Reason: `npm install -g
+    # @anthropic-ai/claude-code` typically writes to the user's npm prefix
+    # (e.g. ~/.npm-global/bin/claude), but the user's $PATH may still
+    # resolve `claude` to an older system-wide install at /usr/bin/claude.
+    # If we only probed shutil.which("claude") we'd report the shadowed
+    # OLD version even right after the user successfully upgraded — UI
+    # would keep showing the upgrade-available badge. The fix is to also
+    # peek into npm's prefix and the conventional ~/.npm-global path, then
+    # report whichever binary actually has the highest semver.
+    system_candidates: list[str] = []
+    which_claude = shutil.which("claude")
+    if which_claude:
+        system_candidates.append(which_claude)
+    home_npm = str(Path.home() / ".npm-global" / "bin" / "claude")
+    if Path(home_npm).exists() and home_npm not in system_candidates:
+        system_candidates.append(home_npm)
+    if shutil.which("npm"):
+        try:
+            r = subprocess.run(
+                ["npm", "config", "get", "prefix"],
+                capture_output=True, text=True, timeout=2,
+            )
+            prefix = (r.stdout or "").strip()
+            if prefix and prefix not in ("undefined",):
+                cand = str(Path(prefix) / "bin" / "claude")
+                if Path(cand).exists() and cand not in system_candidates:
+                    system_candidates.append(cand)
+        except Exception:
+            pass
+
+    system_cli: str | None = None
+    system_cli_path: str | None = None
+    for cand in system_candidates:
+        v = _probe(cand)
+        if v and (system_cli is None or _semver_gt(v, system_cli)):
+            system_cli = v
+            system_cli_path = cand
+
     return {
         "sdk": sdk_version,
         "bundled_cli": bundled_cli,
         "system_cli": system_cli,
         "system_cli_present": system_cli is not None,
+        # New: the actual path muselab is reporting from. Helps users
+        # diagnose "I just upgraded but the badge is still there" — they
+        # can see whether muselab is looking at the right binary.
+        "system_cli_path": system_cli_path,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         # Legacy field kept for backward-compat with any consumer expecting it.
         "cli": bundled_cli or system_cli,
