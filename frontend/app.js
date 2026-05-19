@@ -99,8 +99,16 @@ function portal() {
       history: [],
       unreadCount: 0,
       loading: false,
-      // Inline-create form state. Reset by _resetSchedDraft().
-      draft: { name: "", prompt: "", hour: 9, minute: 0, model: "" },
+      // Inline-create form state. Polymorphic — only the fields
+      // matching `kind` get sent to the backend. Reset by _resetSchedDraft.
+      draft: {
+        name: "", prompt: "", model: "",
+        kind: "daily",         // daily / weekly / monthly / once
+        hour: 9, minute: 0,
+        weekdays: [1, 2, 3, 4, 5],  // weekly: Mon-Fri default
+        day: 1,                // monthly day-of-month
+        onceDate: "",          // once: "YYYY-MM-DD"
+      },
     },
     // Notification prefs — purely client-side. Vibration is a foreground-
     // only nicety (when muselab is open, vibrate on unread count tick up).
@@ -4657,8 +4665,12 @@ function portal() {
     closeScheduler() { this.scheduler.show = false; },
     _resetSchedDraft() {
       this.scheduler.draft = {
-        name: "", prompt: "", hour: 9, minute: 0,
-        model: this.model || "",
+        name: "", prompt: "", model: this.model || "",
+        kind: "daily",
+        hour: 9, minute: 0,
+        weekdays: [1, 2, 3, 4, 5],
+        day: 1,
+        onceDate: "",
       };
     },
     async loadSchedulerTasks() {
@@ -4690,14 +4702,38 @@ function portal() {
           "warn", 2500);
         return;
       }
+      // Build the schedule dict per kind. Backend's ScheduleIn validates
+      // ranges + ignores fields irrelevant to the chosen kind.
+      const sched = {
+        kind: d.kind,
+        hour: Number(d.hour),
+        minute: Number(d.minute),
+      };
+      if (d.kind === "weekly") {
+        if (!d.weekdays.length) {
+          this.toast(this.lang === "zh"
+            ? "至少选一天" : "Pick at least one weekday", "warn", 2500);
+          return;
+        }
+        sched.weekdays = d.weekdays.slice();
+      } else if (d.kind === "monthly") {
+        sched.day = Number(d.day);
+      } else if (d.kind === "once") {
+        if (!d.onceDate) {
+          this.toast(this.lang === "zh"
+            ? "选个日期" : "Pick a date", "warn", 2500);
+          return;
+        }
+        const [y, m, dy] = d.onceDate.split("-").map(Number);
+        sched.year = y; sched.month = m; sched.day = dy;
+      }
       const r = await fetch("/api/scheduler/tasks", {
         method: "POST",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
         body: JSON.stringify({
           name: d.name.trim(),
           prompt: d.prompt.trim(),
-          hour: Number(d.hour),
-          minute: Number(d.minute),
+          schedule: sched,
           model: d.model || "",
         }),
       });
@@ -4711,6 +4747,38 @@ function portal() {
       await this.loadSchedulerTasks();
       this.toast(this.lang === "zh" ? "任务已创建" : "Task created",
         "success", 2000);
+    },
+    toggleDraftWeekday(w) {
+      const wds = this.scheduler.draft.weekdays;
+      const i = wds.indexOf(w);
+      if (i >= 0) wds.splice(i, 1);
+      else wds.push(w);
+    },
+    fmtSchedule(s) {
+      // Human-readable summary of a schedule dict — appears next to the
+      // task name in the list.
+      if (!s) return "";
+      const zh = this.lang === "zh";
+      const hh = String(s.hour).padStart(2, "0") + ":"
+                + String(s.minute).padStart(2, "0");
+      if (s.kind === "daily") return (zh ? "每天 " : "Daily ") + hh;
+      if (s.kind === "weekly") {
+        const names = zh
+          ? ["一", "二", "三", "四", "五", "六", "日"]
+          : ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+        const days = (s.weekdays || []).sort().map(w => names[w]).join(
+          zh ? "、" : " ");
+        return (zh ? "每周" : "Weekly ") + days + " " + hh;
+      }
+      if (s.kind === "monthly") {
+        return zh ? `每月 ${s.day} 日 ${hh}` : `Monthly day ${s.day} ${hh}`;
+      }
+      if (s.kind === "once") {
+        return zh
+          ? `${s.year}-${String(s.month).padStart(2,"0")}-${String(s.day).padStart(2,"0")} ${hh}`
+          : `Once ${s.year}-${String(s.month).padStart(2,"0")}-${String(s.day).padStart(2,"0")} ${hh}`;
+      }
+      return hh;
     },
     async deleteSchedTask(t) {
       if (!confirm(this.lang === "zh"

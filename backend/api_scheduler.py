@@ -19,19 +19,30 @@ from . import scheduler as sched
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
 
 
+class ScheduleIn(BaseModel):
+    """Polymorphic schedule. Frontend sends one shape per kind; only the
+    fields relevant to that kind are required, rest ignored."""
+    kind: str = Field(pattern="^(daily|weekly|monthly|once)$")
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    weekdays: list[int] | None = None   # weekly: 0..6 (0=Mon)
+    day: int | None = Field(default=None, ge=1, le=31)  # monthly
+    year: int | None = Field(default=None, ge=2024, le=2100)   # once
+    month: int | None = Field(default=None, ge=1, le=12)       # once
+    # 'day' is reused for the day-of-month in `once` too.
+
+
 class TaskIn(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     prompt: str = Field(min_length=1)
-    hour: int = Field(ge=0, le=23)
-    minute: int = Field(ge=0, le=59)
+    schedule: ScheduleIn
     model: str = ""
 
 
 class TaskPatch(BaseModel):
     name: str | None = None
     prompt: str | None = None
-    hour: int | None = Field(default=None, ge=0, le=23)
-    minute: int | None = Field(default=None, ge=0, le=59)
+    schedule: ScheduleIn | None = None
     model: str | None = None
     enabled: bool | None = None
 
@@ -46,19 +57,25 @@ def list_tasks_endpoint() -> dict:
 
 @router.post("/tasks", dependencies=[Depends(require_token)])
 def create_task_endpoint(req: TaskIn) -> dict:
-    return sched.create_task(
-        name=req.name,
-        prompt=req.prompt,
-        hour=req.hour,
-        minute=req.minute,
-        model=req.model,
-    )
+    try:
+        return sched.create_task(
+            name=req.name,
+            prompt=req.prompt,
+            schedule=req.schedule.model_dump(exclude_none=True),
+            model=req.model,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
 
 
 @router.patch("/tasks/{tid}", dependencies=[Depends(require_token)])
 def patch_task_endpoint(tid: str, req: TaskPatch) -> dict:
     # Pydantic v2: model_dump(exclude_unset=True) for "only sent fields"
     changes = req.model_dump(exclude_unset=True)
+    # If a schedule was sent, normalize its dict shape (drop None fields)
+    if "schedule" in changes and changes["schedule"]:
+        changes["schedule"] = {k: v for k, v in changes["schedule"].items()
+                                if v is not None}
     t = sched.update_task(tid, **changes)
     if not t:
         raise HTTPException(404, "task not found")

@@ -1784,32 +1784,91 @@ window.addEventListener("error", e => {
                 :title="lang==='zh' ? '关闭' : 'Close'">×</button>
       </div>
       <div class="modal-body sched-body">
-        <!-- Create form (inline, always visible) -->
+        <!-- Create form — labeled rows, grid-aligned, supports daily /
+             weekly / monthly / once with the time picker always
+             precise to the minute. -->
         <div class="sched-create">
-          <div class="sched-create-row">
-            <input class="settings-input" x-model="scheduler.draft.name"
-                   :placeholder="lang==='zh' ? '任务名（例：每日复盘）' : 'Task name (e.g. Daily review)'" />
-            <select class="settings-input" x-model.number="scheduler.draft.hour">
-              <template x-for="h in 24" :key="h">
-                <option :value="h - 1" x-text="String(h - 1).padStart(2, '0') + ':'"></option>
-              </template>
-            </select>
-            <select class="settings-input" x-model.number="scheduler.draft.minute">
-              <template x-for="m in [0, 15, 30, 45]" :key="m">
-                <option :value="m" x-text="String(m).padStart(2, '0')"></option>
-              </template>
-            </select>
-            <button class="btn-primary" @click="createSchedTask()"
-                    x-text="lang==='zh' ? '+ 添加' : '+ Add'"></button>
+          <div class="sched-field">
+            <label class="sched-label" x-text="lang==='zh' ? '任务名' : 'Name'"></label>
+            <input class="settings-input sched-input-name"
+                   x-model="scheduler.draft.name"
+                   :placeholder="lang==='zh' ? '例：每日复盘' : 'e.g. Daily review'" />
           </div>
-          <textarea class="sched-create-prompt" x-model="scheduler.draft.prompt"
-                    rows="3"
-                    :placeholder="lang==='zh'
-                      ? 'prompt — Muse 每次会跑的指令。例：「总结过去 24 小时 archive 的改动，列出值得我关注的三件事」'
-                      : 'Prompt — what Muse runs each time. e.g. “Summarize what changed in my archive in the last 24h and flag the 3 worth my attention”'"></textarea>
-          <div class="sched-create-hint" x-text="lang==='zh'
-              ? '每天此时间运行；每个任务会创建一个独立 session 累积历史'
-              : 'Fires every day at the chosen time; each task gets its own session for history'"></div>
+          <div class="sched-field">
+            <label class="sched-label" x-text="lang==='zh' ? '频率' : 'Repeat'"></label>
+            <div class="sched-freq">
+              <template x-for="k in ['daily','weekly','monthly','once']" :key="k">
+                <button type="button" class="sched-freq-btn"
+                        :class="{ active: scheduler.draft.kind === k }"
+                        @click="scheduler.draft.kind = k"
+                        x-text="lang==='zh'
+                          ? ({daily:'每天',weekly:'每周',monthly:'每月',once:'一次'})[k]
+                          : ({daily:'Daily',weekly:'Weekly',monthly:'Monthly',once:'Once'})[k]"></button>
+              </template>
+            </div>
+          </div>
+
+          <!-- Weekday picker — only visible for weekly. -->
+          <div class="sched-field" x-show="scheduler.draft.kind === 'weekly'">
+            <label class="sched-label" x-text="lang==='zh' ? '星期几' : 'Weekdays'"></label>
+            <div class="sched-weekdays">
+              <template x-for="(wd, idx) in (lang==='zh'
+                  ? ['一','二','三','四','五','六','日']
+                  : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])" :key="idx">
+                <button type="button" class="sched-weekday"
+                        :class="{ active: scheduler.draft.weekdays.includes(idx) }"
+                        @click="toggleDraftWeekday(idx)"
+                        x-text="wd"></button>
+              </template>
+            </div>
+          </div>
+
+          <!-- Day-of-month — only for monthly. -->
+          <div class="sched-field" x-show="scheduler.draft.kind === 'monthly'">
+            <label class="sched-label" x-text="lang==='zh' ? '每月第' : 'Day of month'"></label>
+            <div class="sched-monthly">
+              <input type="number" min="1" max="31" class="settings-input sched-day-input"
+                     x-model.number="scheduler.draft.day" />
+              <span class="sched-monthly-suffix"
+                    x-text="lang==='zh' ? '日（超过月底自动顺延到月底当天）' : '(falls back to last day for short months)'"></span>
+            </div>
+          </div>
+
+          <!-- Once: date picker. -->
+          <div class="sched-field" x-show="scheduler.draft.kind === 'once'">
+            <label class="sched-label" x-text="lang==='zh' ? '日期' : 'Date'"></label>
+            <input type="date" class="settings-input sched-input-date"
+                   x-model="scheduler.draft.onceDate" />
+          </div>
+
+          <div class="sched-field">
+            <label class="sched-label" x-text="lang==='zh' ? '时间' : 'Time'"></label>
+            <div class="sched-time">
+              <input type="number" min="0" max="23" class="settings-input sched-time-input"
+                     x-model.number="scheduler.draft.hour" />
+              <span class="sched-time-sep">:</span>
+              <input type="number" min="0" max="59" class="settings-input sched-time-input"
+                     x-model.number="scheduler.draft.minute" />
+            </div>
+          </div>
+
+          <div class="sched-field sched-field-prompt">
+            <label class="sched-label" x-text="lang==='zh' ? 'Prompt' : 'Prompt'"></label>
+            <textarea class="sched-create-prompt"
+                      x-model="scheduler.draft.prompt"
+                      rows="3"
+                      :placeholder="lang==='zh'
+                        ? '例：总结过去 24 小时 archive 的改动，列出值得关注的三件事'
+                        : 'e.g. Summarize what changed in my archive in the last 24h and flag the 3 worth my attention'"></textarea>
+          </div>
+
+          <div class="sched-create-foot">
+            <span class="sched-create-hint" x-text="lang==='zh'
+                ? '运行结果发送到自动创建的同名 session'
+                : 'Output streams into an auto-created session of the same name'"></span>
+            <button class="btn-primary" @click="createSchedTask()"
+                    x-text="lang==='zh' ? '+ 添加任务' : '+ Add task'"></button>
+          </div>
         </div>
 
         <!-- Tasks list -->
@@ -1826,8 +1885,7 @@ window.addEventListener("error", e => {
                 <div class="sched-row-name">
                   <span x-text="t.name"></span>
                   <span class="sched-row-time"
-                        x-text="' · ' + String(t.schedule.hour).padStart(2, '0')
-                                + ':' + String(t.schedule.minute).padStart(2, '0')"></span>
+                        x-text="' · ' + fmtSchedule(t.schedule)"></span>
                 </div>
                 <div class="sched-row-prompt" x-text="t.prompt"></div>
                 <div class="sched-row-meta">

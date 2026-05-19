@@ -72,21 +72,99 @@ def _save_state() -> None:
 # ---------- schedule math ----------
 
 def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | None:
-    """Return the next epoch-time `schedule` fires (or None if invalid).
-    Only `daily` is supported in this iteration; extend here for weekly /
-    monthly / once."""
-    if schedule.get("kind") != "daily":
-        return None
+    """Return the next epoch-time `schedule` fires (or None if invalid /
+    in the past for a one-shot schedule).
+
+    Supported `kind` values:
+      daily            — every day at hour:minute
+      weekly           — schedule["weekdays"] is a list of ints 0..6
+                          (0=Mon, 6=Sun), at hour:minute
+      monthly          — every month on schedule["day"] (1..31), at
+                          hour:minute. Months without that day (Feb 31)
+                          fall back to that month's last valid day.
+      once             — schedule["year/month/day"] + hour:minute, fires
+                          once. Returns None once the date is past, so
+                          the scheduler stops trying to fire it.
+    """
+    kind = schedule.get("kind")
     try:
-        h = int(schedule["hour"])
-        m = int(schedule["minute"])
-    except (KeyError, ValueError, TypeError):
+        h = int(schedule.get("hour", 0))
+        m = int(schedule.get("minute", 0))
+    except (ValueError, TypeError):
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
         return None
     base = datetime.fromtimestamp(ref_ts if ref_ts is not None else time.time())
-    target = base.replace(hour=h, minute=m, second=0, microsecond=0)
-    if target <= base:
-        target += timedelta(days=1)
-    return target.timestamp()
+
+    if kind == "daily":
+        target = base.replace(hour=h, minute=m, second=0, microsecond=0)
+        if target <= base:
+            target += timedelta(days=1)
+        return target.timestamp()
+
+    if kind == "weekly":
+        wds = schedule.get("weekdays") or []
+        try:
+            wds = sorted({int(w) for w in wds if 0 <= int(w) <= 6})
+        except (ValueError, TypeError):
+            return None
+        if not wds:
+            return None
+        # Probe today + next 7 days, take the first match.
+        for delta in range(0, 8):
+            cand = base.replace(hour=h, minute=m, second=0, microsecond=0) \
+                       + timedelta(days=delta)
+            if cand.weekday() in wds and cand > base:
+                return cand.timestamp()
+        return None
+
+    if kind == "monthly":
+        try:
+            day = int(schedule["day"])
+        except (KeyError, ValueError, TypeError):
+            return None
+        if not (1 <= day <= 31):
+            return None
+        # Try current month, then advance month-by-month until we find a
+        # valid date. Cap at 12 iterations (a year) so we never loop on
+        # bad input.
+        cur = base
+        for _ in range(12):
+            try:
+                cand = cur.replace(day=min(day, _month_max_day(cur.year, cur.month)),
+                                    hour=h, minute=m, second=0, microsecond=0)
+            except ValueError:
+                cand = None
+            if cand and cand > base:
+                return cand.timestamp()
+            # advance one month
+            ny = cur.year + (1 if cur.month == 12 else 0)
+            nm = 1 if cur.month == 12 else cur.month + 1
+            cur = cur.replace(year=ny, month=nm, day=1)
+        return None
+
+    if kind == "once":
+        try:
+            y = int(schedule["year"])
+            mo = int(schedule["month"])
+            d = int(schedule["day"])
+            target = datetime(y, mo, d, h, m, 0)
+        except (KeyError, ValueError, TypeError):
+            return None
+        if target <= base:
+            return None
+        return target.timestamp()
+
+    return None
+
+
+def _month_max_day(year: int, month: int) -> int:
+    """Last calendar day of a given (year, month). Avoids importing calendar."""
+    if month == 12:
+        nxt = datetime(year + 1, 1, 1)
+    else:
+        nxt = datetime(year, month + 1, 1)
+    return (nxt - timedelta(days=1)).day
 
 
 # ---------- public CRUD ----------
@@ -102,15 +180,24 @@ def get_task(tid: str) -> dict | None:
     return _state["tasks"].get(tid)
 
 
-def create_task(name: str, prompt: str, hour: int, minute: int,
+def create_task(name: str, prompt: str, schedule: dict,
                  model: str = "") -> dict:
-    """Create a daily task. Auto-creates a dedicated muselab session
-    bound to the task so every run appends to the same history. Session
-    name is `[定时] <task name>` so it's easy to find in the picker."""
+    """Create a task with the given schedule dict. The dict shape
+    depends on schedule.kind — see _compute_next_run for valid forms.
+    Auto-creates a dedicated muselab session bound to the task so every
+    run appends to the same history. Session name is `[定时] <task name>`."""
+    # Validate the schedule actually resolves to a future fire time —
+    # the API surface (api_scheduler.TaskIn) already validates field
+    # ranges; this catches "once-in-the-past" / "weekly with empty
+    # weekdays" gracefully.
+    next_run = _compute_next_run(schedule)
+    if next_run is None and schedule.get("kind") != "once":
+        # Allow `once` with no next_run only when explicitly so (past
+        # date) — but the API layer should reject those upfront.
+        raise ValueError(f"schedule does not produce a next fire time: {schedule}")
     # Lazy import to avoid backend.sessions ↔ backend.scheduler cycle
     from . import sessions as sess
     sess_meta = sess.create_session(name=f"[定时] {name}", model=model)
-    schedule = {"kind": "daily", "hour": int(hour), "minute": int(minute)}
     tid = str(uuid.uuid4())
     task = {
         "id": tid,
@@ -121,7 +208,7 @@ def create_task(name: str, prompt: str, hour: int, minute: int,
         "schedule": schedule,
         "enabled": True,
         "last_run": None,
-        "next_run": _compute_next_run(schedule),
+        "next_run": next_run,
         "created_at": time.time(),
     }
     _state["tasks"][tid] = task
@@ -138,14 +225,9 @@ def update_task(tid: str, **changes: Any) -> dict | None:
             t[k] = str(changes[k])
     if "enabled" in changes and changes["enabled"] is not None:
         t["enabled"] = bool(changes["enabled"])
-    if changes.get("hour") is not None or changes.get("minute") is not None:
-        sched = dict(t["schedule"])
-        if changes.get("hour") is not None:
-            sched["hour"] = int(changes["hour"])
-        if changes.get("minute") is not None:
-            sched["minute"] = int(changes["minute"])
-        t["schedule"] = sched
-        t["next_run"] = _compute_next_run(sched)
+    if "schedule" in changes and changes["schedule"] is not None:
+        t["schedule"] = changes["schedule"]
+        t["next_run"] = _compute_next_run(t["schedule"])
     _save_state()
     return t
 
