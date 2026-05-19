@@ -146,6 +146,10 @@ html, body {
   background: var(--c-bg-0); color: var(--c-fg-1);
   font-family: var(--font-sans); font-size: var(--fs-base); line-height: 1.55;
   -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  /* Block iOS pull-to-refresh / Chrome bounce — without this, dragging
+     the chat area down reloads the SPA and discards in-flight typing. */
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* #loading uses .splash styles below — no separate rule needed */
@@ -353,6 +357,10 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   background: var(--c-bg-1);
   border-top: 1px solid var(--c-border);
   box-shadow: 0 -2px 8px rgba(0,0,0,0.05);
+  /* iOS notch / Android gesture bar — push the buttons above the safe area
+     so they're still tappable on full-screen devices. */
+  padding-bottom: env(safe-area-inset-bottom);
+  height: calc(52px + env(safe-area-inset-bottom));
 }
 .mobile-tab-bar button {
   flex: 1; display: flex; flex-direction: column;
@@ -373,7 +381,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   /* Force single-column grid regardless of inline :style="layoutStyle()". */
   .layout {
     grid-template-columns: 1fr !important;
-    grid-template-rows: 1fr 52px !important;
+    grid-template-rows: 1fr calc(52px + env(safe-area-inset-bottom)) !important;
   }
   /* Hide every pane by default; show only the one matching the active tab. */
   .layout .pane { display: none; }
@@ -384,14 +392,20 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .layout .resizer { display: none; }
   /* Show the tab bar */
   .mobile-tab-bar { display: flex; }
-  /* Pane height: viewport - tab bar. dvh for mobile Safari address-bar collapse. */
-  .pane { height: calc(100vh - 52px); height: calc(100dvh - 52px); }
+  /* Pane height: viewport - tab bar. dvh for mobile Safari address-bar collapse;
+     safe-area-inset-bottom for the notch / gesture-bar on iOS / Android. */
+  .pane {
+    height: calc(100vh - 52px);
+    height: calc(100dvh - 52px - env(safe-area-inset-bottom));
+  }
   /* Chat textarea / context meter / session bar sometimes overflow on tiny
-     screens — trim padding so they fit. */
-  .session-bar { padding: 6px var(--sp-1); gap: 4px; min-height: 36px; }
-  .session-bar select { font-size: var(--fs-sm); padding: 0 6px; }
-  .pane-head { padding: 6px var(--sp-2); }
-  .pane-head .pane-title { font-size: var(--fs-sm); }
+     screens — trim padding so they fit. Font sizes here intentionally
+     larger than the desktop --fs-sm (12px) so labels next to inputs
+     don't look mismatched against the auto-zoom-forced 16px inputs. */
+  .session-bar { padding: 6px var(--sp-1); gap: 4px; min-height: 40px; }
+  .session-bar select { font-size: 14px; padding: 0 8px; height: 32px; }
+  .pane-head { padding: 6px var(--sp-2); height: 46px; }
+  .pane-head .pane-title { font-size: 14.5px; }
   .login { padding: 0 16px; }
   .login input { width: calc(100% - 32px); max-width: 320px; }
   /* Tabs in preview pane — already scrollable horizontally; force on mobile */
@@ -443,8 +457,12 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .tab-ctx-menu button { padding: 10px 16px; }
 
   /* Ctx meter and pane heads breathe less on phones */
-  .ctx-meter { padding: 4px 8px; }
+  .ctx-meter { padding: 4px 8px; font-size: 12.5px; }
   .pane.chat .pane-head { gap: 4px; }
+
+  /* Empty-state hint inside chat pane — desktop 12px reads as cramped
+     on phones. Title was already fs-md (14.5px); only the hint needs help. */
+  .empty-hint { font-size: 13.5px; }
 
   /* Chat input area — keep input large enough to tap, send button reachable */
   .chat-input-wrap { padding: 8px; }
@@ -461,6 +479,109 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .pane.chat .pane-head .mcp-badge { display: none; }
   /* Brand title shorter */
   .brand-logo { font-size: 22px; }
+}
+
+/* ===== Mobile virtual keyboard handling =====
+   When the on-screen keyboard is up, body gets `.kb-open` from
+   _initMobileKeyboardWatch (see app.js). Hide the bottom tab bar so the
+   chat-input + send button get visible real estate, and absorb the iOS
+   safe-area-inset-bottom so notched devices don't clip the send row. */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .chat-input {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+  }
+}
+body.kb-open .mobile-tab-bar { display: none !important; }
+body.kb-open .layout {
+  /* Drop the 52px tab-bar row so the chat pane gets that space back when
+     the keyboard squeezes us. */
+  grid-template-rows: 1fr 0 !important;
+}
+body.kb-open .pane {
+  height: calc(100dvh) !important;
+}
+
+/* Modal sizing on mobile. Default min-width 360px / settings min-width 560px
+   would force horizontal overflow on phones; let them stretch to viewport
+   with a small inset and cap the body height so the keyboard / safe-area
+   don't clip the footer buttons. */
+@media (max-width: 720px) {
+  .modal {
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+    width: calc(100vw - 24px);
+  }
+  .settings-modal {
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+    width: calc(100vw - 24px);
+  }
+  .modal-body {
+    max-height: calc(100dvh - 200px) !important;
+  }
+  .modal-head, .modal-body, .modal-foot {
+    padding-left: var(--sp-3); padding-right: var(--sp-3);
+  }
+  /* Footer buttons stack on very narrow phones so they don't get clipped. */
+  .modal-foot { flex-wrap: wrap; gap: 6px; }
+  .modal-foot button { flex: 1 1 auto; min-width: 90px; }
+
+  /* ----- Settings: stack each row vertically + bump surrounding type up.
+     Without this, the desktop "220px label | 1fr input" grid leaves the
+     input column only ~100px wide on a 360px viewport, AND the 11/12px
+     label/hint sit next to a 16px-forced input (see end-of-file
+     auto-zoom override) — looks jarringly mismatched. */
+  .settings-row {
+    grid-template-columns: 1fr;
+    row-gap: 6px;
+    min-height: 0;
+    margin-bottom: 14px;
+  }
+  .settings-row label {
+    /* desktop ellipsis would clip multi-word i18n labels in stacked layout */
+    overflow: visible; text-overflow: clip; white-space: normal;
+    font-size: 14.5px;
+  }
+  .settings-row .chk { font-size: 14.5px; }
+  .settings-section-title { font-size: 13px; letter-spacing: 0.6px; }
+  .settings-hint { font-size: 13px; line-height: 1.55; }
+  .settings-sub-label { font-size: 12.5px; }
+  .settings-badge { font-size: 12px; height: 24px; }
+  .settings-empty { font-size: 14px; padding: 16px; }
+  /* Bump base body font so checkbox labels, helper text, etc. inherit
+     a readable size on a phone. Input/textarea stay forced to 16px by
+     the auto-zoom override at end-of-file. */
+  .modal-body { font-size: 14.5px; line-height: 1.6; }
+  /* Touch-friendly form control height — 32px is too short for a thumb. */
+  .settings-input,
+  .settings-row select,
+  .settings-row input[type="text"],
+  .settings-row input[type="password"],
+  .settings-row input[type="number"] {
+    height: 40px; line-height: 38px; padding: 0 12px;
+  }
+}
+
+/* Touch devices — bigger tap targets in the chat toolbar. 26px is a
+   pixel-perfect mouse target but Apple HIG / Material both call for ~44px on
+   touch. Bump the primary send button + ring; keep selects at 26px since
+   they have a wider hit area via the surrounding text. */
+@media (pointer: coarse) {
+  .chat-toolbar { gap: 4px; padding: 6px; }
+  .chat-toolbar-btn,
+  .chat-toolbar-ring,
+  .chat-toolbar-send {
+    height: 36px;
+    min-width: 36px;
+  }
+  .chat-toolbar-send { width: auto; padding: 0 12px; }
+  .chat-toolbar-send svg { width: 16px; height: 16px; }
+  /* Show the send label on touch — gives the user a clearer target than
+     a tiny icon. */
+  .chat-toolbar-send > span:last-child {
+    display: inline; margin-left: 6px;
+    font-size: var(--fs-xs); font-weight: var(--fw-medium);
+  }
 }
 
 .resizer {
@@ -1539,6 +1660,45 @@ pre.has-copy-btn .code-copy-btn.copied {
 .bubble ul, .bubble ol { padding-left: 1.4em; margin: 0.4em 0; }
 .bubble li { margin: 2px 0; }
 .bubble a { color: var(--c-accent-hover); text-decoration: underline; }
+/* Tables (GFM) — `marked` emits them but the styles previously only
+   existed under .markdown (preview pane). Bubble didn't inherit, so
+   tables rendered as a wall of plaintext. Mirror the preview rules. */
+.bubble table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.95em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.bubble th, .bubble td {
+  border: 1px solid var(--c-border-strong);
+  padding: 5px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.bubble th {
+  background: var(--c-bg-2);
+  font-weight: var(--fw-semibold);
+}
+.bubble tr:nth-child(even) td { background: var(--c-bg-1); }
+/* Headings inside an assistant bubble — modest sizes (chat is not preview). */
+.bubble h1, .bubble h2, .bubble h3, .bubble h4 {
+  margin: 0.8em 0 0.3em; font-weight: var(--fw-semibold);
+}
+.bubble h1 { font-size: 1.25em; }
+.bubble h2 { font-size: 1.15em; }
+.bubble h3 { font-size: 1.05em; }
+.bubble h4 { font-size: 1em; color: var(--c-fg-1); }
+.bubble blockquote {
+  margin: 0.5em 0; padding: 4px 12px;
+  border-left: 3px solid var(--c-border-strong);
+  color: var(--c-fg-2);
+}
+.bubble hr {
+  border: 0; border-top: 1px solid var(--c-border);
+  margin: 0.8em 0;
+}
 
 /* Indent non-bubble blocks (tool / tool_result / thinking) by avatar width
    so their left edge aligns with the assistant bubble's content. Without
@@ -1582,22 +1742,51 @@ pre.has-copy-btn .code-copy-btn.copied {
   color: var(--c-fg-2); max-height: 200px; overflow-y: auto;
 }
 
-.thinking {
+/* Limit to the inner block. The outer wrapper is `<div class="msg thinking">`
+   which also matches `.thinking`; without the `.msg >` guard, both layers
+   pick up the border-left and the user sees two parallel vertical bars. */
+.msg > .thinking {
   background: var(--c-thinking-bg); color: var(--c-thinking-fg);
   border-left: 2px solid var(--c-accent);
   padding: 6px 12px; border-radius: 0 var(--r-md) var(--r-md) 0;
   font-family: var(--font-mono); font-size: var(--fs-xs);
-  cursor: pointer;
+  cursor: default;
 }
-.thinking-label { font-weight: var(--fw-semibold); display: flex; align-items: center; gap: 4px; opacity: 0.85; margin-bottom: 4px; }
-.thinking pre { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; }
-.thinking.collapsed { padding: 4px 12px; }
-.thinking.collapsed pre { display: none; }
-.thinking.collapsed .thinking-label { margin-bottom: 0; }
-.thinking-preview { color: var(--c-fg-3); margin-left: 8px; font-size: var(--fs-xs); }
-.tool-result { cursor: pointer; }
-.tool-result.collapsed pre { max-height: 1.6em; overflow: hidden; opacity: 0.7; }
-.tool-result-summary { color: var(--c-fg-3); font-size: var(--fs-xs); margin-left: 4px; }
+/* Clickable header — chevron + brain icon + label + (collapsed) preview.
+   Whole row is clickable, not just the text, so users have a wide hit
+   target. cursor:pointer + hover bg makes affordance obvious. */
+.thinking-head, .tool-result-head {
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border-radius: var(--r-sm);
+  user-select: none;
+}
+.thinking-head:hover, .tool-result-head:hover { background: rgba(255,255,255,0.04); }
+.thinking-chevron {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 12px; color: var(--c-fg-3);
+  flex-shrink: 0;
+}
+.thinking-label-text {
+  font-weight: var(--fw-semibold);
+  opacity: 0.85;
+}
+.thinking pre, .tool-result pre {
+  margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
+  max-height: 240px; overflow-y: auto;
+}
+.thinking.collapsed, .tool-result.collapsed { padding-bottom: 4px; }
+.thinking-preview {
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; flex: 1;
+}
+.tool-result-summary {
+  color: var(--c-fg-3); font-size: var(--fs-xs);
+}
 
 /* ==========================================================================
    ask_user_question — Muse asks the user with structured options (mcp tool)
@@ -2849,3 +3038,47 @@ pre.has-copy-btn .code-copy-btn.copied {
 
 /* (Session management table removed — delete now lives inline in the chat
    header's session picker, not in Settings.) */
+
+/* ==========================================================================
+   Touch-device fallbacks for hover-only UI. On `hover: none` pointers
+   (phones / tablets) we can't surface controls "on hover" — they must
+   either be always visible (faded) or summoned by tap-and-hold. We pick
+   "faded by default, full opacity on :active" so the user at least
+   knows the control exists.
+   ========================================================================== */
+@media (hover: none) {
+  /* Per-message action bar (Copy etc.) — invisible (opacity 0) on
+     desktop until hover. Phone users had no way to discover it. */
+  .msg-actions { opacity: 0.65; }
+  .msg-actions:active { opacity: 1; }
+  /* Pin star in session picker — fade up from 0.5 to make it discoverable. */
+  .session-picker-pin { opacity: 0.85; }
+}
+
+/* ==========================================================================
+   iOS auto-zoom defeat — MUST stay at end of file.
+
+   Why end-of-file: per-element rules like `.chat-input-textarea
+   { font-size: var(--fs-base) }` appear later in the document and have
+   the same specificity (0,0,1,0) as the mobile override. Whichever
+   declaration comes later in source order wins. So this block has to
+   sit after every other `.chat-input-textarea`, `input`, etc. rule.
+
+   What this fixes: iOS WebKit (Safari, iOS Chrome, iOS Edge — all
+   WebKit) zooms the page whenever the user focuses an input whose
+   computed font-size is < 16px. Once zoomed, the page stays zoomed.
+   We force 16px on all text-input controls for touch / coarse-pointer
+   devices, which is the exact threshold WebKit checks.
+   ========================================================================== */
+@media (pointer: coarse) {
+  input,
+  textarea,
+  select,
+  .chat-input-textarea,
+  .login input,
+  .modal input,
+  .modal textarea,
+  .modal select {
+    font-size: 16px;
+  }
+}

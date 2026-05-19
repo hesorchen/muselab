@@ -99,7 +99,10 @@ function portal() {
     messages: [],
     model: "claude-sonnet-4-6",
     permission: "bypassPermissions",
-    showThinking: false,
+    // Always render thinking blocks. Toggle removed 2026-05-19 — adaptive
+    // thinking was causing invisible mid-reply stalls when hidden; now we
+    // always enable thinking on the backend AND always display it.
+    showThinking: true,
     input: "", streaming: false, es: null,
     // 锁定当前在跑的那条请求用的模型——dropdown 切到别的，pending bubble 不能跟着变。
     streamingModel: "",
@@ -199,7 +202,7 @@ function portal() {
       show: false,
       providers: [],
       draftKeys: {},
-      draftDefaults: { model: "", permission: "", show_thinking: false },
+      draftDefaults: { model: "", permission: "" },
       draftParams: { thinking_budget: 4000, max_turns: 0 },
       // MCP server list (loaded from /api/settings/mcp)
       mcpServers: [],
@@ -327,6 +330,27 @@ function portal() {
       this.initLang();
       this.initMascot();
       this.configureMarked();
+      this._initMobileKeyboardWatch();
+      // Global error capture — when alpine's "Cannot read properties of
+      // undefined (reading 'after')" fires we want the FULL story (msg,
+      // file, line, stack) printed in one block so the user can copy it
+      // in a single paste. The minified alpine stack is useless on its
+      // own; pair this with the dev (unminified) bundle for real names.
+      window.addEventListener("error", (ev) => {
+        if (!ev || !ev.error) return;
+        const msg = ev.error.message || String(ev.error);
+        if (!msg.includes("after")) return;
+        console.group("%c[muselab DEBUG] alpine .after error", "color: #f87171; font-weight: bold");
+        console.error("message:", msg);
+        console.error("file:", ev.filename, "line:", ev.lineno, "col:", ev.colno);
+        console.error("stack:", ev.error.stack);
+        console.error("currentId:", this.currentId,
+                      "messages.length:", (this.messages || []).length,
+                      "sessions.length:", (this.sessions || []).length,
+                      "previewTabCtxMenu:", JSON.stringify(this.previewTabCtxMenu),
+                      "ctxBreakdown:", JSON.stringify(this.ctxBreakdown));
+        console.groupEnd();
+      });
       this.$watch("editing", v => v ? this.mountCM() : this.unmountCM());
       this.$watch("rightOpen", v => { if (v) this.greetMascot(this.t("toast.muse_back")); });
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
@@ -344,6 +368,45 @@ function portal() {
         // No token saved → skip splash, jump straight to login.
         this.appReady = true;
       }
+    },
+
+    // Mobile keyboard handling. iOS Safari (and some Android browsers) overlay
+    // the virtual keyboard ABOVE the layout instead of resizing it — without
+    // intervention, the chat-input + bottom tab bar end up hidden behind the
+    // keyboard and the user can't tap "send". We watch visualViewport for
+    // height changes and (a) flag the body so CSS can hide the bottom tab
+    // bar, (b) expose --kb-inset so the chat-input can lift above the
+    // keyboard. The viewport meta `interactive-widget=resizes-content` does
+    // this natively on modern browsers; this is the fallback path.
+    _initMobileKeyboardWatch() {
+      if (!window.visualViewport) return;
+      const vv = window.visualViewport;
+      const update = () => {
+        const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        // Anything > 80px likely means the on-screen keyboard is up (small
+        // values are OS-chrome / address-bar transitions, not the keyboard).
+        const kbOpen = inset > 80;
+        const wasOpen = document.body.classList.contains("kb-open");
+        if (kbOpen) {
+          document.body.classList.add("kb-open");
+          document.documentElement.style.setProperty("--kb-inset", inset + "px");
+        } else {
+          document.body.classList.remove("kb-open");
+          document.documentElement.style.setProperty("--kb-inset", "0px");
+        }
+        // Keyboard open/close shrinks/grows chat-body. If the user was
+        // already at the bottom, the new viewport leaves the latest
+        // message stranded mid-screen — re-pin to bottom. Use rAF so
+        // the browser has done layout pass for the new height. We pass
+        // force=false because scrollToBottom honors `atBottom`, so a
+        // user mid-history won't get yanked.
+        if (kbOpen !== wasOpen) {
+          requestAnimationFrame(() => this.scrollToBottom(false));
+        }
+      };
+      vv.addEventListener("resize", update);
+      vv.addEventListener("scroll", update);
+      update();
     },
 
     // First-load splash + initial fetch sequence. Sets appReady=true once
@@ -871,7 +934,16 @@ function portal() {
 
     mdRender(text) {
       if (!text) return "";
-      const raw = window.marked ? window.marked.parse(text) : text;
+      // marked occasionally throws on partial markdown mid-stream (unclosed
+      // fenced block, half-typed table row, etc). Catch and fall through to
+      // escaped raw text so the bubble keeps showing SOMETHING instead of
+      // briefly clearing while the next chunk arrives.
+      let raw;
+      try {
+        raw = window.marked ? window.marked.parse(text) : text;
+      } catch (e) {
+        raw = "<pre>" + this.escape(text) + "</pre>";
+      }
       if (!window.DOMPurify) return raw;
       const safe = window.DOMPurify.sanitize(raw, {
         USE_PROFILES: { html: true, mathMl: true },          // KaTeX may emit MathML
@@ -879,6 +951,14 @@ function portal() {
         FORBID_ATTR: ["style", "formaction"],
         ADD_ATTR: ["aria-hidden"],                            // KaTeX uses these
       });
+      // If sanitize returned a string MUCH shorter than the input text (e.g.
+      // partial code-block syntax tripped the parser and everything past it
+      // got stripped), fall back to a plain-pre rendering so we don't display
+      // a half-empty bubble mid-stream. Threshold is heuristic — only kicks
+      // in on dramatic loss.
+      if (safe.length < text.length * 0.25 && text.length > 80) {
+        return "<pre>" + this.escape(text) + "</pre>";
+      }
       // Math: render $...$ / $$...$$ via KaTeX auto-render. KaTeX runs after
       // DOMPurify (its output is trusted vendor HTML, no need to re-sanitize).
       const tmp = document.createElement("div");
@@ -1179,7 +1259,8 @@ function portal() {
         const p = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
         if (p.model) this.model = p.model;
         if (p.permission) this.permission = p.permission;
-        if (typeof p.showThinking === "boolean") this.showThinking = p.showThinking;
+        // showThinking is now always-on; ignore any persisted `false` from
+        // pre-2026-05-19 prefs. See app.js:102.
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
         if (typeof p.rightOpen === "boolean") this.rightOpen = p.rightOpen;
         if (typeof p.leftWidth === "number") this.leftWidth = p.leftWidth;
@@ -1616,21 +1697,32 @@ function portal() {
       return name ? `${prefix}${name} · muselab` : "muselab — Meet Muse";
     },
     // ===== thinking / tool_result collapse =====
-    // Default-collapse historical thinking + tool_result blocks so a long
-    // session doesn't drown the user in wall-of-text. The currently-streaming
-    // last-rendered block stays expanded so the user can watch live progress.
-    // User can click to override either direction.
+    // Default-collapse historical blocks; the currently-streaming last block
+    // stays expanded. User clicks override either way.
+    // Storage: top-level reactive _expandedMsgs map (keyed by uuid or _k).
+    // Previously stored as `m._userExpanded` on the message object directly,
+    // but Alpine v3 doesn't deep-wrap array elements — direct property set
+    // didn't trigger re-render. Top-level prop + spread-assign does.
+    _expandedMsgs: {},
+    _msgKey(i, m) {
+      if (!m) return "";
+      return m.uuid || m._k || ("m-" + i);
+    },
     isMsgExpanded(i, m) {
       if (!m) return true;
-      if (m._userExpanded != null) return m._userExpanded;
-      // Live-streaming last-rendered block stays expanded by default.
+      const k = this._msgKey(i, m);
+      if (k in this._expandedMsgs) return this._expandedMsgs[k];
+      // Default: only the actively-streaming last block is expanded.
       const msgs = this.messages || [];
       return !!this.streaming && i === msgs.length - 1;
     },
-    toggleMsgExpanded(m) {
+    toggleMsgExpanded(m, i) {
       if (!m) return;
-      const cur = this.isMsgExpanded((this.messages || []).indexOf(m), m);
-      m._userExpanded = !cur;
+      const idx = (i ?? (this.messages || []).indexOf(m));
+      const k = this._msgKey(idx, m);
+      const cur = this.isMsgExpanded(idx, m);
+      // Spread-assign so Alpine sees the replacement and re-evaluates.
+      this._expandedMsgs = { ...this._expandedMsgs, [k]: !cur };
     },
     toolResultClass(i, m) {
       let cls = "tool-result";
@@ -2350,7 +2442,6 @@ function portal() {
       const body = {
         default_model: this.settings.draftDefaults.model,
         default_permission: this.settings.draftDefaults.permission,
-        default_show_thinking: this.settings.draftDefaults.show_thinking,
         thinking_budget: this.settings.draftParams.thinking_budget,
         max_turns: this.settings.draftParams.max_turns,
       };
@@ -2724,6 +2815,37 @@ function portal() {
       return "/api/files/raw?path=" + encodeURIComponent(p)
               + "&token=" + encodeURIComponent(this.token) + v;
     },
+    async reloadPreview() {
+      // Manual "🗘 reload" button in preview header. Bumps previewVersion
+      // (cache-buster for iframe / image / pdf rawUrl) AND re-fetches the
+      // read endpoint for md / text. Useful when the file changed outside
+      // muselab's normal write paths (terminal git pull, external editor).
+      if (!this.selected) return;
+      this.previewVersion = Date.now();
+      if (this.previewMode === "md" || this.previewMode === "text") {
+        const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
+                     + "&_v=" + this.previewVersion;
+        try {
+          const r = await fetch(url, { headers: this.hdr() });
+          if (r.ok) {
+            this.rawText = await r.text();
+            if (this.previewMode === "md") {
+              this.renderedMd = this.mdRender(this.rawText);
+              this.$nextTick(() => this.highlightCode(".markdown"));
+            } else {
+              this.$nextTick(() => {
+                document.querySelectorAll(".text code")
+                  .forEach(el => { delete el.dataset.hl; });
+                this.highlightCode(".text");
+              });
+            }
+          }
+        } catch (_e) { /* network blip */ }
+      }
+      this.toast(this.lang === "zh" ? "已刷新预览" : "Preview reloaded",
+                  "success", 1200);
+    },
+
     async _maybeReloadPreview(toolFilePath) {
       // Called from the tool_use SSE handler when a write-style tool fires.
       // Refresh the preview pane if the tool's target path matches what's
@@ -3060,6 +3182,12 @@ function portal() {
           this.renderedMd = this.mdRender(this.rawText);
           this.$nextTick(() => this.highlightCode(".markdown"));
         }
+        // Bump previewVersion so HTML / PDF / image iframes pick up the new
+        // file content. Without this, iframes keep showing the stale render
+        // (browser disk cache + same URL) until the user hard-refreshes —
+        // the issue was visible when editing a html report styled in dark
+        // mode to light mode: editor saved, preview iframe still showed dark.
+        this.previewVersion = Date.now();
         this.editing = false;
         this.toast(this.t("toast.saved"), "success");
       } else this.toast("保存失败：" + (await r.text()), "error");
@@ -3796,10 +3924,19 @@ function portal() {
         _scrollIfActive();
       });
       es.addEventListener("thinking", ev => {
-        if (!this.showThinking) return;
         closeAsst();
         const d = JSON.parse(ev.data);
-        streamState.messages.push({ role: "thinking", text: d.text });
+        // Backend yields one SSE event per thinking_delta. Coalesce them
+        // into the most recent thinking message so we see ONE block per
+        // reasoning segment, not N tiny ones. If the tail isn't a thinking
+        // message (e.g. previous was tool_use), start a new one.
+        const msgs = streamState.messages;
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === "thinking") {
+          last.text = (last.text || "") + (d.text || "");
+        } else {
+          msgs.push({ role: "thinking", text: d.text || "" });
+        }
         _scrollIfActive();
       });
       es.addEventListener("tool_use", ev => {

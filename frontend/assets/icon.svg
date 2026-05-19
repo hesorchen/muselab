@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="muselab">
+  <rect width="200" height="200" rx="44" ry="44" fill="#6093ff"/>
+  <path d="M55 140 L55 60 L100 110 L145 60 L145 140"
+        stroke="#ffffff" stroke-width="18"
+        stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <circle cx="155" cy="148" r="9" fill="#ffffff"/>
+</svg>
