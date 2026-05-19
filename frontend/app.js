@@ -88,6 +88,21 @@ function portal() {
     // takes to fetch.
     messagesLoading: false,
 
+    // ===== scheduled tasks (bell drawer) =====
+    // Daily-fire prompts that dispatch into a dedicated muselab session.
+    // The bell icon in the top bar shows unread_count from the server;
+    // opening the drawer ack-zeros it. Drafts and tasks both live here
+    // so the modal stays self-contained.
+    scheduler: {
+      show: false,
+      tasks: [],
+      history: [],
+      unreadCount: 0,
+      loading: false,
+      // Inline-create form state. Reset by _resetSchedDraft().
+      draft: { name: "", prompt: "", hour: 9, minute: 0, model: "" },
+    },
+
     // ===== command palette (Cmd/Ctrl+K) =====
     // Single fuzzy-search dropdown across: quick actions, open sessions,
     // and any file under the archive root (via /api/files/search). Action
@@ -539,6 +554,10 @@ function portal() {
           this.connState = "ok";
         }
         this._connFails = 0;
+        // Refresh scheduler unread count — cheap (single JSON, no auth
+        // round-trip beyond what /api/meta already costs) and keeps the
+        // bell badge live without forcing the user to open the drawer.
+        this.fetchSchedulerUnread();
       } catch (e) {
         this._connFails++;
         if (this._connFails >= 2) this.connState = "reconnecting";
@@ -4527,6 +4546,126 @@ function portal() {
     paletteIcon(type) {
       // Tiny svg id mapping; falls back to a dot if unknown.
       return ({ act: "#i-settings", session: "#i-file-text", file: "#i-file" })[type] || "#i-circle";
+    },
+
+    // ===== scheduler drawer =====
+    async openScheduler() {
+      this.scheduler.show = true;
+      await this.loadSchedulerTasks();
+      await this.loadSchedulerHistory();
+      // Opening the drawer = user has seen unread results. Server-side
+      // ack so the badge clears on this AND any other tab.
+      if (this.scheduler.unreadCount > 0) await this.ackSchedulerUnread();
+    },
+    closeScheduler() { this.scheduler.show = false; },
+    _resetSchedDraft() {
+      this.scheduler.draft = {
+        name: "", prompt: "", hour: 9, minute: 0,
+        model: this.model || "",
+      };
+    },
+    async loadSchedulerTasks() {
+      this.scheduler.loading = true;
+      try {
+        const r = await fetch("/api/scheduler/tasks", { headers: this.hdr() });
+        if (r.ok) {
+          const d = await r.json();
+          this.scheduler.tasks = d.tasks || [];
+          this.scheduler.unreadCount = d.unread_count || 0;
+        }
+      } finally {
+        this.scheduler.loading = false;
+      }
+    },
+    async loadSchedulerHistory() {
+      const r = await fetch("/api/scheduler/history?limit=30", { headers: this.hdr() });
+      if (r.ok) {
+        const d = await r.json();
+        this.scheduler.history = d.history || [];
+        this.scheduler.unreadCount = d.unread_count || 0;
+      }
+    },
+    async createSchedTask() {
+      const d = this.scheduler.draft;
+      if (!d.name.trim() || !d.prompt.trim()) {
+        this.toast(this.lang === "zh"
+          ? "任务名 / prompt 不能为空" : "Name and prompt are required",
+          "warn", 2500);
+        return;
+      }
+      const r = await fetch("/api/scheduler/tasks", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: d.name.trim(),
+          prompt: d.prompt.trim(),
+          hour: Number(d.hour),
+          minute: Number(d.minute),
+          model: d.model || "",
+        }),
+      });
+      if (!r.ok) {
+        const err = await r.text();
+        this.toast((this.lang === "zh" ? "创建失败：" : "Create failed: ") + err,
+          "error", 4000);
+        return;
+      }
+      this._resetSchedDraft();
+      await this.loadSchedulerTasks();
+      this.toast(this.lang === "zh" ? "任务已创建" : "Task created",
+        "success", 2000);
+    },
+    async deleteSchedTask(t) {
+      if (!confirm(this.lang === "zh"
+          ? `删除任务"${t.name}"？(关联的 session 不会被删)`
+          : `Delete task "${t.name}"? (Bound session is kept)`)) return;
+      const r = await fetch("/api/scheduler/tasks/" + encodeURIComponent(t.id),
+        { method: "DELETE", headers: this.hdr() });
+      if (r.ok) await this.loadSchedulerTasks();
+    },
+    async toggleSchedEnabled(t) {
+      const r = await fetch("/api/scheduler/tasks/" + encodeURIComponent(t.id), {
+        method: "PATCH",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !t.enabled }),
+      });
+      if (r.ok) await this.loadSchedulerTasks();
+    },
+    async ackSchedulerUnread() {
+      const r = await fetch("/api/scheduler/ack", {
+        method: "POST", headers: this.hdr(),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        this.scheduler.unreadCount = d.unread_count || 0;
+      }
+    },
+    async fetchSchedulerUnread() {
+      // Called from the heartbeat — keeps the bell badge live without
+      // requiring the user to open the drawer.
+      try {
+        const r = await fetch("/api/scheduler/tasks", { headers: this.hdr() });
+        if (r.ok) {
+          const d = await r.json();
+          this.scheduler.unreadCount = d.unread_count || 0;
+        }
+      } catch {}
+    },
+    openSchedTaskSession(t) {
+      // Jump straight to the muselab session bound to this scheduled task.
+      // closes the drawer first so the chat-tab swap is visible.
+      this.closeScheduler();
+      this.activateTab(t.session_id || t);
+    },
+    fmtSchedTime(ts) {
+      if (!ts) return "—";
+      const d = new Date(ts * 1000);
+      const pad = n => String(n).padStart(2, "0");
+      const today = new Date();
+      const sameDay = d.toDateString() === today.toDateString();
+      const hh = pad(d.getHours()) + ":" + pad(d.getMinutes());
+      if (sameDay) return (this.lang === "zh" ? "今天 " : "today ") + hh;
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hh}`;
     },
   };
 }

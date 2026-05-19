@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
 from .chat import router as chat_router
 from .api_settings import router as settings_router
+from .api_scheduler import router as scheduler_router
 from .settings import ROOT, PORT, HOST
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
@@ -38,6 +39,16 @@ app = FastAPI(title="muselab", version="0.1.0")
 app.include_router(files_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
+app.include_router(scheduler_router)
+
+
+@app.on_event("startup")
+async def _startup_scheduler() -> None:
+    """Boot the in-process task scheduler so any persisted scheduled
+    prompts start firing on their schedule. No-op when scheduler.json
+    is empty / missing — the daemon just idles."""
+    from . import scheduler as _sched
+    await _sched.start_scheduler()
 
 
 def _detect_versions() -> dict:

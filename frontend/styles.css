@@ -3401,6 +3401,138 @@ pre.has-copy-btn .code-copy-btn.copied {
    header's session picker, not in Settings.) */
 
 /* ==========================================================================
+   Bell button with unread badge — top bar, opens scheduled-tasks drawer.
+   ========================================================================== */
+.bell-btn { position: relative; }
+.bell-badge {
+  position: absolute;
+  top: 2px; right: 2px;
+  min-width: 14px; height: 14px;
+  padding: 0 3px;
+  border-radius: var(--r-full);
+  background: var(--c-danger, #ef4444);
+  color: white;
+  font-size: 9px;
+  font-weight: var(--fw-semibold);
+  font-family: var(--font-mono);
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* ==========================================================================
+   Scheduled tasks drawer — modal with create form, task list, run log.
+   ========================================================================== */
+.sched-modal { width: 640px; max-width: calc(100vw - 32px); }
+.sched-body { max-height: 70vh; overflow-y: auto; padding: 12px 16px; }
+.sched-create {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px; margin-bottom: 18px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+}
+.sched-create-row {
+  display: flex; gap: 6px; align-items: center;
+}
+.sched-create-row .settings-input:first-child { flex: 1; }
+.sched-create-row select.settings-input {
+  width: 64px; min-width: 0; padding: 0 4px;
+}
+.sched-create-prompt {
+  width: 100%; padding: 8px 10px; resize: vertical;
+  background: var(--c-bg-1); color: var(--c-fg-0);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  font-family: var(--font-sans); font-size: var(--fs-md);
+  line-height: 1.5;
+}
+.sched-create-prompt:focus {
+  outline: none;
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 3px var(--c-accent-soft);
+}
+.sched-create-hint {
+  font-size: var(--fs-xs); color: var(--c-fg-3); line-height: 1.4;
+}
+
+.sched-section { margin-bottom: 16px; }
+.sched-section-title {
+  font-size: var(--fs-xs); font-weight: var(--fw-semibold);
+  color: var(--c-accent); letter-spacing: 0.6px; text-transform: uppercase;
+  margin-bottom: 8px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--c-border);
+}
+.sched-empty {
+  padding: 14px; text-align: center;
+  font-size: var(--fs-sm); color: var(--c-fg-3);
+  border: 1px dashed var(--c-border-strong); border-radius: var(--r-md);
+}
+
+.sched-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; margin-bottom: 6px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  transition: background var(--t-fast);
+}
+.sched-row.disabled { opacity: 0.55; }
+.sched-row:hover { background: var(--c-bg-3); }
+.sched-row-main { flex: 1; min-width: 0; }
+.sched-row-name {
+  font-size: var(--fs-md); font-weight: var(--fw-semibold);
+  color: var(--c-fg-0); margin-bottom: 2px;
+}
+.sched-row-time {
+  font-family: var(--font-mono); font-weight: var(--fw-normal);
+  color: var(--c-accent); font-size: var(--fs-sm);
+}
+.sched-row-prompt {
+  font-size: var(--fs-sm); color: var(--c-fg-2);
+  margin-bottom: 4px; line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.sched-row-meta {
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  font-family: var(--font-mono);
+  display: flex; gap: 12px;
+}
+.sched-row-actions {
+  display: flex; align-items: center; gap: 4px;
+  flex-shrink: 0;
+}
+
+.sched-hist-row {
+  padding: 8px 12px; margin-bottom: 4px;
+  background: var(--c-bg-2); border-radius: var(--r-sm);
+  border-left: 2px solid var(--c-accent);
+}
+.sched-hist-row.err {
+  border-left-color: var(--c-danger, #ef4444);
+}
+.sched-hist-head {
+  display: flex; gap: 8px; align-items: center;
+  margin-bottom: 4px;
+}
+.sched-hist-name {
+  font-size: var(--fs-sm); font-weight: var(--fw-semibold);
+  color: var(--c-fg-0);
+}
+.sched-hist-time {
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  font-family: var(--font-mono); margin-left: auto;
+}
+.sched-hist-body {
+  font-size: var(--fs-sm); color: var(--c-fg-2);
+  line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.sched-hist-row.err .sched-hist-body { color: var(--c-danger, #ef4444); }
+
+/* ==========================================================================
    Touch-device fallbacks for hover-only UI. On `hover: none` pointers
    (phones / tablets) we can't surface controls "on hover" — they must
    either be always visible (faded) or summoned by tap-and-hold. We pick

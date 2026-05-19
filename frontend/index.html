@@ -589,6 +589,21 @@ window.addEventListener("error", e => {
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
               x-text="tokenBadgeText()"></span>
+        <!-- Scheduled-tasks bell — unread badge when any scheduled
+             prompt has produced output since the user last opened
+             the drawer. Heartbeat keeps the count fresh. -->
+        <button @click="openScheduler()" class="icon-btn bell-btn"
+                :title="lang==='zh' ? '定时任务' : 'Scheduled tasks'"
+                aria-label="Scheduled tasks">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+          </svg>
+          <span class="bell-badge" x-show="scheduler.unreadCount > 0"
+                x-text="scheduler.unreadCount > 99 ? '99+' : scheduler.unreadCount"></span>
+        </button>
         <!-- Command palette entry — slim icon-btn alongside settings.
              Discoverability comes from the first-run toast (init()) +
              a tooltip showing the keyboard shortcut. Visual weight is
@@ -1715,6 +1730,115 @@ window.addEventListener("error", e => {
       <div class="modal-foot">
         <button @click="modal.cancel && modal.cancel()" class="btn-ghost" x-text="modal.cancelText || '取消'"></button>
         <button @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || '确认'"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scheduled-tasks drawer — modal listing tasks + create form +
+       recent run history. Opens on bell click; ack-zeros the unread
+       count on open. -->
+  <div class="modal-backdrop" x-show="scheduler.show"
+       x-transition.opacity.duration.120ms
+       @click.self="closeScheduler()">
+    <div class="modal sched-modal" @keydown.escape.window="closeScheduler()">
+      <div class="modal-head">
+        ⏰ <span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span>
+        <span class="spacer"></span>
+        <button class="icon-btn sm" @click="closeScheduler()"
+                :title="lang==='zh' ? '关闭' : 'Close'">×</button>
+      </div>
+      <div class="modal-body sched-body">
+        <!-- Create form (inline, always visible) -->
+        <div class="sched-create">
+          <div class="sched-create-row">
+            <input class="settings-input" x-model="scheduler.draft.name"
+                   :placeholder="lang==='zh' ? '任务名（例：每日复盘）' : 'Task name (e.g. Daily review)'" />
+            <select class="settings-input" x-model.number="scheduler.draft.hour">
+              <template x-for="h in 24" :key="h">
+                <option :value="h - 1" x-text="String(h - 1).padStart(2, '0') + ':'"></option>
+              </template>
+            </select>
+            <select class="settings-input" x-model.number="scheduler.draft.minute">
+              <template x-for="m in [0, 15, 30, 45]" :key="m">
+                <option :value="m" x-text="String(m).padStart(2, '0')"></option>
+              </template>
+            </select>
+            <button class="btn-primary" @click="createSchedTask()"
+                    x-text="lang==='zh' ? '+ 添加' : '+ Add'"></button>
+          </div>
+          <textarea class="sched-create-prompt" x-model="scheduler.draft.prompt"
+                    rows="3"
+                    :placeholder="lang==='zh'
+                      ? 'prompt — Muse 每次会跑的指令。例：「总结过去 24 小时 archive 的改动，列出值得我关注的三件事」'
+                      : 'Prompt — what Muse runs each time. e.g. \"Summarize what changed in my archive in the last 24h and flag the 3 worth my attention\"'"></textarea>
+          <div class="sched-create-hint" x-text="lang==='zh'
+              ? '每天此时间运行；每个任务会创建一个独立 session 累积历史'
+              : 'Fires every day at the chosen time; each task gets its own session for history'"></div>
+        </div>
+
+        <!-- Tasks list -->
+        <div class="sched-section">
+          <div class="sched-section-title" x-text="lang==='zh'
+              ? `已配置（${scheduler.tasks.length}）`
+              : `Configured (${scheduler.tasks.length})`"></div>
+          <div class="sched-empty" x-show="!scheduler.tasks.length"
+               x-text="lang==='zh' ? '还没有任务。在上方添加一个。'
+                                   : 'No tasks yet. Add one above.'"></div>
+          <template x-for="t in scheduler.tasks" :key="t.id">
+            <div class="sched-row" :class="{ disabled: !t.enabled }">
+              <div class="sched-row-main">
+                <div class="sched-row-name">
+                  <span x-text="t.name"></span>
+                  <span class="sched-row-time"
+                        x-text="' · ' + String(t.schedule.hour).padStart(2, '0')
+                                + ':' + String(t.schedule.minute).padStart(2, '0')"></span>
+                </div>
+                <div class="sched-row-prompt" x-text="t.prompt"></div>
+                <div class="sched-row-meta">
+                  <span x-show="t.last_run"
+                        x-text="(lang==='zh' ? '上次: ' : 'last: ') + fmtSchedTime(t.last_run)"></span>
+                  <span x-show="t.next_run && t.enabled"
+                        x-text="(lang==='zh' ? '下次: ' : 'next: ') + fmtSchedTime(t.next_run)"></span>
+                </div>
+              </div>
+              <div class="sched-row-actions">
+                <label class="switch sm" :title="lang==='zh' ? '启用 / 暂停' : 'Enable / pause'">
+                  <input type="checkbox" :checked="t.enabled"
+                         @change="toggleSchedEnabled(t)" />
+                  <span class="switch-slider"></span>
+                </label>
+                <button class="icon-btn sm" @click="openSchedTaskSession(t)"
+                        :title="lang==='zh' ? '打开关联 session' : 'Open bound session'">
+                  <svg><use href="#i-eye"/></svg>
+                </button>
+                <button class="icon-btn sm" @click="deleteSchedTask(t)"
+                        :title="lang==='zh' ? '删除' : 'Delete'">
+                  <svg><use href="#i-trash"/></svg>
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Recent runs -->
+        <div class="sched-section">
+          <div class="sched-section-title" x-text="lang==='zh'
+              ? `最近运行（${scheduler.history.length}）`
+              : `Recent runs (${scheduler.history.length})`"></div>
+          <div class="sched-empty" x-show="!scheduler.history.length"
+               x-text="lang==='zh' ? '还没有运行记录。'
+                                   : 'No runs yet.'"></div>
+          <template x-for="(h, i) in scheduler.history" :key="i">
+            <div class="sched-hist-row" :class="{ err: !h.ok }">
+              <div class="sched-hist-head">
+                <span class="sched-hist-name" x-text="h.task_name"></span>
+                <span class="sched-hist-time" x-text="fmtSchedTime(h.ts)"></span>
+              </div>
+              <div class="sched-hist-body"
+                   x-text="h.ok ? h.reply_preview : ('Error: ' + (h.error || 'unknown'))"></div>
+            </div>
+          </template>
+        </div>
       </div>
     </div>
   </div>
