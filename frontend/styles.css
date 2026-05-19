@@ -3285,6 +3285,24 @@ pre.has-copy-btn .code-copy-btn.copied {
   height: 100%;
   background: var(--c-bg-1);
 }
+/* CSV preview — reuses xlsx-table styling but adds a page-nav strip at
+   the top and a "X–Y of N" range badge. */
+.csv-toolbar {
+  display: flex; gap: 10px; align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--c-border);
+  background: var(--c-bg-2);
+  font-size: var(--fs-xs); color: var(--c-fg-2);
+  flex-shrink: 0;
+}
+.csv-toolbar .btn-text { padding: 2px 8px; }
+.csv-range { font-family: var(--font-mono); }
+.csv-meta { color: var(--c-fg-3); margin-left: auto; }
+.csv-meta + .csv-meta { margin-left: 8px; }
+.csv-loading {
+  padding: 12px; text-align: center; color: var(--c-fg-3);
+  font-size: var(--fs-sm);
+}
 .xlsx-tabs {
   display: flex; gap: 4px;
   padding: 6px 8px;

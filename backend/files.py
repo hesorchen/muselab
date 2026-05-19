@@ -240,6 +240,115 @@ def xlsx_preview(path: str) -> dict:
         wb.close()
 
 
+# CSV preview caps. Paginated by design — CSV files in the wild can be
+# millions of rows, so we never load the whole file into memory. Each
+# request returns one window; the UI calls back with offset += limit when
+# the user pages forward.
+CSV_DEFAULT_LIMIT = 200       # default page size
+CSV_MAX_LIMIT = 1000          # hard ceiling the client can request
+CSV_MAX_COLS = 50             # per-row column cap
+CSV_CELL_MAX_CHARS = 500
+CSV_SNIFF_BYTES = 8192        # sample size for delimiter / header detection
+
+
+@router.get("/csv", dependencies=[Depends(require_token)])
+def csv_preview(path: str, offset: int = 0, limit: int = CSV_DEFAULT_LIMIT) -> dict:
+    """Read-only paginated CSV / TSV preview as structured JSON.
+
+    Returns rows[offset : offset+limit] from the file, plus the sniffed
+    delimiter and a `total_rows` count so the UI can show pagination.
+    Header row (if csv.Sniffer flags one) is returned separately.
+
+    Designed to never load more than a window into memory: the file is
+    iterated row-by-row, skipping rows below offset and breaking once
+    `limit` is filled. The trailing total-rows count is the only full
+    scan, and it just discards each row.
+    """
+    import csv as _csv  # local import — csv is stdlib, but keep import local
+                       # so import overhead stays out of every other route.
+    target = safe_resolve(path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    if target.suffix.lower() not in {".csv", ".tsv"}:
+        raise HTTPException(status_code=415, detail="not a csv/tsv file")
+    if limit < 1:
+        limit = CSV_DEFAULT_LIMIT
+    if limit > CSV_MAX_LIMIT:
+        limit = CSV_MAX_LIMIT
+    if offset < 0:
+        offset = 0
+    # Sniff delimiter + header from a small head sample. Defaults to
+    # excel-style comma if Sniffer can't tell (e.g. one-column file).
+    try:
+        with target.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            sample = f.read(CSV_SNIFF_BYTES)
+        try:
+            dialect = _csv.Sniffer().sniff(sample, delimiters=",\t;|")
+            has_header = _csv.Sniffer().has_header(sample)
+        except _csv.Error:
+            dialect = _csv.excel
+            has_header = False
+        # Override sniff for explicit .tsv — Sniffer sometimes guesses comma
+        # on tab-separated files when the first row has no tabs.
+        if target.suffix.lower() == ".tsv":
+            dialect = _csv.excel_tab
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"failed to read: {e}")
+
+    header: list[str] = []
+    rows: list[list[str]] = []
+    cols_truncated = False
+    total_rows = 0
+    try:
+        with target.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = _csv.reader(f, dialect=dialect)
+            # Pull header before any data offset is applied. The user paging
+            # to offset=200 still wants column titles at the top of the page.
+            if has_header:
+                try:
+                    header_row = next(reader)
+                    header = [_clip_cell(c) for c in header_row[:CSV_MAX_COLS]]
+                    if len(header_row) > CSV_MAX_COLS:
+                        cols_truncated = True
+                except StopIteration:
+                    pass
+            row_idx = 0
+            for raw in reader:
+                if row_idx < offset:
+                    row_idx += 1
+                    continue
+                if len(rows) < limit:
+                    cells = [_clip_cell(c) for c in raw[:CSV_MAX_COLS]]
+                    if len(raw) > CSV_MAX_COLS:
+                        cols_truncated = True
+                    rows.append(cells)
+                row_idx += 1
+            total_rows = row_idx
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"failed to read: {e}")
+
+    return {
+        "path": path,
+        "header": header,
+        "rows": rows,
+        "offset": offset,
+        "limit": limit,
+        "total_rows": total_rows,
+        "has_header": has_header,
+        "delimiter": dialect.delimiter,
+        "cols_truncated": cols_truncated,
+        "limits": {"max_cols": CSV_MAX_COLS, "max_limit": CSV_MAX_LIMIT},
+    }
+
+
+def _clip_cell(value: str) -> str:
+    """Cap a single CSV cell so one runaway value can't blow up the page."""
+    s = "" if value is None else str(value)
+    if len(s) > CSV_CELL_MAX_CHARS:
+        s = s[:CSV_CELL_MAX_CHARS] + "…"
+    return s
+
+
 @router.get("/read", dependencies=[Depends(require_token)])
 def read_file(path: str) -> PlainTextResponse:
     target = safe_resolve(path)

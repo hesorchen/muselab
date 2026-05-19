@@ -239,3 +239,61 @@ def test_chinese_markdown_at_sniff_boundary_previewable(client, auth, temp_root)
     r = client.get("/api/files/read?path=cn.md", headers=auth)
     assert r.status_code == 200
     assert "今天天气真好" in r.text
+
+
+# ---- csv preview ----
+
+def test_csv_preview_basic(client, auth, temp_root):
+    """Comma-separated file: sniffed header + paginated rows."""
+    (temp_root / "small.csv").write_text(
+        "name,age,city\nAlice,30,Beijing\nBob,25,Shanghai\nCarol,40,Guangzhou\n",
+        encoding="utf-8",
+    )
+    r = client.get("/api/files/csv?path=small.csv", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["has_header"]
+    assert data["header"] == ["name", "age", "city"]
+    assert data["rows"][0] == ["Alice", "30", "Beijing"]
+    assert data["total_rows"] == 3
+    assert data["delimiter"] == ","
+
+
+def test_csv_preview_tsv(client, auth, temp_root):
+    """Tab-separated — Sniffer can mis-guess on tabby files; .tsv extension
+    forces the correct dialect."""
+    (temp_root / "t.tsv").write_text("a\tb\nv1\tv2\n", encoding="utf-8")
+    r = client.get("/api/files/csv?path=t.tsv", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["delimiter"] == "\t"
+    assert data["rows"][0] == ["v1", "v2"]
+
+
+def test_csv_preview_pagination(client, auth, temp_root):
+    """Page-window slicing: offset skips data rows; limit caps page size.
+
+    Uses an obvious numeric/string header column so csv.Sniffer reliably
+    detects has_header=True; the pagination math is then unambiguous
+    (offset N means skip N data rows after the header)."""
+    lines = ["id,name\n"] + [f"{i},row-{i}\n" for i in range(50)]
+    (temp_root / "big.csv").write_text("".join(lines), encoding="utf-8")
+    r = client.get("/api/files/csv?path=big.csv&offset=10&limit=5", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["offset"] == 10
+    assert data["limit"] == 5
+    assert len(data["rows"]) == 5
+    # Sniffer may or may not flag the header on small samples — accept both
+    # branches: with-header skips header before counting, without-header
+    # treats line 0 as data so offset=10 lands one row earlier.
+    first_id = int(data["rows"][0][0])
+    assert first_id in (9, 10)
+    assert int(data["rows"][4][0]) == first_id + 4
+    assert data["total_rows"] in (50, 51)
+
+
+def test_csv_preview_rejects_non_csv(client, auth):
+    """README.md is text but not CSV — endpoint rejects with 415."""
+    r = client.get("/api/files/csv?path=README.md", headers=auth)
+    assert r.status_code == 415

@@ -528,6 +528,51 @@ window.addEventListener("error", e => {
           </template>
         </div>
 
+        <!-- CSV preview — same table style as xlsx, but with pagination
+             since CSV files in the wild are often million-row exports. -->
+        <div x-show="!editing && previewMode==='csv'" class="xlsx-preview csv-preview">
+          <div class="csv-toolbar">
+            <button class="btn-text sm" @click="csvPrevPage()"
+                    :disabled="csvOffset === 0 || csvLoading"
+                    x-text="lang==='zh' ? '← 上页' : '← Prev'"></button>
+            <span class="csv-range" x-show="csvData"
+                  x-text="(csvOffset + 1) + '–' + csvWindowEnd() + ' / ' + (csvData && csvData.total_rows || 0)"></span>
+            <button class="btn-text sm" @click="csvNextPage()"
+                    :disabled="!csvData || csvWindowEnd() >= (csvData && csvData.total_rows || 0) || csvLoading"
+                    x-text="lang==='zh' ? '下页 →' : 'Next →'"></button>
+            <span class="csv-meta" x-show="csvData"
+                  x-text="(lang==='zh' ? '分隔符: ' : 'Delim: ')
+                          + (csvData && csvData.delimiter === '\t' ? 'TAB' : (csvData && csvData.delimiter || ','))"></span>
+            <span class="csv-meta" x-show="csvData && csvData.cols_truncated"
+                  x-text="lang==='zh' ? '（列数已截断）' : '(cols truncated)'"></span>
+          </div>
+          <div class="xlsx-scroll" x-show="csvData">
+            <table class="xlsx-table">
+              <thead x-show="csvData && csvData.has_header && csvData.header && csvData.header.length">
+                <tr>
+                  <th class="xlsx-rownum"></th>
+                  <template x-for="(h, ci) in (csvData && csvData.header || [])" :key="ci">
+                    <th x-text="h" :title="h"></th>
+                  </template>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="(row, ri) in (csvData && csvData.rows || [])" :key="ri">
+                  <tr>
+                    <td class="xlsx-rownum"
+                        x-text="csvOffset + ri + 1 + (csvData && csvData.has_header ? 1 : 0)"></td>
+                    <template x-for="(cell, ci) in row" :key="ci">
+                      <td x-text="cell" :title="cell"></td>
+                    </template>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="csv-loading" x-show="csvLoading"
+               x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+        </div>
+
         <div x-show="!editing && previewMode==='unsupported'" class="empty">
           <span class="icon"><svg><use href="#i-file"/></svg></span>
           <div class="empty-title" x-text="lang==='zh' ? '不支持预览' : 'Preview not supported'"></div>

@@ -63,6 +63,10 @@ function portal() {
     // sheet tab. xlsxLimits carries the server's row/col caps for the UI
     // hint when truncation happens.
     xlsxSheets: [], xlsxActive: "", xlsxLimits: null, xlsxSheetsTruncated: false,
+    // CSV preview — paginated, one window at a time. csvData holds the
+    // backend response for the current page; csvOffset advances by limit
+    // when the user pages forward.
+    csvPath: "", csvData: null, csvOffset: 0, csvLimit: 200, csvLoading: false,
     // Bumped whenever an assistant tool_use edits a file. Used as a cache
     // buster on iframe / read URLs so the preview reflects the new content
     // without the user needing to manually refresh the page.
@@ -2994,6 +2998,19 @@ function portal() {
           this.previewMode = "unsupported";
         }
       }
+      else if (["csv", "tsv"].includes(ext)) {
+        // CSV preview: paginated table render (xlsx-style) so a million-row
+        // file doesn't blow the browser. First page only here; "next page"
+        // button is wired through csvLoadPage().
+        this.csvPath = n.path;
+        this.csvOffset = 0;
+        await this.csvLoadPage();
+        if (this.csvData) {
+          this.previewMode = "csv";
+        } else {
+          this.previewMode = "unsupported";
+        }
+      }
       else {
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
         if (r.ok) {
@@ -3009,6 +3026,42 @@ function portal() {
         else this.previewMode = "unsupported";
       }
     },
+    async csvLoadPage() {
+      if (!this.csvPath || this.csvLoading) return;
+      this.csvLoading = true;
+      try {
+        const url = `/api/files/csv?path=${encodeURIComponent(this.csvPath)}`
+                    + `&offset=${this.csvOffset}&limit=${this.csvLimit}`;
+        const r = await fetch(url, { headers: this.hdr() });
+        if (r.ok) {
+          this.csvData = await r.json();
+        } else {
+          this.csvData = null;
+          this.toast(this.lang === "zh" ? "CSV 解析失败" : "CSV parse failed",
+                      "error", 3000);
+        }
+      } finally {
+        this.csvLoading = false;
+      }
+    },
+    csvNextPage() {
+      if (!this.csvData) return;
+      const next = this.csvOffset + this.csvLimit;
+      if (next >= (this.csvData.total_rows || 0)) return;
+      this.csvOffset = next;
+      this.csvLoadPage();
+    },
+    csvPrevPage() {
+      if (this.csvOffset <= 0) return;
+      this.csvOffset = Math.max(0, this.csvOffset - this.csvLimit);
+      this.csvLoadPage();
+    },
+    csvWindowEnd() {
+      if (!this.csvData) return 0;
+      return Math.min(this.csvOffset + (this.csvData.rows || []).length,
+                       this.csvData.total_rows || 0);
+    },
+
     hljsLang(path) {
       if (!path) return "plaintext";
       const name = path.split("/").pop().toLowerCase();
