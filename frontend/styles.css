@@ -1273,7 +1273,12 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   border-bottom: 1px solid var(--c-border);
 }
 .session-picker-row:last-child { border-bottom: none; }
-.session-picker-row:hover { background: var(--c-bg-2); }
+/* Hover-gated for the same reason as .chat-tab — without (hover: hover)
+   iOS Safari/Chrome consumes the first tap as a phantom-hover, so the
+   user has to tap twice to actually pick a session from the picker. */
+@media (hover: hover) {
+  .session-picker-row:hover { background: var(--c-bg-2); }
+}
 .session-picker-row.active { background: var(--c-accent-soft); color: var(--c-accent); }
 .session-picker-row .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-picker-count {
@@ -1371,7 +1376,14 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
 }
-.chat-tab:hover { background: var(--c-bg-2); color: var(--c-fg-0); }
+/* `(hover: hover)` gates this rule to real mouse pointers. On iOS Safari /
+   Chrome a `:hover` rule causes a "phantom hover" state: the first tap
+   triggers the simulated hover (background swap), and the *click* only
+   fires on the second tap. Restricting to true hover devices makes the
+   tab switch on the first tap on touch screens. */
+@media (hover: hover) {
+  .chat-tab:hover { background: var(--c-bg-2); color: var(--c-fg-0); }
+}
 .chat-tab.active {
   background: var(--c-bg-0);
   color: var(--c-fg-0);
