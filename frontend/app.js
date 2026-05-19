@@ -90,9 +90,17 @@ function portal() {
 
     // ===== command palette (Cmd/Ctrl+K) =====
     // Single fuzzy-search dropdown across: quick actions, open sessions,
-    // and any files currently in the tree view. Action items have a `run`
-    // closure; selecting an item fires it and closes the palette.
-    palette: { show: false, query: "", activeIndex: 0 },
+    // and any file under the archive root (via /api/files/search). Action
+    // items have a `run` closure; selecting an item fires it and closes
+    // the palette.
+    palette: {
+      show: false,
+      query: "",
+      activeIndex: 0,
+      fileResults: [],   // populated by _fetchPaletteFiles() (server-side)
+      fileQuery: "",     // last query the server fetch ran for
+      fileLoading: false,
+    },
     // Tab strip — VS Code-Claude style. `openTabIds` is the visible order; each
     // entry is a session id (also present in `sessions`). currentId is the
     // active tab. Tabs can be opened from the session picker, closed via × on
@@ -469,8 +477,8 @@ function portal() {
         setTimeout(() => {
           this.toast(
             this.lang === "zh"
-              ? "Tip：输入 / 看斜杠命令，@ 引用文件，↑ 回滚上一条"
-              : "Tip: type / for slash commands, @ to reference files, ↑ to recall last message",
+              ? "Tip：⌘K 命令面板 · / 斜杠命令 · @ 引用文件 · ↑ 回滚上一条"
+              : "Tip: ⌘K command palette · / slash commands · @ to reference files · ↑ to recall last message",
             "info", 7000);
           localStorage.setItem("muselab_seen_help", "1");
         }, 1500);
@@ -4343,6 +4351,8 @@ function portal() {
     openPalette() {
       this.palette.query = "";
       this.palette.activeIndex = 0;
+      this.palette.fileResults = [];
+      this.palette.fileQuery = "";
       this.palette.show = true;
       this.$nextTick(() => {
         const el = document.querySelector(".cmd-palette-input");
@@ -4350,6 +4360,36 @@ function portal() {
       });
     },
     closePalette() { this.palette.show = false; },
+    // Fetch files matching the current palette query against the whole
+    // archive (not just loaded tree rows). Called from the palette input's
+    // debounced @input. Idempotent — skips if the query hasn't changed.
+    async _fetchPaletteFiles() {
+      const q = this.palette.query.trim();
+      if (q.length < 2) {
+        this.palette.fileResults = [];
+        this.palette.fileQuery = "";
+        return;
+      }
+      if (q === this.palette.fileQuery) return;
+      this.palette.fileQuery = q;
+      this.palette.fileLoading = true;
+      try {
+        const r = await fetch(
+          "/api/files/search?q=" + encodeURIComponent(q) + "&limit=30",
+          { headers: this.hdr() });
+        if (!r.ok) { this.palette.fileResults = []; return; }
+        const data = await r.json();
+        // Race: only commit if the user hasn't typed something else since
+        // we kicked off this request.
+        if (this.palette.query.trim() === q) {
+          this.palette.fileResults = (data.entries || []).filter(n => !n.is_dir);
+        }
+      } catch {
+        this.palette.fileResults = [];
+      } finally {
+        this.palette.fileLoading = false;
+      }
+    },
     // Build the item list freshly each render — cheap (few hundred entries
     // at most) and keeps logic out of x-show templates. Item shape:
     //   { type, label, hint, run }
@@ -4388,12 +4428,12 @@ function portal() {
         });
       }
 
-      // 3) Currently-loaded file tree rows — opens preview. We only scan
-      // what's visible (not a full archive scan) because the tree is lazy
-      // and a full server-side fuzzy file index is a separate feature.
-      // 500 cap is plenty — beyond that the user should use the in-tree
-      // search (the search bar above the tree) instead.
-      for (const n of (this.visible || []).slice(0, 500)) {
+      // 3) Files — server-side search across the whole archive (not
+      // limited to the loaded tree view). Results in palette.fileResults
+      // are pre-filtered server-side by name match; we still pass them
+      // through the substring scorer below so they get ordered together
+      // with action / session matches.
+      for (const n of (this.palette.fileResults || [])) {
         if (n.is_dir) continue;
         items.push({
           type: "file",

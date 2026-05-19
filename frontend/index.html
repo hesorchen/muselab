@@ -572,17 +572,6 @@ window.addEventListener("error", e => {
           </span>
           <span x-text="t('pane.chat')"></span>
         </span>
-        <!-- Command palette entry — fills the top-bar space VS Code /
-             Linear / Cursor all use for the same thing. Click or Cmd+K
-             pops the modal. Doubles as discoverability for power-user
-             keyboard navigation. -->
-        <button class="cmd-palette-trigger" @click="openPalette()"
-                :title="lang==='zh' ? '搜索 / 跳转  Cmd+K' : 'Search / jump  ⌘K'">
-          <span class="cmd-palette-trigger-icon"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
-          <span class="cmd-palette-trigger-label"
-                x-text="lang==='zh' ? '搜索或跳转…' : 'Search or jump to…'"></span>
-          <span class="cmd-palette-trigger-kbd">⌘K</span>
-        </button>
         <span class="spacer"></span>
         <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
              by default, so the "present" state is implicit). When missing,
@@ -600,6 +589,18 @@ window.addEventListener("error", e => {
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
               x-text="tokenBadgeText()"></span>
+        <!-- Command palette entry — slim icon-btn alongside settings.
+             Discoverability comes from the first-run toast (init()) +
+             a tooltip showing the keyboard shortcut. Visual weight is
+             intentionally low so the palette doesn't read as "chat
+             search" — it's app-global. -->
+        <button @click="openPalette()" class="icon-btn"
+                :title="lang==='zh' ? '命令面板  ⌘K' : 'Command palette  ⌘K'"
+                aria-label="Command palette">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+        </button>
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
 
@@ -1722,9 +1723,10 @@ window.addEventListener("error", e => {
                type="text"
                x-model="palette.query"
                @input="palette.activeIndex = 0"
+               @input.debounce.300ms="_fetchPaletteFiles()"
                :placeholder="lang==='zh'
-                 ? '搜索动作 / 会话 / 文件…'
-                 : 'Search actions / sessions / files…'"
+                 ? '搜索动作 / 会话 / 文件（含整个 archive）…'
+                 : 'Search actions / sessions / files (whole archive)…'"
                autocomplete="off"
                autocorrect="off"
                autocapitalize="off"
