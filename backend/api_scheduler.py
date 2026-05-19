@@ -89,6 +89,21 @@ def delete_task_endpoint(tid: str) -> dict:
     return {"deleted": tid}
 
 
+@router.post("/tasks/{tid}/run", dependencies=[Depends(require_token)])
+async def run_task_now_endpoint(tid: str) -> dict:
+    """Trigger an out-of-schedule run of an existing task. Fire-and-forget:
+    the actual LLM call happens in a background asyncio.task so the HTTP
+    response returns immediately. UI polls /history to see the result.
+
+    Used for: (a) "retry" on a failed history entry; (b) manual smoke-test
+    after editing prompt / model without waiting for the next fire window."""
+    task = sched.get_task(tid)
+    if not task:
+        raise HTTPException(404, "task not found")
+    await sched.run_task_now(tid)
+    return {"ok": True, "task_id": tid}
+
+
 @router.get("/history", dependencies=[Depends(require_token)])
 def history_endpoint(limit: int = 50) -> dict:
     return {

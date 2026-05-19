@@ -3664,6 +3664,15 @@ pre.has-copy-btn .code-copy-btn.copied {
   font-size: var(--fs-xs); color: var(--c-fg-3);
   font-family: var(--font-mono); margin-left: auto;
 }
+.sched-hist-retry {
+  font-size: var(--fs-xs); padding: 2px 8px;
+  border: 1px solid var(--c-border); border-radius: var(--r-sm);
+  background: transparent; color: var(--c-fg-2); cursor: pointer;
+}
+.sched-hist-retry:hover:not([disabled]) {
+  background: var(--c-bg-1); color: var(--c-fg-0);
+}
+.sched-hist-retry[disabled] { opacity: 0.5; cursor: not-allowed; }
 .sched-hist-body {
   font-size: var(--fs-sm); color: var(--c-fg-2);
   line-height: 1.4;

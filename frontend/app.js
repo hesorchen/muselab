@@ -110,6 +110,9 @@ function portal() {
         onceDate: "",          // once: "YYYY-MM-DD"
       },
     },
+    // Per-task "run-now" inflight flag — disables retry / send buttons
+    // until the LLM call returns and history is reloaded. Keyed by task id.
+    schedRunning: {},
     // Notification prefs — purely client-side. Vibration is a foreground-
     // only nicety (when muselab is open, vibrate on unread count tick up).
     // pushEnabled is a UI hint mirroring the actual SW push subscription
@@ -4919,6 +4922,38 @@ function portal() {
         body: JSON.stringify({ enabled: !t.enabled }),
       });
       if (r.ok) await this.loadSchedulerTasks();
+    },
+    // Out-of-schedule run. Backend dispatches a background task; we poll
+    // history once and again after a short delay so the new entry shows
+    // up without waiting for the next periodic refresh.
+    async runSchedTaskNow(t) {
+      if (!t || !t.id || this.schedRunning[t.id]) return;
+      this.schedRunning[t.id] = true;
+      try {
+        const r = await fetch(
+          "/api/scheduler/tasks/" + encodeURIComponent(t.id) + "/run",
+          { method: "POST", headers: this.hdr() });
+        if (!r.ok) throw new Error(await r.text());
+        this.toast(this.lang === "zh" ? "已触发，等待结果…" : "Triggered — awaiting result…",
+                    "info", 2000);
+        // Poll history a couple of times to surface the new entry; backend
+        // appends synchronously in _execute_task's finally so a few-second
+        // delay catches even slow LLM turns.
+        setTimeout(() => this.loadSchedulerHistory(), 1500);
+        setTimeout(async () => {
+          await this.loadSchedulerHistory();
+          this.schedRunning[t.id] = false;
+        }, 8000);
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "触发失败: " : "Trigger failed: ")
+                    + ((e && e.message) || e), "error", 4000);
+        this.schedRunning[t.id] = false;
+      }
+    },
+    retrySchedHistory(h) {
+      if (!h || !h.task_id) return;
+      const task = this.scheduler.tasks.find(t => t.id === h.task_id);
+      if (task) this.runSchedTaskNow(task);
     },
     async ackSchedulerUnread() {
       const r = await fetch("/api/scheduler/ack", {

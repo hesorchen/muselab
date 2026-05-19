@@ -257,6 +257,20 @@ def ack_unread() -> int:
 
 # ---------- task execution ----------
 
+async def run_task_now(tid: str) -> bool:
+    """Fire-and-forget out-of-schedule run. Returns True if the task exists
+    and got scheduled; False if not found. Does NOT advance next_run — this
+    is a one-off, the regular schedule keeps ticking.
+
+    Useful as a "retry" affordance after a failure, and as a smoke test
+    after editing a task without having to wait for the next fire window."""
+    task = _state["tasks"].get(tid)
+    if not task:
+        return False
+    asyncio.create_task(_execute_task(task))
+    return True
+
+
 async def _execute_task(task: dict) -> None:
     """One full run: send the prompt against the bound session, collect
     the assistant reply, store a history entry. Robust to ANY error in
@@ -295,9 +309,11 @@ async def _execute_task(task: dict) -> None:
         error = f"{type(e).__name__}: {e}"
         sys.stderr.write(f"[scheduler] task {tid} ({task['name']}) failed: {error}\n")
     finally:
+        # Don't touch next_run here — the scheduler_loop already advanced
+        # it before firing, and run_task_now() is explicitly an out-of-band
+        # run that mustn't disturb the regular cadence.
         now = time.time()
         task["last_run"] = now
-        task["next_run"] = _compute_next_run(task["schedule"])
         preview = reply_text.strip()
         if len(preview) > _PREVIEW_CAP_CHARS:
             preview = preview[:_PREVIEW_CAP_CHARS] + "…"

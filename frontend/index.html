@@ -1921,6 +1921,11 @@ window.addEventListener("error", e => {
                          @change="toggleSchedEnabled(t)" />
                   <span class="switch-slider"></span>
                 </label>
+                <button class="icon-btn sm" @click="runSchedTaskNow(t)"
+                        :disabled="schedRunning[t.id]"
+                        :title="lang==='zh' ? '立即运行一次' : 'Run now'">
+                  <svg><use href="#i-send"/></svg>
+                </button>
                 <button class="icon-btn sm" @click="openSchedTaskSession(t)"
                         :title="lang==='zh' ? '打开关联 session' : 'Open bound session'">
                   <svg><use href="#i-eye"/></svg>
@@ -1947,6 +1952,13 @@ window.addEventListener("error", e => {
               <div class="sched-hist-head">
                 <span class="sched-hist-name" x-text="h.task_name"></span>
                 <span class="sched-hist-time" x-text="fmtSchedTime(h.ts)"></span>
+                <button class="btn-text sm sched-hist-retry"
+                        x-show="!h.ok && scheduler.tasks.find(t => t.id === h.task_id)"
+                        :disabled="schedRunning[h.task_id]"
+                        @click="retrySchedHistory(h)"
+                        x-text="schedRunning[h.task_id]
+                          ? (lang==='zh' ? '执行中…' : 'Running…')
+                          : (lang==='zh' ? '重试' : 'Retry')"></button>
               </div>
               <div class="sched-hist-body"
                    x-text="h.ok ? h.reply_preview : ('Error: ' + (h.error || 'unknown'))"></div>
