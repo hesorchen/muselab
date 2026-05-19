@@ -1626,6 +1626,39 @@ window.addEventListener("error", e => {
           </div>
         </div>
 
+        <!-- Notification prefs — per-device (lives in localStorage),
+             does NOT round-trip through /api/settings. Vibrate works
+             whenever muselab is open in this tab; push covers the
+             "muselab closed, still notify" case via a service worker. -->
+        <div class="settings-section">
+          <div class="settings-section-title"
+               x-text="lang==='zh' ? '通知' : 'Notifications'"></div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '定时任务运行完成时的提醒方式。每台设备独立设置。'
+                 : 'How you get pinged when a scheduled task finishes. Per-device.'"></div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '完成时震动（前台）' : 'Vibrate on completion (foreground)'"></label>
+            <label class="switch">
+              <input type="checkbox" x-model="notifyPrefs.vibrate"
+                     @change="saveNotifyPrefs()" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '推送通知（即使关掉 muselab）' : 'Push notifications (even when muselab is closed)'"></label>
+            <label class="switch">
+              <input type="checkbox" x-model="notifyPrefs.push"
+                     @change="onPushToggle($event)" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+          <div class="settings-hint" x-show="notifyPrefs.push"
+               x-text="lang==='zh'
+                 ? '已开启：浏览器会弹通知 + 震动。需要把 muselab 添加到主屏 (PWA) 才能在 iOS 上后台收推送。'
+                 : 'Enabled — browser shows a notification + vibrates. iOS requires adding muselab to home screen (PWA) for background push.'"></div>
+        </div>
+
         <div class="settings-section">
           <div class="settings-section-title" x-text="t('set.sec.skills')"></div>
           <div class="settings-hint" x-text="t('set.skills.hint')"></div>

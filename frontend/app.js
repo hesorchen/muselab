@@ -102,6 +102,13 @@ function portal() {
       // Inline-create form state. Reset by _resetSchedDraft().
       draft: { name: "", prompt: "", hour: 9, minute: 0, model: "" },
     },
+    // Notification prefs — purely client-side. Vibration is a foreground-
+    // only nicety (when muselab is open, vibrate on unread count tick up).
+    // pushEnabled is a UI hint mirroring the actual SW push subscription
+    // state; the subscribe flow itself lives in pushSubscribe().
+    notifyPrefs: { vibrate: false, push: false },
+    // Last-seen unread, used to detect a tick-up and trigger vibration.
+    _lastSeenUnread: 0,
 
     // ===== command palette (Cmd/Ctrl+K) =====
     // Single fuzzy-search dropdown across: quick actions, open sessions,
@@ -390,6 +397,11 @@ function portal() {
       // always showing the same first 5. shuffleInspirePrompts() bumps
       // this on demand for "give me another batch".
       this._inspireSeed = Math.floor(Math.random() * 1e9);
+      // Vibration / push prefs come from localStorage (per-device) so a
+      // shared muselab between a desktop + phone keeps independent
+      // settings — your phone can vibrate; the desktop tab silently
+      // updates the bell badge.
+      this.loadNotifyPrefs();
       // Global error capture — when alpine's "Cannot read properties of
       // undefined (reading 'after')" fires we want the FULL story (msg,
       // file, line, stack) printed in one block so the user can copy it
@@ -4727,13 +4739,48 @@ function portal() {
     },
     async fetchSchedulerUnread() {
       // Called from the heartbeat — keeps the bell badge live without
-      // requiring the user to open the drawer.
+      // requiring the user to open the drawer. Also detects a tick-up
+      // since last poll → triggers foreground vibration (if user opted in).
       try {
         const r = await fetch("/api/scheduler/tasks", { headers: this.hdr() });
         if (r.ok) {
           const d = await r.json();
-          this.scheduler.unreadCount = d.unread_count || 0;
+          const next = d.unread_count || 0;
+          if (next > this._lastSeenUnread && this.notifyPrefs.vibrate) {
+            // 3-pulse "task done" pattern. navigator.vibrate is a no-op
+            // (returns false) on devices without a vibration motor, so
+            // it's safe to call unconditionally.
+            try { navigator.vibrate?.([120, 60, 120]); } catch {}
+          }
+          this._lastSeenUnread = next;
+          this.scheduler.unreadCount = next;
         }
+      } catch {}
+    },
+    saveNotifyPrefs() {
+      try {
+        localStorage.setItem("muselab_notify",
+          JSON.stringify(this.notifyPrefs));
+      } catch {}
+    },
+    async onPushToggle(ev) {
+      // Real wiring (service worker registration + VAPID subscribe /
+      // unsubscribe) lands in the Web Push commit. For now the toggle
+      // bounces back to off and flashes a notice — keeps the row in
+      // the UI so we don't have to rebuild the section later.
+      if (ev?.target) ev.target.checked = false;
+      this.notifyPrefs.push = false;
+      this.saveNotifyPrefs();
+      this.toast(this.lang === "zh"
+        ? "推送通知即将上线（VAPID / Service Worker 接通中）"
+        : "Push notifications coming soon (VAPID / SW pipeline in progress)",
+        "info", 3000);
+    },
+    loadNotifyPrefs() {
+      try {
+        const p = JSON.parse(localStorage.getItem("muselab_notify") || "{}");
+        if (typeof p.vibrate === "boolean") this.notifyPrefs.vibrate = p.vibrate;
+        if (typeof p.push === "boolean")    this.notifyPrefs.push    = p.push;
       } catch {}
     },
     openSchedTaskSession(t) {
