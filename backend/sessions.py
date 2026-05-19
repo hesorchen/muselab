@@ -328,7 +328,11 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
 def bump_session(sid: str, message_count: int | None = None,
                   auto_rename_from: str | None = None) -> None:
     """Update updated_at and optionally message_count; opportunistically
-    auto-rename from the first substantive user message text."""
+    auto-rename from the first substantive user message text. Auto-rename
+    also writes an `ai-title` entry to the CLI JSONL so that
+    `claude --resume` picker shows muselab-created sessions (without the
+    ai-title entry, cc's picker silently skips them — only `--resume <sid>`
+    explicit resume works)."""
     idx = _load_index()
     for s in idx:
         if s["id"] == sid:
@@ -342,5 +346,20 @@ def bump_session(sid: str, message_count: int | None = None,
                 if title:
                     s["name"] = title
                     s["auto_named"] = False
+                    # Propagate to CLI JSONL so cc's `/resume` picker sees us.
+                    # rename_session writes a {"type":"ai-title", "aiTitle":...}
+                    # entry — this is what the picker filters on. Silent on
+                    # FileNotFound (JSONL not created yet) / ValueError.
+                    try:
+                        from claude_agent_sdk import rename_session as _sdk_rn
+                        from .settings import ROOT as _ROOT
+                        if _ROOT is not None:
+                            _sdk_rn(sid, title, directory=str(_ROOT))
+                    except (FileNotFoundError, ValueError):
+                        pass
+                    except Exception as _e:
+                        sys.stderr.write(
+                            f"[sessions] auto-rename ai-title write "
+                            f"failed for {sid}: {type(_e).__name__}: {_e}\n")
             _save_index(idx)
             return
