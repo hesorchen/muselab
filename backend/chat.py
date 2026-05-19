@@ -287,10 +287,20 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 except Exception:
                     pass  # fall through with just muselab
             opts_kwargs["mcp_servers"] = mcp_dict
-            if show_thinking:
-                from claude_agent_sdk import ThinkingConfigEnabled
-                budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
-                opts_kwargs["thinking"] = ThinkingConfigEnabled(budget_tokens=budget)
+            # Always enable extended thinking. Without an explicit config the
+            # model uses adaptive thinking and silently pauses mid-reply for
+            # invisible reasoning — user perceives "few chars + stall + dump".
+            # With ThinkingConfigEnabled the reasoning is streamed visibly via
+            # thinking_delta events, which the FE renders as a collapsible
+            # block. The `show_thinking` parameter is retained for API compat
+            # but no longer toggles the model side.
+            from claude_agent_sdk import ThinkingConfigEnabled
+            budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
+            # ThinkingConfigEnabled is a TypedDict — instantiating without
+            # `type` produces a dict missing that key, and the SDK then raises
+            # KeyError('type') in subprocess_cli.py:376. Set it explicitly.
+            opts_kwargs["thinking"] = ThinkingConfigEnabled(
+                type="enabled", budget_tokens=budget)
             # When permission_mode is not bypassPermissions, wire the SDK's
             # can_use_tool callback to muselab's permission_request UI bridge.
             if permission != "bypassPermissions":
@@ -460,8 +470,18 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                 text_buf += block.get("text", "")
             elif bt == "thinking":
                 flush_text()
-                out.append({"role": "thinking", "text": block.get("thinking", ""),
-                            "uuid": sm.uuid})
+                # Anthropic Opus 4.x extended-thinking blocks come back
+                # redacted in the final transcript — `thinking` is "" and
+                # only the `signature` survives. The plain-text content is
+                # ONLY visible live via thinking_delta events during streaming.
+                # Surface a placeholder so the UI doesn't show an empty
+                # block on reload — reads as "model thought here but the
+                # text isn't retained" rather than a broken render.
+                th_text = block.get("thinking", "") or ""
+                if not th_text.strip() and block.get("signature"):
+                    th_text = "[已加密推理 · 仅 streaming 期间可见明文]"
+                out.append({"role": "thinking", "text": th_text,
+                             "uuid": sm.uuid})
             elif bt == "tool_use":
                 flush_text()
                 tu = {

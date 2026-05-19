@@ -37,7 +37,6 @@ PROVIDER_KEYS = [
 DEFAULT_KEYS = [
     "MUSELAB_DEFAULT_MODEL",
     "MUSELAB_DEFAULT_PERMISSION",
-    "MUSELAB_DEFAULT_SHOW_THINKING",
     "MUSELAB_THINKING_BUDGET",
     "MUSELAB_MAX_TURNS",
 ]
@@ -61,7 +60,6 @@ class SettingsIn(BaseModel):
     # Defaults
     default_model: str | None = None
     default_permission: str | None = None
-    default_show_thinking: bool | None = None
     # Params
     thinking_budget: int | None = None
     max_turns: int | None = None
@@ -135,7 +133,6 @@ def get_settings() -> dict:
         "defaults": {
             "model": os.environ.get("MUSELAB_DEFAULT_MODEL", os.environ.get("MUSELAB_MODEL", "claude-sonnet-4-6")),
             "permission": os.environ.get("MUSELAB_DEFAULT_PERMISSION", "bypassPermissions"),
-            "show_thinking": os.environ.get("MUSELAB_DEFAULT_SHOW_THINKING", "false").lower() == "true",
         },
         "params": {
             "thinking_budget": int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000")),
@@ -170,8 +167,6 @@ def put_settings(req: SettingsIn) -> dict:
         updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
     if req.default_permission is not None:
         updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
-    if req.default_show_thinking is not None:
-        updates["MUSELAB_DEFAULT_SHOW_THINKING"] = "true" if req.default_show_thinking else "false"
     if req.thinking_budget is not None:
         updates["MUSELAB_THINKING_BUDGET"] = str(req.thinking_budget)
     if req.max_turns is not None:
