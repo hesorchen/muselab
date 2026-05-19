@@ -805,7 +805,9 @@ window.addEventListener("error", e => {
                 <span class="msg-avatar assistant-avatar" :title="mascotLabel()">
                   <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                 </span>
-                <div class="bubble" x-html="m.html"></div>
+                <div class="bubble"
+                     :class="{ 'is-streaming-bubble': streaming && i === messages.length - 1 }"
+                     x-html="m.html"></div>
               </div>
             <div x-show="m.role==='assistant' && m.model" class="model-tag"
                  :title="m.model"

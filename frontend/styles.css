@@ -980,16 +980,25 @@ body.kb-open .pane {
   letter-spacing: 0.5px;
 }
 .muse-mascot.greet { animation: muse-bounce .9s ease; }
-/* `.is-streaming` 类不触发任何动画 — mascot 保持完全静止。
-   流式状态由 pending bubble 的 thinking-dots 表达，mascot 动反而分散。
-   注意：曾经用 .thinking 这个类，但 .thinking 在 styles.css 别处有
-   "消息泡泡" 样式（黑底 + padding），会把 20px 的图标挤没。 */
+/* `.is-streaming` — slow breathing animation. Previously this class was
+   intentionally STATIC ("流式状态由 pending bubble 的 thinking-dots
+   表达") but the pending bubble disappears the moment the first chunk
+   arrives, leaving the user with no in-flight indicator for the rest
+   of the reply. Breathing is gentle enough not to compete with content
+   yet clearly signals "still working". Stream-caret on the bubble itself
+   carries the per-token feedback; mascot carries the session-level one.
+   Note: avoid using the .thinking class name — it has unrelated bubble
+   styling elsewhere that crushes the 20px mascot. */
 .muse-mascot.is-streaming {
   color: var(--c-accent);
-  animation: none !important;
+  animation: muse-breath 2.4s ease-in-out infinite;
   transition: none;
 }
-.muse-mascot.is-streaming:hover { transform: none; }
+.muse-mascot.is-streaming:hover { transform: none; animation: muse-breath 2.4s ease-in-out infinite; }
+@keyframes muse-breath {
+  0%, 100% { transform: scale(1);    opacity: 0.85; }
+  50%      { transform: scale(1.05); opacity: 1; }
+}
 
 @keyframes muse-bounce {
   0%   { transform: scale(1)    rotate(0deg); }
@@ -1577,6 +1586,24 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   color: var(--c-fg-3); display: inline-flex; align-items: center; gap: 8px;
 }
 .bubble.pending .thinking-label { font-size: var(--fs-sm); opacity: 0.7; }
+
+/* Live streaming bubble — blinking caret at the tail. Tells the user
+   tokens are still flowing even when the model pauses briefly (between
+   tool calls, mid-codeblock, finalization). The mascot's breathing
+   animation carries the session-level signal; this one is per-token. */
+.bubble.is-streaming-bubble::after {
+  content: "▌";
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--c-accent);
+  animation: stream-caret-blink 1s steps(2, end) infinite;
+  vertical-align: -1px;
+  font-weight: var(--fw-normal);
+}
+@keyframes stream-caret-blink {
+  0%, 49%   { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
 .thinking-dots { display: inline-flex; gap: 4px; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
