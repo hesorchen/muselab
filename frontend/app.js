@@ -76,6 +76,10 @@ function portal() {
     // counts (system prompt / tools / memory files / messages / mcp / skills)
     // so the user can see which slice is using their context window.
     ctxBreakdown: { show: false, loading: false, data: null, error: "" },
+    // Per-category expansion state inside the breakdown popup. Keyed by
+    // category name from SDK; only categories that map to a sub-list
+    // (memoryFiles / mcpTools / agents) actually expand.
+    ctxExpanded: {},
     editing: false, editText: "",
     cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, mode: "plaintext", dirty: false },
     tabs: [],   // open file tabs: [{path, name}]
@@ -1923,6 +1927,7 @@ function portal() {
     async showCtxBreakdown() {
       if (!this.currentId) return;
       this.ctxBreakdown = { show: true, loading: true, data: null, error: "" };
+      this.ctxExpanded = {};
       const { ok, data, error, status } = await this.api(
         `/api/chat/context-breakdown/${this.currentId}`);
       this.ctxBreakdown.loading = false;
@@ -1936,6 +1941,45 @@ function portal() {
               : "Send a message first — SDK breakdown needs a live client")
           : (error || (this.lang === "zh" ? "查询失败" : "Fetch failed"));
       }
+    },
+    // % of maxTokens used by this category — drives both the stacked bar
+    // at the top of the popup and the per-row inline bar.
+    ctxCategoryPct(cat) {
+      const max = (this.ctxBreakdown.data && this.ctxBreakdown.data.maxTokens) || 0;
+      if (!max || !cat || !cat.tokens) return 0;
+      return Math.min(100, (cat.tokens / max) * 100);
+    },
+    // Pick a category color. SDK populates cat.color for known categories;
+    // fall back to a stable hash-based hue for everything else so the bar
+    // segments stay distinct.
+    ctxCategoryColor(cat) {
+      if (cat && cat.color) return cat.color;
+      const n = (cat && cat.name) || "?";
+      let h = 0;
+      for (let i = 0; i < n.length; i++) h = (h * 31 + n.charCodeAt(i)) >>> 0;
+      return `hsl(${h % 360}, 55%, 55%)`;
+    },
+    ctxFormatTokens(n) {
+      if (!n) return "0";
+      if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+      return String(n);
+    },
+    // Map a category name to its detailed sub-list. SDK returns
+    // memoryFiles / mcpTools / agents as separate top-level arrays; we
+    // surface them under whichever category row carries the same totals.
+    // Match is fuzzy (lowercased + stripped of separators) since the SDK
+    // labels may localize the category name.
+    ctxRowChildren(name) {
+      const data = this.ctxBreakdown.data || {};
+      const key = String(name || "").toLowerCase().replace(/[\s_-]/g, "");
+      if (key.includes("memory")) return data.memoryFiles || [];
+      if (key.includes("mcp")) return data.mcpTools || [];
+      if (key.includes("agent")) return data.agents || [];
+      return [];
+    },
+    ctxToggleRow(name) {
+      if (!this.ctxRowChildren(name).length) return;
+      this.ctxExpanded[name] = !this.ctxExpanded[name];
     },
 
     ctxRingTitle() {

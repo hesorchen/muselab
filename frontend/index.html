@@ -657,14 +657,43 @@ window.addEventListener("error", e => {
           <div class="ctx-breakdown-body">
             <div class="ctx-breakdown-summary"
                  x-text="((ctxBreakdown.data.totalTokens||0)/1000).toFixed(1) + 'K / ' + ((ctxBreakdown.data.maxTokens||0)/1000).toFixed(0) + 'K (' + (ctxBreakdown.data.percentage||0).toFixed(1) + '%)'"></div>
+            <!-- Stacked bar — shows each category as a colored segment so the
+                 user can eyeball "where did 50K go" at a glance. -->
+            <div class="ctx-breakdown-stack">
+              <template x-for="cat in (ctxBreakdown.data.categories || [])" :key="cat.name">
+                <div class="ctx-breakdown-stack-seg"
+                     :style="`width: ${ctxCategoryPct(cat)}%; background: ${ctxCategoryColor(cat)}`"
+                     :title="cat.name + ' · ' + ctxFormatTokens(cat.tokens)"></div>
+              </template>
+            </div>
             <template x-for="cat in (ctxBreakdown.data.categories || [])" :key="cat.name">
-              <div class="ctx-breakdown-row">
+              <div class="ctx-breakdown-row"
+                   :class="{ expandable: ctxRowChildren(cat.name).length, expanded: ctxExpanded[cat.name] }"
+                   @click="ctxToggleRow(cat.name)">
+                <span class="ctx-breakdown-swatch"
+                      :style="`background: ${ctxCategoryColor(cat)}`"></span>
                 <span class="ctx-breakdown-name" x-text="cat.name"></span>
+                <span class="ctx-breakdown-bar">
+                  <span class="ctx-breakdown-bar-fill"
+                        :style="`width: ${ctxCategoryPct(cat)}%; background: ${ctxCategoryColor(cat)}`"></span>
+                </span>
                 <span class="ctx-breakdown-tokens"
-                      x-text="cat.tokens >= 1000
-                                ? (cat.tokens/1000).toFixed(1) + 'K'
-                                : cat.tokens + ''"></span>
+                      x-text="ctxFormatTokens(cat.tokens)"></span>
+                <span class="ctx-breakdown-caret"
+                      x-show="ctxRowChildren(cat.name).length"
+                      x-text="ctxExpanded[cat.name] ? '▾' : '▸'"></span>
               </div>
+              <template x-if="ctxExpanded[cat.name] && ctxRowChildren(cat.name).length">
+                <div class="ctx-breakdown-sub">
+                  <template x-for="item in ctxRowChildren(cat.name)" :key="item.name + '-' + item.tokens">
+                    <div class="ctx-breakdown-subrow">
+                      <span class="ctx-breakdown-subname" x-text="item.name"></span>
+                      <span class="ctx-breakdown-subtokens"
+                            x-text="ctxFormatTokens(item.tokens)"></span>
+                    </div>
+                  </template>
+                </div>
+              </template>
             </template>
             <div class="ctx-breakdown-hint"
                  x-text="lang==='zh' ? '说明：tools / system prompt 是 Claude Code CLI 内置；memoryFiles 是 CLAUDE.md union；messages 含所有历史 + tool_result' : 'Note: tools / system_prompt are CLI built-in; memoryFiles is CLAUDE.md union; messages include full history + tool results'"></div>
