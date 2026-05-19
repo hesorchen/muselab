@@ -2237,6 +2237,31 @@ pre.has-copy-btn .code-copy-btn.copied {
 .onboard-card.warn  { border-left-color: #d97706; background: rgba(245, 158, 11, 0.05); }
 .onboard-card.calm  { border-left-color: var(--c-accent-soft); }
 .onboard-card-title { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--c-fg-0); margin-bottom: 6px; }
+/* Title + shuffle button on one row when the inspire-prompts card is
+   showing. Without flex they stack and the shuffle hangs awkwardly. */
+.onboard-card-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px;
+}
+.onboard-card-head .onboard-card-title { margin-bottom: 0; flex: 1; }
+.onboard-shuffle {
+  background: transparent;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  color: var(--c-fg-3);
+  cursor: pointer;
+  width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: color var(--t-fast), border-color var(--t-fast),
+              background var(--t-fast), transform .12s;
+}
+.onboard-shuffle:hover {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+.onboard-shuffle:active { transform: rotate(30deg) scale(0.94); }
 .onboard-card-body  { font-size: var(--fs-sm); color: var(--c-fg-2); line-height: 1.55; margin-bottom: 12px; }
 .onboard-card button.btn-primary { font-size: var(--fs-sm); padding: 6px 14px; }
 

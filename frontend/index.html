@@ -838,9 +838,23 @@ window.addEventListener("error", e => {
             </template>
             <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && !contextInfo.archive_empty">
               <div class="onboard-card calm">
-                <div class="onboard-card-title" x-text="t('onboard.ready_title')"></div>
+                <div class="onboard-card-head">
+                  <div class="onboard-card-title" x-text="t('onboard.ready_title')"></div>
+                  <button class="onboard-shuffle"
+                          @click="shuffleInspirePrompts()"
+                          :title="lang==='zh' ? '换一批' : 'Shuffle'"
+                          aria-label="Shuffle">
+                    <svg viewBox="0 0 24 24" width="14" height="14"
+                         fill="none" stroke="currentColor" stroke-width="2"
+                         stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="23 4 23 10 17 10"/>
+                      <polyline points="1 20 1 14 7 14"/>
+                      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                    </svg>
+                  </button>
+                </div>
                 <div class="onboard-suggestions">
-                  <template x-for="(q, i) in onboardingPrompts()" :key="i">
+                  <template x-for="(q, i) in onboardingPrompts()" :key="i + '|' + q">
                     <button class="onboard-suggestion" @click="useSuggestedPrompt(q)" x-text="q"></button>
                   </template>
                 </div>

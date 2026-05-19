@@ -370,6 +370,11 @@ function portal() {
       this.initMascot();
       this.configureMarked();
       this._initMobileKeyboardWatch();
+      // Per-session-load seed so the inspire prompts feel fresh each
+      // time the user lands on the empty chat screen, rather than
+      // always showing the same first 5. shuffleInspirePrompts() bumps
+      // this on demand for "give me another batch".
+      this._inspireSeed = Math.floor(Math.random() * 1e9);
       // Global error capture — when alpine's "Cannot read properties of
       // undefined (reading 'after')" fires we want the FULL story (msg,
       // file, line, stack) printed in one block so the user can copy it
@@ -3504,14 +3509,37 @@ function portal() {
     },
 
     onboardingPrompts() {
+      // Inspire prompts come from window.MUSELAB_INSPIRE_PROMPTS (a 30+
+      // tagged bilingual list). Filter to those whose tags either match
+      // an existing archive subdir or are tagged "general" (always-on).
+      // Shuffle and slice — gives a fresh-feeling sample each time the
+      // chat-empty state renders. _inspireSeed is bumped by
+      // shuffleInspirePrompts() so the user can ask for "another round"
+      // without reloading.
+      const list = window.MUSELAB_INSPIRE_PROMPTS || [];
       const sp = this.contextInfo.subdir_present || {};
-      const ps = [];
-      if (sp.health) ps.push(this.t("onboard.q_health"));
-      if (sp.work)   ps.push(this.t("onboard.q_work"));
-      if (sp.money)  ps.push(this.t("onboard.q_money"));
-      if (sp.people) ps.push(this.t("onboard.q_people"));
-      ps.push(this.t("onboard.q_overview"));
-      return ps.slice(0, 4);
+      const lang = this.lang;
+      const eligible = list.filter(p => {
+        if (!p.tags || p.tags.length === 0) return true;
+        return p.tags.some(t => t === "general" || sp[t]);
+      });
+      // Seeded shuffle (Fisher-Yates with a tiny linear-congruential PRNG
+      // seeded by _inspireSeed) — keeps the chosen set stable as Alpine
+      // re-renders during typing, but flips on shuffleInspirePrompts().
+      const seed = this._inspireSeed || 1;
+      const a = eligible.slice();
+      let s = seed;
+      for (let i = a.length - 1; i > 0; i--) {
+        s = (s * 1664525 + 1013904223) & 0xffffffff;
+        const j = Math.abs(s) % (i + 1);
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a.slice(0, 5).map(p => p[lang] || p.zh);
+    },
+    shuffleInspirePrompts() {
+      // Bump the seed so onboardingPrompts() picks a different sample.
+      // +1 each time; the LCG inside onboardingPrompts spreads it.
+      this._inspireSeed = (this._inspireSeed || 1) + 1;
     },
 
     async quickNewNote() {
