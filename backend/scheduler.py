@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .settings import ROOT
+from .settings import ROOT, atomic_write_text
 
 # Lazy import target — set at module load
 _STATE_FILE: Path | None = (ROOT / ".muselab" / "scheduler.json") if ROOT else None
@@ -60,10 +60,9 @@ def _save_state() -> None:
     if not _STATE_FILE:
         return
     try:
-        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _STATE_FILE.write_text(
+        atomic_write_text(
+            _STATE_FILE,
             json.dumps(_state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
     except Exception as e:
         sys.stderr.write(f"[scheduler] failed to save state: {e}\n")

@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .settings import ROOT
+from .settings import ROOT, atomic_write_text
 
 
 _DIR = (ROOT / ".muselab") if ROOT else None
@@ -74,10 +74,7 @@ def _ensure_vapid() -> dict[str, str]:
             sys.stderr.write(f"[push] vapid.json unreadable, regenerating: {e}\n")
     _vapid = _gen_vapid_keypair()
     if _VAPID_FILE:
-        _VAPID_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _VAPID_FILE.write_text(
-            json.dumps(_vapid, indent=2), encoding="utf-8",
-        )
+        atomic_write_text(_VAPID_FILE, json.dumps(_vapid, indent=2))
         try:
             os.chmod(_VAPID_FILE, 0o600)
         except Exception:
@@ -104,8 +101,7 @@ def _load_subs() -> None:
 def _save_subs() -> None:
     if not _SUBS_FILE:
         return
-    _SUBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _SUBS_FILE.write_text(json.dumps(_subs, indent=2), encoding="utf-8")
+    atomic_write_text(_SUBS_FILE, json.dumps(_subs, indent=2))
 
 
 def add_subscription(sub: dict) -> None:

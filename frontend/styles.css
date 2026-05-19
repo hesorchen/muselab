@@ -929,6 +929,7 @@ body.kb-open .pane {
 .tab-bar:hover::-webkit-scrollbar-thumb { background: var(--c-fg-4); }
 .tab-bar:hover::-webkit-scrollbar-thumb:hover { background: var(--c-fg-3); }
 .tab {
+  position: relative;
   display: flex; align-items: center; gap: 6px;
   padding: 6px 10px 6px 12px; max-width: 200px;
   border-right: 1px solid var(--c-border);
@@ -944,13 +945,10 @@ body.kb-open .pane {
   border-bottom: 2px solid var(--c-accent); padding-bottom: 4px;
 }
 .tab.active .icon { color: var(--c-accent); }
-/* Drag-over hint — matches chat-tab.drag-over: 2px accent bar at the leading
-   edge marks the insertion point as the cursor crosses tabs during reorder. */
 .tab.drag-over::before {
   content: ""; position: absolute; left: 0; top: 0; bottom: 0;
   width: 2px; background: var(--c-accent);
 }
-.tab { position: relative; }
 .tab .icon { color: inherit; }
 .tab .icon svg { width: 13px; height: 13px; }
 .tab .tab-name { overflow: hidden; text-overflow: ellipsis; }
@@ -1275,8 +1273,6 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   font-size: 18px; line-height: 1;
 }
 .lightbox-close:hover { background: rgba(255,255,255,0.2); }
-.user-msg-img { cursor: zoom-in; transition: transform 100ms; }
-.user-msg-img:hover { transform: scale(1.02); }
 .session-sel-btn .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-sel-btn .caret { color: var(--c-fg-3); margin-left: 6px; }
 .session-picker-pop {
@@ -2037,7 +2033,9 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-radius: var(--r-md);
   border: 1px solid var(--c-border-strong);
   display: block;
+  cursor: zoom-in; transition: transform 100ms;
 }
+.user-msg-img:hover { transform: scale(1.02); }
 .user-msg-doc {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: var(--r-md);

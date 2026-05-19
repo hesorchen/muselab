@@ -3,6 +3,26 @@ import warnings
 from pathlib import Path
 from dotenv import load_dotenv
 
+
+def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
+    """Write text atomically: tmpfile in same dir + os.replace().
+
+    Survives crash / OOM-kill mid-write — the destination either holds the
+    old content or the new content, never a truncated half-write.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(data, encoding=encoding)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # 不再主动 pop ANTHROPIC_API_KEY —— claude CLI 的优先级已经正确：

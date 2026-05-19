@@ -42,7 +42,7 @@ from typing import Any
 # the session immediately after create_session).
 from claude_agent_sdk import list_sessions as sdk_list_sessions
 from claude_agent_sdk import get_session_info as sdk_get_session_info
-from .settings import ROOT
+from .settings import ROOT, atomic_write_text
 
 
 def _default_session_name() -> str:
@@ -90,7 +90,7 @@ def _load_index() -> list[dict]:
 
 
 def _save_index(items: list[dict]) -> None:
-    INDEX.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(INDEX, json.dumps(items, ensure_ascii=False, indent=2))
 
 
 def _load_sidecar(sid: str) -> dict:
@@ -106,8 +106,7 @@ def _load_sidecar(sid: str) -> dict:
 
 
 def _save_sidecar(sid: str, data: dict) -> None:
-    _sidecar_path(sid).write_text(
-        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(_sidecar_path(sid), json.dumps(data, ensure_ascii=False))
 
 
 # ============================================================================
