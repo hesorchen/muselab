@@ -740,29 +740,34 @@ window.addEventListener("error", e => {
                      x-ref="sessionPickerSearchInput"
                      :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
                      @keydown.escape="sessionPickerOpen = false" />
-              <template x-for="s in filteredSessions()" :key="s.id">
-                <div class="session-picker-row"
-                     :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
-                     @click="pickerOpenSession(s.id)"
-                     @contextmenu.prevent="pickerRowMenu($event, s.id)">
-                  <button class="session-picker-pin"
-                          :class="{ active: s.pinned }"
-                          @click.stop="togglePinSession(s.id)"
-                          :title="s.pinned ? (lang==='zh'?'取消置顶':'Unpin') : (lang==='zh'?'置顶':'Pin to top')">
-                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
-                      <line x1="12" y1="17" x2="12" y2="22"/>
-                      <path d="M5 17h14l-1.5-5H6.5L5 17z"/>
-                      <path d="M9 12V5h6v7"/>
-                    </svg>
-                  </button>
-                  <span class="ellipsis" x-text="s.name"></span>
-                  <span class="session-picker-count" x-text="s.message_count"></span>
-                  <button class="session-picker-kebab"
-                          @click="pickerRowMenu($event, s.id)"
-                          :title="lang==='zh' ? '更多操作' : 'More'">⋮</button>
-                  <button class="session-picker-del"
-                          @click="pickerDeleteSession(s.id, $event)"
-                          :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+              <template x-for="g in groupedFilteredSessions()" :key="g.key">
+                <div class="session-picker-group">
+                  <div class="session-picker-group-label" x-text="g.label"></div>
+                  <template x-for="s in g.items" :key="s.id">
+                    <div class="session-picker-row"
+                         :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
+                         @click="pickerOpenSession(s.id)"
+                         @contextmenu.prevent="pickerRowMenu($event, s.id)">
+                      <button class="session-picker-pin"
+                              :class="{ active: s.pinned }"
+                              @click.stop="togglePinSession(s.id)"
+                              :title="s.pinned ? (lang==='zh'?'取消置顶':'Unpin') : (lang==='zh'?'置顶':'Pin to top')">
+                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                          <line x1="12" y1="17" x2="12" y2="22"/>
+                          <path d="M5 17h14l-1.5-5H6.5L5 17z"/>
+                          <path d="M9 12V5h6v7"/>
+                        </svg>
+                      </button>
+                      <span class="ellipsis" x-text="s.name"></span>
+                      <span class="session-picker-count" x-text="s.message_count"></span>
+                      <button class="session-picker-kebab"
+                              @click="pickerRowMenu($event, s.id)"
+                              :title="lang==='zh' ? '更多操作' : 'More'">⋮</button>
+                      <button class="session-picker-del"
+                              @click="pickerDeleteSession(s.id, $event)"
+                              :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+                    </div>
+                  </template>
                 </div>
               </template>
               <div x-show="filteredSessions().length === 0" class="session-picker-empty"
@@ -785,6 +790,8 @@ window.addEventListener("error", e => {
                   x-text="lang==='zh' ? '编辑 system prompt' : 'Edit system prompt'"></button>
           <button @click="menuClose(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '关闭 tab' : 'Close tab'"></button>
+          <button @click="menuExportMarkdown(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '导出为 Markdown' : 'Export as Markdown'"></button>
           <hr/>
           <button class="danger" @click="menuDelete(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '删除会话' : 'Delete session'"></button>

@@ -4,10 +4,12 @@ import json
 import asyncio
 import re
 import time
+import urllib.parse
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Response
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 from claude_agent_sdk import (
@@ -596,6 +598,68 @@ def get_session_api(sid: str) -> dict:
     compact_uuids = _compact_summary_uuids(sid)
     messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
     return {**meta, "messages": messages}
+
+
+@router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
+def export_session_markdown(sid: str) -> Response:
+    """Render the transcript as a single Markdown file the user can save.
+
+    Auth is via ?token=... rather than the header — file downloads from a
+    plain anchor don't carry custom headers."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    try:
+        sdk_msgs = get_session_messages(sid, directory=str(ROOT))
+    except Exception:
+        sdk_msgs = []
+    annotations = sess.get_message_annotations(sid)
+    compact_uuids = _compact_summary_uuids(sid)
+    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+
+    name = meta.get("name") or "session"
+    model = meta.get("model") or ""
+    created = meta.get("created_at")
+    created_str = (datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M")
+                    if created else "")
+    lines: list[str] = [f"# {name}", ""]
+    if created_str:
+        lines.append(f"*Created: {created_str}*  ")
+    if model:
+        lines.append(f"*Model: {model}*  ")
+    lines.append(f"*Messages: {len(messages)}*")
+    lines.append("")
+    for m in messages:
+        role = m.get("role")
+        text = (m.get("text") or "").strip()
+        if not text or role in ("tool_use", "tool_result"):
+            continue
+        if role == "user":
+            lines.append("---")
+            lines.append("")
+            lines.append("### 👤 User")
+        elif role == "assistant":
+            lines.append("### 🤖 Muse")
+        else:
+            lines.append(f"### {role}")
+        lines.append("")
+        lines.append(text)
+        lines.append("")
+
+    body = "\n".join(lines)
+    # Filenames in Content-Disposition can't safely include CJK / spaces in all
+    # browsers; fall back to a slug. RFC 5987 filename*=UTF-8 covers Unicode for
+    # modern browsers; the bare filename is an ASCII fallback for older ones.
+    safe_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "session"
+    safe_slug = safe_slug[:60]
+    encoded = urllib.parse.quote(name, safe="")
+    headers = {
+        "Content-Disposition":
+            f'attachment; filename="{safe_slug}.md"; '
+            f"filename*=UTF-8''{encoded}.md",
+    }
+    return Response(content=body, media_type="text/markdown; charset=utf-8",
+                    headers=headers)
 
 
 @router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])

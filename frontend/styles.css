@@ -1294,6 +1294,16 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   z-index: 1;
 }
 .session-picker-search:focus { background: var(--c-bg-1); box-shadow: inset 0 -2px 0 var(--c-accent); }
+/* Group label — sticky underneath the search bar so users can see the
+   bucket as they scroll a long list. */
+.session-picker-group + .session-picker-group { margin-top: 6px; }
+.session-picker-group-label {
+  padding: 6px 12px 4px;
+  font-size: 11px; font-weight: 600;
+  color: var(--c-fg-4); text-transform: uppercase; letter-spacing: 0.5px;
+  background: var(--c-bg-1);
+  border-bottom: 1px solid var(--c-border);
+}
 /* Pin button — pinned rows show active accent color; pinned rows also get
    a subtle background nudge so they're recognizable at a glance. */
 .session-picker-pin {

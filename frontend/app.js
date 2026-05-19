@@ -2138,6 +2138,39 @@ function portal() {
         || (s.first_prompt && s.first_prompt.toLowerCase().includes(q))
       );
     },
+    // Bucket the filtered list into Pinned / Today / This week / Earlier
+    // for a cleaner picker once a few dozen sessions accumulate. Pinned
+    // always floats to the top; the other three are based on updated_at
+    // (epoch seconds — same source as the existing sort).
+    groupedFilteredSessions() {
+      const items = this.filteredSessions();
+      if (!items.length) return [];
+      const now = new Date();
+      const startOfToday = new Date(now.getFullYear(), now.getMonth(),
+                                     now.getDate()).getTime() / 1000;
+      // Monday as week start. getDay() returns 0 for Sunday → shift to (day+6)%7
+      const dayIdx = (now.getDay() + 6) % 7;
+      const startOfWeek = startOfToday - dayIdx * 86400;
+      const pinned = [], today = [], week = [], earlier = [];
+      for (const s of items) {
+        if (s.pinned) { pinned.push(s); continue; }
+        const t = s.updated_at || s.created_at || 0;
+        if (t >= startOfToday) today.push(s);
+        else if (t >= startOfWeek) week.push(s);
+        else earlier.push(s);
+      }
+      const zh = this.lang === "zh";
+      const groups = [];
+      if (pinned.length) groups.push({ key: "pinned",
+        label: zh ? "置顶" : "Pinned", items: pinned });
+      if (today.length) groups.push({ key: "today",
+        label: zh ? "今天" : "Today", items: today });
+      if (week.length) groups.push({ key: "week",
+        label: zh ? "本周" : "This week", items: week });
+      if (earlier.length) groups.push({ key: "earlier",
+        label: zh ? "更早" : "Earlier", items: earlier });
+      return groups;
+    },
     toggleHistoryPicker(ev) {
       if (this.sessionPickerOpen) { this.sessionPickerOpen = false; return; }
       const btn = ev && ev.currentTarget;
@@ -2221,6 +2254,23 @@ function portal() {
       finally { this.currentId = orig; }
     },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
+    menuExportMarkdown(id) {
+      this.closeTabMenu();
+      if (!id) return;
+      // Use a transient anchor so the browser opens the streaming Response
+      // as a file download. Token goes in the query string because anchor
+      // requests can't carry custom headers.
+      const url = `/api/chat/sessions/${id}/export?token=`
+                  + encodeURIComponent(this.token);
+      const a = document.createElement("a");
+      a.href = url; a.style.display = "none";
+      // download attribute lets the server's Content-Disposition take
+      // precedence but still hints to the browser this isn't navigation.
+      a.setAttribute("download", "");
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 200);
+    },
     async menuDelete(id) {
       this.closeTabMenu();
       // Close side effects (ES / interval) on the dying tab BEFORE the
