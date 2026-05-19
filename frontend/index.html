@@ -1175,8 +1175,11 @@ window.addEventListener("error", e => {
              @dragleave="dragHover=false"
              @drop.prevent="dragHover=false; onAttachDrop($event)"
              :class="{ 'drag-hover': dragHover }">
+          <!-- No `accept` filter — lets the user pick any file from the OS
+               picker. The classifier (frontend + backend) decides what
+               actually gets inlined; unsupported types are rejected with
+               a clear toast instead of being hidden in the picker. -->
           <input type="file" x-ref="attachInput"
-                 accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/csv,application/json,text/x-python,text/x-yaml,text/x-toml,text/x-shellscript,text/javascript,text/typescript,text/html,text/css,text/xml,.md,.markdown,.txt,.csv,.json,.yaml,.yml,.toml,.py,.sh,.js,.ts,.tsx,.jsx,.html,.css,.xml,.log,.ini,.conf"
                  multiple style="display:none" @change="onAttachPicked($event)" />
           <!-- 包一个 noop form：iOS 17+ AutoFill 会用"页面上下文"决定要不要在
                键盘上方塞快译条；只要 textarea 没有 form 父元素 / form 里有

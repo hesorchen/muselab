@@ -1160,7 +1160,19 @@ _TEXT_EXTS = {
     ".env.example", ".rs", ".go", ".java", ".c", ".h", ".cpp", ".hpp",
     ".rb", ".php", ".swift", ".kt", ".sql", ".dockerfile", ".gitignore",
 }
+# Spreadsheets — we pre-process these to CSV-style text via openpyxl so
+# the model sees the data inline. Same "ends as `text` kind to the
+# frontend" contract — frontend's _classifyFile maps these to "text"
+# too so the chip is consistent.
+_XLSX_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 _TEXT_MAX_BYTES = 200 * 1024            # inline at most 200 KB as text
+# Caps for xlsx inlining — same shape as the /api/files/xlsx preview
+# endpoint, kept smaller because we're shoving this into the prompt
+# context, not just rendering a table.
+_XLSX_ATTACH_MAX_SHEETS = 5
+_XLSX_ATTACH_MAX_ROWS = 200
+_XLSX_ATTACH_MAX_COLS = 30
+_XLSX_ATTACH_CELL_MAX_CHARS = 200
 
 
 def _gc_images() -> None:
@@ -1172,7 +1184,7 @@ def _gc_images() -> None:
 
 
 def _classify_attachment(mime: str, name: str) -> str:
-    """Return one of: 'image' / 'pdf' / 'text' / '' (unsupported)."""
+    """Return one of: 'image' / 'pdf' / 'text' / 'xlsx' / '' (unsupported)."""
     mime = (mime or "").lower()
     if mime in _IMAGE_MIME:
         return "image"
@@ -1187,12 +1199,80 @@ def _classify_attachment(mime: str, name: str) -> str:
             return "text"
     if lower.endswith(".pdf"):
         return "pdf"
+    for ext in _XLSX_EXTS:
+        if lower.endswith(ext):
+            return "xlsx"
     return ""
+
+
+def _xlsx_to_text(body: bytes, name: str) -> str:
+    """Read xlsx bytes and dump each sheet as `[Sheet: name]\\n<csv>` blocks.
+    Capped by _XLSX_ATTACH_MAX_* so a 100k-row spreadsheet doesn't blow
+    the prompt. Truncation is signaled inline so the model knows."""
+    import openpyxl
+    from io import BytesIO
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(body), read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(
+            422, f"failed to parse xlsx '{name}': {type(e).__name__}: {e}",
+        )
+
+    parts: list[str] = [f"# Spreadsheet: {name}"]
+    sheets_total = len(wb.sheetnames)
+    sheets_truncated = sheets_total > _XLSX_ATTACH_MAX_SHEETS
+    try:
+        for sheet_name in wb.sheetnames[:_XLSX_ATTACH_MAX_SHEETS]:
+            ws = wb[sheet_name]
+            parts.append("")
+            parts.append(f"## Sheet: {sheet_name}")
+            rows_emitted = 0
+            cols_truncated = False
+            rows_truncated = False
+            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if r_idx >= _XLSX_ATTACH_MAX_ROWS:
+                    rows_truncated = True
+                    break
+                cells: list[str] = []
+                for c_idx, val in enumerate(row):
+                    if c_idx >= _XLSX_ATTACH_MAX_COLS:
+                        cols_truncated = True
+                        break
+                    if val is None:
+                        cells.append("")
+                    else:
+                        s = str(val)
+                        if len(s) > _XLSX_ATTACH_CELL_MAX_CHARS:
+                            s = s[:_XLSX_ATTACH_CELL_MAX_CHARS] + "…"
+                        # CSV-light: only quote/escape if a separator or
+                        # quote actually appears (cheap heuristic — the
+                        # model parses prose, not strict RFC 4180).
+                        if "," in s or '"' in s or "\n" in s:
+                            s = '"' + s.replace('"', '""') + '"'
+                        cells.append(s)
+                parts.append(",".join(cells))
+                rows_emitted += 1
+            if rows_truncated:
+                parts.append(f"… (rows truncated at {_XLSX_ATTACH_MAX_ROWS})")
+            if cols_truncated:
+                parts.append(f"… (cols truncated at {_XLSX_ATTACH_MAX_COLS})")
+            if rows_emitted == 0:
+                parts.append("(empty sheet)")
+    finally:
+        wb.close()
+
+    if sheets_truncated:
+        parts.append("")
+        parts.append(f"… (sheets truncated at {_XLSX_ATTACH_MAX_SHEETS} "
+                     f"of {sheets_total})")
+
+    return "\n".join(parts)
 
 
 @router.post("/upload-image", dependencies=[Depends(require_token)])
 async def upload_image(file: UploadFile = File(...)) -> dict:
-    """Legacy endpoint name; now handles images + PDF + text-ish docs."""
+    """Legacy endpoint name; now handles images + PDF + text-ish docs + xlsx."""
     _gc_images()
     mime = (file.content_type or "").lower()
     name = file.filename or "upload"
@@ -1201,32 +1281,47 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
         raise HTTPException(
             400,
             f"unsupported file type: {mime or 'unknown'} ({name}). "
-            f"Accepted: images (png/jpg/gif/webp), PDF, or text-based docs "
-            f"(md/txt/csv/json/yaml/source code).",
+            f"Accepted: images (png/jpg/gif/webp), PDF, text-based docs "
+            f"(md/txt/csv/json/yaml/source code), or Excel (xlsx/xlsm).",
         )
     body = await file.read()
-    if kind == "text" and len(body) > _TEXT_MAX_BYTES:
-        raise HTTPException(
-            413,
-            f"text file too large: {len(body)} bytes. Max {_TEXT_MAX_BYTES} "
-            f"(~200 KB). Trim it or convert to PDF.",
-        )
     if len(body) > _IMAGE_MAX_BYTES:
         raise HTTPException(413, f"file too large: {len(body)} bytes. "
                                   f"Max {_IMAGE_MAX_BYTES} bytes (~10MB)")
     aid = uuid.uuid4().hex
     entry: dict = {"kind": kind, "mime": mime, "name": name, "ts": time.time()}
     if kind == "text":
+        if len(body) > _TEXT_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"text file too large: {len(body)} bytes. Max "
+                f"{_TEXT_MAX_BYTES} (~200 KB). Trim it or send as PDF.",
+            )
         try:
             entry["text"] = body.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPException(400, "text file is not valid UTF-8 — "
                                       "convert to UTF-8 or send as PDF") from None
+    elif kind == "xlsx":
+        # Convert to text up front; downstream chat code only inlines
+        # entries whose kind is "text", so flip it before storing.
+        entry["text"] = _xlsx_to_text(body, name)
+        entry["kind"] = "text"
+        if len(entry["text"].encode("utf-8")) > _TEXT_MAX_BYTES * 2:
+            # Higher cap for converted spreadsheets — the per-cell + row
+            # ceilings already bound output size, this is just a hard
+            # safety rail. 400 KB ≈ 10k rows of 8 short cols.
+            raise HTTPException(
+                413,
+                f"spreadsheet too large after conversion. Reduce rows / "
+                f"cols and re-upload, or send a CSV of just the slice "
+                f"you need.",
+            )
     else:
         entry["b64"] = base64.b64encode(body).decode("ascii")
     _image_store[aid] = entry
     return {"id": aid, "mime": mime, "bytes": len(body),
-             "kind": kind, "name": name}
+             "kind": entry["kind"], "name": name}
 
 
 @router.get("/stream", dependencies=[Depends(require_token_query)])

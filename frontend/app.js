@@ -831,9 +831,20 @@ function portal() {
       const textExts = [".md", ".markdown", ".txt", ".csv", ".json", ".yaml",
                          ".yml", ".toml", ".py", ".sh", ".js", ".ts", ".tsx",
                          ".jsx", ".html", ".css", ".xml", ".log", ".ini",
-                         ".conf", ".cfg"];
+                         ".conf", ".cfg", ".rs", ".go", ".java", ".c", ".h",
+                         ".cpp", ".hpp", ".rb", ".php", ".swift", ".kt",
+                         ".sql"];
       if (textExts.some(ext => name.endsWith(ext))) return "text";
-      return "unknown";
+      // Spreadsheets — backend converts them to CSV-style text via
+      // openpyxl. Use "text" kind for the chip since that's what they
+      // become downstream; the backend echoes the same.
+      const xlsxExts = [".xlsx", ".xlsm", ".xltx", ".xltm"];
+      if (xlsxExts.some(ext => name.endsWith(ext))) return "text";
+      // Anything else: still try to upload — the backend has the final say
+      // and will reject with a clear error if it can't be handled. Better
+      // UX than silently filtering files out client-side and confusing the
+      // user (the "I uploaded but nothing happened" bug).
+      return "text";
     },
     async _attachFile(file) {
       if (file.size > 10 * 1024 * 1024) {
