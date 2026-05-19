@@ -82,6 +82,11 @@ function portal() {
 
     // ===== chat =====
     sessions: [], currentId: "",
+    // True while loadSession(currentId) is in flight. UI uses this to swap
+    // the brand-empty placeholder for a shimmer skeleton, so users don't
+    // see "Muse · Calliope / empty chat" for the second a big session
+    // takes to fetch.
+    messagesLoading: false,
     // Tab strip — VS Code-Claude style. `openTabIds` is the visible order; each
     // entry is a session id (also present in `sessions`). currentId is the
     // active tab. Tabs can be opened from the session picker, closed via × on
@@ -2159,29 +2164,38 @@ function portal() {
     async loadSession(sid) {
       if (!sid) return;
       const st = this._ensureTabState(sid);
-      const r = await fetch("/api/chat/sessions/" + sid, { headers: this.hdr() });
-      if (!r.ok) {
+      // Skeleton on the active tab during the fetch — markdown rendering of
+      // a long history can also take a noticeable beat after the network
+      // returns, so the flag must wrap both phases.
+      const isCurrent = sid === this.currentId;
+      if (isCurrent) this.messagesLoading = true;
+      try {
+        const r = await fetch("/api/chat/sessions/" + sid, { headers: this.hdr() });
+        if (!r.ok) {
+          st.messages.length = 0;
+          if (isCurrent) this.messages = st.messages;
+          return;
+        }
+        const s = await r.json();
+        const next = (s.messages || []).map((m, i) => {
+          const out = { ...m, _k: sid + "-" + i };
+          if (m.role === "assistant" && m.text) out.html = this.mdRender(m.text);
+          return out;
+        });
+        // Mutate in place — preserves the Array reference Alpine is watching.
         st.messages.length = 0;
-        if (sid === this.currentId) this.messages = st.messages;
-        return;
+        st.messages.push(...next);
+        if (isCurrent) {
+          this.messages = st.messages;
+          if (s.model) this.model = s.model;
+          this.atBottom = true;
+          this.scrollToBottom(true);
+          this.$nextTick(() => this.highlightCode(".chat-body"));
+        }
+        await this._fetchTabUsage(sid);
+      } finally {
+        if (isCurrent) this.messagesLoading = false;
       }
-      const s = await r.json();
-      const next = (s.messages || []).map((m, i) => {
-        const out = { ...m, _k: sid + "-" + i };
-        if (m.role === "assistant" && m.text) out.html = this.mdRender(m.text);
-        return out;
-      });
-      // Mutate in place — preserves the Array reference Alpine is watching.
-      st.messages.length = 0;
-      st.messages.push(...next);
-      if (sid === this.currentId) {
-        this.messages = st.messages;
-        if (s.model) this.model = s.model;
-        this.atBottom = true;
-        this.scrollToBottom(true);
-        this.$nextTick(() => this.highlightCode(".chat-body"));
-      }
-      await this._fetchTabUsage(sid);
     },
     async renameSession() {
       const cur = this.sessions.find(x => x.id === this.currentId);

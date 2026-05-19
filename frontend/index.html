@@ -297,6 +297,20 @@ window.addEventListener("error", e => {
             </span>
             <span class="icon"><svg><use :href="iconRef(n)"/></svg></span>
             <span class="name" x-text="n.name" :title="n.name"></span>
+            <!-- VSCode-style inline actions on directory rows. Hidden by
+                 default; revealed on hover (desktop) or always faded
+                 (touch — no hover). @click.stop so the action doesn't
+                 also collapse/expand the row. -->
+            <span class="tree-actions" x-show="n.is_dir">
+              <button class="tree-action" type="button"
+                      @click.stop="doNewFile(n)"
+                      :title="lang==='zh' ? '在此目录新建文件' : 'New file here'"
+                      aria-label="New file">+</button>
+              <button class="tree-action" type="button"
+                      @click.stop="openCtxMenu($event, n)"
+                      :title="lang==='zh' ? '更多操作（重命名 / 删除 / 上传 / 新建目录…）' : 'More (rename / delete / upload / new folder…)'"
+                      aria-label="More">⋯</button>
+            </span>
             <span class="size" x-show="!n.is_dir" x-text="fmtSize(n.size)"></span>
           </li>
         </template>
@@ -752,7 +766,22 @@ window.addEventListener("error", e => {
 
       <div class="chat-scroll-wrap">
         <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @click="onChatClick($event)">
-          <div x-show="!messages.length" class="brand-empty chat-empty">
+          <!-- Shimmer skeleton while loadSession is in-flight. Without
+               this, switching to a long-history session briefly shows the
+               brand-empty onboarding cards as if it were a new session. -->
+          <div x-show="messagesLoading && !messages.length" class="chat-skeleton" aria-hidden="true">
+            <template x-for="i in 3" :key="i">
+              <div class="chat-skeleton-msg">
+                <div class="chat-skeleton-avatar"></div>
+                <div class="chat-skeleton-bubble">
+                  <div class="chat-skeleton-line"></div>
+                  <div class="chat-skeleton-line"></div>
+                  <div class="chat-skeleton-line"></div>
+                </div>
+              </div>
+            </template>
+          </div>
+          <div x-show="!messages.length && !messagesLoading" class="brand-empty chat-empty">
             <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
               <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
             </span>
