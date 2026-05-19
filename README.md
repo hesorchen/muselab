@@ -47,8 +47,11 @@ boring tech you can fully see beats clever tech you can't.
 - 💸 Reuse your `$20–100/mo` Pro / Max subscription via OAuth — zero per-token bill
 - 🌏 Or bring **DeepSeek / GLM / MiniMax** keys — same SDK loop, no proxy needed
 - 🗂 **VS Code–style multi-tab chat**: hop between sessions without losing in-flight streams; double-click a tab name to rename inline; right-click (or ⋮ on mobile) for the full menu
+- 📱 **Add-to-home-screen PWA** — one codebase serves iOS / Android / desktop; no App Store, no $99/yr Apple cert, standalone mode + theme-color status bar
 - 🚀 One installer per OS (Linux / macOS / Windows) or `docker run` from GHCR
 - ⚡ ~8 k lines · 152 tests · runs on a 1 GB VPS
+
+<!-- HERO_GIF_PLACEHOLDER — record a 20–30s screencast (chat + file preview + model switch), convert to gif/webp ≤2 MB, drop into docs/assets/ and replace this comment with: ![](docs/assets/hero.gif) -->
 
 > 📸 *Demo gif: coming soon. In the meantime, scroll to [Architecture](#under-the-hood) for a mermaid diagram of the data flow, or jump straight to [Quick start](#quick-start) — 3 commands to running locally.*
 
@@ -59,6 +62,7 @@ boring tech you can fully see beats clever tech you can't.
 - [Is this for me?](#is-this-for-me)
 - [Quick start](#quick-start) — 3 commands
 - [Use any model](#use-any-model) — provider matrix
+- [Mobile (PWA)](#mobile-pwa) — add to home screen, standalone
 - [How it compares](#how-it-compares) — vs claude-code-ui, LobeChat, AnythingLLM, others
 - [A day with muselab](#a-day-with-muselab) — concrete examples
 - [Under the hood](#under-the-hood) — architecture
@@ -244,6 +248,30 @@ session with the new model (avoids cross-vendor thinking-signature drift).
 
 ---
 
+## Mobile (PWA)
+
+muselab ships a Web App Manifest + apple-touch-icon, so once you've
+deployed it to your own server you can add it to your phone's home screen
+and launch like a native app:
+
+- **One codebase** serves iOS / Android / desktop — no `.ipa` / `.apk` builds, no App Store review
+- **Standalone mode**: no browser address bar / tab bar — full-screen app shell
+- **Theme-color aware**: iOS status bar follows your light/dark preference
+- **Touch-tuned**: inputs ≥ 16 px (defeats iOS auto-zoom), pull-to-refresh disabled, on-screen-keyboard pushes chat to follow
+
+How to install on iPhone (Chrome): ⋮ menu → **Share** → **Add to Home Screen** → Add.
+On Android Chrome the address bar shows an "Install" prompt directly.
+
+> The self-host angle matters here: your phone talks straight to *your*
+> server, with no Apple/Google signed binary, no third-party
+> distribution channel in the chain. The whole point of self-hosting
+> isn't violated by the install path.
+
+**Not yet implemented** (roadmapped): Web Push notifications for long-running
+agent runs, Service Worker for offline UI cache. Track in [TODO.md](TODO.md).
+
+---
+
 ## How it compares
 
 |  | muselab | claudecodeui | LobeChat | AnythingLLM | Claude Code CLI |
@@ -379,13 +407,13 @@ The favicon follows along — your browser tab quietly carries today's muse.
 
 | Muse | Domain | Geometric form |
 |---|---|---|
-| Calliope | Epic poetry | Hex |
-| Clio | History | Stacked bars |
+| Calliope | Epic poetry | Hexagon |
+| Clio | History | Stacked horizontal bars (scroll layers) |
 | Erato | Love poetry | Vesica piscis (lens) |
 | Euterpe | Music | Sine wave |
 | Melpomene | Tragedy | Crescent |
-| Polyhymnia | Sacred hymns | Halo |
-| Terpsichore | Dance | Trio of dots |
+| Polyhymnia | Sacred hymns | Halo ring |
+| Terpsichore | Dance | Three dots (triangular) |
 | Thalia | Comedy | Spark |
 | Urania | Astronomy | Orbit |
 
