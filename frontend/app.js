@@ -4764,17 +4764,88 @@ function portal() {
       } catch {}
     },
     async onPushToggle(ev) {
-      // Real wiring (service worker registration + VAPID subscribe /
-      // unsubscribe) lands in the Web Push commit. For now the toggle
-      // bounces back to off and flashes a notice — keeps the row in
-      // the UI so we don't have to rebuild the section later.
-      if (ev?.target) ev.target.checked = false;
-      this.notifyPrefs.push = false;
+      const wantOn = ev?.target?.checked ?? this.notifyPrefs.push;
+      if (wantOn) {
+        const ok = await this.pushSubscribe();
+        this.notifyPrefs.push = ok;
+        if (ev?.target) ev.target.checked = ok;
+      } else {
+        await this.pushUnsubscribe();
+        this.notifyPrefs.push = false;
+      }
       this.saveNotifyPrefs();
-      this.toast(this.lang === "zh"
-        ? "推送通知即将上线（VAPID / Service Worker 接通中）"
-        : "Push notifications coming soon (VAPID / SW pipeline in progress)",
-        "info", 3000);
+    },
+    async pushSubscribe() {
+      // Browser feature checks upfront so we can give a clearer error
+      // than "TypeError: Cannot read property 'subscribe' of undefined".
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+        this.toast(this.lang === "zh"
+          ? "此浏览器不支持 Web Push" : "This browser doesn't support Web Push",
+          "warn", 3500);
+        return false;
+      }
+      try {
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") {
+          this.toast(this.lang === "zh"
+            ? "未授权通知 — 在浏览器设置里允许后重试"
+            : "Notification permission denied", "warn", 4000);
+          return false;
+        }
+        // Make sure the SW is installed + activated before we touch
+        // pushManager — pushManager.subscribe on an installing worker
+        // throws on Firefox.
+        const reg = await navigator.serviceWorker.register("/sw.js");
+        await navigator.serviceWorker.ready;
+        // Public key arrives as urlsafe-b64. PushManager wants raw bytes.
+        const r = await fetch("/api/push/vapid-public", { headers: this.hdr() });
+        if (!r.ok) throw new Error("vapid fetch failed: " + r.status);
+        const { public_key } = await r.json();
+        const sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: this._urlsafeB64ToBytes(public_key),
+        });
+        const sr = await fetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(sub.toJSON()),
+        });
+        if (!sr.ok) throw new Error("subscribe POST failed: " + sr.status);
+        this.toast(this.lang === "zh"
+          ? "已开启推送通知" : "Push notifications enabled",
+          "success", 2500);
+        return true;
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "开启失败：" : "Push subscribe failed: ")
+          + (e.message || e), "error", 5000);
+        return false;
+      }
+    },
+    async pushUnsubscribe() {
+      try {
+        if (!("serviceWorker" in navigator)) return;
+        const reg = await navigator.serviceWorker.getRegistration("/sw.js");
+        if (!reg) return;
+        const sub = await reg.pushManager.getSubscription();
+        if (!sub) return;
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        await fetch("/api/push/unsubscribe", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint }),
+        });
+      } catch (e) {
+        // Silent — even if the cleanup fails, the local subscription is gone.
+      }
+    },
+    _urlsafeB64ToBytes(s) {
+      const pad = "=".repeat((4 - (s.length % 4)) % 4);
+      const b64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
+      const raw = atob(b64);
+      const buf = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+      return buf;
     },
     loadNotifyPrefs() {
       try {

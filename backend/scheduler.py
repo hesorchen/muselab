@@ -236,6 +236,19 @@ async def _execute_task(task: dict) -> None:
         if len(_state["history"]) > _HISTORY_CAP:
             _state["history"] = _state["history"][-_HISTORY_CAP:]
         _save_state()
+        # Fire Web Push to every subscribed device. Errors swallowed —
+        # push is best-effort, must never break the scheduler loop.
+        try:
+            from . import push as _push
+            title = task["name"]
+            if error:
+                body = f"Failed: {error[:120]}"
+            else:
+                body = (preview[:120] + "…") if len(preview) > 120 else preview
+            _push.send_to_all(title=title, body=body or "(no reply)",
+                              url="/", tag=f"task-{tid}")
+        except Exception as e:
+            sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 
 
 # ---------- daemon loop ----------

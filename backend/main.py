@@ -10,6 +10,7 @@ from .files import router as files_router
 from .chat import router as chat_router
 from .api_settings import router as settings_router
 from .api_scheduler import router as scheduler_router
+from .api_push import router as push_router
 from .settings import ROOT, PORT, HOST
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
@@ -40,14 +41,19 @@ app.include_router(files_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
 app.include_router(scheduler_router)
+app.include_router(push_router)
 
 
 @app.on_event("startup")
 async def _startup_scheduler() -> None:
     """Boot the in-process task scheduler so any persisted scheduled
     prompts start firing on their schedule. No-op when scheduler.json
-    is empty / missing — the daemon just idles."""
+    is empty / missing — the daemon just idles. Also eagerly init Web
+    Push (loads / generates VAPID) so the first frontend subscribe
+    request doesn't pay key-gen latency."""
     from . import scheduler as _sched
+    from . import push as _push
+    _push.init()
     await _sched.start_scheduler()
 
 
@@ -125,6 +131,21 @@ class _VersionedStaticFiles(StaticFiles):
 
 
 app.mount("/static", _VersionedStaticFiles(directory=FRONTEND), name="static")
+
+
+@app.get("/sw.js")
+def service_worker():
+    """Service Worker must be served from the same path it controls — if
+    we left it at /static/sw.js, the browser would scope it to /static/*
+    only and Web Push events for the main app (/) wouldn't fire. Serving
+    at /sw.js gives it whole-origin scope automatically."""
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        FRONTEND / "sw.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache",
+                 "Service-Worker-Allowed": "/"},
+    )
 
 
 @app.get("/api/meta")

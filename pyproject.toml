@@ -11,6 +11,10 @@ dependencies = [
     # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
     # native deps; safe to ship in the muselab Docker image.
     "openpyxl>=3.1.5",
+    # Web Push: VAPID-signed pushes to browsers / PWAs subscribed to
+    # /api/push/subscribe. Has a transitive cryptography dep but no
+    # external binaries.
+    "pywebpush>=2.0.0",
 ]
 
 [dependency-groups]
