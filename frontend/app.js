@@ -934,13 +934,26 @@ function portal() {
 
     mdRender(text) {
       if (!text) return "";
+      // Streaming-friendly preprocess: close any unclosed ``` or ~~~ fenced
+      // code blocks before handing to marked. Without this, while the model
+      // is mid-codeblock the parser sees `<lang>\n<content>` with no closer
+      // and either drops everything past the opening fence or returns an
+      // empty render — the user perceives this as "Muse stalled mid-reply,
+      // then dumped the rest on completion". Patches a *copy* fed to
+      // marked; the source `text` stays the truth. Both fence kinds covered;
+      // already-balanced text is untouched.
+      let parseInput = text;
+      const tripleCount = (text.match(/```/g) || []).length;
+      if (tripleCount % 2 === 1) parseInput += "\n```";
+      const tildeCount = (text.match(/~~~/g) || []).length;
+      if (tildeCount % 2 === 1) parseInput += "\n~~~";
       // marked occasionally throws on partial markdown mid-stream (unclosed
       // fenced block, half-typed table row, etc). Catch and fall through to
       // escaped raw text so the bubble keeps showing SOMETHING instead of
       // briefly clearing while the next chunk arrives.
       let raw;
       try {
-        raw = window.marked ? window.marked.parse(text) : text;
+        raw = window.marked ? window.marked.parse(parseInput) : parseInput;
       } catch (e) {
         raw = "<pre>" + this.escape(text) + "</pre>";
       }
