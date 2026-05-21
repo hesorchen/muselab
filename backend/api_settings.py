@@ -3,8 +3,12 @@ GET returns current values with keys masked. PUT atomically rewrites .env and
 refreshes os.environ so the changes take effect without restarting the server.
 """
 from __future__ import annotations
+import asyncio
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -13,7 +17,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import require_token
-from . import endpoints
 
 MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
@@ -63,6 +66,12 @@ class SettingsIn(BaseModel):
     # Params
     thinking_budget: int | None = None
     max_turns: int | None = None
+    # Push notification toggles — server-side decision on whether to
+    # send_to_all for each event class. notify_scheduled covers the
+    # scheduler.py daemon's task-done push; notify_normal covers
+    # chat.py's per-turn done push.
+    notify_scheduled: bool | None = None
+    notify_normal: bool | None = None
 
 
 def _write_env(updates: dict[str, str]) -> None:
@@ -104,8 +113,10 @@ def _write_env(updates: dict[str, str]) -> None:
             f.write("\n".join(out).rstrip("\n") + "\n")
         os.replace(tmp, ENV_PATH)
     except Exception:
-        try: os.unlink(tmp)
-        except OSError: pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         raise
 
     # Refresh in-process env so the change takes effect immediately.
@@ -137,6 +148,8 @@ def get_settings() -> dict:
         "params": {
             "thinking_budget": int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000")),
             "max_turns": int(os.environ.get("MUSELAB_MAX_TURNS", "0")),
+            "notify_scheduled": (os.environ.get("MUSELAB_NOTIFY_SCHEDULED", "true").lower() != "false"),
+            "notify_normal":    (os.environ.get("MUSELAB_NOTIFY_NORMAL",    "true").lower() != "false"),
         },
     }
 
@@ -171,6 +184,10 @@ def put_settings(req: SettingsIn) -> dict:
         updates["MUSELAB_THINKING_BUDGET"] = str(req.thinking_budget)
     if req.max_turns is not None:
         updates["MUSELAB_MAX_TURNS"] = str(req.max_turns)
+    if req.notify_scheduled is not None:
+        updates["MUSELAB_NOTIFY_SCHEDULED"] = "true" if req.notify_scheduled else "false"
+    if req.notify_normal is not None:
+        updates["MUSELAB_NOTIFY_NORMAL"] = "true" if req.notify_normal else "false"
 
     _write_env(updates)
     return {"ok": True, "updated": list(updates.keys())}
@@ -215,8 +232,10 @@ def _save_mcp(cfg: dict) -> None:
             f.write("\n")
         os.replace(tmp, MCP_CONFIG_PATH)
     except Exception:
-        try: os.unlink(tmp)
-        except OSError: pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         raise
 
 
@@ -429,11 +448,7 @@ def list_skills() -> dict:
 
 
 # ====== Upgrade / version check ======
-
-import asyncio
-import shutil
-import subprocess
-import sys
+# (asyncio / shutil / subprocess / sys imports hoisted to module top per E402)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _UPGRADE_LOCK = asyncio.Lock()        # serialize upgrades — never run two at once

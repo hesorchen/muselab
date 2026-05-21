@@ -1,5 +1,7 @@
 # Install muselab on Linux
 
+> [简体中文](install-linux_zh.md)
+
 One-shot installer for desktop / personal-server Linux. Runs as a **user-level
 systemd service** — no root, no system-wide config, easy to undo.
 

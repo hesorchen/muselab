@@ -1,6 +1,5 @@
 """Runtime settings API: GET masking, PUT writes .env + refreshes env."""
 import os
-from pathlib import Path
 
 
 def test_get_settings_shape(client, auth):

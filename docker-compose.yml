@@ -27,12 +27,24 @@ services:
       - ${CLAUDE_HOME:-${HOME}/.claude}:/home/muse/.claude
       # Persist chat sessions across container recreations.
       - ./sessions:/app/sessions
+    # Resource ceilings mirror the systemd unit (see
+    # ~/.config/systemd/user/muselab.service): both deployment paths get the
+    # same "long-running but bounded" envelope. SDK subprocess + token
+    # buffering + cache usually sits well under 1 GiB; 4 GiB is the hard
+    # OOM-kill ceiling that protects the host from a memory leak.
+    mem_limit: 4g
+    mem_reservation: 1g
+    # Cap process / thread count to prevent fork-bomb-style runaway from a
+    # misbehaving MCP server or skill.
+    pids_limit: 4096
     healthcheck:
+      # Use the dedicated /api/health endpoint — cheaper than rendering the
+      # full index.html on every probe (every 30s × 24h = 2880 renders/day).
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/', timeout=3).status==200 else 1)"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3).status==200 else 1)"
       interval: 30s
       timeout: 5s
       retries: 3

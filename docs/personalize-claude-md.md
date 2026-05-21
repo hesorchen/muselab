@@ -1,121 +1,136 @@
-# 把 CLAUDE.md 调成你自己的
+# Personalize CLAUDE.md
 
-Muse 是**一个**整体助理——同时理解你的身体、做的事、钱、关心的人、生活。
-它不会按话题切人格，而是一直用全部背景信息回答任何问题。
+> [简体中文](personalize-claude-md_zh.md)
 
-要做到这点，Muse 启动时会读你 archive 根目录下的 `CLAUDE.md`。这个文件
-是你给 Muse 的**自传式简介**。
+Muse is **one** assistant — it understands your body, what you do, your
+money, the people you care about, your life, all at once. It doesn't
+switch personas by topic; it always answers with the full background
+in view.
 
-**重要**：模板对所有人群中性——学生、上班族、自由职业者、全职父母、退休
-人士、创业者……都适用。不适合你的段落直接删掉，不必硬填。
+To make that work, Muse reads the `CLAUDE.md` at the root of your archive
+on every startup. This file is **your autobiographical brief** to Muse.
+
+**Important**: the template is neutral across life stages — students,
+employees, freelancers, full-time parents, retirees, founders — all fit.
+Delete sections that don't apply to you; don't force-fill.
 
 ---
 
-## 怎么生成这份文件
+## How to generate this file
 
-### 用安装脚本（推荐）
+### Use the installer (recommended)
 
-`scripts/install-{linux,macos,windows}` 第一次跑会问你要不要：
+The first run of `scripts/install-{linux,macos,windows}` asks whether you
+want it to:
 
-1. 在 archive 下建好 6 个子目录（`health/` `work/` `money/` `people/`
-   `notes/` `archives/`），每个带 README 说明
-2. 做 7 个开放式 intake 问题：
-   - 怎么称呼你
-   - 出生年份（或年龄段）
-   - 现住地
-   - 一周大部分时间在做什么（学习 / 工作 / 自由职业 / 照护 / 退休 ……）
-   - 一句话当前人生阶段
-   - 今年主目标
-   - 当前最关心的健康问题
-3. 把答案直接 patch 进 CLAUDE.md 对应字段
-4. 提示你接下来该把哪些原件丢进哪个目录
+1. Create 6 sub-directories under your archive (`health/` `work/` `money/`
+   `people/` `notes/` `archives/`), each with its own README
+2. Ask 7 open-ended intake questions:
+   - How to call you
+   - Birth year (or age range)
+   - Current city
+   - What you do most of the week (study / work / freelance / care / retired / …)
+   - One sentence about your current life stage
+   - Main goal this year
+   - Health concern you're most focused on right now
+3. Patch the answers into the corresponding fields in CLAUDE.md
+4. Tell you which originals to drop into which directory next
 
-跳过 intake 也行，所有问题按 Enter 跳过即可。
+Skipping intake is fine — just press Enter on every question.
 
-### 手动建
+### Manual
 
 ```bash
 cp scripts/templates/default-CLAUDE.md ~/muselab-archive/CLAUDE.md
 sed -i "s/%DATE%/$(date +%Y-%m-%d)/" ~/muselab-archive/CLAUDE.md
-# 子目录骨架
+# subdirectory skeleton
 cp -r scripts/templates/archive-skeleton/* ~/muselab-archive/
 ```
 
 ---
 
-## 模板的 9 个 section
+## The 9 sections of the template
 
-| Section | 写什么 |
-|---------|--------|
-| **1. 我是谁** | 称呼 / 年龄 / 城市 / 语言 / 同住情况 |
-| **2. 我现在主要在干嘛** | 一句话人生阶段 + 按身份选填的状态（学生 / 在职 / 自雇 / 照护 / 退休 / ……） |
-| **3. 钱** | 收入来源 / 量级 / 主要关注（不分阶段） |
-| **4. 身体** | 大致情况 / 体检 / 用药 / 关注点 |
-| **5. 我关心的人** | 不只是家人——伴侣 / 父母 / 朋友 / 任何重要的人 |
-| **6. 心里在想什么** | 当下烦恼 / 在做的事 / 想做没做的事 |
-| **7. 档案里都有什么** | 6 个子目录索引 + 当前已有的关键材料 |
-| **8. Muse 怎么协作** | 行为约定（中性，所有人都适用） |
-| **9. 我自己要维护的** | 生活变化时该更新哪段 |
-
----
-
-## 子目录骨架（6 个，所有人都通用）
-
-| 目录 | 适合放 | 学生 | 在职 | 自由职业 | 全职父母 | 退休 |
-|------|--------|------|------|---------|---------|------|
-| `health/` | 身体相关 | 入学体检 | 年度体检 | 同左 | 自己+孩子 | 慢病管理 |
-| `work/` | 你在做的事 | 论文/申研材料 | 简历/项目 | 作品集/客户 | 育儿记录 | 当前活动 |
-| `money/` | 钱 | 月度预算 | 收支/储蓄 | 报税/应急金 | 家庭预算 | 现金流 |
-| `people/` | 关心的人 | 父母/朋友 | 伴侣/同事/父母 | 同左 | 配偶/孩子/双方父母 | 老伴/子女/老友 |
-| `notes/` | 杂项 | 通用 | 通用 | 通用 | 通用 | 通用 |
-| `archives/` | 原件归档 | 通用 | 通用 | 通用 | 通用 | 通用 |
-
-每个目录都带自己的 `README.md`，里面有按你的阶段细化的建议。
+| Section | What to put |
+|---------|-------------|
+| **1. Who I am** | Name / age / city / language / household |
+| **2. What I do most of the week** | One-line life stage + status by role (student / employed / self-employed / caregiving / retired / …) |
+| **3. Money** | Income source / scale / main concerns (no stage gating) |
+| **4. Body** | General health / checkups / medications / concerns |
+| **5. People I care about** | Not just family — partner / parents / friends / anyone important |
+| **6. What's on my mind** | Current worries / things you're doing / things you want to do |
+| **7. What's in the archive** | Index of the 6 sub-directories + current key materials |
+| **8. How Muse collaborates with me** | Behavioral promises (neutral; apply to everyone) |
+| **9. What I maintain myself** | Which section to update when life changes |
 
 ---
 
-## 关键设计原则
+## Subdirectory skeleton (6, all general-purpose)
 
-### Muse 是一个 assistant，不是多个 persona
+| Directory | What it holds | Student | Employed | Freelance | Full-time parent | Retired |
+|-----------|---------------|---------|----------|-----------|------------------|---------|
+| `health/` | Body-related | School physical | Annual checkup | same | Self + kids | Chronic-disease mgmt |
+| `work/` | What you do | Papers / grad-school apps | Resume / projects | Portfolio / clients | Childcare logs | Current activities |
+| `money/` | Money | Monthly budget | Income & savings | Tax / emergency fund | Household budget | Cash flow |
+| `people/` | People you care about | Parents / friends | Partner / coworkers / parents | same | Spouse / kids / in-laws | Spouse / kids / old friends |
+| `notes/` | Miscellaneous | general | general | general | general | general |
+| `archives/` | Original files | general | general | general | general | general |
 
-跨领域决策才是 Muse 的核心价值。例：**父母刚做完心脏支架 + 你今年现金流 +
-你这几年要不要换工作 → 该不该给父母升级香港医保**？persona 模型把这切成
-3 个独立专家给 3 套不互通的建议；统一 assistant 才能给"贴你"的连贯方案。
-
-### 模板中性
-
-所有的措辞、目录名、intake 问题都不预设你是哪类人群：
-
-- 用 `work/` 而不是 `career/`（学生 / 退休都能用）
-- 用 `money/` 而不是 `investment/`（涵盖预算 / 学贷 / 退休金 / FIRE）
-- 用 `people/` 而不是 `family/`（独居 / 单身 / 朋友圈也算）
-- intake 问"一周大部分时间在做什么"而不是"你的工作是什么"
-
-### 行为约定是 Muse 的承诺，不是用户的义务
-
-§8 里的"涉及健康 / 涉及钱 / 涉及学业工作"规则是**Muse 怎么回答**的承诺
-（如：涉及健康必引指南、不下诊断），不是要求你每段都填健康投资工作。
+Each directory ships with its own `README.md` containing stage-specific
+suggestions.
 
 ---
 
-## 维护节奏
+## Key design principles
 
-| 触发 | 改哪里 |
-|------|--------|
-| 体检后 | §4，PDF 放 `health/` |
-| 学业 / 工作 / 业务变化 | §2 |
-| 大额财务变化 | §3，记录放 `money/` |
-| 关心的人有重大变化 | §5 |
-| 任何时刻 | 半年回头扫一遍，把不再 true 的删掉 |
+### Muse is one assistant, not multiple personas
+
+Cross-domain decisions are where Muse earns its keep. Example:
+**parent just had a cardiac stent + your cash flow this year + whether
+you'll change jobs in the next few years → should you upgrade your
+parent's Hong Kong health insurance?** A persona model splits this into 3
+separate experts giving 3 disconnected pieces of advice; one assistant
+can give a single coherent answer that actually fits you.
+
+### Template is neutral
+
+All phrasing, directory names, and intake questions avoid presupposing
+your life stage:
+
+- `work/`, not `career/` (works for students and retirees)
+- `money/`, not `investment/` (covers budgets, student loans, pensions, FIRE)
+- `people/`, not `family/` (also fits solo / unmarried / friend-only circles)
+- "What you do most of the week", not "What's your job?"
+
+### Behavioral promises are Muse's, not yours
+
+The "health-related / money-related / study-or-work-related" rules in
+§8 are promises about **how Muse answers** (e.g. cite the guideline for
+health, don't diagnose), not requirements that you fill in every section.
 
 ---
 
-## 隐私 / 安全
+## Maintenance cadence
 
-- 强烈建议给 muselab archive 启用文件系统加密（macOS FileVault / Linux LUKS /
-  Windows BitLocker）
-- **不要**把 archive sync 到 OneDrive / Google Drive / Dropbox 等公共云
-- 涉及他人的信息可以脱敏（"父亲" / "M" 代替名字）
-- 密码 / 身份证号 / 银行账号请放专门的密码管理器，**不**写进 archive
-- 远程备份用 [restic](https://restic.net) 或 [borg](https://borgbackup.org) +
-  端到端加密
+| Trigger | What to update |
+|---------|----------------|
+| After a checkup | §4; PDF into `health/` |
+| Study / job / business change | §2 |
+| Major financial change | §3; record into `money/` |
+| Major change in someone you care about | §5 |
+| Anytime | Half-yearly sweep — delete anything no longer true |
+
+---
+
+## Privacy / security
+
+- Strongly recommend filesystem encryption on your muselab archive
+  (macOS FileVault / Linux LUKS / Windows BitLocker)
+- **Do not** sync the archive to OneDrive / Google Drive / Dropbox or
+  similar public clouds
+- Information about other people can be redacted ("father" / "M" instead
+  of real names)
+- Passwords / national-ID / bank accounts belong in a dedicated password
+  manager, **not** in the archive
+- For remote backup, use [restic](https://restic.net) or
+  [borg](https://borgbackup.org) with end-to-end encryption

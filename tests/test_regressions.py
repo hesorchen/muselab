@@ -3,9 +3,7 @@ guards against a real bug that shipped during muselab's 2026-05-17 debugging
 sprint. Keep them passing — if you add new file I/O, encoding handling, or
 provider gating, the bug class will be re-caught here, not in production."""
 from __future__ import annotations
-from pathlib import Path
 
-import pytest
 
 
 # ============================================================================
@@ -22,7 +20,8 @@ def test_session_persist_handles_emoji_and_cjk(client, auth):
                      headers={**auth, "Content-Type": "application/json"},
                      json={"name": "emoji test 😄", "model": "deepseek-v4-flash"})
     assert r.status_code == 200, r.text
-    sid = r.json()["id"]
+    # sid extracted not needed — round-trip check below uses the listing
+    # endpoint to verify emoji survived the on-disk round-trip.
 
     # Round-trip the session name (contains emoji)
     r = client.get("/api/chat/sessions", headers=auth)
@@ -189,3 +188,97 @@ def test_context_breakdown_returns_409_for_session_without_client(client, auth):
 # was deleted in the 2026-05-17 refactor. CLI's native /compact writes
 # isCompactSummary into the JSONL; SDK get_session_messages returns it as a
 # normal message, so no muselab-side marker is needed.
+
+
+# ============================================================================
+# Bug 6: in-flight turn persistence — sidecars must survive process restart
+# so an OOM-kill mid-stream doesn't silently lose the user's prompt
+# ============================================================================
+
+def test_interrupted_turns_endpoint_empty_on_clean_boot(client, auth):
+    """Fresh test fixture has no active_turns/ sidecars. Endpoint must
+    return an empty list, not 404 / not 500 / not omit the `turns` key
+    — the frontend's _checkInterruptedTurns() reads `data.turns` and
+    expects an Array."""
+    r = client.get("/api/chat/interrupted-turns", headers=auth)
+    assert r.status_code == 200
+    body = r.json()
+    assert "turns" in body and body["turns"] == []
+
+
+def test_interrupted_turn_sidecar_round_trip(app_module, client, auth, tmp_path):
+    """Write a fake sidecar (simulating a previous-process crash mid-turn),
+    re-scan, hit the endpoint, dismiss, verify cleanup.
+
+    Why this matters: the recovery flow's whole point is "you had N
+    unfinished turns last session, here they are." A regression that
+    silently dropped sidecars would break the contract without breaking
+    any other test."""
+    import json
+    import time
+    from backend import chat as chat_mod
+
+    # Drop a fake sidecar (mimics what _write_active_turn_sidecar does
+    # on turn start, then a process death before _delete... could fire).
+    fake_sid = "TEST-CRASHED-TURN-001"
+    sidecar_path = chat_mod._active_turn_path(fake_sid)
+    sidecar_path.write_text(json.dumps({
+        "sid": fake_sid,
+        "user_text": "review this PR for security risks",
+        "user_text_preview": "review this PR for security risks",
+        "model": "claude-sonnet-4-6",
+        "started_at": time.time() - 120,
+    }), encoding="utf-8")
+
+    # The startup scan already happened at import time, so we patch in
+    # the new entry as if the scan caught it. (In real life this only
+    # happens at process boot — testing that path separately would
+    # require a full subprocess restart.)
+    chat_mod._interrupted_at_startup[fake_sid] = json.loads(
+        sidecar_path.read_text(encoding="utf-8"))
+
+    # Endpoint surfaces the entry.
+    r = client.get("/api/chat/interrupted-turns", headers=auth)
+    assert r.status_code == 200
+    sids = [t["sid"] for t in r.json()["turns"]]
+    assert fake_sid in sids
+    # Preview must carry through (the toast shows it).
+    entry = next(t for t in r.json()["turns"] if t["sid"] == fake_sid)
+    assert "security risks" in entry["preview"]
+
+    # Dismiss removes both in-memory state AND the on-disk sidecar.
+    r = client.post(f"/api/chat/interrupted-turns/{fake_sid}/dismiss",
+                     headers=auth)
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert not sidecar_path.exists(), "dismiss didn't delete the sidecar"
+
+    # Subsequent list call returns empty for this sid.
+    r = client.get("/api/chat/interrupted-turns", headers=auth)
+    assert fake_sid not in [t["sid"] for t in r.json()["turns"]]
+
+
+# ============================================================================
+# Bug 7: default response security headers — token-in-query-string mitigation
+# ============================================================================
+
+def test_security_headers_present_on_every_response(client, auth):
+    """Auth token rides in query strings for SSE / file download endpoints
+    (see auth.py docstring). Without `Referrer-Policy: same-origin`, a
+    user clicking a link out to github.com would leak the URL — token
+    included — in the Referer header. Lock the three headers we set."""
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.headers.get("X-Content-Type-Options") == "nosniff"
+    assert r.headers.get("Referrer-Policy") == "same-origin"
+    assert r.headers.get("X-Frame-Options") == "SAMEORIGIN"
+
+
+def test_robots_txt_disallows_all(client):
+    """Defense-in-depth for accidental public exposure. If a user
+    misconfigures their reverse proxy or Cloudflare tunnel, at least
+    search engines won't index the archive contents."""
+    r = client.get("/robots.txt")
+    assert r.status_code == 200
+    body = r.text
+    assert "User-agent: *" in body
+    assert "Disallow: /" in body

@@ -1,5 +1,7 @@
 # Install muselab on Windows
 
+> [简体中文](install-windows_zh.md)
+
 One-shot installer for personal Windows machines. Uses **Task Scheduler** to
 autostart on user logon. Runs entirely in user space — no service account, no
 admin needed.

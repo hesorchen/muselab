@@ -1,5 +1,4 @@
 """Third-party provider catalog: prefix→endpoint+key dispatch."""
-import importlib
 import sys
 
 import pytest
@@ -124,7 +123,7 @@ def test_all_catalog_providers_have_valid_fields(monkeypatch):
     for p in ep.CATALOG:
         assert p.prefix.endswith("-"), f"prefix should end with '-': {p.prefix}"
         assert p.base_url.startswith("https://"), f"base_url should be https: {p.base_url}"
-        assert "anthropic" in p.base_url, f"base_url should hit /anthropic endpoint"
+        assert "anthropic" in p.base_url, "base_url should hit /anthropic endpoint"
         assert p.env_key.endswith("_API_KEY"), f"env_key convention: {p.env_key}"
         assert len(p.models) > 0, f"provider {p.prefix} has no models listed"
         for mid, label in p.models:

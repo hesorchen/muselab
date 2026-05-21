@@ -3,6 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover" />
+<!-- noindex defense: muselab is a personal archive. If a user accidentally
+     exposes their instance (Cloudflare tunnel, port-forward, misconfigured
+     reverse proxy), search engines should not slurp it up. Belt + suspenders
+     with /robots.txt served from main.py. -->
+<meta name="robots" content="noindex, nofollow, noarchive" />
 <title>muselab — Meet Muse</title>
 
 <!-- PWA: manifest + icons + iOS standalone behavior. Added so "Add to
@@ -84,8 +89,20 @@
     </svg>
   </span>
   <div class="splash-logo">muse<span class="accent">·lab</span></div>
-  <div class="splash-text">正在唤醒 Muse</div>
+  <div class="splash-text" id="splash-text">正在唤醒 Muse</div>
 </div>
+<script>
+  // Localize the pre-Alpine splash based on browser language so a
+  // non-Chinese first-time visitor doesn't see a Chinese-only "正在唤
+  // 醒 Muse" before Alpine boots.
+  (function () {
+    var lang = (navigator.language || "").toLowerCase();
+    if (!lang.startsWith("zh")) {
+      var el = document.getElementById("splash-text");
+      if (el) el.textContent = "Waking Muse…";
+    }
+  })();
+</script>
 <div id="jserr"></div>
 <script>
 window.addEventListener("error", e => {
@@ -119,7 +136,7 @@ window.addEventListener("error", e => {
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
   <symbol id="i-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></symbol>
-  <symbol id="i-square" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+  <symbol id="i-square" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
   <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></symbol>
   <symbol id="i-arrow-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
@@ -232,17 +249,18 @@ window.addEventListener("error", e => {
            Row layout: grid (icon · name · ×) — name 中段 truncate，× 不重叠。
            高度调节：底部 splitter bar（draggable），不依赖 CSS resize 手柄。 -->
       <div class="open-files" x-show="!searchMode && tabs.length > 0">
-        <div class="open-files-head">
-          <button class="open-files-toggle"
-                  :title="openFilesCollapsed ? (lang==='zh'?'展开':'Expand') : (lang==='zh'?'折叠':'Collapse')"
-                  @click="openFilesCollapsed = !openFilesCollapsed">
+        <div class="open-files-head"
+             @click="openFilesCollapsed = !openFilesCollapsed"
+             :title="openFilesCollapsed ? (lang==='zh'?'展开':'Expand') : (lang==='zh'?'折叠':'Collapse')">
+          <button class="open-files-toggle" type="button" tabindex="-1"
+                  aria-hidden="true">
             <svg x-show="!openFilesCollapsed"><use href="#i-chevron-down"/></svg>
             <svg x-show="openFilesCollapsed"><use href="#i-chevron-right"/></svg>
           </button>
           <span class="open-files-label"
                 x-text="(lang==='zh'?'打开的文件 ':'Open ') + '(' + tabs.length + ')'"></span>
           <button class="open-files-close-all icon-btn sm"
-                  @click="tabs = []; selected = ''; savePrefs()"
+                  @click.stop="tabs = []; selected = ''; savePrefs()"
                   :title="lang==='zh'?'关闭全部':'Close all'"><svg><use href="#i-x"/></svg></button>
         </div>
         <ul class="open-files-list" x-show="!openFilesCollapsed"
@@ -274,12 +292,11 @@ window.addEventListener("error", e => {
            "Open files" section above. -->
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
-             :title="contextInfo.archive_root || ''"
-             @click="copyRootPath()">
+             :title="contextInfo.archive_root || ''">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
-          <span class="path" x-text="rootDisplay()"></span>
+          <span class="path" x-text="contextInfo.archive_root || '—'"></span>
         </div>
-      <ul class="filelist">
+      <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())">
         <template x-for="n in visible" :key="n.path">
           <li :class="{file: !n.is_dir, dir: n.is_dir, sel: selected===n.path, 'drag-over': dragOver===n.path}"
               :style="`padding-left:${10 + n.depth*14}px; --depth: ${n.depth}`"
@@ -372,8 +389,9 @@ window.addEventListener("error", e => {
         </button>
         <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
         <span class="spacer"></span>
-        <button x-show="selected" @click="reloadPreview()" class="icon-btn"
-                :title="lang==='zh' ? '刷新预览' : 'Reload preview'">
+        <button x-show="selected" @click="reloadPreview()" class="icon-btn preview-keep-mobile"
+                :title="lang==='zh' ? '刷新预览' : 'Reload preview'"
+                :aria-label="lang==='zh' ? '刷新预览' : 'Reload preview'">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
         </button>
         <button x-show="selected && isEditable(selected)" @click="toggleEdit()" class="icon-btn"
@@ -382,8 +400,8 @@ window.addEventListener("error", e => {
           <svg x-show="editing"><use href="#i-eye"/></svg>
         </button>
         <button x-show="editing" @click="saveEdit()" class="btn-primary" style="padding:4px 12px;font-size:12px" x-text="t('btn.save')"></button>
-        <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
-        <a x-show="selected" :href="downloadUrl(selected)" :download="selected.split('/').pop()" class="icon-btn" :title="t('btn.download')"><svg><use href="#i-download"/></svg></a>
+        <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
+        <a x-show="selected" :href="downloadUrl(selected)" :download="selected.split('/').pop()" class="icon-btn preview-keep-mobile" :title="t('btn.download')"><svg><use href="#i-download"/></svg></a>
         <button @click="rightOpen=!rightOpen; savePrefs()" class="icon-btn" :title="rightOpen?t('btn.hide_right'):t('btn.show_right')">
           <svg x-show="rightOpen"><use href="#i-chevron-right"/></svg>
           <svg x-show="!rightOpen"><use href="#i-chevron-left"/></svg>
@@ -442,14 +460,41 @@ window.addEventListener("error", e => {
         </div>
       </template>
 
+      <!-- Floating immersive toggle — only shown on mobile via @media in
+           styles.css. Necessary fallback for iframe / pdf / img preview
+           where scroll events don't cross the sandbox boundary, so the
+           scroll-direction auto-toggle in onPreviewScroll can only fire
+           for markdown / text. -->
+      <button class="preview-immersive-toggle"
+              @click="toggleImmersive()"
+              :title="previewImmersive ? (lang==='zh' ? '退出全屏阅读' : 'Exit immersive') : (lang==='zh' ? '全屏阅读' : 'Immersive reading')">
+        <svg x-show="!previewImmersive" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"/>
+        </svg>
+        <svg x-show="previewImmersive" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6"/>
+        </svg>
+      </button>
+
       <div class="preview-body"
-           :class="{ 'drag-hover': previewDragHover }"
+           :class="{ 'drag-hover': previewDragHover || osFileDragging }"
+           @scroll.passive="onPreviewScroll($event.target)"
            @dragover.prevent="previewDragHover = true"
            @dragenter.prevent="previewDragHover = true"
            @dragleave.prevent="previewDragHover = false"
            @drop.prevent="onPreviewDrop($event)">
-        <!-- Drag overlay — visible when user drags a file in from OS. -->
-        <div class="preview-drop-overlay" x-show="previewDragHover" x-transition.opacity>
+        <!-- Drag overlay — visible during any OS file drag (osFileDragging is
+             set by document-level listeners in init()) so it covers the
+             HTML preview iframe / image element and intercepts the drop.
+             Without this, dragging onto a previewed iframe would fall
+             through to the browser's "open file as navigation" default.
+             pointer-events: auto (in styles.css) makes the overlay the
+             real drop target whenever it's visible. -->
+        <div class="preview-drop-overlay"
+             x-show="previewDragHover || osFileDragging"
+             x-transition.opacity
+             @dragover.prevent
+             @drop.prevent="onPreviewDrop($event); previewDragHover = false; osFileDragging = false; _dragCounter = 0">
           <div class="preview-drop-inner">
             <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
@@ -637,6 +682,33 @@ window.addEventListener("error", e => {
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
               x-text="tokenBadgeText()"></span>
+        <!-- Organize archive — creates a curator-mode session that walks
+             Muse through scan → suggest → confirm-per-item → execute.
+             Sits next to the scheduled-tasks bell because both are
+             "agent-driven background work" entry points. -->
+        <button @click="startOrganize()" class="icon-btn"
+                :title="lang==='zh' ? '整理档案 — 让 Muse 帮我梳理 archive' : 'Organize — have Muse tidy the archive'"
+                aria-label="Organize archive">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/>
+          </svg>
+        </button>
+        <!-- Manual hard-refresh escape hatch. When the chat pane gets
+             stuck (SSE wedged, Alpine state out of sync after a flaky
+             reconnect, etc.), users have no way out except closing the
+             browser tab or PWA. `location.reload()` is the bluntest fix
+             but always works — loadPrefs restores currentId / openTabIds
+             / preview state on boot, and the SSE auto-reconnect path
+             picks up any still-running backend turn. The toast gives a
+             visible confirmation so the user knows the click registered
+             before the page actually unloads. -->
+        <button @click="reloadApp()" class="icon-btn"
+                :title="lang==='zh' ? '刷新页面（chat 卡住时点这里）' : 'Reload page (use if chat is stuck)'"
+                aria-label="Reload page">
+          <svg><use href="#i-refresh"/></svg>
+        </button>
         <!-- Scheduled-tasks bell — unread badge when any scheduled
              prompt has produced output since the user last opened
              the drawer. Heartbeat keeps the count fresh. -->
@@ -755,11 +827,104 @@ window.addEventListener("error", e => {
            overflow; .chat-tabs-actions stays pinned right (new-session + history
            picker always visible regardless of how many tabs are open). -->
       <div class="chat-tabs-wrap">
+        <!-- History picker — leftmost slot so it's the first thing the
+             eye hits on the top bar. Click opens the all-sessions picker
+             (search + grouped list); click a row to open it as a tab. -->
+        <div class="session-picker chat-tab-history" @click.outside="sessionPickerOpen = false">
+          <button class="chat-tab-history-btn" @click="toggleHistoryPicker($event)" type="button"
+                  :title="lang==='zh' ? '历史会话' : 'Session history'">
+            <svg><use href="#i-folder"/></svg>
+          </button>
+          <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
+               class="session-picker-pop"
+               :style="historyPickerStyle">
+            <input class="session-picker-search"
+                   type="text"
+                   x-model="sessionPickerSearch"
+                   x-ref="sessionPickerSearchInput"
+                   :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
+                   @keydown.escape="sessionPickerOpen = false" />
+            <template x-for="g in groupedFilteredSessions()" :key="g.key">
+              <div class="session-picker-group">
+                <div class="session-picker-group-label" x-text="g.label"></div>
+                <template x-for="s in g.items" :key="s.id">
+                  <div class="session-picker-row"
+                       :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
+                       @click="pickerOpenSession(s.id)"
+                       @contextmenu.prevent="pickerRowMenu($event, s.id)">
+                    <button class="session-picker-pin"
+                            :class="{ active: s.pinned }"
+                            @click.stop="togglePinSession(s.id)"
+                            :title="s.pinned ? (lang==='zh'?'取消置顶':'Unpin') : (lang==='zh'?'置顶':'Pin to top')">
+                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="17" x2="12" y2="22"/>
+                        <path d="M5 17h14l-1.5-5H6.5L5 17z"/>
+                        <path d="M9 12V5h6v7"/>
+                      </svg>
+                    </button>
+                    <!-- Row content has two states:
+                         a) normal — name + count + actions (rename / kebab / del)
+                         b) renaming — inline input + ✓ commit / ✕ cancel
+                         x-show (not x-if) keeps the input mounted so its
+                         focus() call from pickerStartInlineRename stays in
+                         the original user-gesture context (iOS Safari only
+                         shows the on-screen keyboard for focus() inside the
+                         same synchronous tick as the click). -->
+                    <span class="ellipsis"
+                          x-show="renamingPickerSid !== s.id"
+                          x-text="s.name"></span>
+                    <span class="session-picker-count"
+                          x-show="renamingPickerSid !== s.id"
+                          :title="(lang==='zh' ? 'Turn 数（用户发言次数）' : 'Turn count (user prompts)') + ' · msg=' + s.message_count"
+                          x-text="s.turn_count ?? Math.max(0, Math.floor((s.message_count||0)/2))"></span>
+                    <button class="session-picker-rename"
+                            x-show="renamingPickerSid !== s.id"
+                            @click="pickerStartInlineRename($event, s.id)"
+                            :title="lang==='zh' ? '重命名' : 'Rename'">
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 20h9"/>
+                        <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                      </svg>
+                    </button>
+                    <button class="session-picker-kebab"
+                            x-show="renamingPickerSid !== s.id"
+                            @click="pickerRowMenu($event, s.id)"
+                            :title="lang==='zh' ? '更多操作' : 'More'">⋮</button>
+                    <button class="session-picker-del"
+                            x-show="renamingPickerSid !== s.id"
+                            @click="pickerDeleteSession(s.id, $event)"
+                            :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
+                    <!-- Renaming state: inline input + commit / cancel buttons -->
+                    <input class="session-picker-rename-input"
+                           type="text"
+                           x-show="renamingPickerSid === s.id"
+                           :data-sid="s.id"
+                           x-model="pickerRenameDraft"
+                           @click.stop
+                           @keydown.enter.prevent="pickerCommitInlineRename()"
+                           @keydown.escape.prevent="pickerCancelInlineRename()"
+                           @blur="pickerCommitInlineRename()" />
+                    <button class="session-picker-rename-ok"
+                            x-show="renamingPickerSid === s.id"
+                            @click.stop="pickerCommitInlineRename()"
+                            :title="lang==='zh' ? '确定' : 'Save'">✓</button>
+                    <button class="session-picker-rename-cancel"
+                            x-show="renamingPickerSid === s.id"
+                            @click.stop="pickerCancelInlineRename()"
+                            :title="lang==='zh' ? '取消' : 'Cancel'">✕</button>
+                  </div>
+                </template>
+              </div>
+            </template>
+            <div x-show="filteredSessions().length === 0" class="session-picker-empty"
+                 x-text="lang==='zh' ? (sessionPickerSearch ? '没有匹配' : '暂无会话') : (sessionPickerSearch ? 'No match' : 'No sessions')"></div>
+          </div>
+        </div>
         <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
           <template x-for="tid in openTabIds" :key="tid">
             <div class="chat-tab" :class="{active: tid === currentId, 'drag-over': tabDragOverId === tid}"
                  :data-tid="tid"
-                 draggable="true"
+                 :draggable="isPointerDevice"
                  @dragstart="onTabDragStart($event, tid)"
                  @dragover.prevent="onTabDragOver($event, tid)"
                  @dragleave="onTabDragLeave(tid)"
@@ -796,58 +961,12 @@ window.addEventListener("error", e => {
           </template>
         </div>
         <div class="chat-tabs-actions">
+          <!-- Per user request: top bar reduced to "history (left) + tabs
+               strip (middle) + new (right)". Removed current-session chip
+               (redundant once strip is visible) and outline button (moved
+               to chat-pane FAB that aligns with .jump-bottom). -->
           <button class="chat-tab-new" @click="newSession()"
                   :title="t('btn.new_session')">+</button>
-          <!-- History picker — collapses old sessions into a dropdown to avoid
-               a wall of tabs. Clicking a row opens it as a tab via openTab(). -->
-          <div class="session-picker chat-tab-history" @click.outside="sessionPickerOpen = false">
-            <button class="chat-tab-history-btn" @click="toggleHistoryPicker($event)" type="button"
-                    :title="lang==='zh' ? '打开历史会话' : 'Open history session'">
-              <svg><use href="#i-folder"/></svg>
-            </button>
-            <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
-                 class="session-picker-pop"
-                 :style="historyPickerStyle">
-              <input class="session-picker-search"
-                     type="text"
-                     x-model="sessionPickerSearch"
-                     x-ref="sessionPickerSearchInput"
-                     :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
-                     @keydown.escape="sessionPickerOpen = false" />
-              <template x-for="g in groupedFilteredSessions()" :key="g.key">
-                <div class="session-picker-group">
-                  <div class="session-picker-group-label" x-text="g.label"></div>
-                  <template x-for="s in g.items" :key="s.id">
-                    <div class="session-picker-row"
-                         :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
-                         @click="pickerOpenSession(s.id)"
-                         @contextmenu.prevent="pickerRowMenu($event, s.id)">
-                      <button class="session-picker-pin"
-                              :class="{ active: s.pinned }"
-                              @click.stop="togglePinSession(s.id)"
-                              :title="s.pinned ? (lang==='zh'?'取消置顶':'Unpin') : (lang==='zh'?'置顶':'Pin to top')">
-                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
-                          <line x1="12" y1="17" x2="12" y2="22"/>
-                          <path d="M5 17h14l-1.5-5H6.5L5 17z"/>
-                          <path d="M9 12V5h6v7"/>
-                        </svg>
-                      </button>
-                      <span class="ellipsis" x-text="s.name"></span>
-                      <span class="session-picker-count" x-text="s.message_count"></span>
-                      <button class="session-picker-kebab"
-                              @click="pickerRowMenu($event, s.id)"
-                              :title="lang==='zh' ? '更多操作' : 'More'">⋮</button>
-                      <button class="session-picker-del"
-                              @click="pickerDeleteSession(s.id, $event)"
-                              :title="lang==='zh' ? '删除此会话' : 'Delete this session'">×</button>
-                    </div>
-                  </template>
-                </div>
-              </template>
-              <div x-show="filteredSessions().length === 0" class="session-picker-empty"
-                   x-text="lang==='zh' ? (sessionPickerSearch ? '没有匹配' : '暂无会话') : (sessionPickerSearch ? 'No match' : 'No sessions')"></div>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -943,7 +1062,7 @@ window.addEventListener("error", e => {
                           @click="shuffleInspirePrompts()"
                           :title="lang==='zh' ? '换一批' : 'Shuffle'"
                           aria-label="Shuffle">
-                    <svg viewBox="0 0 24 24" width="14" height="14"
+                    <svg viewBox="0 0 24 24"
                          fill="none" stroke="currentColor" stroke-width="2"
                          stroke-linecap="round" stroke-linejoin="round">
                       <polyline points="23 4 23 10 17 10"/>
@@ -979,231 +1098,403 @@ window.addEventListener("error", e => {
               <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span></div>
               <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
               <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
+              <div class="brand-tip"><span class="kbd">?</span><span x-text="t('chat.empty_tip4')"></span></div>
             </div>
           </div>
-          <template x-for="(m,i) in messages" :key="m._k || ((currentId || 'init') + '-' + i)">
-            <div :class="'msg ' + m.role">
-              <!-- Compact-summary pill: SDK returns the post-/compact summary as
-                   a regular user/assistant message; we mark its UUID via the
-                   _is_compact_summary flag (detected by reading isCompactSummary
-                   from the raw CLI JSONL). Render as a centered pill above the
-                   message text so the user sees "this is the summary, not the
-                   original history." -->
-              <div x-show="m._is_compact_summary" class="compact-summary-pill">
-                <span x-text="lang==='zh' ? '📦 上方对话已压缩 · 以下为摘要' : '📦 Conversation compacted · summary below'"></span>
-              </div>
-              <!-- Compact-summary messages: render only the pill above, hide
-                   the bubble. The actual content (CLI's "This session is
-                   being continued from a previous conversation..." preamble)
-                   is internal CLI protocol — users shouldn't see it. -->
-              <div x-show="m.role==='user' && !m._is_compact_summary" class="msg-row">
-                <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
-                <div class="bubble user-bubble">
-                  <template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)"><div class="user-msg-imgs"><template x-for="(im, ii) in (m.images || [])" :key="'i'+ii"><img class="user-msg-img" :src="im.preview || ''" alt="" @click="openLightbox(im.preview)" :title="lang==='zh'?'点击放大':'Click to enlarge'" /></template><template x-for="(doc, di) in (m.docs || [])" :key="'d'+di"><span class="user-msg-doc" :title="doc.name"><svg><use href="#i-file-text"/></svg><span x-text="doc.name"></span></span></template></div></template>
-                  <template x-if="editingMsgUuid !== m.uuid"><span class="user-msg-text" x-text="m.text"></span></template>
-                  <template x-if="editingMsgUuid === m.uuid">
-                    <div class="user-msg-edit">
-                      <textarea class="user-msg-edit-ta" x-model="editingMsgDraft" @keydown.escape.stop="cancelEditMsg()" @keydown.ctrl.enter.prevent.stop="saveEditMsg()" @keydown.meta.enter.prevent.stop="saveEditMsg()"></textarea>
-                      <div class="user-msg-edit-actions">
-                        <button class="btn-text" @click="cancelEditMsg()" x-text="t('btn.cancel')"></button>
-                        <button class="btn-primary" :disabled="editingMsgSaving" @click="saveEditMsg()" x-text="editingMsgSaving ? t('msg.edit_saving') : t('msg.edit_save')"></button>
+          <!-- Per-message rendering — Alpine 3's reactivity worked
+               reliably on this flat messages x-for. The "group into
+               assistant turns" experiment broke streaming reactivity
+               (text chunks stopped triggering re-render unless the
+               user switched tabs), so we render each msg standalone
+               and use CSS adjacent selectors at the end of styles.css
+               to hide the avatar on all but the FIRST assistant-side
+               msg in a run — visually the same "one avatar per turn"
+               result without a derived data structure. -->
+          <template x-for="(m, i) in messages" :key="m._k || m.uuid || ('m-' + i)">
+            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role)"
+                 :data-uuid="m.uuid || ''">
+              <!-- compact-summary pill -->
+              <template x-if="m._is_compact_summary">
+                <div class="compact-summary-pill">
+                  <span x-text="lang==='zh' ? '📦 上方对话已压缩 · 以下为摘要' : '📦 Conversation compacted · summary below'"></span>
+                </div>
+              </template>
+
+              <!-- user message -->
+              <template x-if="m.role === 'user' && !m._is_compact_summary">
+                <div>
+                  <div class="msg-row">
+                    <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
+                    <div class="bubble user-bubble">
+                      <template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)">
+                        <div class="user-msg-imgs">
+                          <template x-for="(im, ii) in (m.images || [])" :key="'i'+ii">
+                            <img class="user-msg-img" :src="im.preview || ''" alt=""
+                                 @click="openLightbox(im.preview)"
+                                 :title="lang==='zh'?'点击放大':'Click to enlarge'" />
+                          </template>
+                          <template x-for="(doc, di) in (m.docs || [])" :key="'d'+di">
+                            <span class="user-msg-doc" :title="doc.name">
+                              <svg><use href="#i-file-text"/></svg>
+                              <span x-text="doc.name"></span>
+                            </span>
+                          </template>
+                        </div>
+                      </template>
+                      <span class="user-msg-text" x-html="userTextHtml(m.text)"></span>
+                    </div>
+                  </div>
+                  <div class="msg-actions">
+                    <button @click="copyMsg(m)" class="icon-btn sm"
+                            :class="{ 'copied-flash': m._copied }"
+                            :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
+                      <svg x-show="!m._copied"><use href="#i-copy"/></svg>
+                      <svg x-show="m._copied"><use href="#i-check"/></svg>
+                    </button>
+                    <button x-show="m._failed"
+                            @click="retryFailedMessage(m)" class="icon-btn sm retry-btn"
+                            :title="lang==='zh' ? '重试发送' : 'Retry'">
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <!-- assistant text bubble — has avatar; subsequent
+                   non-user msgs in the same run hide theirs via CSS. -->
+              <template x-if="m.role === 'assistant' && !m._is_compact_summary">
+                <div>
+                  <div class="msg-row">
+                    <span class="msg-avatar assistant-avatar"
+                          :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                          :title="mascotLabel()">
+                      <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                    </span>
+                    <div class="bubble"
+                         :class="{ 'is-streaming-bubble': streaming && i === messages.length - 1 }"
+                         x-html="m.html"></div>
+                  </div>
+                  <!-- Per-bubble footer removed. Time + streaming dots
+                       are rendered once per turn in the turn-footer
+                       at the end of the row's root div (see below) so
+                       a turn made up of thinking + tool_use + tool_
+                       result + assistant gets ONE timestamp at the
+                       bottom, not three. -->
+                  <div class="msg-actions">
+                    <button @click="copyMsg(m)" class="icon-btn sm"
+                            :class="{ 'copied-flash': m._copied }"
+                            :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
+                      <svg x-show="!m._copied"><use href="#i-copy"/></svg>
+                      <svg x-show="m._copied"><use href="#i-check"/></svg>
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <!-- thinking — wrap in msg-row + spacer avatar so the
+                   CSS-hidden avatar still occupies the same 32px gutter
+                   and the block lines up with assistant text blocks. -->
+              <template x-if="m.role === 'thinking'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div :class="thinkingClass(i, m)">
+                    <div class="thinking-head"
+                         @click.stop="toggleMsgExpanded(m, i)"
+                         :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
+                      <span class="thinking-chevron">
+                        <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
+                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                        </svg>
+                      </span>
+                      <span class="icon"><svg><use href="#i-brain"/></svg></span>
+                      <span class="thinking-label-text">thinking</span>
+                      <span x-show="!isMsgExpanded(i, m)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
+                    </div>
+                    <pre x-show="isMsgExpanded(i, m)" x-text="m.text"></pre>
+                  </div>
+                </div>
+              </template>
+
+              <!-- TodoWrite -->
+              <template x-if="m.role === 'tool_use' && m.name === 'TodoWrite'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div class="todo-card">
+                    <div class="todo-card-head">
+                      <span class="todo-card-icon"><svg><use href="#i-check-circle"/></svg></span>
+                      <span class="todo-card-title" x-text="t('todo.title')"></span>
+                      <span class="todo-card-count"
+                            x-text="(m.todos || []).filter(td => td.status==='completed').length + ' / ' + (m.todos || []).length"></span>
+                    </div>
+                    <ul class="todo-list">
+                      <template x-for="(td, tdi) in (m.todos || [])" :key="tdi">
+                        <li :class="'todo-item todo-' + (td.status || 'pending')">
+                          <span class="todo-status">
+                            <svg x-show="td.status==='completed'"><use href="#i-check"/></svg>
+                            <span x-show="td.status==='in_progress'" class="todo-spinner"></span>
+                            <span x-show="td.status!=='completed' && td.status!=='in_progress'" class="todo-dot"></span>
+                          </span>
+                          <span class="todo-text" x-text="td.content || td.subject || td.description || ''"></span>
+                          <span x-show="td.status==='in_progress'" class="todo-tag" x-text="t('todo.doing')"></span>
+                        </li>
+                      </template>
+                    </ul>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Task subagent -->
+              <template x-if="m.role === 'tool_use' && m.name === 'Task'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div class="subagent-card">
+                    <div class="subagent-head">
+                      <span class="subagent-icon"><svg><use href="#i-tool"/></svg></span>
+                      <span class="subagent-label" x-text="t('subagent.label')"></span>
+                      <span class="subagent-type" x-text="(m.task && m.task.subagent_type) || 'agent'"></span>
+                    </div>
+                    <div class="subagent-desc" x-text="(m.task && m.task.description) || ''"></div>
+                    <details class="subagent-prompt" x-show="m.task && m.task.prompt">
+                      <summary x-text="t('subagent.prompt_toggle')"></summary>
+                      <pre x-text="m.task && m.task.prompt"></pre>
+                    </details>
+                  </div>
+                </div>
+              </template>
+
+              <!-- ExitPlanMode -->
+              <template x-if="m.role === 'tool_use' && m.name === 'ExitPlanMode'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div class="plan-card">
+                    <div class="plan-head">
+                      <span class="plan-icon"><svg><use href="#i-check-circle"/></svg></span>
+                      <span class="plan-title" x-text="t('plan.title')"></span>
+                    </div>
+                    <div class="plan-body markdown-body" x-html="renderMd(m.plan || '')"></div>
+                  </div>
+                </div>
+              </template>
+
+              <!-- default tool bubble -->
+              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'ExitPlanMode'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div class="tool"
+                       :class="{ 'tool-mcp': m.name && m.name.startsWith('mcp__'), 'tool-skill': m.name === 'Skill' }">
+                    <span class="tool-name">
+                      <span x-show="m.name && m.name.startsWith('mcp__')" class="tool-prefix-icon">🔌</span>
+                      <span x-show="m.name === 'Skill'" class="tool-prefix-icon">🧩</span>
+                      <span x-text="renderToolName(m.name)"></span>
+                    </span>
+                    <template x-if="toolFilePath(m)">
+                      <a class="tool-arg file-link" href="#"
+                         :data-path="toolFilePath(m)"
+                         :title="toolFilePath(m)"
+                         x-text="toolFilePath(m)"></a>
+                    </template>
+                    <template x-if="!toolFilePath(m)">
+                      <span class="tool-arg" x-text="m.summary"></span>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
+              <!-- tool_result -->
+              <template x-if="m.role === 'tool_result'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div :class="toolResultClass(i, m)">
+                    <div class="tool-result-head"
+                         @click.stop="toggleMsgExpanded(m, i)"
+                         :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
+                      <span class="thinking-chevron">
+                        <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
+                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                        </svg>
+                      </span>
+                      <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
+                            x-text="toolResultSummary(m)"></span>
+                    </div>
+                    <pre x-show="isMsgExpanded(i, m)" x-text="m.preview"></pre>
+                  </div>
+                </div>
+              </template>
+
+              <!-- system_note -->
+              <template x-if="m.role === 'system_note'">
+                <div class="sys-note" x-text="m.text"></div>
+              </template>
+
+              <!-- ask_user_question -->
+              <template x-if="m.role === 'ask_user_question'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                  </span>
+                  <div class="ask-question">
+                    <div class="ask-header">
+                      <span class="ask-title" x-text="t('ask.title')"></span>
+                      <span x-show="m.submitted" class="ask-submitted-tag" x-text="t('ask.submitted')"></span>
+                    </div>
+                    <template x-for="(q, qIdx) in m.questions" :key="qIdx">
+                      <div class="ask-question-block">
+                        <div class="ask-question-head">
+                          <span x-show="q.header" class="ask-question-chip" x-text="q.header"></span>
+                          <span class="ask-question-text" x-text="q.question"></span>
+                          <span x-show="q.multiSelect" class="ask-multi-tag" x-text="t('ask.multi')"></span>
+                        </div>
+                        <!-- Render normalized options. The label is computed
+                             via askOptionLabel() instead of `opt.label` directly
+                             so an old backend (pre-normalize) that forwarded
+                             raw model output as `["a","b"]` / `[{text:"a"}]`
+                             still produces clickable buttons. New backends
+                             normalize this in ask_user_question.py — this is
+                             belt+suspenders for "user is running new frontend
+                             against old backend" scenarios. -->
+                        <div class="ask-options">
+                          <template x-for="(opt, optIdx) in (q.options || [])" :key="optIdx">
+                            <button class="ask-option"
+                                    :class="{ picked: isAskOptionPicked(m, qIdx, askOptionLabel(opt)), disabled: m.submitted }"
+                                    :disabled="m.submitted"
+                                    @click="q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt))">
+                              <div class="ask-option-label" x-text="askOptionLabel(opt)"></div>
+                              <div x-show="askOptionDesc(opt)" class="ask-option-desc" x-text="askOptionDesc(opt)"></div>
+                            </button>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                    <div x-show="(m.questions || []).some(q => q.multiSelect) && !m.submitted && !m.askOtherOpen" class="ask-submit-row">
+                      <button class="btn-primary" @click="submitAskAnswers(m)" x-text="t('ask.submit')"></button>
+                    </div>
+                    <!-- Free-text fallback. The MCP tool only lets the model
+                         offer 2-4 fixed options; sometimes none fit and the
+                         user wants to say something else. Claude Code's
+                         AskUserQuestion has an implicit "Other" for the same
+                         reason — without it the question is a forced choice
+                         and the user has to either pick a wrong-ish option
+                         or wait 10 min for the 600 s timeout to bail. Click
+                         "其他" → inline textarea → submit routes the text
+                         through /api/chat/answer the same way the buttons do,
+                         so the model sees it as a normal tool result. -->
+                    <div class="ask-other-section" x-show="!m.submitted">
+                      <button x-show="!m.askOtherOpen"
+                              class="ask-other-toggle"
+                              @click="openAskOther(m)"
+                              x-text="lang==='zh' ? '其他（自由输入）' : 'Other (custom answer)'"></button>
+                      <div x-show="m.askOtherOpen" class="ask-other-form">
+                        <textarea x-model="m.askOtherText"
+                                  class="ask-other-textarea"
+                                  rows="3"
+                                  :placeholder="lang==='zh' ? '直接写你的回复…' : 'Type your reply…'"
+                                  @keydown.escape.stop="cancelAskOther(m)"
+                                  @keydown.meta.enter.prevent="submitAskOther(m)"
+                                  @keydown.ctrl.enter.prevent="submitAskOther(m)"></textarea>
+                        <div class="ask-other-actions">
+                          <button class="ask-other-cancel" @click="cancelAskOther(m)"
+                                  x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
+                          <button class="btn-primary" @click="submitAskOther(m)"
+                                  :disabled="!(m.askOtherText || '').trim()"
+                                  x-text="lang==='zh' ? '提交' : 'Submit'"></button>
+                        </div>
                       </div>
                     </div>
-                  </template>
-                  <button class="user-msg-edit-btn" x-show="m.uuid && editingMsgUuid !== m.uuid && !streaming" @click="startEditMsg(m, i)" :title="t('msg.edit_hint')"><svg><use href="#i-edit"/></svg></button>
+                  </div>
                 </div>
-              </div>
-              <div x-show="m.role==='assistant' && !m._is_compact_summary" class="msg-row">
-                <span class="msg-avatar assistant-avatar" :title="mascotLabel()">
-                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                </span>
-                <div class="bubble"
-                     :class="{ 'is-streaming-bubble': streaming && i === messages.length - 1 }"
-                     x-html="m.html"></div>
-              </div>
-            <div x-show="m.role==='assistant' && m.model" class="model-tag"
-                 :title="m.model"
-                 x-text="modelLabel(m.model)"></div>
-              <!-- TodoWrite: dedicated checklist UI instead of generic tool bubble. -->
-              <template x-if="m.role==='tool_use' && m.name==='TodoWrite'"><div class="todo-card">
-                <div class="todo-card-head">
-                  <span class="todo-card-icon"><svg><use href="#i-check-circle"/></svg></span>
-                  <span class="todo-card-title" x-text="t('todo.title')"></span>
-                  <span class="todo-card-count"
-                        x-text="(m.todos || []).filter(t => t.status==='completed').length + ' / ' + (m.todos || []).length"></span>
-                </div>
-                <ul class="todo-list">
-                  <template x-for="(t, ti) in (m.todos || [])" :key="ti">
-                    <li :class="'todo-item todo-' + (t.status || 'pending')">
-                      <span class="todo-status">
-                        <svg x-show="t.status==='completed'"><use href="#i-check"/></svg>
-                        <span x-show="t.status==='in_progress'" class="todo-spinner"></span>
-                        <span x-show="t.status!=='completed' && t.status!=='in_progress'" class="todo-dot"></span>
-                      </span>
-                      <span class="todo-text" x-text="t.content || t.subject || t.description || ''"></span>
-                      <span x-show="t.status==='in_progress'" class="todo-tag" x-text="t('todo.doing')"></span>
-                    </li>
-                  </template>
-                </ul>
-              </div></template>
-              <!-- Task: subagent invocation. -->
-              <template x-if="m.role==='tool_use' && m.name==='Task'"><div class="subagent-card">
-                <div class="subagent-head">
-                  <span class="subagent-icon"><svg><use href="#i-tool"/></svg></span>
-                  <span class="subagent-label" x-text="t('subagent.label')"></span>
-                  <span class="subagent-type" x-text="(m.task && m.task.subagent_type) || 'agent'"></span>
-                </div>
-                <div class="subagent-desc" x-text="(m.task && m.task.description) || ''"></div>
-                <details class="subagent-prompt" x-show="m.task && m.task.prompt">
-                  <summary x-text="t('subagent.prompt_toggle')"></summary>
-                  <pre x-text="m.task && m.task.prompt"></pre>
-                </details>
-              </div></template>
-              <!-- ExitPlanMode: plan + approve/reject. Approval just acknowledges; SDK
-                   permission flow is what actually gates execution. -->
-              <template x-if="m.role==='tool_use' && m.name==='ExitPlanMode'"><div class="plan-card">
-                <div class="plan-head">
-                  <span class="plan-icon"><svg><use href="#i-check-circle"/></svg></span>
-                  <span class="plan-title" x-text="t('plan.title')"></span>
-                </div>
-                <div class="plan-body markdown-body" x-html="renderMd(m.plan || '')"></div>
-              </div></template>
-              <!-- Default tool bubble for anything else. -->
-              <div x-show="m.role==='tool_use' && m.name!=='TodoWrite' && m.name!=='Task' && m.name!=='ExitPlanMode'"
-                   class="tool"
-                   :class="{ 'tool-mcp': m.name && m.name.startsWith('mcp__'), 'tool-skill': m.name==='Skill' }">
-                <span class="tool-name">
-                  <span x-show="m.name && m.name.startsWith('mcp__')" class="tool-prefix-icon">🔌</span>
-                  <span x-show="m.name==='Skill'" class="tool-prefix-icon">🧩</span>
-                  <span x-text="renderToolName(m.name)"></span>
-                </span>
-                <template x-if="toolFilePath(m)">
-                  <a class="tool-arg file-link" href="#"
-                     :data-path="toolFilePath(m)"
-                     :title="toolFilePath(m)"
-                     x-text="toolFilePath(m)"></a>
-                </template>
-                <template x-if="!toolFilePath(m)">
-                  <span class="tool-arg" x-text="m.summary"></span>
-                </template>
-              </div>
-              <div x-show="m.role==='tool_result'"
-                   :class="toolResultClass(i, m)">
-                <div class="tool-result-head"
-                     @click.stop="toggleMsgExpanded(m)"
-                     :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
-                  <span class="thinking-chevron">
-                    <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                      <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
-                    </svg>
+              </template>
+
+              <!-- permission_request -->
+              <template x-if="m.role === 'permission_request'">
+                <div class="msg-row">
+                  <span class="msg-avatar assistant-avatar"
+                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :title="mascotLabel()">
+                    <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
-                  <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
-                        x-text="toolResultSummary(m)"></span>
-                </div>
-                <pre x-show="isMsgExpanded(i, m)" x-text="m.preview"></pre>
-              </div>
-              <!-- Inline system note (e.g. "model switched to X") — small, centered. -->
-              <div x-show="m.role==='system_note'" class="sys-note" x-text="m.text"></div>
-              <div x-show="m.role==='thinking'"
-                   :class="thinkingClass(i, m)">
-                <div class="thinking-head"
-                     @click.stop="toggleMsgExpanded(m)"
-                     :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
-                  <span class="thinking-chevron">
-                    <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                      <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
-                    </svg>
-                  </span>
-                  <span class="icon"><svg><use href="#i-brain"/></svg></span>
-                  <span class="thinking-label-text">thinking</span>
-                  <span x-show="!isMsgExpanded(i, m)" class="thinking-preview"
-                        x-text="thinkingPreview(m)"></span>
-                </div>
-                <pre x-show="isMsgExpanded(i, m)" x-text="m.text"></pre>
-              </div>
-              <!-- Muse asks user a structured question (mcp__muselab__ask_user_question).
-                   Use x-if (not x-show) so the inner expressions only evaluate when this is
-                   actually an ask_user_question message — avoids `m.questions.some(...)` on
-                   undefined for all the other message roles. -->
-              <template x-if="m.role==='ask_user_question'"><div class="ask-question">
-                <div class="ask-header">
-                  <span class="muse-mascot sm"><svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg></span>
-                  <span class="ask-title" x-text="t('ask.title')"></span>
-                  <span x-show="m.submitted" class="ask-submitted-tag" x-text="t('ask.submitted')"></span>
-                </div>
-                <template x-for="(q, qIdx) in m.questions" :key="qIdx">
-                  <div class="ask-question-block">
-                    <div class="ask-question-head">
-                      <span x-show="q.header" class="ask-question-chip" x-text="q.header"></span>
-                      <span class="ask-question-text" x-text="q.question"></span>
-                      <span x-show="q.multiSelect" class="ask-multi-tag" x-text="t('ask.multi')"></span>
+                  <div class="perm-request" :class="{ resolved: m.resolved }">
+                    <div class="perm-header">
+                      <span class="perm-title" x-text="t('perm.title')"></span>
+                      <span x-show="m.resolved" class="perm-decision-tag"
+                            :class="'perm-decision-' + m.decision"
+                            x-text="t('perm.decision_' + m.decision)"></span>
                     </div>
-                    <div class="ask-options">
-                      <template x-for="(opt, optIdx) in q.options" :key="optIdx">
-                        <button class="ask-option"
-                                :class="{ picked: isAskOptionPicked(m, qIdx, opt.label), disabled: m.submitted }"
-                                :disabled="m.submitted"
-                                @click="q.multiSelect ? toggleAskOption(m, qIdx, opt.label) : pickAskOption(m, qIdx, opt.label)">
-                          <div class="ask-option-label" x-text="opt.label"></div>
-                          <div x-show="opt.description" class="ask-option-desc" x-text="opt.description"></div>
-                        </button>
-                      </template>
+                    <div class="perm-body">
+                      <div class="perm-tool">
+                        <span class="perm-tool-icon"><svg><use href="#i-tool"/></svg></span>
+                        <span class="perm-tool-name" x-text="m.tool"></span>
+                      </div>
+                      <pre class="perm-summary" x-text="m.summary"></pre>
+                    </div>
+                    <div class="perm-actions" x-show="!m.resolved">
+                      <button class="btn-deny" @click="decidePermission(m, 'deny')" x-text="t('perm.deny')"></button>
+                      <button class="btn-allow" @click="decidePermission(m, 'allow')" x-text="t('perm.allow')"></button>
+                      <button class="btn-always" @click="decidePermission(m, 'always')" x-text="t('perm.always')"></button>
                     </div>
                   </div>
-                </template>
-                <!-- Multi-select: explicit submit button. Single-select auto-submits when all chosen. -->
-                <div x-show="(m.questions || []).some(q => q.multiSelect) && !m.submitted" class="ask-submit-row">
-                  <button class="btn-primary" @click="submitAskAnswers(m)"
-                          x-text="t('ask.submit')"></button>
                 </div>
-              </div></template>
-              <!-- Muse asks the user to allow / deny a tool call (can_use_tool bridge).
-                   Mirrors the ask_user_question pattern: x-if lazy-mounts so other roles
-                   don't evaluate these expressions. -->
-              <template x-if="m.role==='permission_request'"><div class="perm-request"
-                  :class="{ resolved: m.resolved }">
-                <div class="perm-header">
-                  <span class="muse-mascot sm"><svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg></span>
-                  <span class="perm-title" x-text="t('perm.title')"></span>
-                  <span x-show="m.resolved" class="perm-decision-tag"
-                        :class="'perm-decision-' + m.decision"
-                        x-text="t('perm.decision_' + m.decision)"></span>
-                </div>
-                <div class="perm-body">
-                  <div class="perm-tool">
-                    <span class="perm-tool-icon"><svg><use href="#i-tool"/></svg></span>
-                    <span class="perm-tool-name" x-text="m.tool"></span>
-                  </div>
-                  <pre class="perm-summary" x-text="m.summary"></pre>
-                </div>
-                <div class="perm-actions" x-show="!m.resolved">
-                  <button class="btn-deny" @click="decidePermission(m, 'deny')"
-                          x-text="t('perm.deny')"></button>
-                  <button class="btn-allow" @click="decidePermission(m, 'allow')"
-                          x-text="t('perm.allow')"></button>
-                  <button class="btn-always" @click="decidePermission(m, 'always')"
-                          x-text="t('perm.always')"></button>
-                </div>
-              </div></template>
-              <div class="msg-actions" x-show="m.role==='assistant' || m.role==='user'">
-                <button @click="copyMsg(m)" class="icon-btn sm"
-                        :class="{ 'copied-flash': m._copied }"
-                        :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
-                  <svg x-show="!m._copied"><use href="#i-copy"/></svg>
-                  <svg x-show="m._copied"><use href="#i-check"/></svg>
-                </button>
-                <button x-show="m.role==='user' && m._failed"
-                        @click="retryFailedMessage(m)" class="icon-btn sm retry-btn"
-                        :title="lang==='zh' ? '重试发送' : 'Retry'">
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/>
-                  </svg>
-                </button>
+              </template>
+
+              <!-- Per-turn footer. A "turn" here = a contiguous run of
+                   muse-side messages between two user messages. The
+                   tail message of that run carries the footer; every
+                   other message has it display:none. The footer hosts
+                   BOTH the streaming dots (while in flight) and the
+                   HH:MM completion stamp (once done) — so a multi-
+                   block turn (thinking + tool_use + assistant + …)
+                   shows ONE indicator at the bottom of the whole run,
+                   not one per block.
+
+                   Uses x-show (not <template x-if>) intentionally:
+                   nesting x-if inside x-for had reactivity glitches
+                   where isTurnTail() wasn't re-evaluated on push to
+                   the messages array, leaving previous turn-tails
+                   stuck "showing" or new ones never appearing. x-show
+                   keeps the DOM node always present and only toggles
+                   display, which Alpine handles reliably per-frame. -->
+              <!-- Inline expression instead of method call so Alpine
+                   tracks reactive deps (m.role / messages[i+1].role /
+                   messages.length) directly — method calls aren't
+                   guaranteed to wire up reactivity inside x-for. -->
+              <div class="turn-footer"
+                   x-show="m.role !== 'user' && (i === messages.length - 1 || (messages[i + 1] && messages[i + 1].role === 'user'))"
+                   aria-hidden="true">
+                <span x-show="streaming && i === messages.length - 1"
+                      class="thinking-dots">
+                  <span></span><span></span><span></span>
+                </span>
+                <span x-show="m.ts && !(streaming && i === messages.length - 1)"
+                      class="msg-ts" :title="m.model || ''"
+                      x-text="fmtTurnTime(m.ts)"></span>
               </div>
-              <!-- Per-message cost annotation removed 2026-05-18: SDK's
-                   ResultMessage.total_cost_usd is cumulative-per-session, so
-                   each row showing "$X" was misleading (felt wrong because
-                   it was). Total cost still in /cost slash + session usage. -->
             </div>
           </template>
           <!-- Pending "Muse 正在思考" bubble — only while we're waiting for
@@ -1211,14 +1502,20 @@ window.addEventListener("error", e => {
                started accumulating text (its bubble is already rendered
                above via the x-for), this pending placeholder must hide or
                we get two stacked bubbles with overlapping model labels. -->
+          <!-- Pending bubble: shown only when streaming AND there's no
+               assistant-side msg yet (i.e. last msg is the user's
+               input, or the message list is empty). Simpler than the
+               old "role NOT in [assistant, tool_use, tool_result,
+               thinking]" exclusion list — that list missed ask_user_
+               question / permission_request / system_note, leaving
+               the pending bubble's avatar duplicated next to those
+               msgs' own avatars. Now: any non-user last msg already
+               has its own avatar — suppress pending. -->
           <div x-show="streaming && (!messages.length
-                                       || (messages[messages.length-1].role !== 'assistant'
-                                           && messages[messages.length-1].role !== 'tool_use'
-                                           && messages[messages.length-1].role !== 'tool_result'
-                                           && messages[messages.length-1].role !== 'thinking'))"
+                                       || messages[messages.length-1].role === 'user')"
                class="msg assistant">
             <div class="msg-row">
-              <span class="msg-avatar assistant-avatar" :title="mascotLabel()">
+              <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
                 <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
               </span>
               <div class="bubble pending">
@@ -1231,8 +1528,47 @@ window.addEventListener("error", e => {
               </div>
             </div>
           </div>
+
+          <!-- Standalone .streaming-tail removed — its job is now done
+               by .turn-footer inside the x-for loop, which renders on
+               the tail block of each turn and shows dots while
+               streaming + HH:MM once done. -->
+
+          <!-- Compact-in-progress placeholder bubble. Mirrors the streaming
+               pending bubble above so the user sees a familiar "something is
+               working" cue at the bottom of the chat (not just the silent
+               shimmer in the top ctx-meter). Appears for the full window
+               between native-compact POST and loadSession completing — can
+               be ~20-60s on a long session. -->
+          <div x-show="_compacting" class="msg assistant compact-pending">
+            <div class="msg-row">
+              <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
+                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+              </span>
+              <div class="bubble pending">
+                <span class="compact-pending-icon">📦</span>
+                <span class="thinking-dots"><span></span><span></span><span></span></span>
+                <span class="thinking-label" x-text="lang==='zh' ? '压缩对话中…' : 'Compacting conversation…'"></span>
+              </div>
+            </div>
+          </div>
         </div>
         <button class="jump-bottom" x-show="!atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
+        <!-- Outline FAB — sits right above jump-bottom in the same chat
+             pane. Same visibility rule as jump-bottom (x-show="!atBottom")
+             so the two appear/disappear together as a pair. -->
+        <button class="chat-outline-fab" x-show="!atBottom"
+                @click="msgOutlineOpen = true"
+                :title="lang==='zh' ? '会话目录' : 'Outline'">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="8" y1="6" x2="21" y2="6"/>
+            <line x1="8" y1="12" x2="21" y2="12"/>
+            <line x1="8" y1="18" x2="21" y2="18"/>
+            <circle cx="4" cy="6" r="1" fill="currentColor"/>
+            <circle cx="4" cy="12" r="1" fill="currentColor"/>
+            <circle cx="4" cy="18" r="1" fill="currentColor"/>
+          </svg>
+        </button>
       </div>
 
       <div class="chat-input">
@@ -1265,6 +1601,14 @@ window.addEventListener("error", e => {
           <div class="hint-row" x-show="!mentionResults.length" x-text="t('files.empty_search')"></div>
         </div>
         <!-- Attachment preview row (above input). -->
+        <!-- Pending attachment chips. Upload starts eagerly the moment the
+             file is picked / pasted / dropped — by the time the user finishes
+             typing it's almost always done. We deliberately DON'T render an
+             "uploading…" spinner: the spinner used to make the chip feel like
+             a separate uploading step before send, when in fact send-time
+             auto-wait (sendMessage) already handles the rare case where the
+             upload is still in flight. Only the .error state gets a visual —
+             a red border via .img-chip.error / .doc-chip.error in styles.css. -->
         <div class="img-attachments" x-show="pendingImages.length || pendingDocs.length">
           <template x-for="(img, i) in pendingImages" :key="img.id || ('i'+i)">
             <div class="img-chip" :class="{ uploading: img.uploading, error: img.error }">
@@ -1273,7 +1617,13 @@ window.addEventListener("error", e => {
                       @click="removePendingImage(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
               </button>
-              <span x-show="img.uploading" class="img-chip-spin"></span>
+              <!-- Slim animated progress bar at the chip's bottom edge.
+                   Replaces the previous big spinning overlay (user wanted
+                   the chip to feel "uploaded" instantly); a hairline gives
+                   the necessary feedback on slow / large uploads without
+                   reading as a separate processing step. Disappears the
+                   moment upload completes or errors out. -->
+              <div x-show="img.uploading" class="chip-upload-bar"></div>
             </div>
           </template>
           <template x-for="(doc, i) in pendingDocs" :key="doc.id || ('d'+i)">
@@ -1288,7 +1638,7 @@ window.addEventListener("error", e => {
                       @click="removePendingDoc(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
               </button>
-              <span x-show="doc.uploading" class="img-chip-spin"></span>
+              <div x-show="doc.uploading" class="chip-upload-bar"></div>
             </div>
           </template>
         </div>
@@ -1326,7 +1676,9 @@ window.addEventListener("error", e => {
                     @keydown.down="(mentionShow || slashShow) && _navPop(1) && $event.preventDefault()"
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
-                    :placeholder="t('chat.placeholder')" :disabled="streaming"></textarea>
+                    @focus="onChatInputFocus($event)"
+                    @blur="document.body.classList.remove('kb-open')"
+                    :placeholder="t('chat.placeholder')"></textarea>
           </form>
           <div class="chat-toolbar">
             <!-- Attach button -->
@@ -1351,7 +1703,7 @@ window.addEventListener("error", e => {
               </template>
             </select>
             <!-- Permission mode -->
-            <select x-model="permission" class="chat-toolbar-select"
+            <select x-model="permission" class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
               <option value="bypassPermissions">bypass</option>
               <option value="acceptEdits">acceptEdits</option>
@@ -1362,7 +1714,7 @@ window.addEventListener("error", e => {
                  adaptive thinking picks per turn). Overrides apply session-
                  wide and trigger a client rebuild on next turn. -->
             <select x-model="effort" @change="onEffortChange()"
-                    class="chat-toolbar-select"
+                    class="chat-toolbar-select chat-toolbar-effort"
                     :title="t('effort.title')">
               <option value="" x-text="t('effort.auto')"></option>
               <option value="low" x-text="t('effort.low')"></option>
@@ -1394,9 +1746,15 @@ window.addEventListener("error", e => {
               </svg>
             </button>
             <span class="chat-toolbar-spacer"></span>
-            <!-- Send / Stop -->
+            <!-- Send / Stop. While `_sendWaitingForUpload` is true (rare:
+                 user hit send while a slow attachment upload is still in
+                 flight) the button stays in "send" form but is disabled —
+                 the auto-wait inside sendMessage resolves within 30 s and
+                 the click effectively becomes synchronous from the user's
+                 POV. Without this disabling, double-tap could queue two
+                 sends for the same upload. -->
             <button x-show="!streaming" @click="send()"
-                    :disabled="!input.trim() && !pendingImages.length && !pendingDocs.length"
+                    :disabled="_sendWaitingForUpload || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send" :title="t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
             </button>
@@ -1428,13 +1786,49 @@ window.addEventListener("error", e => {
 
   </div>
 
+  <!-- ============ Message outline modal ============
+       Lists every user prompt in the current session; tap a row to scroll
+       chat to that message + flash highlight. Entry point: chat-tabs-actions
+       outline button (☰). On mobile this slides up as a bottom sheet, on
+       desktop it centers as a normal modal. -->
+  <div class="msg-outline-modal" x-show="msgOutlineOpen"
+       x-transition.opacity
+       @click.self="msgOutlineOpen = false"
+       @keydown.escape.window="msgOutlineOpen = false">
+    <div class="msg-outline-panel" @click.stop>
+      <div class="msg-outline-head">
+        <span class="msg-outline-label"
+              x-text="(lang==='zh' ? '会话目录 ' : 'Outline ') + '(' + outlineMessages().length + ')'"></span>
+        <button class="msg-outline-close" @click="msgOutlineOpen = false"
+                :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'">×</button>
+      </div>
+      <ul class="msg-outline-list">
+        <template x-for="(m, i) in outlineMessages()" :key="m.uuid || m._k || ('o-' + i)">
+          <li @click="_scrollToUserMsg(m); msgOutlineOpen = false"
+              :title="m.text || m.body || ''">
+            <span class="msg-outline-idx" x-text="'#' + (i + 1)"></span>
+            <span class="msg-outline-text ellipsis" x-text="outlineText(m)"></span>
+            <span class="msg-outline-time" x-text="m.ts ? fmtHM(m.ts) : ''"></span>
+          </li>
+        </template>
+      </ul>
+      <div x-show="outlineMessages().length === 0" class="msg-outline-empty"
+           x-text="lang==='zh' ? '此会话还没有 user 消息' : 'No user messages yet'"></div>
+    </div>
+  </div>
+
   <!-- ============ Image lightbox ============ -->
+  <!-- Click anywhere — backdrop, image itself, or the explicit × button — to
+       close. Previously the image swallowed clicks (@click.stop) so users
+       had to find the backdrop or hit the corner ×; the image-toggles-itself
+       pattern is what every modern photo viewer does (iOS Photos, Telegram). -->
   <div class="lightbox"
        x-show="lightbox.show"
        x-transition.opacity
        @click="lightbox.show = false"
        @keydown.escape.window="lightbox.show = false">
-    <img :src="lightbox.src" class="lightbox-img" @click.stop alt="" />
+    <img :src="lightbox.src" class="lightbox-img"
+         @click.stop="lightbox.show = false" alt="" />
     <button class="lightbox-close"
             :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'"
             @click.stop="lightbox.show = false">×</button>
@@ -1503,10 +1897,85 @@ window.addEventListener("error", e => {
   <!-- ============ Settings Modal ============ -->
   <div class="modal-backdrop" x-show="settings.show" @click.self="settings.show=false">
     <div class="modal settings-modal" @keydown.escape.window="settings.show=false">
-      <div class="modal-head">⚙ <span x-text="t('set.title')"></span></div>
-      <div class="modal-body" style="max-height:70vh;overflow-y:auto">
+      <div class="modal-head">
+        <span class="modal-title">⚙ <span x-text="t('set.title')"></span></span>
+        <button class="modal-close" @click="settings.show=false"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body settings-modal-body">
+        <!-- Mobile-only iOS-style menu. On desktop (isWideScreen=true)
+             everything below renders as one long scroll, like before.
+             On phone (isWideScreen=false): if activePage is null, show
+             this menu; if set, show only the corresponding section +
+             a back button. Per-section x-show conditions below switch
+             on this same activePage. -->
+        <ul class="settings-menu"
+            x-show="!isWideScreen && !settings.activePage">
+          <li class="settings-menu-item" @click="settings.activePage='lang'">
+            <span class="settings-menu-icon">🌐</span>
+            <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='provider'">
+            <span class="settings-menu-icon">🔑</span>
+            <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='appearance'">
+            <span class="settings-menu-icon">🎨</span>
+            <span class="settings-menu-title" x-text="t('set.sec.appearance')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='notification'">
+            <span class="settings-menu-icon">🔔</span>
+            <span class="settings-menu-title"
+                  x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='defaults'">
+            <span class="settings-menu-icon">⚙️</span>
+            <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='model_params'">
+            <span class="settings-menu-icon">🧠</span>
+            <span class="settings-menu-title" x-text="t('set.sec.model_params')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='skills'">
+            <span class="settings-menu-icon">🧩</span>
+            <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='mcp'">
+            <span class="settings-menu-icon">🔌</span>
+            <span class="settings-menu-title" x-text="t('set.sec.mcp')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item" @click="settings.activePage='versions'">
+            <span class="settings-menu-icon">🛠</span>
+            <span class="settings-menu-title"
+                  x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+          <li class="settings-menu-item"
+              @click="settings.activePage='cost'; loadCostDashboard();">
+            <span class="settings-menu-icon">💰</span>
+            <span class="settings-menu-title" x-text="t('set.sec.cost')"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
+        </ul>
 
-        <div class="settings-section">
+        <!-- Mobile-only back button — shown on detail pages. -->
+        <button class="settings-back"
+                x-show="!isWideScreen && settings.activePage"
+                @click="settings.activePage = null">
+          <span>‹</span>
+          <span x-text="lang==='zh' ? '返回' : 'Back'"></span>
+        </button>
+
+        <div class="settings-section" data-page="lang"
+             x-show="isWideScreen || settings.activePage === 'lang'">
           <div class="settings-section-title" x-text="t('set.sec.lang')"></div>
           <div class="settings-row">
             <label x-text="t('set.label.lang')"></label>
@@ -1517,19 +1986,8 @@ window.addEventListener("error", e => {
           </div>
         </div>
 
-        <div class="settings-section">
-          <div class="settings-section-title"
-               x-text="lang==='zh' ? '我的档案' : 'My profile'"></div>
-          <div class="settings-hint"
-               x-text="lang==='zh' ? 'CLAUDE.md 是 Muse 启动时读的「关于你」档案。改完不用重启 muselab，下条消息自动用新内容。' : 'CLAUDE.md is the profile Muse reads on startup. Edits take effect on the next message — no restart needed.'"></div>
-          <div class="settings-row">
-            <label x-text="lang==='zh' ? '当前项目 (ROOT/CLAUDE.md)' : 'Project (ROOT/CLAUDE.md)'"></label>
-            <button class="btn-ghost sm" @click="openMyArchiveFile()"
-                    x-text="lang==='zh' ? '打开编辑' : 'Open & edit'"></button>
-          </div>
-        </div>
-
-        <div class="settings-section">
+        <div class="settings-section" data-page="provider"
+             x-show="isWideScreen || settings.activePage === 'provider'">
           <div class="settings-section-title" x-text="t('set.sec.provider')"></div>
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
           <template x-for="p in settings.providers" :key="p.env_key">
@@ -1565,7 +2023,8 @@ window.addEventListener("error", e => {
           </template>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-page="appearance"
+             x-show="isWideScreen || settings.activePage === 'appearance'">
           <div class="settings-section-title" x-text="t('set.sec.appearance')"></div>
           <div class="settings-row">
             <label x-text="t('set.label.accent')"></label>
@@ -1584,7 +2043,8 @@ window.addEventListener("error", e => {
         </div>
 
         <!-- Versions + upgrade — shows current vs latest SDK / CLI, one-click bump. -->
-        <div class="settings-section">
+        <div class="settings-section" data-page="versions"
+             x-show="isWideScreen || settings.activePage === 'versions'">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
             <button class="btn-ghost sm" @click="loadVersions()"
@@ -1698,7 +2158,96 @@ window.addEventListener("error", e => {
           </template>
         </div>
 
-        <div class="settings-section">
+        <!-- Cost dashboard — aggregated per-turn $ usage across all
+             sessions. Loads lazily when the user navigates to this
+             section (loadCostDashboard called on menu click + on first
+             desktop open via openSettings). -->
+        <div class="settings-section" data-page="cost"
+             x-show="isWideScreen || settings.activePage === 'cost'">
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.cost')"></span>
+            <button class="btn-ghost sm" @click="loadCostDashboard(true)"
+                    :disabled="cost.loading"
+                    style="margin-left: 8px;"
+                    x-text="cost.loading ? t('set.cost.loading') : t('set.cost.refresh')"></button>
+            <select class="cost-window-select"
+                    x-model.number="cost.windowDays"
+                    @change="loadCostDashboard(true)">
+              <option :value="7">7</option>
+              <option :value="14">14</option>
+              <option :value="30">30</option>
+              <option :value="60">60</option>
+              <option :value="90">90</option>
+            </select>
+          </div>
+          <template x-if="!cost.data && !cost.loading">
+            <div class="settings-hint" x-text="t('set.cost.empty')"></div>
+          </template>
+          <template x-if="cost.data">
+            <div>
+              <!-- 4 KPI cards: total tokens up top, cost as secondary line -->
+              <div class="cost-kpis">
+                <template x-for="key in ['today','last_7d','last_30d','all_time']" :key="key">
+                  <div class="cost-kpi">
+                    <div class="cost-kpi-label"
+                         x-text="t('set.cost.' + (key === 'last_7d' ? '7d' : key === 'last_30d' ? '30d' : key === 'all_time' ? 'all' : 'today'))"></div>
+                    <div class="cost-kpi-value"
+                         x-text="fmtTokens(totalTokens(cost.data[key]))"></div>
+                    <div class="cost-kpi-sub"
+                         x-text="cost.data[key].turns + ' ' + t('set.cost.turns') +
+                                  (cost.data[key].cost > 0
+                                    ? ' · $' + cost.data[key].cost.toFixed(2)
+                                    : '')"></div>
+                  </div>
+                </template>
+              </div>
+              <!-- Token-class legend explains the 4 numbers below the chart -->
+              <div class="cost-token-breakdown"
+                   x-show="cost.data.all_time.turns > 0">
+                <span class="cost-token-chip in"
+                      x-text="t('set.cost.in_tokens') + ': ' + fmtTokens(cost.data.last_30d.input_tokens)"></span>
+                <span class="cost-token-chip out"
+                      x-text="t('set.cost.out_tokens') + ': ' + fmtTokens(cost.data.last_30d.output_tokens)"></span>
+                <span class="cost-token-chip cache"
+                      x-text="t('set.cost.cache_tokens') + ': ' + fmtTokens(cost.data.last_30d.cache_read_tokens)"></span>
+              </div>
+
+              <!-- Per-day bar chart: stacked input + cache (visual hint of cache hit rate) -->
+              <div class="cost-block-title" x-text="t('set.cost.by_day')"></div>
+              <div class="cost-bars">
+                <template x-for="d in cost.data.by_day" :key="d.date">
+                  <div class="cost-bar"
+                       :title="`${d.date}: in=${fmtTokens(d.input_tokens)} out=${fmtTokens(d.output_tokens)} cache_read=${fmtTokens(d.cache_read_tokens)} · ${d.turns} turns · $${d.cost.toFixed(4)}`">
+                    <div class="cost-bar-fill"
+                         :style="`height: ${costBarHeight(totalTokens(d))}%`"></div>
+                    <div class="cost-bar-label" x-text="d.date.slice(5)"></div>
+                  </div>
+                </template>
+              </div>
+
+              <!-- Per-model breakdown — tokens primary, cost secondary -->
+              <div class="cost-block-title" x-text="t('set.cost.by_model')"></div>
+              <div class="cost-models">
+                <template x-for="m in cost.data.by_model" :key="m.model">
+                  <div class="cost-model-row">
+                    <div class="cost-model-name" x-text="m.model"></div>
+                    <div class="cost-model-bar-track">
+                      <div class="cost-model-bar-fill"
+                           :style="`width: ${costModelPct(totalTokens(m))}%`"></div>
+                    </div>
+                    <div class="cost-model-amount"
+                         x-text="fmtTokens(totalTokens(m)) + ' · ' + m.turns + 'x' + (m.cost > 0 ? ' · $' + m.cost.toFixed(2) : '')"></div>
+                  </div>
+                </template>
+              </div>
+              <div class="settings-hint" style="margin-top: 12px;"
+                   x-text="t('set.cost.cost_note')"></div>
+            </div>
+          </template>
+        </div>
+
+        <div class="settings-section" data-page="defaults"
+             x-show="isWideScreen || settings.activePage === 'defaults'">
           <div class="settings-section-title" x-text="t('set.sec.defaults')"></div>
           <div class="settings-row">
             <label x-text="t('set.label.default_model')"></label>
@@ -1717,9 +2266,15 @@ window.addEventListener("error", e => {
               <option value="plan">plan</option>
             </select>
           </div>
+          <div class="settings-hint warn"
+               x-show="settings.draftDefaults.permission === 'bypassPermissions'"
+               x-text="lang==='zh'
+                 ? '⚠ bypass 模式下 Muse 可以读 / 改 / 删 archive 内任意文件，不会弹窗确认。仅在你充分信任当前对话内容时使用。'
+                 : '⚠ In bypass mode Muse can read / edit / delete any file under your archive without confirmation. Only use it when you fully trust what you ask.'"></div>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-page="model_params"
+             x-show="isWideScreen || settings.activePage === 'model_params'">
           <div class="settings-section-title" x-text="t('set.sec.model_params')"></div>
           <div class="settings-row">
             <label x-text="t('set.label.thinking_budget')"></label>
@@ -1737,13 +2292,15 @@ window.addEventListener("error", e => {
              does NOT round-trip through /api/settings. Vibrate works
              whenever muselab is open in this tab; push covers the
              "muselab closed, still notify" case via a service worker. -->
-        <div class="settings-section">
+        <div class="settings-section" data-page="notification"
+             x-show="isWideScreen || settings.activePage === 'notification'">
           <div class="settings-section-title"
                x-text="lang==='zh' ? '通知' : 'Notifications'"></div>
-          <div class="settings-hint"
-               x-text="lang==='zh'
-                 ? '定时任务运行完成时的提醒方式。每台设备独立设置。'
-                 : 'How you get pinged when a scheduled task finishes. Per-device.'"></div>
+
+          <!-- Per-device (localStorage) — controls how THIS browser/device
+               reacts when push arrives. -->
+          <div class="settings-subtitle"
+               x-text="lang==='zh' ? '本设备' : 'This device'"></div>
           <div class="settings-row">
             <label x-text="lang==='zh' ? '完成时震动（前台）' : 'Vibrate on completion (foreground)'"></label>
             <label class="switch">
@@ -1764,9 +2321,38 @@ window.addEventListener("error", e => {
                x-text="lang==='zh'
                  ? '已开启：浏览器会弹通知 + 震动。需要把 muselab 添加到主屏 (PWA) 才能在 iOS 上后台收推送。'
                  : 'Enabled — browser shows a notification + vibrates. iOS requires adding muselab to home screen (PWA) for background push.'"></div>
+
+          <!-- Server-side gates — control which event classes muselab even
+               sends to your devices. Saved with the rest of /api/settings. -->
+          <div class="settings-subtitle"
+               style="margin-top: 16px;"
+               x-text="lang==='zh' ? '服务端推送开关' : 'Server-side push gates'"></div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '关掉对应分类后，muselab 后端就不会再为该类事件发推送（独立控制）。'
+                 : 'Disabling a class stops the backend from sending pushes of that class entirely.'"></div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '⏰ 定时任务完成' : '⏰ Scheduled task done'"></label>
+            <label class="switch">
+              <input type="checkbox" x-model="settings.draftParams.notify_scheduled" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '💬 普通会话回复完成' : '💬 Normal chat turn done'"></label>
+            <label class="switch">
+              <input type="checkbox" x-model="settings.draftParams.notify_normal" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '这两个开关需要点底部「保存」才生效。'
+                 : 'These two need clicking Save at the bottom to take effect.'"></div>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-page="skills"
+             x-show="isWideScreen || settings.activePage === 'skills'">
           <div class="settings-section-title" x-text="t('set.sec.skills')"></div>
           <div class="settings-hint" x-text="t('set.skills.hint')"></div>
           <div x-show="!settings.skills.length" class="settings-empty"
@@ -1784,7 +2370,8 @@ window.addEventListener("error", e => {
           </template>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-page="mcp"
+             x-show="isWideScreen || settings.activePage === 'mcp'">
           <div class="settings-section-title" x-text="t('set.sec.mcp')"></div>
           <div class="settings-hint" x-text="t('set.mcp.hint')"></div>
 
@@ -1861,10 +2448,92 @@ window.addEventListener("error", e => {
     </div>
   </div>
 
+  <!-- ============ Keyboard cheat-sheet ============ -->
+  <!-- Triggered by `?` keypress outside any input. Lists all global
+       shortcuts so users discover them without reading the README. -->
+  <div class="modal-backdrop" x-show="cheatSheet.show"
+       @click.self="cheatSheet.show=false">
+    <div class="modal cheatsheet-modal"
+         @keydown.escape.window="cheatSheet.show=false">
+      <div class="modal-head">
+        <span class="modal-title">⌨ <span x-text="lang==='zh' ? '键盘快捷键' : 'Keyboard shortcuts'"></span></span>
+        <button class="modal-close" @click="cheatSheet.show=false"
+                :title="lang==='zh' ? '关闭' : 'Close'"
+                aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <table class="cheatsheet-table">
+          <tbody>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">K</span></td>
+              <td x-text="lang==='zh' ? '命令面板（搜索文件 / 会话 / 操作）' : 'Command palette (files, sessions, actions)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">T</span></td>
+              <td x-text="lang==='zh' ? '新建会话' : 'New chat'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">W</span></td>
+              <td x-text="lang==='zh' ? '关闭当前 tab' : 'Close current tab'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">Tab</span></td>
+              <td x-text="lang==='zh' ? '下一个 tab（Shift 反向）' : 'Next tab (Shift = previous)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">1</span>–<span class="kbd">9</span></td>
+              <td x-text="lang==='zh' ? '跳到第 N 个 tab' : 'Jump to Nth tab'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">S</span></td>
+              <td x-text="lang==='zh' ? '保存当前文件（编辑模式）' : 'Save file (in edit mode)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">Enter</span></td>
+              <td x-text="lang==='zh' ? '发送消息（桌面）；移动端是换行' : 'Send (desktop); newline on mobile'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">Shift</span><span class="kbd">Enter</span></td>
+              <td x-text="lang==='zh' ? '输入框换行' : 'Newline in input'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">@</span></td>
+              <td x-text="lang==='zh' ? '在输入框引用 archive 文件（自动补全）' : 'Mention archive file in input (autocomplete)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">/</span></td>
+              <td x-text="lang==='zh' ? '在输入框开头：slash 命令（/help /compact ...）' : 'At input start: slash commands (/help /compact …)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">↑</span></td>
+              <td x-text="lang==='zh' ? '空输入框时：唤回上一条用户消息（重编辑 / 重发）' : 'In empty input: recall last user message (edit & resend)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">Esc</span></td>
+              <td x-text="lang==='zh' ? '关闭弹窗 / 取消编辑 / 停止流式' : 'Close modal / exit edit / stop stream'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">?</span></td>
+              <td x-text="lang==='zh' ? '打开这个面板' : 'Open this cheat sheet'"></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="cheatsheet-hint"
+             x-text="lang==='zh'
+               ? 'Mac 用 ⌘，Windows / Linux 用 Ctrl'
+               : 'Mac uses ⌘, Windows / Linux uses Ctrl'"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ============ Modal ============ -->
   <div class="modal-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
     <div class="modal" @keydown.escape.window="modal.cancel && modal.cancel()">
-      <div class="modal-head" x-text="modal.title"></div>
+      <div class="modal-head">
+        <span class="modal-title" x-text="modal.title"></span>
+        <button class="modal-close" @click="modal.cancel && modal.cancel()"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
       <div class="modal-body">
         <div x-text="modal.body"></div>
         <input x-show="modal.input !== null" x-model="modal.input"
@@ -1885,16 +2554,21 @@ window.addEventListener("error", e => {
        @click.self="closeScheduler()">
     <div class="modal sched-modal" @keydown.escape.window="closeScheduler()">
       <div class="modal-head">
-        ⏰ <span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span>
-        <span class="spacer"></span>
-        <button class="icon-btn sm" @click="closeScheduler()"
-                :title="lang==='zh' ? '关闭' : 'Close'">×</button>
+        <span class="modal-title">⏰ <span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span></span>
+        <button class="modal-close" @click="closeScheduler()"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body sched-body">
         <!-- Create form — labeled rows, grid-aligned, supports daily /
              weekly / monthly / once with the time picker always
-             precise to the minute. -->
-        <div class="sched-create">
+             precise to the minute. Doubles as the edit form when
+             scheduler.draft.editingId is set (see editSchedTask). -->
+        <div class="sched-create" :class="{ 'is-editing': scheduler.draft.editingId }">
+          <div class="sched-edit-banner" x-show="scheduler.draft.editingId">
+            <span x-text="(lang==='zh' ? '编辑中：' : 'Editing: ') + scheduler.draft.name"></span>
+            <button class="btn-text sm" @click="cancelEditSched()"
+                    x-text="lang==='zh' ? '取消编辑' : 'Cancel edit'"></button>
+          </div>
           <div class="sched-field">
             <label class="sched-label" x-text="lang==='zh' ? '任务名' : 'Name'"></label>
             <input class="settings-input sched-input-name"
@@ -1959,6 +2633,20 @@ window.addEventListener("error", e => {
             </div>
           </div>
 
+          <!-- Model selector — without this, draft.model stays empty
+               and the scheduler falls back to SDK default, which doesn't
+               match the user's UI model. -->
+          <div class="sched-field">
+            <label class="sched-label" x-text="lang==='zh' ? '模型' : 'Model'"></label>
+            <select class="settings-input sched-input-model"
+                    x-model="scheduler.draft.model">
+              <option value="" x-text="lang==='zh' ? '跟随默认' : 'Default'"></option>
+              <template x-for="m in availableModels" :key="m.model">
+                <option :value="m.model" x-text="m.label || m.model"></option>
+              </template>
+            </select>
+          </div>
+
           <div class="sched-field sched-field-prompt">
             <label class="sched-label" x-text="lang==='zh' ? 'Prompt' : 'Prompt'"></label>
             <textarea class="sched-create-prompt"
@@ -1973,8 +2661,13 @@ window.addEventListener("error", e => {
             <span class="sched-create-hint" x-text="lang==='zh'
                 ? '运行结果发送到自动创建的同名 session'
                 : 'Output streams into an auto-created session of the same name'"></span>
+            <button class="btn-ghost" x-show="scheduler.draft.editingId"
+                    @click="cancelEditSched()"
+                    x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
             <button class="btn-primary" @click="createSchedTask()"
-                    x-text="lang==='zh' ? '+ 添加任务' : '+ Add task'"></button>
+                    x-text="scheduler.draft.editingId
+                      ? (lang==='zh' ? '保存修改' : 'Save changes')
+                      : (lang==='zh' ? '+ 添加任务' : '+ Add task')"></button>
           </div>
         </div>
 
@@ -1987,7 +2680,10 @@ window.addEventListener("error", e => {
                x-text="lang==='zh' ? '还没有任务。在上方添加一个。'
                                    : 'No tasks yet. Add one above.'"></div>
           <template x-for="t in scheduler.tasks" :key="t.id">
-            <div class="sched-row" :class="{ disabled: !t.enabled }">
+            <div class="sched-row sched-row-clickable"
+                 :class="{ disabled: !t.enabled }"
+                 @click="openSchedTaskSession(t)"
+                 :title="lang==='zh' ? '点击打开关联 session' : 'Click to open bound session'">
               <div class="sched-row-main">
                 <div class="sched-row-name">
                   <span x-text="t.name"></span>
@@ -2002,22 +2698,26 @@ window.addEventListener("error", e => {
                         x-text="(lang==='zh' ? '下次: ' : 'next: ') + fmtSchedTime(t.next_run)"></span>
                 </div>
               </div>
-              <div class="sched-row-actions">
-                <label class="switch sm" :title="lang==='zh' ? '启用 / 暂停' : 'Enable / pause'">
+              <!-- All in-row controls .stop so they don't trigger the
+                   row-level click → openSchedTaskSession. -->
+              <div class="sched-row-actions" @click.stop>
+                <label class="switch sm" :title="lang==='zh' ? '启用 / 暂停' : 'Enable / pause'"
+                       @click.stop>
                   <input type="checkbox" :checked="t.enabled"
                          @change="toggleSchedEnabled(t)" />
                   <span class="switch-slider"></span>
                 </label>
-                <button class="icon-btn sm" @click="runSchedTaskNow(t)"
+                <button class="icon-btn sm" @click.stop="runSchedTaskNow(t)"
                         :disabled="schedRunning[t.id]"
                         :title="lang==='zh' ? '立即运行一次' : 'Run now'">
                   <svg><use href="#i-send"/></svg>
                 </button>
-                <button class="icon-btn sm" @click="openSchedTaskSession(t)"
-                        :title="lang==='zh' ? '打开关联 session' : 'Open bound session'">
-                  <svg><use href="#i-eye"/></svg>
+                <button class="icon-btn sm" @click.stop="editSchedTask(t)"
+                        :class="{ active: scheduler.draft.editingId === t.id }"
+                        :title="lang==='zh' ? '编辑' : 'Edit'">
+                  <svg><use href="#i-edit"/></svg>
                 </button>
-                <button class="icon-btn sm" @click="deleteSchedTask(t)"
+                <button class="icon-btn sm" @click.stop="deleteSchedTask(t)"
                         :title="lang==='zh' ? '删除' : 'Delete'">
                   <svg><use href="#i-trash"/></svg>
                 </button>
@@ -2035,14 +2735,17 @@ window.addEventListener("error", e => {
                x-text="lang==='zh' ? '还没有运行记录。'
                                    : 'No runs yet.'"></div>
           <template x-for="(h, i) in scheduler.history" :key="i">
-            <div class="sched-hist-row" :class="{ err: !h.ok }">
+            <div class="sched-hist-row sched-row-clickable"
+                 :class="{ err: !h.ok }"
+                 @click="openSchedTaskSession(h)"
+                 :title="lang==='zh' ? '点击打开对应会话查看完整回复' : 'Click to open the bound session for the full reply'">
               <div class="sched-hist-head">
                 <span class="sched-hist-name" x-text="h.task_name"></span>
                 <span class="sched-hist-time" x-text="fmtSchedTime(h.ts)"></span>
                 <button class="btn-text sm sched-hist-retry"
                         x-show="!h.ok && scheduler.tasks.find(t => t.id === h.task_id)"
                         :disabled="schedRunning[h.task_id]"
-                        @click="retrySchedHistory(h)"
+                        @click.stop="retrySchedHistory(h)"
                         x-text="schedRunning[h.task_id]
                           ? (lang==='zh' ? '执行中…' : 'Running…')
                           : (lang==='zh' ? '重试' : 'Retry')"></button>
@@ -2077,10 +2780,10 @@ window.addEventListener("error", e => {
                type="text"
                x-model="palette.query"
                @input="palette.activeIndex = 0"
-               @input.debounce.300ms="_fetchPaletteFiles()"
+               @input.debounce.300ms="_fetchPaletteFiles(); _fetchPaletteMessages();"
                :placeholder="lang==='zh'
-                 ? '搜索动作 / 会话 / 文件（含整个 archive）…'
-                 : 'Search actions / sessions / files (whole archive)…'"
+                 ? '搜索动作 / 会话 / 文件 / 历史消息…'
+                 : 'Search actions / sessions / files / messages…'"
                autocomplete="off"
                autocorrect="off"
                autocapitalize="off"
@@ -2097,6 +2800,7 @@ window.addEventListener("error", e => {
                   :class="'type-' + item.type"
                   x-text="item.type === 'act' ? (lang==='zh' ? '操作' : 'act')
                         : item.type === 'session' ? (lang==='zh' ? '会话' : 'sess')
+                        : item.type === 'message' ? (lang==='zh' ? '消息' : 'msg')
                         : (lang==='zh' ? '文件' : 'file')"></span>
             <span class="cmd-palette-item-label" x-text="item.label"></span>
             <span class="cmd-palette-item-hint" x-text="item.hint || ''"></span>

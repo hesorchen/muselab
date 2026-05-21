@@ -1,150 +1,172 @@
-# 加新 LLM provider 到 muselab
+# Adding a new LLM provider
 
-muselab 不锁 Claude，只要厂商提供 **Anthropic Messages API 兼容端点**，就能直连，
-**3 步、3 行配置、~5 分钟** 完成。所有 Claude SDK 的能力（Read/Edit/Bash/Grep/MCP/
-Skills/CLAUDE.md auto-load）都自动跨厂可用。
+> [简体中文](add-provider_zh.md)
 
-## 前提：确认厂商有 Anthropic 兼容端点
+muselab is not Claude-locked. Any vendor that exposes an
+**Anthropic Messages API-compatible endpoint** can be wired in with
+**3 steps, 3 lines of config, ~5 minutes**. All Claude SDK capabilities
+(Read/Edit/Bash/Grep/MCP/Skills/CLAUDE.md auto-load) work across vendors
+automatically.
 
-去厂商文档搜 "Anthropic compatible" / "anthropic-compatible" / "/anthropic"。
-2026 年起，国产 LLM 大多支持，目前已知：
+## Prerequisite: check whether the vendor has an Anthropic-compatible endpoint
 
-| 厂商 | Anthropic 端点 | 状态 |
-|------|---------------|------|
-| DeepSeek | `https://api.deepseek.com/anthropic` | ✅ 内置 |
-| 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` | ✅ 内置 |
-| MiniMax | `https://api.minimaxi.com/anthropic` | ✅ 内置 |
-| 小米 MiMo | – | ❌ 暂只支持 OpenAI 协议 |
-| Qwen | – | ❌ 暂只支持 OpenAI 协议 |
+Search the vendor's docs for "Anthropic compatible" / "anthropic-compatible"
+/ "/anthropic". Since 2026, most Chinese LLM vendors support it. Currently
+known:
 
-**没 Anthropic 端点的厂商**目前不支持。可以推动厂商出兼容端点，或考虑用
-[claude-code-router](https://github.com/musistudio/claude-code-router) 做协议翻译
-（损耗大、需要额外进程）。
+| Vendor | Anthropic endpoint | Status |
+|--------|-------------------|--------|
+| DeepSeek | `https://api.deepseek.com/anthropic` | ✅ built-in |
+| 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` | ✅ built-in |
+| MiniMax | `https://api.minimaxi.com/anthropic` | ✅ built-in |
+| Xiaomi MiMo | – | ❌ OpenAI protocol only |
+| Qwen | – | ❌ OpenAI protocol only |
+
+**Vendors without an Anthropic endpoint** aren't supported. Either push the
+vendor to ship a compatible endpoint, or use
+[claude-code-router](https://github.com/musistudio/claude-code-router) as a
+protocol translator (lossy; needs an extra process).
 
 ---
 
-## 加新 provider 的 3 步
+## The 3 steps
 
-### 1. 在 `backend/endpoints.py` 加一条 catalog
+### 1. Add a catalog entry in `backend/endpoints.py`
 
 ```python
-# backend/endpoints.py — CATALOG 元组中追加
+# backend/endpoints.py — append to the CATALOG tuple
 Provider(
-    prefix="qwen-",                                    # 模型名前缀（dispatcher 用）
-    base_url="https://dashscope.aliyuncs.com/anthropic",  # 厂商 Anthropic 端点
-    env_key="DASHSCOPE_API_KEY",                       # 对应的 .env key
-    display="Qwen",                                    # UI 分组名
-    models=("qwen-3.6-max", "qwen-3.6-plus"),          # 暴露在模型下拉里的具体型号
+    prefix="qwen-",                                       # model name prefix (dispatcher uses this)
+    base_url="https://dashscope.aliyuncs.com/anthropic",  # vendor's Anthropic endpoint
+    env_key="DASHSCOPE_API_KEY",                          # corresponding .env key
+    display="Qwen",                                       # UI group name
+    models=("qwen-3.6-max", "qwen-3.6-plus"),             # specific models exposed in the dropdown
 ),
 ```
 
-### 2. 在 `.env` 里加 API key
+### 2. Add the API key in `.env`
 
 ```bash
 echo "DASHSCOPE_API_KEY=sk-xxx" >> .env
 ```
 
-或通过 Settings modal UI 填入（更安全，会自动写入并刷新 `os.environ`）。
+Or paste it via the Settings modal UI (safer — it writes to file and
+refreshes `os.environ` for you).
 
-### 3. 重启服务
+### 3. Restart the service
 
 ```bash
 # Docker
 docker compose restart
 
-# 或原生
-# kill 旧 uvicorn 进程, 重新 uv run uvicorn ...
+# Or native
+# kill the old uvicorn, then uv run uvicorn ...
 ```
 
-完成。浏览器**模型下拉**会自动多出 "Qwen" 分组。选了立刻能聊 + 用工具。
+Done. The browser **model dropdown** will show a new "Qwen" group. Pick it
+and you can chat + use tools immediately.
 
 ---
 
-## 工作原理
+## How it works
 
 ```
-muselab 收到 chat 请求
+muselab receives a chat request
   ↓
-chat.py 看 model 前缀
-  ├── claude-*  → ClaudeSDKClient (无 env override)
-  │              → 默认走 Anthropic API + 你的 Pro OAuth 凭据
+chat.py looks at the model prefix
+  ├── claude-*  → ClaudeSDKClient (no env override)
+  │              → goes to Anthropic API via your Pro OAuth credentials
   │
-  └── 匹配 catalog 的前缀 → ClaudeSDKClient (env override)
-                          → 替换 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
-                          → SDK 以为还在跟 Anthropic 说话，实际打到厂商端点
-                          → 厂商端点把 Anthropic 协议翻成自己的，返回时翻回来
+  └── matches a catalog prefix → ClaudeSDKClient (env override)
+                                → swaps ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+                                → SDK thinks it's still talking to Anthropic,
+                                  the request actually hits the vendor endpoint
+                                → vendor endpoint translates Anthropic protocol
+                                  to its own, and back on the response
 ```
 
-**关键点**：muselab 一行业务代码都不用改，SDK 也不用知道。env override 在每次
-`get_client(session_id, model, ...)` 调用时通过 `ClaudeAgentOptions(env=...)`
-传给底层 claude CLI 子进程。
+**Key point**: muselab business code stays untouched, the SDK doesn't know
+either. The env override is passed to the underlying claude CLI subprocess
+via `ClaudeAgentOptions(env=...)` on each `get_client(session_id, model, ...)`
+call.
 
 ---
 
-## 测试新 provider
+## Testing a new provider
 
 ```bash
-# 1. 验证 endpoint 可达
-curl https://你的厂商.com/anthropic/v1/messages -X POST \
+# 1. Verify the endpoint reachable
+curl https://your-vendor.com/anthropic/v1/messages -X POST \
   -H "Authorization: Bearer sk-xxx" \
   -H "Content-Type: application/json" \
-  -d '{"model": "你的模型", "messages": [{"role":"user","content":"hi"}], "max_tokens": 50}'
+  -d '{"model": "your-model", "messages": [{"role":"user","content":"hi"}], "max_tokens": 50}'
 
-# 2. 在 muselab UI 里选这个模型，发条消息
-# 3. 检查是否触发工具调用（让它 "Read README.md"）
+# 2. In the muselab UI, pick this model and send a message
+# 3. Check whether tool calls fire (ask it to "Read README.md")
 ```
 
-如果**对话能通但工具不行**，多半是厂商的 Anthropic 兼容端点没实现 tool use。
-可向厂商提 issue，或暂时只把它当"纯对话"用。
+If **chat works but tool calls don't**, the vendor's Anthropic-compatible
+endpoint likely hasn't implemented tool use. File an issue with them, or
+treat it as a chat-only provider for now.
 
 ---
 
-## 已知踩坑
+## Known gotchas
 
-### DeepSeek thinking 模式
+### DeepSeek thinking mode
 
-DeepSeek 推理模型（`deepseek-reasoner`）要求把 `reasoning_content` 在下一轮回传。
-SDK 走 Anthropic 协议时，这个映射由 DeepSeek 自家端点处理；如果未来端点行为变化
-导致丢上下文，临时方案是关掉 thinking 或切到 chat 模型。
+DeepSeek reasoning models (`deepseek-reasoner`) require `reasoning_content`
+to be echoed back on the next turn. When SDK talks the Anthropic protocol,
+that mapping is handled by DeepSeek's endpoint; if that ever breaks
+context across turns, the workaround is to disable thinking or switch to
+a chat model.
 
-### Pro OAuth 不会被影响
+### Pro OAuth stays untouched
 
-只有 catalog 命中前缀的模型才会被 env override。Claude 模型 (`claude-*`) **不会**走
-override，继续用 `claude login` 的 OAuth → 不付 API key 费。
+Only models whose prefix matches a catalog entry get the env override.
+Claude models (`claude-*`) **don't** go through override — they keep using
+`claude login`'s OAuth, so you never pay API fees.
 
-### 测试当然要补
+### Don't forget tests
 
-加新 provider 时，请在 `tests/test_endpoints.py` 里加：
+When adding a provider, please add to `tests/test_endpoints.py`:
 
 ```python
 @pytest.mark.parametrize("model,expected_host", [
-    ("qwen-3.6-max", "dashscope.aliyuncs.com"),   # 你的厂
+    ("qwen-3.6-max", "dashscope.aliyuncs.com"),   # your vendor
 ])
 def test_provider_routing_correct(monkeypatch, model, expected_host):
     ep = _reload_endpoints(monkeypatch, {})
     assert expected_host in ep.lookup(model).base_url
 ```
 
-跑 `make test` 保证没破回归。
+Run `make test` to make sure nothing regressed.
 
 ---
 
 ## FAQ
 
-**Q: 厂商要先充值才能用？**  
-A: 是。muselab 不替你管账。Pro OAuth 才走订阅免费配额。
+**Q: Does the vendor require a top-up first?**
+A: Yes. muselab doesn't manage your bills. Only Pro OAuth uses the
+subscription's included quota.
 
-**Q: 能让一个 session 跨厂连续聊吗？**  
-A: 可以。session 是 model-agnostic，切下拉就生效，历史不丢。但跨厂时新模型看不到
-对方厂特有的内部 tool_use 上下文，纯文字对话没问题。
+**Q: Can one session switch vendors mid-conversation?**
+A: Yes. Sessions are model-agnostic — switching the dropdown takes effect
+immediately, history is preserved. But cross-vendor switches mean the new
+model can't see the other vendor's internal `tool_use` context. Plain text
+chat works fine.
 
-**Q: catalog 里 `prefix` 和 `models` 重不重？**  
-A: `prefix` 是 dispatcher 匹配用的；`models` 是 UI 下拉显示的具体型号。`models`
-里每个值必须以 `prefix` 开头。
+**Q: Are `prefix` and `models` redundant in the catalog?**
+A: `prefix` is what the dispatcher matches on; `models` is the explicit
+list shown in the UI dropdown. Every value in `models` must start with
+`prefix`.
 
-**Q: 改 catalog 后要不要重启？**  
-A: 要。它是 Python 模块的常量，热重载是另一个工程问题。
+**Q: Do I need to restart after editing the catalog?**
+A: Yes. It's a Python module-level constant; hot reload is a separate
+engineering problem.
 
-**Q: 想做厂商间智能路由（如 plan task 走 Sonnet、code task 走 DeepSeek）？**  
-A: 不建议在 muselab 里做。该用 [claude-code-router](https://github.com/musistudio/claude-code-router)
-独立处理。muselab 的设计哲学是"thin layer + 用户自己选模型"。
+**Q: Smart routing between vendors (e.g. plan tasks → Sonnet, code → DeepSeek)?**
+A: Don't do it inside muselab.
+[claude-code-router](https://github.com/musistudio/claude-code-router) is
+the right place. muselab's design philosophy is "thin layer + user picks
+the model".

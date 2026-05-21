@@ -155,8 +155,11 @@ html, body {
 /* #loading uses .splash styles below — no separate rule needed */
 #jserr {
   display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
-  padding: 16px 20px; background: white; color: var(--c-danger);
+  padding: 16px 20px;
+  background: var(--c-bg-0); color: var(--c-danger);
+  border-bottom: 2px solid var(--c-danger);
   font-family: var(--font-mono); white-space: pre-wrap;
+  box-shadow: var(--shadow-md);
 }
 
 /* ==========================================================================
@@ -353,25 +356,33 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   display: none;
   position: fixed;
   bottom: 0; left: 0; right: 0;
-  height: 52px; z-index: 100;
+  height: 36px !important; z-index: 100;
   background: var(--c-bg-1);
   border-top: 1px solid var(--c-border);
   box-shadow: 0 -2px 8px rgba(0,0,0,0.05);
   /* iOS notch / Android gesture bar — push the buttons above the safe area
      so they're still tappable on full-screen devices. */
   padding-bottom: env(safe-area-inset-bottom);
-  height: calc(52px + env(safe-area-inset-bottom));
+  height: calc(36px + env(safe-area-inset-bottom)) !important;
+  transition: transform var(--t-base);
+  /* Keyboard-up handling is centralized on body.kb-open — see the
+     mobile @media block above for the full set (display: none on
+     tab-bar, layout grid row → 0, pane height → 100dvh). Chat
+     textarea's @focus/@blur in index.html toggle that class so the
+     iOS-PWA case (where visualViewport-based detection is defeated by
+     interactive-widget=resizes-content) still triggers the
+     handlers. */
 }
 .mobile-tab-bar button {
-  flex: 1; display: flex; flex-direction: column;
+  flex: 1; display: flex; flex-direction: row;
   align-items: center; justify-content: center;
-  gap: 2px; background: transparent; border: none;
-  color: var(--c-fg-3); font-size: var(--fs-xs);
-  cursor: pointer; padding: 4px 0;
+  gap: 4px; background: transparent; border: none;
+  color: var(--c-fg-3); font-size: 11px;
+  cursor: pointer; padding: 0;
   transition: color var(--t-fast);
 }
 .mobile-tab-bar button.active { color: var(--c-accent); }
-.mobile-tab-bar button .icon svg { width: 22px; height: 22px; }
+.mobile-tab-bar button .icon svg { width: 14px; height: 14px; }
 
 /* ==========================================================================
    Mobile responsive: < 900px collapses the 3-column grid into a single
@@ -381,7 +392,8 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   /* Force single-column grid regardless of inline :style="layoutStyle()". */
   .layout {
     grid-template-columns: 1fr !important;
-    grid-template-rows: 1fr calc(52px + env(safe-area-inset-bottom)) !important;
+    grid-template-rows: 1fr calc(36px + env(safe-area-inset-bottom)) !important;
+    transition: grid-template-rows var(--t-base);
   }
   /* Hide every pane by default; show only the one matching the active tab. */
   .layout .pane { display: none; }
@@ -395,8 +407,8 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   /* Pane height: viewport - tab bar. dvh for mobile Safari address-bar collapse;
      safe-area-inset-bottom for the notch / gesture-bar on iOS / Android. */
   .pane {
-    height: calc(100vh - 52px);
-    height: calc(100dvh - 52px - env(safe-area-inset-bottom));
+    height: calc(100vh - 36px);
+    height: calc(100dvh - 36px - env(safe-area-inset-bottom));
   }
   /* Chat textarea / context meter / session bar sometimes overflow on tiny
      screens — trim padding so they fit. Font sizes here intentionally
@@ -418,23 +430,28 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
     min-height: 32px;
   }
   .chat-tab {
-    max-width: 140px; min-width: 56px;
+    /* Bumped from 56-140 to 90-160 so the name region has enough room
+       even when × is shown — see below. ~50-120px of name = 3-7 中文字
+       comfortably + ellipsis, no more "name region collapses to 6px
+       and every tap lands on a button". */
+    max-width: 160px; min-width: 90px;
     padding: 0 4px 0 8px;
     font-size: var(--fs-xs);
     gap: 4px;
   }
   .chat-tab-name { padding: 6px 0; }
-  /* Touch devices have no hover — keep × always visible so the user can
-     actually close a tab. */
-  .chat-tab-close { opacity: 0.9; width: 26px; height: 26px; }
+  /* Mobile: keep × close button (24px, right edge). kebab ⋮ is hidden
+     instead (set below) — its menu items (rename / edit prompt /
+     export / delete) are all reachable from the picker (📁 button)
+     which is the mobile-primary navigation surface anyway. Net effect:
+     each chat-tab has just two zones — large name (tap to switch) +
+     small × (tap to close), no overlap. */
+  .chat-tab-close { display: flex; opacity: 0.7; width: 24px; height: 24px; }
   .chat-tab-close:active { opacity: 1; background: var(--c-bg-3); }
-  /* Show the kebab on mobile (replaces desktop right-click for opening
-     the per-tab action menu). */
-  .chat-tab-kebab {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 24px; height: 26px;
-  }
-  .chat-tab-kebab:active { background: var(--c-bg-3); }
+  /* Kebab is hidden on mobile — its actions (rename / edit prompt / export
+     / delete) are all reachable from the picker (📁), the mobile-primary
+     navigation surface. Avoids competing with × for the right edge. */
+  .chat-tab-kebab { display: none; }
   .session-picker-kebab {
     display: inline-flex; align-items: center; justify-content: center;
     width: 32px; height: 32px;
@@ -466,11 +483,137 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 
   /* Chat input area — keep input large enough to tap, send button reachable */
   .chat-input-wrap { padding: 8px; }
+  /* Per-message action bar (Copy etc.) — also enforced by the mobile
+     sentinel block at end-of-file, which guarantees source-order win
+     against the global `.msg-actions { display: flex }` rule. */
+  .msg-actions { display: none; }
+  /* Markdown rendered inside chat bubbles — desktop h1=1.7em/h2=1.35em is too
+     loud on a 360px-wide screen; one heading line eats the whole viewport.
+     Trim heading scale and code-block padding so a multi-section reply
+     (heading + table + paragraph) stays scannable on phone. */
+  .bubble .markdown h1 { font-size: 1.4em; }
+  .bubble .markdown h2 { font-size: 1.2em; }
+  .bubble .markdown h3 { font-size: 1.08em; margin-top: 1em; }
+  .bubble .markdown pre { padding: var(--sp-2) var(--sp-3); font-size: 12px; }
+  .bubble .markdown th, .bubble .markdown td { padding: 4px 8px; }
+  /* Bubble itself: slimmer horizontal padding so text starts closer to the
+     viewport edge, gaining a few extra characters per line. */
+  .msg.assistant .bubble, .msg.user .bubble { padding: 8px 11px; }
+
+  /* ============================================================
+     Pane head decluttering — desktop has 5–7 buttons per pane head
+     because mouse users have horizontal room. On a 360px phone the
+     same buttons crowd the title out and split the chrome onto
+     two lines. Surgical strikes:
+     ============================================================ */
+
+  /* Files pane head: drop upload / mkdir / hidden-toggle / refresh /
+     theme. User asks Muse for new dirs; pull-to-refresh covers reload
+     (planned); theme moves to Settings. Title stays. */
+  .pane.files .pane-head .icon-btn { display: none; }
+
+  /* Preview pane head on mobile: keep @-mention + download + reload
+     (marker class `.preview-keep-mobile`). Edit/save is desktop-only —
+     no on-phone code editing; collapse-left / collapse-right are
+     meaningless in single-pane mobile mode. Reload was added back
+     after user feedback — when Muse rewrites a file mid-conversation
+     the basename auto-refresh covers the common case, but external
+     edits (`git pull`, another device's edit) still need a manual
+     reload tap. */
+  .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
+  .pane.preview .pane-head .btn-primary { display: none; }
+
+  /* Chat toolbar: keep attach + model + send. Permission / effort /
+     ctx-ring are low-frequency or have other entry points (Settings,
+     the slim ctx-progress bar above the toolbar). */
+  .chat-toolbar-permission,
+  .chat-toolbar-effort,
+  .chat-toolbar-ring { display: none; }
+
+  /* Chat tab strip: horizontal-scroll session list eats vertical
+     room and is fiddly on touch. Replace with a single "current
+     session ▾" button that opens the history picker (same dropdown
+     as the desktop folder-icon button). User picks any session from
+     the bottom-anchored list. */
+  /* Mobile: keep the horizontal tab strip visible so tapping a session
+     tab switches in ONE tap, instead of forcing chat-tab-current → picker
+     → row (two taps). The strip already supports horizontal scroll for
+     overflow. chat-tab-current is hidden — it's redundant once the strip
+     is back. */
+  .chat-tabs-list {
+    display: flex;
+    /* Tighter tabs on narrow screens — desktop's 160-180px tab is too wide. */
+    max-width: 100%;
+  }
+  /* NOTE: specificity (.chat-tabs-list .chat-tab) beats the bare .chat-tab
+     block above; keep min/max-width and padding aligned with L437 so the
+     name region stays wide enough for the × button not to encroach on the
+     tap area. */
+  .chat-tabs-list .chat-tab {
+    min-width: 90px; max-width: 160px;
+    padding: 0 4px 0 8px;
+  }
+  .chat-tab-current { display: none; }
+
+  /* Empty-state keyboard hints — also enforced by the mobile sentinel
+     block at end-of-file (source-order beats the global flex rule). */
+  .brand-tips { display: none; }
+
+  /* Scheduler form on mobile: stack label above control (was 78px |
+     1fr grid that left the input column ~150px wide on a 360 screen).
+     Frequency buttons become segment-control: spread across the row,
+     equal width — looks like iOS/Android native frequency pickers. */
+  .sched-field {
+    grid-template-columns: 1fr;
+    row-gap: 4px;
+  }
+  .sched-field .sched-label {
+    font-size: var(--fs-sm); color: var(--c-fg-2);
+  }
+  .sched-freq {
+    display: flex; width: 100%;
+  }
+  .sched-freq-btn {
+    flex: 1; padding: 8px 4px; text-align: center;
+  }
+  .sched-weekdays { gap: 3px; }
+  .sched-weekday { width: 32px; height: 32px; font-size: var(--fs-xs); }
+  .sched-input-name, .sched-input-model, .sched-input-date { width: 100%; max-width: none; }
+  .sched-time-input { width: 56px; }
+  .sched-create-prompt { width: 100%; min-height: 80px; }
+  .sched-create-foot { flex-wrap: wrap; gap: 8px; }
+  .sched-create-foot .btn-primary,
+  .sched-create-foot .btn-ghost { flex: 1 1 auto; min-width: 80px; }
+  .sched-create-hint { font-size: var(--fs-xs); flex-basis: 100%; }
+}
+
+/* Desktop default — current-session button is mobile-only. */
+.chat-tab-current { display: none; }
+.chat-tab-current {
+  align-items: center; gap: 6px;
+  background: var(--c-bg-1); border: 0; border-right: 1px solid var(--c-border);
+  padding: 0 10px;
+  color: var(--c-fg-1); font-size: var(--fs-sm); font-weight: var(--fw-medium);
+  cursor: pointer;
+  min-width: 0; max-width: 60vw; flex: 1;
+  height: 100%;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.chat-tab-current:active { background: var(--c-bg-2); }
+.chat-tab-current-name {
+  flex: 1; min-width: 0;
+  text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-tab-current-chev {
+  color: var(--c-fg-3); font-size: 12px; flex-shrink: 0;
 }
 @media (hover: none) {
-  /* On touch (incl. tablets with hover:none) the × button should be visible
-     without requiring hover. Mirrors the same rule we added under 900px. */
-  .chat-tab-close { opacity: 0.6; }
+  /* Touch devices: × visible without hover. Sizing handled in the
+     900px mobile block above (24×24 hit target, kebab hidden so name
+     + × split the tab cleanly). */
+  .chat-tab-close { opacity: 0.7; }
   .chat-tab-close:active { opacity: 1; }
 }
 @media (max-width: 480px) {
@@ -483,22 +626,258 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 
 /* ===== Mobile virtual keyboard handling =====
    When the on-screen keyboard is up, body gets `.kb-open` from
-   _initMobileKeyboardWatch (see app.js). Hide the bottom tab bar so the
-   chat-input + send button get visible real estate, and absorb the iOS
-   safe-area-inset-bottom so notched devices don't clip the send row. */
+   _initMobileKeyboardWatch (see app.js). The `--kb-inset` CSS variable
+   is the keyboard's pixel height (visualViewport-derived in JS).
+   Subtract it from the layout's height so the WHOLE app shrinks above
+   the keyboard — every bottom-anchored element (chat-input, mobile-
+   tab-bar) naturally lifts. iOS Safari's `interactive-widget=resizes-
+   content` meta SHOULD do this automatically on 16.4+ but is unreliable
+   in PWA standalone mode; this is the JS-driven fallback. */
+body.kb-open .layout {
+  /* 100dvh on iOS doesn't account for the on-screen keyboard — that's
+     what visualViewport tracks. Subtract --kb-inset so the layout box
+     ends right at the keyboard's top edge. The 100vh fallback exists
+     for browsers that don't support dvh. */
+  height: calc(100vh - var(--kb-inset, 0px));
+  height: calc(100dvh - var(--kb-inset, 0px));
+  grid-template-rows: calc(100vh - var(--kb-inset, 0px));
+  grid-template-rows: calc(100dvh - var(--kb-inset, 0px));
+  transition: height 120ms ease-out;
+}
+body.kb-open .mobile-tab-bar { display: none; }
+/* Safety net: even on browsers where layout shrink fails, scrollIntoView
+   on focus (see app.js onTextareaFocus) needs the textarea to have
+   actual room below to scroll-stop against. scroll-margin-bottom keeps a
+   gap so the bottom-most position lands above the keyboard, not flush
+   against it (cramped one-line height where you can't see what you
+   typed). */
+.chat-input-textarea {
+  scroll-margin-bottom: 16px;
+}
+
 @supports (padding-bottom: env(safe-area-inset-bottom)) {
   .chat-input {
     padding-bottom: calc(8px + env(safe-area-inset-bottom));
   }
+  /* When keyboard is up, the safe-area inset is irrelevant (the keyboard
+     covers more than the home-bar area). Zero out the bottom padding so
+     the input sits as compactly as possible. */
+  body.kb-open .chat-input {
+    padding-bottom: 8px;
+  }
 }
-body.kb-open .mobile-tab-bar { display: none !important; }
-body.kb-open .layout {
-  /* Drop the 52px tab-bar row so the chat pane gets that space back when
-     the keyboard squeezes us. */
-  grid-template-rows: 1fr 0 !important;
+/* Message outline modal — full-overlay panel listing every user prompt in
+   the current session. Tap a row to scroll chat to that message + flash
+   highlight. Entry point: chat-tabs-actions ☰ button. Desktop centers it;
+   mobile slides as bottom sheet. */
+.msg-outline-modal {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
 }
-body.kb-open .pane {
-  height: calc(100dvh) !important;
+.msg-outline-panel {
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  width: 100%; max-width: 520px;
+  max-height: 80vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.msg-outline-head {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-1);
+  font-weight: var(--fw-semibold);
+  border-bottom: 1px solid var(--c-border);
+  flex-shrink: 0;
+}
+.msg-outline-label { flex: 1; }
+.msg-outline-close {
+  background: transparent; border: none; cursor: pointer;
+  color: var(--c-fg-3); font-size: 22px; line-height: 1;
+  padding: 0 6px;
+}
+.msg-outline-close:hover { color: var(--c-fg-0); }
+.msg-outline-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.msg-outline-list li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid var(--c-border);
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+.msg-outline-list li:last-child { border-bottom: none; }
+.msg-outline-list li:hover {
+  background: var(--c-bg-2);
+  border-left-color: var(--c-accent);
+}
+.msg-outline-idx {
+  color: var(--c-fg-3);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  min-width: 28px;
+}
+.msg-outline-text { color: var(--c-fg-0); min-width: 0; }
+.msg-outline-time {
+  color: var(--c-fg-3);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+.msg-outline-empty {
+  padding: 28px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+
+/* Mobile: bottom sheet style — slide from bottom, rounded top corners. */
+@media (max-width: 720px) {
+  .msg-outline-modal {
+    align-items: flex-end;
+    padding: 0;
+  }
+  .msg-outline-panel {
+    max-width: 100%;
+    max-height: 75vh;
+    border-radius: 16px 16px 0 0;
+    border-bottom: none;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* Outline button — desktop sits in chat-tabs-actions strip. Mobile
+   uses the floating button above the bottom nav instead (see below). */
+.chat-tab-outline {
+  background: transparent; border: 1px solid var(--c-border);
+  color: var(--c-fg-2); cursor: pointer;
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color var(--t-fast), background var(--t-fast),
+              border-color var(--t-fast);
+}
+.chat-tab-outline:hover {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+@media (max-width: 900px) {
+  .chat-tab-outline { display: none; }
+}
+
+/* Outline FAB inside the chat pane — paired with .jump-bottom (same
+   container, same right edge, same color, same visibility rule). Sits
+   46px above jump-bottom so the two stack vertically. Both appear/
+   disappear together via x-show="!atBottom" in the markup. */
+.chat-outline-fab {
+  position: absolute; bottom: 64px; right: 18px;
+  width: 36px; height: 36px; border-radius: var(--r-full);
+  background: var(--c-accent); color: white; border: 0;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-lg); cursor: pointer;
+  transition: transform var(--t-fast), background var(--t-fast);
+  z-index: 5;
+}
+.chat-outline-fab:hover {
+  background: var(--c-accent-hover);
+  transform: scale(1.05);
+}
+.chat-outline-fab svg { width: 18px; height: 18px; }
+
+/* Keyboard-up: bottom-nav stays visible per user preference (consistent
+   navigation > a few extra pixels of chat area). chat-input padding above
+   already accounts for the safe-area inset. */
+
+/* Mobile preview body — fix horizontal jitter when scrolling markdown with
+   long URLs / unbroken strings. Default .preview-body uses `overflow: auto`
+   which lets the X-axis scroll appear, and the scrollbar pop in/out as
+   content reflows causes a 1-2px left-right shift each frame. On phones we
+   never want horizontal scroll at the body level (wide elements like <pre>
+   / <table> handle their own internal scroll), so hide it hard. */
+@media (max-width: 900px) {
+  .pane.preview .preview-body {
+    overflow-x: hidden;
+  }
+  .pane.preview .markdown {
+    padding: var(--sp-4) var(--sp-4);
+    /* Long URLs / hashes / paths must wrap, not push the line past the
+       viewport (which would re-trigger horizontal overflow even with
+       overflow-x: hidden above, via layout shifts on each frame). */
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
+/* Mobile preview immersive mode — toggled by onPreviewScroll when the user
+   scrolls down ≥30px (markdown / text preview), or by the floating toggle
+   button (iframe / pdf / image, where scroll events don't cross the sandbox
+   boundary). Hides preview pane's top header + file-tab bar, slides the
+   bottom mobile-tab-bar out of view, AND reclaims the row + pane height the
+   bar used to occupy — otherwise the bar disappears but the pane stays
+   42px short and the content area shows a blank strip at the bottom. */
+@media (max-width: 900px) {
+  body.preview-immersive .pane.preview .pane-head,
+  body.preview-immersive .pane.preview .tab-bar {
+    display: none;
+  }
+  body.preview-immersive .mobile-tab-bar {
+    transform: translateY(100%);
+  }
+  body.preview-immersive .layout {
+    grid-template-rows: 1fr 0 !important;
+  }
+  body.preview-immersive .pane.preview {
+    height: 100vh !important;
+    height: 100dvh !important;
+  }
+}
+
+/* Floating immersive toggle — mobile-only, sticky bottom-right of preview
+   pane. Needed because iframe / pdf / image preview don't emit scroll
+   events to the parent, so the scroll-direction auto-toggle can only fire
+   for markdown / text. Tap to enter/exit immersive on those modes. */
+.preview-immersive-toggle { display: none; }
+@media (max-width: 900px) {
+  .pane.preview .preview-immersive-toggle {
+    display: flex;
+    position: fixed;
+    right: 12px;
+    bottom: calc(50px + env(safe-area-inset-bottom));
+    width: 38px; height: 38px;
+    z-index: 50;
+    border-radius: 50%;
+    background: var(--c-bg-2);
+    border: 1px solid var(--c-border);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+    color: var(--c-fg-2);
+    align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: opacity var(--t-fast), transform var(--t-fast);
+    opacity: 0.65;
+  }
+  .pane.preview .preview-immersive-toggle:hover,
+  .pane.preview .preview-immersive-toggle:active {
+    opacity: 1;
+  }
+  body.preview-immersive .pane.preview .preview-immersive-toggle {
+    bottom: calc(16px + env(safe-area-inset-bottom));
+  }
 }
 
 /* Modal sizing on mobile. Default min-width 360px / settings min-width 560px
@@ -506,19 +885,38 @@ body.kb-open .pane {
    with a small inset and cap the body height so the keyboard / safe-area
    don't clip the footer buttons. */
 @media (max-width: 720px) {
+  /* Mobile: modal goes full-screen — was using `width: 100vw - 24px` +
+     center-aligned backdrop, but with no max-height the modal could
+     grow taller than the viewport and the top/bottom got clipped
+     (Settings has 6+ sections, easily 800px on a 700px screen).
+     Stretch backdrop + flex column layout lets the body scroll
+     internally while head stays pinned. */
+  .modal-backdrop {
+    align-items: stretch; justify-content: stretch;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
   .modal {
     min-width: 0;
-    max-width: calc(100vw - 24px);
-    width: calc(100vw - 24px);
+    width: 100vw; max-width: 100vw;
+    max-height: 100dvh;
+    height: auto;
+    border-radius: 0;
+    display: flex; flex-direction: column;
   }
   .settings-modal {
     min-width: 0;
-    max-width: calc(100vw - 24px);
-    width: calc(100vw - 24px);
+    width: 100vw; max-width: 100vw;
   }
+  .modal-head { flex-shrink: 0; }
   .modal-body {
-    max-height: calc(100dvh - 200px) !important;
+    flex: 1 1 auto;
+    /* max-height enforced by end-of-file sentinel block (source-order
+       beats the inline `max-height:70vh` on .settings-modal-body). */
+    max-height: none;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
+  .modal-foot { flex-shrink: 0; }
   .modal-head, .modal-body, .modal-foot {
     padding-left: var(--sp-3); padding-right: var(--sp-3);
   }
@@ -582,6 +980,12 @@ body.kb-open .pane {
     display: inline; margin-left: 6px;
     font-size: var(--fs-xs); font-weight: var(--fw-medium);
   }
+  /* Textarea on touch: no min-height override here. The tighter
+     line-height that prevents single-line input from inflating the
+     box is set at the END of this file (alongside the iOS anti-zoom
+     rules) so it actually wins source-order against the
+     .chat-input-textarea base rule at L3033. Putting it here would
+     lose to that base, which is what the previous attempt did. */
 }
 
 .resizer {
@@ -639,6 +1043,35 @@ body.kb-open .pane {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   overflow: hidden;
+  /* Position context for the absolutely-positioned PTR indicator —
+     it floats above the list without taking layout space. */
+  position: relative;
+}
+
+/* Pull-to-refresh indicator — injected by _attachPTR(). Sits absolutely
+   at the top of the scroll container, slides DOWN as the user pulls.
+   opacity controlled by JS based on pull distance. */
+.ptr-indicator {
+  position: absolute; top: -50px; left: 0; right: 0;
+  height: 50px;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  font-size: var(--fs-sm); color: var(--c-fg-2);
+  background: transparent;
+  pointer-events: none;
+  opacity: 0;
+  transition: transform 0.18s ease, opacity 0.18s ease;
+  z-index: 3;
+}
+.ptr-indicator .ptr-icon {
+  font-size: 16px; display: inline-block;
+  transition: transform 0.18s ease;
+}
+.ptr-indicator.ptr-spinning .ptr-icon {
+  animation: ptr-spin 0.9s linear infinite;
+}
+@keyframes ptr-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
 .filelist-sticky-root {
   display: flex; align-items: center; gap: 6px;
@@ -652,12 +1085,11 @@ body.kb-open .pane {
   border-bottom: 1px solid var(--c-border-strong);
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
   flex-shrink: 0;
-  cursor: pointer;
   user-select: none;
+  cursor: default;
   white-space: nowrap;
   position: sticky; top: 0; z-index: 2;
 }
-.filelist-sticky-root:hover { background: var(--c-bg-2); color: var(--c-fg-0); }
 .filelist-sticky-root .icon { display: inline-flex; color: var(--c-accent); flex-shrink: 0; }
 .filelist-sticky-root .path { overflow: hidden; text-overflow: ellipsis; }
 
@@ -680,10 +1112,17 @@ body.kb-open .pane {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   flex-shrink: 0;
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+@media (hover: hover) {
+  .open-files-head:hover { color: var(--c-fg-1); background: var(--c-bg-2); }
 }
 .open-files-toggle {
   background: none; border: 0; padding: 2px; cursor: pointer;
   color: var(--c-fg-3); display: inline-flex; align-items: center;
+  pointer-events: none;  /* head handles the click; this is a visual chevron only */
 }
 .open-files-toggle svg { width: 10px; height: 10px; }
 .open-files-label { flex: 1; }
@@ -1063,7 +1502,15 @@ body.kb-open .pane {
   position: absolute; inset: 0; z-index: 50;
   background: rgba(0, 0, 0, 0.35);
   display: flex; align-items: center; justify-content: center;
-  pointer-events: none;   /* let drag events bubble to parent */
+  /* pointer-events: auto so the overlay is the actual drop target —
+     critical when an HTML preview iframe or an image element sits
+     below it (iframes / cross-origin embeds swallow drag events from
+     their parent, so the overlay HAS to be the topmost listener).
+     The previous `pointer-events: none` was a holdover from when the
+     overlay only displayed while preview-body was already receiving
+     dragover events; with the document-level osFileDragging detection
+     in init(), the overlay needs to catch the drop directly. */
+  pointer-events: auto;
   color: #fff;
 }
 .preview-drop-inner {
@@ -1133,7 +1580,13 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   font-size: 12.5px; line-height: 1.6;
 }
 .markdown pre code { background: transparent; padding: 0; }
-.markdown table { border-collapse: collapse; margin: 0.8em 0; }
+/* Tables: display:block + overflow-x lets a wide table scroll horizontally
+   inside its bubble instead of stretching the whole chat column past the
+   viewport on phones. max-width:100% keeps it bounded by the bubble. */
+.markdown table {
+  border-collapse: collapse; margin: 0.8em 0;
+  display: block; max-width: 100%; overflow-x: auto;
+}
 .markdown th, .markdown td { border: 1px solid var(--c-border-strong); padding: 6px 12px; }
 .markdown th { background: var(--c-bg-2); font-weight: var(--fw-semibold); }
 .markdown blockquote {
@@ -1343,6 +1796,53 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   border-radius: var(--r-sm); padding: 0;
 }
 .session-picker-del:hover { background: var(--c-danger); color: #fff; }
+/* Inline rename trigger on each picker row. Visual sibling of -del /
+   -kebab so the three icon buttons cluster on the right. ✎ icon is
+   inline SVG (in HTML) so we just style the button. */
+.session-picker-rename {
+  background: none; border: none; color: var(--c-fg-3); cursor: pointer;
+  width: 22px; height: 22px;
+  border-radius: var(--r-sm); padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.session-picker-rename:hover { background: var(--c-bg-3); color: var(--c-accent); }
+@media (pointer: coarse) {
+  /* Bigger tap target on touch, same as the other picker buttons. */
+  .session-picker-rename { width: 32px; height: 32px; }
+  .session-picker-rename:active { background: var(--c-bg-3); }
+}
+/* Inline rename input + commit/cancel buttons inside a picker row.
+   Shown when renamingPickerSid === s.id. Input takes the flex slot
+   the .ellipsis name used; the two buttons are sized to match the
+   other picker icons. */
+.session-picker-rename-input {
+  flex: 1; min-width: 0;
+  background: var(--c-bg-0);
+  border: 1px solid var(--c-accent);
+  border-radius: var(--r-sm);
+  padding: 4px 6px;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-0);
+  outline: none;
+}
+.session-picker-rename-ok,
+.session-picker-rename-cancel {
+  background: none; border: none; cursor: pointer;
+  width: 22px; height: 22px;
+  border-radius: var(--r-sm); padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.session-picker-rename-ok { color: var(--c-accent); }
+.session-picker-rename-ok:hover { background: var(--c-accent); color: #fff; }
+.session-picker-rename-cancel { color: var(--c-fg-3); }
+.session-picker-rename-cancel:hover { background: var(--c-bg-3); }
+@media (pointer: coarse) {
+  .session-picker-rename-ok,
+  .session-picker-rename-cancel { width: 32px; height: 32px; }
+}
 .session-picker-empty {
   padding: 14px; text-align: center; color: var(--c-fg-3); font-size: var(--fs-xs);
 }
@@ -1495,9 +1995,18 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   padding: 0; border-radius: var(--r-sm);
   flex-shrink: 0;
 }
-.chat-tab:hover .chat-tab-close,
+/* Same `(hover: hover)` gate as L1892 — without it, `.chat-tab:hover ...`
+   triggers iOS phantom-hover: the first tap on a non-active tab only flips
+   the hover state (× appears), and only the second tap fires `click`
+   (which is what runs activateTab). Gating restores single-tap switching
+   on touch screens. The touch-only "× always faintly visible" affordance
+   is provided by the `@media (hover: none)` block (L609-615) + the mobile
+   block (L449). */
+@media (hover: hover) {
+  .chat-tab:hover .chat-tab-close { opacity: 0.7; }
+  .chat-tab-close:hover { background: var(--c-danger); color: #fff; opacity: 1; }
+}
 .chat-tab.active .chat-tab-close { opacity: 0.7; }
-.chat-tab-close:hover { background: var(--c-danger); color: #fff; opacity: 1; }
 .chat-tab-new {
   background: none; border: none; cursor: pointer;
   color: var(--c-fg-2); font-size: 18px; line-height: 1;
@@ -1509,7 +2018,10 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 /* "Open history" folder button at end of tab strip */
 .chat-tab-history {
   position: relative; flex-shrink: 0;
-  margin-left: auto;            /* push to right end of the strip */
+  /* Sits at the left end of chat-tabs-wrap (before .chat-tabs-list) per
+     user's "history at the top/start" layout request. Border separates
+     it visually from the horizontally-scrolling tabs strip on its right. */
+  border-right: 1px solid var(--c-border);
 }
 .chat-tab-history-btn {
   background: none; border: none; cursor: pointer;
@@ -1556,24 +2068,90 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .chat-scroll-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
 .chat-body {
   flex: 1; overflow-y: auto;
+  /* overflow-x: hidden is a hard safety net — any single misbehaving
+     descendant (a long un-wrappable URL in a thinking block, a pre
+     that escapes its bubble due to a third-party stylesheet, etc.)
+     would otherwise drag the whole chat-body horizontally and push
+     ALL bubbles off-screen. With this, the worst case is one bubble
+     clipping its own runaway content, not the whole layout breaking. */
+  overflow-x: hidden;
   padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2);
 }
 .msg { display: flex; flex-direction: column; position: relative; animation: msg-in var(--t-base); }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+/* user side hugs the right; muse side hugs the left. Both with the
+   SAME max-row-width — true wechat mirror layout. */
 .msg.user { align-items: flex-end; }
-.msg.assistant, .msg.tool_use, .msg.tool_result, .msg.thinking { align-items: stretch; }
+.msg.assistant, .msg.tool_use, .msg.tool_result, .msg.thinking,
+.msg.ask_user_question, .msg.permission_request,
+.msg.assistant-turn { align-items: flex-start; }
 
 /* Avatar + bubble side-by-side. user is right-aligned with avatar on the
    right; assistant is left-aligned with avatar on the left. Tool/thinking
    bubbles intentionally don't get an avatar (less visual noise for the
    procedural blocks). */
+/* === Bubble alignment design ===
+   Row fills chat-body 100% so the avatar pins to the chat edge
+   (user avatar right, muse avatar left). Bubble hugs its content
+   with max-width capped at "row - avatar - gap" so the longest
+   message lands exactly at the same edge as the avatar from the
+   OTHER side — true wechat mirror layout. */
 .msg-row {
   display: flex; align-items: flex-start; gap: 8px;
-  min-width: 0; max-width: 100%;
+  width: 100%;
+  min-width: 0;
 }
 .msg.user .msg-row {
   flex-direction: row-reverse;
-  max-width: min(86%, 760px);
+  /* width 100% from base rule above — just reverse the visual order */
+}
+/* Alpine's <template x-if> requires a single root element, so the
+   user-message template wraps `.msg-row` + `.msg-actions` in an
+   unnamed `<div>`. That wrapper, being a flex child of `.msg.user`
+   (which has align-items: flex-end, NOT stretch), defaults to its
+   own max-content width — collapsing `.msg-row`'s `width: 100%`
+   to "100% of a content-sized wrapper" instead of the full chat-body.
+   Force the wrapper to fill its parent so `.msg-row` (and the bubble
+   inside) get the row width they expect. Same trick applied to
+   muse-side wrappers for consistency. Observed bug: a 4-char user
+   message wrapping one char per line (2026-05-21). */
+.msg > div { width: 100%; min-width: 0; }
+/* Assistant rows mirror the user-row width cap so the right edge of
+   Muse's bubble lines up with the left edge of the user's avatar
+   column. Without this the assistant bubble stretched to ~100% and
+   visually crossed into the user-avatar gutter. Applies to both the
+   legacy .msg.assistant (single-block, kept for back-compat) and the
+   new .msg.assistant-turn (one row hosting multiple blocks). */
+/* Unified row width cap for EVERY muse-side block type — without
+   this, .msg.assistant rows were capped at 86%/760 but .msg.thinking
+   / .msg.tool_use / .msg.tool_result / .msg.ask_user_question /
+   .msg.permission_request defaulted to 100% and visually overflowed
+   beyond the bubble's right edge (severe on mobile — thinking-preview
+   could punch out of the viewport entirely). */
+/* All muse-side rows inherit --row-width from the base .msg-row rule
+   above — no per-type override needed. Kept for documentation. */
+/* turn-blocks is the vertical stack of (thinking / text bubble /
+   tool_use / tool_result / ask / perm) blocks within ONE assistant
+   turn. Avatar lives to its left; the stack takes the remaining
+   row width. */
+.turn-blocks {
+  display: flex; flex-direction: column;
+  gap: 8px;
+  flex: 1 1 auto; min-width: 0;
+}
+.turn-block { min-width: 0; }
+/* The legacy `margin-left: 40px` (see below) faked an avatar gutter
+   for blocks rendered as their own .msg row. Inside .assistant-turn
+   the avatar already sits to the LEFT of turn-blocks, so we MUST
+   undo that indent or each block gets pushed in by another 40px and
+   the stack drifts right out of the row. */
+.assistant-turn .turn-block .tool,
+.assistant-turn .turn-block .todo-card,
+.assistant-turn .turn-block .subagent-card,
+.assistant-turn .turn-block .plan-card,
+.assistant-turn .turn-block .tool-result,
+.assistant-turn .turn-block .thinking {
+  margin-left: 0;
 }
 .msg-avatar {
   flex-shrink: 0;
@@ -1587,42 +2165,205 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 }
 .msg-avatar svg { width: 22px; height: 22px; }
 .assistant-avatar { color: var(--c-accent); }
+
+/* ===== "Muse is writing" — streaming avatar effect =====
+   Triple-layer animation on the avatar of the currently-streaming msg:
+     1. conic-gradient halo rotating around the avatar (the "spinner")
+     2. accent-color box-shadow pulsing in/out (the "breathing")
+     3. inner SVG icon scaling subtly (the "alive" feel)
+   The .msg.msg-streaming class on the outer .msg wrapper overrides the
+   adjacent-selector rule that would otherwise hide this avatar
+   (because turn-last is not turn-first in source order). */
+@keyframes avatar-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes avatar-breathe {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(96, 147, 255, 0.0),
+                0 0 10px 0 var(--c-accent-soft);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(96, 147, 255, 0.18),
+                0 0 16px 2px var(--c-accent-soft);
+  }
+}
+@keyframes avatar-breathe-svg {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.1); }
+}
+.assistant-avatar.is-streaming-avatar {
+  position: relative;
+  background: var(--c-accent-soft);
+  animation: avatar-breathe 2.4s ease-in-out infinite;
+  border-color: var(--c-accent);
+}
+/* Conic-gradient halo behind the avatar, rotating slowly. ::before sits
+   slightly outside the avatar circle (negative offsets) so the halo
+   reads as a ring of light rather than tinting the icon itself. */
+.assistant-avatar.is-streaming-avatar::before {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    var(--c-accent) 0%,
+    transparent 30%,
+    transparent 70%,
+    var(--c-accent) 100%
+  );
+  animation: avatar-spin 2.4s linear infinite;
+  z-index: -1;
+  opacity: 0.85;
+}
+/* svg inside streaming avatar — stack above the ::before halo */
+.assistant-avatar.is-streaming-avatar svg {
+  animation: avatar-breathe-svg 2.4s ease-in-out infinite;
+  position: relative;
+}
+@media (prefers-reduced-motion: reduce) {
+  .assistant-avatar.is-streaming-avatar,
+  .assistant-avatar.is-streaming-avatar::before,
+  .assistant-avatar.is-streaming-avatar svg {
+    animation: none;
+  }
+}
 .user-avatar {
   background: var(--c-accent); color: white; border: none;
   font-weight: var(--fw-semibold); font-size: 13px;
   letter-spacing: 0;
 }
-/* Bubble inside the row no longer needs its own align-self / max-width —
-   the row container handles alignment, and bubble fills the rest. */
-.msg.user .msg-row .bubble,
-.msg.assistant .msg-row .bubble {
-  align-self: flex-start;
-  max-width: none;
+/* WeChat-style edge alignment.
+   Each block (bubble / thinking / tool / tool_result / todo-card /
+   subagent-card / plan-card / ask-card / perm-card) renders inside
+   its own .msg-row alongside the avatar. We force every non-avatar
+   direct child of an assistant-side .msg-row to:
+     - take all remaining row width  (flex: 1 1 auto)
+     - allow truncation of long inner text   (min-width: 0)
+     - never overflow the row's max-width    (max-width: 100%)
+   That makes the LEFT edge (right of avatar) and the RIGHT edge
+   (at the row's max-width cap) line up across all heterogeneous
+   block types. Without min-width: 0 the default flex `min-content`
+   sizing lets a long thinking-preview nowrap line punch through
+   the row and overflow the viewport — observed on mobile. */
+/* Common: reserve BOTH its own avatar slot AND the opposing avatar's
+   slot. That way a bubble's far edge stops at exactly where the OTHER
+   party's avatar would end. No bubble ever visually intrudes into the
+   "column" the other party's avatar would occupy. Slot = avatar 32 +
+   gap 8 = 40 on desktop; ×2 = 80 reserved. */
+.msg:not(.user) .msg-row > :not(.msg-avatar),
+.msg.user .msg-row .bubble {
+  flex: 0 0 auto;
+  max-width: calc(100% - 80px);
+  min-width: 0;
+  box-sizing: border-box;
 }
+/* User bubble: WeChat / iMessage style — short messages hug content
+   (right-anchored), long messages cap at max-width. fit-content keeps
+   one-line replies visually compact instead of stretching to a slab. */
+.msg.user .msg-row .bubble {
+  width: fit-content;
+  align-self: flex-start;
+  padding: 8px 10px;
+}
+/* Muse-side: slab mode — short and long messages alike fill the full
+   max-width column, giving the assistant side a stable visual rhythm.
+   Pairs well with multi-block turns (thinking + text + tool_use stacked
+   vertically) where varied content widths would otherwise produce a
+   jagged left column. User explicitly preferred this over fit-content
+   (2026-05-21). */
+.msg:not(.user) .msg-row > :not(.msg-avatar) {
+  width: 100%;
+}
+/* Muse bubble stays hug-content too (inherited from the shared rule
+   above). The previous "width: 100% to dodge code-block inflation"
+   trick was wrong — it made every short reply look like a stretched
+   slab. The real fix is in .bubble pre below: on touch we wrap long
+   code lines, which removes the long max-content that used to blow
+   up the bubble's fit-content calculation in the first place. */
+/* Code blocks / long lines inside a bubble scroll horizontally so a
+   single wide pre doesn't push the bubble past its siblings' edge. */
+.bubble pre, .bubble code { max-width: 100%; }
+.bubble pre { overflow-x: auto; }
 @media (max-width: 480px) {
   .msg-avatar { width: 26px; height: 26px; }
   .msg-avatar svg { width: 18px; height: 18px; }
   .user-avatar { font-size: 12px; }
-  .msg.user .msg-row { max-width: 92%; }
+  /* Mobile bubble cap — same principle as desktop, but with mobile's
+     smaller avatar (26 + 8 gap = 34 each side, × 2 = 68 reserved).
+     The bubble's far edge lands at exactly where the opposing avatar
+     would end, leaving a clean "WeChat-style" two-column-with-gutter
+     layout. See desktop block above for full rationale. */
+  .msg.user .msg-row { max-width: 100%; }
+  .msg:not(.user) .msg-row > :not(.msg-avatar),
+  .msg.user .msg-row .bubble {
+    max-width: calc(100% - 68px);
+  }
+  /* Modest chat-body horizontal padding on mobile — small inset from
+     the screen edge so avatars don't sit flush against the device
+     bezel. 16px is the smallest value where there's a visible gap;
+     bumping higher just shrinks usable bubble width. The OPPOSING-side
+     gutter inside the bubble is now provided by the max-width cap
+     above, so we don't need to over-pad chat-body for that. */
+  .chat-body {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  /* Mobile: wrap long code lines inside bubbles instead of horizontal
+     scroll. Mobile users barely notice horizontal scrollbars (no
+     hover state, narrow scrollbar) and routinely complain "the code
+     is cut off". pre-wrap preserves indentation; break-all lets long
+     URLs / flag values break mid-token. Critical side effect: with
+     pre wrapping, its max-content is no longer the long-line width
+     but ~one-character — so it stops blowing up the parent .bubble's
+     fit-content calculation, which means a muse reply with a code
+     block no longer jumps to a wider bubble than a text-only reply.
+     Desktop keeps the original "preserve code formatting, horizontal
+     scroll for long lines" — wider viewport makes that the better
+     trade-off there. */
+  .bubble pre, .bubble pre code {
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+  }
+  /* Mobile table fix rolled back — display:block + overflow-x:auto
+     made things worse than the original column-crush. Keep the
+     original behaviour for now; revisit when we have a real fix
+     (likely a wrapper div + scroll cue, not a CSS-only hack). */
 }
 
 .bubble {
   padding: 9px 13px; border-radius: var(--r-lg);
-  line-height: 1.6; word-break: break-word; max-width: 92%;
+  line-height: 1.6; word-break: break-word;
+  /* Note: the legacy `max-width: 92%` here was removed 2026-05-21. It
+     compounded with the `calc(100% - 40px)` cap already on the bubble's
+     ancestor `.turn-blocks` to produce ~74% of row width — visibly
+     pinched bubbles with empty space on the right (user feedback:
+     "明明还没满一行就换行"). The ancestor cap alone is the right
+     constraint; bubble itself defers to `width: fit-content + max-width`
+     set on the row child / bubble selectors above. */
   font-size: var(--fs-base);
+  /* Safety net: a stray <pre> with a wide max-content line should
+     never punch through the bubble's right edge. The inner <pre>
+     keeps its own overflow-x: auto so the user can still scroll the
+     code horizontally — this overflow:hidden only catches sizing
+     bugs (e.g. third-party CSS overriding our pre max-width). */
+  overflow-x: hidden;
 }
-/* 用户消息气泡用主色派生 — 跟着主题色变 */
+/* 用户消息气泡仅保留视觉样式 (背景色 + 圆角)。宽度 / 对齐 / max-width
+   全部由上面的 .msg.user .msg-row .bubble 规则统一控制 — 之前
+   width: fit-content + max-width: min(78%, 720px) 在这里和上面那条
+   规则打架，最终用户看到 bubble 永远撑不到和 muse 对称的宽度。 */
 .msg.user .bubble {
   background: var(--c-accent); color: white;
   border-bottom-right-radius: var(--r-sm);
-  /* 不在 .bubble 上用 pre-wrap — 模板里 <div> / <template> / <span> 之间
-     的源码换行+缩进会被 pre-wrap 当真实空白渲染，让气泡多出几行空行。
-     pre-wrap 只挂在直接承载文本的 span 上（见下面 .user-msg-text）。 */
-  width: fit-content;
-  align-self: flex-end;
-  max-width: min(78%, 720px);
 }
-.user-msg-text { white-space: pre-wrap; word-break: break-word; }
+/* Newlines are now rendered as <br> by userTextHtml() in JS, so
+   white-space: pre-wrap is gone — it would have forced max-content
+   to compute per-line and kept the bubble narrow vs. muse's
+   continuous blocks (asymmetric long-message widths). Just keep
+   word-break so long unbroken strings still wrap. */
+.user-msg-text { word-break: break-word; }
 html[data-theme="light"] .msg.user .bubble { color: white; }
 
 /* Compact-summary pill — shown above the message that contains the
@@ -1649,6 +2390,27 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   color: var(--c-fg-3); display: inline-flex; align-items: center; gap: 8px;
 }
 .bubble.pending .thinking-label { font-size: var(--fs-sm); opacity: 0.7; }
+
+/* Compact-in-progress placeholder bubble. Sits at the very bottom of the
+   message list while native /compact is running (can be 20-60s on a long
+   session). Reuses .bubble.pending layout — adds a 📦 prefix icon + a
+   subtle border-pulse to differentiate it from the assistant-thinking
+   pending bubble (otherwise the two look identical). */
+.compact-pending .bubble.pending {
+  border: 1px solid var(--c-accent);
+  animation: compact-pending-pulse 1.6s ease-in-out infinite;
+}
+.compact-pending-icon {
+  font-size: var(--fs-md);
+  line-height: 1;
+  flex-shrink: 0;
+}
+@keyframes compact-pending-pulse {
+  /* RGB matches --c-accent (#6093ff dark / #3a78f0 light — close enough that
+     a single mid-tone halo reads as "accent glow" on both themes). */
+  0%, 100% { box-shadow: 0 0 0 0 rgba(96, 147, 255, 0); }
+  50%      { box-shadow: 0 0 0 4px rgba(96, 147, 255, 0.22); }
+}
 
 /* Chat skeleton — placeholder rows while loadSession is fetching. The
    shimmer pulse signals "loading, please wait" without taking over the
@@ -1697,23 +2459,30 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   50%      { opacity: 0.85; }
 }
 
-/* Live streaming bubble — blinking caret at the tail. Tells the user
-   tokens are still flowing even when the model pauses briefly (between
-   tool calls, mid-codeblock, finalization). The mascot's breathing
-   animation carries the session-level signal; this one is per-token. */
-.bubble.is-streaming-bubble::after {
-  content: "▌";
-  display: inline-block;
-  margin-left: 2px;
-  color: var(--c-accent);
-  animation: stream-caret-blink 1s steps(2, end) infinite;
-  vertical-align: -1px;
-  font-weight: var(--fw-normal);
+/* Per-bubble streaming caret retired — the new .streaming-tail row at
+   the bottom of the chat body (see index.html, after the pending
+   bubble) handles "muse is still generating" universally, including
+   when the last block is a thinking card or tool result rather than
+   a text bubble. Avoids double-pulsing dots stacked in two places. */
+/* Per-turn footer. Sits under the tail block of every muse turn —
+   carries the streaming dots while in flight and the HH:MM
+   completion stamp once done. One footer per turn, regardless of
+   how many blocks (thinking / tool_use / tool_result / assistant)
+   are in the turn. Aligned to the muse-side content column (avatar
+   width 32px + gap 8px = 40px gutter). */
+.turn-footer {
+  padding: 4px 0 6px 40px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;            /* avoid layout jitter when dots → time */
 }
-@keyframes stream-caret-blink {
-  0%, 49%   { opacity: 1; }
-  50%, 100% { opacity: 0; }
+@media (max-width: 480px) {
+  /* avatar shrinks to 26px on phones (see .msg-avatar @ media block),
+     keep the footer aligned by matching that gutter — 26 + 8 gap = 34. */
+  .turn-footer { padding-left: 34px; }
 }
+
 .thinking-dots { display: inline-flex; gap: 4px; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
@@ -1837,26 +2606,11 @@ pre.has-copy-btn .code-copy-btn.copied {
   margin: 0.8em 0;
 }
 
-/* Indent non-bubble blocks (tool / tool_result / thinking) by avatar width
-   so their left edge aligns with the assistant bubble's content. Without
-   this they ran flush-left while user/assistant text bubbles were offset
-   by the 32px avatar + 8px gap, looking misaligned. */
-.msg.tool_use > .tool,
-.msg.tool_use > .todo-card,
-.msg.tool_use > .subagent-card,
-.msg.tool_use > .plan-card,
-.msg.tool_result > .tool-result,
-.msg.thinking > .thinking {
-  margin-left: 40px;
-}
-@media (max-width: 480px) {
-  /* Avatar shrinks on mobile — match the indent. */
-  .msg.tool_use > .tool, .msg.tool_use > .todo-card,
-  .msg.tool_use > .subagent-card, .msg.tool_use > .plan-card,
-  .msg.tool_result > .tool-result, .msg.thinking > .thinking {
-    margin-left: 32px;
-  }
-}
+/* `margin-left: 40px` fake-gutter is no longer needed: every assistant-
+   side block now lives inside its own .msg-row with a real .msg-avatar
+   (visibility-hidden on all but the first in a run via the adjacent
+   selector at end-of-file). The avatar element itself occupies the
+   left gutter so contents align naturally. */
 
 .tool {
   display: flex; gap: 8px; align-items: baseline;
@@ -1900,7 +2654,9 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-radius: var(--r-sm);
   user-select: none;
 }
-.thinking-head:hover, .tool-result-head:hover { background: rgba(255,255,255,0.04); }
+/* Token-driven hover background works in both themes — rgba white
+   overlay was invisible on light (white on white). */
+.thinking-head:hover, .tool-result-head:hover { background: var(--c-bg-3); }
 .thinking-chevron {
   display: inline-flex; align-items: center; justify-content: center;
   width: 12px; color: var(--c-fg-3);
@@ -1935,7 +2691,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-radius: var(--r-md);
   padding: 12px 14px;
   margin: 4px 0;
-  max-width: 100%;
+  flex: 1; min-width: 0; max-width: 100%;
 }
 .ask-header {
   display: flex; align-items: center; gap: 8px;
@@ -1998,6 +2754,88 @@ pre.has-copy-btn .code-copy-btn.copied {
 .ask-option-desc { font-size: var(--fs-xs); color: var(--c-fg-3); margin-top: 2px; line-height: 1.4; }
 .ask-submit-row { margin-top: 10px; text-align: right; }
 
+/* ----- "Other / 其他" free-text fallback ----- */
+/* Sits below the option buttons. Matches .ask-option dimensions exactly
+   (left-aligned, same padding / font-size / border-radius) so it reads
+   as "one of the options" visually — what makes it different is the
+   dashed border + accent-coloured "+" prefix, which signals "this slot
+   isn't predefined, you fill it in." Earlier version used centred text /
+   smaller font / muted colour which felt visually disconnected from
+   the rest of the card (2026-05-21 feedback). */
+.ask-other-section { margin-top: 6px; }
+.ask-other-toggle {
+  /* Mirror .ask-option exactly except for border-style + prefix glyph. */
+  display: block; width: 100%;
+  text-align: left;
+  background: var(--c-bg-0);
+  border: 1px dashed var(--c-border-strong);
+  border-radius: var(--r-md);
+  padding: 8px 12px;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: var(--fw-semibold);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-2);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.ask-other-toggle::before {
+  content: "+ ";
+  color: var(--c-accent);
+  font-weight: var(--fw-bold);
+}
+.ask-other-toggle:hover {
+  color: var(--c-fg-0);
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+}
+.ask-other-form {
+  display: flex; flex-direction: column;
+  gap: 8px;
+  /* Sit slightly inset so it visually nests under the toggle's slot
+     when expanded, rather than appearing as a separate floating block. */
+  padding: 8px;
+  border: 1px solid var(--c-accent);
+  border-radius: var(--r-md);
+  background: var(--c-bg-0);
+}
+.ask-other-textarea {
+  width: 100%;
+  min-height: 64px;
+  padding: 8px 10px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  background: var(--c-bg-0);
+  color: var(--c-fg-0);
+  font: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.ask-other-textarea:focus {
+  outline: none;
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 3px var(--c-accent-soft);
+}
+.ask-other-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+}
+.ask-other-cancel {
+  background: transparent;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  padding: 6px 14px;
+  font: inherit;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-2);
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.ask-other-cancel:hover {
+  color: var(--c-fg-0);
+  border-color: var(--c-fg-3);
+}
+
 /* ===== Image attachments ===== */
 .img-attachments {
   display: flex; flex-wrap: wrap; gap: 6px;
@@ -2014,8 +2852,39 @@ pre.has-copy-btn .code-copy-btn.copied {
 .img-chip img {
   width: 100%; height: 100%; object-fit: cover; display: block;
 }
-.img-chip.uploading img { opacity: 0.6; }
-.img-chip.error { border-color: var(--c-error, #dc3545); }
+/* Upload-in-progress styling (re-added 2026-05-21 after "图片发送很慢
+   还发不出去" feedback). Subtle: a 2px accent progress bar at the chip's
+   bottom edge + a very light opacity dim. NOT a full-screen spin overlay —
+   that's what we removed the first time. The hairline gives the user a
+   "still working" signal on slow 4G uploads (the upload itself can take
+   3-10 s for a high-res photo) without reading as a discrete "uploading"
+   step that blocks chat. */
+.img-chip.uploading img,
+.doc-chip.uploading .doc-chip-icon { opacity: 0.85; }
+.img-chip.error,
+.doc-chip.error { border-color: var(--c-error, #dc3545); }
+/* Indeterminate progress bar — the actual upload doesn't report a %, so
+   we use a sliding gradient. Lives in styles.css after the chip block
+   below so it can reference --c-accent. */
+.chip-upload-bar {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--c-accent) 30%,
+    var(--c-accent) 70%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: chip-upload-slide 1.4s linear infinite;
+  pointer-events: none;
+}
+@keyframes chip-upload-slide {
+  from { background-position: 100% 0; }
+  to   { background-position: -100% 0; }
+}
 .img-chip-x {
   position: absolute; top: 2px; right: 2px;
   width: 18px; height: 18px;
@@ -2025,15 +2894,6 @@ pre.has-copy-btn .code-copy-btn.copied {
   cursor: pointer;
 }
 .img-chip-x svg { width: 10px; height: 10px; }
-.img-chip-spin {
-  position: absolute; top: 50%; left: 50%;
-  width: 18px; height: 18px;
-  margin: -9px 0 0 -9px;
-  border-radius: 50%;
-  border: 2px solid rgba(255,255,255,0.4);
-  border-top-color: #fff;
-  animation: spin 0.8s linear infinite;
-}
 .user-msg-imgs {
   display: flex; flex-wrap: wrap; gap: 6px;
   margin-bottom: 6px;
@@ -2057,35 +2917,6 @@ pre.has-copy-btn .code-copy-btn.copied {
 .user-msg-doc span {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-
-/* ===== User-message inline edit ===== */
-.user-bubble { position: relative; }
-.user-msg-edit-btn {
-  position: absolute; top: 4px; right: 4px;
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 22px; height: 22px;
-  background: rgba(0,0,0,0.18); border: 0; border-radius: var(--r-sm);
-  color: rgba(255,255,255,0.85); cursor: pointer; padding: 0;
-  opacity: 0; transition: opacity var(--t-fast), background var(--t-fast);
-}
-.user-msg-edit-btn svg { width: 12px; height: 12px; }
-@media (hover: hover) {
-  .user-bubble:hover .user-msg-edit-btn { opacity: 1; }
-  .user-msg-edit-btn:hover { background: rgba(0,0,0,0.34); }
-}
-/* Touch devices: always visible (no hover), small enough not to clutter */
-@media (hover: none) {
-  .user-msg-edit-btn { opacity: 0.55; }
-}
-.user-msg-edit { display: flex; flex-direction: column; gap: 8px; min-width: 280px; }
-.user-msg-edit-ta {
-  width: 100%; min-height: 80px; resize: vertical;
-  background: rgba(255,255,255,0.95); color: var(--c-fg-0);
-  border: 1px solid var(--c-border); border-radius: var(--r-sm);
-  padding: 8px 10px; font: inherit; font-size: var(--fs-sm); line-height: 1.5;
-  box-sizing: border-box;
-}
-.user-msg-edit-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* ===== Context meter ===== */
 .ctx-meter {
@@ -2333,12 +3164,13 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-radius: var(--r-sm);
   color: var(--c-fg-3);
   cursor: pointer;
-  width: 26px; height: 26px;
+  width: 32px; height: 32px;
   display: inline-flex; align-items: center; justify-content: center;
   flex-shrink: 0;
   transition: color var(--t-fast), border-color var(--t-fast),
               background var(--t-fast), transform .12s;
 }
+.onboard-shuffle svg { width: 18px; height: 18px; }
 .onboard-shuffle:hover {
   color: var(--c-accent);
   border-color: var(--c-accent);
@@ -2540,7 +3372,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-radius: var(--r-md);
   padding: 12px 14px;
   margin: 4px 0;
-  max-width: 100%;
+  flex: 1; min-width: 0; max-width: 100%;
 }
 .perm-request.resolved { opacity: 0.85; border-color: var(--c-border-strong); }
 .perm-header {
@@ -2617,6 +3449,21 @@ pre.has-copy-btn .code-copy-btn.copied {
   margin-top: 2px; padding: 0 4px;
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
+  /* Long unmapped model ids (e.g. "claude-haiku-4-5-20251001") would
+     otherwise stretch under the bubble — clip them. Hover the badge
+     to see the full id via the :title attribute. */
+  max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Per-message completion-time footer ("HH:MM"). Same visual language
+   as the old model-tag (monospace, small, muted), no max-width clip
+   since timestamps are always 5 chars. Sits under the bubble of an
+   assistant message once the turn finishes — see fmtHM() in app.js. */
+.msg-ts {
+  font-size: 10px; color: var(--c-fg-3);
+  margin-top: 2px; padding: 0 4px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.2px;
 }
 
 .jump-bottom {
@@ -2684,11 +3531,15 @@ pre.has-copy-btn .code-copy-btn.copied {
 .chat-input-textarea {
   width: 100%;
   resize: none;
-  min-height: 42px; max-height: 200px; height: 42px;
+  /* Match the toolbar height (34px = 26px button + 4px×2 padding)
+     so the empty input + toolbar look like one balanced row. Using
+     box-sizing: border-box so padding lives inside the 34px budget. */
+  box-sizing: border-box;
+  min-height: 34px; max-height: 200px; height: 34px;
   overflow-y: auto;
   background: transparent;
   font-size: var(--fs-base);
-  padding: 10px 14px 6px 14px;
+  padding: 6px 14px;
   border: 0; outline: none;
   color: var(--c-fg-0);
   line-height: 1.5;
@@ -2822,7 +3673,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   border: 1px solid var(--c-border-strong);
   border-radius: var(--r-md);
 }
-.doc-chip.uploading { opacity: 0.7; }
+/* Same rationale as .img-chip — see comment above. Removed 2026-05-21. */
 .doc-chip.error { border-color: var(--c-error, #dc3545); }
 .doc-chip-icon {
   width: 22px; height: 22px; flex-shrink: 0;
@@ -2967,17 +3818,35 @@ pre.has-copy-btn .code-copy-btn.copied {
 .modal {
   background: var(--c-bg-1); border: 1px solid var(--c-border-strong);
   border-radius: var(--r-lg); box-shadow: var(--shadow-lg);
-  min-width: 360px; max-width: 480px;
   animation: modal-in var(--t-base);
+}
+/* Desktop sizing only — mobile @media block (above in file order) sets
+   width:100vw / max-width:100vw and would otherwise lose to the global
+   `min-width: 360px / max-width: 480px` due to CSS source-order. */
+@media (min-width: 721px) {
+  .modal { min-width: 360px; max-width: 480px; }
 }
 @keyframes modal-in { from { opacity: 0; transform: translateY(-12px) scale(0.96); } to { opacity: 1; transform: none; } }
 .modal-head {
-  padding: var(--sp-4) var(--sp-5);
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) var(--sp-3) var(--sp-5);
   border-bottom: 1px solid var(--c-border);
   border-top: 3px solid var(--c-accent);   /* modal 顶部主色条 */
   border-radius: var(--r-lg) var(--r-lg) 0 0;
   font-weight: var(--fw-semibold); font-size: var(--fs-md); color: var(--c-fg-0);
 }
+.modal-head > .modal-title { flex: 1; min-width: 0; }
+.modal-close {
+  margin-left: auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0;
+  background: transparent; border: 0; color: var(--c-fg-3);
+  border-radius: var(--r-md); cursor: pointer;
+  font-size: 18px; line-height: 1;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.modal-close:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.modal-close:active { background: var(--c-bg-4); }
 .modal-body { padding: var(--sp-4) var(--sp-5); color: var(--c-fg-1); font-size: var(--fs-sm); line-height: 1.55; }
 .modal-body input {
   width: 100%; margin-top: var(--sp-3); padding: 0 12px; height: 36px; font-size: var(--fs-md);
@@ -2988,8 +3857,88 @@ pre.has-copy-btn .code-copy-btn.copied {
   background: var(--c-bg-2); border-radius: 0 0 var(--r-lg) var(--r-lg);
 }
 
-/* ---- Settings modal ---- */
-.settings-modal { min-width: 560px; max-width: 680px; }
+/* ---- Cheat-sheet modal ---- */
+.cheatsheet-modal { min-width: 460px; max-width: 560px; }
+@media (max-width: 480px) {
+  /* Cheatsheet on phone: drop the 460px min-width and let the modal
+     follow viewport. Edge case (phones rarely have a `?` key), but
+     a hardware-keyboard user shouldn't get a viewport-blown modal. */
+  .cheatsheet-modal { min-width: 0; max-width: 92vw; }
+  .cheatsheet-table { font-size: var(--fs-xs); }
+  .cheatsheet-table td:first-child { width: 90px; padding-right: 8px; }
+}
+.cheatsheet-table {
+  width: 100%; border-collapse: collapse; font-size: var(--fs-sm);
+}
+.cheatsheet-table td { padding: 8px 6px; vertical-align: middle; }
+.cheatsheet-table td:first-child {
+  white-space: nowrap; width: 130px; padding-right: 14px;
+}
+.cheatsheet-table td:first-child .kbd { margin-right: 3px; }
+.cheatsheet-table tr:not(:last-child) td { border-bottom: 1px solid var(--c-border); }
+.cheatsheet-hint {
+  margin-top: 12px; font-size: var(--fs-xs); color: var(--c-fg-3);
+  text-align: center;
+}
+
+/* ---- Settings modal ----
+   Desktop sizing only — `@media (min-width: 721px)` gate prevents this
+   from overriding the mobile @media block above (CSS source order would
+   otherwise let `min-width: 560px` win on a 360px screen and the modal
+   blew past the viewport edge). */
+@media (min-width: 721px) {
+  .settings-modal { min-width: 560px; max-width: 680px; }
+  .settings-modal-body { max-height: 70vh; overflow-y: auto; }
+}
+
+/* ---- Settings iOS-style 2-level menu (mobile only) ----
+   On desktop both .settings-menu + .settings-back are kept out of the
+   layout via x-show (the alpine condition !isWideScreen evaluates to
+   false). On mobile, when settings.activePage is null the menu is
+   shown and every .settings-section is hidden (also via x-show on each
+   section). Tapping a row sets activePage; that flips the visibility
+   so only the matching section + a Back button are shown.
+
+   Why x-show (per-section) + CSS for the menu, not the other way:
+   we WANT the desktop to render all sections inline as before, which
+   the x-show `isWideScreen || ...` condition already does for free.
+   Hiding the menu on desktop just needs `display: none` here. */
+.settings-menu {
+  list-style: none; margin: 0; padding: 0;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+}
+.settings-menu-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 14px;
+  border-bottom: 1px solid var(--c-border);
+  cursor: pointer;
+  font-size: var(--fs-md);
+  color: var(--c-fg-0);
+  transition: background var(--t-fast);
+}
+.settings-menu-item:last-child { border-bottom: 0; }
+.settings-menu-item:active { background: var(--c-bg-3); }
+.settings-menu-icon { font-size: 20px; line-height: 1; flex-shrink: 0; }
+.settings-menu-title { flex: 1; }
+.settings-menu-chevron {
+  color: var(--c-fg-3); font-size: 22px; line-height: 1;
+  font-weight: 300;
+}
+.settings-back {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: transparent; border: 0; padding: 8px 4px;
+  margin: -4px 0 12px -4px;
+  color: var(--c-accent); cursor: pointer;
+  font-size: var(--fs-md);
+  -webkit-tap-highlight-color: transparent;
+}
+.settings-back > span:first-child {
+  font-size: 22px; line-height: 1; margin-right: 2px;
+}
+.settings-back:active { opacity: 0.6; }
 
 .settings-section { margin-bottom: var(--sp-6); }
 .settings-section:last-child { margin-bottom: 0; }
@@ -3009,6 +3958,14 @@ pre.has-copy-btn .code-copy-btn.copied {
 .settings-hint {
   font-size: var(--fs-xs); color: var(--c-fg-3);
   margin: -8px 0 var(--sp-3); line-height: 1.5;
+}
+/* Subdivider within a settings-section (e.g. "本设备" / "服务端开关"
+   inside the notification section). Lighter than the section title. */
+.settings-subtitle {
+  font-size: var(--fs-xs); font-weight: var(--fw-semibold);
+  color: var(--c-fg-2); letter-spacing: 0.4px;
+  margin: var(--sp-2) 0 var(--sp-2);
+  padding-bottom: 2px; border-bottom: 1px dashed var(--c-border);
 }
 
 /* 每一行：固定 220px label 列 + flex 1 输入列；统一 32px 行高 */
@@ -3463,6 +4420,164 @@ pre.has-copy-btn .code-copy-btn.copied {
 .cmd-palette-item-type.type-act     { background: rgba(96, 147, 255, 0.18);  color: var(--c-accent); }
 .cmd-palette-item-type.type-session { background: rgba(74, 222, 128, 0.18);  color: var(--c-success); }
 .cmd-palette-item-type.type-file    { background: rgba(245, 158, 11, 0.18);  color: var(--c-warning, #d97706); }
+.cmd-palette-item-type.type-message { background: rgba(167, 139, 250, 0.18); color: #8b5cf6; }
+/* Flash a message bubble after the palette jumps to it (via
+   _jumpToMessage) so the user can see where the scroll landed. */
+.msg-highlight .bubble {
+  animation: msg-highlight-pulse 2.2s ease-out;
+}
+@keyframes msg-highlight-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.55); }
+  30%  { box-shadow: 0 0 0 6px rgba(167, 139, 250, 0.25); }
+  100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0); }
+}
+
+/* ===== Cost dashboard ===== */
+.cost-window-select {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  padding: 2px 6px;
+  background: var(--c-bg-2);
+  color: var(--c-fg-1);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+}
+.cost-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 12px 0 18px;
+}
+.cost-kpi {
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  text-align: center;
+}
+.cost-kpi-label {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  margin-bottom: 4px;
+}
+.cost-kpi-value {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--c-fg-1);
+  font-variant-numeric: tabular-nums;
+}
+.cost-kpi-sub {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  margin-top: 2px;
+}
+.cost-token-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 18px;
+}
+.cost-token-chip {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  color: var(--c-fg-2);
+}
+.cost-token-chip.in    { color: #2563eb; border-color: rgba(37,99,235,0.4); }
+.cost-token-chip.out   { color: #7c3aed; border-color: rgba(124,58,237,0.4); }
+.cost-token-chip.cache { color: #059669; border-color: rgba(5,150,105,0.4); }
+.cost-block-title {
+  font-size: var(--fs-sm);
+  color: var(--c-fg-2);
+  margin: 18px 0 8px;
+  font-weight: 600;
+}
+.cost-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 130px;
+  padding: 0 4px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  position: relative;
+}
+.cost-bar {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+  position: relative;
+  cursor: default;
+  min-width: 0;
+}
+.cost-bar-fill {
+  width: 70%;
+  background: linear-gradient(180deg, #8b5cf6 0%, #6366f1 100%);
+  border-radius: 3px 3px 0 0;
+  transition: opacity 120ms;
+  min-height: 0;
+}
+.cost-bar:hover .cost-bar-fill {
+  opacity: 0.8;
+}
+.cost-bar-label {
+  font-size: 9px;
+  color: var(--c-fg-3);
+  font-family: var(--font-mono);
+  margin-top: 3px;
+  white-space: nowrap;
+  transform: rotate(0deg);
+  /* On narrow days, only show every 3rd label */
+}
+.cost-bars .cost-bar:not(:nth-child(3n+1)) .cost-bar-label {
+  visibility: hidden;
+}
+.cost-models {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cost-model-row {
+  display: grid;
+  grid-template-columns: 180px 1fr 130px;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-sm);
+}
+.cost-model-name {
+  font-family: var(--font-mono);
+  color: var(--c-fg-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cost-model-bar-track {
+  height: 8px;
+  background: var(--c-bg-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.cost-model-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1 0%, #8b5cf6 100%);
+  border-radius: 4px;
+  transition: width 200ms;
+}
+.cost-model-amount {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--c-fg-2);
+}
+@media (max-width: 720px) {
+  .cost-kpis { grid-template-columns: repeat(2, 1fr); }
+  .cost-model-row { grid-template-columns: 100px 1fr 100px; font-size: var(--fs-xs); }
+}
 .cmd-palette-item-label {
   flex: 1;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -3524,7 +4639,11 @@ pre.has-copy-btn .code-copy-btn.copied {
 /* ==========================================================================
    Scheduled tasks drawer — modal with create form, task list, run log.
    ========================================================================== */
-.sched-modal { width: 640px; max-width: calc(100vw - 32px); }
+/* Desktop sizing only — mobile @media block above forces width: 100vw
+   on .modal; this rule must NOT override that on phones. */
+@media (min-width: 721px) {
+  .sched-modal { width: 640px; max-width: calc(100vw - 32px); }
+}
 .sched-body { max-height: 70vh; overflow-y: auto; padding: 12px 16px; }
 .sched-create {
   display: flex; flex-direction: column; gap: 10px;
@@ -3532,6 +4651,33 @@ pre.has-copy-btn .code-copy-btn.copied {
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+/* Visual cue that the form is editing an existing task — accent border +
+   the banner below tells the user "you're not creating a new one". */
+.sched-create.is-editing {
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+.sched-edit-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px;
+  background: var(--c-accent-soft);
+  border: 1px solid var(--c-accent);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  color: var(--c-accent);
+  font-weight: var(--fw-medium);
+}
+.sched-edit-banner > span { flex: 1; }
+.sched-create.is-editing .sched-edit-banner {
+  background: var(--c-bg-1);
+}
+/* Task-row edit button glows when it owns the form's editing state. */
+.sched-row-actions .icon-btn.active {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
 }
 /* Each field is a label / control pair. Labels share a fixed width so
    all the controls line up vertically — no more random flex spillover. */
@@ -3551,6 +4697,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .sched-input-name { width: 100%; }
 .sched-input-date { width: 180px; }
+.sched-input-model { width: 100%; max-width: 320px; }
 
 .sched-freq {
   display: inline-flex; gap: 4px;
@@ -3683,6 +4830,11 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .sched-row.disabled { opacity: 0.55; }
 .sched-row:hover { background: var(--c-bg-3); }
+/* Rows are click-through to their bound session — cursor + a stronger
+   hover state telegraph that. Applies to both .sched-row (configured
+   tasks) and .sched-hist-row (run history) via the shared class. */
+.sched-row-clickable { cursor: pointer; }
+.sched-hist-row.sched-row-clickable:hover { background: var(--c-bg-2); }
 .sched-row-main { flex: 1; min-width: 0; }
 .sched-row-name {
   font-size: var(--fs-md); font-weight: var(--fw-semibold);
@@ -3762,6 +4914,91 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 
 /* ==========================================================================
+   Mobile sentinel — MUST stay near end of file (right before the iOS
+   auto-zoom block).
+
+   Why: muselab is a desktop-first CSS file. mobile rules live in
+   @media (max-width: 720px) blocks ~line 380 and ~line 621. Global
+   rules (e.g. `.modal { min-width: 360px }`) declared LATER in the
+   file get the same specificity as the mobile counterparts and win
+   on source-order, silently undoing the mobile override on phones.
+
+   Symptom history:
+     - .modal width 100vw lost to global `min-width:360px` (modal too wide)
+     - .settings-modal width 100vw lost to global `min-width:560px` (settings overflows)
+     - .msg-actions display:none lost to global `display:flex` (copy btn drifts)
+     - .brand-tips display:none lost to global `display:flex` ("press Enter" still showed)
+
+   Each fix used to need !important on the mobile rule. This block is
+   the structural fix: ANY mobile-only width/display rule prone to
+   being trampled lives here, at the bottom — source-order wins
+   without `!important`.
+
+   Don't add !important to rules in here. If something needs an extra
+   override, just add it to this block — being last in source is the
+   whole point. Selectors with higher specificity from elsewhere will
+   still win (that's expected — those are intentional desktop carve-
+   outs); same-specificity collisions are what this block defeats.
+   ========================================================================== */
+@media (max-width: 720px) {
+  /* All modals go full-screen on phones. Background, header, body,
+     footer all collaborate via flex so the body scrolls internally
+     and the keyboard / safe-area doesn't clip the footer buttons. */
+  .modal-backdrop {
+    align-items: stretch; justify-content: stretch;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  .modal,
+  .settings-modal,
+  .sched-modal {
+    min-width: 0;
+    width: 100vw; max-width: 100vw;
+    max-height: 100dvh;
+    height: auto;
+    border-radius: 0;
+    display: flex; flex-direction: column;
+  }
+  .modal-body {
+    flex: 1 1 auto;
+    max-height: none;
+    overflow-y: auto;
+  }
+
+  /* Empty-state keyboard hints ("press Enter", "@ for files") don't
+     apply on phones (Enter = newline on soft keyboards, @-mention
+     picker is touch-fiddly). */
+  .brand-tips { display: none; }
+
+  /* Per-message floating action bar (Copy etc.) — `position:absolute;
+     top:-8px` drifts above narrow bubbles and overlaps the previous
+     message. iOS / Android long-press-to-select handles copy anyway. */
+  .msg-actions { display: none; }
+}
+
+/* ==========================================================================
+   "Avatar per turn" visual: every assistant-side msg renders its own
+   .msg-row + .msg-avatar in the template (kept reactive-friendly), but
+   visually we hide the avatar on all-but-the-first in a run of
+   non-user / non-compact msgs. Result: one avatar per logical "turn"
+   without grouping in JS (which broke streaming reactivity).
+
+   The avatar still occupies its 32px width slot via `visibility:hidden`
+   so blocks stay aligned. Also kill the streaming-breathe animation on
+   the hidden ones — animating an invisible element wastes paint cycles
+   and could leak through if a child uses currentColor.
+   ========================================================================== */
+.msg:not(.user):not(.compact) + .msg:not(.user):not(.compact) .msg-avatar {
+  visibility: hidden;
+  animation: none;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+.msg:not(.user):not(.compact) + .msg:not(.user):not(.compact) .msg-avatar svg {
+  animation: none;
+}
+
+/* ==========================================================================
    iOS auto-zoom defeat — MUST stay at end of file.
 
    Why end-of-file: per-element rules like `.chat-input-textarea
@@ -3786,5 +5023,21 @@ pre.has-copy-btn .code-copy-btn.copied {
   .modal textarea,
   .modal select {
     font-size: 16px;
+  }
+  /* Mobile textarea baseline = 36px (slightly taller than PC's 34px).
+     On touch, iOS forces font-size: 16px (anti-zoom rule below) and
+     line-height: 1.5 gives a single-line scrollHeight of exactly 36px
+     (16 × 1.5 = 24 line + 12 padding). Setting min-height: 36px makes
+     scrollHeight == min-height for single-line content, so autoGrow's
+     "if scrollHeight fits within min-height, clear inline height"
+     branch fires and the textarea is a flat 36px regardless of
+     typing/erasing. Without this, min-height stayed at 34 < 36, so
+     every keystroke pushed inline height to 36 and it never came back.
+     Multi-line content still expands naturally via autoGrow.
+     MUST live at end-of-file to win the source-order race against
+     L3033's base rule. */
+  .chat-input-textarea {
+    min-height: 36px;
+    height: 36px;
   }
 }

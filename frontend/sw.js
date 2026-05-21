@@ -43,6 +43,12 @@ self.addEventListener("notificationclick", (event) => {
     const all = await self.clients.matchAll({
       type: "window", includeUncontrolled: true,
     });
+    // Tell any live muselab window to ack the unread badge — the user
+    // just acknowledged this push by clicking it, so the bell-icon
+    // count should clear without making them open the drawer first.
+    for (const c of all) {
+      try { c.postMessage({ type: "muselab/notification-clicked" }); } catch {}
+    }
     // If muselab is already open in a tab, focus it. Otherwise spawn one.
     for (const c of all) {
       if (c.url.includes(self.registration.scope) && "focus" in c) {

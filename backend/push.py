@@ -27,8 +27,6 @@ import base64
 import json
 import os
 import sys
-from pathlib import Path
-from typing import Any
 
 from .settings import ROOT, atomic_write_text
 
@@ -43,7 +41,15 @@ _subs: dict[str, dict] = {}  # endpoint -> subscription dict
 
 def _gen_vapid_keypair() -> dict[str, str]:
     """Generate a fresh P-256 ECDSA keypair encoded as urlsafe-base64,
-    matching the format pywebpush + browsers expect."""
+    matching the format pywebpush + browsers expect.
+
+    Use TraditionalOpenSSL (SEC1 `-----BEGIN EC PRIVATE KEY-----`), NOT
+    PKCS8. py_vapid.Vapid.from_string passes the PEM to
+    `serialization.load_pem_private_key`, which (in current versions)
+    chokes on PKCS8 EC keys with an opaque "ASN.1 parsing error:
+    invalid length" — confirmed reproducible against pywebpush in the
+    pinned deps. SEC1 is the older EC-only format every VAPID library
+    supports. Public key bytes are identical either way."""
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.backends import default_backend
@@ -51,7 +57,7 @@ def _gen_vapid_keypair() -> dict[str, str]:
     private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("ascii")
     public_numbers = private_key.public_key().public_numbers()
@@ -62,6 +68,30 @@ def _gen_vapid_keypair() -> dict[str, str]:
     return {"private_pem": private_pem, "public_b64": public_b64}
 
 
+def _migrate_pkcs8_to_sec1(pem: str) -> str | None:
+    """One-shot migration for vapid.json written before the SEC1 fix.
+    Same key material, different ASN.1 wrapping, so derived public key
+    + existing browser subscriptions stay valid — no re-subscribe
+    needed. Returns the new PEM, or None if input is already SEC1."""
+    if "BEGIN EC PRIVATE KEY" in pem:
+        return None
+    if "BEGIN PRIVATE KEY" not in pem:
+        return None
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.backends import default_backend
+        key = serialization.load_pem_private_key(
+            pem.encode("ascii"), password=None, backend=default_backend())
+        return key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode("ascii")
+    except Exception as e:
+        sys.stderr.write(f"[push] PKCS8→SEC1 migration failed: {e}\n")
+        return None
+
+
 def _ensure_vapid() -> dict[str, str]:
     global _vapid
     if _vapid:
@@ -69,6 +99,21 @@ def _ensure_vapid() -> dict[str, str]:
     if _VAPID_FILE and _VAPID_FILE.exists():
         try:
             _vapid = json.loads(_VAPID_FILE.read_text(encoding="utf-8"))
+            # Auto-migrate old PKCS8 vapid.json to SEC1 in place. Public
+            # key (and therefore subscriptions) are unchanged.
+            old_pem = _vapid.get("private_pem", "")
+            new_pem = _migrate_pkcs8_to_sec1(old_pem)
+            if new_pem and new_pem != old_pem:
+                _vapid["private_pem"] = new_pem
+                atomic_write_text(_VAPID_FILE,
+                                   json.dumps(_vapid, indent=2))
+                try:
+                    os.chmod(_VAPID_FILE, 0o600)
+                except Exception:
+                    pass
+                sys.stderr.write(
+                    "[push] migrated vapid.json from PKCS8 to SEC1; "
+                    "existing subscriptions still valid\n")
             return _vapid
         except Exception as e:
             sys.stderr.write(f"[push] vapid.json unreadable, regenerating: {e}\n")
@@ -132,9 +177,16 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     from the push service) are dropped from the store. Returns
     {sent, dropped, errors}."""
     from pywebpush import webpush, WebPushException
+    from py_vapid import Vapid
 
     vapid = _ensure_vapid()
-    private_pem = vapid["private_pem"]
+    # pywebpush.webpush passes the vapid_private_key string through
+    # Vapid.from_string, which fails on standard EC PEMs with an opaque
+    # "ASN.1 parsing error". from_pem works fine on the same input. So
+    # we instantiate Vapid ourselves and pass the object instead of a
+    # string — pywebpush detects the object via `hasattr(_, "sign")`
+    # and skips from_string entirely.
+    vapid_obj = Vapid.from_pem(vapid["private_pem"].encode("ascii"))
     payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag})
     sent = 0
     dropped: list[str] = []
@@ -144,10 +196,15 @@ def send_to_all(title: str, body: str, *, url: str = "/",
             webpush(
                 subscription_info=sub,
                 data=payload,
-                vapid_private_key=private_pem,
-                # subject: an email or https URL — push services need it
-                # to know who's sending. The literal value isn't validated.
-                vapid_claims={"sub": "mailto:noreply@muselab.local"},
+                vapid_private_key=vapid_obj,
+                # subject: py_vapid enforces this MUST be `mailto:<email>`
+                # (no https URL accepted, even though VAPID spec allows it).
+                # Apple's push.apple.com further rejects mailtos whose TLD
+                # is non-routable (`.local`, `.test`) with 403 BadJwtToken.
+                # `.dev` is a real ICANN TLD, accepted by both Apple + FCM.
+                # Self-hosters can override via MUSELAB_VAPID_SUBJECT in .env.
+                vapid_claims={"sub": os.environ.get(
+                    "MUSELAB_VAPID_SUBJECT", "mailto:noreply@muselab.dev")},
                 ttl=24 * 3600,
             )
             sent += 1

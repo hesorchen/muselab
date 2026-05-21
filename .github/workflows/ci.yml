@@ -37,10 +37,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
+      - name: Install deps
+        # Sync dev group so the pinned ruff version from pyproject.toml is
+        # used (matches `scripts/lint.sh` local dev). Replaces the previous
+        # `uv tool install ruff` which pulled latest non-reproducibly.
+        run: uv sync --frozen
       - name: ruff check
-        run: |
-          uv tool install ruff
-          uv tool run ruff check backend/ tests/ || true   # non-blocking for now
+        # Blocking now that the backend is clean — regressions fail CI
+        # instead of accumulating silently.
+        run: uv run ruff check backend/ tests/
       - name: muselab lint (encoding / BOM / class collisions)
         # Catches the bug classes we've shipped historically — Python file
         # I/O without encoding, .ps1 files missing BOM, etc. See

@@ -1,8 +1,5 @@
 """Shared pytest fixtures: spin up a backend.main app against a temp ROOT and
 fresh sessions dir, with a known token. Each test gets a clean filesystem."""
-import importlib
-import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -45,14 +42,18 @@ def app_module(monkeypatch, temp_root, tmp_path):
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
 
-    import backend.main as main_mod  # type: ignore[import]
-
-    # Isolate sessions dir so tests don't litter production data.
+    # Isolate sessions dir BEFORE backend.main imports backend.chat, which
+    # snapshots `sess.SESS_DIR / "active_turns"` into `_ACTIVE_TURN_DIR` at
+    # module import time. If we patched SESS_DIR after, chat.py would have
+    # already cached production's active_turns path — leaking real in-flight
+    # sidecars (including the dev's own muselab session) into the test.
     from backend import sessions as sess_mod
     test_sess_dir = tmp_path / "sessions"
     test_sess_dir.mkdir()
     monkeypatch.setattr(sess_mod, "SESS_DIR", test_sess_dir)
     monkeypatch.setattr(sess_mod, "INDEX", test_sess_dir / "index.json")
+
+    import backend.main as main_mod  # type: ignore[import]
 
     for k in ("DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY",
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):

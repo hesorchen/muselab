@@ -23,7 +23,7 @@ from claude_agent_sdk import (
     fork_session as sdk_fork_session,
 )
 from .auth import require_token_query, require_token
-from .settings import ROOT, MODEL, MCP_CONFIG_PATH
+from .settings import ROOT, MODEL, MCP_CONFIG_PATH, atomic_write_text
 from . import sessions as sess
 from . import endpoints
 from .ask_user_question import (
@@ -43,12 +43,174 @@ _clients: dict[tuple[str, str], ClaudeSDKClient] = {}
 # client whose mode no longer matches the request swap via
 # client.set_permission_mode() instead of needing a full rebuild.
 _client_permission: dict[tuple[str, str], str] = {}
+
+
+class TurnBroadcast:
+    """Fan-out for an in-flight assistant turn.
+
+    Why: the SSE event_gen used to be the sole consumer of SDK output
+    via merge_q; when the browser closed, the generator unwound and
+    cancelled pump_claude, killing the in-progress reply.
+
+    Now event_gen runs as a detached background task that PUBLISHES
+    every SSE event it would have yielded to this broadcast. The HTTP
+    endpoint is just a SUBSCRIBER — it replays the existing buffer +
+    streams new events. A reconnecting browser becomes a new subscriber
+    and gets the full reply via replay + live tail, with no extra logic
+    on the SDK side. Up to 30 min per turn (asyncio.wait_for at the
+    background-task level). Removed from `_active_turns` when finished.
+    """
+    def __init__(self, session_id: str, model: str = ""):
+        self.session_id = session_id
+        self.model = model
+        self.events: list[dict] = []
+        self.subscribers: set[asyncio.Queue] = set()
+        self.done = False
+        self.started_at = time.time()
+        # User-side context for this turn — populated when the SSE
+        # endpoint kicks off a new turn. Needed because SDK CLI only
+        # flushes the session JSONL at turn completion; mid-turn reloads
+        # would see an empty session unless we reconstruct the message
+        # list from broadcast state. The user message itself isn't in
+        # `events` (those are server→client SSE events; user prompt is
+        # a separate input channel) so we keep it on the broadcast.
+        self.user_text: str = ""
+        self.user_images: list[dict] = []
+        self.user_docs: list[dict] = []
+
+    def publish(self, event: dict) -> None:
+        self.events.append(event)
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+    def finish(self) -> None:
+        if self.done:
+            return
+        self.done = True
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(None)   # sentinel — subscribers stop yielding
+            except Exception:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self.subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self.subscribers.discard(q)
+
+
+# In-flight turns by session id. Lookup target for reconnect.
+_active_turns: dict[str, TurnBroadcast] = {}
 # LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
 # muselab leaks memory as users open more sessions. New clients append to
 # the tail; on cache miss with len > cap, oldest gets disconnected.
 _client_lru: list[tuple[str, str, str]] = []   # (session_id, model, effort)
 _CLIENT_POOL_CAP = int(os.environ.get("MUSELAB_CLIENT_POOL_CAP", "3"))
 _lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# In-flight turn persistence (survives muselab process restart)
+# ---------------------------------------------------------------------------
+# Why: `_active_turns` is in-memory only. If muselab restarts mid-turn
+# (systemd OOM-kill / manual restart / crash / `systemctl --user restart`),
+# the user's prompt is lost and they may not even realize the turn never
+# replied. We write a tiny sidecar JSON to disk per in-flight turn, delete
+# it on clean completion, and on process startup scan for orphans to tell
+# the frontend "you had N unfinished turns last session."
+#
+# Design choices:
+# - Sidecar lives under `sessions/active_turns/<sid>.json`, not `~/.muselab/`,
+#   because SESS_DIR already exists, is gitignored, and is the natural sibling
+#   for per-session state.
+# - We do NOT auto-resume. Auto-resume would burn tokens on conversations the
+#   user has already abandoned and bypass their "should I rephrase?" judgment.
+#   Frontend gets the list + sids and toasts the user — they decide.
+# - File presence == status "in_flight". Don't bother with a status field;
+#   deletion is the only terminal action.
+# - No periodic touch / last_event_ts. Adding background touch task per turn
+#   means N file writes per second across active turns — not worth the
+#   complexity for "stale by 30s vs 30min" UX granularity. `started_at` is
+#   enough to show "5 min ago" in the toast.
+
+_ACTIVE_TURN_DIR = sess.SESS_DIR / "active_turns"
+_ACTIVE_TURN_DIR.mkdir(exist_ok=True)
+
+
+def _active_turn_path(sid: str) -> Path:
+    return _ACTIVE_TURN_DIR / f"{sid}.json"
+
+
+def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
+    """Persist the in-flight turn so a restart can surface it to the UI.
+    Best-effort: a failure here must NOT abort the turn (we'd rather run
+    the user's prompt without a recovery breadcrumb than refuse to run)."""
+    try:
+        raw = bc.user_text or ""
+        first_line = raw.strip().splitlines()[0] if raw.strip() else ""
+        preview = first_line if len(first_line) <= 200 else first_line[:199] + "…"
+        atomic_write_text(
+            _active_turn_path(bc.session_id),
+            json.dumps({
+                "sid": bc.session_id,
+                "user_text": raw,
+                "user_text_preview": preview,
+                "model": bc.model,
+                "started_at": bc.started_at,
+            }, ensure_ascii=False),
+        )
+    except Exception as e:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[chat] failed to write active-turn sidecar sid={bc.session_id}: "
+            f"{type(e).__name__}: {e}\n")
+        _sys.stderr.flush()
+
+
+def _delete_active_turn_sidecar(sid: str) -> None:
+    """Called on clean turn termination (success / error / timeout). The
+    only case where we leave it on disk is when the process dies before
+    reaching this — exactly the case we want startup scan to catch."""
+    try:
+        p = _active_turn_path(sid)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _scan_interrupted_turns_at_startup() -> dict[str, dict]:
+    """Read all sidecars left over from a previous process. Runs once at
+    module import. Keeps the files on disk until the user dismisses each
+    one — that way two browsers can both see the notification, and a
+    second muselab restart still surfaces undismissed entries."""
+    out: dict[str, dict] = {}
+    if not _ACTIVE_TURN_DIR.exists():
+        return out
+    for p in _ACTIVE_TURN_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            sid = data.get("sid") or p.stem
+            out[sid] = data
+        except Exception as e:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[chat] skipping malformed active-turn sidecar {p.name}: "
+                f"{type(e).__name__}: {e}\n")
+    return out
+
+
+# Snapshot taken once at process startup. Endpoints serve from this dict;
+# starting a new turn for an sid here auto-dismisses (the new turn supersedes
+# the old in-flight). Don't re-scan disk on each request — once consumed by a
+# browser dismiss, the user has acknowledged.
+_interrupted_at_startup: dict[str, dict] = _scan_interrupted_turns_at_startup()
 
 
 async def _evict_lru_if_needed():
@@ -121,6 +283,38 @@ DEFAULT_CONTEXT_LIMIT = 128_000
 
 # Soft budget. If set (via MUSELAB_BUDGET_USD env or PUT /api/settings),
 # usage endpoint flags overrun so the UI can color the cost badge red.
+def _is_real_user_prompt(sm: Any) -> bool:
+    """True if ``sm`` is a user message the human actually typed.
+
+    SDK 0.2.82's get_session_messages doesn't really filter tool-use
+    sidechain frames — every wrapped tool_result still comes back as
+    ``type="user"`` with ``parent_tool_use_id=None``, contrary to the
+    docstring. So we discriminate by content shape: real user prompts
+    contain text (string content, or a list with at least one non-
+    tool_result block); pure-tool_result frames are sidechain echoes
+    and don't count as a turn.
+
+    Without this filter a session with 45 prompts + heavy agent tool
+    use shows up as 300+ turns in the picker.
+    """
+    if sm is None or getattr(sm, "type", None) != "user":
+        return False
+    if getattr(sm, "parent_tool_use_id", None):
+        return False
+    msg = getattr(sm, "message", None)
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        # If any block is non-tool_result (text / image / etc.) → real prompt.
+        for b in content:
+            if isinstance(b, dict) and b.get("type") != "tool_result":
+                return True
+        return False
+    # Unknown shape — default to "real" so we don't under-count.
+    return True
+
+
 def _budget_usd() -> float:
     try:
         return float(os.environ.get("MUSELAB_BUDGET_USD", "0") or 0)
@@ -128,20 +322,74 @@ def _budget_usd() -> float:
         return 0.0
 
 
-SYSTEM_PROMPT = (
-    "You are a personal assistant for browsing and editing the user's "
-    f"archive directory at {ROOT}. Be concise. Reply in Chinese unless asked.\n\n"
-    "When you need to disambiguate the user's intent or have them pick from a "
-    "small set of mutually exclusive options (2-4 choices), call the "
-    "`mcp__muselab__ask_user_question` tool with structured questions. The UI "
-    "will render clickable buttons. Prefer this over writing out the options as "
-    "plain text and waiting for the user to retype an answer — it's faster for "
-    "them. Do NOT use it for open-ended questions; use plain text reply for those."
-)
+_MEMORY_DIR_PATH = f"~/.claude/projects/{str(ROOT).replace('/', '-')}/memory/"
+
+SYSTEM_PROMPT = f"""\
+You are Muse, a personal assistant running inside muselab — a self-hosted AI
+workspace on the user's own machine. The user's files live at the archive root
+{ROOT} (path varies per install). You can browse and edit anything under that
+root via the available tools.
+
+# Who Muse is
+- One assistant, not split personalities. You hold the user's information
+  across whichever life dimensions they've put in the archive
+  (health / work / money / people / notes / …) and reason across them.
+- The user may have written a CLAUDE.md (at the archive root or in
+  ~/.claude/) describing who they are, what they care about, and how
+  they want you to respond. Treat it as ground truth about *them*.
+
+# Defaults
+- Be concise. Lead with the conclusion, then the supporting detail.
+- Reply in the same language as the user's last message.
+- Tables and bullet lists beat long paragraphs for comparing options.
+  Code blocks for code, with the language tag.
+- No "As an AI assistant…", no "I'd be happy to…", no apologizing for
+  things you didn't do. Skip the preamble, answer the question.
+
+# Tools
+- Read / Grep / Glob / Bash to explore the archive freely before
+  answering. Don't guess file contents — read them.
+- Edit / Write for changes. For non-trivial edits, show the diff intent
+  before touching the file.
+- `mcp__muselab__ask_user_question`: use this when you need the user to
+  pick from 2–4 mutually exclusive options. The UI renders clickable
+  buttons — faster than asking in plain text. NOT for open-ended
+  questions; for those, ask in plain text.
+
+# Memory (cross-conversation long-term memory)
+Claude Code keeps a file-based memory at `{_MEMORY_DIR_PATH}`.
+`MEMORY.md` in that dir is the index; its first 200 lines (or 25KB)
+load automatically at session start.
+
+When you learn something that should survive across conversations —
+a stable user preference, a personal fact, a behavior correction, an
+ongoing-project context — save a memory file via Write / Edit, then
+add a one-line entry to `MEMORY.md`.
+
+Naming conventions (mirror what's already there if the dir is
+non-empty):
+- `user_*.md` — identity, persistent facts about the user
+- `feedback_*.md` — behavior rules the user has corrected you on
+- `project_*.md` — context for an ongoing initiative
+- `reference_*.md` — pointers to authoritative files in the archive
+
+Don't memorize:
+- Trivial facts that change daily
+- Things already in archive files (just reference them with a
+  `reference_*.md` pointer)
+- Anything the user asked you NOT to remember
+
+When something changes, update the existing entry — don't duplicate.
+When in doubt, ask the user "should I remember this?" before writing.
+
+# When the user has a CLAUDE.md
+That document is the user's own rules for how you should behave around
+them. Follow it. If it conflicts with anything above, the user's
+CLAUDE.md wins — they wrote it on purpose.
+"""
 
 
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
-                     show_thinking: bool = False,
                      effort: str = "") -> ClaudeSDKClient:
     """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
     Switching model OR effort in the UI yields a fresh client; resume=session_id
@@ -298,8 +546,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             # invisible reasoning — user perceives "few chars + stall + dump".
             # With ThinkingConfigEnabled the reasoning is streamed visibly via
             # thinking_delta events, which the FE renders as a collapsible
-            # block. The `show_thinking` parameter is retained for API compat
-            # but no longer toggles the model side.
+            # block. (Old `show_thinking` toggle removed 2026-05-20 — was
+            # always-on for years; nobody passes it any more.)
             from claude_agent_sdk import ThinkingConfigEnabled
             budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
             # ThinkingConfigEnabled is a TypedDict — instantiating without
@@ -316,6 +564,14 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 opts_kwargs["effort"] = effort
             # When permission_mode is not bypassPermissions, wire the SDK's
             # can_use_tool callback to muselab's permission_request UI bridge.
+            # NOTE: tried wiring this unconditionally for SDK-native
+            # AskUserQuestion routing — SDK 0.2.82's bundled CLI does not yet
+            # surface the trained-in tool through can_use_tool, and the
+            # required PreToolUse keepalive hook added an extra control-channel
+            # round-trip per token that buffered streaming output ("first char
+            # then long pause then a flood" symptom). AskUserQuestion still
+            # works via the MCP route (mcp__muselab__ask_user_question), which
+            # the system prompt above guides the model toward.
             if permission != "bypassPermissions":
                 opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
             try:
@@ -336,8 +592,41 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 else:
                     opts_kwargs.pop("resume", None)
                     opts_kwargs["session_id"] = session_id
-                client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
-                await client.connect()
+                # The fallback can ALSO hit "already in use" — happens when
+                # a prior CLI subprocess for the same sid is still flushing
+                # its session JSONL after a vendor switch (GLM → MiniMax).
+                # SDK transport.close() waits up to 5s for graceful exit, but
+                # the OS-level file lock can persist a bit longer. Retry with
+                # exponential backoff (up to ~3s total) before surfacing the
+                # error to the user.
+                last_err: Exception | None = None
+                for attempt in range(4):
+                    try:
+                        client = ClaudeSDKClient(
+                            options=ClaudeAgentOptions(**opts_kwargs))
+                        await client.connect()
+                        last_err = None
+                        if attempt > 0:
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f"[chat] sid={session_id[:8]} connect retry "
+                                f"succeeded on attempt {attempt + 1}\n")
+                            _sys.stderr.flush()
+                        break
+                    except Exception as e2:
+                        last_err = e2
+                        if "already in use" not in str(e2).lower():
+                            raise
+                        # Backoff: 200ms, 400ms, 800ms, 1600ms (~3s total).
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[chat] sid={session_id[:8]} attempt {attempt + 1} "
+                            f"hit 'already in use', backing off "
+                            f"{200 * (2 ** attempt)}ms\n")
+                        _sys.stderr.flush()
+                        await asyncio.sleep(0.2 * (2 ** attempt))
+                if last_err is not None:
+                    raise last_err
             _clients[key] = client
             _client_permission[key] = permission
             _client_lru.append(key)
@@ -396,6 +685,136 @@ def list_sessions_api() -> dict:
 def create_session_api(req: CreateReq) -> dict:
     meta = sess.create_session(name=req.name or "", model=req.model or MODEL)
     return meta
+
+
+@router.post("/sessions/organize", dependencies=[Depends(require_token)])
+def create_organize_session_api(req: CreateReq | None = None) -> dict:
+    """Create a session preconfigured with the archive-curator system
+    prompt. Returns the session metadata + an initial_message the
+    frontend should immediately send to kick off the curator workflow.
+    See backend/prompts.py for the actual prompt + bilingual seed."""
+    from .prompts import CURATOR_SYSTEM_PROMPT, CURATOR_INITIAL_MESSAGE
+    import datetime as _dt
+    name = (req.name if req else None) or (
+        "[整理档案] " + _dt.datetime.now().strftime("%m-%d %H:%M"))
+    model = (req.model if req else None) or MODEL
+    meta = sess.create_session(
+        name=name, model=model, system_prompt=CURATOR_SYSTEM_PROMPT)
+    return {**meta, "initial_message": CURATOR_INITIAL_MESSAGE}
+
+
+def _extract_searchable_text(content: Any) -> str:
+    """Extract plain text from a JSONL message.content field for search.
+    Handles both string content and list-of-blocks. Skips tool_use /
+    tool_result blocks because their inputs/outputs are usually noisy
+    JSON and not what users mean when they search."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            t = block.get("text")
+            if isinstance(t, str):
+                parts.append(t)
+        elif btype == "thinking":
+            t = block.get("thinking")
+            if isinstance(t, str):
+                parts.append(t)
+    return "\n".join(parts)
+
+
+def _make_snippet(text: str, idx: int, qlen: int, *,
+                   ctx: int = 60, max_len: int = 200) -> str:
+    """Build a search-result snippet centered on a match. Caller passes the
+    match position so we don't have to find() twice. Result is capped at
+    max_len chars with leading/trailing ellipses if truncated."""
+    start = max(0, idx - ctx)
+    end = min(len(text), idx + qlen + ctx)
+    snippet = text[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    # Collapse whitespace runs so multi-line transcripts render compactly
+    # in the search result list.
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+    if len(snippet) > max_len:
+        snippet = snippet[:max_len - 1] + "…"
+    return snippet
+
+
+@router.get("/search", dependencies=[Depends(require_token)])
+def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200),
+                         limit: int = Query(default=30, ge=1, le=100)) -> dict:
+    """Cross-session full-text search. Scans CLI JSONL files for user /
+    assistant text matching `q` (case-insensitive substring). Returns
+    hits sorted by timestamp desc. Each hit:
+        {sid, name, uuid, role, snippet, ts}
+    Implementation: line-by-line JSON parse of every JSONL under the
+    project's CLI directory. For ~200 sessions of typical size (< 1MB
+    each) this runs in <500ms — switch to SQLite FTS5 if it grows."""
+    query = q.strip()
+    if not query:
+        return {"hits": [], "total": 0}
+    qlower = query.lower()
+    if ROOT is None:
+        return {"hits": [], "total": 0}
+    projects_root = Path.home() / ".claude" / "projects"
+    cwd_key = str(ROOT).replace("/", "-")
+    proj_dir = projects_root / cwd_key
+    if not proj_dir.exists():
+        return {"hits": [], "total": 0}
+
+    name_map = {s["id"]: s.get("name", "") for s in sess.list_sessions()}
+
+    hits: list[dict] = []
+    PER_SESSION_CAP = 5   # avoid one chatty session swamping results
+    for jsonl in proj_dir.glob("*.jsonl"):
+        sid = jsonl.stem
+        per_sess = 0
+        try:
+            with jsonl.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if qlower not in line.lower():
+                        continue   # fast reject before JSON parse
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if entry.get("type") not in ("user", "assistant"):
+                        continue
+                    msg = entry.get("message") or {}
+                    text = _extract_searchable_text(msg.get("content"))
+                    if not text:
+                        continue
+                    # CLI's slash-command wrapper round-trips as user
+                    # text — strip before matching so e.g. searching
+                    # "compact" doesn't surface every /compact invocation.
+                    text = _strip_cli_slash_wrapper(text) or text
+                    pos = text.lower().find(qlower)
+                    if pos < 0:
+                        continue
+                    hits.append({
+                        "sid": sid,
+                        "name": name_map.get(sid, ""),
+                        "uuid": entry.get("uuid", ""),
+                        "role": entry.get("type"),
+                        "snippet": _make_snippet(text, pos, len(query)),
+                        "ts": entry.get("timestamp", ""),
+                    })
+                    per_sess += 1
+                    if per_sess >= PER_SESSION_CAP:
+                        break
+        except OSError:
+            continue
+
+    hits.sort(key=lambda h: h["ts"], reverse=True)
+    return {"hits": hits[:limit], "total": len(hits)}
 
 
 # CLI wraps slash commands as pseudo-user messages with these tags so it can
@@ -536,6 +955,20 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                 image_refs.append({"mime": src.get("media_type") or ""})
             # Other block types (server_tool_use, etc.) — skip silently for now.
         flush_text()
+    # Propagate the turn-completion ts (stored on the LAST sm.uuid of
+    # the turn via set_message_annotation in chat_stream's tail) onto
+    # EVERY ui entry that shares that uuid — thinking / tool_use /
+    # tool_result / assistant text. The frontend renders turn-footer
+    # under whichever entry is the turn tail; making sure all of them
+    # carry ts means whatever block ends up at the tail can display
+    # the time. Cheap O(N) — annotations is already a dict lookup.
+    for entry in out:
+        u = entry.get("uuid")
+        if not u:
+            continue
+        ts = annotations.get(u, {}).get("ts")
+        if ts is not None and "ts" not in entry:
+            entry["ts"] = ts
     return out
 
 
@@ -597,7 +1030,14 @@ def _compact_summary_uuids(sid: str) -> set[str]:
 def get_session_api(sid: str) -> dict:
     """Read session: metadata from muselab sidecar + transcript from CLI JSONL
     via SDK. Merges per-message annotations (cost, model, images) into the
-    transcript so the UI gets one flat list of bubbles."""
+    transcript so the UI gets one flat list of bubbles.
+
+    Mid-turn fallback: SDK CLI only writes the JSONL on turn completion,
+    so a reload while a reply is streaming would otherwise return an
+    empty list. When an active TurnBroadcast exists for `sid`, we
+    reconstruct the in-flight messages from its event buffer (user
+    prompt + every SSE event yielded so far) so the user sees the
+    partial reply instead of a blank session."""
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
@@ -608,7 +1048,103 @@ def get_session_api(sid: str) -> dict:
     annotations = sess.get_message_annotations(sid)
     compact_uuids = _compact_summary_uuids(sid)
     messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    # Mid-turn merge: SDK CLI writes the JSONL incrementally — the
+    # user prompt lands immediately when the turn starts, but the
+    # assistant reply (text/thinking/tool blocks) only commits when
+    # the whole turn finishes. So a reload during streaming sees the
+    # user msg but no reply. The active TurnBroadcast has the live
+    # event stream → reconstruct an in-progress view from it and
+    # splice it in place of the last (incomplete) user msg the SDK
+    # returned. When the turn finishes, the active broadcast is
+    # popped and this branch becomes inert; the SDK JSONL alone is
+    # the source of truth again.
+    # NOTE: deliberately NOT layering broadcast rebuild on top of the
+    # SDK transcript here. The frontend's _checkActiveTurn fires SSE
+    # reconnect when the backend says active=true, and the reconnect
+    # endpoint replays the broadcast buffer + streams live events.
+    # If we rebuilt the in-flight portion here too, the user would
+    # either:
+    #  a) see static partial content with no further streaming
+    #     (frontend skips reconnect because messages already ends in
+    #     assistant), or
+    #  b) see duplicated content (SDK partial + broadcast replay).
+    # Keeping this path SDK-only lets reconnect be the sole live-tail
+    # mechanism. The user briefly sees just the user msg, then SSE
+    # fills in everything via replay → live.
     return {**meta, "messages": messages}
+
+
+def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
+    """Reconstruct a UI-shaped message list from an in-flight broadcast.
+    Lossy by design: this is shown only mid-turn while SDK JSONL is
+    empty. Once the turn finishes the regular SDK→UI path takes over
+    and we drop this view.
+
+    Events fold like the streaming-handler's openAsst/closeAsst dance:
+    consecutive 'text' deltas form one assistant bubble; thinking
+    deltas accumulate into one thinking message; tool_use / tool_result
+    push their own messages. Non-render events (done / error / etc.)
+    are ignored here — the UI's `done` handler only matters in live
+    streaming, not in a reload-rebuild."""
+    out: list[dict] = []
+    if bc.user_text or bc.user_images or bc.user_docs:
+        out.append({
+            "role": "user",
+            "text": bc.user_text,
+            "images": bc.user_images,
+            "docs": bc.user_docs,
+        })
+    cur_text_msg: dict | None = None
+    cur_thinking_msg: dict | None = None
+    for ev in bc.events:
+        kind = ev.get("event") or ""
+        data_str = ev.get("data") or "{}"
+        try:
+            data = json.loads(data_str)
+        except Exception:
+            continue
+        if kind == "text":
+            cur_thinking_msg = None
+            chunk = data.get("text", "")
+            if cur_text_msg is None:
+                cur_text_msg = {"role": "assistant", "text": chunk,
+                                  "model": bc.model}
+                out.append(cur_text_msg)
+            else:
+                cur_text_msg["text"] += chunk
+        elif kind == "thinking":
+            cur_text_msg = None
+            chunk = data.get("text", "")
+            if cur_thinking_msg is None:
+                cur_thinking_msg = {"role": "thinking", "text": chunk}
+                out.append(cur_thinking_msg)
+            else:
+                cur_thinking_msg["text"] += chunk
+        elif kind == "tool_use":
+            cur_text_msg = None
+            cur_thinking_msg = None
+            out.append({
+                "role": "tool_use",
+                "name": data.get("name"),
+                "summary": data.get("summary"),
+                "input": data.get("input"),
+                **({"todos": data["todos"]} if "todos" in data else {}),
+                **({"task": data["task"]} if "task" in data else {}),
+                **({"plan": data["plan"]} if "plan" in data else {}),
+            })
+        elif kind == "tool_result":
+            cur_text_msg = None
+            cur_thinking_msg = None
+            out.append({
+                "role": "tool_result",
+                "preview": data.get("preview"),
+                "truncated": data.get("truncated"),
+                "is_error": data.get("is_error"),
+            })
+        # ask_user_question / permission_request not reconstructed here —
+        # they're interactive blocks whose answer state lives in the
+        # ask/perm queues, not in the broadcast buffer.
+    return out
 
 
 @router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
@@ -764,6 +1300,23 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         #   - cross-vendor switches can hit thinking-signature errors on the
         #     next reply if the prior turn had thinking blocks
         #   - prompt cache resets when model changes (first turn slower)
+        # If a turn is still streaming for this session, interrupt it
+        # first. Otherwise the old CLI subprocess is still actively
+        # writing to the session JSONL and disconnect_client below would
+        # race with that — leading to "Session ID already in use" on the
+        # next stream's CLI spawn (eg. GLM → MiniMax mid-reply).
+        bc = _active_turns.get(sid)
+        if bc is not None and not bc.done:
+            async with _lock:
+                live_clients = [c for k, c in _clients.items() if k[0] == sid]
+            for c in live_clients:
+                try:
+                    await c.interrupt()
+                except Exception as _e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat] interrupt before model swap failed for "
+                        f"{sid}: {type(_e).__name__}: {_e}\n")
         sess.update_model(sid, req.model)
         # SDK-native swap if same provider — `client.set_model()` reuses the
         # CLI subprocess (and its loaded CLAUDE.md / MCP / system prompt).
@@ -882,6 +1435,254 @@ def session_usage(session_id: str, model: str = "") -> dict:
     }
 
 
+def _parse_cost(raw: Any) -> float:
+    """Sidecar stores cost as the formatted string we showed in the UI
+    (e.g. '$0.1993'). Parse back to a float for aggregation. Returns 0.0
+    for missing / unparseable values."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lstrip("$").replace(",", "")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _empty_bucket() -> dict:
+    """Per-time-bucket aggregator shape. Used by cost_dashboard to add
+    up arbitrary turn slices. Cost comes from sidecar (vendor knows
+    pricing); tokens come from JSONL (universal across all vendors)."""
+    return {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_tokens": 0, "cache_creation_tokens": 0,
+             "cost": 0.0, "turns": 0}
+
+
+def _add_bucket(dst: dict, src: dict) -> None:
+    for k, v in src.items():
+        if k in dst:
+            dst[k] += v
+
+
+@router.get("/cost-dashboard", dependencies=[Depends(require_token)])
+def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
+                    tz_offset_minutes: int = Query(default=0, ge=-1440, le=1440)
+                    ) -> dict:
+    """Aggregate per-turn usage across all sessions, bucketed by local date
+    and by model. JSONL is the truth for **token counts and model** (CLI
+    writes `message.usage` per turn for every vendor — Anthropic, GLM,
+    MiniMax, DeepSeek). Sidecar adds **cost in USD** where available
+    (only Anthropic + a few others report it; third-party vendors
+    typically report 0). All vendors get full token visibility.
+
+    `tz_offset_minutes` lets the browser ask for buckets in its local
+    timezone (e.g. Beijing = +480). Server stays UTC internally.
+
+    Returns:
+      {
+        "window_days": int,
+        "today" / "last_7d" / "last_30d" / "all_time": {
+            input_tokens, output_tokens, cache_read_tokens,
+            cache_creation_tokens, cost, turns
+        },
+        "by_day":   [{date, ...same fields}, ...]   # densified to `days`
+        "by_model": [{model, ...same fields}, ...]  # all time
+      }
+    """
+    import datetime as _dt
+    from collections import defaultdict
+
+    # 1) Sidecar costs by (sid, uuid) — optional overlay, may be sparse
+    # or empty for third-party vendors. Walk it once so the JSONL scan
+    # can do a cheap dict lookup per turn.
+    cost_by_uuid: dict[str, dict[str, float]] = {}
+    for sidecar in sess.SESS_DIR.glob("*.sidecar.json"):
+        sid = sidecar.name.split(".sidecar.json")[0]
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        msgs = data.get("messages") or {}
+        per_sess: dict[str, float] = {}
+        for uuid_key, ann in msgs.items():
+            if not isinstance(ann, dict):
+                continue
+            cost_val = _parse_cost(ann.get("cost"))
+            if cost_val > 0:
+                per_sess[uuid_key] = cost_val
+        if per_sess:
+            cost_by_uuid[sid] = per_sess
+
+    # 2) Walk JSONL — the universal token source. Every vendor writes
+    # message.usage on assistant turns in Anthropic-compatible shape
+    # (CLI normalizes OpenAI-compatible vendors transparently).
+    tz = _dt.timezone(_dt.timedelta(minutes=tz_offset_minutes))
+    now = _dt.datetime.now(tz)
+    today_str = now.date().isoformat()
+    cutoff_day = (now.date() - _dt.timedelta(days=days - 1)).isoformat()
+    cutoff_7d  = (now.date() - _dt.timedelta(days=6)).isoformat()
+
+    all_total   = _empty_bucket()
+    today_total = _empty_bucket()
+    last_7d     = _empty_bucket()
+    last_30d    = _empty_bucket()
+    by_day:   dict[str, dict] = defaultdict(_empty_bucket)
+    by_model: dict[str, dict] = defaultdict(_empty_bucket)
+
+    # Discover all JSONLs for muselab-tracked sessions. SDK CLI keys
+    # the projects dir by the cwd that ran the session, so a single
+    # logical archive (one ROOT) can have JSONL spread across multiple
+    # `~/.claude/projects/<encoded-cwd>/` dirs if ROOT (or working dir)
+    # changed over time. We track every JSONL whose session id matches
+    # something muselab knows about (sidecar OR sess.list_sessions()) —
+    # this catches early sessions on prior cwds without picking up
+    # totally unrelated projects.
+    projects_root = Path.home() / ".claude" / "projects"
+    if not projects_root.exists():
+        return _empty_dashboard_response(days, tz_offset_minutes, now)
+
+    known_sids: set[str] = set()
+    for sidecar in sess.SESS_DIR.glob("*.sidecar.json"):
+        known_sids.add(sidecar.name.split(".sidecar.json")[0])
+    try:
+        for s in sess.list_sessions():
+            sid = s.get("id")
+            if sid:
+                known_sids.add(sid)
+    except Exception:
+        pass
+
+    jsonl_paths: list[Path] = []
+    for proj_sub in projects_root.iterdir():
+        if not proj_sub.is_dir():
+            continue
+        for jsonl in proj_sub.glob("*.jsonl"):
+            if jsonl.stem in known_sids:
+                jsonl_paths.append(jsonl)
+
+    for jsonl in jsonl_paths:
+        sid = jsonl.stem
+        sid_costs = cost_by_uuid.get(sid, {})
+        try:
+            with jsonl.open("r", encoding="utf-8") as f:
+                for line in f:
+                    # Cheap reject: only assistant turns carry usage.
+                    if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    msg = entry.get("message") or {}
+                    usage = msg.get("usage") or {}
+                    if not isinstance(usage, dict):
+                        continue
+                    in_t  = int(usage.get("input_tokens", 0) or 0)
+                    out_t = int(usage.get("output_tokens", 0) or 0)
+                    cr_t  = int(usage.get("cache_read_input_tokens", 0)
+                                  or usage.get("cache_read_tokens", 0) or 0)
+                    cc_t  = int(usage.get("cache_creation_input_tokens", 0)
+                                  or usage.get("cache_creation_tokens", 0) or 0)
+                    # Skip empty-usage entries (e.g. CLI-internal markers).
+                    if in_t == 0 and out_t == 0 and cr_t == 0 and cc_t == 0:
+                        continue
+                    # A single "turn" = one user prompt + its assistant
+                    # response chain. Inside that chain there can be many
+                    # intermediate assistant lines for tool_use loops —
+                    # those have stop_reason="tool_use". Only count the
+                    # final completion (stop_reason="end_turn", "max_tokens",
+                    # or sometimes None for legacy/streamed lines).
+                    stop_reason = msg.get("stop_reason")
+                    is_final = stop_reason in (None, "end_turn",
+                                                  "max_tokens", "stop_sequence")
+                    ts = entry.get("timestamp") or ""
+                    if not ts:
+                        continue
+                    try:
+                        dt_utc = _dt.datetime.fromisoformat(
+                            ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    day_str = dt_utc.astimezone(tz).date().isoformat()
+                    model_name = msg.get("model") or "unknown"
+                    uuid_key = entry.get("uuid") or ""
+                    cost_val = sid_costs.get(uuid_key, 0.0)
+
+                    turn = {
+                        "input_tokens": in_t,
+                        "output_tokens": out_t,
+                        "cache_read_tokens": cr_t,
+                        "cache_creation_tokens": cc_t,
+                        "cost": cost_val,
+                        # Every assistant line contributes tokens (each
+                        # tool-use loop iteration costs real compute), but
+                        # only the final completion counts as a "turn"
+                        # from the user's perspective.
+                        "turns": 1 if is_final else 0,
+                    }
+                    _add_bucket(all_total, turn)
+                    _add_bucket(by_model[model_name], turn)
+                    if day_str >= cutoff_day:
+                        _add_bucket(by_day[day_str], turn)
+                        _add_bucket(last_30d, turn)
+                    if day_str >= cutoff_7d:
+                        _add_bucket(last_7d, turn)
+                    if day_str == today_str:
+                        _add_bucket(today_total, turn)
+        except OSError:
+            continue
+
+    # Densify by_day so quiet days still get a zero bar.
+    dense_days: list[dict] = []
+    for i in range(days):
+        d = (now.date() - _dt.timedelta(days=days - 1 - i)).isoformat()
+        bucket = by_day.get(d, _empty_bucket())
+        dense_days.append({"date": d, **_round_bucket(bucket)})
+
+    by_model_list = sorted(
+        [{"model": k, **_round_bucket(v)} for k, v in by_model.items()],
+        key=lambda x: (x["input_tokens"] + x["output_tokens"]
+                        + x["cache_read_tokens"] + x["cache_creation_tokens"]),
+        reverse=True)
+
+    return {
+        "window_days": days,
+        "tz_offset_minutes": tz_offset_minutes,
+        "today":    _round_bucket(today_total),
+        "last_7d":  _round_bucket(last_7d),
+        "last_30d": _round_bucket(last_30d),
+        "all_time": _round_bucket(all_total),
+        "by_day":   dense_days,
+        "by_model": by_model_list,
+    }
+
+
+def _round_bucket(b: dict) -> dict:
+    return {**b, "cost": round(b["cost"], 4)}
+
+
+def _empty_dashboard_response(days: int, tz_offset_minutes: int, now) -> dict:
+    """Helper for the no-JSONL case — returns the same shape with all
+    zeros + a densified by_day list so the frontend's chart doesn't
+    crash on missing keys."""
+    import datetime as _dt
+    dense = [{"date": (now.date() - _dt.timedelta(days=days - 1 - i)).isoformat(),
+                **_round_bucket(_empty_bucket())} for i in range(days)]
+    return {
+        "window_days": days,
+        "tz_offset_minutes": tz_offset_minutes,
+        "today":    _round_bucket(_empty_bucket()),
+        "last_7d":  _round_bucket(_empty_bucket()),
+        "last_30d": _round_bucket(_empty_bucket()),
+        "all_time": _round_bucket(_empty_bucket()),
+        "by_day":   dense,
+        "by_model": [],
+    }
+
+
 @router.get("/context-breakdown/{session_id}", dependencies=[Depends(require_token)])
 async def context_breakdown(session_id: str, model: str = "") -> dict:
     """Detailed context breakdown via SDK — answers "where did my 100K go?".
@@ -926,17 +1727,22 @@ async def native_compact_session_api(sid: str) -> dict:
     if meta is None:
         raise HTTPException(404, "session not found")
     model = (meta.get("model") or "").strip() or MODEL
-    client = await get_client(sid, model, "bypassPermissions", show_thinking=False)
+    client = await get_client(sid, model, "bypassPermissions")
     try:
         await client.query("/compact")
         async for _ in client.receive_response():
             pass
     except Exception as e:
         raise HTTPException(500, f"native /compact failed: {e}")
-    # Refresh message_count so the sidebar reflects the compacted size.
+    # Refresh message_count + turn_count so the sidebar reflects the
+    # compacted size. turn_count uses the real-prompt filter — see the
+    # comment on _is_real_user_prompt for why bare `type == "user"` over-
+    # counts by 5-10× in tool-heavy sessions.
     try:
         new_msgs = get_session_messages(sid, directory=str(ROOT))
-        sess.bump_session(sid, message_count=len(new_msgs))
+        n_turns = sum(1 for sm in new_msgs if _is_real_user_prompt(sm))
+        sess.bump_session(sid, message_count=len(new_msgs),
+                           turn_count=n_turns)
     except Exception:
         pass
     return {"ok": True}
@@ -1414,6 +2220,8 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
 @router.post("/upload-image", dependencies=[Depends(require_token)])
 async def upload_image(file: UploadFile = File(...)) -> dict:
     """Legacy endpoint name; now handles images + PDF + text-ish docs + xlsx."""
+    import sys as _sys
+    _t0 = time.perf_counter()
     _gc_images()
     mime = (file.content_type or "").lower()
     name = file.filename or "upload"
@@ -1425,7 +2233,9 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
             f"Accepted: images (png/jpg/gif/webp), PDF, text-based docs "
             f"(md/txt/csv/json/yaml/source code), or Excel (xlsx/xlsm).",
         )
+    _t_read_start = time.perf_counter()
     body = await file.read()
+    _t_read_end = time.perf_counter()
     if len(body) > _IMAGE_MAX_BYTES:
         raise HTTPException(413, f"file too large: {len(body)} bytes. "
                                   f"Max {_IMAGE_MAX_BYTES} bytes (~10MB)")
@@ -1454,27 +2264,66 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
             # safety rail. 400 KB ≈ 10k rows of 8 short cols.
             raise HTTPException(
                 413,
-                f"spreadsheet too large after conversion. Reduce rows / "
-                f"cols and re-upload, or send a CSV of just the slice "
-                f"you need.",
+                "spreadsheet too large after conversion. Reduce rows / "
+                "cols and re-upload, or send a CSV of just the slice "
+                "you need.",
             )
     else:
         entry["b64"] = base64.b64encode(body).decode("ascii")
     _image_store[aid] = entry
+    # Diagnostic timing — logs to journalctl so we can cross-reference
+    # against the frontend's console.log when uploads feel slow. Splits
+    # into "read body" (multipart parse + transfer-out-of-uvicorn) vs
+    # "total" (incl. base64 / dict insert) so we know where the time
+    # actually went on the server side.
+    _t_end = time.perf_counter()
+    _sys.stderr.write(
+        f"[upload] kind={kind} mime={mime} bytes={len(body)} "
+        f"name={name!r} read_ms={(_t_read_end - _t_read_start)*1000:.0f} "
+        f"total_ms={(_t_end - _t0)*1000:.0f}\n")
+    _sys.stderr.flush()
     return {"id": aid, "mime": mime, "bytes": len(body),
              "kind": entry["kind"], "name": name}
 
 
 @router.get("/stream", dependencies=[Depends(require_token_query)])
 async def stream(
-    prompt: str = Query(...),
+    prompt: str = Query(default=""),
     token: str = Query(...),
     session_id: str = Query(...),
     model: str = Query(default=""),
     permission: str = Query(default="bypassPermissions"),
-    show_thinking: bool = Query(default=False),
     image_ids: str = Query(default=""),
 ):
+    # RECONNECT MODE: empty prompt + an active in-flight turn on this
+    # session = subscribe to the existing TurnBroadcast for replay +
+    # live tail. Frontend uses this after loadSession discovers that
+    # `/sessions/{sid}/active` is true. No new query is sent to the SDK.
+    if not prompt.strip():
+        existing = _active_turns.get(session_id)
+        if existing is None:
+            async def _no_active_gen():
+                yield {"event": "error",
+                        "data": json.dumps({"error": "no active turn"})}
+            return EventSourceResponse(_no_active_gen())
+        return EventSourceResponse(
+            _subscribe_broadcast(existing),
+            headers={
+                "Content-Encoding": "identity",
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # NEW-TURN MODE: refuse if there's already an unfinished turn on
+    # this session — otherwise the second turn would overwrite the
+    # broadcast and the user would lose visibility into the first.
+    # Frontend should either reconnect (empty prompt) or wait.
+    if session_id in _active_turns and not _active_turns[session_id].done:
+        async def _busy_gen():
+            yield {"event": "error",
+                    "data": json.dumps({"error": "previous turn still running"})}
+        return EventSourceResponse(_busy_gen())
     # One-session-one-model: if the session already has a locked model,
     # that wins over whatever the frontend's dropdown happens to say. This
     # prevents the "I tried to switch but it didn't take" class of bugs and
@@ -1496,7 +2345,7 @@ async def stream(
     # render as the generic "stream connection failed" toast).
     try:
         client = await get_client(session_id, model_to_use, permission,
-                                    show_thinking, effort=effort_to_use)
+                                    effort=effort_to_use)
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
         async def _early_err_gen():
@@ -1596,7 +2445,8 @@ async def stream(
                 # Log the full exception type + message + traceback for diagnosis.
                 # SDK transport errors / vendor 401s land here. Without this we
                 # silently die and the user just sees "卡着，无法对话".
-                import traceback, sys as _sys
+                import traceback
+                import sys as _sys
                 _sys.stderr.write(
                     f"[chat-stream] sid={session_id} model={model_to_use} "
                     f"exc={type(e).__name__}: {e}\n{traceback.format_exc()}\n")
@@ -1644,7 +2494,10 @@ async def stream(
             """Per-turn AssistantMessage:
               1. Snapshot per-turn usage (msg.usage is raw Anthropic per-call
                  dict; populate sess_u truthfully for the context meter).
-              2. Iterate content blocks — tail-emit TextBlock suffix the
+              2. Accumulate per-turn tokens into the global _stats (truth
+                 for `/api/chat/usage`). ResultMessage.usage is cumulative
+                 per session and would double-count, so we do it here.
+              3. Iterate content blocks — tail-emit TextBlock suffix the
                  stream may have skipped; forward tool_use / tool_result.
             """
             nonlocal assistant_acc, streamed_in_bubble
@@ -1655,6 +2508,14 @@ async def stream(
                 cc_t = int(a_usage.get("cache_creation_input_tokens", 0) or 0)
                 out_t = int(a_usage.get("output_tokens", 0) or 0)
                 ctx_used = in_t + cr_t + cc_t
+                # Per-turn accumulation into the global stats. We do this
+                # here (not in ResultMessage) because ResultMessage.usage
+                # is the cumulative-per-session value and would inflate
+                # _stats quadratically on long sessions.
+                _stats["total_input_tokens"]           += in_t
+                _stats["total_output_tokens"]          += out_t
+                _stats["total_cache_read_tokens"]      += cr_t
+                _stats["total_cache_creation_tokens"]  += cc_t
                 sess_u = _session_usage.setdefault(session_id, {
                     "input_tokens": 0, "output_tokens": 0,
                     "cache_read_tokens": 0, "cache_creation_tokens": 0,
@@ -1724,6 +2585,12 @@ async def stream(
             yield the consolidated 'done' SSE event the FE awaits."""
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
+            # ResultMessage.usage is CUMULATIVE per session. Per-turn
+            # token accumulation into _stats happens in
+            # _handle_assistant_message; here we only record the
+            # cumulative numbers for the SSE "done" payload (FE reads
+            # them as a snapshot). Cost is per-turn (not cumulative),
+            # so it's safe to += into _stats.
             in_t = int(u.get("input_tokens", 0) or 0)
             out_t = int(u.get("output_tokens", 0) or 0)
             cr_t = int(u.get("cache_read_input_tokens", 0)
@@ -1732,15 +2599,6 @@ async def stream(
                         or u.get("cache_creation_tokens", 0) or 0)
             _stats["total_cost_usd"] += cost
             _stats["total_messages"] += 1
-            _stats["total_input_tokens"] += in_t
-            _stats["total_output_tokens"] += out_t
-            _stats["total_cache_read_tokens"] += cr_t
-            _stats["total_cache_creation_tokens"] += cc_t
-
-            # Per-turn input/cache_* + context_used populated from
-            # AssistantMessage.usage in _handle_assistant_message above.
-            # ResultMessage.usage is CUMULATIVE per session — if we += it
-            # into _stats we'd double-count (known bug, out-of-scope here).
             sess_u = _session_usage.setdefault(session_id, {
                 "input_tokens": 0, "output_tokens": 0,
                 "cache_read_tokens": 0, "cache_creation_tokens": 0,
@@ -1808,9 +2666,17 @@ async def stream(
                 if new_asst_uuid and new_user_uuid:
                     break
             if new_asst_uuid and assistant_acc:
+                # ts (ms epoch) stamps the turn's completion time. The
+                # frontend's turn-footer (.turn-footer in index.html)
+                # reads it via fmtHM() → "HH:MM" under the last muse
+                # block of the turn. Stored at ms granularity to match
+                # JS Date.now() (the frontend writes the same ts onto
+                # in-flight messages in _markDone; loading from sidecar
+                # uses this one).
                 sess.set_message_annotation(
                     session_id, new_asst_uuid,
-                    cost=f"${cost:.4f}", model=model_to_use)
+                    cost=f"${cost:.4f}", model=model_to_use,
+                    ts=int(time.time() * 1000))
             if new_user_uuid and (persisted_imgs or persisted_docs):
                 sess.set_message_annotation(
                     session_id, new_user_uuid,
@@ -1830,10 +2696,46 @@ async def stream(
                                 first_user_text = b.get("text", "")
                                 break
                     break
+            # turn_count = real user prompts only. SDK's get_session_messages
+            # claims to filter tool-use sidechain (parent_tool_use_id always
+            # None) but actually returns *every* user-typed frame, including
+            # the implicit ones that wrap tool_result blocks after an agent
+            # tool call. We detect those by content shape: if every content
+            # block is a tool_result, the frame is a sidechain echo, not a
+            # real user message. Without this filter, a session with 45 real
+            # prompts but heavy agent tool use shows up as 300+ turns.
+            n_turns = sum(1 for sm in all_msgs if _is_real_user_prompt(sm))
             sess.bump_session(session_id, message_count=len(all_msgs),
+                               turn_count=n_turns,
                                auto_rename_from=first_user_text or prompt)
             sess.update_model(session_id, model_to_use)
-            limit = MODEL_CONTEXT_LIMITS.get(model_to_use, DEFAULT_CONTEXT_LIMIT)
+            # Web Push on turn-done. Gated by `notify_normal` setting so the
+            # user can mute per-turn pushes independently from scheduler
+            # pushes. Best-effort — never let push failure block the stream.
+            # Body kept minimal per user preference: session name as title +
+            # "Muse 已回复" as body. No reply preview — full text is one tap
+            # away in the actual chat, and preview text often duplicates the
+            # foreground tab the user is already looking at.
+            if os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false":
+                try:
+                    from . import push as _push
+                    sname = ""
+                    try:
+                        for s in sess.list_sessions():
+                            if s.get("id") == session_id:
+                                sname = s.get("name", "")
+                                break
+                    except Exception:
+                        pass
+                    _push.send_to_all(
+                        title=sname or "muselab",
+                        body="💬 Muse 已回复",
+                        url="/",
+                        tag=f"turn-{session_id}",
+                    )
+                except Exception as e:
+                    import sys as _sys
+                    _sys.stderr.write(f"[chat] turn push failed: {e}\n")
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,
@@ -1856,6 +2758,11 @@ async def stream(
                 ),
             })}
 
+        # event_gen is now driven by a detached background task (see
+        # stream endpoint below), so the SSE generator doesn't cancel
+        # these workers when the browser disconnects — they complete
+        # naturally. 30-minute hard cap is applied to the outer
+        # task, not here.
         claude_task = asyncio.create_task(pump_claude())
         side_task = asyncio.create_task(pump_side_q(side_q))
         perm_task = asyncio.create_task(pump_side_q(perm_q))
@@ -1889,13 +2796,167 @@ async def stream(
             yield {"event": "cancelled", "data": "{}"}
             raise
         finally:
+            # event_gen runs as part of a detached background task now;
+            # cleanup here runs after the task finishes naturally (or
+            # the 30-min outer timeout fires and cancels us).
             side_task.cancel()
             perm_task.cancel()
             claude_task.cancel()
             unregister_session_queue(session_id)
             perm.unregister_session_queue(session_id)
 
-    return EventSourceResponse(event_gen())
+    # Background-completion + reconnect-streaming design:
+    #
+    # Old: `event_gen()` was the SSE response generator directly.
+    # Browser disconnect cancelled the generator, which cancelled
+    # pump_claude, which cut off the SDK reply mid-stream.
+    #
+    # New: event_gen() runs as a DETACHED background task that publishes
+    # every event it would have yielded into a per-session TurnBroadcast.
+    # The HTTP response is just a subscriber that replays the buffer +
+    # streams new events. A user closing their browser doesn't affect
+    # the background task — it runs to completion (or 30-min timeout).
+    # A second SSE request to the same session (reconnect) becomes
+    # another subscriber and sees the full reply via replay + live tail.
+    BG_TIMEOUT_S = 1800   # 30 minutes — see PR thread for rationale
+
+    broadcast = TurnBroadcast(session_id=session_id, model=model_to_use)
+    broadcast.user_text = prompt
+    broadcast.user_images = list(persisted_imgs)
+    broadcast.user_docs = list(persisted_docs)
+    _active_turns[session_id] = broadcast
+    # Persist an in-flight breadcrumb so a process crash / restart can
+    # surface this turn to the user on next boot. Auto-dismiss any
+    # stale entry for this sid — starting a new turn supersedes whatever
+    # the previous process left behind.
+    _write_active_turn_sidecar(broadcast)
+    _interrupted_at_startup.pop(session_id, None)
+
+    async def _pump_gen_to_broadcast():
+        try:
+            async with asyncio.timeout(BG_TIMEOUT_S):
+                async for ev in event_gen():
+                    broadcast.publish(ev)
+        except asyncio.TimeoutError:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[chat] turn exceeded {BG_TIMEOUT_S}s (30min), aborting "
+                f"sid={session_id}\n")
+            _sys.stderr.flush()
+            broadcast.publish({
+                "event": "error",
+                "data": json.dumps({"error": "turn exceeded 30min"}),
+            })
+        except Exception as e:
+            import sys as _sys
+            import traceback as _tb
+            _sys.stderr.write(
+                f"[chat] background turn crashed sid={session_id} "
+                f"exc={type(e).__name__}: {e}\n{_tb.format_exc()}\n")
+            _sys.stderr.flush()
+            broadcast.publish({
+                "event": "error",
+                "data": json.dumps({"error": f"{type(e).__name__}: {e}"}),
+            })
+        finally:
+            broadcast.finish()
+            _active_turns.pop(session_id, None)
+            # Turn reached a terminal state (success / error / timeout) inside
+            # this process — drop the persistence breadcrumb so startup scan
+            # doesn't surface it as "interrupted." Only an actual process death
+            # (OOM kill / SIGKILL / power loss) leaves the sidecar on disk.
+            _delete_active_turn_sidecar(session_id)
+
+    asyncio.create_task(_pump_gen_to_broadcast())
+
+    return EventSourceResponse(
+        _subscribe_broadcast(broadcast),
+        headers={
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _subscribe_broadcast(broadcast: TurnBroadcast):
+    """Yields buffered events first (replay), then live events as they
+    publish, terminating on the broadcast's finish sentinel. A late
+    subscriber (reconnecting browser) gets the complete history plus
+    everything that arrives after.
+
+    Atomicity note: `broadcast.subscribe()` adds the queue and
+    `len(...)` snapshots the buffer length in one synchronous block
+    (no `await` between them). asyncio is single-threaded and won't
+    preempt — publishes that happen before subscribe are entirely in
+    the buffer, publishes after go into BOTH the buffer and the queue.
+    Slicing the buffer up to `snap_len` gives us exactly the "before"
+    set, and the queue gives us exactly the "after" set, with no
+    duplication and no missed events."""
+    q = broadcast.subscribe()
+    snap_len = len(broadcast.events)
+    try:
+        # Replay the buffered prefix (events published BEFORE we
+        # subscribed — they're not in our queue).
+        for i in range(snap_len):
+            yield broadcast.events[i]
+        # If the turn already finished before we subscribed, the queue
+        # holds nothing but the None sentinel.
+        while True:
+            ev = await q.get()
+            if ev is None:
+                break
+            yield ev
+    finally:
+        broadcast.unsubscribe(q)
+
+
+@router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
+def session_active_status(sid: str) -> dict:
+    """Tell the frontend whether `sid` has an in-progress background
+    turn. Used on session load to decide between "render JSONL history"
+    and "open a reconnect SSE stream to follow the live tail."""
+    b = _active_turns.get(sid)
+    if not b:
+        return {"active": False}
+    return {
+        "active": True,
+        "model": b.model,
+        "started_at": b.started_at,
+        "events_so_far": len(b.events),
+    }
+
+
+# ====== interrupted turns (process-crash recovery) ======
+
+@router.get("/interrupted-turns", dependencies=[Depends(require_token)])
+def list_interrupted_turns() -> dict:
+    """Returns turns that were in-flight when the previous muselab process
+    died. Empty list on clean restart. Frontend reads this once per session
+    boot and toasts the user — does NOT auto-resume (user decides whether
+    the conversation is worth retrying)."""
+    items = []
+    for sid, data in _interrupted_at_startup.items():
+        items.append({
+            "sid": sid,
+            "preview": data.get("user_text_preview") or "",
+            "model": data.get("model") or "",
+            "started_at": data.get("started_at") or 0,
+        })
+    # Most recent first — usually what the user remembers best
+    items.sort(key=lambda x: x["started_at"], reverse=True)
+    return {"turns": items}
+
+
+@router.post("/interrupted-turns/{sid}/dismiss",
+             dependencies=[Depends(require_token)])
+def dismiss_interrupted_turn(sid: str) -> dict:
+    """User clicked 'dismiss' (or opened the session and saw the history).
+    Removes the in-memory entry AND deletes the disk sidecar so future
+    restarts don't keep nagging about the same turn."""
+    _interrupted_at_startup.pop(sid, None)
+    _delete_active_turn_sidecar(sid)
+    return {"ok": True}
 
 
 # ====== ask_user_question answer endpoint ======

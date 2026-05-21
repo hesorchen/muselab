@@ -91,6 +91,39 @@ def _load_index() -> list[dict]:
 
 def _save_index(items: list[dict]) -> None:
     atomic_write_text(INDEX, json.dumps(items, ensure_ascii=False, indent=2))
+    # Index was just rewritten — invalidate any cached list_sessions() output
+    # so the next caller sees the rename / delete / bump immediately rather
+    # than waiting for the TTL to expire.
+    invalidate_sessions_cache()
+
+
+# ---------------------------------------------------------------------------
+# list_sessions() TTL cache
+# ---------------------------------------------------------------------------
+# Profile on a 270-session archive showed `list_sessions()` takes 150-480ms,
+# dominated by `sdk_list_sessions()` walking every JSONL for metadata. The
+# function is called multiple times per request flow:
+#   - /api/chat/sessions (UI refresh)
+#   - search endpoint (builds id→name map)
+#   - compact cross-session lookups
+#   - heartbeat reconnect path
+#
+# Caching with a short TTL deduplicates "refresh storms" (heartbeat reconnect
+# triggers refreshSessions + fetchContextInfo + scheduler unread simultaneously)
+# without staling user-visible state for more than ~2s. Internal mutations
+# (bump_session / rename / delete / pin) call `invalidate_sessions_cache()`
+# via `_save_index` so muselab-driven changes appear immediately; only
+# external JSONL writes (rare in muselab context) wait for the TTL.
+
+_LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_LIST_CACHE_TTL_S = 2.0
+
+
+def invalidate_sessions_cache() -> None:
+    """Drop the cached list_sessions() snapshot. Call after any mutation that
+    changes index.json or adds/removes a session sidecar."""
+    _LIST_CACHE["at"] = 0.0
+    _LIST_CACHE["data"] = None
 
 
 def _load_sidecar(sid: str) -> dict:
@@ -141,6 +174,12 @@ def _merge_sdk_with_index(info: Any, m: dict) -> dict:
         # scan per session). bump_session writes it to index after each
         # turn, so fall back there. New sessions show 0 until first turn.
         "message_count": m.get("message_count", 0),
+        # turn_count = how many user prompts this session has. More intuitive
+        # than message_count (which counts every assistant / thinking / tool
+        # frame). Falls back to message_count // 2 for legacy entries written
+        # before this field existed.
+        "turn_count": m.get("turn_count",
+                              max(0, m.get("message_count", 0) // 2)),
         "first_prompt": info.first_prompt or "",
         "tag": info.tag or m.get("tag"),
         "pinned": bool(m.get("pinned", False)),
@@ -171,7 +210,18 @@ def toggle_pin(sid: str) -> bool:
 def list_sessions() -> list[dict]:
     """List sessions, preferring SDK truth (CLI JSONL last_modified +
     custom_title) and falling back to muselab index for muselab-specific
-    fields and pre-first-query sessions."""
+    fields and pre-first-query sessions.
+
+    Cached for `_LIST_CACHE_TTL_S` seconds — see cache block in this module.
+    Mutations call `invalidate_sessions_cache()` so cache staleness only
+    affects external-to-muselab JSONL writes."""
+    now = time.time()
+    cached = _LIST_CACHE.get("data")
+    if cached is not None and (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S:
+        # Return a shallow copy of the list so callers that mutate-in-place
+        # (e.g. add a transient field for rendering) don't poison the cache.
+        # Inner dicts are still shared — read-only callers won't notice.
+        return list(cached)
     index = _load_index()
     index_by_id = {s["id"]: s for s in index}
     sdk_list: list[Any] = []
@@ -195,11 +245,15 @@ def list_sessions() -> list[dict]:
         if s["id"] not in seen:
             out.append(s)
     # Sort: pinned sessions first (descending), then by updated_at desc.
-    return sorted(
+    result = sorted(
         out,
         key=lambda s: (1 if s.get("pinned") else 0, s.get("updated_at", 0)),
         reverse=True,
     )
+    _LIST_CACHE["data"] = result
+    _LIST_CACHE["at"] = now
+    # Return a shallow copy so caller mutations don't bleed back into cache.
+    return list(result)
 
 
 def create_session(name: str = "", model: str = "", system_prompt: str = "") -> dict:
@@ -268,8 +322,10 @@ def delete_session(sid: str) -> bool:
     _save_index(new)
     p = _sidecar_path(sid)
     if p.exists():
-        try: p.unlink()
-        except OSError: pass
+        try:
+            p.unlink()
+        except OSError:
+            pass
     return True
 
 
@@ -345,19 +401,22 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
 # ============================================================================
 
 def bump_session(sid: str, message_count: int | None = None,
+                  turn_count: int | None = None,
                   auto_rename_from: str | None = None) -> None:
-    """Update updated_at and optionally message_count; opportunistically
-    auto-rename from the first substantive user message text. Auto-rename
-    also writes an `ai-title` entry to the CLI JSONL so that
-    `claude --resume` picker shows muselab-created sessions (without the
-    ai-title entry, cc's picker silently skips them — only `--resume <sid>`
-    explicit resume works)."""
+    """Update updated_at and optionally message_count / turn_count;
+    opportunistically auto-rename from the first substantive user message
+    text. Auto-rename also writes an `ai-title` entry to the CLI JSONL so
+    that `claude --resume` picker shows muselab-created sessions (without
+    the ai-title entry, cc's picker silently skips them — only
+    `--resume <sid>` explicit resume works)."""
     idx = _load_index()
     for s in idx:
         if s["id"] == sid:
             s["updated_at"] = time.time()
             if message_count is not None:
                 s["message_count"] = message_count
+            if turn_count is not None:
+                s["turn_count"] = turn_count
             is_auto = s.get("auto_named",
                             s.get("name", "").startswith("新会话"))
             if is_auto and auto_rename_from:

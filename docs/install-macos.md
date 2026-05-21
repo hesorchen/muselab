@@ -1,5 +1,7 @@
 # Install muselab on macOS
 
+> [简体中文](install-macos_zh.md)
+
 One-shot installer for personal Mac. Runs as a **user-level LaunchAgent** —
 no `sudo`, autostarts on login, restarts on crash.
 

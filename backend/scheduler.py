@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
@@ -219,6 +220,11 @@ def update_task(tid: str, **changes: Any) -> dict | None:
     t = _state["tasks"].get(tid)
     if not t:
         return None
+    # Capture the old name BEFORE applying the change — used to detect a
+    # rename so we can keep the bound session's name in sync. Without
+    # this the history picker kept showing the old `[定时] xxx` label
+    # while the scheduler list showed the new task name.
+    old_name = t.get("name")
     for k in ("name", "prompt", "model"):
         if k in changes and changes[k] is not None:
             t[k] = str(changes[k])
@@ -227,16 +233,43 @@ def update_task(tid: str, **changes: Any) -> dict | None:
     if "schedule" in changes and changes["schedule"] is not None:
         t["schedule"] = changes["schedule"]
         t["next_run"] = _compute_next_run(t["schedule"])
+    # Sync bound session name if the task was renamed. Best-effort —
+    # failure to find the session shouldn't roll back the task update.
+    new_name = t.get("name")
+    sid = t.get("session_id")
+    if sid and new_name and new_name != old_name:
+        try:
+            from . import sessions as sess
+            sess.rename_session(sid, f"[定时] {new_name}")
+        except Exception as e:
+            sys.stderr.write(
+                f"[scheduler] update_task({tid}): bound session {sid} "
+                f"rename failed: {e}\n")
     _save_state()
     return t
 
 
 def delete_task(tid: str) -> bool:
-    if tid in _state["tasks"]:
-        del _state["tasks"][tid]
-        _save_state()
-        return True
-    return False
+    """Delete a task AND its bound session by default. Leaving the
+    session behind used to create orphan `[定时] xxx` entries in the
+    history picker that the user couldn't easily tell apart from active
+    ones — so we now clean both. The session's on-disk JSONL is removed
+    too (sess.delete_session handles it). Returns True if the task
+    existed and got removed."""
+    t = _state["tasks"].pop(tid, None)
+    if not t:
+        return False
+    sid = t.get("session_id")
+    if sid:
+        try:
+            from . import sessions as sess
+            sess.delete_session(sid)
+        except Exception as e:
+            sys.stderr.write(
+                f"[scheduler] delete_task({tid}): bound session {sid} "
+                f"cleanup failed: {e}\n")
+    _save_state()
+    return True
 
 
 def list_history(limit: int = 50) -> list[dict]:
@@ -284,26 +317,35 @@ async def _execute_task(task: dict) -> None:
     error: str | None = None
 
     try:
+        # Tasks created before the scheduler UI had a model picker stored
+        # model=""; SDK then silently fell back to its built-in default
+        # (which differs from whatever the user has selected in the chat
+        # UI), so the bound session's reply style + capability didn't
+        # match what the user expected. Fall back to muselab's MODEL
+        # default when task.model is empty.
+        from .settings import MODEL as _DEFAULT_MODEL
+        model = task.get("model") or _DEFAULT_MODEL
         client = await get_client(
             session_id=sid,
-            model=task.get("model") or "",
+            model=model,
             permission="bypassPermissions",
-            show_thinking=False,
         )
+        # SDK 0.2.x AssistantMessage.content is a list of dataclass
+        # blocks (TextBlock / ToolUseBlock / ThinkingBlock / …), NOT
+        # plain dicts — so `block.type` doesn't exist as a string. The
+        # original implementation was checking that string and silently
+        # never matching, which left reply_text empty and made every
+        # push notification say "(no reply)". isinstance check is what
+        # chat.py uses too — mirror it here.
+        from claude_agent_sdk import TextBlock
         await client.query(task["prompt"])
         async for msg in client.receive_response():
             tname = type(msg).__name__
             if tname == "AssistantMessage":
-                # SDK gives a list of TextBlock / ToolUseBlock etc.
                 for block in getattr(msg, "content", []) or []:
-                    bt = getattr(block, "type", None) or \
-                         (block.get("type") if isinstance(block, dict) else None)
-                    if bt == "text":
-                        txt = getattr(block, "text", None) or \
-                              (block.get("text", "") if isinstance(block, dict) else "")
-                        reply_text += txt
+                    if isinstance(block, TextBlock):
+                        reply_text += getattr(block, "text", "") or ""
             elif tname == "ResultMessage":
-                # End of this turn — receive_response() will return None next
                 break
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
@@ -333,19 +375,27 @@ async def _execute_task(task: dict) -> None:
         if len(_state["history"]) > _HISTORY_CAP:
             _state["history"] = _state["history"][-_HISTORY_CAP:]
         _save_state()
-        # Fire Web Push to every subscribed device. Errors swallowed —
-        # push is best-effort, must never break the scheduler loop.
-        try:
-            from . import push as _push
-            title = task["name"]
-            if error:
-                body = f"Failed: {error[:120]}"
-            else:
-                body = (preview[:120] + "…") if len(preview) > 120 else preview
-            _push.send_to_all(title=title, body=body or "(no reply)",
-                              url="/", tag=f"task-{tid}")
-        except Exception as e:
-            sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
+        # Fire Web Push to every subscribed device. Gated by the
+        # `notify_scheduled` setting so users can mute scheduled-task pushes
+        # independently from normal turn-done pushes (see api_settings.py).
+        # Errors swallowed — push is best-effort, must never break the loop.
+        if os.environ.get("MUSELAB_NOTIFY_SCHEDULED", "true").lower() != "false":
+            try:
+                from . import push as _push
+                # Prefix with ⏰ so the notification banner is universally
+                # recognizable as muselab scheduler output across both zh
+                # and en users. (Pushes are server-side rendered; we don't
+                # know the user's lang preference, so language-neutral
+                # icon beats either zh or en prose.)
+                title = f"⏰ {task['name']}"
+                if error:
+                    body = f"❌ {error[:120]}"
+                else:
+                    body = (preview[:120] + "…") if len(preview) > 120 else preview
+                _push.send_to_all(title=title, body=body or "—",
+                                  url="/", tag=f"task-{tid}")
+            except Exception as e:
+                sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 
 
 # ---------- daemon loop ----------

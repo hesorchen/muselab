@@ -1,7 +1,6 @@
 """Tests for POST /api/chat/upload-image."""
 import base64
 import io
-import pytest
 
 
 # 1x1 PNG (8-byte signature + minimal chunks) — small valid PNG

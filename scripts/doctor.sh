@@ -116,19 +116,24 @@ fi
 echo
 bold "5. HTTP probe"
 URL="http://127.0.0.1:${PORT:-8765}/"
-if curl -fs -o /dev/null -m 3 "$URL" 2>/dev/null; then
-  ok "$URL responds 200"
-  if [[ -n "$TOKEN" ]]; then
-    if curl -fs -m 3 -H "X-Auth-Token: $TOKEN" "http://127.0.0.1:${PORT:-8765}/api/chat/context-info" >/dev/null 2>&1; then
-      ok "token works — /api/chat/context-info OK"
-    else
-      err "token rejected by /api/chat/context-info — TOKEN in .env doesn't match running process"
-      FAIL=$((FAIL+1))
-    fi
-  fi
+HEALTH_URL="http://127.0.0.1:${PORT:-8765}/api/health"
+# Prefer the auth-free /api/health (added 2026-05-20) since it returns a
+# stable JSON probe shape; fall back to "/" for older builds.
+if curl -fs -m 3 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; then
+  ok "$HEALTH_URL responds ok"
+elif curl -fs -o /dev/null -m 3 "$URL" 2>/dev/null; then
+  ok "$URL responds 200 (no /api/health — older build?)"
 else
   warn "$URL not responding — service may not be up"
   WARN=$((WARN+1))
+fi
+if [[ -n "$TOKEN" ]]; then
+  if curl -fs -m 3 -H "X-Auth-Token: $TOKEN" "http://127.0.0.1:${PORT:-8765}/api/chat/context-info" >/dev/null 2>&1; then
+    ok "token works — /api/chat/context-info OK"
+  else
+    err "token rejected by /api/chat/context-info — TOKEN in .env doesn't match running process"
+    FAIL=$((FAIL+1))
+  fi
 fi
 
 echo

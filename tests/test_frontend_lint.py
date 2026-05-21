@@ -26,8 +26,11 @@ FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 #   the keyword as the name. Without this, `async closeChatTab` matched as
 #   `async` and missed the real collision.
 # - Excludes arrow assignments (`const foo = () =>`) and `function ` decls.
+# `(?!\{)` negative lookahead excludes calls like `_report({ ... })` where
+# the open paren is immediately followed by a `{` (object literal arg). A
+# real method def starts with `name(arg…)` or `name()`, never `name({`.
 _METHOD_DEF = re.compile(
-    r"^    (?:async\s+|static\s+|\*\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+    r"^    (?:async\s+|static\s+|\*\s*)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\((?!\{)"
 )
 
 

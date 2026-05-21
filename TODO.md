@@ -3,13 +3,13 @@
 > 状态：核心可用，开源前所有 P0 / P1 已清。剩 demo gif 和小幅打磨。
 > 排序原则：开源前必修 → 强化亮点 → 体验打磨。
 
-最后更新：2026-05-18（multi-tab 收尾 + e2e 脚手架）
+最后更新：2026-05-21（长时运行加固 + 全栈优化扫荡）
 
 ---
 
 ## 📈 现状速览
 
-- **151 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
+- **164 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
 - **多模型**：Claude (Pro OAuth) + DeepSeek + GLM + MiniMax
 - **三个 OS 一键安装**（systemd / launchd / Task Scheduler）+ `doctor` / `intake` 工具
 - **multi-arch Docker** 镜像通过 GH Actions 自动发到 `ghcr.io/hesorchen/muselab`
@@ -95,6 +95,26 @@
 - [ ] **CodeMirror Ctrl+S 保存快捷键** + auto-save 草稿
 - [ ] **进度可视化**：调 claude.ai 接口拉本周期 Pro/Max 用量（看是否有非官方 API）
 
+### 长时运行加固（2026-05-21 业界方案调研后）
+
+> 目标：让 muselab 能稳定跑数小时～数天，autonomous loop / 长任务场景不丢状态。
+> 路线选择：A（SDK 自身能力）已用足，C（systemd）+ 应用层 in-flight 持久化最划算。B（Temporal/Restate/LangGraph）单用户场景 overkill，不做。
+
+- [x] **systemd unit 加固** ✅ 2026-05-21
+  - `~/.config/systemd/user/muselab.service` 已加 `StartLimitIntervalSec=300` / `StartLimitBurst=5` / `MemoryHigh=2G` / `MemoryMax=4G` / `TasksMax=4096`
+  - `Restart=on-failure` 保持不变（手动 stop 不应自动拉）
+  - `Type=notify + WatchdogSec` 暂未上，等真出"假死"再加
+  - daemon-reload 已执行；新限制在下次 restart 后应用到 running process
+- [x] **in-flight turn 持久化** ✅ 2026-05-21
+  - 选 (b) UI 提示（不自动续）
+  - backend：sidecar 写到 `sessions/active_turns/<sid>.json`（不是 `.muselab/`），用 settings.atomic_write_text；开 turn 时写，正常 / 异常 / timeout 终止时删
+  - backend：模块导入时一次性 `_scan_interrupted_turns_at_startup()`，结果存内存 dict；新 turn 启动时 auto-dismiss 同 sid 的旧条目
+  - backend：`GET /api/chat/interrupted-turns` 返回列表 + `POST /api/chat/interrupted-turns/{sid}/dismiss`
+  - frontend：`_bootApp()` 末尾 fire-and-forget `_checkInterruptedTurns()`，每个中断 turn 一个 warn toast（含 `[打开]` action + 自动 POST dismiss）
+  - 不持久化 `last_event_ts`（每 token 一次写盘太贵；起始时间已够 UX 判断）
+
+> 调研来源（查询日期 2026-05-21）：anthropics/claude-code GH #32062 / #10856；anthropics/claude-agent-sdk-python #772；oneuptime 2026-03 systemd watchdog 系列；zylos.ai 2026-02 durable execution 综述；LangGraph PostgresSaver 2026 文档。Temporal/Restate/DBOS/Inngest/LangGraph 五个 durable runtime 单用户场景下 ROI 不够，不引入。
+
 ### 进阶能力（按需）
 
 - [ ] **多目录 archive**：SDK `add_dirs` 暴露多 root
@@ -105,6 +125,32 @@
 - [ ] **全文搜索升级**：可选 ripgrep / SQLite FTS5 后端
 
 ---
+
+### 全栈扫荡审计（2026-05-21）
+
+> 本次"找一切可优化点"扫荡，确定的已开干（见 CHANGELOG 2026-05-21 块），剩下的列在这里待你 review。
+
+#### 待你拍板（需要决策才能继续）
+
+- [ ] **bubble 长消息宽度不对称（user vs muse）** — 已在已知 Bug 里列出，仍需拍板 (A) / (B) / (C)
+- [ ] **`Restart=on-failure` → `Restart=always`?** — 当前手动 `systemctl stop` 后服务不会自动拉。如果你希望 systemctl stop 之外的任何退出都自动恢复（包括 ctrl+c 调试），切到 always。我没改，怕意外干扰你的调试流程。
+
+#### 我有疑虑、留给你 review 后再动
+
+- [ ] **`Type=notify + WatchdogSec=60s` 改造** — 检测"假死"（事件循环阻塞 / 死锁）。需要 Python 端加 `sdnotify` 周期 ping。当前没遇到真"假死"现象，过度工程；先观察 systemd 加固后 1-2 周再决定。
+- [ ] **`/api/log/client-error` 加 rate limit** — 当前 8 KiB 单次上限 + 无频率限制，被 LAN 内恶意调用可以刷爆 stderr。自托管单人场景下不实际威胁；如果未来要暴露到 LAN 以外再加 token 鉴权或 IP 限流。
+- [ ] **`sessions/index.json` 高并发写损坏防护** — 已在已知 Bug 里。当前 atomic_write_text 防半写，但两个 muselab 进程同时写会丢更新。考虑 fcntl 文件锁（POSIX，跨平台需测 Windows）或迁 SQLite。单用户单进程下不触发；如果未来支持 multi-instance 再考虑。
+- [ ] **list_sessions cache 用 mtime + size 而非 TTL** — 当前 2s TTL 兜底外部 JSONL 变化。更精确的做法：跟踪 `sessions/` 目录 + `~/.claude/projects/<root>/` 的 mtime，变化才重新计算。但 cross-platform 文件 watch 复杂，当前 TTL 已经把 list 调用 dedupe 到 0ms，收益边际。
+- [ ] **Frontend bundle 拆分** — app.js 已 279 kB。按 muselab "纯 HTML / 无构建" 哲学不该拆。但如果首屏 LCP 成问题，可以考虑：异步加载 CodeMirror / highlight.js / DOMPurify（这些都是 vendored 大块），首屏只加载 chat 必需。需要先量化首屏体验问题再动。
+- [ ] **Service worker cache 策略复核** — 当前 sw.js 只做 push notification，没做静态资源缓存。如果 LCP / 重复访问性能是问题再加；自托管局域网下没意义。
+
+#### 我能做、可能值得做的（按 ROI 排）
+
+- [ ] **`/api/log/client-error` 加最小 IP rate limit**（每分钟 30 条 stderr 日志，超过丢弃但不返回错）— 防"被发现 endpoint" 后的日志洪水。10 行代码。
+- [ ] **`sdk_list_sessions` 内部 profile** — 还有 ~150ms 的 cold 路径。看 SDK 在做什么，能不能复用一次 directory walk。需要读 SDK 源码。
+- [ ] **首屏 LCP 量化** — 用 chrome devtools performance tab 量首次进入的关键指标，证明是否需要优化。先量化再优化。
+- [ ] **CSP 部分启用**：`script-src 'self' 'unsafe-inline' 'unsafe-eval'` 阻止外部 script 注入但保留 Alpine.js 内联事件。比"完全不设 CSP"安全一点点。但 Alpine 的 `x-on:`/`@click` 走的不是 inline script 协议，需要测试。
+- [ ] **Frontend "无障碍审计"** — 用 axe-core 跑一遍，输出 a11y 问题列表。muselab 是个人工具不强追求 WCAG，但开源后可能有 a11y 工具用户。
 
 ## 🚫 明确不做（已决策）
 
@@ -118,6 +164,10 @@
 
 ## 🐛 已知 Bug / 技术债
 
+- [ ] **bubble 长消息宽度不对称（user vs muse）— 2026-05-20**
+  - 现状：bubble 用 `fit-content + max-width: calc(100% - 40px)`。muse markdown 内是连续 `<p>` 块（长段无 forced break），max-content 撑到 cap；user 文本里的 `\n`（pre-wrap）或 `<br>` 是 forced line break，max-content = 最长那一行宽 → 多行 user 消息永远比 muse 长消息窄
+  - 三选项：(A) 接受 trade-off（建议用户少手动换行）；(B) user bubble 改 `width: calc(100% - 40px)` 撑横条，短消息也满宽；(C) 用 JS 把 user 文本 push 进 markdown 渲染 pipeline，soft-break 不形成 forced break
+  - 用户暂未拍板。需要拍板：你想要 (A) / (B) / (C)?
 - [ ] `sessions/index.json` 高并发写入可能损坏（加文件锁 / 改 SQLite）
 - [ ] 大文件 read 接口无流式（>2MB 直接 413）— 主要影响 archive 里大 log 预览
 - [ ] CodeMirror 切文件需手动退出编辑再进入（不会自动加载新内容）
@@ -134,13 +184,24 @@
 
 ---
 
-## 🎯 项目定位（不再变）
+## 🎯 项目定位（2026-05-21 校准）
 
-**一句话**：在浏览器里复用你的 Claude Pro / Max 订阅，让 Muse 跟你的真实档案对话。
+**一句话**：muselab 是个开源 self-hosted Web UI，让 Muse（基于 Claude Agent SDK）跟你的真实 archive 对话；多端同步，archive / 配置 / credentials 不通过任何 SaaS。
 
-**4 个差异化亮点**（按重要性排）：
+**4 个核心能力**（按"用户能拿到啥"排）：
 
-1. **复用 Pro/Max 订阅** — 省 $20-100/月 vs 按 API 计费
-2. **专为个人档案设计** — health / career / money / people / notes / archives 6 个预置子目录 + universal CLAUDE.md 模板
-3. **~4.4 k 行可读完** — 无 npm / 无 webpack / 单人项目质感
-4. **完整 Agent SDK 能力**：MCP / Skills / Subagent / plan / 图片 / PDF / 流式 partial — 跟 Claude Code 同源
+1. **完整的个人上下文**——`MUSELAB_ROOT` 指向你的 archive；6 个预置子目录（`health / work / money / people / notes / archives`）+ CLAUDE.md 自加载，Muse 默认就懂你
+2. **完整 Agent 能力**——基于 Claude Agent SDK（业界最完整的开源 agent runtime）：MCP / Skills / Subagent / plan / tool use / 流式 partial
+3. **优秀基础模型 + 多模型路由**——同一 agent loop 接入 Claude / DeepSeek / GLM / MiniMax，零 vendor 切换成本
+4. **多端同步 + 无中转**——自部署 server 让手机/电脑/平板共享 sessions；archive / 配置 / credentials 不通过任何 SaaS；模型厂商只看到你授权的对话内容
+
+**额外卖点（不是核心能力，但是用户的决策点）**：
+
+- **复用 Pro/Max 订阅**——通过 Anthropic 官方 OAuth 路径（`~/.claude/.credentials.json`），相比 API key 按量计费可省 $20-100/月。但 OAuth 本身是 Anthropic 推的，不是 muselab 的技术壁垒；竞品想接也能接
+- **~17k 行可读完 + 无构建链**——前端 vanilla HTML + Alpine.js，没 npm / webpack；自部署敢真用、敢改
+
+**澄清（避免外宣 overclaim）**：
+
+- "Claude Agent SDK 是 Anthropic 写的"——muselab 的贡献是把它在浏览器里铺平 + 多 tab + 多模型路由 + 多端同步，不是发明 agent loop
+- "数据不出本机"只指 archive / sessions / 配置 / credentials；你发给模型的对话内容（包括 Muse 替你读的文件内容）**会**到 vendor 那里
+- 跟 Claude.ai / ChatGPT 的区别：没有 SaaS 中间商持有/审阅/训练你的全部历史，仅有 vendor 看到你当下授权的那一轮对话

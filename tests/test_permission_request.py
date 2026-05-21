@@ -16,7 +16,7 @@ def clean_registry():
 
 
 def test_register_and_unregister():
-    q = perm.register_session_queue("s1")
+    perm.register_session_queue("s1")
     assert "s1" in perm._session_queues
     assert "s1" in perm._always_allow
     perm.unregister_session_queue("s1")

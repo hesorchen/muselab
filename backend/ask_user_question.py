@@ -33,6 +33,76 @@ _session_queues: dict[str, asyncio.Queue] = {}
 ANSWER_TIMEOUT_S = 600
 
 
+def _normalize_questions(raw: list) -> list[dict]:
+    """Coerce model output into the exact shape the frontend expects.
+
+    Models are inconsistent: some send bare strings as options, some use
+    `text`/`name`/`value` instead of `label`, some omit `multiSelect`, etc.
+    The SDK schema (`{questions: list}`) is intentionally loose so the
+    model is free to phrase questions naturally — we pay the price here
+    by hand-normalizing rather than failing the tool call on a strict
+    pydantic check (which would just retry with another loose shape).
+
+    Output guarantees per question:
+      - `question`: non-empty str
+      - `header`: str (may be empty)
+      - `multiSelect`: bool
+      - `options`: list of {label: str, description: str}, length >= 1
+    Questions with no usable options are dropped silently — better than
+    rendering a dead question.
+    """
+    out: list[dict] = []
+    for q in raw:
+        if not isinstance(q, dict):
+            # Bare-string question with no options is not something the UI
+            # can render — skip rather than fake options.
+            continue
+        # The actual question text: try common synonyms before giving up.
+        q_text = (q.get("question")
+                   or q.get("text")
+                   or q.get("prompt")
+                   or q.get("title")
+                   or "")
+        q_text = str(q_text).strip()
+        if not q_text:
+            continue
+        header = str(q.get("header") or "").strip()
+        # multiSelect — accept both camelCase (per SDK docs) and snake_case
+        # (models sometimes "correct" to Python style).
+        multi = bool(q.get("multiSelect") or q.get("multi_select") or False)
+
+        options_raw = q.get("options") or q.get("choices") or []
+        options: list[dict] = []
+        for opt in options_raw:
+            if isinstance(opt, str):
+                label = opt.strip()
+                desc = ""
+            elif isinstance(opt, dict):
+                label = str(opt.get("label")
+                              or opt.get("text")
+                              or opt.get("name")
+                              or opt.get("value")
+                              or "").strip()
+                desc = str(opt.get("description")
+                            or opt.get("desc")
+                            or opt.get("detail")
+                            or "").strip()
+            else:
+                continue
+            if not label:
+                continue
+            options.append({"label": label, "description": desc})
+        if not options:
+            continue
+        out.append({
+            "question": q_text,
+            "header": header,
+            "multiSelect": multi,
+            "options": options,
+        })
+    return out
+
+
 def register_session_queue(session_id: str) -> asyncio.Queue:
     """Streaming endpoint calls this at start; returns the queue to merge into SSE."""
     q: asyncio.Queue = asyncio.Queue()
@@ -82,10 +152,26 @@ def build_server_for_session(session_id: str):
         {"questions": list},
     )
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
-        questions = args.get("questions") or []
-        if not questions:
+        raw_questions = args.get("questions") or []
+        if not raw_questions:
             return {
                 "content": [{"type": "text", "text": "Error: no questions provided"}],
+                "is_error": True,
+            }
+        # Normalize every question into the exact shape the frontend's Alpine
+        # template expects:
+        #   {question: str, header: str, multiSelect: bool,
+        #    options: [{label: str, description: str}, ...]}
+        # Without this, models that hand us `options: ["yes", "no"]` (bare
+        # strings), or `options: [{text: "yes"}]` (wrong key), or skip
+        # `multiSelect` entirely, render as a question with NO clickable
+        # buttons — the user sees the question text and dead air. See
+        # 2026-05-21 frontend feedback.
+        questions = _normalize_questions(raw_questions)
+        if not questions:
+            return {
+                "content": [{"type": "text",
+                              "text": "Error: questions payload had no usable options"}],
                 "is_error": True,
             }
 

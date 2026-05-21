@@ -1,3 +1,5 @@
+import os
+import time
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -355,7 +357,6 @@ def read_file(path: str) -> PlainTextResponse:
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     suffix = target.suffix.lower()
-    name_lower = target.name.lower()
     # Fast reject for known binary extensions.
     if suffix in BINARY_EXT:
         raise HTTPException(status_code=415, detail="binary file — not previewable as text")
@@ -466,10 +467,8 @@ def write_file(req: WriteReq) -> dict:
     return {"ok": True, "size": target.stat().st_size}
 
 
-import os as _os
-
 # Default 100 MB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
-MAX_UPLOAD_BYTES = int(_os.environ.get("MUSELAB_MAX_UPLOAD_MB", "100")) * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get("MUSELAB_MAX_UPLOAD_MB", "100")) * 1024 * 1024
 # Filename extensions that are likely to be hostile or pointless to host in
 # a personal archive. Block at upload (cleaner than after-the-fact cleanup).
 UPLOAD_BLOCKED_SUFFIX = {
@@ -574,9 +573,6 @@ GREP_EXTS = {".md", ".markdown", ".txt", ".html", ".htm", ".json", ".yaml", ".ym
              ".log", ".xml", ".rst", ".tex"}
 
 
-import os as _os
-import time as _time
-
 MAX_GREP_FILE_SIZE = 1_000_000   # 1MB per file — skip large files
 MAX_GREP_TIME_SEC = 8            # soft time budget
 
@@ -588,14 +584,14 @@ def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
     if not q_lower:
         return {"hits": []}
     hits: list[dict] = []
-    started = _time.monotonic()
+    started = time.monotonic()
     timed_out = False
-    for dirpath, dirnames, filenames in _os.walk(ROOT):
+    for dirpath, dirnames, filenames in os.walk(ROOT):
         # prune ignored dirs; hidden only if not requested
         dirnames[:] = [d for d in dirnames
                        if d not in SEARCH_IGNORE
                        and (show_hidden or not d.startswith("."))]
-        if _time.monotonic() - started > MAX_GREP_TIME_SEC:
+        if time.monotonic() - started > MAX_GREP_TIME_SEC:
             timed_out = True
             break
         for fname in filenames:
@@ -625,7 +621,7 @@ def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
                                 return {"hits": hits, "truncated": True}
             except OSError:
                 continue
-            if _time.monotonic() - started > MAX_GREP_TIME_SEC:
+            if time.monotonic() - started > MAX_GREP_TIME_SEC:
                 timed_out = True
                 break
         if timed_out:
