@@ -95,3 +95,24 @@ if ROOT in _FORBIDDEN_ROOTS:
         f"MUSELAB_ROOT={ROOT} is a system / cross-user path. Point it at "
         f"your $HOME or a sub-directory you own."
     )
+
+
+def is_chinese_locale() -> bool:
+    """Best-effort host-locale check — True when LANG / LC_ALL / LC_MESSAGES
+    indicates a Chinese system.
+
+    Used to choose between bilingual template assets at runtime
+    (`default-CLAUDE.md` vs `default-CLAUDE.en.md`, archive-skeleton READMEs,
+    session labels). Mirrors the env-var probe in
+    `scripts/install-*.{sh,ps1}` and `scripts/intake.{sh,ps1}` so install-time
+    + runtime decisions agree.
+
+    Conservative: only returns True when one of the locale env vars contains
+    "zh" (zh / zh_CN / zh_TW / zh_HK). Everything else falls through to
+    English."""
+    blob = (
+        os.environ.get("LANG", "")
+        + os.environ.get("LC_ALL", "")
+        + os.environ.get("LC_MESSAGES", "")
+    )
+    return "zh" in blob.lower()

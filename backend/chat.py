@@ -23,7 +23,7 @@ from claude_agent_sdk import (
     fork_session as sdk_fork_session,
 )
 from .auth import require_token_query, require_token
-from .settings import ROOT, MODEL, MCP_CONFIG_PATH, atomic_write_text
+from .settings import ROOT, MODEL, MCP_CONFIG_PATH, atomic_write_text, is_chinese_locale
 from . import sessions as sess
 from . import endpoints
 from .ask_user_question import (
@@ -695,8 +695,11 @@ def create_organize_session_api(req: CreateReq | None = None) -> dict:
     See backend/prompts.py for the actual prompt + bilingual seed."""
     from .prompts import CURATOR_SYSTEM_PROMPT, CURATOR_INITIAL_MESSAGE
     import datetime as _dt
+    # Locale-aware default label so English users don't see "[整理档案]" in
+    # their tab strip. Mirrors profile-intake + install scripts.
+    _label = "[整理档案] " if is_chinese_locale() else "[Organize] "
     name = (req.name if req else None) or (
-        "[整理档案] " + _dt.datetime.now().strftime("%m-%d %H:%M"))
+        _label + _dt.datetime.now().strftime("%m-%d %H:%M"))
     model = (req.model if req else None) or MODEL
     meta = sess.create_session(
         name=name, model=model, system_prompt=CURATOR_SYSTEM_PROMPT)
@@ -719,15 +722,11 @@ def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
     # If no CLAUDE.md yet, drop the template in so the agent's first
     # Read tool call succeeds. Locale-aware: zh if any of LANG / LC_ALL /
     # LC_MESSAGES env vars contains "zh" (matches the install/intake
-    # scripts' detection logic — see scripts/install-linux.sh).
+    # scripts' detection logic — see scripts/install-linux.sh and
+    # settings.is_chinese_locale).
     project_claude_md = ROOT / "CLAUDE.md"
     if not project_claude_md.exists():
-        lang_env = (
-            os.environ.get("LANG", "")
-            + os.environ.get("LC_ALL", "")
-            + os.environ.get("LC_MESSAGES", "")
-        )
-        is_zh = "zh" in lang_env.lower()
+        is_zh = is_chinese_locale()
         repo_root = Path(__file__).resolve().parent.parent
         tpl_name = "default-CLAUDE.md" if is_zh else "default-CLAUDE.en.md"
         tpl_path = repo_root / "scripts" / "templates" / tpl_name
@@ -763,13 +762,7 @@ def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
     # Session label follows the same locale check used for the template.
     # English users were seeing "[设置档案] 05-22 14:30" in their tab strip
     # because we always used the Chinese label.
-    lang_env_for_name = (
-        os.environ.get("LANG", "")
-        + os.environ.get("LC_ALL", "")
-        + os.environ.get("LC_MESSAGES", "")
-    )
-    is_zh_for_name = "zh" in lang_env_for_name.lower()
-    default_label = "[设置档案] " if is_zh_for_name else "[Set up profile] "
+    default_label = "[设置档案] " if is_chinese_locale() else "[Set up profile] "
     name = (req.name if req else None) or (
         default_label + _dt.datetime.now().strftime("%m-%d %H:%M"))
     model = (req.model if req else None) or MODEL
