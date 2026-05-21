@@ -336,9 +336,10 @@ this date.
 
 ## Architecture notes
 
-- **Backend** (~1.2 k lines Python): FastAPI + Claude Agent SDK + httpx
-- **Frontend** (~3.2 k lines, no build): plain HTML + Alpine.js + marked + DOMPurify + highlight.js + CodeMirror 5 (all vendored)
+- **Backend** (~7 k lines Python): FastAPI + Claude Agent SDK
+- **Frontend** (~16 k lines, no build): plain HTML + Alpine.js + marked + DOMPurify + highlight.js + KaTeX + CodeMirror 5 (all vendored)
 - **No npm / no webpack / no bundler** — clone and run
 - **Single binary install** via `uv` (cross-platform)
 
-[Unreleased]: https://github.com/hesorchen/muselab/commits/main
+[Unreleased]: https://github.com/hesorchen/muselab/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/hesorchen/muselab/releases/tag/v0.1.0
