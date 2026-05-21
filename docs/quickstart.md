@@ -119,6 +119,14 @@ The container runs as a non-root `muse` user (uid 1000), so its home is
 `/home/muse/.claude` — bind-mount your host's `~/.claude` there to reuse
 the OAuth credentials from `claude login`.
 
+> **Host UID note.** The container's `muse` user is uid 1000. On most
+> single-user Linux/macOS hosts your account is also uid 1000, so the
+> bind-mounts work. If your host UID differs (multi-user box, custom
+> mac admin account, …), either run `chmod -R go+rX ~/.claude` and
+> `chown -R 1000:1000 ~/muselab-archive` before starting the container,
+> or pass `--user $(id -u):$(id -g)` and accept that the in-container
+> `~/.claude` may be read-only.
+
 Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 
 ### Docker Compose

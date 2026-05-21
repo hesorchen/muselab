@@ -116,6 +116,12 @@ docker run -d --name muselab \
 容器以非 root 用户 `muse` (uid 1000) 运行，home 在 `/home/muse/.claude`——
 把宿主的 `~/.claude` 挂到那里就能复用 `claude login` 拿到的 OAuth 凭据。
 
+> **宿主 UID 注意**：容器内 muse 用户是 uid 1000，大多数单用户 Linux / macOS
+> 主机的账号也是 1000，bind-mount 直接能用。如果你的主机 UID 不是 1000
+> （多用户机器、自定义 mac 管理员账号等），要么提前 `chmod -R go+rX ~/.claude`
+> + `chown -R 1000:1000 ~/muselab-archive`，要么加 `--user $(id -u):$(id -g)`
+> 但接受容器内 `~/.claude` 可能只读。
+
 指定版本：`ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`。
 
 ### Docker Compose
