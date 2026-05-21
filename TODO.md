@@ -9,7 +9,7 @@
 
 ## 📈 现状速览
 
-- **178 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
+- **182 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
 - **多模型**：Claude (Pro OAuth) + DeepSeek + GLM + MiniMax
 - **三个 OS 一键安装**（systemd / launchd / Task Scheduler）+ `doctor` / `intake` 工具
 - **multi-arch Docker** 镜像通过 GH Actions 自动发到 `ghcr.io/hesorchen/muselab`

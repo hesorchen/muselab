@@ -198,3 +198,49 @@ def test_delete_session_clears_sidecar(client, auth, app_module):
     assert sess.delete_session(sid) is True
     assert sess.get_session_meta(sid) is None
     assert sess.delete_session(sid) is False
+
+
+def test_export_session_markdown_empty(client, auth, app_module):
+    """Export endpoint must produce a valid markdown body even for a brand-new
+    session with no turns yet. Verifies metadata header (name + created +
+    msg count) lands and Content-Disposition includes both ASCII filename
+    fallback and RFC 5987 UTF-8 filename* for CJK / spaces."""
+    r = client.post("/api/chat/sessions", headers=auth,
+                     json={"name": "export-empty"})
+    sid = r.json()["id"]
+    r = client.get(
+        f"/api/chat/sessions/{sid}/export",
+        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/markdown")
+    cd = r.headers["content-disposition"]
+    assert "attachment" in cd
+    # ASCII fallback filename present
+    assert "filename=" in cd
+    # RFC 5987 UTF-8 variant present (for CJK / spaces)
+    assert "filename*=UTF-8" in cd
+    body = r.text
+    # Title from session name
+    assert "# export-empty" in body
+    # Empty-session marker — no message turns yet
+    assert "*Messages: 0*" in body
+
+
+def test_export_session_markdown_404_for_unknown(client, auth):
+    r = client.get(
+        "/api/chat/sessions/no-such-session/export",
+        params={"token": "test-token-1234567890abcdef-secure-min-32"},
+    )
+    assert r.status_code == 404
+
+
+def test_export_session_markdown_rejects_bad_token(client, auth, app_module):
+    r = client.post("/api/chat/sessions", headers=auth,
+                     json={"name": "export-auth"})
+    sid = r.json()["id"]
+    r = client.get(
+        f"/api/chat/sessions/{sid}/export",
+        params={"token": "not-the-real-token-but-long-enough-to-pass-the-len-check"},
+    )
+    assert r.status_code == 401
