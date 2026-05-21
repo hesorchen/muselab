@@ -28,7 +28,7 @@ sudo apt install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
 ```bash
 # 起后端（独立终端）
 MUSELAB_TOKEN=test-token-1234567890abcdef-secure-min-32 \
-MUSELAB_ROOT=$HOME/claude_space/projects/muselab \
+MUSELAB_ROOT=$HOME/muselab-archive \
 MUSELAB_PORT=9999 \
 .venv/bin/python -m backend.main
 

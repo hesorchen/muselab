@@ -3,7 +3,7 @@
 > 自托管 Web UI，把 **Claude Agent SDK** 跑在**你自己的文件**之上。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-177_passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-179_passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart_zh.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)

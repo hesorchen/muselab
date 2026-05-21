@@ -64,3 +64,31 @@ def test_app_js_has_no_duplicate_method_definitions():
         "code and any caller wired to them silently breaks. Rename or "
         "merge the duplicates."
     )
+
+
+def test_i18n_zh_en_key_parity():
+    """Both language sections in i18n/index.js must define the same set of
+    keys. A missing translation causes `t('foo.bar')` to fall back to the
+    key literal — exposed to users as 'foo.bar' on screen. We hit this
+    historically when a quick zh-only addition landed without the en
+    mirror; the English UI showed raw keys until a user reported it."""
+    text = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+    # The file has shape `window.MUSELAB_STRINGS = { zh: {...}, en: {...} };`
+    # — split it at the top-level "zh:" / "en:" labels. The blocks are
+    # several hundred lines but contain no nested object literals that look
+    # like another language label, so a greedy "until next label" works.
+    zh_match = re.search(r"\bzh:\s*\{(.*?)\n  \},\s*en:", text, re.S)
+    en_match = re.search(r"\ben:\s*\{(.*?)\n  \},?\s*\};", text, re.S)
+    assert zh_match, "couldn't find zh: { ... } block in i18n/index.js"
+    assert en_match, "couldn't find en: { ... } block in i18n/index.js"
+    zh_keys = set(re.findall(r'"([\w.]+)"\s*:', zh_match.group(1)))
+    en_keys = set(re.findall(r'"([\w.]+)"\s*:', en_match.group(1)))
+    only_zh = zh_keys - en_keys
+    only_en = en_keys - zh_keys
+    assert not only_zh and not only_en, (
+        f"i18n key drift between zh and en. "
+        f"only in zh: {sorted(only_zh)[:8]}; "
+        f"only in en: {sorted(only_en)[:8]}. "
+        f"Add the missing translations or `t()` will leak raw keys to "
+        f"users on the side that's missing them."
+    )
