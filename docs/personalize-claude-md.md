@@ -18,7 +18,21 @@ Delete sections that don't apply to you; don't force-fill.
 
 ## How to generate this file
 
-### Use the installer (recommended)
+### Chat-driven intake — 👤 button (recommended)
+
+The fastest path inside muselab itself. Click the **👤** icon in the
+top bar. Muse opens a fresh session, seeds an empty CLAUDE.md from the
+template if you don't have one yet, then walks you through the nine
+sections one at a time, asking concrete questions and saving each answer
+via `Edit`. Skip any section by saying "skip" or "no for now". Sensitive
+sections (money / health) get a softer treatment — Muse asks
+qualitative orders-of-magnitude first, exact numbers only when you offer
+them.
+
+This is the path the welcome card on first chat load points you at —
+step 2 of the three-step orientation.
+
+### Use the installer (alternative, less interactive)
 
 The first run of `scripts/install-{linux,macos,windows}` asks whether you
 want it to:
@@ -36,7 +50,8 @@ want it to:
 3. Patch the answers into the corresponding fields in CLAUDE.md
 4. Tell you which originals to drop into which directory next
 
-Skipping intake is fine — just press Enter on every question.
+Skipping intake is fine — just press Enter on every question. You can
+always finish the rest later via the 👤 chat flow.
 
 ### Manual
 
