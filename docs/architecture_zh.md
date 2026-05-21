@@ -32,8 +32,9 @@ flowchart TB
   挂到 Anthropic 账单上。
 
 - **无 bundler 无 transpiler**。编辑文件刷新浏览器即生效。`vendor/` 内放置
-  经过校验的 runtime（Alpine / marked / DOMPurify / KaTeX / hljs），安装过程
-  不下载 npm 包。
+  经过校验的 runtime（Alpine / marked / DOMPurify / KaTeX / hljs / CodeMirror），
+  安装过程不下载 npm 包。每个库的授权见
+  [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)。
 
 - **Session = `(session_id, model)`** 缓存 client。切换 model 时新建 client；
   每条 assistant 消息存自己的 `model` 字段，reload 后 bubble badge 依然准确。

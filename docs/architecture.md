@@ -34,8 +34,9 @@ flowchart TB
   meant for a third-party vendor.
 
 - **No bundler, no transpiler.** Edit a file, refresh, done. `vendor/`
-  carries vetted runtime (Alpine, marked, DOMPurify, KaTeX, hljs) so
-  install never hits npm.
+  carries vetted runtime (Alpine, marked, DOMPurify, KaTeX, hljs,
+  CodeMirror) so install never hits npm. Each library's license is
+  attributed in [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md).
 
 - **Session = `(session_id, model)`** cached client. Switching model
   spawns a fresh client; per-message `model` field on assistant bubbles
