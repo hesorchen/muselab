@@ -8,7 +8,7 @@ flowchart TB
     F[📁 文件] --- P[📄 预览 + 多 tab] --- C[💬 chat + 多模型]
   end
   Browser ==>|HTTP / SSE| BE
-  subgraph BE["后端 · FastAPI ~6.8k 行"]
+  subgraph BE["后端 · FastAPI ~7k 行"]
     A["/api/files/*<br/>safe-resolve · 读写 · grep"]
     B["/api/chat/*<br/>ClaudeSDKClient 池<br/>per (session, model)"]
   end
