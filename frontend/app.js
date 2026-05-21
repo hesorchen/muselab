@@ -5023,25 +5023,52 @@ function portal() {
       };
     },
 
-    // Open the user's CLAUDE.md in the preview pane / editor. If it
-    // doesn't exist yet, fall back to the help dialog (which explains
-    // how the intake script creates it). Called from the top-bar
-    // "Edit CLAUDE.md" button.
-    async openClaudeMdEdit() {
-      if (!this.contextInfo.claude_md_exists) {
-        this.openClaudeMdHelp();
+    // Start a dedicated profile-intake session: Muse walks the user
+    // through CLAUDE.md conversationally, asking 1-2 questions per turn
+    // and using Edit to save answers. Backend creates the session with
+    // a curator-style system prompt (see backend/prompts.py) and seeds
+    // the template file if missing. This is the primary path for
+    // "let me set up / refresh my profile" — direct file editing is
+    // deliberately not surfaced (worse UX for personal-info data entry).
+    async startProfileIntake() {
+      const zh = this.lang === "zh";
+      const ok = await this.confirm({
+        title: zh ? "设置档案" : "Set up profile",
+        body: zh
+          ? "将新建一个 [设置档案] 会话，Muse 会通过聊天逐项问你（不是填表单）。任意一步都可以跳过或随时停下。"
+          : "Will create a new [Set up profile] session — Muse asks you questions conversationally (no form). You can skip any question or stop anytime.",
+        okText: zh ? "开始" : "Start",
+      });
+      if (!ok) return;
+      const r = await fetch("/api/chat/sessions/profile-intake", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ model: this.model }),
+      });
+      if (!r.ok) {
+        this.toast(zh
+          ? "创建失败：" + (await r.text())
+          : "Create failed: " + (await r.text()), "error", 4000);
         return;
       }
-      // Project-scope file lives at MUSELAB_ROOT/CLAUDE.md — the file API
-      // uses paths relative to ROOT, so just "CLAUDE.md".
-      try {
-        await this.openFile({ path: "CLAUDE.md", name: "CLAUDE.md" });
-        // Auto-enter edit mode — most clicks on this button mean "I want
-        // to update my profile", not just "I want to read it".
-        this.editing = true;
-      } catch (e) {
-        this.toast(this.t("toast.failed") || "Failed to open CLAUDE.md", "error");
-      }
+      const meta = await r.json();
+      await this.refreshSessions();
+      this.currentId = meta.id;
+      const st = this._ensureTabState(meta.id);
+      st.messages.length = 0;
+      st._loaded = true;
+      this._activateTabState(meta.id);
+      if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+      this._fetchTabUsage(meta.id);
+      this.savePrefs();
+      // Auto-send the intake seed message — the system prompt tells
+      // Muse to begin by reading the existing CLAUDE.md and asking
+      // about whichever sections are still blank.
+      const lang = this.lang === "en" ? "en" : "zh";
+      const initialMsg = (meta.initial_message && meta.initial_message[lang])
+        || meta.initial_message?.zh || "开始";
+      this.input = initialMsg;
+      this.$nextTick(() => { this.send(); });
     },
 
     // Welcome card — shown until user dismisses it (then never again on

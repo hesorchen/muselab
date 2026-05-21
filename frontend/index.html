@@ -682,20 +682,26 @@ window.addEventListener("error", e => {
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
               x-text="tokenBadgeText()"></span>
-        <!-- Edit CLAUDE.md — opens the user's own profile file (the
-             autobiographical brief that Muse reads at every session
-             start). If it doesn't exist yet, falls back to the help
-             dialog explaining how to create it. Distinct from the
-             ctx-chip warning: the chip flags the missing state, this
-             button is the always-available "go edit me" entry point. -->
-        <button @click="openClaudeMdEdit()" class="icon-btn"
-                :title="lang==='zh' ? '编辑 CLAUDE.md（Muse 关于你的档案）' : 'Edit CLAUDE.md (Muse\'s profile of you)'"
-                aria-label="Edit CLAUDE.md">
+        <!-- Set up / refresh profile — opens a dedicated chat session
+             where Muse walks the user through CLAUDE.md interactively,
+             one or two questions at a time, Edit-ing the file as
+             answers come in. Distinct from the ctx-chip warning: the
+             chip flags the missing state, this button is the
+             always-available "let's update my profile with Muse"
+             entry point.
+
+             Deliberately NOT a "raw edit" button — direct editing of
+             CLAUDE.md works (it's just a file) but is a worse UX:
+             nobody wants to stare at a 9-section form. -->
+        <button @click="startProfileIntake()" class="icon-btn"
+                :title="lang==='zh' ? '设置 / 更新档案（让 Muse 通过对话引导）' : 'Set up profile (Muse walks you through it)'"
+                aria-label="Set up profile">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
                stroke="currentColor" stroke-width="2"
                stroke-linecap="round" stroke-linejoin="round">
-            <path d="M20 14.66V20a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5.34"/>
-            <polygon points="18 2 22 6 12 16 8 16 8 12 18 2"/>
+            <circle cx="12" cy="8" r="4"/>
+            <path d="M4 21v-2a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v2"/>
+            <circle cx="18" cy="6" r="2.5" fill="currentColor" stroke="none"/>
           </svg>
         </button>
         <!-- Organize archive — creates a curator-mode session that walks
@@ -1073,7 +1079,7 @@ window.addEventListener("error", e => {
               <div class="onboard-card warn">
                 <div class="onboard-card-title" x-text="t('onboard.no_claude_md_title')"></div>
                 <div class="onboard-card-body" x-text="t('onboard.no_claude_md_body')"></div>
-                <button class="btn-primary" @click="openClaudeMdHelp()" x-text="t('onboard.no_claude_md_cta')"></button>
+                <button class="btn-primary" @click="startProfileIntake()" x-text="t('onboard.no_claude_md_cta')"></button>
               </div>
             </template>
             <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && contextInfo.archive_empty">

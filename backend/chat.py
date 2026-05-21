@@ -703,6 +703,71 @@ def create_organize_session_api(req: CreateReq | None = None) -> dict:
     return {**meta, "initial_message": CURATOR_INITIAL_MESSAGE}
 
 
+@router.post("/sessions/profile-intake", dependencies=[Depends(require_token)])
+def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
+    """Create a session preconfigured for CLAUDE.md profile intake —
+    Muse asks questions conversationally and Edits the file as the
+    user answers. Side-effect: if CLAUDE.md doesn't exist yet at the
+    archive root, seed it from the template (locale-aware) so the
+    chat workflow has something to Read on its first tool call.
+
+    See backend/prompts.py for the system prompt + bilingual seed."""
+    from .prompts import PROFILE_INTAKE_SYSTEM_PROMPT, PROFILE_INTAKE_INITIAL_MESSAGE
+    import datetime as _dt
+    import shutil as _shutil
+
+    # If no CLAUDE.md yet, drop the template in so the agent's first
+    # Read tool call succeeds. Locale-aware: zh if any of LANG / LC_ALL /
+    # LC_MESSAGES env vars contains "zh" (matches the install/intake
+    # scripts' detection logic — see scripts/install-linux.sh).
+    project_claude_md = ROOT / "CLAUDE.md"
+    if not project_claude_md.exists():
+        lang_env = (
+            os.environ.get("LANG", "")
+            + os.environ.get("LC_ALL", "")
+            + os.environ.get("LC_MESSAGES", "")
+        )
+        is_zh = "zh" in lang_env.lower()
+        repo_root = Path(__file__).resolve().parent.parent
+        tpl_name = "default-CLAUDE.md" if is_zh else "default-CLAUDE.en.md"
+        tpl_path = repo_root / "scripts" / "templates" / tpl_name
+        if tpl_path.exists():
+            content = tpl_path.read_text(encoding="utf-8")
+            content = content.replace(
+                "%DATE%", _dt.datetime.now().strftime("%Y-%m-%d"))
+            try:
+                project_claude_md.write_text(content, encoding="utf-8")
+            except OSError as e:
+                # Don't block session creation — agent will fail more
+                # informatively when it tries to Read a non-existent file.
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[profile-intake] couldn't seed CLAUDE.md: {e}\n")
+                _sys.stderr.flush()
+
+        # Also drop archive-skeleton subdirs so the user's first
+        # interaction has the right shape on disk. Skip ones that exist.
+        skel_root = repo_root / "scripts" / "templates" / "archive-skeleton"
+        readme_src = "README.md" if is_zh else "README.en.md"
+        for sub in ("health", "work", "money", "people", "notes", "archives"):
+            sd = ROOT / sub
+            if not sd.exists():
+                try:
+                    sd.mkdir(parents=True, exist_ok=True)
+                    src = skel_root / sub / readme_src
+                    if src.exists():
+                        _shutil.copy(src, sd / "README.md")
+                except OSError:
+                    pass
+
+    name = (req.name if req else None) or (
+        "[设置档案] " + _dt.datetime.now().strftime("%m-%d %H:%M"))
+    model = (req.model if req else None) or MODEL
+    meta = sess.create_session(
+        name=name, model=model, system_prompt=PROFILE_INTAKE_SYSTEM_PROMPT)
+    return {**meta, "initial_message": PROFILE_INTAKE_INITIAL_MESSAGE}
+
+
 def _extract_searchable_text(content: Any) -> str:
     """Extract plain text from a JSONL message.content field for search.
     Handles both string content and list-of-blocks. Skips tool_use /
