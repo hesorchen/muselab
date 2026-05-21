@@ -116,9 +116,13 @@ def test_cost_dashboard_aggregates_tokens_by_day_and_model(client, auth, _staged
     assert models["glm-4.7"]["cost"] == 0.0   # vendor doesn't report cost
     assert models["claude-opus-4-7"]["cost"] == pytest.approx(1.2345, abs=1e-4)
 
-    # by_day is densified to exactly window_days entries
+    # by_day is densified to exactly window_days entries. Use UTC date
+    # to match the tz_offset_minutes=0 query — `dt.date.today()` is local
+    # tz and disagrees when local clock is ahead of / behind UTC across
+    # midnight (caused a flaky failure at 00:xx UTC).
     assert len(data["by_day"]) == 30
-    assert data["by_day"][-1]["date"] == dt.date.today().isoformat()
+    assert data["by_day"][-1]["date"] == \
+        dt.datetime.now(dt.timezone.utc).date().isoformat()
 
 
 def test_cost_dashboard_empty_when_no_sidecars(client, auth):

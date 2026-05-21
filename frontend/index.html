@@ -1118,10 +1118,17 @@ window.addEventListener("error", e => {
                     <button class="onboard-suggestion" @click="useSuggestedPrompt(q)" x-text="q"></button>
                   </template>
                 </div>
-                <!-- Skill triggers — surface what the loaded skills can do -->
+                <!-- Skill triggers — surface what the loaded skills can do.
+                     Header tells the total count (incl. auto-detected Claude
+                     Code skills), chips show only the 7 hand-crafted examples.
+                     "See all" link opens the drawer for the full picker. -->
                 <template x-if="settings.skills.length">
                   <div class="onboard-skills">
-                    <div class="onboard-skills-label" x-text="t('onboard.skill_hint')"></div>
+                    <div class="onboard-skills-label">
+                      <span x-text="t('onboard.skill_hint_count', { n: settings.skills.length })"></span>
+                      <button class="onboard-skills-seeall" @click="toggleSkillsDrawer()"
+                              x-text="lang==='zh' ? '查看全部 →' : 'See all →'"></button>
+                    </div>
                     <div class="onboard-skills-chips">
                       <template x-for="sk in skillSuggestions()" :key="sk.name">
                         <button class="skill-chip" @click="useSuggestedPrompt(sk.prompt)"
@@ -1728,6 +1735,15 @@ window.addEventListener("error", e => {
                     class="chat-toolbar-btn"
                     :disabled="streaming" :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
+            </button>
+            <!-- Skills drawer toggle — always reachable from chat (not just
+                 the empty-chat ready card). Opens a card grid of every
+                 discoverable skill across project / user / plugin scopes. -->
+            <button @click="toggleSkillsDrawer()"
+                    class="chat-toolbar-btn"
+                    :title="t('set.skills.drawer_open')"
+                    aria-label="Open skills list">
+              <span style="font-size:14px;line-height:1">🧩</span>
             </button>
             <!-- Model selector -->
             <select x-model="model" @change="onModelChange()"
@@ -2396,20 +2412,42 @@ window.addEventListener("error", e => {
         <div class="settings-section" data-page="skills"
              x-show="isWideScreen || settings.activePage === 'skills'">
           <div class="settings-section-title" x-text="t('set.sec.skills')"></div>
-          <div class="settings-hint" x-text="t('set.skills.hint')"></div>
+          <!-- Auto-detection notice: tells the user muselab automatically
+               pulled in skills from their Claude Code setup. No setup
+               needed — the SDK already loaded them. -->
+          <div class="skills-meta" x-show="settings.skills.length">
+            <span class="skills-count" x-text="t('set.skills.count', { n: settings.skills.length })"></span>
+            <span class="skills-meta-sep">·</span>
+            <span class="skills-source-hint" x-text="t('set.skills.source_hint')"></span>
+          </div>
+          <input type="text" class="skills-filter" x-model="settings.skillFilter"
+                 :placeholder="lang==='zh' ? '过滤 skill（名字 / 描述）...' : 'Filter skills (name or description)…'"
+                 x-show="settings.skills.length">
           <div x-show="!settings.skills.length" class="settings-empty"
                x-text="t('set.skills.empty')"></div>
-          <template x-for="sk in settings.skills" :key="sk.scope + ':' + sk.name">
-            <div class="skill-row">
-              <div class="skill-row-main">
-                <div class="skill-row-head">
-                  <span class="skill-row-name mono" x-text="sk.name"></span>
-                  <span class="skill-row-scope" :class="'skill-scope-' + sk.scope" x-text="sk.scope"></span>
+          <!-- Card grid — no per-skill emoji (skills are dynamic, can't
+               hardcode icons). Single generic 🧩 marker, scope tag tells
+               where it came from. "Try this" pre-fills the chat input
+               with a starter prompt; for the 7 hand-crafted ones we use
+               a concrete demo prompt, others get a generic seed. -->
+          <div class="skills-grid">
+            <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
+              <div class="skill-card">
+                <div class="skill-card-head">
+                  <span class="skill-card-icon">🧩</span>
+                  <span class="skill-card-name mono" x-text="sk.name"></span>
+                  <span class="skill-card-scope" :class="'skill-scope-' + sk.scope"
+                        :title="sk.source || ''"
+                        x-text="sk.source ? sk.scope + '·' + sk.source.split('/').slice(-1)[0] : sk.scope"></span>
                 </div>
-                <div class="skill-row-desc" x-text="sk.description"></div>
+                <div class="skill-card-desc" x-text="sk.description || (lang==='zh' ? '（无描述）' : '(no description)')"></div>
+                <div class="skill-card-actions">
+                  <button class="skill-card-try" @click="trySkill(sk)"
+                          x-text="t('set.skills.try')"></button>
+                </div>
               </div>
-            </div>
-          </template>
+            </template>
+          </div>
         </div>
 
         <div class="settings-section" data-page="mcp"
@@ -2564,6 +2602,52 @@ window.addEventListener("error", e => {
              x-text="lang==='zh'
                ? 'Mac 用 ⌘，Windows / Linux 用 Ctrl'
                : 'Mac uses ⌘, Windows / Linux uses Ctrl'"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Skills drawer ============
+       Card grid of every discoverable skill (project + user + plugin
+       scopes). Opens from the 🧩 button in the chat toolbar. Clicking a
+       card pre-fills the input with a seed prompt and focuses the
+       textarea — works regardless of whether the user is on the empty
+       chat or mid-conversation. -->
+  <div class="skills-drawer-overlay" x-show="skillsDrawerOpen"
+       @click.self="skillsDrawerOpen = false"
+       @keydown.escape.window="skillsDrawerOpen = false"
+       x-cloak>
+    <div class="skills-drawer">
+      <div class="skills-drawer-head">
+        <div>
+          <div class="skills-drawer-title" x-text="t('set.skills.drawer_title') + ' · ' + settings.skills.length"></div>
+          <div class="skills-drawer-subtitle" x-text="t('set.skills.drawer_subtitle')"></div>
+        </div>
+        <button class="skills-drawer-close" @click="skillsDrawerOpen = false"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <input type="text" class="skills-filter" x-model="settings.skillFilter"
+             :placeholder="lang==='zh' ? '过滤 skill...' : 'Filter skills…'">
+      <div class="skills-drawer-body">
+        <div x-show="!settings.skills.length" class="settings-empty"
+             x-text="t('set.skills.empty')"></div>
+        <div class="skills-grid">
+          <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
+            <div class="skill-card">
+              <div class="skill-card-head">
+                <span class="skill-card-icon">🧩</span>
+                <span class="skill-card-name mono" x-text="sk.name"></span>
+                <span class="skill-card-scope" :class="'skill-scope-' + sk.scope"
+                      :title="sk.source || ''"
+                      x-text="sk.source ? sk.scope + '·' + sk.source.split('/').slice(-1)[0] : sk.scope"></span>
+              </div>
+              <div class="skill-card-desc" x-text="sk.description || (lang==='zh' ? '（无描述）' : '(no description)')"></div>
+              <div class="skill-card-actions">
+                <button class="skill-card-try" @click="trySkill(sk)"
+                        x-text="t('set.skills.try')"></button>
+              </div>
+            </div>
+          </template>
+        </div>
       </div>
     </div>
   </div>

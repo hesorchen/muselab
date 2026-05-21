@@ -460,7 +460,8 @@ function portal() {
       mcpServers: [],
       mcpExamples: [],
       mcpDraft: { show: false, name: "", command: "", argsStr: "" },
-      skills: [],   // discovered skill list (read-only browse)
+      skills: [],         // discovered skill list (read-only browse)
+      skillFilter: "",    // free-text filter (name / description / source)
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
       // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
       versions: null,
@@ -4937,6 +4938,65 @@ function portal() {
           description: lang === "zh" ? "触发 skill: " + t.name : "Triggers skill: " + t.name,
         }))
         .slice(0, 6);
+    },
+
+    // Filter the Settings → Skills grid by free-text search (name /
+    // description / plugin source). Case-insensitive substring match.
+    filteredSkills() {
+      const q = (this.settings.skillFilter || "").trim().toLowerCase();
+      if (!q) return this.settings.skills;
+      return this.settings.skills.filter(s => {
+        const hay = (s.name + " " + (s.description || "") + " " + (s.source || ""))
+          .toLowerCase();
+        return hay.includes(q);
+      });
+    },
+
+    // "Try this" button on a skill card. For the 7 hand-crafted skills
+    // (see SKILL_TRIGGERS), uses the concrete demo prompt. For other
+    // skills (user-installed Claude Code skills + plugin skills), generates
+    // a generic seed and focuses the chat input so the user can fill in
+    // the rest. Closes the Settings modal first so the chat is visible.
+    trySkill(sk) {
+      const zh = this.lang === "zh";
+      // Look up hand-crafted prompt by name; fall back to generic seed.
+      const hand = (this.SKILL_TRIGGERS || []).find(t => t.name === sk.name);
+      const prompt = hand
+        ? hand.prompt_zh
+        : (zh ? `用 ${sk.name} 帮我：` : `Use ${sk.name} to: `);
+      // Close settings modal if open
+      if (this.settings && this.settings.show) this.settings.show = false;
+      // Close skills drawer if open
+      if (this.skillsDrawerOpen) this.skillsDrawerOpen = false;
+      this.input = prompt;
+      this.$nextTick(() => {
+        const ta = this.$refs.chatInput;
+        if (ta) {
+          ta.focus();
+          // Put cursor at end so user can keep typing
+          ta.selectionStart = ta.selectionEnd = ta.value.length;
+          this.autoGrow(ta);
+        }
+      });
+    },
+
+    // Skills drawer (chat-input 🧩 entry). Reactive boolean so Alpine
+    // re-renders on toggle.
+    skillsDrawerOpen: false,
+    toggleSkillsDrawer() {
+      this.skillsDrawerOpen = !this.skillsDrawerOpen;
+      // Refresh skills list each time the drawer opens — picks up newly
+      // installed Claude Code skills without requiring a settings open.
+      if (this.skillsDrawerOpen) this.loadSkills();
+    },
+    async loadSkills() {
+      try {
+        const r = await fetch("/api/settings/skills", { headers: this.hdr() });
+        if (r.ok) {
+          const data = await r.json();
+          this.settings.skills = data.skills || [];
+        }
+      } catch (e) { /* network / first-boot — silent fail */ }
     },
 
     onboardingPrompts() {

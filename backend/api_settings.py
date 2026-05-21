@@ -381,6 +381,11 @@ async def mcp_status() -> dict:
 
 SKILL_USER_DIR = Path.home() / ".claude" / "skills"
 SKILL_PROJECT_DIR = Path(__file__).resolve().parent.parent / "skills"
+# Plugin skills live two levels deeper under marketplaces — each marketplace
+# holds N plugins, each plugin can ship its own skills/ subdir. Discovered
+# at request time (no caching) so newly installed plugins surface without
+# a muselab restart.
+SKILL_PLUGIN_ROOT = Path.home() / ".claude" / "plugins" / "marketplaces"
 
 
 def _parse_skill_md(p: Path) -> dict | None:
@@ -418,7 +423,7 @@ def _parse_skill_md(p: Path) -> dict | None:
     return out
 
 
-def _list_skills_in(dir_: Path, scope: str) -> list[dict]:
+def _list_skills_in(dir_: Path, scope: str, source: str = "") -> list[dict]:
     if not dir_.exists() or not dir_.is_dir():
         return []
     out = []
@@ -429,21 +434,68 @@ def _list_skills_in(dir_: Path, scope: str) -> list[dict]:
             p = child / fname
             if p.exists():
                 meta = _parse_skill_md(p) or {}
-                out.append({
+                entry = {
                     "name": meta.get("name") or child.name,
                     "description": meta.get("description", ""),
                     "scope": scope,
                     "path": str(child),
-                })
+                }
+                if source:
+                    entry["source"] = source  # e.g. plugin name for scope=plugin
+                out.append(entry)
                 break
+    return out
+
+
+def _list_plugin_skills() -> list[dict]:
+    """Walk ~/.claude/plugins/marketplaces/<mp>/plugins/<plugin>/skills/ and
+    collect skills as scope=plugin entries. Each entry carries `source` =
+    "<marketplace>/<plugin>" so the UI can show which plugin owns it.
+
+    Why this matters: Claude Code users who install plugins (via the
+    plugin marketplace) get skills bundled with each plugin. The SDK
+    surfaces those at runtime, but muselab's discovery loop only looked
+    at the top-level user/project scopes — so users saw "muselab knows
+    18 skills" when their actual Claude Code setup had 40+.
+    """
+    out: list[dict] = []
+    if not SKILL_PLUGIN_ROOT.exists() or not SKILL_PLUGIN_ROOT.is_dir():
+        return out
+    try:
+        marketplaces = sorted(p for p in SKILL_PLUGIN_ROOT.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for mp in marketplaces:
+        plugins_dir = mp / "plugins"
+        if not plugins_dir.is_dir():
+            continue
+        try:
+            plugins = sorted(p for p in plugins_dir.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for plugin in plugins:
+            skills_dir = plugin / "skills"
+            if not skills_dir.is_dir():
+                continue
+            source = f"{mp.name}/{plugin.name}"
+            out.extend(_list_skills_in(skills_dir, "plugin", source=source))
     return out
 
 
 @router.get("/skills", dependencies=[Depends(require_token)])
 def list_skills() -> dict:
-    """List all skills discoverable by the SDK (user + project scopes)."""
+    """List all skills discoverable from project, user, and plugin scopes.
+
+    project = muselab's own preset skills (this repo's skills/)
+    user    = ~/.claude/skills/ (shared with Claude Code CLI)
+    plugin  = ~/.claude/plugins/marketplaces/*/plugins/*/skills/
+
+    Same-named skills across scopes are returned as separate entries —
+    the UI shows scope badges so users can see when a skill is shadowed
+    (e.g. they have a user-scope mermaid-helper AND a project preset)."""
     skills = (_list_skills_in(SKILL_PROJECT_DIR, "project") +
-              _list_skills_in(SKILL_USER_DIR, "user"))
+              _list_skills_in(SKILL_USER_DIR, "user") +
+              _list_plugin_skills())
     return {"skills": skills}
 
 
