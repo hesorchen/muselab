@@ -4585,10 +4585,14 @@ function portal() {
       // 动态算 template，匹配实际渲染的元素数。否则 x-show 隐藏 resizer 时
       // 元素被移出 grid，剩余 children 错位填入空闲 column，导致右 resizer
       // 拿到 1fr 宽 → 鼠标 hover 它整片变成 accent 色。
+      // Clamp persisted widths to half-screen so window-shrink doesn't
+      // leave one pane wider than the viewport (which would collapse the
+      // center chat to 0 and lock the user out). Mirrors the drag clamp.
+      const maxW = Math.max(160, Math.floor(window.innerWidth / 2));
       const cols = [];
-      if (this.leftOpen) cols.push(this.leftWidth + "px", "4px");
+      if (this.leftOpen) cols.push(Math.min(this.leftWidth, maxW) + "px", "4px");
       cols.push("1fr");
-      if (this.rightOpen) cols.push("4px", this.rightWidth + "px");
+      if (this.rightOpen) cols.push("4px", Math.min(this.rightWidth, maxW) + "px");
       return { gridTemplateColumns: cols.join(" ") };
     },
     // computedOpenFilesHeight() removed — auto-fit now relies on CSS
@@ -4649,9 +4653,35 @@ function portal() {
       overlay.style.cssText =
         "position:fixed;inset:0;z-index:99999;cursor:col-resize;background:transparent;";
       document.body.appendChild(overlay);
+      // Bounds — min/max enforced during the drag itself.
+      // Hide-snap: dragging below HIDE_AT auto-collapses the pane (sets
+      // leftOpen/rightOpen=false) so the user gets a 2-column or
+      // single-pane layout. Width is restored to `startW` (their last
+      // open size) so re-opening via the chevron button feels stable
+      // instead of dumping them at 120px.
+      // Max: half the viewport — gives room for very wide chat / big
+      // file previews on big monitors. Hard-stop at 50vw because going
+      // bigger would shove the center pane below usable width.
+      const HIDE_AT = 140;
+      const MIN_W = 160;
+      const maxW = Math.floor(window.innerWidth / 2);
       const onMove = (e) => {
         const delta = which === "left" ? (e.clientX - startX) : (startX - e.clientX);
-        const w = Math.max(180, Math.min(700, startW + delta));
+        const targetW = startW + delta;
+        if (targetW < HIDE_AT) {
+          // Snap-to-hide. Keep the pre-drag width as the "remembered"
+          // size so chevron-reopen restores it.
+          if (which === "left") {
+            this.leftWidth = startW;
+            this.leftOpen = false;
+          } else {
+            this.rightWidth = startW;
+            this.rightOpen = false;
+          }
+          onUp();
+          return;
+        }
+        const w = Math.max(MIN_W, Math.min(maxW, targetW));
         if (which === "left") this.leftWidth = w;
         else this.rightWidth = w;
       };
