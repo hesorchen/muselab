@@ -15,7 +15,7 @@
 | HTML / PDF / 图片预览 | ✅ first-class | ⚠️ | ⚠️ | ⚠️ | ❌ |
 | **所有模型均具备完整 agent SDK** | ✅ | ⚠️ 主要 Claude | ❌ 仅 chat | ❌ RAG focus | ✅ 仅 Claude |
 | 复用 Claude Pro 订阅 | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 代码行数 | ~17 k | 几万 | 几十万 | ~150 k | 闭源 |
+| 代码行数 | ~22 k | 几万 | 几十万 | ~150 k | 闭源 |
 | 安装命令数 | 3 | 多 | docker compose | docker | brew / npm |
 
 需要 **IDE 完整功能**：选 claudecodeui / code-server。

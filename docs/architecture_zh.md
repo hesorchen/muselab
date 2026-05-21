@@ -4,11 +4,11 @@
 
 ```mermaid
 flowchart TB
-  subgraph Browser["浏览器 · ~5.8k 行 原生 HTML + Alpine.js + CSS"]
+  subgraph Browser["浏览器 · ~15k 行 原生 HTML + Alpine.js + CSS"]
     F[📁 文件] --- P[📄 预览 + 多 tab] --- C[💬 chat + 多模型]
   end
   Browser ==>|HTTP / SSE| BE
-  subgraph BE["后端 · FastAPI ~2.6k 行"]
+  subgraph BE["后端 · FastAPI ~6.8k 行"]
     A["/api/files/*<br/>safe-resolve · 读写 · grep"]
     B["/api/chat/*<br/>ClaudeSDKClient 池<br/>per (session, model)"]
   end

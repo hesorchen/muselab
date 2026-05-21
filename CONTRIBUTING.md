@@ -1,7 +1,7 @@
 # Contributing to muselab
 
 Thanks for considering a contribution! muselab is intentionally small
-(~17k lines, no npm, no build step) so it stays grokkable.
+(no npm, no build step) so it stays grokkable.
 
 ## Quick start (dev loop)
 
@@ -10,7 +10,7 @@ git clone https://github.com/hesorchen/muselab && cd muselab
 uv sync                                   # install Python deps
 cp .env.example .env                      # then fill MUSELAB_TOKEN + MUSELAB_ROOT
 uv run uvicorn backend.main:app --reload  # dev server on :8765
-uv run pytest tests/                      # all tests (~164 passing)
+uv run pytest tests/                      # all tests (~173 passing)
 ```
 
 The frontend is plain HTML + Alpine.js v3 (vendored). No build step —

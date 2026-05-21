@@ -16,8 +16,8 @@
   per-token bill. Or bring a vendor API key.
 - 🔄 **Multi-device, one server.** Phone / tablet / desktop share
   sessions; archive never leaves your host.
-- 🛠 **~17k lines, no build step.** Vanilla HTML + Alpine.js + CSS — read
-  the whole frontend in an afternoon.
+- 🛠 **No build step.** Vanilla HTML + Alpine.js + CSS, served as static
+  files — edit, refresh, done.
 
 ## Install
 

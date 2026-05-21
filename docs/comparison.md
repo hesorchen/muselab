@@ -17,7 +17,7 @@ author's own positioning notes (more candid, undated) live in
 | HTML / PDF / image preview | ✅ first-class | ⚠️ | ⚠️ | ⚠️ | ❌ |
 | **Full agent SDK on every model** | ✅ | ⚠️ Claude-mostly | ❌ chat only | ❌ RAG focus | ✅ Claude only |
 | Reuse Claude Pro subscription | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Lines of code | ~17 k | tens of k | hundreds of k | ~150 k | closed |
+| Lines of code | ~22 k | tens of k | hundreds of k | ~150 k | closed |
 | Install command count | 3 | many | docker compose | docker | brew / npm |
 
 If you want **IDE breadth**, pick claudecodeui or code-server.

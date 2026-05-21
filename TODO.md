@@ -198,7 +198,7 @@
 **额外卖点（不是核心能力，但是用户的决策点）**：
 
 - **复用 Pro/Max 订阅**——通过 Anthropic 官方 OAuth 路径（`~/.claude/.credentials.json`），相比 API key 按量计费可省 $20-100/月。但 OAuth 本身是 Anthropic 推的，不是 muselab 的技术壁垒；竞品想接也能接
-- **~17k 行可读完 + 无构建链**——前端 vanilla HTML + Alpine.js，没 npm / webpack；自部署敢真用、敢改
+- **无构建链**——前端 vanilla HTML + Alpine.js，没 npm / webpack；自部署敢真用、敢改
 
 **澄清（避免外宣 overclaim）**：
 

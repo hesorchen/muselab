@@ -4,11 +4,11 @@
 
 ```mermaid
 flowchart TB
-  subgraph Browser["Browser · ~5.8k LOC vanilla HTML + Alpine.js + CSS"]
+  subgraph Browser["Browser · ~15k LOC vanilla HTML + Alpine.js + CSS"]
     F[📁 files] --- P[📄 preview + tabs] --- C[💬 chat + multi-model]
   end
   Browser ==>|HTTP / SSE| BE
-  subgraph BE["Backend · FastAPI ~2.6k LOC"]
+  subgraph BE["Backend · FastAPI ~6.8k LOC"]
     A["/api/files/*<br/>safe-resolve · read/write/grep"]
     B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model)"]
   end
