@@ -1,15 +1,15 @@
 # TODO — muselab
 
-> 状态：核心可用，开源前所有 P0 / P1 已清。剩 demo gif 和小幅打磨。
+> 状态：核心可用，开源前所有 P0 / P1 已清。剩 launch readiness（demo gif / 截图 / release / awesome lists / launch post）。
 > 排序原则：开源前必修 → 强化亮点 → 体验打磨。
 
-最后更新：2026-05-21（长时运行加固 + 全栈优化扫荡）
+最后更新：2026-05-21（README 双语 + LOC 校正 + launch readiness 清单）
 
 ---
 
 ## 📈 现状速览
 
-- **164 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
+- **173 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
 - **多模型**：Claude (Pro OAuth) + DeepSeek + GLM + MiniMax
 - **三个 OS 一键安装**（systemd / launchd / Task Scheduler）+ `doctor` / `intake` 工具
 - **multi-arch Docker** 镜像通过 GH Actions 自动发到 `ghcr.io/hesorchen/muselab`
@@ -70,14 +70,107 @@
 
 ## 🟡 还能做的（按价值）
 
-### 真正会影响开源声量的（你自己做）
+### Launch readiness checklist（2026-05-21 评估）
 
+> 按"是否会显著影响第一周 traffic / 转化"排序。🔴 必做、🟡 强烈建议、🟢 可发布后补。
+> 拆成"你自己做"和"我能做"两栏，前者多是 GitHub UI 操作 + 个人账号动作。
+
+#### 🔴 必做（缺一项就显著掉转化）
+
+**你自己做**：
+
+- [ ] **Repo About + topics**（GitHub repo settings）
+  - description 一句话（复用 README tagline）
+  - 10 个 topics：`claude` `anthropic` `claude-agent-sdk` `mcp` `self-hosted` `llm` `ai-assistant` `personal-archive` `deepseek` `pwa`
+- [ ] **第一个 release tag (v0.1.0)**
+  - `git tag v0.1.0 && git push --tags`
+  - GitHub Releases UI 里手写 highlights（用 CHANGELOG 总结）
+- [ ] **Repo Social Preview 图**（1280×640 png，repo settings → Social preview）
+  - 决定 HN / Twitter / 微信 卡片缩略图样子
+- [ ] **Launch post 一组草稿**：Show HN / r/selfhosted / r/LocalLLaMA / V2EX 各一份
+  - 标题 + 第一段决定 60% traffic；写完互不相同
+  - HN 投放时间：美东周二/周三 凌晨 5-7 点
+- [ ] **Awesome lists 提 PR**：awesome-claude / awesome-self-hosted / awesome-llm-apps / awesome-mcp
+
+**我能做**：
+
+- [ ] **THIRD_PARTY_LICENSES.md**
+  - `vendor/` 下 Alpine / marked / DOMPurify / KaTeX / hljs 的 license attribution
+  - 漏了等于 license violation
 - [ ] **Demo gif**（30 秒：三栏 + onboarding 卡片 + 切模型 + skill chip 触发 + context meter 警告 + 压缩流程）
-  - VPS 没桌面，**需要笔记本上录**
-  - 建议工具：macOS QuickTime + gifski；Linux peek；Windows ScreenToGif
-- [ ] **首页截图 hero PNG**（chat 满状态 + onboarding 卡片各一张）
-- [ ] **Hosted 只读 demo**（Cloudflare tunnel / 你 VPS 套个 read-only token）
-- [ ] **HN / Reddit / V2EX 发布**：标题用 README hero 那句 + 30s gif
+  - VPS 没桌面，**需要笔记本上录**（macOS QuickTime + gifski / Linux peek / Windows ScreenToGif）
+- [ ] **首页截图 hero PNG**（chat 满状态 + onboarding 卡片 + 手机 PWA 各一张）
+- [ ] **CHANGELOG.md v0.1.0 entry**（把当前 squash commit 改成结构化 release notes）
+
+#### 🟡 强烈建议（前两周补也来得及）
+
+**你自己做**：
+
+- [ ] **GitHub Discussions enable**（settings → Features），open 一个 welcome thread
+- [ ] **Twitter / X launch tweet**：@Anthropic + Claude 团队，配 demo gif
+- [ ] **`good first issue` 标签**：从 TODO.md 挑 3-5 个低门槛（新 provider catalog / 文档扩展 / 小 UI fix）开 issue 打标签
+
+**我能做**：
+
+- [ ] **Hosted 只读 demo**（Cloudflare tunnel + VPS 套 read-only token + 限速）
+- [ ] **README 顶部 hero 美化**（badges 排版统一，加一张缩略图）
+
+#### 🟢 Nice to have（发布后再做）
+
+- [ ] **GitHub Pages 落地页** `hesorchen.github.io/muselab`
+- [ ] **Dependabot config**（`.github/dependabot.yml` 周扫一次依赖）
+- [ ] **release-please CI**（自动 bump version + 生成 changelog）
+- [ ] **Container image scan**（trivy / grype 加进 CI）
+- [ ] **"Multi-user 不支持"显式说明**（README + docs/comparison.md 各加一行，避免企业用户提 issue）
+- [ ] **Discord / TG 群**（< 500 star 前没人会进，先不做）
+
+#### 📣 发布渠道 cheat sheet
+
+**Hacker News（HN）= [news.ycombinator.com](https://news.ycombinator.com)**
+
+| 维度 | 说明 |
+|------|------|
+| 是什么 | Y Combinator 运营的极简 tech news 聚合站 |
+| 受众 | 北美 / 欧洲技术圈 + 独立开发者 + startup 圈 + OSS 维护者——**自部署工具的核心受众** |
+| 规模 | 日活 ~200-300 万；上首页 top 30 一次 ≈ 数万曝光 + 1-3k 新 star |
+| 形式 | 纯文本标题 + 链接 + comments，无图无视频。**标题决定一切** |
+| muselab 适配度 | 高——HN 极爱 self-hosted / 复用 paid subscription / no build step / vanilla HTML 这些标签 |
+
+**Show HN 格式**：自己作品标题前缀 `Show HN:`，例：
+
+```
+Show HN: Muselab – Self-hosted web UI for Claude Agent SDK with your own files
+```
+
+⚠ **作者必须在评论区全程在线 2-4 小时**回答问题、收 bug 反馈。发完就跑会被社区记恨。
+
+**上首页机制**：
+
+1. 提交后进 `/newest` 队列（按时间倒序，几分钟被新内容刷下去）
+2. 前 30 分钟收到 5-10 个 upvote → 算法给一次 front page "试推"
+3. 上 front page 后 vote / 评论速率持续涨 → 维持几小时，曝光呈指数累积
+4. **黄金时段**：美东周二 / 周三早 5-9 点（北京下午 5-9 点）——欧洲已起床、美东刚到办公室、亚洲下班刷手机
+5. 错过黄金时段 → 曝光差 3-5 倍。**周末发是浪费**
+
+**多渠道发布顺序**：
+
+| 渠道 | 受众 | 发布时机 |
+|------|------|----------|
+| 🥇 HN（Show HN） | 全球技术圈 | 周二 / 周三 北京 17:00 |
+| 🥈 Reddit r/selfhosted | 自部署玩家 | HN 当天工作日中午（错峰）|
+| 🥈 Reddit r/LocalLLaMA | 本地 LLM 玩家 | 同上，错开几小时 |
+| 🥉 V2EX（节点：分享创造） | 中文技术圈 | 国内白天，HN 之后或当天 |
+| 配合 | Twitter / X | HN 上首页后立刻发，配 gif 引流 |
+
+**逻辑**：HN 先发，如果上 front page 当天 Reddit / V2EX 会自然 pickup；如果 HN 没爆 Reddit 还能独立尝试。**不要全平台同时撒**——精力分散在评论区。
+
+**HN 投放 checklist**（发那一刻前 30 分钟内）：
+
+- [ ] 标题斟酌过 5 遍以上（短句 / 一句话讲清独特性 / 不要 "Introducing X"）
+- [ ] README hero 段读起来没错别字 + gif 已嵌入
+- [ ] 自己已登录 HN 在浏览器 tab 开着 comments 页面
+- [ ] 接下来 2-4 小时无其他安排（女友 / 会议 / 通勤都得避开）
+- [ ] 预先想好 5 个最可能被问的问题，答案打草稿（"why not LobeChat?" / "vs claude-code-ui?" / "security model?" / "how is the archive different from RAG?" / "do you handle multi-user?"）
 
 ### 代码层小幅打磨（我能做）
 

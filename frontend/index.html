@@ -682,6 +682,22 @@ window.addEventListener("error", e => {
               :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
               :title="costBadgeTitle()"
               x-text="tokenBadgeText()"></span>
+        <!-- Edit CLAUDE.md — opens the user's own profile file (the
+             autobiographical brief that Muse reads at every session
+             start). If it doesn't exist yet, falls back to the help
+             dialog explaining how to create it. Distinct from the
+             ctx-chip warning: the chip flags the missing state, this
+             button is the always-available "go edit me" entry point. -->
+        <button @click="openClaudeMdEdit()" class="icon-btn"
+                :title="lang==='zh' ? '编辑 CLAUDE.md（Muse 关于你的档案）' : 'Edit CLAUDE.md (Muse\'s profile of you)'"
+                aria-label="Edit CLAUDE.md">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 14.66V20a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5.34"/>
+            <polygon points="18 2 22 6 12 16 8 16 8 12 18 2"/>
+          </svg>
+        </button>
         <!-- Organize archive — creates a curator-mode session that walks
              Muse through scan → suggest → confirm-per-item → execute.
              Sits next to the scheduled-tasks bell because both are
@@ -1020,6 +1036,26 @@ window.addEventListener("error", e => {
               <span class="muse-domain" x-text="lang==='zh' ? mascot().domain.zh : mascot().domain.en"></span>
               · <span x-text="t('chat.runs_on')"></span> <span x-text="currentModelLabel()"></span>
             </div>
+
+            <!-- Welcome card — shown ONCE per browser on first chat load.
+                 Explains what muselab is + 3 concrete next actions. Dismissed
+                 via localStorage flag `muselab.welcomeDismissed`. Stacks
+                 ABOVE the state cards (no-provider / no-claude_md / etc.) —
+                 a new user sees both "welcome" and "set up a model" at once. -->
+            <template x-if="showWelcomeCard()">
+              <div class="onboard-card welcome">
+                <button class="welcome-dismiss" @click="dismissWelcome()"
+                        :title="lang==='zh' ? '关闭' : 'Dismiss'"
+                        aria-label="dismiss welcome">×</button>
+                <div class="onboard-card-title" x-text="t('onboard.welcome_title')"></div>
+                <div class="onboard-card-body" x-html="t('onboard.welcome_body')"></div>
+                <ol class="welcome-steps">
+                  <li><span x-html="t('onboard.welcome_step1')"></span></li>
+                  <li><span x-html="t('onboard.welcome_step2')"></span></li>
+                  <li><span x-html="t('onboard.welcome_step3')"></span></li>
+                </ol>
+              </div>
+            </template>
 
             <!-- Onboarding cards — only one shows at a time, in priority order:
                  1. no provider auth → "Set up a model before chatting"

@@ -27,15 +27,39 @@ if [[ -z "$ARCHIVE" || ! -d "$ARCHIVE" ]]; then
   exit 1
 fi
 
-bold "muselab intake / 入门问答 — archive at $ARCHIVE"
+# Locale detection — Chinese template if shell locale is zh, else English.
+if [[ "${LANG:-}${LC_ALL:-}${LC_MESSAGES:-}" == *zh* ]]; then
+  MUSE_LOCALE=zh
+  MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.md"
+  MUSE_README_SRC="README.md"
+else
+  MUSE_LOCALE=en
+  MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.en.md"
+  MUSE_README_SRC="README.en.md"
+fi
+
+if [[ "$MUSE_LOCALE" == "zh" ]]; then
+  bold "muselab 入门问答 — archive 在 $ARCHIVE"
+else
+  bold "muselab intake — archive at $ARCHIVE"
+fi
 echo
 
 # Confirm overwrite if CLAUDE.md already exists
 if [[ -f "$ARCHIVE/CLAUDE.md" ]]; then
   warn "$ARCHIVE/CLAUDE.md already exists"
-  REPLY="$(ask 'Overwrite with a fresh template? (existing content goes to CLAUDE.md.bak) [y/N]:' 'N')"
+  if [[ "$MUSE_LOCALE" == "zh" ]]; then
+    PROMPT_OVERWRITE='覆盖为新模板？（旧内容会备份到 CLAUDE.md.bak） [y/N]:'
+  else
+    PROMPT_OVERWRITE='Overwrite with a fresh template? (existing content goes to CLAUDE.md.bak) [y/N]:'
+  fi
+  REPLY="$(ask "$PROMPT_OVERWRITE" 'N')"
   if [[ ! "$REPLY" =~ ^[Yy] ]]; then
-    echo "  Aborted. Edit $ARCHIVE/CLAUDE.md manually if you just want to tweak it."
+    if [[ "$MUSE_LOCALE" == "zh" ]]; then
+      echo "  已取消。如果只是想小改，直接编辑 $ARCHIVE/CLAUDE.md。"
+    else
+      echo "  Aborted. Edit $ARCHIVE/CLAUDE.md manually if you just want to tweak it."
+    fi
     exit 0
   fi
   cp "$ARCHIVE/CLAUDE.md" "$ARCHIVE/CLAUDE.md.bak"
@@ -46,58 +70,93 @@ fi
 for sub in health work money people notes archives; do
   if [[ ! -d "$ARCHIVE/$sub" ]]; then
     mkdir -p "$ARCHIVE/$sub"
-    cp "scripts/templates/archive-skeleton/$sub/README.md" "$ARCHIVE/$sub/README.md"
+    cp "scripts/templates/archive-skeleton/$sub/$MUSE_README_SRC" "$ARCHIVE/$sub/README.md"
     ok "created $sub/"
+  fi
+done
+# Drop in concrete "_example-" template files so users see the shape of
+# a typical entry. Suffix (.en.md / .zh.md) stripped on destination so
+# user just sees _example-*.md.
+for ex in health/_example-checkup work/_example-project-log money/_example-budget; do
+  src="scripts/templates/archive-skeleton/${ex}.${MUSE_LOCALE}.md"
+  dest="$ARCHIVE/${ex}.md"
+  if [[ -f "$src" && ! -f "$dest" ]]; then
+    cp "$src" "$dest"
+    ok "added ${ex}.md (example template)"
   fi
 done
 
 echo
-echo "  --- Quick intake / 入门问答 (press Enter to skip any / 任意题回车跳过) ---"
-INTAKE_NAME="$(ask 'How should Muse address you? / Muse 该怎么称呼你？' '')"
-INTAKE_BIRTH="$(ask 'Birth year (or age range) / 出生年份（或大致年龄段）:' '')"
-INTAKE_CITY="$(ask 'Where do you live? / 你现在住在哪？' '')"
-echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
-echo "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
-INTAKE_DOING="$(ask '' '')"
-echo "  One sentence about your life stage right now"
-echo "  用一句话描述你当下的人生阶段"
-INTAKE_STAGE="$(ask '' '')"
-INTAKE_GOAL="$(ask 'One main goal for this year / 这一年最想做成的一件事:' '')"
-INTAKE_HEALTH="$(ask 'Top health concern right now (or "none") / 当前最关心的健康问题（无则填 none）:' '')"
+if [[ "$MUSE_LOCALE" == "zh" ]]; then
+  echo "  --- 入门问答（任意题回车跳过）---"
+  INTAKE_NAME="$(ask 'Muse 该怎么称呼你？' '')"
+  INTAKE_BIRTH="$(ask '出生年份（或大致年龄段）:' '')"
+  INTAKE_CITY="$(ask '你现在住在哪？' '')"
+  echo "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
+  INTAKE_DOING="$(ask '' '')"
+  echo "  用一句话描述你当下的人生阶段"
+  INTAKE_STAGE="$(ask '' '')"
+  INTAKE_GOAL="$(ask '这一年最想做成的一件事:' '')"
+  INTAKE_HEALTH="$(ask '当前最关心的健康问题（无则填 none）:' '')"
+else
+  echo "  --- Quick intake (press Enter to skip any) ---"
+  INTAKE_NAME="$(ask 'How should Muse address you?' '')"
+  INTAKE_BIRTH="$(ask 'Birth year (or age range):' '')"
+  INTAKE_CITY="$(ask 'Where do you live?' '')"
+  echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
+  INTAKE_DOING="$(ask '' '')"
+  echo "  One sentence about your life stage right now"
+  INTAKE_STAGE="$(ask '' '')"
+  INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
+  INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
+fi
 
 sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
-  scripts/templates/default-CLAUDE.md > "$ARCHIVE/CLAUDE.md"
+  "$MUSE_CLAUDE_TPL" > "$ARCHIVE/CLAUDE.md"
 
-# Patch values into CLAUDE.md. Portable awk-based replace (GNU + BSD safe).
+# Patch with whole-line awk equality — robust against any chars in the
+# label (slashes, parens, full-width punctuation).
 _patch() {
   local label="$1" value="$2"
   [[ -z "$value" ]] && return
-  local esc
-  esc="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
-  # ${label} / ${esc} braces required — bash 3.2 under `set -u` mis-parses
-  # "$label：" as one identifier when fullwidth colon UTF-8 bytes follow.
-  awk -v lbl="- ${label}：" -v val=" ${esc}" '
+  awk -v lbl="$label" -v val=" $value" '
     !done && $0 == lbl { print lbl val; done=1; next } { print }
   ' "$ARCHIVE/CLAUDE.md" > "$ARCHIVE/CLAUDE.md.tmp" \
     && mv "$ARCHIVE/CLAUDE.md.tmp" "$ARCHIVE/CLAUDE.md"
 }
-_patch "称呼 / 名字（你希望 Muse 叫你什么）" "$INTAKE_NAME"
-_patch "出生年份（年龄段就行，不必精确）"     "$INTAKE_BIRTH"
-_patch "现在住在"                              "$INTAKE_CITY"
-_patch "我现在主要在做"                        "$INTAKE_DOING"
-_patch "这一年最想做成的一件事"               "$INTAKE_GOAL"
-_patch "当前最关心的健康问题（如有）"         "$INTAKE_HEALTH"
+if [[ "$MUSE_LOCALE" == "zh" ]]; then
+  _patch "- 称呼 / 名字（你希望 Muse 叫你什么）：" "$INTAKE_NAME"
+  _patch "- 出生年份（年龄段就行，不必精确）："     "$INTAKE_BIRTH"
+  _patch "- 现在住在："                              "$INTAKE_CITY"
+  _patch "- 我现在主要在做："                        "$INTAKE_DOING"
+  _patch "- 这一年最想做成的一件事："                "$INTAKE_GOAL"
+  _patch "- 当前最关心的健康问题（如有）："         "$INTAKE_HEALTH"
+  STAGE_NEEDLE='（如：「大三在准备保研」'
+else
+  _patch "- Name / how you'd like Muse to address you:" "$INTAKE_NAME"
+  _patch "- Birth year (an age range is fine, no need for exact):" "$INTAKE_BIRTH"
+  _patch "- Where you currently live:" "$INTAKE_CITY"
+  _patch "- What I'm mainly doing:" "$INTAKE_DOING"
+  _patch "- One thing I most want to make happen this year:" "$INTAKE_GOAL"
+  _patch "- Top health concern right now (if any):" "$INTAKE_HEALTH"
+  STAGE_NEEDLE='(e.g. "junior in college prepping for grad school"'
+fi
 if [[ -n "$INTAKE_STAGE" ]]; then
   STAGE_ESC="$(printf '%s' "$INTAKE_STAGE" | sed -e 's/[\\&|]/\\&/g')"
   # Portable in-place sed (GNU vs BSD)
   if sed --version >/dev/null 2>&1; then
-    sed -i "s|（如：「大三在准备保研」|$STAGE_ESC\\n\\n（如：「大三在准备保研」|" "$ARCHIVE/CLAUDE.md"
+    sed -i "s|$STAGE_NEEDLE|$STAGE_ESC\\n\\n$STAGE_NEEDLE|" "$ARCHIVE/CLAUDE.md"
   else
-    sed -i '' "s|（如：「大三在准备保研」|$STAGE_ESC\\n\\n（如：「大三在准备保研」|" "$ARCHIVE/CLAUDE.md"
+    sed -i '' "s|$STAGE_NEEDLE|$STAGE_ESC\\n\\n$STAGE_NEEDLE|" "$ARCHIVE/CLAUDE.md"
   fi
 fi
 
-ok "CLAUDE.md updated / 已更新"
+ok "CLAUDE.md updated"
 echo
-echo "  Next / 下一步: open $ARCHIVE/CLAUDE.md and fill any blanks."
-echo "  打开上面那个文件把空字段填完。Muse 下一次 chat 会自动加载（不用重启服务）。"
+if [[ "$MUSE_LOCALE" == "zh" ]]; then
+  echo "  下一步: 打开 $ARCHIVE/CLAUDE.md 把空字段填完。"
+  echo "  Muse 下一次 chat 会自动加载（不用重启服务）。"
+else
+  echo "  Next: open $ARCHIVE/CLAUDE.md and fill in the blanks."
+  echo "  Muse picks it up on the next chat — no restart needed."
+fi

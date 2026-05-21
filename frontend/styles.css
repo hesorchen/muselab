@@ -3150,6 +3150,72 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .onboard-card.warn  { border-left-color: #d97706; background: rgba(245, 158, 11, 0.05); }
 .onboard-card.calm  { border-left-color: var(--c-accent-soft); }
+
+/* Welcome card — one-time orientation card. Wider than the state cards
+   because it carries the value-prop + a 3-step ordered list. Has a close
+   "×" in the top-right; the close call writes localStorage so this never
+   shows again on this device. */
+.onboard-card.welcome {
+  position: relative;
+  max-width: 560px;
+  background: linear-gradient(180deg, var(--c-bg-1) 0%, var(--c-bg-0) 100%);
+  border-left-color: var(--c-accent);
+}
+.onboard-card.welcome code {
+  font-family: var(--ff-mono, monospace);
+  font-size: 0.85em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--c-bg-0);
+  border: 1px solid var(--c-border);
+  color: var(--c-accent);
+}
+.welcome-dismiss {
+  position: absolute; top: 6px; right: 8px;
+  width: 24px; height: 24px;
+  border: none; background: transparent;
+  color: var(--c-fg-3); cursor: pointer;
+  font-size: 18px; line-height: 1;
+  border-radius: var(--r-sm);
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+.welcome-dismiss:hover { color: var(--c-fg-0); background: var(--c-bg-0); }
+.welcome-steps {
+  list-style: none;
+  counter-reset: welcome-step;
+  padding: 0; margin: 4px 0 0;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.welcome-steps li {
+  counter-increment: welcome-step;
+  padding: 8px 12px 8px 36px;
+  background: var(--c-bg-0);
+  border-radius: var(--r-md);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-1);
+  line-height: 1.5;
+  position: relative;
+}
+.welcome-steps li::before {
+  content: counter(welcome-step);
+  position: absolute; left: 10px; top: 50%;
+  transform: translateY(-50%);
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  color: white;
+  font-size: 11px; font-weight: var(--fw-semibold);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.welcome-steps code {
+  font-family: var(--ff-mono, monospace);
+  font-size: 0.85em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--c-bg-1);
+  color: var(--c-accent);
+}
 .onboard-card-title { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--c-fg-0); margin-bottom: 6px; }
 /* Title + shuffle button on one row when the inspire-prompts card is
    showing. Without flex they stack and the shuffle hangs awkwardly. */

@@ -756,6 +756,10 @@ function portal() {
       // always showing the same first 5. shuffleInspirePrompts() bumps
       // this on demand for "give me another batch".
       this._inspireSeed = Math.floor(Math.random() * 1e9);
+      // Welcome-card visibility — Alpine-reactive so dismissWelcome()
+      // immediately re-renders the chat-body. localStorage flag persists
+      // dismissal across reloads / PWA reopens.
+      this._welcomeDismissed = localStorage.getItem("muselab_welcome_dismissed") === "1";
       // Vibration / push prefs come from localStorage (per-device) so a
       // shared muselab between a desktop + phone keeps independent
       // settings — your phone can vibrate; the desktop tab silently
@@ -5017,6 +5021,44 @@ function portal() {
         confirm: () => { this.modal.show = false; },
         cancel: () => { this.modal.show = false; },
       };
+    },
+
+    // Open the user's CLAUDE.md in the preview pane / editor. If it
+    // doesn't exist yet, fall back to the help dialog (which explains
+    // how the intake script creates it). Called from the top-bar
+    // "Edit CLAUDE.md" button.
+    async openClaudeMdEdit() {
+      if (!this.contextInfo.claude_md_exists) {
+        this.openClaudeMdHelp();
+        return;
+      }
+      // Project-scope file lives at MUSELAB_ROOT/CLAUDE.md — the file API
+      // uses paths relative to ROOT, so just "CLAUDE.md".
+      try {
+        await this.openFile({ path: "CLAUDE.md", name: "CLAUDE.md" });
+        // Auto-enter edit mode — most clicks on this button mean "I want
+        // to update my profile", not just "I want to read it".
+        this.editing = true;
+      } catch (e) {
+        this.toast(this.t("toast.failed") || "Failed to open CLAUDE.md", "error");
+      }
+    },
+
+    // Welcome card — shown until user dismisses it (then never again on
+    // this device). Suppressed while session is loading to avoid a flicker
+    // between the skeleton and the real cards.
+    showWelcomeCard() {
+      if (this._welcomeDismissed) return false;
+      if (this.messagesLoading) return false;
+      // Only on the empty-chat screen — once the user has sent a turn,
+      // they've clearly oriented themselves and the welcome card is noise.
+      if (this.messages && this.messages.length) return false;
+      return true;
+    },
+    dismissWelcome() {
+      this._welcomeDismissed = true;
+      try { localStorage.setItem("muselab_welcome_dismissed", "1"); }
+      catch (e) { /* private mode / quota / no-op */ }
     },
 
     // Pretty-print a USD amount for the cost badge.
