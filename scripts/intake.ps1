@@ -69,7 +69,7 @@ foreach ($sub in @("health","work","money","people","notes","archives")) {
 }
 # Drop in concrete "_example-" template files so users see the shape of
 # a typical entry. Suffix (.en.md / .zh.md) stripped on destination.
-foreach ($exSrc in @("health\_example-checkup", "work\_example-project-log", "money\_example-budget")) {
+foreach ($exSrc in @("health\_example-checkup", "work\_example-project-log", "money\_example-budget", "notes\_example-weekly-review", "people\_example-person-card")) {
   $src  = Join-Path $skel "$exSrc.$MuseLocale.md"
   $dest = Join-Path $Archive "$exSrc.md"
   if ((Test-Path $src) -and -not (Test-Path $dest)) {
