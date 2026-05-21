@@ -746,8 +746,20 @@ def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
 
         # Also drop archive-skeleton subdirs so the user's first
         # interaction has the right shape on disk. Skip ones that exist.
+        # Mirrors what scripts/install-*.sh and intake.* do — README +
+        # concrete _example-*.md per supported subdir, so the chat-driven
+        # path produces the same starter skeleton as the installer path.
         skel_root = repo_root / "scripts" / "templates" / "archive-skeleton"
         readme_src = "README.md" if is_zh else "README.en.md"
+        example_suffix = ".zh.md" if is_zh else ".en.md"
+        examples_for_sub = {
+            "health":  "_example-checkup",
+            "work":    "_example-project-log",
+            "money":   "_example-budget",
+            "notes":   "_example-weekly-review",
+            "people":  "_example-person-card",
+            # archives/ intentionally has no example — it's a raw-source dir
+        }
         for sub in ("health", "work", "money", "people", "notes", "archives"):
             sd = ROOT / sub
             if not sd.exists():
@@ -756,6 +768,12 @@ def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
                     src = skel_root / sub / readme_src
                     if src.exists():
                         _shutil.copy(src, sd / "README.md")
+                    ex_basename = examples_for_sub.get(sub)
+                    if ex_basename:
+                        ex_src = skel_root / sub / (ex_basename + example_suffix)
+                        ex_dst = sd / (ex_basename + ".md")
+                        if ex_src.exists() and not ex_dst.exists():
+                            _shutil.copy(ex_src, ex_dst)
                 except OSError:
                     pass
 
