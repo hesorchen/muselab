@@ -760,8 +760,18 @@ def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
                 except OSError:
                     pass
 
+    # Session label follows the same locale check used for the template.
+    # English users were seeing "[设置档案] 05-22 14:30" in their tab strip
+    # because we always used the Chinese label.
+    lang_env_for_name = (
+        os.environ.get("LANG", "")
+        + os.environ.get("LC_ALL", "")
+        + os.environ.get("LC_MESSAGES", "")
+    )
+    is_zh_for_name = "zh" in lang_env_for_name.lower()
+    default_label = "[设置档案] " if is_zh_for_name else "[Set up profile] "
     name = (req.name if req else None) or (
-        "[设置档案] " + _dt.datetime.now().strftime("%m-%d %H:%M"))
+        default_label + _dt.datetime.now().strftime("%m-%d %H:%M"))
     model = (req.model if req else None) or MODEL
     meta = sess.create_session(
         name=name, model=model, system_prompt=PROFILE_INTAKE_SYSTEM_PROMPT)
