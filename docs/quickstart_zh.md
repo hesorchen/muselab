@@ -107,11 +107,14 @@ provider keys），失败时给出具体建议。运行异常时跑一下。
 docker run -d --name muselab \
   -p 8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-archive:/root/muselab-archive \
-  -e MUSELAB_ROOT=/root/muselab-archive \
-  -v $HOME/.claude:/root/.claude \
+  -v $HOME/muselab-archive:/data \
+  -e MUSELAB_ROOT=/data \
+  -v $HOME/.claude:/home/muse/.claude \
   ghcr.io/hesorchen/muselab:latest
 ```
+
+容器以非 root 用户 `muse` (uid 1000) 运行，home 在 `/home/muse/.claude`——
+把宿主的 `~/.claude` 挂到那里就能复用 `claude login` 拿到的 OAuth 凭据。
 
 指定版本：`ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`。
 

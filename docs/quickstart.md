@@ -109,11 +109,15 @@ Per-OS detail (verify / restart / tail logs / expose to LAN / uninstall):
 docker run -d --name muselab \
   -p 8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-archive:/root/muselab-archive \
-  -e MUSELAB_ROOT=/root/muselab-archive \
-  -v $HOME/.claude:/root/.claude \
+  -v $HOME/muselab-archive:/data \
+  -e MUSELAB_ROOT=/data \
+  -v $HOME/.claude:/home/muse/.claude \
   ghcr.io/hesorchen/muselab:latest
 ```
+
+The container runs as a non-root `muse` user (uid 1000), so its home is
+`/home/muse/.claude` — bind-mount your host's `~/.claude` there to reuse
+the OAuth credentials from `claude login`.
 
 Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 
