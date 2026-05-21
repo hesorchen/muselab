@@ -1,15 +1,15 @@
 # TODO — muselab
 
-> 状态：核心可用，开源前所有 P0 / P1 已清。剩 launch readiness（demo gif / 截图 / release / awesome lists / launch post）。
+> 状态：核心可用，开源前所有 P0 / P1 / P2 已清。剩 launch readiness（demo gif / 截图 / release tag / awesome lists / launch post）。
 > 排序原则：开源前必修 → 强化亮点 → 体验打磨。
 
-最后更新：2026-05-21（README 双语 + LOC 校正 + launch readiness 清单）
+最后更新：2026-05-22（P0/P1/P2 launch readiness 清单全清）
 
 ---
 
 ## 📈 现状速览
 
-- **173 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
+- **178 tests passing**（pytest，含 frontend lint；e2e 模块默认 skip）
 - **多模型**：Claude (Pro OAuth) + DeepSeek + GLM + MiniMax
 - **三个 OS 一键安装**（systemd / launchd / Task Scheduler）+ `doctor` / `intake` 工具
 - **multi-arch Docker** 镜像通过 GH Actions 自动发到 `ghcr.io/hesorchen/muselab`
@@ -94,13 +94,11 @@
 
 **我能做**：
 
-- [ ] **THIRD_PARTY_LICENSES.md**
-  - `vendor/` 下 Alpine / marked / DOMPurify / KaTeX / hljs 的 license attribution
-  - 漏了等于 license violation
+- [x] **THIRD_PARTY_LICENSES.md** ✅ 2026-05-22 — 已建，列了 Alpine/marked/DOMPurify/highlight.js/KaTeX/CodeMirror + 后端 deps
 - [ ] **Demo gif**（30 秒：三栏 + onboarding 卡片 + 切模型 + skill chip 触发 + context meter 警告 + 压缩流程）
   - VPS 没桌面，**需要笔记本上录**（macOS QuickTime + gifski / Linux peek / Windows ScreenToGif）
 - [ ] **首页截图 hero PNG**（chat 满状态 + onboarding 卡片 + 手机 PWA 各一张）
-- [ ] **CHANGELOG.md v0.1.0 entry**（把当前 squash commit 改成结构化 release notes）
+- [x] **CHANGELOG.md v0.1.0 entry** ✅ 2026-05-22 — 已切 [Unreleased] → [0.1.0] - 2026-05-22 + 结构化 release notes
 
 #### 🟡 强烈建议（前两周补也来得及）
 
@@ -113,15 +111,15 @@
 **我能做**：
 
 - [ ] **Hosted 只读 demo**（Cloudflare tunnel + VPS 套 read-only token + 限速）
-- [ ] **README 顶部 hero 美化**（badges 排版统一，加一张缩略图）
+- [x] **README 顶部 hero 美化** ✅ 2026-05-22 — badges 排版统一 + Self-hosted 徽章；缩略图待 demo gif 出来再嵌
 
 #### 🟢 Nice to have（发布后再做）
 
 - [ ] **GitHub Pages 落地页** `hesorchen.github.io/muselab`
-- [ ] **Dependabot config**（`.github/dependabot.yml` 周扫一次依赖）
+- [x] **Dependabot config** ✅ — `.github/dependabot.yml` 已有，uv + github-actions 周扫
 - [ ] **release-please CI**（自动 bump version + 生成 changelog）
 - [ ] **Container image scan**（trivy / grype 加进 CI）
-- [ ] **"Multi-user 不支持"显式说明**（README + docs/comparison.md 各加一行，避免企业用户提 issue）
+- [x] **"Multi-user 不支持"显式说明** ✅ 2026-05-22 — README + docs/comparison.md 已加
 - [ ] **Discord / TG 群**（< 500 star 前没人会进，先不做）
 
 #### 📣 发布渠道 cheat sheet
@@ -174,8 +172,8 @@ Show HN: Muselab – Self-hosted web UI for Claude Agent SDK with your own files
 
 ### 代码层小幅打磨（我能做）
 
-- [ ] **Sessions 搜索**：list > 20 时加搜索框 + 按日期分组（今天 / 本周 / 更早）
-- [ ] **会话导出**：右键 session → 下载 markdown
+- [x] **Sessions 搜索 + 按日期分组** ✅ 2026-05-22 — 搜索框已有；分组扩到 今天 / 昨天 / 7d / 30d / 更早
+- [x] **会话导出**：右键 session → 下载 markdown ✅ — `/api/chat/sessions/{sid}/export` + `menuExportMarkdown` 已实现
 - [ ] **消息重发 / 编辑**：用户消息上鼠标悬停显示编辑按钮
 - [x] **Mobile Safari 100vh bug**：~~用 `100dvh` 兜底~~ ✅ 2026-05-17
 - [x] **Chat 多会话 tab**：~~VS Code 风格~~ ✅ 2026-05-17
@@ -185,7 +183,7 @@ Show HN: Muselab – Self-hosted web UI for Claude Agent SDK with your own files
 - [x] **关 tab undo toast**：~~5s 内可恢复~~ ✅ 2026-05-18
 - [x] **mdRender 流式节流**：~~done/error/cancelled/close 强制 flush~~ ✅ 2026-05-18（80ms coalesce）
 - [x] **前端 e2e 测试**（playwright headless）：~~脚手架就位~~ ✅ 2026-05-18（默认 skip；首次启用见 tests/e2e/README.md）
-- [ ] **CodeMirror Ctrl+S 保存快捷键** + auto-save 草稿
+- [x] **CodeMirror Ctrl+S 保存快捷键** ✅ 2026-05-22 — 已绑到 extraKeys；草稿 auto-save 留待未来
 - [ ] **进度可视化**：调 claude.ai 接口拉本周期 Pro/Max 用量（看是否有非官方 API）
 
 ### 长时运行加固（2026-05-21 业界方案调研后）
@@ -231,7 +229,7 @@ Show HN: Muselab – Self-hosted web UI for Claude Agent SDK with your own files
 #### 我有疑虑、留给你 review 后再动
 
 - [ ] **`Type=notify + WatchdogSec=60s` 改造** — 检测"假死"（事件循环阻塞 / 死锁）。需要 Python 端加 `sdnotify` 周期 ping。当前没遇到真"假死"现象，过度工程；先观察 systemd 加固后 1-2 周再决定。
-- [ ] **`/api/log/client-error` 加 rate limit** — 当前 8 KiB 单次上限 + 无频率限制，被 LAN 内恶意调用可以刷爆 stderr。自托管单人场景下不实际威胁；如果未来要暴露到 LAN 以外再加 token 鉴权或 IP 限流。
+- [x] **`/api/log/client-error` 加 rate limit** ✅ 2026-05-22 — 每 IP 30/min，超额返回 `rate_limited:true` 不写 stderr；test_client_error_rate_limited 锁住
 - [ ] **`sessions/index.json` 高并发写损坏防护** — 已在已知 Bug 里。当前 atomic_write_text 防半写，但两个 muselab 进程同时写会丢更新。考虑 fcntl 文件锁（POSIX，跨平台需测 Windows）或迁 SQLite。单用户单进程下不触发；如果未来支持 multi-instance 再考虑。
 - [ ] **list_sessions cache 用 mtime + size 而非 TTL** — 当前 2s TTL 兜底外部 JSONL 变化。更精确的做法：跟踪 `sessions/` 目录 + `~/.claude/projects/<root>/` 的 mtime，变化才重新计算。但 cross-platform 文件 watch 复杂，当前 TTL 已经把 list 调用 dedupe 到 0ms，收益边际。
 - [ ] **Frontend bundle 拆分** — app.js 已 279 kB。按 muselab "纯 HTML / 无构建" 哲学不该拆。但如果首屏 LCP 成问题，可以考虑：异步加载 CodeMirror / highlight.js / DOMPurify（这些都是 vendored 大块），首屏只加载 chat 必需。需要先量化首屏体验问题再动。
@@ -239,7 +237,7 @@ Show HN: Muselab – Self-hosted web UI for Claude Agent SDK with your own files
 
 #### 我能做、可能值得做的（按 ROI 排）
 
-- [ ] **`/api/log/client-error` 加最小 IP rate limit**（每分钟 30 条 stderr 日志，超过丢弃但不返回错）— 防"被发现 endpoint" 后的日志洪水。10 行代码。
+- [x] **`/api/log/client-error` 加最小 IP rate limit** ✅ 2026-05-22 — 已做
 - [ ] **`sdk_list_sessions` 内部 profile** — 还有 ~150ms 的 cold 路径。看 SDK 在做什么，能不能复用一次 directory walk。需要读 SDK 源码。
 - [ ] **首屏 LCP 量化** — 用 chrome devtools performance tab 量首次进入的关键指标，证明是否需要优化。先量化再优化。
 - [ ] **CSP 部分启用**：`script-src 'self' 'unsafe-inline' 'unsafe-eval'` 阻止外部 script 注入但保留 Alpine.js 内联事件。比"完全不设 CSP"安全一点点。但 Alpine 的 `x-on:`/`@click` 走的不是 inline script 协议，需要测试。

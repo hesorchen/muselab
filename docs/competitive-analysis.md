@@ -46,7 +46,7 @@ What repeatedly causes a chat UI project to break 5k+ stars in the first 90 days
 1. **Pro OAuth reuse + non-Claude provider fallback** — *better than* claude-code-ui,
    which only does Claude. muselab handles DeepSeek / GLM / MiniMax
    through the official SDK with vendor endpoints. Tell that story explicitly.
-2. **~4.4k lines, no npm, no webpack** — muselab is grokkable in one sitting.
+2. **~22k lines, no npm, no webpack** — muselab is grokkable in one sitting.
    Most competitors are 50k+ TS LOC behind a build chain. Lead with this for
    the hacker crowd.
 3. **Greek Muses persona** — distinctive vs. the generic "AI assistant" framing.
@@ -90,16 +90,16 @@ What repeatedly causes a chat UI project to break 5k+ stars in the first 90 days
 **Current** (rough paraphrase):
 
 > Muselab — self-hosted web UI pairing your personal archive with Claude /
-> DeepSeek / GLM / MiniMax. ~4.4k lines, no npm.
+> DeepSeek / GLM / MiniMax. ~22k lines, no npm.
 
 **Proposed A** — leads with the saving:
 
 > # Muselab
 > **Reuse your Claude Pro / Max ($20-100/mo) seat from a browser.**
 > Talk to your own files. Bring your DeepSeek / GLM keys for the
-> cheap stuff. ~4.4k lines, clone-and-run, no npm, no webpack.
+> cheap stuff. ~22k lines, clone-and-run, no npm, no webpack.
 >
-> ![demo](docs/assets/hero.gif)
+> ![demo](assets/demo.gif)
 
 **Proposed B** — leads with the asset:
 
@@ -108,7 +108,7 @@ What repeatedly causes a chat UI project to break 5k+ stars in the first 90 days
 > any Claude / DeepSeek / GLM model. Skills + MCP + CLAUDE.md just work.
 > Reuse your Pro subscription instead of paying API rates.
 >
-> ![demo](docs/assets/hero.gif)
+> ![demo](assets/demo.gif)
 
 **Recommendation**: A wins for HN / Reddit (savings story sticks). B wins for
 the personal-knowledge crowd (Roam / Notion refugees). Run A.

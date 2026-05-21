@@ -32,7 +32,7 @@ execution on `MUSELAB_ROOT`**. Operate accordingly:
 
 - A compromised `MUSELAB_TOKEN` — full access by design
 - Symlink escapes from inside `MUSELAB_ROOT` (don't put attacker-controlled symlinks in your archive)
-- Resource exhaustion at the request layer — upload size IS capped (100 MB default, override via `MUSELAB_MAX_UPLOAD_MB`) and `/api/files/grep` has a soft 8 s time budget + 1 MB per-file cap, but there's no per-IP request rate limiting. If you expose muselab beyond a single trusted user, put a reverse proxy (caddy / nginx) in front with rate limits.
+- Resource exhaustion at the request layer — upload size IS capped (100 MB default, override via `MUSELAB_MAX_UPLOAD_MB`), `/api/files/grep` has a soft 8 s time budget + 1 MB per-file cap, and `/api/log/client-error` is rate-limited to 30 requests/IP/minute. Other endpoints don't have per-IP rate limiting. If you expose muselab beyond a single trusted user, put a reverse proxy (caddy / nginx) in front with global rate limits.
 
 ## Reporting a vulnerability
 

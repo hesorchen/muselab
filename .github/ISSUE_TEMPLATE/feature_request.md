@@ -16,7 +16,7 @@ assignees: ''
 
 ## Does this fit muselab's scope?
 
-muselab is "personal archive + Claude Agent SDK" — single-user, ~4.4k lines,
+muselab is "personal archive + Claude Agent SDK" — single-user, ~22k lines,
 no build step. Please confirm the feature aligns:
 
 - [ ] Helps a solo user work with their own files
