@@ -10,7 +10,7 @@ git clone https://github.com/hesorchen/muselab && cd muselab
 uv sync                                   # install Python deps
 cp .env.example .env                      # then fill MUSELAB_TOKEN + MUSELAB_ROOT
 uv run uvicorn backend.main:app --reload  # dev server on :8765
-uv run pytest tests/                      # all tests (~182 passing)
+uv run pytest tests/                      # all tests (~185 passing)
 ```
 
 The frontend is plain HTML + Alpine.js v3 (vendored). No build step —

@@ -147,3 +147,37 @@ def test_settings_provider_count_matches_catalog(client, auth):
     keys = {p["env_key"] for p in d["providers"]}
     assert keys == {"ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
                      "ZHIPUAI_API_KEY", "MINIMAX_API_KEY"}
+
+
+def test_is_chinese_locale_zh(monkeypatch, app_module):
+    """is_chinese_locale should return True for any of the standard
+    zh_* values that locale env vars carry on Chinese systems."""
+    from backend.settings import is_chinese_locale
+    for v in ("zh_CN.UTF-8", "zh_TW.UTF-8", "zh_HK.UTF-8", "zh", "ZH_CN"):
+        monkeypatch.setenv("LANG", v)
+        monkeypatch.delenv("LC_ALL", raising=False)
+        monkeypatch.delenv("LC_MESSAGES", raising=False)
+        assert is_chinese_locale() is True, f"failed for LANG={v}"
+
+
+def test_is_chinese_locale_en_and_unset(monkeypatch, app_module):
+    """is_chinese_locale should return False for non-Chinese locales
+    (en_US, ja_JP, …) and when all three env vars are unset."""
+    from backend.settings import is_chinese_locale
+    for v in ("en_US.UTF-8", "ja_JP.UTF-8", "fr_FR.UTF-8", "C", ""):
+        monkeypatch.setenv("LANG", v)
+        monkeypatch.delenv("LC_ALL", raising=False)
+        monkeypatch.delenv("LC_MESSAGES", raising=False)
+        assert is_chinese_locale() is False, f"false positive for LANG={v}"
+    # all unset
+    monkeypatch.delenv("LANG", raising=False)
+    assert is_chinese_locale() is False
+
+
+def test_is_chinese_locale_picks_up_lc_messages(monkeypatch, app_module):
+    """LC_MESSAGES overrides LANG on most distros — make sure we check it."""
+    from backend.settings import is_chinese_locale
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("LC_MESSAGES", "zh_CN.UTF-8")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    assert is_chinese_locale() is True
