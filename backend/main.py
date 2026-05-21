@@ -307,6 +307,38 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+# Per-IP rate limiter for /api/log/client-error. The endpoint is
+# intentionally unauthenticated (errors fire before auth is established),
+# which means a misbehaving page or a hostile client could flood
+# stderr / journald. Cap each IP to 30 errors / minute; over-budget
+# requests are silently accepted (return ok) but not logged. State is a
+# plain dict — the endpoint is single-process; a multi-worker deployment
+# would want Redis here, but muselab is single-user / single-worker.
+_CLIENT_ERR_BUCKETS: dict[str, tuple[float, int]] = {}
+_CLIENT_ERR_WINDOW_SEC = 60.0
+_CLIENT_ERR_PER_WINDOW = 30
+
+
+def _client_err_allow(ip: str) -> bool:
+    import time
+    now = time.monotonic()
+    win, count = _CLIENT_ERR_BUCKETS.get(ip, (now, 0))
+    if now - win >= _CLIENT_ERR_WINDOW_SEC:
+        _CLIENT_ERR_BUCKETS[ip] = (now, 1)
+        # Opportunistic GC: if the table grows past 1024 entries (hostile
+        # spray from many IPs), drop everything older than a window.
+        if len(_CLIENT_ERR_BUCKETS) > 1024:
+            cutoff = now - _CLIENT_ERR_WINDOW_SEC
+            stale = [k for k, (w, _) in _CLIENT_ERR_BUCKETS.items() if w < cutoff]
+            for k in stale:
+                _CLIENT_ERR_BUCKETS.pop(k, None)
+        return True
+    if count >= _CLIENT_ERR_PER_WINDOW:
+        return False
+    _CLIENT_ERR_BUCKETS[ip] = (win, count + 1)
+    return True
+
+
 @app.post("/api/log/client-error")
 async def client_error_log(request: Request) -> dict:
     """Capture browser-side JS errors that the user can't easily extract
@@ -316,8 +348,14 @@ async def client_error_log(request: Request) -> dict:
 
     Body is opaque JSON, size-capped, written verbatim to stderr so it
     lands in systemd/docker logs alongside server-side tracebacks. No
-    storage, no parsing — keep the surface tiny on purpose."""
+    storage, no parsing — keep the surface tiny on purpose.
+
+    Rate-limited per IP (30 / minute) so a runaway error loop in the
+    browser can't fill journald / docker logs."""
     import json as _json
+    ip = (request.client.host if request.client else "?") or "?"
+    if not _client_err_allow(ip):
+        return {"ok": True, "rate_limited": True}
     try:
         raw = await request.body()
     except Exception as e:

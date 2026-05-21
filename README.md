@@ -3,8 +3,9 @@
 > A self-hosted web UI that runs the **Claude Agent SDK** on top of *your own files*.
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-177_passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-173_passing-brightgreen.svg)](tests/)
+[![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
 [![中文](https://img.shields.io/badge/lang-中文-red)](README_zh.md)
 
@@ -18,6 +19,10 @@
   sessions; archive never leaves your host.
 - 🛠 **No build step.** Vanilla HTML + Alpine.js + CSS, served as static
   files — edit, refresh, done.
+
+> **Single-user only.** muselab is meant to run on your own machine for
+> *you*. There's one token, one archive, and no per-user isolation. If
+> you need a multi-tenant deployment, this isn't it (yet).
 
 ## Install
 
@@ -39,7 +44,8 @@ For prerequisites, Docker, dev mode and per-OS detail, see
 [Mobile (PWA)](docs/mobile.md) ·
 [Security](SECURITY.md) ·
 [How it compares](docs/comparison.md) ·
-[The nine Muses](docs/muses.md)
+[The nine Muses](docs/muses.md) ·
+[Third-party licenses](THIRD_PARTY_LICENSES.md)
 
 ## Status
 

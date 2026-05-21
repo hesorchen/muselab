@@ -3,8 +3,9 @@
 > 自托管 Web UI，把 **Claude Agent SDK** 跑在**你自己的文件**之上。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-177_passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-173_passing-brightgreen.svg)](tests/)
+[![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart_zh.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
@@ -18,6 +19,9 @@
   始终留在你自己的主机上。
 - 🛠 **无构建链**。原生 HTML + Alpine.js + CSS，作为静态文件直出——
   编辑文件刷新浏览器即生效。
+
+> **单用户专属**。muselab 设计在你自己的机器上为你一个人服务：一个 token、
+> 一个 archive、无多用户隔离。如果你需要多租户部署，这个项目不适合（暂时）。
 
 ## 安装
 
@@ -38,7 +42,8 @@ bash scripts/install-linux.sh    # 或 install-macos.sh / install-windows.ps1
 [手机端 PWA](docs/mobile_zh.md) ·
 [安全](SECURITY.md) ·
 [同类对比](docs/comparison_zh.md) ·
-[九位缪斯](docs/muses_zh.md)
+[九位缪斯](docs/muses_zh.md) ·
+[第三方授权](THIRD_PARTY_LICENSES.md)
 
 ## 状态
 

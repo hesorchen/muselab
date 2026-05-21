@@ -1177,6 +1177,15 @@ function portal() {
             tabSize: 2,
             indentUnit: 2,
             theme: this.theme === "light" ? "default" : "material-darker",
+            // Ctrl/Cmd+S inside the editor → save. Without this, on some
+            // browsers the browser's own "save page" dialog can fire even
+            // when the document-level keydown handler exists, because
+            // CodeMirror's contenteditable subtree captures the event
+            // first. Hooking it here is the most defensive spot.
+            extraKeys: {
+              "Ctrl-S": () => { this.saveEdit(); },
+              "Cmd-S":  () => { this.saveEdit(); },
+            },
           });
           // Initial status
           this.cmStatus = {
@@ -3123,9 +3132,9 @@ function portal() {
         || (s.first_prompt && s.first_prompt.toLowerCase().includes(q))
       );
     },
-    // Bucket the filtered list into Pinned / Today / This week / Earlier
-    // for a cleaner picker once a few dozen sessions accumulate. Pinned
-    // always floats to the top; the other three are based on updated_at
+    // Bucket the filtered list into Pinned / Today / Yesterday / Last 7d /
+    // Last 30d / Earlier so a few hundred sessions stay scannable. Pinned
+    // always floats to the top; the rest are based on updated_at
     // (epoch seconds — same source as the existing sort).
     groupedFilteredSessions() {
       const items = this.filteredSessions();
@@ -3133,15 +3142,17 @@ function portal() {
       const now = new Date();
       const startOfToday = new Date(now.getFullYear(), now.getMonth(),
                                      now.getDate()).getTime() / 1000;
-      // Monday as week start. getDay() returns 0 for Sunday → shift to (day+6)%7
-      const dayIdx = (now.getDay() + 6) % 7;
-      const startOfWeek = startOfToday - dayIdx * 86400;
-      const pinned = [], today = [], week = [], earlier = [];
+      const startOfYesterday = startOfToday - 86400;
+      const startOf7d = startOfToday - 7 * 86400;
+      const startOf30d = startOfToday - 30 * 86400;
+      const pinned = [], today = [], yest = [], week = [], month = [], earlier = [];
       for (const s of items) {
         if (s.pinned) { pinned.push(s); continue; }
         const t = s.updated_at || s.created_at || 0;
         if (t >= startOfToday) today.push(s);
-        else if (t >= startOfWeek) week.push(s);
+        else if (t >= startOfYesterday) yest.push(s);
+        else if (t >= startOf7d) week.push(s);
+        else if (t >= startOf30d) month.push(s);
         else earlier.push(s);
       }
       const zh = this.lang === "zh";
@@ -3150,8 +3161,12 @@ function portal() {
         label: zh ? "置顶" : "Pinned", items: pinned });
       if (today.length) groups.push({ key: "today",
         label: zh ? "今天" : "Today", items: today });
+      if (yest.length) groups.push({ key: "yesterday",
+        label: zh ? "昨天" : "Yesterday", items: yest });
       if (week.length) groups.push({ key: "week",
-        label: zh ? "本周" : "This week", items: week });
+        label: zh ? "最近 7 天" : "Last 7 days", items: week });
+      if (month.length) groups.push({ key: "month",
+        label: zh ? "最近 30 天" : "Last 30 days", items: month });
       if (earlier.length) groups.push({ key: "earlier",
         label: zh ? "更早" : "Earlier", items: earlier });
       return groups;

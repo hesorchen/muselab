@@ -128,3 +128,26 @@ def test_upload_blocks_sensitive_filename(client, auth):
         data={"path": ""},
     )
     assert r.status_code == 403
+
+
+# ---- /api/log/client-error rate limit ----
+
+def test_client_error_rate_limited(client):
+    """The unauthenticated client-error sink must not be floodable.
+    First N requests log to stderr, rest return rate_limited:true."""
+    from backend import main as m
+    # Reset bucket state so previous tests don't interfere.
+    m._CLIENT_ERR_BUCKETS.clear()
+    cap = m._CLIENT_ERR_PER_WINDOW
+    payload = {"msg": "test error"}
+    # First `cap` requests should pass through.
+    for _ in range(cap):
+        r = client.post("/api/log/client-error", json=payload)
+        assert r.status_code == 200
+        body = r.json()
+        assert body.get("ok") is True
+        assert not body.get("rate_limited")
+    # The next one must be rate-limited.
+    r = client.post("/api/log/client-error", json=payload)
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "rate_limited": True}

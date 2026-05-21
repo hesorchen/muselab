@@ -5,6 +5,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet — track work in [TODO.md](TODO.md)._
+
+## [0.1.0] - 2026-05-22
+
+First public-tagged release. Code has been used daily by the author for
+a few months; this version cuts a tag so people can pin / fork / point
+issues at a stable revision. Treat anything below as released-as-of
+this date.
+
+### Onboarding & first-run polish (2026-05-22)
+- **Chat-driven CLAUDE.md intake.** Replaces the "edit CLAUDE.md by hand"
+  surface with a curated chat: muselab opens a fresh session prompted to
+  walk the user section-by-section through `CLAUDE.md`, saves each
+  answer via `Edit`, and handles sensitive sections (money / health)
+  gently. New endpoint `POST /api/chat/sessions/profile-intake`; top-bar
+  👤 button opens it. Side-effect: seeds CLAUDE.md from the
+  locale-aware template + creates the archive skeleton if missing.
+- **Skills auto-discovery + visualization.** `/api/settings/skills` now
+  walks all three Claude Code scopes — project (`./.claude/skills`),
+  user (`~/.claude/skills`), and plugin marketplace
+  (`~/.claude/plugins/marketplaces/<mp>/plugins/<plug>/skills`). Each
+  entry returns its `scope` and (for plugin scope) `source`. The
+  Settings UI changed from a text list to a filterable card grid; new
+  🧩 toolbar drawer in the chat input lets the user fire a skill any
+  time. First-load toast tells the user how many skills were discovered.
+- **Resize side panes up to 2/3 viewport with snap-hide.** Left and
+  right panes can now be dragged to two-thirds of the window width.
+  Below the hide threshold (200px) they auto-collapse; 20px hysteresis
+  keeps the drag from flickering at the boundary, and releasing the
+  mouse is no longer required to recover from an over-shrink.
+- **Welcome card on first chat load.** Numbered three-step orientation
+  card above the state cards; dismissable, remembered in localStorage.
+- **Bilingual cold-start.** Installer scripts (`install-*.sh / .ps1`,
+  `intake.sh / .ps1`) detect locale via `$LANG / $LC_ALL / $LC_MESSAGES`
+  on Unix and `Get-Culture` on Windows, then pick `default-CLAUDE.md` vs
+  `default-CLAUDE.en.md` and `README.{md,en.md}` per subdir. Patching
+  switched from `sed` (broke on `/` in Chinese labels) to whole-line
+  awk equality. Installer auto-opens the browser at the end
+  (`xdg-open` / `open` / `Start-Process`); skip via `MUSELAB_NO_BROWSER=1`.
+  Token is **not** placed in the URL (browser history leak).
+- **Six predefined archive subdirs ship with examples.** Each of
+  `health / work / money / people / notes / archives` has a bilingual
+  `README.md / README.en.md` plus a `_example-*.md` template (checkup
+  log / project log / monthly budget) the user can copy-paste.
+
+### Docs & open-source polish (2026-05-21)
+- **README rewrite (454 → 50 lines).** Replaced the long-form pitch with
+  five bullets + an install one-liner + a docs index. Removed
+  "read in an afternoon" overclaim. Detail moved into
+  `docs/{quickstart,providers,architecture,mobile,comparison,muses}.md`.
+- **Bilingual docs.** Every `.md` doc has a `_zh.md` mirror; both carry
+  a switcher link at the top.
+- **`THIRD_PARTY_LICENSES.md`** lists every vendored frontend library
+  (Alpine, marked, DOMPurify, highlight.js, KaTeX, CodeMirror) plus
+  backend dependencies with upstream URLs.
+- **Removed accidental personal-context leakage from `README_zh.md`** —
+  the initial rewrite included `跳槽材料` ("job-hunting materials")
+  as a concrete example of what to drop into `MUSELAB_ROOT`. Replaced
+  with neutral category language. Codified a rule for future docs.
+
+### Long-running hardening (2026-05-21)
+- **systemd unit hardening.** Resource ceilings added to
+  `~/.config/systemd/user/muselab.service` and the installer template:
+  `MemoryHigh=2G` / `MemoryMax=4G` / `TasksMax=4096` /
+  `LimitNOFILE=8192`, plus restart rate limit
+  `StartLimitIntervalSec=300` + `StartLimitBurst=5` so a crash loop
+  can't burn CPU and flood the journal. Existing installs need
+  `systemctl --user daemon-reload && systemctl --user restart muselab`
+  to pick them up.
+- **macOS launchd parity.** `com.muselab.plist.tmpl` sets
+  `HardResourceLimits.NumberOfFiles=8192` + `NumberOfProcesses=4096`.
+- **Docker resource limits mirror systemd.** `docker-compose.yml` adds
+  `mem_limit: 4g` / `mem_reservation: 1g` / `pids_limit: 4096`.
+- **Cheaper Docker healthcheck.** Both `Dockerfile` `HEALTHCHECK` and
+  `docker-compose.yml` healthcheck now hit `/api/health` instead of
+  `/` — saves ~2880 full HTML renders per container per day.
+- **In-flight turn persistence.** Each turn writes
+  `sessions/active_turns/<sid>.json` at start and deletes it on clean
+  termination. Anything left over after restart is an interrupted turn,
+  surfaced on boot with a toast + jump-to-session action. Does not
+  auto-resume — user decides whether the prompt is worth rephrasing.
+- **`list_sessions()` TTL cache (2s)** with invalidation on muselab
+  writes. Profile on a 270-session archive dropped from 150-480 ms to
+  ~0 ms on cached calls.
+
+### Security (2026-05-21)
+- **Constant-time token comparison.** `backend/auth.py` switched from
+  `==` to `hmac.compare_digest` to close a timing side-channel.
+- **Default security headers** via middleware: `X-Content-Type-Options:
+  nosniff`, `Referrer-Policy: same-origin`, `X-Frame-Options:
+  SAMEORIGIN`. The `Referrer-Policy` matters because auth tokens ride
+  in query strings for SSE / file download endpoints; `same-origin`
+  strips `Referer` on cross-origin clicks.
+- **`noindex` defense-in-depth.** `<meta name="robots"
+  content="noindex,nofollow,noarchive">` in `index.html` + a
+  `/robots.txt` route serving `Disallow: /`.
+
+### Code health (2026-05-21)
+- **Ruff is now a pinned dev dep** (`pyproject.toml` `[dependency-groups].dev`
+  + `[tool.ruff]` config). CI lint step is **blocking** instead of
+  `|| true`. Cleared 23 pre-existing ruff errors.
+
 ### Docs — project positioning rewrite + tone tightening (2026-05-21)
 - **Removed accidental personal-context leakage from `README_zh.md`**: the initial rewrite included `跳槽材料` ("job-hunting materials") as a concrete example of what users might put in `MUSELAB_ROOT`, which inadvertently surfaced the project author's current life situation. Replaced with neutral category language ("notes / records / documents") that doesn't presume what the user is going through.
 - **Tone tightened to project-author voice**: the first hero rewrite over-corrected toward colloquial / informal phrasing ("by the time you say hi", "like a colleague would", "随手翻阅", "切 vendor 不影响") which read as a chat transcript more than a project README. Replaced with declarative, scannable prose; kept the htmx / 11ty / Levels lineage references (those situate the project in an existing aesthetic, which is the point).
