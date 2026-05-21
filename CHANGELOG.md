@@ -5,7 +5,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet — track work in [TODO.md](TODO.md)._
+### Fixed
+- **Docker `docker run` example mounted to `/root/*` instead of `/home/muse/*`.**
+  The container's `USER` is `muse` (uid 1000), so bind-mounting host paths
+  to `/root` left files unreadable for the running process and OAuth was
+  never picked up. Standalone `docker run` example in `docs/quickstart.md`
+  + `docs/quickstart_zh.md` now mounts `/data` for the archive and
+  `/home/muse/.claude` for credentials, matching `docker-compose.yml`.
+- **English users saw Chinese session labels** (`[设置档案]`, `[整理档案]`)
+  in their tab strip from `/sessions/profile-intake` and `/sessions/organize`.
+  Both endpoints now pick zh / en label via the same `LANG / LC_ALL /
+  LC_MESSAGES` probe as the installer scripts. Logic extracted to
+  `settings.is_chinese_locale()` so future locale-aware code paths can
+  reuse one helper.
+- **Stale doc copy.** `docs/architecture{,_zh}.md` Mermaid label backend
+  size `~6.8k` → `~7k` (matches current Python LOC). `docs/comparison.md`
+  was already `~22 k` — no change.
+
+### Added
+- **`THIRD_PARTY_LICENSES.md`** at the repo root attributing every
+  vendored frontend library (Alpine.js / marked / DOMPurify /
+  highlight.js / KaTeX / CodeMirror) plus every backend dependency, each
+  with license + version floor + upstream URL.
+- **CHANGELOG `[0.1.0] - 2026-05-22` release entry** cut from `[Unreleased]`
+  so the inaugural tag has a structured Keep-a-Changelog summary instead
+  of a long squash commit body.
+- **Multi-user-not-supported notice** in `README.md` / `README_zh.md`
+  plus a "muselab is **not**" section in `docs/comparison{,_zh}.md` so
+  prospective users don't deploy expecting per-user isolation.
+- **`Self-hosted` README badge** linking to `docs/quickstart.md`.
+- **Sessions picker grouping** expanded from `Today / This week / Earlier`
+  to `Today / Yesterday / Last 7 days / Last 30 days / Earlier` so a few
+  hundred sessions stay scannable.
+- **CodeMirror Ctrl/Cmd-S → saveEdit()** via `extraKeys`, defending
+  against browsers that swallow the document-level keydown handler.
+- **`/api/log/client-error` per-IP rate limit** (30/minute) so a runaway
+  browser error loop can't flood journald / docker logs. New
+  `test_client_error_rate_limited` locks the budget.
+- **`test_i18n_zh_en_key_parity`** locks the i18n key set to be identical
+  across the zh and en language blocks in `frontend/i18n/index.js`. We've
+  shipped raw `foo.bar` keys to users before when a zh-only addition
+  landed without the en mirror.
+
+### Security
+- **SECURITY.md** updated to reflect the new client-error rate limit
+  alongside upload caps + grep budget.
 
 ## [0.1.0] - 2026-05-22
 
