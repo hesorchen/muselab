@@ -5,6 +5,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Rich per-tool result rendering.** `tool_result` events now carry the
+  full body (up to 50 KB), the originating `tool_name`, and — for Bash —
+  pre-parsed `{stdout, stderr, exit_code, interrupted}`. Frontend picks a
+  renderer per kind:
+  - **Bash** — terminal-style dark block, stdout / stderr split, exit-code
+    pill (green ok / red fail), `⚠ interrupted` flag.
+  - **Read** — line-numbered gutter, monospace code column.
+  - **WebFetch / WebSearch** — markdown card with clickable links.
+  - **Glob / Grep / MCP** — monospace hit list with same expand affordance.
+  - **everything else** — plain `<pre>` (unchanged behavior).
+  Falls back gracefully for tools without a dedicated renderer.
+- **Edit / MultiEdit / Write diff strip.** `tool_use` payload now forwards
+  `old_string` / `new_string` / `edits` / `content` (capped 100 KB per
+  field). Frontend computes a line-based LCS diff and renders insert /
+  delete / context lines under the tool bubble — collapsible, so the user
+  can see WHAT changed before opening the file. No new dependency: a
+  ~40-line LCS in `app.js` covers it.
+- **Classified stream errors with CTA buttons.** `event: error` now carries
+  `{kind, cta, retryable}` alongside the raw message. Frontend renders a
+  color-coded card under the failed user bubble:
+  - `auth` → "Open Settings" (typically vendor API key missing / 401)
+  - `quota` → "Switch model" (429 / rate-limit / overloaded)
+  - `network` → "Retry"
+  - `cross_vendor` → "Compact session" (Claude thinking-signature leaked
+    into a non-Claude turn after model swap)
+  - `session` → "Retry" (CLI "Session ID already in use" — usually
+    transient)
+  - `unknown` / no classification → plain Retry button (old behavior).
+- **`ask_user_question` option previews.** The `preview` field on each
+  option (markdown / mockup / code snippet — already supported by the
+  SDK schema) now passes through `_normalize_questions` and renders as a
+  collapsed footnote on the button. Lets the model attach side-by-side
+  rich context when the label alone isn't enough.
+
+### Changed
+- `_render_tool_use` / `_sdk_messages_to_ui` share a wider `_SLIM_INPUT_FIELDS`
+  set so the diff-rendering and Read-pagination fields survive both the
+  live stream and the historic reload paths. Each field is capped at
+  `_MAX_INPUT_FIELD_LEN = 100 KB` with an inline truncation marker —
+  pathological 500 KB Write inputs still ship cleanly.
+- `tool_result` summary header for Bash now surfaces the exit code
+  (`✓ ok · 12 lines` / `✗ exit 1 · 4 lines`) so the user doesn't have to
+  expand to know whether the command succeeded.
+
 ### Fixed
 - **`GET /api/settings/mcp/status` 500'd as soon as any client was alive.**
   Endpoint unpacked the `_clients` cache key into two vars, but the key gained

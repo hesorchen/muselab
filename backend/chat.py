@@ -934,6 +934,11 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
     get an `_is_compact_summary` flag so the UI can render a "📦 已压缩" pill."""
     compact_uuids = compact_uuids or set()
     out: list[dict] = []
+    # tool_use_id → tool_name lookup so the historic-load path attaches the
+    # same `tool_name` field that the live stream attaches. Keeps the FE's
+    # per-tool rich renderers (Bash terminal, Read with gutter, …) working
+    # after a page refresh / session reload.
+    tool_use_names: dict[str, str] = {}
     for sm in sm_list:
         ann = annotations.get(sm.uuid, {})
         is_compact = sm.uuid in compact_uuids
@@ -1005,15 +1010,47 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                              "uuid": sm.uuid})
             elif bt == "tool_use":
                 flush_text()
+                tu_name = block.get("name") or ""
+                tu_id = block.get("id") or ""
+                if tu_id:
+                    tool_use_names[tu_id] = tu_name
+                # Slim + cap the input the same way the live stream does so
+                # the FE gets a consistent shape across "fresh stream" and
+                # "reload from JSONL". Without this, reload-after-Edit lost
+                # the old_string/new_string fields and the diff renderer
+                # silently degraded to file-path-only.
+                raw_input = block.get("input") or {}
+                slim_input = {
+                    k: _slim_input_value(v)
+                    for k, v in raw_input.items()
+                    if k in {
+                        "file_path", "notebook_path", "path",
+                        "command", "pattern", "url", "query",
+                        "name", "skill", "subagent_type", "description", "todos",
+                        "old_string", "new_string", "edits", "content",
+                        "offset", "limit",
+                        "timeout", "run_in_background", "replace_all",
+                    }
+                }
                 tu = {
                     "role": "tool_use",
                     "uuid": sm.uuid,
-                    "id": block.get("id"),
-                    "name": block.get("name"),
-                    "input": block.get("input") or {},
+                    "id": tu_id,
+                    "name": tu_name,
+                    "input": slim_input,
                     # Compact summary that the frontend usually shows in the bubble
-                    "summary": _summarize_tool_input(block.get("name"), block.get("input") or {}),
+                    "summary": _summarize_tool_input(tu_name, raw_input),
                 }
+                if tu_name == "TodoWrite":
+                    tu["todos"] = raw_input.get("todos") or []
+                elif tu_name == "Task":
+                    tu["task"] = {
+                        "subagent_type": raw_input.get("subagent_type"),
+                        "description": raw_input.get("description"),
+                        "prompt": raw_input.get("prompt"),
+                    }
+                elif tu_name == "ExitPlanMode":
+                    tu["plan"] = raw_input.get("plan") or ""
                 out.append(tu)
             elif bt == "tool_result":
                 flush_text()
@@ -1029,13 +1066,24 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                         else:
                             parts.append(str(p))
                     tr_text = "\n".join(parts)
-                out.append({
+                tu_id = block.get("tool_use_id") or ""
+                tool_name = tool_use_names.get(tu_id, "")
+                entry = {
                     "role": "tool_result", "uuid": sm.uuid,
-                    "id": block.get("tool_use_id"),
-                    "preview": tr_text[:500],
-                    "truncated": len(tr_text) > 500,
+                    "id": tu_id,
+                    "preview": tr_text[:_TOOL_RESULT_PREVIEW_CAP],
+                    "truncated": len(tr_text) > _TOOL_RESULT_PREVIEW_CAP,
+                    "text": tr_text[:_TOOL_RESULT_TEXT_CAP],
+                    "text_truncated": len(tr_text) > _TOOL_RESULT_TEXT_CAP,
                     "is_error": bool(block.get("is_error", False)),
-                })
+                }
+                if tool_name:
+                    entry["tool_name"] = tool_name
+                if tool_name == "Bash":
+                    bash = _parse_bash_result(tr_text)
+                    if bash:
+                        entry["bash"] = bash
+                out.append(entry)
             elif bt == "image":
                 # Inline image block in user content — record a reference.
                 # Real base64 lives in the sidecar (annotations["images"]) for
@@ -2115,6 +2163,33 @@ async def reset(session_id: str | None = None) -> dict:
 
 # ====== streaming ======
 
+# Per-field cap so a single tool_use payload stays bounded even when Write
+# pastes a 500KB file. 100KB covers >99% of real Edit / Write inputs while
+# capping the worst case at "still fits in one SSE frame, fits in the browser
+# buffer". Truncation is marked inline so the FE can show "…and 90KB more"
+# instead of silently rendering a partial diff.
+_MAX_INPUT_FIELD_LEN = 100_000
+
+
+def _slim_input_value(v: Any) -> Any:
+    """Cap a single tool-input field so a runaway Write doesn't blow the
+    SSE buffer. Strings get truncated with a marker; large lists/dicts are
+    rejected entirely and replaced by a placeholder (the FE wasn't going to
+    render them meaningfully anyway)."""
+    if isinstance(v, str) and len(v) > _MAX_INPUT_FIELD_LEN:
+        return (v[:_MAX_INPUT_FIELD_LEN]
+                + f"\n…[truncated, {len(v) - _MAX_INPUT_FIELD_LEN} chars more]")
+    if isinstance(v, (list, dict)):
+        try:
+            dumped = json.dumps(v, ensure_ascii=False)
+            if len(dumped) > _MAX_INPUT_FIELD_LEN:
+                return (f"[truncated structured field, "
+                        f"{len(dumped)} chars total]")
+        except (TypeError, ValueError):
+            pass
+    return v
+
+
 def _render_tool_use(block: ToolUseBlock) -> dict:
     inp = block.input or {}
     name = block.name
@@ -2142,17 +2217,31 @@ def _render_tool_use(block: ToolUseBlock) -> dict:
     else:
         summary = json.dumps(inp, ensure_ascii=False)[:200]
 
-    # Slim input — drop bulky fields (Write/Edit's `content`, `new_string`
-    # etc. could be a whole file). FE uses `input.file_path` to drive the
-    # clickable file-link chip and the preview auto-refresh on edit; without
-    # this passthrough both silently no-op'd (toolFilePath always returned "",
-    # _maybeReloadPreview never matched). 2026-05-18 audit fix.
+    # Slim input — drop bulky fields the FE doesn't use, cap retained fields
+    # at _MAX_INPUT_FIELD_LEN. FE uses these for:
+    #   - file_path → clickable chip + preview auto-refresh on Edit
+    #   - old_string / new_string / edits / content → diff rendering for
+    #     Edit / MultiEdit / Write (previously the FE had no way to show
+    #     "what Muse actually changed" beyond a file_path chip)
+    #   - offset / limit → "lines N–M of …" label on Read
+    #   - command → Bash terminal-style block
     _SLIM_INPUT_FIELDS = {
         "file_path", "notebook_path", "path",
         "command", "pattern", "url", "query",
         "name", "skill", "subagent_type", "description", "todos",
+        # Diff-rendering inputs (Edit / MultiEdit / Write).
+        "old_string", "new_string", "edits", "content",
+        # Read pagination — surfaces as "lines N–M" label.
+        "offset", "limit",
+        # Bash extras — `description` already in the set; also pass
+        # `timeout` / `run_in_background` if present so the FE can show a
+        # spinner state for long-running commands.
+        "timeout", "run_in_background",
+        # MultiEdit/Edit "fix on miss" flag (Claude sometimes sends it).
+        "replace_all",
     }
-    slim_input = {k: v for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
+    slim_input = {k: _slim_input_value(v)
+                  for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
     out: dict = {"name": name, "summary": summary, "id": block.id,
                   "input": slim_input}
     # Pass full structured payloads through for tools that have dedicated UIs.
@@ -2169,7 +2258,116 @@ def _render_tool_use(block: ToolUseBlock) -> dict:
     return out
 
 
-def _render_tool_result(block: ToolResultBlock) -> dict:
+# tool_result raw text cap. preview stays small (cheap default render);
+# `text` carries the full body up to this cap (drives the "expand" button).
+# 50 KB ≈ a long Bash stack trace or a 500-line Read window — bigger than
+# that and the FE's <pre> render starts to feel sluggish anyway.
+_TOOL_RESULT_PREVIEW_CAP = 500
+_TOOL_RESULT_TEXT_CAP = 50_000
+
+
+# Bash output format from claude-code's CLI: stdout / stderr / exit_code are
+# wrapped in pseudo-XML tags so we can split them apart for terminal-style
+# rendering. Falls through gracefully when the tags aren't present (vendor
+# wrappers / mocked runs); the FE then just renders the raw body.
+_BASH_TAG_RE = re.compile(
+    r"<(stdout|stderr|exit_code|interrupted|description)>"
+    r"(.*?)</\1>",
+    re.DOTALL,
+)
+
+
+def _classify_stream_error(err: Any) -> dict:
+    """Tag a stream-error message with a kind + CTA hint + retryable flag so
+    the FE can render a useful action button instead of just a red toast.
+
+    Real-world breakdown (seen on the user's machine):
+      - vendor 401 / "invalid api key" / "Not logged in"  → kind=auth, retry=N
+      - "429" / "rate limit" / "quota exceeded"           → kind=quota, retry=Y
+      - "Connection refused" / "timeout" / "ECONNRESET"   → kind=network, retry=Y
+      - "Session ID already in use"                        → kind=session, retry=Y
+      - "thinking signature"                               → kind=cross_vendor, retry=Y
+      - everything else                                    → kind=unknown, retry=Y
+
+    `cta`: optional opaque key the FE maps to a button label + handler
+    (e.g. "open_settings", "switch_model", "retry"). FE falls back to a
+    plain "Retry" button when None.
+    """
+    msg = str(err) if err is not None else ""
+    low = msg.lower()
+    kind = "unknown"
+    cta: str | None = "retry"
+    retryable = True
+    if any(t in low for t in (
+        "401", "invalid api key", "invalid_api_key",
+        "not logged in", "requires auth", "no api key",
+        "anthropic_api_key", "authentication",
+    )):
+        kind = "auth"
+        cta = "open_settings"
+        retryable = False
+    elif any(t in low for t in (
+        "429", "rate limit", "rate_limit", "quota", "too many requests",
+        "overloaded",
+    )):
+        kind = "quota"
+        cta = "switch_model"
+    elif any(t in low for t in (
+        "connection refused", "timeout", "timed out",
+        "econnreset", "econnrefused", "enotfound", "network", "dns",
+    )):
+        kind = "network"
+        cta = "retry"
+    elif "thinking" in low and "signature" in low:
+        # Cross-vendor switch left a Claude thinking-signature in history;
+        # next turn from a non-Claude vendor fails validation. UX: tell the
+        # user to clear / compact / fork.
+        kind = "cross_vendor"
+        cta = "compact_or_fork"
+    elif "session" in low and ("already in use" in low or "already_in_use" in low):
+        kind = "session"
+        cta = "retry"
+    elif "processerror" in low or "claudesdkerror" in low:
+        kind = "sdk"
+        cta = "retry"
+    return {"kind": kind, "retryable": retryable, "cta": cta}
+
+
+def _error_event(err: Any) -> dict:
+    """Bundle a stream-error message with its classification into an SSE
+    `error` event payload — single call site so the FE always sees the
+    same shape regardless of which yield-error branch fired."""
+    msg = str(err) if err is not None else ""
+    return {"event": "error",
+            "data": json.dumps({"error": msg, **_classify_stream_error(msg)})}
+
+
+def _parse_bash_result(text: str) -> dict | None:
+    """Return {stdout, stderr, exit_code, interrupted, description} when
+    `text` carries CLI's wrapped Bash output. None when the body isn't in
+    that shape (still falls through to plain-text rendering on the FE)."""
+    if not text or "<" not in text:
+        return None
+    matches = list(_BASH_TAG_RE.finditer(text))
+    if not matches:
+        return None
+    parts: dict[str, Any] = {}
+    for m in matches:
+        tag, body = m.group(1), m.group(2)
+        if tag == "exit_code":
+            try:
+                parts["exit_code"] = int(body.strip())
+            except ValueError:
+                pass
+        elif tag == "interrupted":
+            parts["interrupted"] = body.strip().lower() in ("true", "1", "yes")
+        else:
+            parts[tag] = body
+    return parts or None
+
+
+def _render_tool_result(block: ToolResultBlock,
+                        *, tool_name: str = "") -> dict:
     text = ""
     if isinstance(block.content, str):
         text = block.content
@@ -2181,10 +2379,29 @@ def _render_tool_result(block: ToolResultBlock) -> dict:
             else:
                 parts.append(str(p))
         text = "\n".join(parts)
-    return {"id": getattr(block, "tool_use_id", None),
-            "preview": text[:500],
-            "truncated": len(text) > 500,
-            "is_error": bool(getattr(block, "is_error", False))}
+    out: dict = {
+        "id": getattr(block, "tool_use_id", None),
+        "preview": text[:_TOOL_RESULT_PREVIEW_CAP],
+        "truncated": len(text) > _TOOL_RESULT_PREVIEW_CAP,
+        # Full body up to _TOOL_RESULT_TEXT_CAP — drives the FE's "expand"
+        # affordance and per-tool rich render (Bash terminal, Read with
+        # gutter, WebFetch markdown card). When the underlying SDK text was
+        # bigger than the cap, `text_truncated` tells the FE so it can show
+        # "… 50KB more cut" instead of pretending this is the full output.
+        "text": text[:_TOOL_RESULT_TEXT_CAP],
+        "text_truncated": len(text) > _TOOL_RESULT_TEXT_CAP,
+        "is_error": bool(getattr(block, "is_error", False)),
+    }
+    if tool_name:
+        out["tool_name"] = tool_name
+    # Bash gets structured-output extraction so the FE can render stdout /
+    # stderr / exit-code with different styling. Only emit when the parse
+    # actually succeeded — empty objects would mislead.
+    if tool_name == "Bash":
+        bash = _parse_bash_result(text)
+        if bash:
+            out["bash"] = bash
+    return out
 
 
 # ====== attachment upload (images + documents) ======
@@ -2414,8 +2631,7 @@ async def stream(
         existing = _active_turns.get(session_id)
         if existing is None:
             async def _no_active_gen():
-                yield {"event": "error",
-                        "data": json.dumps({"error": "no active turn"})}
+                yield _error_event("no active turn")
             return EventSourceResponse(_no_active_gen())
         return EventSourceResponse(
             _subscribe_broadcast(existing),
@@ -2441,8 +2657,7 @@ async def stream(
     async with _lock:
         if session_id in _active_turns and not _active_turns[session_id].done:
             async def _busy_gen():
-                yield {"event": "error",
-                        "data": json.dumps({"error": "previous turn still running"})}
+                yield _error_event("previous turn still running")
             return EventSourceResponse(_busy_gen())
         broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
         _active_turns[session_id] = broadcast
@@ -2479,7 +2694,7 @@ async def stream(
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
         async def _early_err_gen():
-            yield {"event": "error", "data": json.dumps({"error": err_msg})}
+            yield _error_event(err_msg)
         return EventSourceResponse(_early_err_gen())
 
     # Pull attachments from the in-memory store; build content blocks for the
@@ -2538,6 +2753,12 @@ async def stream(
     # closeAsst). Lets us tail-emit any TextBlock suffix the SDK didn't
     # send as text_delta — see TextBlock branch below for context.
     streamed_in_bubble = ""
+    # tool_use_id → tool_name lookup populated as we forward ToolUseBlock
+    # events. When the matching ToolResultBlock arrives, we attach the
+    # name so the FE can pick a per-tool rich renderer (Bash terminal,
+    # Read with line gutter, etc.) without re-scanning its own message
+    # list. Cleared per turn (lives in event_gen closure).
+    tool_use_names: dict[str, str] = {}
 
     async def event_gen():
         nonlocal assistant_acc, streamed_in_bubble
@@ -2701,13 +2922,18 @@ async def stream(
                     # Already streamed via thinking_delta events.
                     pass
                 elif isinstance(block, ToolUseBlock):
+                    if block.id:
+                        tool_use_names[block.id] = block.name or ""
                     yield {"event": "tool_use",
                            "data": json.dumps(_render_tool_use(block))}
                     # FE closeAsst()'s the bubble on tool_use; reset mirror.
                     streamed_in_bubble = ""
                 elif isinstance(block, ToolResultBlock):
+                    tu_id = getattr(block, "tool_use_id", "") or ""
+                    tname = tool_use_names.get(tu_id, "")
                     yield {"event": "tool_result",
-                           "data": json.dumps(_render_tool_result(block))}
+                           "data": json.dumps(
+                               _render_tool_result(block, tool_name=tname))}
 
         async def _handle_result_message(msg):
             """ResultMessage = turn complete. Update cumulative cost / stats,
@@ -2924,7 +3150,7 @@ async def stream(
                     yield payload
                     continue
                 if kind == "error":
-                    yield {"event": "error", "data": json.dumps({"error": str(payload)})}
+                    yield _error_event(payload)
                     break
                 if kind == "done":
                     break
@@ -2994,10 +3220,7 @@ async def stream(
                 f"[chat] turn exceeded {BG_TIMEOUT_S}s (30min), aborting "
                 f"sid={session_id}\n")
             _sys.stderr.flush()
-            broadcast.publish({
-                "event": "error",
-                "data": json.dumps({"error": "turn exceeded 30min"}),
-            })
+            broadcast.publish(_error_event("turn exceeded 30min"))
         except Exception as e:
             import sys as _sys
             import traceback as _tb
@@ -3005,10 +3228,7 @@ async def stream(
                 f"[chat] background turn crashed sid={session_id} "
                 f"exc={type(e).__name__}: {e}\n{_tb.format_exc()}\n")
             _sys.stderr.flush()
-            broadcast.publish({
-                "event": "error",
-                "data": json.dumps({"error": f"{type(e).__name__}: {e}"}),
-            })
+            broadcast.publish(_error_event(f"{type(e).__name__}: {e}"))
         finally:
             broadcast.finish()
             _active_turns.pop(session_id, None)

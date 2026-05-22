@@ -2821,12 +2821,195 @@ function portal() {
       let cls = "tool-result";
       if (m && m.is_error) cls += " err";
       if (!this.isMsgExpanded(i, m)) cls += " collapsed";
+      // Per-tool class hooks let CSS show terminal / read-gutter / web-card
+      // styling only for the relevant result. Falls back to plain text.
+      const kind = this.toolResultKind(m);
+      if (kind) cls += " kind-" + kind;
       return cls;
     },
     toolResultSummary(m) {
-      const text = (m && m.preview) || "";
+      const text = (m && (m.text || m.preview)) || "";
       const lines = text.split("\n").length;
-      return lines + (this.lang === "zh" ? " 行输出" : " lines");
+      const kind = this.toolResultKind(m);
+      const suffix = this.lang === "zh" ? " 行输出" : " lines";
+      // Bash gets a more useful summary (exit code surfaced) so the user
+      // doesn't have to expand to see if the command succeeded.
+      if (kind === "bash" && m && m.bash && typeof m.bash.exit_code === "number") {
+        const ec = m.bash.exit_code;
+        const tag = ec === 0
+          ? (this.lang === "zh" ? "✓ 成功" : "✓ ok")
+          : (this.lang === "zh" ? `✗ 退出码 ${ec}` : `✗ exit ${ec}`);
+        return `${tag} · ${lines}${suffix}`;
+      }
+      return lines + suffix;
+    },
+    toolResultKind(m) {
+      // Map tool_name → renderer key. Drives both CSS class and the
+      // Alpine template that fires inside the expanded body.
+      if (!m) return "";
+      const name = m.tool_name || "";
+      if (name === "Bash") return "bash";
+      if (name === "Read") return "read";
+      if (name === "WebFetch") return "web";
+      if (name === "WebSearch") return "web";
+      if (name === "Glob" || name === "Grep") return "search";
+      if (name && name.startsWith("mcp__")) return "mcp";
+      return "";
+    },
+    toolResultBodyText(m) {
+      // Full body for the expanded view (or the truncation-marker tail).
+      // Prefer `text` (50KB cap) over the legacy `preview` (500-char).
+      if (!m) return "";
+      const body = m.text || m.preview || "";
+      if (m.text_truncated) {
+        const suffix = this.lang === "zh"
+          ? "\n\n…（输出已截断，剩余内容未传到前端）"
+          : "\n\n…(output truncated — server did not forward the rest)";
+        return body + suffix;
+      }
+      return body;
+    },
+    readResultLines(m) {
+      // Read tool emits `   1→line one\n   2→line two\n...`. We rebuild a
+      // [{n, content}] list so the template can render a line-number gutter
+      // without re-splitting every render frame. Falls back to a single
+      // synthetic entry when the format doesn't match (vendor wrapper,
+      // mocked test, etc.).
+      const body = this.toolResultBodyText(m);
+      const out = [];
+      const re = /^\s*(\d+)→(.*)$/;
+      for (const ln of body.split("\n")) {
+        const mm = ln.match(re);
+        if (mm) {
+          out.push({ n: Number(mm[1]), content: mm[2] });
+        } else if (ln === "" && out.length) {
+          // Trailing blank — Read often ends with an empty marker. Keep
+          // it so spacing is faithful to the source file.
+          out.push({ n: 0, content: "" });
+        } else if (out.length === 0) {
+          // Pre-data noise (e.g. "(Reading X lines from file Y)") — render
+          // as a header line without a gutter number.
+          out.push({ n: 0, content: ln });
+        } else {
+          // Line that doesn't match the n→ format mid-stream — append to
+          // the previous content so wrapped output stays readable.
+          out[out.length - 1].content += "\n" + ln;
+        }
+      }
+      return out;
+    },
+    bashResultText(m) {
+      // Prefer the structured parse (stdout/stderr/exit_code separated)
+      // when the backend provided it; otherwise fall back to the raw body.
+      if (m && m.bash) {
+        const stdout = (m.bash.stdout || "").replace(/\n+$/, "");
+        const stderr = (m.bash.stderr || "").replace(/\n+$/, "");
+        return { stdout, stderr,
+                 exit_code: m.bash.exit_code,
+                 interrupted: !!m.bash.interrupted };
+      }
+      return { stdout: this.toolResultBodyText(m), stderr: "",
+               exit_code: undefined, interrupted: false };
+    },
+    // ---- LCS-based line diff for Edit/Write/MultiEdit ----
+    //
+    // Why we ship our own and not jsdiff: muselab has a no-build-step rule
+    // (vendor/ is pre-built minified blobs only). A 40-line LCS is enough
+    // for the Edit-tool case (typically <100-line snippets) and avoids the
+    // 20KB jsdiff dependency. We cap input length so a pathological
+    // 5000-line both-sides snippet doesn't pin the main thread.
+    _lineDiff(oldText, newText, capLines = 800) {
+      const a = (oldText || "").split("\n");
+      const b = (newText || "").split("\n");
+      // Trim to cap on each side and prepend a synthetic ellipsis line so
+      // the user knows we capped — better than silently dropping context.
+      if (a.length > capLines) a.length = capLines;
+      if (b.length > capLines) b.length = capLines;
+      const m = a.length, n = b.length;
+      // Build LCS table. O(m·n) space — fine for capLines² = 640k cells.
+      const dp = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+      for (let i = m - 1; i >= 0; i--) {
+        for (let j = n - 1; j >= 0; j--) {
+          dp[i][j] = a[i] === b[j]
+            ? dp[i + 1][j + 1] + 1
+            : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+      }
+      // Walk it to produce a unified-style op list.
+      const ops = [];
+      let i = 0, j = 0;
+      while (i < m && j < n) {
+        if (a[i] === b[j]) {
+          ops.push({ op: "ctx", text: a[i] }); i++; j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+          ops.push({ op: "del", text: a[i] }); i++;
+        } else {
+          ops.push({ op: "ins", text: b[j] }); j++;
+        }
+      }
+      while (i < m) { ops.push({ op: "del", text: a[i++] }); }
+      while (j < n) { ops.push({ op: "ins", text: b[j++] }); }
+      return ops;
+    },
+    editDiffOps(m) {
+      // Returns ops for an Edit / Write / MultiEdit tool_use. MultiEdit's
+      // `edits` array is flattened into a single op list with a separator
+      // op between sub-edits so the template can render section labels.
+      if (!m || !m.input) return [];
+      const inp = m.input;
+      if (m.name === "MultiEdit" && Array.isArray(inp.edits)) {
+        const out = [];
+        inp.edits.forEach((e, idx) => {
+          if (idx > 0) out.push({ op: "sep", text: `--- edit ${idx + 1} ---` });
+          const sub = this._lineDiff(e.old_string || "", e.new_string || "");
+          out.push(...sub);
+        });
+        return out;
+      }
+      if (m.name === "Write") {
+        // Write creates / overwrites — show `content` as all-insertions so
+        // the user sees what's about to land in the file.
+        const body = inp.content || "";
+        return body.split("\n").map(t => ({ op: "ins", text: t }));
+      }
+      // Edit (or fallback)
+      return this._lineDiff(inp.old_string || "", inp.new_string || "");
+    },
+    // ---- error CTA dispatch ----
+    errorCtaLabel(kind, cta) {
+      if (cta === "open_settings") {
+        return this.lang === "zh" ? "打开设置" : "Open Settings";
+      }
+      if (cta === "switch_model") {
+        return this.lang === "zh" ? "换个模型" : "Switch model";
+      }
+      if (cta === "compact_or_fork") {
+        return this.lang === "zh" ? "压缩对话" : "Compact session";
+      }
+      return this.lang === "zh" ? "重试" : "Retry";
+    },
+    errorCtaInvoke(m) {
+      // m carries _error_kind / _error_cta. Map to the matching action —
+      // we deliberately reuse existing methods to avoid duplicate codepaths.
+      const cta = m && m._error_cta;
+      if (cta === "open_settings") { this.openSettings(); return; }
+      if (cta === "switch_model") {
+        // Open the model picker if it exists; otherwise just toast hint.
+        const pick = document.querySelector(".model-picker, #model-select");
+        if (pick) pick.focus();
+        this.toast(this.lang === "zh"
+          ? "在右上模型下拉里选别的" : "Pick another model from the top dropdown",
+          "info", 3500);
+        return;
+      }
+      if (cta === "compact_or_fork") {
+        this.runCompact && this.runCompact();
+        return;
+      }
+      // Default "Retry" — reuse the existing failed-message retry path.
+      if (m && m.role === "user" && m._failed) {
+        this.retryFailedMessage(m);
+      }
     },
     thinkingClass(i, m) {
       return this.isMsgExpanded(i, m) ? "thinking" : "thinking collapsed";
@@ -5815,8 +5998,21 @@ function portal() {
       });
       es.addEventListener("tool_result", ev => {
         const d = JSON.parse(ev.data);
+        // `text` (up to 50KB) drives the "expand" affordance and per-tool
+        // rich renderers (Bash terminal / Read with gutter / WebFetch card).
+        // `tool_name` lets the FE pick a renderer without scanning backwards
+        // for the matching tool_use. `bash` is pre-parsed exit_code +
+        // stdout/stderr when the result came from a Bash call.
         streamState.messages.push({
-          role: "tool_result", preview: d.preview, truncated: d.truncated, is_error: d.is_error,
+          role: "tool_result",
+          id: d.id,
+          tool_name: d.tool_name || "",
+          preview: d.preview,
+          text: d.text || "",
+          truncated: d.truncated,
+          text_truncated: d.text_truncated,
+          is_error: d.is_error,
+          bash: d.bash || null,
         });
 
         _scrollIfActive();
@@ -5955,16 +6151,32 @@ function portal() {
         //      Capped at 3 attempts with exponential backoff so a truly
         //      dead backend doesn't loop forever.
         let serverError = null;
+        let errKind = "unknown";
+        let errCta = "retry";
+        let errRetryable = true;
         try {
           const d = JSON.parse(ev.data);
           if (d && d.error) serverError = d.error;
+          if (d && d.kind) errKind = d.kind;
+          if (d && typeof d.cta === "string") errCta = d.cta;
+          if (d && typeof d.retryable === "boolean") errRetryable = d.retryable;
         } catch (_) {
           // ev.data missing → transport-level. Fall through to auto-retry.
         }
         const markUserFailed = () => {
           for (let i = streamState.messages.length - 1; i >= 0; i--) {
             const m = streamState.messages[i];
-            if (m.role === "user") { m._failed = true; break; }
+            if (m.role === "user") {
+              m._failed = true;
+              // Stash the classification so the FE can render a useful
+              // CTA button under the failed bubble (Open Settings on auth,
+              // Switch model on quota, Compact on cross-vendor signature).
+              m._error_kind = errKind;
+              m._error_cta = errCta;
+              m._error_retryable = errRetryable;
+              m._error_text = serverError || "";
+              break;
+            }
           }
         };
 

@@ -74,6 +74,7 @@ def _normalize_questions(raw: list) -> list[dict]:
         options_raw = q.get("options") or q.get("choices") or []
         options: list[dict] = []
         for opt in options_raw:
+            preview = ""
             if isinstance(opt, str):
                 label = opt.strip()
                 desc = ""
@@ -87,11 +88,20 @@ def _normalize_questions(raw: list) -> list[dict]:
                             or opt.get("desc")
                             or opt.get("detail")
                             or "").strip()
+                # `preview` carries rich content (markdown / mockup / code
+                # diff) the model wants to show when this option is focused.
+                # SDK exposes it on the AskUserQuestion schema; the MCP
+                # fallback path here just needs to forward it untouched so
+                # the FE can render it as a side panel under the buttons.
+                preview = str(opt.get("preview") or "").strip()
             else:
                 continue
             if not label:
                 continue
-            options.append({"label": label, "description": desc})
+            option_entry: dict = {"label": label, "description": desc}
+            if preview:
+                option_entry["preview"] = preview
+            options.append(option_entry)
         if not options:
             continue
         out.append({

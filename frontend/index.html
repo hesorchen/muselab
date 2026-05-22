@@ -1209,6 +1209,27 @@ window.addEventListener("error", e => {
                     </button>
                   </div>
                 </div>
+                <!-- Failed-message error card with classified CTA — only shows
+                     when the backend sent kind/cta classification (modern
+                     backend). Old-backend failures still get the bare ↻
+                     button above. -->
+                <template x-if="m._failed && m._error_cta && m._error_cta !== 'retry'">
+                  <div class="err-card"
+                       :class="'err-kind-' + (m._error_kind || 'unknown')">
+                    <div class="err-card-body">
+                      <div class="err-card-msg" x-text="m._error_text || ''"></div>
+                      <div class="err-card-actions">
+                        <button class="btn-primary xs"
+                                @click="errorCtaInvoke(m)"
+                                x-text="errorCtaLabel(m._error_kind, m._error_cta)"></button>
+                        <button x-show="m._error_retryable"
+                                class="btn-ghost xs"
+                                @click="retryFailedMessage(m)"
+                                x-text="lang==='zh' ? '直接重试' : 'Retry as-is'"></button>
+                      </div>
+                    </div>
+                  </div>
+                </template>
               </template>
 
               <!-- assistant text bubble — has avatar; subsequent
@@ -1369,6 +1390,29 @@ window.addEventListener("error", e => {
                     </template>
                   </div>
                 </div>
+                <!-- Diff strip under Edit / MultiEdit / Write so the user
+                     can see WHAT changed without opening the file. Collapsed
+                     by default to keep the message stream scannable. -->
+                <template x-if="['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
+                  <div class="diff-strip">
+                    <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
+                      <span class="thinking-chevron">
+                        <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
+                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                        </svg>
+                      </span>
+                      <span class="diff-strip-label" x-text="lang==='zh' ? 'diff 预览' : 'diff preview'"></span>
+                    </div>
+                    <div x-show="isMsgExpanded(i, m)" class="diff-body">
+                      <template x-for="(op, oi) in editDiffOps(m)" :key="oi">
+                        <div :class="'diff-line diff-' + op.op">
+                          <span class="diff-sign" x-text="op.op === 'ins' ? '+' : op.op === 'del' ? '−' : op.op === 'sep' ? '⋯' : ' '"></span>
+                          <span class="diff-text" x-text="op.text"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
               </template>
 
               <!-- tool_result -->
@@ -1391,7 +1435,59 @@ window.addEventListener("error", e => {
                       <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
                             x-text="toolResultSummary(m)"></span>
                     </div>
-                    <pre x-show="isMsgExpanded(i, m)" x-text="m.preview"></pre>
+                    <!-- expanded body: per-tool renderer takes precedence,
+                         falls back to plain text for unknown tool types -->
+                    <template x-if="isMsgExpanded(i, m)">
+                      <div class="tool-result-body">
+                        <!-- Bash: terminal-style w/ stdout / stderr split -->
+                        <template x-if="toolResultKind(m) === 'bash'">
+                          <div class="bash-term">
+                            <template x-if="bashResultText(m).stdout">
+                              <pre class="bash-stdout" x-text="bashResultText(m).stdout"></pre>
+                            </template>
+                            <template x-if="bashResultText(m).stderr">
+                              <pre class="bash-stderr" x-text="bashResultText(m).stderr"></pre>
+                            </template>
+                            <template x-if="bashResultText(m).interrupted">
+                              <div class="bash-meta interrupted" x-text="lang==='zh' ? '⚠ 被打断' : '⚠ interrupted'"></div>
+                            </template>
+                            <template x-if="typeof bashResultText(m).exit_code === 'number'">
+                              <div class="bash-meta" :class="{ ok: bashResultText(m).exit_code === 0, err: bashResultText(m).exit_code !== 0 }"
+                                   x-text="(lang==='zh' ? '退出码 ' : 'exit ') + bashResultText(m).exit_code"></div>
+                            </template>
+                          </div>
+                        </template>
+                        <!-- Read: line-numbered gutter -->
+                        <template x-if="toolResultKind(m) === 'read'">
+                          <div class="read-gutter">
+                            <template x-for="(row, ri) in readResultLines(m)" :key="ri">
+                              <div class="read-row">
+                                <span class="read-lineno" x-text="row.n || ''"></span>
+                                <span class="read-code" x-text="row.content"></span>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
+                        <!-- WebFetch / WebSearch: render result body as markdown card -->
+                        <template x-if="toolResultKind(m) === 'web'">
+                          <div class="web-card">
+                            <div class="web-card-body" x-html="mdRender(toolResultBodyText(m))"></div>
+                          </div>
+                        </template>
+                        <!-- Glob / Grep: each match on its own line, monospace -->
+                        <template x-if="toolResultKind(m) === 'search'">
+                          <pre class="search-hits" x-text="toolResultBodyText(m)"></pre>
+                        </template>
+                        <!-- MCP tool: pretty-printed JSON if it parses, else text -->
+                        <template x-if="toolResultKind(m) === 'mcp'">
+                          <pre class="mcp-result" x-text="toolResultBodyText(m)"></pre>
+                        </template>
+                        <!-- Fallback: plain text body -->
+                        <template x-if="!toolResultKind(m)">
+                          <pre x-text="toolResultBodyText(m)"></pre>
+                        </template>
+                      </div>
+                    </template>
                   </div>
                 </div>
               </template>
@@ -1432,11 +1528,19 @@ window.addEventListener("error", e => {
                         <div class="ask-options">
                           <template x-for="(opt, optIdx) in (q.options || [])" :key="optIdx">
                             <button class="ask-option"
-                                    :class="{ picked: isAskOptionPicked(m, qIdx, askOptionLabel(opt)), disabled: m.submitted }"
+                                    :class="{ picked: isAskOptionPicked(m, qIdx, askOptionLabel(opt)), disabled: m.submitted, 'has-preview': !!(opt && opt.preview) }"
                                     :disabled="m.submitted"
                                     @click="q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt))">
                               <div class="ask-option-label" x-text="askOptionLabel(opt)"></div>
                               <div x-show="askOptionDesc(opt)" class="ask-option-desc" x-text="askOptionDesc(opt)"></div>
+                              <!-- Optional preview (markdown / mockup / code).
+                                   Model can attach rich context via the SDK's
+                                   AskUserQuestion.options[].preview field; we
+                                   render it as a collapsed footnote that opens
+                                   in place when the option is focused / hovered. -->
+                              <div x-show="opt && opt.preview"
+                                   class="ask-option-preview"
+                                   x-html="mdRender(opt && opt.preview || '')"></div>
                             </button>
                           </template>
                         </div>

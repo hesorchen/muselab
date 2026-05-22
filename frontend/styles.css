@@ -2682,6 +2682,232 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 
 /* ==========================================================================
+   Per-tool rich renderers — fire inside the expanded tool_result body when
+   tool_name picks a renderer key. Visual goals:
+     - Bash should feel like a terminal (dark, monospace, stdout/stderr split)
+     - Read should look like a code editor (line gutter, monospace)
+     - WebFetch / WebSearch should be readable prose (default font + markdown)
+     - Glob / Grep / MCP keep a plain monospace block (just searchable text)
+   The base `.tool-result-body` wraps all of them so the outer border-left
+   indicator (success / error) remains consistent across kinds.
+   ========================================================================== */
+.tool-result-body { margin-top: 6px; }
+.tool-result-body pre {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  color: var(--c-fg-2); max-height: 320px; overflow-y: auto;
+}
+
+/* Bash terminal */
+.bash-term {
+  background: #0f1115;
+  color: #d1d5db;
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  max-height: 360px; overflow-y: auto;
+}
+.bash-term .bash-stdout { color: #d1d5db; margin: 0; white-space: pre-wrap; word-break: break-word; }
+.bash-term .bash-stderr {
+  color: #f8a4a4; margin: 0; white-space: pre-wrap; word-break: break-word;
+  border-top: 1px dashed rgba(255,255,255,0.08);
+  margin-top: 6px; padding-top: 6px;
+}
+.bash-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+}
+.bash-meta.ok { background: rgba(80, 200, 120, 0.15); color: #7fd49a; }
+.bash-meta.err { background: rgba(255, 90, 90, 0.18); color: #ff9c9c; }
+.bash-meta.interrupted { background: rgba(255, 200, 80, 0.18); color: #f0c674; }
+
+/* Read with line gutter */
+.read-gutter {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-fg-4);
+  border-radius: var(--r-sm);
+  padding: 6px 0;
+  max-height: 360px; overflow-y: auto;
+}
+.read-gutter .read-row {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  align-items: baseline;
+  padding: 0 8px;
+}
+.read-gutter .read-row:hover { background: var(--c-bg-2); }
+.read-gutter .read-lineno {
+  color: var(--c-fg-4);
+  text-align: right;
+  padding-right: 10px;
+  user-select: none;
+}
+.read-gutter .read-code {
+  color: var(--c-fg-1);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Web cards (WebFetch / WebSearch) */
+.web-card {
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-fg-4);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+  max-height: 360px; overflow-y: auto;
+}
+.web-card-body { font-size: var(--fs-sm); line-height: 1.5; }
+.web-card-body p { margin: 0.4em 0; }
+.web-card-body a { color: var(--c-accent); }
+
+/* Glob / Grep hit list */
+.search-hits {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-bg-1);
+  border-radius: var(--r-sm);
+  padding: 6px 8px;
+  max-height: 320px; overflow-y: auto;
+}
+
+/* MCP result */
+.mcp-result {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--c-bg-1);
+  border-radius: var(--r-sm);
+  padding: 6px 8px;
+  max-height: 320px; overflow-y: auto;
+}
+
+/* ==========================================================================
+   Edit / MultiEdit / Write diff strip — collapsed under tool_use bubble.
+   Goal: show WHAT changed at a glance, not just file path. ins green, del
+   red, ctx muted. Capped height so a 500-line Write doesn't blow the
+   message stream.
+   ========================================================================== */
+.diff-strip {
+  margin: 4px 0 0 36px;       /* aligns under tool bubble, past avatar */
+  background: var(--c-bg-2);
+  border-radius: var(--r-sm);
+  padding: 4px 8px;
+  max-width: calc(100% - 60px);
+}
+.diff-strip-head {
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  padding: 2px 0;
+  user-select: none;
+}
+.diff-strip-head:hover { color: var(--c-fg-1); }
+.diff-strip-label { font-family: var(--font-mono); }
+.diff-body {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  max-height: 360px;
+  overflow: auto;
+  padding: 4px 0;
+}
+.diff-line {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  padding: 0 4px;
+  line-height: 1.4;
+}
+.diff-line .diff-sign {
+  color: var(--c-fg-4);
+  text-align: center;
+  user-select: none;
+}
+.diff-line .diff-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diff-ins { background: rgba(70, 180, 100, 0.10); }
+.diff-ins .diff-sign { color: #4ec97a; }
+.diff-ins .diff-text { color: var(--c-fg-1); }
+.diff-del { background: rgba(220, 90, 90, 0.10); }
+.diff-del .diff-sign { color: #e07070; }
+.diff-del .diff-text { color: var(--c-fg-2); text-decoration: line-through; text-decoration-color: rgba(220,90,90,0.4); }
+.diff-ctx { color: var(--c-fg-3); }
+.diff-sep {
+  text-align: center;
+  color: var(--c-fg-4);
+  padding: 4px 0;
+  font-style: italic;
+}
+
+/* ==========================================================================
+   ask_user_question option preview — rich markdown footnote on an option.
+   Shows muted by default; gets prominent when the option is hovered or
+   already picked. Capped height so a long preview doesn't push the next
+   question off-screen.
+   ========================================================================== */
+.ask-option.has-preview .ask-option-preview {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--c-fg-4);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  max-height: 200px; overflow-y: auto;
+  text-align: left;
+}
+.ask-option.has-preview:hover .ask-option-preview,
+.ask-option.picked .ask-option-preview {
+  color: var(--c-fg-2);
+}
+.ask-option-preview p { margin: 0.3em 0; }
+.ask-option-preview pre {
+  background: var(--c-bg-2);
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+  overflow-x: auto;
+  font-size: 11px;
+}
+.ask-option-preview code {
+  background: var(--c-bg-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+/* ==========================================================================
+   Error card — appears under a _failed user bubble when backend classified
+   the error. Color codes by kind so users immediately know the category.
+   Buttons: classified CTA (Open Settings / Switch model / Compact) +
+   plain Retry as fallback.
+   ========================================================================== */
+.err-card {
+  margin: 4px 0 8px 8px;
+  background: var(--c-bg-2);
+  border-left: 3px solid var(--c-danger);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  max-width: calc(100% - 60px);
+}
+.err-card.err-kind-auth { border-left-color: #e0a020; }
+.err-card.err-kind-quota { border-left-color: #c060c0; }
+.err-card.err-kind-network { border-left-color: #4080c0; }
+.err-card.err-kind-cross_vendor { border-left-color: #d06080; }
+.err-card.err-kind-session { border-left-color: #888; }
+.err-card-msg {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-2);
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+.err-card-actions {
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+
+/* ==========================================================================
    ask_user_question — Muse asks the user with structured options (mcp tool)
    ========================================================================== */
 .ask-question {

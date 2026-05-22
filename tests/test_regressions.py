@@ -386,7 +386,8 @@ def test_default_model_change_takes_effect_immediately(client, auth, monkeypatch
     # Avoid mutating the user's real .env during the test — point both at a
     # temp path. _write_env writes both `MUSELAB_DEFAULT_MODEL` AND
     # `MUSELAB_MODEL`, and pushes the latter back into the module globals.
-    import tempfile, pathlib
+    import tempfile
+    import pathlib
     tmp_env = pathlib.Path(tempfile.mkstemp(suffix=".env")[1])
     from backend import api_settings as _api_settings
     monkeypatch.setattr(_api_settings, "ENV_PATH", tmp_env)
@@ -499,3 +500,138 @@ def test_backfill_writes_sentinel_after_run(monkeypatch, tmp_path):
         )
     finally:
         monkeypatch.setattr(_sess, "SESS_DIR", saved_sess_dir)
+
+
+# ============================================================================
+# tool_use payload completeness — Edit / Write / MultiEdit transparently
+# carry old_string / new_string / edits / content so the frontend can render
+# a diff strip. Before this, _SLIM_INPUT_FIELDS dropped those silently and
+# the FE only had file_path to show.
+# ============================================================================
+
+def test_render_tool_use_passes_edit_diff_fields():
+    from backend.chat import _render_tool_use
+
+    class _Block:
+        id = "tu_test_001"
+        name = "Edit"
+        input = {
+            "file_path": "/tmp/foo.py",
+            "old_string": "x = 1\ny = 2",
+            "new_string": "x = 10\ny = 20",
+        }
+
+    out = _render_tool_use(_Block())
+    assert out["name"] == "Edit"
+    assert out["input"]["old_string"] == "x = 1\ny = 2"
+    assert out["input"]["new_string"] == "x = 10\ny = 20"
+    assert out["input"]["file_path"] == "/tmp/foo.py"
+
+
+def test_render_tool_use_caps_oversized_string_input():
+    from backend.chat import _render_tool_use, _MAX_INPUT_FIELD_LEN
+
+    big = "A" * (_MAX_INPUT_FIELD_LEN + 2000)
+
+    class _Block:
+        id = "tu_test_002"
+        name = "Write"
+        input = {"file_path": "/tmp/big.txt", "content": big}
+
+    out = _render_tool_use(_Block())
+    c = out["input"]["content"]
+    assert c.startswith("A" * _MAX_INPUT_FIELD_LEN)
+    assert "[truncated" in c, f"expected truncation marker, got tail: {c[-80:]!r}"
+
+
+# ============================================================================
+# tool_result Bash parsing — when the result body carries CLI's pseudo-XML
+# wrapped output, _render_tool_result populates a `bash` field with
+# stdout / stderr / exit_code so the FE can color-code each part.
+# ============================================================================
+
+def test_render_tool_result_extracts_bash_structure():
+    from backend.chat import _render_tool_result
+
+    body = (
+        "<stdout>hello world\nline two</stdout>"
+        "<stderr>warning: something</stderr>"
+        "<exit_code>0</exit_code>"
+    )
+
+    class _Block:
+        tool_use_id = "tu_b1"
+        content = body
+        is_error = False
+
+    out = _render_tool_result(_Block(), tool_name="Bash")
+    assert out["tool_name"] == "Bash"
+    assert out["text"] == body
+    assert out["bash"]["stdout"] == "hello world\nline two"
+    assert out["bash"]["stderr"] == "warning: something"
+    assert out["bash"]["exit_code"] == 0
+
+
+def test_render_tool_result_no_bash_field_when_not_bash():
+    from backend.chat import _render_tool_result
+
+    class _Block:
+        tool_use_id = "tu_r1"
+        content = "file body line 1\nfile body line 2"
+        is_error = False
+
+    out = _render_tool_result(_Block(), tool_name="Read")
+    assert out["tool_name"] == "Read"
+    assert "bash" not in out
+    # Full body is forwarded (not the legacy 500-cap preview).
+    assert out["text"] == "file body line 1\nfile body line 2"
+
+
+# ============================================================================
+# error event classification — auth / quota / network / cross_vendor / session
+# get distinct kind + cta so the FE can render a typed action button.
+# ============================================================================
+
+def test_classify_stream_error_buckets():
+    from backend.chat import _classify_stream_error
+    cases = [
+        ("Invalid API key", "auth", "open_settings", False),
+        ("ANTHROPIC_API_KEY not configured", "auth", "open_settings", False),
+        ("HTTP 401 Unauthorized", "auth", "open_settings", False),
+        ("429 Too Many Requests", "quota", "switch_model", True),
+        ("quota exceeded", "quota", "switch_model", True),
+        ("Connection refused", "network", "retry", True),
+        ("Request timed out", "network", "retry", True),
+        ("thinking signature missing", "cross_vendor", "compact_or_fork", True),
+        ("Session ID already in use", "session", "retry", True),
+        ("something weird", "unknown", "retry", True),
+    ]
+    for msg, expected_kind, expected_cta, expected_retry in cases:
+        got = _classify_stream_error(msg)
+        assert got["kind"] == expected_kind, f"{msg!r}: kind={got['kind']!r}"
+        assert got["cta"] == expected_cta, f"{msg!r}: cta={got['cta']!r}"
+        assert got["retryable"] == expected_retry, f"{msg!r}: retryable={got['retryable']!r}"
+
+
+# ============================================================================
+# ask_user_question preview field — pass-through to FE so the model can attach
+# rich content (markdown, mockup, code snippet) to each option.
+# ============================================================================
+
+def test_normalize_questions_passes_preview_through():
+    from backend.ask_user_question import _normalize_questions
+    raw = [{
+        "question": "Pick a layout",
+        "options": [
+            {"label": "Sidebar", "preview": "```\n[nav][content]\n```"},
+            {"label": "Topbar"},   # no preview
+        ],
+    }]
+    out = _normalize_questions(raw)
+    assert len(out) == 1
+    opts = out[0]["options"]
+    assert opts[0]["label"] == "Sidebar"
+    assert opts[0]["preview"] == "```\n[nav][content]\n```"
+    # Options without `preview` must not get a fake one (FE checks
+    # `opt.preview` truthiness to decide whether to show the footnote).
+    assert "preview" not in opts[1]
