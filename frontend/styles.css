@@ -4003,21 +4003,33 @@ pre.has-copy-btn .code-copy-btn.copied {
    .show-label class would expose it for users who want the wider button. */
 .chat-toolbar-send > span:last-child { display: none; }
 /* Queue-send button — visible while streaming so the user can keep
-   sending. Wider than .chat-toolbar-send because the label "Queue +N"
-   carries critical info (the backlog count). Muted tone (not primary
-   accent) so it doesn't compete with the red stop button next to it. */
+   sending. Sized as a 26×26 icon-only square to match the stop button
+   sitting right next to it (they appear as a pair when streaming).
+   Backlog count surfaces as a small absolute-positioned badge in the
+   top-right corner so the user knows what they're stacking up. */
 .chat-toolbar-queue {
-  height: 26px; padding: 0 9px;
-  display: inline-flex; align-items: center; gap: 6px;
+  position: relative;
+  height: 26px; width: 26px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
   border: 1px solid var(--c-bg-4); border-radius: 6px;
   background: var(--c-bg-2); color: var(--c-fg-1);
-  cursor: pointer; font-size: var(--fs-sm);
+  cursor: pointer;
   transition: background var(--t-fast), opacity var(--t-fast), transform 80ms;
 }
 .chat-toolbar-queue:hover:not(:disabled) { background: var(--c-bg-3); }
-.chat-toolbar-queue:active:not(:disabled) { transform: scale(0.96); }
+.chat-toolbar-queue:active:not(:disabled) { transform: scale(0.95); }
 .chat-toolbar-queue:disabled { opacity: 0.4; cursor: not-allowed; }
-.chat-toolbar-queue svg { width: 13px; height: 13px; }
+.chat-toolbar-queue svg { width: 14px; height: 14px; }
+.chat-toolbar-queue-badge {
+  position: absolute;
+  top: -5px; right: -5px;
+  min-width: 14px; height: 14px; padding: 0 3px;
+  border-radius: 7px;
+  background: var(--c-accent); color: white;
+  font-size: 10px; font-weight: 600; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  box-sizing: border-box;
+}
 
 /* Queued message bubbles — user messages waiting to dispatch after the
    current turn finishes. Faded + dashed border distinguish them from
