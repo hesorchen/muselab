@@ -228,24 +228,6 @@ def _scan_interrupted_turns_at_startup() -> dict[str, dict]:
 _interrupted_at_startup: dict[str, dict] = _scan_interrupted_turns_at_startup()
 
 
-async def _evict_lru_if_needed():
-    """If pool overflows, disconnect the oldest non-active client.
-    Caller must hold _lock OR call this when no active stream depends on
-    the evicted client (callers do — get_client adds AFTER any current
-    stream finishes acquiring its handle)."""
-    while len(_client_lru) > _CLIENT_POOL_CAP:
-        old_key = _client_lru.pop(0)
-        c = _clients.pop(old_key, None)
-        _client_permission.pop(old_key, None)
-        if c is None:
-            continue
-        try:
-            await c.disconnect()
-        except Exception as e:
-            import sys as _sys
-            _sys.stderr.write(
-                f"[client-pool] evict {old_key} disconnect err: {e}\n")
-
 # Global aggregate stats (across all sessions). cache_read / cache_creation
 # come from the Anthropic prompt cache — high cache_read ratio means subsequent
 # turns are much cheaper. Surfacing this in the UI lets the user see the value
@@ -404,271 +386,352 @@ CLAUDE.md wins — they wrote it on purpose.
 """
 
 
+# Per-(sid, model, effort) creation lock. Coalesces parallel cache misses
+# on the same key (so we don't spawn two CLI subprocesses for one tab) while
+# leaving DIFFERENT keys free to build concurrently. Replaces the global
+# _lock-across-await pattern that froze every other request for 3-5 s while
+# one slow `client.connect()` ran.
+_creation_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+
+
+def _creation_lock_for(key: tuple[str, str, str]) -> asyncio.Lock:
+    lock = _creation_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _creation_locks[key] = lock
+    return lock
+
+
+async def _build_and_connect_client(
+    session_id: str, model: str, permission: str, effort: str,
+) -> ClaudeSDKClient:
+    """The slow path: build ClaudeAgentOptions, instantiate ClaudeSDKClient,
+    call .connect() with retry. NEVER holds _lock — multi-second CLI
+    subprocess spawn must not block sibling requests. Caller is responsible
+    for serialising concurrent misses on the same key via _creation_lock_for().
+    """
+    # Use session's custom system prompt if set, else fall back to muselab default.
+    sess_data = sess.get_session(session_id) or {}
+    custom_sp = (sess_data.get("system_prompt") or "").strip()
+    sp = f"{custom_sp}\n\n---\n\n{SYSTEM_PROMPT}" if custom_sp else SYSTEM_PROMPT
+    # New CLI rule: session_id + resume/continue conflict unless fork_session
+    # is set. So we use resume alone — it both loads existing state AND
+    # implies the session id. Falls back to session_id-only for new sessions.
+    # SDK default max_buffer_size is 1 MB. A single tool_use JSON message
+    # (Edit on a large file, or Read of a long file) can blow past that
+    # and kill the message reader silently — the chat then "hangs forever"
+    # because no more chunks arrive. Bump to 32 MB; configurable via env.
+    max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
+    # Critical SDK option distinction:
+    #   `session_id=X`  → force a NEW session to use UUID X (fails if
+    #                     CLI already has a JSONL for X)
+    #   `resume=X`      → resume an EXISTING session by UUID X
+    # If we always use `resume` for un-streamed sessions, CLI generates
+    # a fresh UUID and orphans ours. If we always use `session_id`,
+    # any session that's ever streamed errors with "already in use".
+    # Detect JSONL existence by RECURSIVELY scanning the CLI's projects
+    # root — SDK's _find_project_dir relies on path-hash matching that
+    # was unreliable on Windows in practice (user's CLI saw the JSONL
+    # but the SDK helper didn't).
+    jsonl_exists = False
+    try:
+        projects_root = Path.home() / ".claude" / "projects"
+        if projects_root.exists():
+            # Glob is faster than recursive walk and matches any sub-
+            # project dir layout. Fine for muselab's session counts.
+            for hit in projects_root.glob(f"*/{session_id}.jsonl"):
+                if hit.is_file():
+                    jsonl_exists = True
+                    break
+    except Exception as e:
+        import sys as _sys
+        _sys.stderr.write(f"[muselab] jsonl_exists check failed for {session_id}: {e}\n")
+    # CLI stderr capture — without this, ProcessError just says
+    # "Check stderr output for details" with no actual details and
+    # we can't tell whether the CLI rejected --session-id, hit an
+    # auth error, or something else. Pipe every line into muselab's
+    # stderr.log so the next failure is debuggable.
+    import sys as _sys
+    def _cli_stderr(line: str) -> None:
+        _sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
+        _sys.stderr.flush()
+
+    opts_kwargs = dict(
+        cwd=str(ROOT),
+        model=model,
+        permission_mode=permission,
+        system_prompt=sp,
+        max_buffer_size=max_buf,
+        stderr=_cli_stderr,
+        # Block harness-only tools the SDK exposes by default. AskUserQuestion
+        # is intentionally NOT blocked: we re-implement it via in-process MCP
+        # (mcp__muselab__ask_user_question) — see backend/ask_user_question.py.
+        # The system prompt tells the model to use that name. The built-in
+        # version is left enabled too as a fallback if the model forgets the
+        # MCP name; the frontend renders both shapes.
+        disallowed_tools=[
+            "ExitPlanMode",           # plan-mode handshake — no UI yet
+            "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
+            "CronCreate", "CronDelete", "CronList",
+            "EnterPlanMode", "EnterWorktree", "ExitWorktree",
+            "Monitor", "PushNotification", "RemoteTrigger",
+            "ShareOnboardingGuide",
+        ],
+        # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
+        # (cwd/CLAUDE.md → the user's archive), and local (.claude/
+        # within cwd). Also enables skill discovery from the same scopes.
+        setting_sources=["user", "project", "local"],
+        # Bind THIS session to muselab's chosen UUID — either as a new
+        # session (session_id=) or by resuming the existing one (resume=).
+        **({"resume": session_id} if jsonl_exists else {"session_id": session_id}),
+        # Token-level streaming: SDK emits StreamEvent for each delta
+        # the model produces (text / thinking). Without this, we only
+        # see full blocks at the end → user waits for the whole reply
+        # before seeing anything. With this, each token shows up.
+        include_partial_messages=True,
+    )
+    # Skills get attached to the system prompt as JSON tool defs.
+    # Claude handles a large skill catalog fine; third-party vendors
+    # (DeepSeek / GLM / MiniMax) often time out or 400 on the bigger
+    # payload. So default to skills only on Claude; opt-out via env.
+    is_third_party = endpoints.is_third_party(model)
+    skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in ("1", "true", "yes")
+    if not is_third_party and not skills_off:
+        opts_kwargs["skills"] = "all"
+    # Optional model params from env (UI-editable via /api/settings).
+    mt = int(os.environ.get("MUSELAB_MAX_TURNS", "0") or 0)
+    if mt > 0:
+        opts_kwargs["max_turns"] = mt
+    # For non-Claude models, point the SDK at the vendor's own
+    # Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax).
+    # This way the SDK's full agent loop (tools, MCP, skills, CLAUDE.md)
+    # works uniformly across providers — no router process needed.
+    # Claude models still go direct so Pro OAuth keeps working.
+    env_ovr = endpoints.env_override(model)
+    if env_ovr is not None:
+        opts_kwargs["env"] = env_ovr
+    else:
+        # No env_override == this is Claude (or unknown model). CLI needs
+        # ONE of: ~/.claude/.credentials.json (Pro OAuth), ANTHROPIC_API_KEY
+        # in env, or ANTHROPIC_AUTH_TOKEN. If none of those are present, CLI
+        # exits 1 with "Not logged in" BEFORE producing any stderr — leaving
+        # only a useless ProcessError. Pre-check and raise a clean message
+        # so the UI can surface "请先配置 Anthropic API key 或运行 claude login"
+        # instead of a generic stream-failure.
+        cred_file = Path.home() / ".claude" / ".credentials.json"
+        if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
+                and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            raise ClaudeSDKError(
+                f"Claude model '{model}' requires auth: either run "
+                f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
+                f"Settings. CLI would exit 1 silently otherwise."
+            )
+        # Capture CLI stderr so vendor 401 / network errors surface
+        # in /tmp/muselab-restart.log instead of vanishing silently.
+        def _stderr_logger(line: str) -> None:
+            sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
+            sys.stderr.flush()
+        opts_kwargs["stderr"] = _stderr_logger
+    # MCP servers: always register the in-process muselab server (for
+    # ask_user_question). If user has mcp.json with external servers, merge.
+    mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
+    if MCP_CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+            for name, spec in (cfg.get("mcpServers") or {}).items():
+                # Skip explicitly disabled servers (UI toggle).
+                if isinstance(spec, dict) and spec.get("disabled"):
+                    continue
+                # Strip our muselab-local `disabled` key before handing to SDK.
+                clean = {k: v for k, v in spec.items() if k != "disabled"} \
+                        if isinstance(spec, dict) else spec
+                mcp_dict[name] = clean
+        except Exception:
+            pass  # fall through with just muselab
+    opts_kwargs["mcp_servers"] = mcp_dict
+    # Always enable extended thinking. Without an explicit config the
+    # model uses adaptive thinking and silently pauses mid-reply for
+    # invisible reasoning — user perceives "few chars + stall + dump".
+    # With ThinkingConfigEnabled the reasoning is streamed visibly via
+    # thinking_delta events, which the FE renders as a collapsible
+    # block. (Old `show_thinking` toggle removed 2026-05-20 — was
+    # always-on for years; nobody passes it any more.)
+    from claude_agent_sdk import ThinkingConfigEnabled
+    budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
+    # ThinkingConfigEnabled is a TypedDict — instantiating without
+    # `type` produces a dict missing that key, and the SDK then raises
+    # KeyError('type') in subprocess_cli.py:376. Set it explicitly.
+    opts_kwargs["thinking"] = ThinkingConfigEnabled(
+        type="enabled", budget_tokens=budget)
+    # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
+    # picks an effort automatically; this override lets users force a
+    # deeper budget on specific tabs (e.g. xhigh for research). SDK
+    # rejects unknown strings, so guard the literal set.
+    _VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
+    if effort and effort in _VALID_EFFORT:
+        opts_kwargs["effort"] = effort
+    # When permission_mode is not bypassPermissions, wire the SDK's
+    # can_use_tool callback to muselab's permission_request UI bridge.
+    if permission != "bypassPermissions":
+        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
+    try:
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
+        await client.connect()
+        return client
+    except Exception as e:
+        # Two failure modes we recover from by swapping session_id ⇔ resume:
+        #   - tried `resume=` but CLI has no on-disk session for it
+        #     → swap to `session_id=` (create fresh tied to our UUID)
+        #   - tried `session_id=` but CLI reports "already in use"
+        #     (its internal lock leaked, or a JSONL appeared between
+        #     our glob check and the spawn) → swap to `resume=`
+        err_text = str(e).lower()
+        used_session_id = "session_id" in opts_kwargs
+        if used_session_id and "already in use" in err_text:
+            opts_kwargs.pop("session_id", None)
+            opts_kwargs["resume"] = session_id
+        else:
+            opts_kwargs.pop("resume", None)
+            opts_kwargs["session_id"] = session_id
+        # The fallback can ALSO hit "already in use" — retry with backoff.
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                client = ClaudeSDKClient(
+                    options=ClaudeAgentOptions(**opts_kwargs))
+                await client.connect()
+                if attempt > 0:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat] sid={session_id[:8]} connect retry "
+                        f"succeeded on attempt {attempt + 1}\n")
+                    _sys.stderr.flush()
+                return client
+            except Exception as e2:
+                last_err = e2
+                if "already in use" not in str(e2).lower():
+                    raise
+                # Backoff: 200ms, 400ms, 800ms, 1600ms (~3s total).
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat] sid={session_id[:8]} attempt {attempt + 1} "
+                    f"hit 'already in use', backing off "
+                    f"{200 * (2 ** attempt)}ms\n")
+                _sys.stderr.flush()
+                await asyncio.sleep(0.2 * (2 ** attempt))
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("unreachable")   # for type checker
+
+
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
                      effort: str = "") -> ClaudeSDKClient:
     """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
     Switching model OR effort in the UI yields a fresh client; resume=session_id
     loads the same on-disk conversation history into the new client.
 
+    Concurrency: _lock is only held across synchronous dict / LRU operations.
+    The slow `await client.connect()` runs OUTSIDE _lock under a per-key
+    creation lock — concurrent callers for different (sid, model, effort)
+    keys never block each other; concurrent callers for the SAME key
+    coalesce so we don't spawn two CLI subprocesses for one tab.
+
     effort: "" (SDK adaptive) / "low" / "medium" / "high" / "xhigh" / "max".
     Anything else is ignored — invalid values fall back to the SDK default."""
     key = (session_id, model, effort)
-    async with _lock:
-        if key not in _clients:
-            # Use session's custom system prompt if set, else fall back to muselab default.
-            sess_data = sess.get_session(session_id) or {}
-            custom_sp = (sess_data.get("system_prompt") or "").strip()
-            sp = f"{custom_sp}\n\n---\n\n{SYSTEM_PROMPT}" if custom_sp else SYSTEM_PROMPT
-            # New CLI rule: session_id + resume/continue conflict unless fork_session
-            # is set. So we use resume alone — it both loads existing state AND
-            # implies the session id. Falls back to session_id-only for new sessions.
-            # SDK default max_buffer_size is 1 MB. A single tool_use JSON message
-            # (Edit on a large file, or Read of a long file) can blow past that
-            # and kill the message reader silently — the chat then "hangs forever"
-            # because no more chunks arrive. Bump to 32 MB; configurable via env.
-            max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
-            # Critical SDK option distinction:
-            #   `session_id=X`  → force a NEW session to use UUID X (fails if
-            #                     CLI already has a JSONL for X)
-            #   `resume=X`      → resume an EXISTING session by UUID X
-            # If we always use `resume` for un-streamed sessions, CLI generates
-            # a fresh UUID and orphans ours. If we always use `session_id`,
-            # any session that's ever streamed errors with "already in use".
-            # Detect JSONL existence by RECURSIVELY scanning the CLI's projects
-            # root — SDK's _find_project_dir relies on path-hash matching that
-            # was unreliable on Windows in practice (user's CLI saw the JSONL
-            # but the SDK helper didn't).
-            jsonl_exists = False
-            try:
-                projects_root = Path.home() / ".claude" / "projects"
-                if projects_root.exists():
-                    # Glob is faster than recursive walk and matches any sub-
-                    # project dir layout. Fine for muselab's session counts.
-                    for hit in projects_root.glob(f"*/{session_id}.jsonl"):
-                        if hit.is_file():
-                            jsonl_exists = True
-                            break
-            except Exception as e:
-                import sys as _sys
-                _sys.stderr.write(f"[muselab] jsonl_exists check failed for {session_id}: {e}\n")
-            # CLI stderr capture — without this, ProcessError just says
-            # "Check stderr output for details" with no actual details and
-            # we can't tell whether the CLI rejected --session-id, hit an
-            # auth error, or something else. Pipe every line into muselab's
-            # stderr.log so the next failure is debuggable.
-            import sys as _sys
-            def _cli_stderr(line: str) -> None:
-                _sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
-                _sys.stderr.flush()
 
-            opts_kwargs = dict(
-                cwd=str(ROOT),
-                model=model,
-                permission_mode=permission,
-                system_prompt=sp,
-                max_buffer_size=max_buf,
-                stderr=_cli_stderr,
-                # Block harness-only tools the SDK exposes by default. AskUserQuestion
-                # is intentionally NOT blocked: we re-implement it via in-process MCP
-                # (mcp__muselab__ask_user_question) — see backend/ask_user_question.py.
-                # The system prompt tells the model to use that name. The built-in
-                # version is left enabled too as a fallback if the model forgets the
-                # MCP name; the frontend renders both shapes.
-                disallowed_tools=[
-                    "ExitPlanMode",           # plan-mode handshake — no UI yet
-                    "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
-                    "CronCreate", "CronDelete", "CronList",
-                    "EnterPlanMode", "EnterWorktree", "ExitWorktree",
-                    "Monitor", "PushNotification", "RemoteTrigger",
-                    "ShareOnboardingGuide",
-                ],
-                # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
-                # (cwd/CLAUDE.md → the user's archive), and local (.claude/
-                # within cwd). Also enables skill discovery from the same scopes.
-                setting_sources=["user", "project", "local"],
-                # Bind THIS session to muselab's chosen UUID — either as a new
-                # session (session_id=) or by resuming the existing one (resume=).
-                **({"resume": session_id} if jsonl_exists else {"session_id": session_id}),
-                # Token-level streaming: SDK emits StreamEvent for each delta
-                # the model produces (text / thinking). Without this, we only
-                # see full blocks at the end → user waits for the whole reply
-                # before seeing anything. With this, each token shows up.
-                include_partial_messages=True,
-            )
-            # Skills get attached to the system prompt as JSON tool defs.
-            # Claude handles a large skill catalog fine; third-party vendors
-            # (DeepSeek / GLM / MiniMax) often time out or 400 on the bigger
-            # payload. So default to skills only on Claude; opt-out via env.
-            is_third_party = endpoints.is_third_party(model)
-            skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in ("1", "true", "yes")
-            if not is_third_party and not skills_off:
-                opts_kwargs["skills"] = "all"
-            # Optional model params from env (UI-editable via /api/settings).
-            mt = int(os.environ.get("MUSELAB_MAX_TURNS", "0") or 0)
-            if mt > 0:
-                opts_kwargs["max_turns"] = mt
-            # For non-Claude models, point the SDK at the vendor's own
-            # Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax).
-            # This way the SDK's full agent loop (tools, MCP, skills, CLAUDE.md)
-            # works uniformly across providers — no router process needed.
-            # Claude models still go direct so Pro OAuth keeps working.
-            env_ovr = endpoints.env_override(model)
-            if env_ovr is not None:
-                opts_kwargs["env"] = env_ovr
-            else:
-                # No env_override == this is Claude (or unknown model). CLI needs
-                # ONE of: ~/.claude/.credentials.json (Pro OAuth), ANTHROPIC_API_KEY
-                # in env, or ANTHROPIC_AUTH_TOKEN. If none of those are present, CLI
-                # exits 1 with "Not logged in" BEFORE producing any stderr — leaving
-                # only a useless ProcessError. Pre-check and raise a clean message
-                # so the UI can surface "请先配置 Anthropic API key 或运行 claude login"
-                # instead of a generic stream-failure.
-                cred_file = Path.home() / ".claude" / ".credentials.json"
-                if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
-                        and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-                    raise ClaudeSDKError(
-                        f"Claude model '{model}' requires auth: either run "
-                        f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
-                        f"Settings. CLI would exit 1 silently otherwise."
-                    )
-                # Capture CLI stderr so vendor 401 / network errors surface
-                # in /tmp/muselab-restart.log instead of vanishing silently.
-                def _stderr_logger(line: str) -> None:
-                    sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
-                    sys.stderr.flush()
-                opts_kwargs["stderr"] = _stderr_logger
-            # MCP servers: always register the in-process muselab server (for
-            # ask_user_question). If user has mcp.json with external servers, merge.
-            mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
-            if MCP_CONFIG_PATH.exists():
-                try:
-                    cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
-                    for name, spec in (cfg.get("mcpServers") or {}).items():
-                        # Skip explicitly disabled servers (UI toggle).
-                        if isinstance(spec, dict) and spec.get("disabled"):
-                            continue
-                        # Strip our muselab-local `disabled` key before handing to SDK.
-                        clean = {k: v for k, v in spec.items() if k != "disabled"} \
-                                if isinstance(spec, dict) else spec
-                        mcp_dict[name] = clean
-                except Exception:
-                    pass  # fall through with just muselab
-            opts_kwargs["mcp_servers"] = mcp_dict
-            # Always enable extended thinking. Without an explicit config the
-            # model uses adaptive thinking and silently pauses mid-reply for
-            # invisible reasoning — user perceives "few chars + stall + dump".
-            # With ThinkingConfigEnabled the reasoning is streamed visibly via
-            # thinking_delta events, which the FE renders as a collapsible
-            # block. (Old `show_thinking` toggle removed 2026-05-20 — was
-            # always-on for years; nobody passes it any more.)
-            from claude_agent_sdk import ThinkingConfigEnabled
-            budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
-            # ThinkingConfigEnabled is a TypedDict — instantiating without
-            # `type` produces a dict missing that key, and the SDK then raises
-            # KeyError('type') in subprocess_cli.py:376. Set it explicitly.
-            opts_kwargs["thinking"] = ThinkingConfigEnabled(
-                type="enabled", budget_tokens=budget)
-            # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
-            # picks an effort automatically; this override lets users force a
-            # deeper budget on specific tabs (e.g. xhigh for research). SDK
-            # rejects unknown strings, so guard the literal set.
-            _VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
-            if effort and effort in _VALID_EFFORT:
-                opts_kwargs["effort"] = effort
-            # When permission_mode is not bypassPermissions, wire the SDK's
-            # can_use_tool callback to muselab's permission_request UI bridge.
-            # NOTE: tried wiring this unconditionally for SDK-native
-            # AskUserQuestion routing — SDK 0.2.82's bundled CLI does not yet
-            # surface the trained-in tool through can_use_tool, and the
-            # required PreToolUse keepalive hook added an extra control-channel
-            # round-trip per token that buffered streaming output ("first char
-            # then long pause then a flood" symptom). AskUserQuestion still
-            # works via the MCP route (mcp__muselab__ask_user_question), which
-            # the system prompt above guides the model toward.
-            if permission != "bypassPermissions":
-                opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
-            try:
-                client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
-                await client.connect()
-            except Exception as e:
-                # Two failure modes we recover from by swapping session_id ⇔ resume:
-                #   - tried `resume=` but CLI has no on-disk session for it
-                #     → swap to `session_id=` (create fresh tied to our UUID)
-                #   - tried `session_id=` but CLI reports "already in use"
-                #     (its internal lock leaked, or a JSONL appeared between
-                #     our glob check and the spawn) → swap to `resume=`
-                err_text = str(e).lower()
-                used_session_id = "session_id" in opts_kwargs
-                if used_session_id and "already in use" in err_text:
-                    opts_kwargs.pop("session_id", None)
-                    opts_kwargs["resume"] = session_id
-                else:
-                    opts_kwargs.pop("resume", None)
-                    opts_kwargs["session_id"] = session_id
-                # The fallback can ALSO hit "already in use" — happens when
-                # a prior CLI subprocess for the same sid is still flushing
-                # its session JSONL after a vendor switch (GLM → MiniMax).
-                # SDK transport.close() waits up to 5s for graceful exit, but
-                # the OS-level file lock can persist a bit longer. Retry with
-                # exponential backoff (up to ~3s total) before surfacing the
-                # error to the user.
-                last_err: Exception | None = None
-                for attempt in range(4):
-                    try:
-                        client = ClaudeSDKClient(
-                            options=ClaudeAgentOptions(**opts_kwargs))
-                        await client.connect()
-                        last_err = None
-                        if attempt > 0:
-                            import sys as _sys
-                            _sys.stderr.write(
-                                f"[chat] sid={session_id[:8]} connect retry "
-                                f"succeeded on attempt {attempt + 1}\n")
-                            _sys.stderr.flush()
-                        break
-                    except Exception as e2:
-                        last_err = e2
-                        if "already in use" not in str(e2).lower():
-                            raise
-                        # Backoff: 200ms, 400ms, 800ms, 1600ms (~3s total).
-                        import sys as _sys
-                        _sys.stderr.write(
-                            f"[chat] sid={session_id[:8]} attempt {attempt + 1} "
-                            f"hit 'already in use', backing off "
-                            f"{200 * (2 ** attempt)}ms\n")
-                        _sys.stderr.flush()
-                        await asyncio.sleep(0.2 * (2 ** attempt))
-                if last_err is not None:
-                    raise last_err
-            _clients[key] = client
-            _client_permission[key] = permission
-            _client_lru.append(key)
-            await _evict_lru_if_needed()
-        else:
-            # Touch LRU — most-recently-used moves to the tail.
+    # Fast path: cache hit. Lock just long enough to read + touch LRU.
+    async with _lock:
+        cached = _clients.get(key)
+        if cached is not None:
             if key in _client_lru:
                 _client_lru.remove(key)
             _client_lru.append(key)
-        # Cached client may have been created with a different permission_mode
-        # (the cache key is (sid, model, effort) — permission is NOT part of
-        # the key so swapping permission doesn't trigger a CLI subprocess
-        # rebuild). Sync to the requested mode via SDK's set_permission_mode
-        # — saves a CLI subprocess restart.
-        current_perm = _client_permission.get(key)
-        if current_perm != permission:
+        cached_perm = _client_permission.get(key) if cached is not None else None
+
+    if cached is not None:
+        # set_permission_mode runs OUTSIDE _lock — it can take seconds and
+        # we never want sibling requests to wait on it. The cache key is
+        # (sid, model, effort), NOT permission, so swapping permission
+        # doesn't trigger a CLI subprocess rebuild.
+        if cached_perm != permission:
             try:
-                await _clients[key].set_permission_mode(permission)
+                await cached.set_permission_mode(permission)
                 _client_permission[key] = permission
             except Exception as e:
                 import sys as _sys
                 _sys.stderr.write(
-                    f"[chat] set_permission_mode {current_perm}→{permission} "
+                    f"[chat] set_permission_mode {cached_perm}→{permission} "
                     f"failed for {key}: {type(e).__name__}: {e}\n")
-        return _clients[key]
+                _sys.stderr.flush()
+        return cached
+
+    # Cache miss: build a new client OUTSIDE _lock. Per-key creation
+    # lock prevents two concurrent misses on the same key from spawning
+    # two CLI subprocesses (where one becomes orphaned).
+    async with _creation_lock_for(key):
+        # Re-check under the global lock — another coroutine may have
+        # already finished building while we waited for the creation lock.
+        async with _lock:
+            cached = _clients.get(key)
+            if cached is not None:
+                if key in _client_lru:
+                    _client_lru.remove(key)
+                _client_lru.append(key)
+                return cached
+
+        # Slow path — no awaits hold _lock.
+        client = await _build_and_connect_client(session_id, model, permission, effort)
+
+        # Commit + LRU eviction. Eviction's await disconnect() runs
+        # OUTSIDE _lock (the disconnect can take up to 5 s). Eviction
+        # also SKIPS any client whose session has an in-flight turn —
+        # dropping a live stream mid-flow looked like "Muse just stopped
+        # talking" to the user (no error event, just dead air).
+        to_disconnect: list[tuple[tuple[str, str, str], ClaudeSDKClient]] = []
+        async with _lock:
+            _clients[key] = client
+            _client_permission[key] = permission
+            _client_lru.append(key)
+            while len(_client_lru) > _CLIENT_POOL_CAP:
+                # Find the oldest evictable client: not ourselves, not
+                # currently streaming. If every cached client is live,
+                # leave the pool over its cap until the next eviction
+                # attempt — better than killing somebody's reply.
+                candidate_idx = None
+                for i, k in enumerate(_client_lru):
+                    if k == key:
+                        continue
+                    if k[0] in _active_turns and not _active_turns[k[0]].done:
+                        continue
+                    candidate_idx = i
+                    break
+                if candidate_idx is None:
+                    break
+                old_key = _client_lru.pop(candidate_idx)
+                old_client = _clients.pop(old_key, None)
+                _client_permission.pop(old_key, None)
+                if old_client is not None:
+                    to_disconnect.append((old_key, old_client))
+
+        for old_key, c in to_disconnect:
+            try:
+                await c.disconnect()
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[client-pool] evict {old_key} disconnect err: {e}\n")
+                _sys.stderr.flush()
+
+        return client
 
 
 async def disconnect_client(session_id: str) -> None:
-    """Disconnect every cached client for this session (across all models)."""
+    """Disconnect every cached client for this session (across all models).
+    The disconnect() call can wait up to 5 s for the CLI subprocess to
+    exit; we pop dict entries under _lock but do the await OUTSIDE so
+    other requests aren't blocked for seconds at a time."""
+    to_disconnect: list[ClaudeSDKClient] = []
     async with _lock:
         keys = [k for k in _clients if k[0] == session_id]
         for k in keys:
@@ -677,10 +740,12 @@ async def disconnect_client(session_id: str) -> None:
             if k in _client_lru:
                 _client_lru.remove(k)
             if c is not None:
-                try:
-                    await c.disconnect()
-                except Exception:
-                    pass
+                to_disconnect.append(c)
+    for c in to_disconnect:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
 
 
 # ====== sessions REST ======
