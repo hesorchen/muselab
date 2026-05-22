@@ -522,6 +522,50 @@ _UPGRADE_LOCK = asyncio.Lock()        # serialize upgrades — never run two at 
 _LAST_UPGRADE: dict[str, Any] = {}     # cache last upgrade output for UI replay
 
 
+def _locate_executable(name: str) -> str | None:
+    """Find a CLI binary that may live outside the running process's PATH.
+
+    Why: when muselab runs as a systemd user service, the inherited PATH is
+    minimal (usually /usr/local/bin:/usr/bin) and excludes ~/.local/bin
+    (where `uv` installs by default) and per-user node version manager
+    directories. shutil.which() only consults the current PATH so calls
+    like `asyncio.create_subprocess_exec("uv", ...)` raise FileNotFoundError
+    and the upgrade endpoint surfaces "uv binary not found in PATH" to the
+    user even when uv is actually installed. We probe a few well-known
+    install locations before giving up.
+
+    Returns the absolute path if found, else None.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    home = Path.home()
+    extra_dirs: list[Path] = [
+        home / ".local" / "bin",          # uv default install, pipx
+        home / ".cargo" / "bin",          # rustup-installed uv
+        home / "bin",
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),        # Apple Silicon Homebrew
+        Path("/usr/bin"),
+    ]
+    # Node version managers shadow the system npm/node; check the active
+    # version they expose. nvm: ~/.nvm/versions/node/<ver>/bin. Volta:
+    # ~/.volta/bin. fnm: ~/.local/share/fnm/aliases/default/bin (best-
+    # effort — full glob resolution would be over-engineering here).
+    if name in {"npm", "node"}:
+        nvm_node = home / ".nvm" / "versions" / "node"
+        if nvm_node.exists():
+            for v in sorted([p for p in nvm_node.iterdir() if p.is_dir()],
+                             reverse=True):
+                extra_dirs.insert(0, v / "bin")
+        extra_dirs.insert(0, home / ".volta" / "bin")
+    for d in extra_dirs:
+        cand = d / name
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
 def _current_versions() -> dict:
     """Currently-installed muselab + SDK + CLI versions.
 
@@ -586,10 +630,11 @@ def _current_versions() -> dict:
     home_npm = str(Path.home() / ".npm-global" / "bin" / "claude")
     if Path(home_npm).exists() and home_npm not in system_candidates:
         system_candidates.append(home_npm)
-    if shutil.which("npm"):
+    npm_bin = _locate_executable("npm")
+    if npm_bin:
         try:
             r = subprocess.run(
-                ["npm", "config", "get", "prefix"],
+                [npm_bin, "config", "get", "prefix"],
                 capture_output=True, text=True, timeout=2,
             )
             prefix = (r.stdout or "").strip()
@@ -713,47 +758,76 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
         steps.append({"step": "before", "versions": before})
 
         if "sdk" in req.targets:
-            # uv lock --upgrade-package claude-agent-sdk, then uv sync
-            try:
-                p1 = await asyncio.create_subprocess_exec(
-                    "uv", "lock", "--upgrade-package", "claude-agent-sdk",
-                    cwd=str(_REPO_ROOT),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                )
-                out1, _ = await p1.communicate()
-                steps.append({"step": "uv lock", "rc": p1.returncode,
-                              "output": (out1 or b"").decode(errors="replace")[-2000:]})
-                if p1.returncode != 0:
-                    raise RuntimeError("uv lock failed")
+            # uv lock --upgrade-package claude-agent-sdk, then uv sync.
+            # Resolve uv via _locate_executable() — systemd-user PATH
+            # rarely includes ~/.local/bin where uv lives by default.
+            uv_bin = _locate_executable("uv")
+            if not uv_bin:
+                steps.append({
+                    "step": "uv lock",
+                    "rc": -1,
+                    "output": (
+                        "uv binary not found. Looked in PATH and "
+                        "~/.local/bin, ~/.cargo/bin, /usr/local/bin, "
+                        "/opt/homebrew/bin, /usr/bin. Install uv first: "
+                        "https://docs.astral.sh/uv/getting-started/installation/"
+                    ),
+                })
+            else:
+                try:
+                    p1 = await asyncio.create_subprocess_exec(
+                        uv_bin, "lock", "--upgrade-package", "claude-agent-sdk",
+                        cwd=str(_REPO_ROOT),
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    )
+                    out1, _ = await p1.communicate()
+                    steps.append({"step": "uv lock", "rc": p1.returncode,
+                                  "output": (out1 or b"").decode(errors="replace")[-2000:]})
+                    if p1.returncode != 0:
+                        raise RuntimeError("uv lock failed")
 
-                p2 = await asyncio.create_subprocess_exec(
-                    "uv", "sync", "--frozen",
-                    cwd=str(_REPO_ROOT),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                )
-                out2, _ = await p2.communicate()
-                steps.append({"step": "uv sync", "rc": p2.returncode,
-                              "output": (out2 or b"").decode(errors="replace")[-2000:]})
-                if p2.returncode != 0:
-                    raise RuntimeError("uv sync failed")
-            except FileNotFoundError:
-                steps.append({"step": "uv lock", "rc": -1, "output": "uv binary not found in PATH"})
-            except Exception as e:
-                steps.append({"step": "sdk upgrade aborted", "rc": -1, "output": f"{type(e).__name__}: {e}"})
+                    p2 = await asyncio.create_subprocess_exec(
+                        uv_bin, "sync", "--frozen",
+                        cwd=str(_REPO_ROOT),
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    )
+                    out2, _ = await p2.communicate()
+                    steps.append({"step": "uv sync", "rc": p2.returncode,
+                                  "output": (out2 or b"").decode(errors="replace")[-2000:]})
+                    if p2.returncode != 0:
+                        raise RuntimeError("uv sync failed")
+                except Exception as e:
+                    steps.append({"step": "sdk upgrade aborted", "rc": -1,
+                                  "output": f"{type(e).__name__}: {e}"})
 
-        if "cli" in req.targets and shutil.which("npm"):
-            try:
-                p3 = await asyncio.create_subprocess_exec(
-                    "npm", "install", "-g", "@anthropic-ai/claude-code@latest",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                )
-                out3, _ = await p3.communicate()
-                steps.append({"step": "npm install -g claude-code", "rc": p3.returncode,
-                              "output": (out3 or b"").decode(errors="replace")[-2000:]})
-            except Exception as e:
-                steps.append({"step": "cli upgrade aborted", "rc": -1, "output": f"{type(e).__name__}: {e}"})
-        elif "cli" in req.targets:
-            steps.append({"step": "npm not found", "rc": -1, "output": "skipped — install Node.js + npm first"})
+        if "cli" in req.targets:
+            # Same PATH problem as uv: node version managers (nvm /
+            # Volta) install npm into per-user dirs that systemd's user
+            # PATH usually doesn't see.
+            npm_bin = _locate_executable("npm")
+            if npm_bin:
+                try:
+                    p3 = await asyncio.create_subprocess_exec(
+                        npm_bin, "install", "-g", "@anthropic-ai/claude-code@latest",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    )
+                    out3, _ = await p3.communicate()
+                    steps.append({"step": "npm install -g claude-code", "rc": p3.returncode,
+                                  "output": (out3 or b"").decode(errors="replace")[-2000:]})
+                except Exception as e:
+                    steps.append({"step": "cli upgrade aborted", "rc": -1,
+                                  "output": f"{type(e).__name__}: {e}"})
+            else:
+                steps.append({
+                    "step": "npm not found",
+                    "rc": -1,
+                    "output": (
+                        "Looked in PATH + ~/.local/bin, ~/.cargo/bin, "
+                        "~/.nvm/versions/node/*/bin, ~/.volta/bin, "
+                        "/usr/local/bin, /opt/homebrew/bin, /usr/bin. "
+                        "Install Node.js + npm first."
+                    ),
+                })
 
         # Re-read post-upgrade versions
         after = _current_versions()
