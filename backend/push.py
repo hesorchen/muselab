@@ -151,7 +151,12 @@ def _save_subs() -> None:
 
 def add_subscription(sub: dict) -> None:
     """`sub` is the JSON shape from PushManager.subscription.toJSON():
-       {endpoint: str, keys: {p256dh: str, auth: str}}"""
+       {endpoint: str, keys: {p256dh: str, auth: str}}
+
+    Reload from disk before mutating so we don't overwrite changes a
+    parallel worker / out-of-band edit made between our last load and
+    this save. _subs is purely a cache of the on-disk file — disk wins."""
+    _load_subs()
     endpoint = sub.get("endpoint")
     if not endpoint:
         raise ValueError("subscription missing endpoint")
@@ -160,6 +165,7 @@ def add_subscription(sub: dict) -> None:
 
 
 def remove_subscription(endpoint: str) -> bool:
+    _load_subs()
     if endpoint in _subs:
         del _subs[endpoint]
         _save_subs()
@@ -168,6 +174,7 @@ def remove_subscription(endpoint: str) -> bool:
 
 
 def list_subscriptions() -> list[dict]:
+    _load_subs()
     return list(_subs.values())
 
 
@@ -188,6 +195,9 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     # and skips from_string entirely.
     vapid_obj = Vapid.from_pem(vapid["private_pem"].encode("ascii"))
     payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag})
+    # Reload from disk before iterating — another worker may have added /
+    # removed subscriptions since our last touch. _subs is just a cache.
+    _load_subs()
     sent = 0
     dropped: list[str] = []
     errors: list[str] = []
