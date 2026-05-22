@@ -2427,15 +2427,6 @@ window.addEventListener("error", e => {
                     :disabled="cost.loading"
                     style="margin-left: 8px;"
                     x-text="cost.loading ? t('set.cost.loading') : t('set.cost.refresh')"></button>
-            <select class="cost-window-select"
-                    x-model.number="cost.windowDays"
-                    @change="loadCostDashboard(true)">
-              <option :value="7">7</option>
-              <option :value="14">14</option>
-              <option :value="30">30</option>
-              <option :value="60">60</option>
-              <option :value="90">90</option>
-            </select>
           </div>
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
@@ -2443,9 +2434,10 @@ window.addEventListener("error", e => {
           <template x-if="cost.data">
             <div>
               <!-- 4 KPI cards: total tokens up top, cost as secondary line.
-                   `last_30d` is actually the user-selected window — backend
-                   field name is historical. Label it dynamically with the
-                   real window days so "30" doesn't show when user picked 7/60/90. -->
+                   Time windows are fixed (today / 7d / 30d / all-time) —
+                   the previous adjustable window dropdown was removed
+                   per user feedback (2026-05-22) since at-a-glance
+                   trends rarely need anything beyond these four. -->
               <div class="cost-kpis">
                 <template x-for="key in ['today','last_7d','last_30d','all_time']" :key="key">
                   <div class="cost-kpi">
@@ -2453,7 +2445,7 @@ window.addEventListener("error", e => {
                          x-text="key === 'today'    ? t('set.cost.today')
                                : key === 'last_7d'  ? t('set.cost.7d')
                                : key === 'all_time' ? t('set.cost.all')
-                               : (lang==='zh' ? `最近 ${cost.windowDays} 天` : `Last ${cost.windowDays}d`)"></div>
+                               : t('set.cost.30d')"></div>
                     <div class="cost-kpi-value"
                          x-text="fmtTokens(totalTokens(cost.data[key]))"></div>
                     <div class="cost-kpi-sub"
@@ -2465,7 +2457,7 @@ window.addEventListener("error", e => {
                 </template>
               </div>
               <!-- Token-class legend explains the 4 numbers below the chart.
-                   Uses the window bucket (last_30d field name is historical). -->
+                   Uses the 30-day window bucket. -->
               <div class="cost-token-breakdown"
                    x-show="cost.data.all_time.turns > 0">
                 <span class="cost-token-chip in"

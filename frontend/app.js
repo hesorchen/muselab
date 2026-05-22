@@ -482,7 +482,6 @@ function portal() {
     cost: {
       loading: false,
       data: null,        // null = never loaded; object = last response
-      windowDays: 30,    // 7 / 14 / 30 / 60 / 90, picked from dropdown
     },
 
     // Reactive viewport flag — used by Settings mobile menu to decide
@@ -3950,8 +3949,11 @@ function portal() {
         // Browser timezone offset is -getTimezoneOffset (JS reports east as
         // negative, server expects east-positive minutes).
         const tz = -new Date().getTimezoneOffset();
+        // Window is fixed at 30 days (the adjustable dropdown was removed
+        // 2026-05-22). Backend keeps the `days` param so older clients
+        // still work; we just always pass 30 now.
         const r = await fetch(
-          `/api/chat/cost-dashboard?days=${this.cost.windowDays}&tz_offset_minutes=${tz}`,
+          `/api/chat/cost-dashboard?days=30&tz_offset_minutes=${tz}`,
           { headers: this.hdr() });
         if (!r.ok) {
           this.cost.data = null;

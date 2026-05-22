@@ -5034,15 +5034,6 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 
 /* ===== Cost dashboard ===== */
-.cost-window-select {
-  margin-left: auto;
-  font-size: var(--fs-xs);
-  padding: 2px 6px;
-  background: var(--c-bg-2);
-  color: var(--c-fg-1);
-  border: 1px solid var(--c-border);
-  border-radius: 4px;
-}
 .cost-kpis {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
