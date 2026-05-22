@@ -1517,20 +1517,134 @@ def usage() -> dict:
             )}
 
 
+def _session_usage_from_jsonl(sid: str) -> dict | None:
+    """Rebuild a session_usage snapshot from the CLI JSONL transcript.
+
+    Why this exists: `_session_usage` is in-memory and clears on every
+    muselab restart. After restart, switching to an existing session
+    used to show an empty context meter until the user sent a new
+    message — a confusing "did my conversation vanish?" UX even though
+    the transcript was still there. Now we lazily rebuild from disk on
+    miss.
+
+    What we extract:
+      - last assistant turn's `message.usage` → input / output / cache
+        tokens (gives the "current context window" estimate the meter
+        cares about)
+      - sum of cost annotations from the muselab sidecar → cumulative
+        total_cost_usd
+
+    Returns None when no JSONL exists (truly new session) so the
+    caller can fall through to a zero-shaped default. The walk is
+    O(n_lines) per session and only fires on a cache miss; subsequent
+    polls hit `_session_usage` again.
+    """
+    if ROOT is None:
+        return None
+    # Walk CLI projects roots — same dual-root logic as cost_dashboard
+    # to also catch vendor-isolated sessions (CLAUDE_CONFIG_DIR isolation
+    # for DeepSeek / GLM / MiniMax writes JSONL to /tmp/muselab-vendor-cli-config).
+    import tempfile as _tempfile
+    project_roots = [Path.home() / ".claude" / "projects",
+                     Path(_tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects"]
+    jsonl_path: Path | None = None
+    for root in project_roots:
+        if not root.exists():
+            continue
+        for hit in root.glob(f"*/{sid}.jsonl"):
+            if hit.is_file():
+                jsonl_path = hit
+                break
+        if jsonl_path:
+            break
+    if jsonl_path is None:
+        return None
+    last_usage: dict[str, int] = {}
+    last_ts: float = 0.0
+    last_model: str = ""
+    try:
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = entry.get("message") or {}
+                u = msg.get("usage") or {}
+                if not isinstance(u, dict) or not u:
+                    continue
+                last_usage = u
+                last_model = msg.get("model") or last_model
+                ts = entry.get("timestamp") or ""
+                if ts:
+                    try:
+                        import datetime as _dt
+                        dt_utc = _dt.datetime.fromisoformat(
+                            ts.replace("Z", "+00:00"))
+                        last_ts = dt_utc.timestamp()
+                    except ValueError:
+                        pass
+    except OSError:
+        return None
+    if not last_usage:
+        return None
+    # Cumulative cost — sum sidecar annotations. Cheaper than reparsing
+    # JSONL costs, and Anthropic is the only vendor that puts USD in
+    # message.usage anyway.
+    total_cost = 0.0
+    try:
+        from . import sessions as _sess
+        anns = _sess.get_message_annotations(sid)
+        for ann in anns.values():
+            if isinstance(ann, dict):
+                total_cost += _parse_cost(ann.get("cost"))
+    except Exception:
+        pass
+    in_t = int(last_usage.get("input_tokens", 0) or 0)
+    out_t = int(last_usage.get("output_tokens", 0) or 0)
+    cr_t = int(last_usage.get("cache_read_input_tokens", 0)
+                or last_usage.get("cache_read_tokens", 0) or 0)
+    cc_t = int(last_usage.get("cache_creation_input_tokens", 0)
+                or last_usage.get("cache_creation_tokens", 0) or 0)
+    ctx_used = in_t + cr_t + cc_t
+    limit = MODEL_CONTEXT_LIMITS.get(last_model, 0)
+    pct = round(ctx_used / limit * 100, 1) if limit else 0.0
+    return {
+        "input_tokens": in_t, "output_tokens": out_t,
+        "cache_read_tokens": cr_t, "cache_creation_tokens": cc_t,
+        "total_cost_usd": total_cost, "last_turn_at": last_ts,
+        "context_used": ctx_used, "context_used_pct": pct,
+        "context_limit": limit,
+    }
+
+
 @router.get("/usage/{session_id}", dependencies=[Depends(require_token)])
 def session_usage(session_id: str, model: str = "") -> dict:
     """Per-session context meter — what fraction of the model's window we're at.
 
     Note: this is the cheap path — reads cached per-turn usage values.
+    On cache miss (e.g. fresh process restart, session not yet streamed
+    in this lifetime), lazily rebuilds the snapshot from the CLI JSONL
+    so the meter doesn't show empty for already-running conversations.
     For a true breakdown (per CLAUDE.md file, per MCP tool, per skill),
     use /context-breakdown/{session_id} which invokes
     ClaudeSDKClient.get_context_usage() against the live session."""
-    u = _session_usage.get(session_id, {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_creation_tokens": 0,
-        "total_cost_usd": 0.0, "last_turn_at": 0.0,
-        "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
-    })
+    u = _session_usage.get(session_id)
+    if u is None:
+        rebuilt = _session_usage_from_jsonl(session_id)
+        if rebuilt is not None:
+            # Populate the cache so subsequent polls don't re-walk JSONL.
+            _session_usage[session_id] = rebuilt
+            u = rebuilt
+        else:
+            u = {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
+            }
     m = model or MODEL
     # Take the MAX of (stored sess_u value, hardcoded table). This way when
     # MODEL_CONTEXT_LIMITS gets bumped (e.g. Opus 200K → 1M), an existing
