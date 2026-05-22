@@ -2814,33 +2814,52 @@ async def stream(
                                turn_count=n_turns,
                                auto_rename_from=first_user_text or prompt)
             sess.update_model(session_id, model_to_use)
-            # Web Push on turn-done. Gated by `notify_normal` setting so the
-            # user can mute per-turn pushes independently from scheduler
-            # pushes. Best-effort — never let push failure block the stream.
-            # Body kept minimal per user preference: session name as title +
-            # "Muse 已回复" as body. No reply preview — full text is one tap
-            # away in the actual chat, and preview text often duplicates the
-            # foreground tab the user is already looking at.
+            # Web Push on turn-done. Three gates, in order:
+            #   1. MUSELAB_NOTIFY_NORMAL toggle (env-level mute switch)
+            #   2. No live SSE subscriber on this turn — if the user is
+            #      actively connected to the broadcast (page open, watching),
+            #      they don't need a push. Pushing anyway caused a "ghost
+            #      notification" UX bug: user sent message B, message A's
+            #      turn finished just after, push fired for A while B's
+            #      SSE was already open — user perceived the push as "you
+            #      sent B and got a reply" and confused the visible A reply
+            #      with B's pending one. Skipping when subscribers > 0
+            #      cleanly removes the false positive.
+            #   3. Wrapped in try/except — push failure must never block
+            #      the stream's done event.
+            # Body intentionally minimal: session name + "Muse 已回复". No
+            # preview text — the actual reply is one tap away in chat.
             if os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false":
+                live_subscribers = 0
                 try:
-                    from . import push as _push
-                    sname = ""
+                    _bc = _active_turns.get(session_id)
+                    if _bc is not None:
+                        live_subscribers = len(_bc.subscribers)
+                except Exception:
+                    pass
+                if live_subscribers > 0:
+                    # User is watching live — no push.
+                    pass
+                else:
                     try:
-                        for s in sess.list_sessions():
-                            if s.get("id") == session_id:
-                                sname = s.get("name", "")
-                                break
-                    except Exception:
-                        pass
-                    _push.send_to_all(
-                        title=sname or "muselab",
-                        body="💬 Muse 已回复",
-                        url="/",
-                        tag=f"turn-{session_id}",
-                    )
-                except Exception as e:
-                    import sys as _sys
-                    _sys.stderr.write(f"[chat] turn push failed: {e}\n")
+                        from . import push as _push
+                        sname = ""
+                        try:
+                            for s in sess.list_sessions():
+                                if s.get("id") == session_id:
+                                    sname = s.get("name", "")
+                                    break
+                        except Exception:
+                            pass
+                        _push.send_to_all(
+                            title=sname or "muselab",
+                            body="💬 Muse 已回复",
+                            url="/",
+                            tag=f"turn-{session_id}",
+                        )
+                    except Exception as e:
+                        import sys as _sys
+                        _sys.stderr.write(f"[chat] turn push failed: {e}\n")
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,

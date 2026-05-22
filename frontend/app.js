@@ -839,6 +839,32 @@ function portal() {
       setTimeout(lift, 400);
     },
 
+    // Triple-click (or any 3+ rapid click) on the chat input selects all
+    // text. Browsers natively give us:
+    //   single-click → place cursor
+    //   double-click → select word
+    //   triple-click → select paragraph (for <textarea> this is one line)
+    // None of those select the WHOLE composed message, which is what the
+    // user usually wants when re-prompting ("oh let me just retype this"
+    // or "wrong tab, retry on the right model"). Listening to event.detail
+    // (the consecutive-click counter that resets after ~500ms idle) is
+    // the cleanest cross-platform path — no manual debounce timer state
+    // to maintain, no conflict with the OS double-click word selection.
+    onChatInputClick(ev) {
+      const ta = ev && ev.target;
+      if (!ta) return;
+      // detail counts consecutive clicks: 1 / 2 / 3 / ... Browser resets
+      // after a short idle window. We trigger on >= 3 so double-click's
+      // word selection still works normally.
+      if (ev.detail >= 3 && ta.value && ta.value.length > 0) {
+        // Default for triple-click on textarea is "select current line".
+        // Override with full select — preventDefault stops the partial
+        // selection from racing the explicit select() call.
+        ev.preventDefault();
+        ta.select();
+      }
+    },
+
     _initMobileKeyboardWatch() {
       if (!window.visualViewport) return;
       const vv = window.visualViewport;
