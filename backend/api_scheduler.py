@@ -9,7 +9,7 @@ POST   /api/scheduler/ack         — mark unread = 0 (called when user opens th
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .auth import require_token
@@ -112,7 +112,10 @@ async def run_task_now_endpoint(tid: str) -> dict:
 
 
 @router.get("/history", dependencies=[Depends(require_token)])
-def history_endpoint(limit: int = 50) -> dict:
+def history_endpoint(limit: int = Query(50, ge=1, le=500)) -> dict:
+    # limit clamped to [1, 500]. Unbounded limit=-1 returned last 1 entry
+    # (slicing semantics) and limit=99999 returned the whole history
+    # blocking the frontend's render — both surfaced as confusing UI bugs.
     return {
         "history": sched.list_history(limit=limit),
         "unread_count": sched.get_unread(),

@@ -6588,6 +6588,7 @@ function portal() {
         // banner gives an explicit Resume.
         if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
           streamState._queuePaused = true;
+          this._saveQueueToStorage(streamSid);
         }
       });
       es.onerror = () => {

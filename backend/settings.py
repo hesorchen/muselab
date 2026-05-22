@@ -1,7 +1,50 @@
 import os
+import shutil
 import warnings
 from pathlib import Path
 from dotenv import load_dotenv
+
+
+def locate_executable(name: str) -> str | None:
+    """Find a CLI binary that may live outside the running process's PATH.
+
+    Why: when muselab runs as a systemd user service, the inherited PATH is
+    minimal (usually /usr/local/bin:/usr/bin) and excludes ~/.local/bin
+    (where `uv` installs by default), ~/.npm-global/bin (where the Claude
+    CLI lands after `npm install -g claude-code`), and per-user node
+    version-manager directories. shutil.which() only consults the current
+    PATH so calls like `shutil.which("claude")` return None and the
+    upgrade endpoint reports "CLI not installed" even when it is.
+
+    Returns absolute path if found, else None.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    home = Path.home()
+    extra_dirs: list[Path] = [
+        home / ".local" / "bin",          # uv default install, pipx
+        home / ".cargo" / "bin",          # rustup-installed uv
+        home / ".npm-global" / "bin",     # npm-global prefix (claude code)
+        home / "bin",
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),        # Apple Silicon Homebrew
+        Path("/usr/bin"),
+    ]
+    # Node version managers shadow the system npm/node; check the active
+    # version they expose.
+    if name in {"npm", "node", "claude"}:
+        nvm_node = home / ".nvm" / "versions" / "node"
+        if nvm_node.exists():
+            for v in sorted([p for p in nvm_node.iterdir() if p.is_dir()],
+                             reverse=True):
+                extra_dirs.insert(0, v / "bin")
+        extra_dirs.insert(0, home / ".volta" / "bin")
+    for d in extra_dirs:
+        cand = d / name
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
 
 
 def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:

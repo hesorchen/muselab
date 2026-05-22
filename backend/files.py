@@ -111,8 +111,17 @@ def safe_resolve(rel: str, allow_sensitive: bool = False) -> Path:
         explicitly check the resolved target is still under ROOT.
       - `.env`, `id_rsa`, `*.pem` etc. (SENSITIVE_SUFFIX / SENSITIVE_NAMES)."""
     rel = (rel or "").lstrip("/")
+    # NUL byte in a path raises ValueError from (ROOT / rel) and FastAPI
+    # converts that to a 500 with a traceback that leaks internal module
+    # paths. Reject early as 400. Same for any string that Python's path
+    # layer refuses (control chars trip OS-level checks downstream).
+    if "\x00" in rel:
+        raise HTTPException(status_code=400, detail="invalid path")
     # First-pass resolve (follows symlinks → catches symlink escape):
-    target = (ROOT / rel).resolve()
+    try:
+        target = (ROOT / rel).resolve()
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="invalid path") from None
     # ROOT itself must also be resolved (it might itself be a symlink target).
     root_real = ROOT.resolve()
     if root_real != target and root_real not in target.parents:

@@ -522,48 +522,10 @@ _UPGRADE_LOCK = asyncio.Lock()        # serialize upgrades — never run two at 
 _LAST_UPGRADE: dict[str, Any] = {}     # cache last upgrade output for UI replay
 
 
-def _locate_executable(name: str) -> str | None:
-    """Find a CLI binary that may live outside the running process's PATH.
-
-    Why: when muselab runs as a systemd user service, the inherited PATH is
-    minimal (usually /usr/local/bin:/usr/bin) and excludes ~/.local/bin
-    (where `uv` installs by default) and per-user node version manager
-    directories. shutil.which() only consults the current PATH so calls
-    like `asyncio.create_subprocess_exec("uv", ...)` raise FileNotFoundError
-    and the upgrade endpoint surfaces "uv binary not found in PATH" to the
-    user even when uv is actually installed. We probe a few well-known
-    install locations before giving up.
-
-    Returns the absolute path if found, else None.
-    """
-    found = shutil.which(name)
-    if found:
-        return found
-    home = Path.home()
-    extra_dirs: list[Path] = [
-        home / ".local" / "bin",          # uv default install, pipx
-        home / ".cargo" / "bin",          # rustup-installed uv
-        home / "bin",
-        Path("/usr/local/bin"),
-        Path("/opt/homebrew/bin"),        # Apple Silicon Homebrew
-        Path("/usr/bin"),
-    ]
-    # Node version managers shadow the system npm/node; check the active
-    # version they expose. nvm: ~/.nvm/versions/node/<ver>/bin. Volta:
-    # ~/.volta/bin. fnm: ~/.local/share/fnm/aliases/default/bin (best-
-    # effort — full glob resolution would be over-engineering here).
-    if name in {"npm", "node"}:
-        nvm_node = home / ".nvm" / "versions" / "node"
-        if nvm_node.exists():
-            for v in sorted([p for p in nvm_node.iterdir() if p.is_dir()],
-                             reverse=True):
-                extra_dirs.insert(0, v / "bin")
-        extra_dirs.insert(0, home / ".volta" / "bin")
-    for d in extra_dirs:
-        cand = d / name
-        if cand.exists() and os.access(cand, os.X_OK):
-            return str(cand)
-    return None
+# Re-export shared helper from settings — _locate_executable used to live
+# here, but it's needed by main.py too (CLI version probe at /api/meta).
+# Both modules now import from settings.locate_executable.
+from .settings import locate_executable as _locate_executable
 
 
 def _current_versions() -> dict:
@@ -624,7 +586,10 @@ def _current_versions() -> dict:
     # peek into npm's prefix and the conventional ~/.npm-global path, then
     # report whichever binary actually has the highest semver.
     system_candidates: list[str] = []
-    which_claude = shutil.which("claude")
+    # _locate_executable covers PATH + ~/.npm-global/bin + nvm/Volta dirs
+    # that systemd's user PATH rarely sees. shutil.which("claude") alone
+    # missed the most common install paths.
+    which_claude = _locate_executable("claude")
     if which_claude:
         system_candidates.append(which_claude)
     home_npm = str(Path.home() / ".npm-global" / "bin" / "claude")

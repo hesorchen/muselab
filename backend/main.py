@@ -197,7 +197,11 @@ def _detect_versions() -> dict:
     except Exception:
         pass
     cli_version = None
-    claude_bin = shutil.which("claude")
+    # locate_executable falls back past systemd's minimal PATH (nvm /
+    # Volta / ~/.npm-global). shutil.which("claude") alone would miss
+    # the most common install locations.
+    from .settings import locate_executable
+    claude_bin = locate_executable("claude")
     if claude_bin:
         try:
             out = subprocess.run([claude_bin, "--version"], capture_output=True,

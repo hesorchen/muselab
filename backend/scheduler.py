@@ -144,6 +144,16 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
         tz_off = int(tz_off)
     except (ValueError, TypeError):
         tz_off = _server_tz_offset_minutes()
+    # API layer pydantic limits to [-1440, 1440] but a hand-edited
+    # scheduler.json can persist anything. Real-world TZ range is
+    # [-720 (UTC-12), +840 (UTC+14)]; values past that produce
+    # OverflowError in fromtimestamp on some platforms and crash the
+    # whole scheduler tick. Clamp + log silently.
+    if not (-720 <= tz_off <= 840):
+        sys.stderr.write(
+            f"[scheduler] tz_offset_minutes={tz_off} out of range "
+            f"[-720, 840]; using server-local instead\n")
+        tz_off = _server_tz_offset_minutes()
     tz = timezone(timedelta(minutes=tz_off))
     base = datetime.fromtimestamp(
         ref_ts if ref_ts is not None else time.time(), tz=tz)
