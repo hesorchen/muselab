@@ -2522,7 +2522,19 @@ function portal() {
       };
     },
     _ensureTabState(id) {
-      if (!this.tabState[id]) this.tabState[id] = this._blankTabState();
+      if (!this.tabState[id]) {
+        this.tabState[id] = this._blankTabState();
+        // First-time creation: pull any queue items localStorage saved
+        // for this sid from a previous session. If restore brings back
+        // pending items, kick a drain on next tick — _drainPendingQueue
+        // self-gates on busy / paused / sid===currentId, so it's safe to
+        // call unconditionally (e.g. for inactive tabs it just no-ops).
+        this._loadQueueFromStorage(id);
+        const st = this.tabState[id];
+        if (st.pendingQueue && st.pendingQueue.length && !st._queuePaused) {
+          this.$nextTick(() => this._drainPendingQueue(id));
+        }
+      }
       return this.tabState[id];
     },
 
@@ -2538,6 +2550,66 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       return !!((st && st.streaming) || this._compacting);
+    },
+    // Persist text-only queue items + paused flag to localStorage so the
+    // queue survives a page reload. Attachments are deliberately NOT
+    // persisted: backend image IDs expire after 10 min and the base64
+    // preview blob would balloon localStorage. Items > 24 h old are
+    // dropped on load — context is almost certainly stale by then.
+    _saveQueueToStorage(sid) {
+      if (!sid) return;
+      const st = this.tabState[sid];
+      if (!st) return;
+      try {
+        const persistable = (st.pendingQueue || []).filter(q =>
+          !((q.pendingImages && q.pendingImages.length)
+             || (q.pendingDocs && q.pendingDocs.length)));
+        const data = {
+          items: persistable.map(q => ({
+            id: q.id,
+            text: q.text || "",
+            enqueuedAt: q.enqueuedAt || Date.now(),
+          })),
+          paused: !!st._queuePaused,
+        };
+        const key = "muselab.queue." + sid;
+        if (!data.items.length && !data.paused) {
+          localStorage.removeItem(key);
+        } else {
+          localStorage.setItem(key, JSON.stringify(data));
+        }
+      } catch (_e) { /* private mode / quota — non-fatal */ }
+    },
+    _loadQueueFromStorage(sid) {
+      if (!sid) return;
+      const st = this.tabState[sid];
+      if (!st) return;
+      let raw;
+      try { raw = localStorage.getItem("muselab.queue." + sid); }
+      catch (_e) { return; }
+      if (!raw) return;
+      let data;
+      try { data = JSON.parse(raw); }
+      catch (_e) {
+        try { localStorage.removeItem("muselab.queue." + sid); } catch (_) {}
+        return;
+      }
+      const cutoff = Date.now() - 24 * 3600 * 1000;
+      const items = (data.items || [])
+        .filter(q => (q.enqueuedAt || 0) > cutoff)
+        .map(q => ({
+          id: q.id || ("q-" + Math.random().toString(36).slice(2, 10)),
+          text: q.text || "",
+          pendingImages: [],
+          pendingDocs: [],
+          enqueuedAt: q.enqueuedAt || Date.now(),
+        }));
+      if (!items.length && !data.paused) {
+        try { localStorage.removeItem("muselab.queue." + sid); } catch (_) {}
+        return;
+      }
+      st.pendingQueue = items;
+      if (data.paused) st._queuePaused = true;
     },
     _currentQueueLen() {
       const st = this.tabState[this.currentId];
@@ -2556,6 +2628,7 @@ function portal() {
         pendingDocs: (item.pendingDocs || []).slice(),
         enqueuedAt: Date.now(),
       });
+      this._saveQueueToStorage(sid);
     },
     _drainPendingQueue(sid) {
       if (!sid) return;
@@ -2569,6 +2642,7 @@ function portal() {
       // Otherwise activateTab(sid) will pick it up when the user returns.
       if (sid !== this.currentId) return;
       const item = st.pendingQueue.shift();
+      this._saveQueueToStorage(sid);
       // Backend evicts uploaded attachments after 600 s. Warn at 9 min so
       // the user knows; the actual abort threshold (10 min) is handled in
       // send() by checking the upload IDs against pendingImages cache.
@@ -2594,6 +2668,7 @@ function portal() {
       if (!st || !st.pendingQueue) return;
       if (idx < 0 || idx >= st.pendingQueue.length) return;
       st.pendingQueue.splice(idx, 1);
+      this._saveQueueToStorage(sid);
     },
     editPendingQueueItem(sid, idx) {
       // Lift the queued item back into the input box so the user can edit
@@ -2604,6 +2679,7 @@ function portal() {
       const item = st.pendingQueue[idx];
       if (!item) return;
       st.pendingQueue.splice(idx, 1);
+      this._saveQueueToStorage(sid);
       // Only restore into this.input if the queue's tab is the active one
       // (otherwise we'd clobber the input the user is typing on the other
       // tab). For inactive tabs, drop the item silently — UI exposes edit
@@ -2621,6 +2697,7 @@ function portal() {
       const st = this.tabState[sid];
       if (!st) return;
       st._queuePaused = false;
+      this._saveQueueToStorage(sid);
       this._drainPendingQueue(sid);
     },
     discardQueue(sid) {
@@ -2628,6 +2705,7 @@ function portal() {
       if (!st || !st.pendingQueue) return;
       st.pendingQueue.length = 0;
       st._queuePaused = false;
+      this._saveQueueToStorage(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
     // from the backend and merge it into tabState[sid].sessionUsage. Limit
@@ -6374,6 +6452,7 @@ function portal() {
           // explicitly continue after fixing the root cause.
           if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
             streamState._queuePaused = true;
+            this._saveQueueToStorage(streamSid);
           }
           return;
         }
@@ -6396,6 +6475,7 @@ function portal() {
           _markDone(); _stopTimer();
           if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
             streamState._queuePaused = true;
+            this._saveQueueToStorage(streamSid);
           }
           return;
         }

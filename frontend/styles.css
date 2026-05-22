@@ -3999,27 +3999,18 @@ pre.has-copy-btn .code-copy-btn.copied {
 .chat-toolbar-send svg { width: 14px; height: 14px; }
 .chat-toolbar-send.btn-danger { background: var(--c-danger, #dc3545); }
 .chat-toolbar-send.btn-danger:hover { background: #b91c2c; }
+/* Secondary variant — same 26×26 base as send/stop, neutral fill.
+   Used by the queue button so it visually pairs with stop (the two
+   only differ in color, not shape/size/border). */
+.chat-toolbar-send.neutral { background: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-toolbar-send.neutral:hover:not(:disabled) { background: var(--c-bg-4); }
 /* The Send label inside the button — hidden by default (icon-only).
    .show-label class would expose it for users who want the wider button. */
 .chat-toolbar-send > span:last-child { display: none; }
-/* Queue-send button — visible while streaming so the user can keep
-   sending. Sized as a 26×26 icon-only square to match the stop button
-   sitting right next to it (they appear as a pair when streaming).
-   Backlog count surfaces as a small absolute-positioned badge in the
-   top-right corner so the user knows what they're stacking up. */
-.chat-toolbar-queue {
-  position: relative;
-  height: 26px; width: 26px; padding: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  border: 1px solid var(--c-bg-4); border-radius: 6px;
-  background: var(--c-bg-2); color: var(--c-fg-1);
-  cursor: pointer;
-  transition: background var(--t-fast), opacity var(--t-fast), transform 80ms;
-}
-.chat-toolbar-queue:hover:not(:disabled) { background: var(--c-bg-3); }
-.chat-toolbar-queue:active:not(:disabled) { transform: scale(0.95); }
-.chat-toolbar-queue:disabled { opacity: 0.4; cursor: not-allowed; }
-.chat-toolbar-queue svg { width: 14px; height: 14px; }
+/* Queue button: full sizing inherits from .chat-toolbar-send +
+   .neutral above. This class only carries the position context for
+   the absolute-positioned badge below. */
+.chat-toolbar-queue { position: relative; }
 .chat-toolbar-queue-badge {
   position: absolute;
   top: -5px; right: -5px;
@@ -4032,19 +4023,21 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 
 /* Queued message bubbles — user messages waiting to dispatch after the
-   current turn finishes. Faded + dashed border distinguish them from
-   real sent bubbles. Compact header carries the queue position and
-   edit/remove actions. */
-.msg.user.queued { align-items: flex-end; opacity: 0.78; }
+   current turn finishes. Dashed border + accent-tinted background mark
+   them as different from real sent bubbles, but kept fully opaque so
+   the text inside reads at full contrast (an earlier opacity: 0.78
+   wash made the content unreadable on light theme — user feedback
+   2026-05-22). */
+.msg.user.queued { align-items: flex-end; }
 .msg.user.queued .bubble {
   border: 1px dashed var(--c-accent);
-  background: color-mix(in srgb, var(--c-accent) 12%, transparent);
+  background: color-mix(in srgb, var(--c-accent) 18%, var(--c-bg-1));
   color: var(--c-fg-0);
   border-bottom-right-radius: var(--r-sm);
 }
 .queued-header {
   display: flex; align-items: center; gap: 6px;
-  font-size: var(--fs-xs); color: var(--c-fg-2);
+  font-size: var(--fs-xs); color: var(--c-fg-1);
   margin-bottom: 4px; padding-bottom: 4px;
   border-bottom: 1px dotted var(--c-bg-4);
 }
