@@ -6472,6 +6472,13 @@ function portal() {
         flushRender();
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
         es.close(); _markDone(); _stopTimer();
+        // User explicitly stopped — pause the queue too. Auto-draining
+        // here would be surprising (they cancelled for a reason, almost
+        // never "just this one but please send the rest"). The paused
+        // banner gives an explicit Resume.
+        if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
+          streamState._queuePaused = true;
+        }
       });
       es.onerror = () => {
         if (es.readyState === EventSource.CLOSED) { _markDone(); _stopTimer(); }
