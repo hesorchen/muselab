@@ -173,7 +173,11 @@ window.addEventListener("error", e => {
 </defs>
 </svg>
 
-<div id="app" x-data="portal()" x-init="document.getElementById('loading').remove(); init()"
+<!-- x-init removes the no-JS splash only. Alpine 3 auto-invokes the
+     component's init() method when x-data evaluates — calling it again
+     here would double-fire _checkInterruptedTurns() and toast every
+     interrupted-turn notice twice. See 2026-05-22 fix. -->
+<div id="app" x-data="portal()" x-init="document.getElementById('loading').remove()"
      x-effect="document.title = pageTitle()" x-cloak>
 
   <!-- Splash — first load / hard refresh, before initial data arrives -->

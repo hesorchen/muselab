@@ -619,6 +619,13 @@ function portal() {
     },
 
     init() {
+      // Idempotency guard. Alpine 3 already auto-invokes init() when x-data
+      // resolves; if anything (a stray x-init="init()", a hot-reload tool,
+      // a future Alpine bump that double-fires) triggers a second call,
+      // every event listener / heartbeat / interrupted-turn toast would
+      // double. Cheap to gate at the front; expensive to debug after.
+      if (this._initialized) return;
+      this._initialized = true;
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
       // 一次性迁移旧 localStorage key（portal_* → muselab_*），让现有用户无感升级
