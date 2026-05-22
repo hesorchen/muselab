@@ -1969,6 +1969,17 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   0%, 100% { opacity: 0.4; transform: scale(0.85); }
   50%      { opacity: 1;   transform: scale(1); }
 }
+/* "Task finished while you were on a different tab." Static green —
+   pulsing would compete visually with the streaming dot on a neighbor
+   tab and create a busy strip. Slight glow so the user catches it in
+   peripheral vision without it feeling alarming. */
+.chat-tab-unread-dot {
+  display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #4ec97a;
+  box-shadow: 0 0 4px rgba(78, 201, 122, 0.55);
+  flex-shrink: 0;
+}
 .chat-tab-rename-input {
   background: var(--c-bg-0); color: var(--c-fg-0);
   border: 1px solid var(--c-accent); border-radius: var(--r-sm);

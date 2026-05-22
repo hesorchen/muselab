@@ -964,6 +964,13 @@ window.addEventListener("error", e => {
               <span class="chat-tab-stream-dot"
                     x-show="isTabStreaming(tid)"
                     :title="lang==='zh' ? '该会话正在生成…' : 'Streaming…'"></span>
+              <!-- Green dot when the tab finished a turn while you were
+                   elsewhere. Sibling to the streaming dot but mutually
+                   exclusive — streaming has priority since "still running"
+                   is the more urgent visual state. -->
+              <span class="chat-tab-unread-dot"
+                    x-show="isTabUnread(tid)"
+                    :title="lang==='zh' ? '该会话有新回复' : 'New reply ready'"></span>
               <!-- x-show, not x-if — keeps both nodes mounted so a blur on the
                    <input> doesn't unmount the very element dispatching the
                    event (which trips an Alpine null.node bug). -->

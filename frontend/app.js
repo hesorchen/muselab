@@ -2502,6 +2502,10 @@ function portal() {
         _streamTimer: null,
         _streamStartedAt: 0,
         _loaded: false,   // set true after first loadSession populates messages
+        // True when this tab's turn finished while the user was looking at a
+        // different tab — drives a green dot on the tab strip so the user
+        // notices "this one's ready". Cleared when the user activates the tab.
+        unread: false,
       };
     },
     _ensureTabState(id) {
@@ -2779,6 +2783,16 @@ function portal() {
     isTabStreaming(tid) {
       const st = this.tabState[tid];
       return !!(st && st.streaming);
+    },
+    isTabUnread(tid) {
+      // True when this tab's most recent turn finished while the user was
+      // on a different tab AND they haven't activated this tab since.
+      // The active tab can never be unread by construction (activateTab
+      // clears the flag), but we double-check here to keep the template
+      // logic-light.
+      if (tid === this.currentId) return false;
+      const st = this.tabState[tid];
+      return !!(st && st.unread && !st.streaming);
     },
     tabCtxMenuStyle() {
       const m = this.tabCtxMenu;
@@ -3150,6 +3164,10 @@ function portal() {
     activateTab(tid) {
       if (tid === this.currentId) return;
       this.currentId = tid;
+      // Clear the green "task done while you were elsewhere" dot now that
+      // the user is actually looking at this tab.
+      const st = this.tabState && this.tabState[tid];
+      if (st && st.unread) st.unread = false;
       this.switchSession();
       // Scroll the newly-active tab into view — when the strip overflows
       // horizontally (many sessions open), keyboard shortcuts / programmatic
@@ -6068,6 +6086,13 @@ function portal() {
       const _markDone = () => {
         streamState.streaming = false;
         streamState.es = null;
+        // If the user is on a different tab when this turn lands, flag
+        // unread so the tab strip can show a green dot. Doing it inside
+        // _markDone covers every termination path (done / error /
+        // cancelled / reconnect-give-up) — no scattered flagging logic.
+        if (this.currentId !== streamSid) {
+          streamState.unread = true;
+        }
         // Stamp the tail block of the just-finished turn with a
         // completion timestamp. A "turn" = a contiguous run of muse-
         // side messages between two user messages; only its tail msg
