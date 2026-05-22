@@ -222,10 +222,11 @@ function portal() {
     // without the user needing to manually refresh the page.
     previewVersion: 0,
     // Compact orchestration: _compacting marks the window where the CLI is
-    // busy summarising history; user messages typed during that window queue
-    // up and dispatch when compact finishes.
+    // busy summarising history. User messages typed during compact go into
+    // the same per-session pendingQueue as messages typed during a streaming
+    // turn (see _blankTabState) — both paths are drained by
+    // _drainPendingQueue(sid).
     _compacting: false,
-    _compactQueue: [],
     // SDK get_context_usage() breakdown popup. Shows per-category token
     // counts (system prompt / tools / memory files / messages / mcp / skills)
     // so the user can see which slice is using their context window.
@@ -2506,11 +2507,127 @@ function portal() {
         // different tab — drives a green dot on the tab strip so the user
         // notices "this one's ready". Cleared when the user activates the tab.
         unread: false,
+        // Per-session message queue. Populated when the user sends while
+        // this tab's turn is still streaming OR while a compact is in
+        // flight. Drained automatically on the next `done` event /
+        // compact-finally / activateTab. Items are {id, text,
+        // pendingImages, pendingDocs, enqueuedAt}.
+        pendingQueue: [],
+        // Set to true when a turn errors out while the queue is non-empty.
+        // Stops auto-drain so the user explicitly chooses to resume vs
+        // discard (auto-draining post-failure would burn tokens on a
+        // quota/auth error and confuse the user). Cleared by explicit
+        // resume-queue or discard-queue actions on the failed user bubble.
+        _queuePaused: false,
       };
     },
     _ensureTabState(id) {
       if (!this.tabState[id]) this.tabState[id] = this._blankTabState();
       return this.tabState[id];
+    },
+
+    // ===== Per-session message queue =====
+    // The user can keep typing & sending while Muse is still answering (or
+    // while a compact is running). Each follow-up gets parked on
+    // tabState[sid].pendingQueue and auto-drained the moment the in-flight
+    // turn finishes. Drain is gated on sid === currentId — we never send a
+    // queued message while the user is looking at a different tab (would
+    // cause writes into the wrong tabState and surprise on switch back).
+    // When the user comes back, activateTab() retries the drain.
+    _isBusy(sid) {
+      if (!sid) return false;
+      const st = this.tabState[sid];
+      return !!((st && st.streaming) || this._compacting);
+    },
+    _currentQueueLen() {
+      const st = this.tabState[this.currentId];
+      return (st && st.pendingQueue) ? st.pendingQueue.length : 0;
+    },
+    _enqueueMessage(sid, item) {
+      const st = this._ensureTabState(sid);
+      if (!Array.isArray(st.pendingQueue)) st.pendingQueue = [];
+      st.pendingQueue.push({
+        id: "q-" + Math.random().toString(36).slice(2, 10),
+        text: item.text || "",
+        // Snapshot the attachment refs — the caller clears
+        // this.pendingImages/Docs immediately after, so the queued copy
+        // owns the upload-id references the SSE endpoint will consume.
+        pendingImages: (item.pendingImages || []).slice(),
+        pendingDocs: (item.pendingDocs || []).slice(),
+        enqueuedAt: Date.now(),
+      });
+    },
+    _drainPendingQueue(sid) {
+      if (!sid) return;
+      const st = this.tabState[sid];
+      if (!st || !st.pendingQueue || !st.pendingQueue.length) return;
+      // Busy or paused — leave the queue alone. The next done / resume
+      // action will retry.
+      if (this._isBusy(sid)) return;
+      if (st._queuePaused) return;
+      // Per design: only drain when the queue's tab is the active one.
+      // Otherwise activateTab(sid) will pick it up when the user returns.
+      if (sid !== this.currentId) return;
+      const item = st.pendingQueue.shift();
+      // Backend evicts uploaded attachments after 600 s. Warn at 9 min so
+      // the user knows; the actual abort threshold (10 min) is handled in
+      // send() by checking the upload IDs against pendingImages cache.
+      const enqAgeS = (Date.now() - (item.enqueuedAt || 0)) / 1000;
+      const hasAttach = (item.pendingImages && item.pendingImages.length)
+                       || (item.pendingDocs && item.pendingDocs.length);
+      if (hasAttach && enqAgeS > 540 && enqAgeS <= 600) {
+        try { this.toast(this.t("queue.attach_expiring"), "warn", 4000); }
+        catch (_) {}
+      }
+      if (hasAttach && enqAgeS > 600) {
+        // Drop the message — attachment IDs are dead. Tell the user so
+        // they can re-attach + re-send.
+        try { this.toast(this.t("queue.attach_expired"), "error", 5000); }
+        catch (_) {}
+        // Recurse to keep draining — the next item might be attachment-free.
+        return this._drainPendingQueue(sid);
+      }
+      this.send({ resumedItem: item });
+    },
+    removePendingQueueItem(sid, idx) {
+      const st = this.tabState[sid];
+      if (!st || !st.pendingQueue) return;
+      if (idx < 0 || idx >= st.pendingQueue.length) return;
+      st.pendingQueue.splice(idx, 1);
+    },
+    editPendingQueueItem(sid, idx) {
+      // Lift the queued item back into the input box so the user can edit
+      // before re-sending. Removes the original from the queue (re-sending
+      // adds it back at the tail if still streaming).
+      const st = this.tabState[sid];
+      if (!st || !st.pendingQueue) return;
+      const item = st.pendingQueue[idx];
+      if (!item) return;
+      st.pendingQueue.splice(idx, 1);
+      // Only restore into this.input if the queue's tab is the active one
+      // (otherwise we'd clobber the input the user is typing on the other
+      // tab). For inactive tabs, drop the item silently — UI exposes edit
+      // only on the currently-active tab anyway.
+      if (sid !== this.currentId) return;
+      this.input = item.text || "";
+      this.pendingImages = (item.pendingImages || []).slice();
+      this.pendingDocs = (item.pendingDocs || []).slice();
+      this.$nextTick(() => {
+        const ta = this.$refs.chatInput;
+        if (ta) { this.autoGrow(ta); ta.focus(); }
+      });
+    },
+    resumeQueueDrain(sid) {
+      const st = this.tabState[sid];
+      if (!st) return;
+      st._queuePaused = false;
+      this._drainPendingQueue(sid);
+    },
+    discardQueue(sid) {
+      const st = this.tabState[sid];
+      if (!st || !st.pendingQueue) return;
+      st.pendingQueue.length = 0;
+      st._queuePaused = false;
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
     // from the backend and merge it into tabState[sid].sessionUsage. Limit
@@ -3127,9 +3244,10 @@ function portal() {
       const limit = u.context_limit || 0;
       const pct = u.context_used_pct || 0;
       if (this._compacting) {
+        const qn = this._currentQueueLen();
         return this.lang === "zh"
-          ? `📦 压缩进行中，已排队 ${this._compactQueue.length} 条`
-          : `📦 Compact in progress (${this._compactQueue.length} queued)`;
+          ? `📦 压缩进行中，已排队 ${qn} 条`
+          : `📦 Compact in progress (${qn} queued)`;
       }
       if (!limit) return this.lang === "zh" ? "上下文 …" : "Context …";
       const used_s = (used / 1000).toFixed(1) + "K";
@@ -3154,7 +3272,7 @@ function portal() {
         try { return this.ctxMeterLabel(); }
         catch { return ""; }
       }
-      const q = (this._compactQueue && this._compactQueue.length) || 0;
+      const q = this._currentQueueLen();
       if (this.lang === "zh") {
         return q ? `📦 压缩中… 消息队列 ${q}` : "📦 压缩中…";
       }
@@ -3173,6 +3291,10 @@ function portal() {
       // horizontally (many sessions open), keyboard shortcuts / programmatic
       // activation would otherwise leave the active tab hidden off-screen.
       this.$nextTick(() => this._scrollTabIntoView(tid));
+      // Drain any queue that was waiting for this tab to become active.
+      // _drainPendingQueue checks busy + paused + sid===currentId, so this
+      // is safe to call unconditionally.
+      this.$nextTick(() => this._drainPendingQueue(tid));
     },
     _scrollTabIntoView(tid) {
       const strip = document.querySelector(".chat-tabs-list");
@@ -5583,37 +5705,13 @@ function portal() {
         this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + e.message, "error", 5000);
       } finally {
         this._compacting = false;
-        // Queued messages: ask the user before flushing. Auto-sending all
-        // queued messages was surprising — the user could end up with 3
-        // unexpected user-bubbles when they thought compact would let them
-        // re-evaluate context first.
-        if (this._compactQueue.length > 0) {
-          const n = this._compactQueue.length;
-          const previewLines = this._compactQueue
-            .map((q, i) => `${i + 1}. ${(q.text || "").slice(0, 50)}`)
-            .join("\n");
-          const ok = await this.confirm({
-            title: this.lang === "zh"
-              ? `压缩期间排队了 ${n} 条消息`
-              : `${n} message(s) queued during compact`,
-            body: this.lang === "zh"
-              ? `要依次发送吗？取消会全部丢弃。\n\n${previewLines}`
-              : `Send them sequentially? Cancel discards all.\n\n${previewLines}`,
-            okText: this.lang === "zh" ? `发送 ${n} 条` : `Send ${n}`,
-            cancelText: this.lang === "zh" ? "丢弃" : "Discard",
-          });
-          if (ok) {
-            while (this._compactQueue.length > 0) {
-              const q = this._compactQueue.shift();
-              this.input = q.text;
-              this.pendingImages = q.pendingImages || [];
-              this.pendingDocs = q.pendingDocs || [];
-              await this.send();
-            }
-          } else {
-            this._compactQueue.length = 0;
-          }
-        }
+        // Queued messages auto-drain. Same pendingQueue + drain path as
+        // streaming-in-flight (see _drainPendingQueue). Earlier versions
+        // used a confirm dialog asking "send N queued?" — user feedback
+        // (2026-05-22) made it automatic to match the streaming queue UX.
+        // If a message errors out, _queuePaused stops the chain and the
+        // failed user bubble shows a resume/discard CTA.
+        this.$nextTick(() => this._drainPendingQueue(this.currentId));
       }
     },
 
@@ -5776,33 +5874,58 @@ function portal() {
       // to subscribe to the existing TurnBroadcast (empty prompt =
       // attach), all the EventSource handlers below stay the same.
       const isReconnect = !!opts.reconnect;
-      const text = isReconnect ? "" : this.input.trim();
-      // Slash command: intercept BEFORE hitting the SDK. /word or /word arg
-      if (!isReconnect && text.startsWith("/") && !this.streaming) {
+      // Resumed mode: _drainPendingQueue popped a previously-enqueued
+      // message and asked us to send it. Pull text + attachments from
+      // the item (NOT from this.input / this.pendingImages — those may
+      // hold a different draft the user has typed since enqueue).
+      const resumed = opts.resumedItem || null;
+      let text;
+      if (isReconnect) text = "";
+      else if (resumed) text = (resumed.text || "").trim();
+      else text = this.input.trim();
+      // Slash command: intercept BEFORE hitting the SDK. /word or /word arg.
+      // Resumed items can't reach the slash branch — slash is processed
+      // before enqueue, so a queued item is always plain text. While
+      // busy (streaming/compacting), slash commands are intentionally NOT
+      // enqueued — they're meta-actions (/clear, /compact, /export) that
+      // depend on session state at execution time, not user intent at
+      // type time. We toast "wait for this turn to finish" instead.
+      if (!isReconnect && !resumed && text.startsWith("/")) {
         const m = text.match(/^\/(\w+)(?:\s+(.*))?$/);
         if (m) {
+          if (this._isBusy(this.currentId)) {
+            this.toast(this.t("queue.slash_blocked"), "warn", 3000);
+            return;
+          }
           this.input = "";
           this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
           await this._runSlash(m[1], m[2] || "");
           return;
         }
       }
-      const readyImages = isReconnect ? []
-        : this.pendingImages.filter(im => im.id && !im.error);
-      const readyDocs = isReconnect ? []
-        : this.pendingDocs.filter(d => d.id && !d.error);
-      if (!isReconnect) {
-        if ((!text && !readyImages.length && !readyDocs.length)
-            || this.streaming || !this.currentId) return;
+      let readyImages, readyDocs;
+      if (isReconnect) {
+        readyImages = []; readyDocs = [];
+      } else if (resumed) {
+        readyImages = (resumed.pendingImages || []).filter(im => im.id && !im.error);
+        readyDocs = (resumed.pendingDocs || []).filter(d => d.id && !d.error);
       } else {
-        if (this.streaming || !this.currentId) return;
+        readyImages = this.pendingImages.filter(im => im.id && !im.error);
+        readyDocs = this.pendingDocs.filter(d => d.id && !d.error);
       }
-      // Compact in progress → queue the message, drained when compact finishes.
-      // Users keep typing & sending without waiting; the message stays out of
-      // the visible transcript until it's actually dispatched (avoids the
-      // "sent but no response" UX where the bubble sits there for 90 s).
-      if (!isReconnect && this._compacting) {
-        this._compactQueue.push({
+      if (isReconnect) {
+        if (this.streaming || !this.currentId) return;
+      } else {
+        if (!text && !readyImages.length && !readyDocs.length) return;
+        if (!this.currentId) return;
+      }
+      // Busy: streaming OR compacting → park on this session's
+      // pendingQueue. Auto-drain happens on done / compact-finally /
+      // activateTab. Reconnect path skips enqueue (it's already a
+      // subscribe, no new message). Resumed path also skips — by
+      // construction, drain only fires when not busy.
+      if (!isReconnect && !resumed && this._isBusy(this.currentId)) {
+        this._enqueueMessage(this.currentId, {
           text,
           pendingImages: this.pendingImages.slice(),
           pendingDocs: this.pendingDocs.slice(),
@@ -5811,10 +5934,6 @@ function portal() {
         this.pendingDocs = [];
         this.input = "";
         this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
-        this.toast(this.lang === "zh"
-                    ? `📦 压缩中，消息已排队（${this._compactQueue.length}）`
-                    : `📦 Compact in progress, message queued (${this._compactQueue.length})`,
-                    "info", 2200);
         return;
       }
       // If any attachment is still mid-upload, silently wait for it to
@@ -5830,15 +5949,31 @@ function portal() {
       // The send button stays disabled (_sendWaitingForUpload) so a double-
       // tap can't enqueue a second send while we wait.
       if (!isReconnect) {
-        const stillUploading = () =>
-          this.pendingImages.some(im => im.uploading)
+        // For resumed (drained-from-queue) items, the relevant attachments
+        // are the snapshot inside the queue item, not this.pendingImages
+        // (which may belong to a different draft the user has typed since
+        // enqueue). Snapshot stores object refs, so .uploading reflects
+        // current state — we just have to look at the right collection.
+        const stillUploading = () => {
+          if (resumed) {
+            return (resumed.pendingImages || []).some(im => im.uploading)
+              || (resumed.pendingDocs || []).some(d => d.uploading);
+          }
+          return this.pendingImages.some(im => im.uploading)
             || this.pendingDocs.some(d => d.uploading);
+        };
         if (stillUploading()) {
           this._sendWaitingForUpload = true;
           while (stillUploading()) {
             await new Promise(r => setTimeout(r, 80));
           }
           this._sendWaitingForUpload = false;
+        }
+        // The uploads may have just finished — re-resolve ready{Images,Docs}
+        // now that .id is set (eager filter above could have returned empty).
+        if (resumed) {
+          readyImages = (resumed.pendingImages || []).filter(im => im.id && !im.error);
+          readyDocs = (resumed.pendingDocs || []).filter(d => d.id && !d.error);
         }
       }
       // Reconnect mode skips pushing a user msg — the backend already
@@ -5869,7 +6004,10 @@ function portal() {
         ...readyImages.map(im => im.id),
         ...readyDocs.map(d => d.id),
       ];
-      if (!isReconnect) {
+      // Reconnect: nothing to clear. Resumed: input/pendingImages were
+      // already cleared at enqueue time, and the user may have typed a
+      // new draft since — don't touch their work-in-progress.
+      if (!isReconnect && !resumed) {
         this.pendingImages = [];
         this.pendingDocs = [];
         this.input = "";
@@ -6175,6 +6313,13 @@ function portal() {
         if (this.currentId === streamSid) {
           this.$nextTick(() => this.highlightCode(".chat-body"));
         }
+        // Auto-drain the next queued message, if any. nextTick lets
+        // _markDone's streaming=false propagate before _isBusy() reads it.
+        // If an auto-compact was just triggered above (ctx >= 95%), the
+        // drain will hit _compacting=true and bail; the compact-finally
+        // path will pick it up. If the queue's tab isn't the active one,
+        // drain bails too and activateTab handles it on return.
+        this.$nextTick(() => this._drainPendingQueue(streamSid));
       });
       es.addEventListener("error", ev => {
         flushRender();
@@ -6223,6 +6368,13 @@ function portal() {
           this.toast(this._humanizeStreamError(serverError), "error", 6000);
           markUserFailed();
           es.close(); _markDone(); _stopTimer();
+          // Pause auto-drain — same context likely fails the next message
+          // too (quota / auth / cross-vendor signature). The failed user
+          // bubble surfaces a "resume queue (N)" CTA so the user can
+          // explicitly continue after fixing the root cause.
+          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
+            streamState._queuePaused = true;
+          }
           return;
         }
 
@@ -6242,6 +6394,9 @@ function portal() {
                       "error");
           markUserFailed();
           _markDone(); _stopTimer();
+          if (streamState.pendingQueue && streamState.pendingQueue.length > 0) {
+            streamState._queuePaused = true;
+          }
           return;
         }
 
