@@ -2309,22 +2309,21 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
     padding-left: 16px;
     padding-right: 16px;
   }
-  /* Mobile: wrap long code lines inside bubbles instead of horizontal
-     scroll. Mobile users barely notice horizontal scrollbars (no
-     hover state, narrow scrollbar) and routinely complain "the code
-     is cut off". pre-wrap preserves indentation; break-all lets long
-     URLs / flag values break mid-token. Critical side effect: with
-     pre wrapping, its max-content is no longer the long-line width
-     but ~one-character — so it stops blowing up the parent .bubble's
-     fit-content calculation, which means a muse reply with a code
-     block no longer jumps to a wider bubble than a text-only reply.
-     Desktop keeps the original "preserve code formatting, horizontal
-     scroll for long lines" — wider viewport makes that the better
-     trade-off there. */
+  /* Mobile: preserve code formatting, horizontally scroll long lines —
+     matches desktop. Users explicitly asked for this (2026-05-22) over
+     the previous wrap-on-mobile heuristic: pre-wrap mangled indentation
+     and made copy-paste of a config snippet painful. Trade-off: a wide
+     code block may make the bubble auto-expand to its max-width when
+     max-content > screen — that's already capped by the .msg max-width
+     calc above, so the bubble never bleeds past the avatar gutter. */
   .bubble pre, .bubble pre code {
-    white-space: pre-wrap;
-    word-break: break-all;
-    overflow-wrap: anywhere;
+    white-space: pre;
+    word-break: normal;
+    overflow-wrap: normal;
+  }
+  .bubble pre {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
   }
   /* Mobile table fix rolled back — display:block + overflow-x:auto
      made things worse than the original column-crush. Keep the
@@ -2521,11 +2520,18 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .file-link:hover { color: var(--c-accent-hover); background: var(--c-accent-soft); }
 .tool-arg.file-link {
   font-size: inherit;
-  /* Long absolute paths used to wrap onto 3-4 lines and push the bubble
-     full-width. Cap with ellipsis; hover title shows full path. */
+  /* Allow long absolute paths to wrap rather than ellipsis-truncate —
+     mobile users couldn't see which file Muse was Read'ing because the
+     middle of `/home/.../foo.md` was hidden behind …, with no hover
+     state to reveal the tooltip. Wrap at any character so a 100-char
+     path stays readable; -webkit-line-clamp keeps it from eating the
+     whole screen on a 200-char path. */
   display: inline-block; max-width: 100%; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  white-space: normal;
+  word-break: break-all;
+  overflow-wrap: anywhere;
   vertical-align: middle;
+  line-height: 1.4;
 }
 
 /* Code block copy button — hover-revealed on the <pre> ancestor of any
@@ -2628,9 +2634,15 @@ pre.has-copy-btn .code-copy-btn.copied {
   font-family: var(--font-mono); font-size: var(--fs-xs);
 }
 .tool-result.err { border-left-color: var(--c-danger); }
+/* Preserve formatting, scroll long lines horizontally instead of wrapping
+   — matches the bubble code-block convention. Mobile gets touch-momentum
+   via -webkit-overflow-scrolling so the swipe doesn't feel jerky. */
 .tool-result pre {
-  margin: 0; white-space: pre-wrap; word-break: break-word;
-  color: var(--c-fg-2); max-height: 200px; overflow-y: auto;
+  margin: 0;
+  white-space: pre; word-break: normal; overflow-wrap: normal;
+  color: var(--c-fg-2);
+  max-height: 200px; overflow-y: auto; overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* Limit to the inner block. The outer wrapper is `<div class="msg thinking">`
@@ -2666,8 +2678,14 @@ pre.has-copy-btn .code-copy-btn.copied {
   font-weight: var(--fw-semibold);
   opacity: 0.85;
 }
-.thinking pre, .tool-result pre {
+/* Thinking blocks still wrap (it's prose, not code) — only tool_result
+   gets the no-wrap + horizontal-scroll treatment. */
+.thinking pre {
   margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
+  max-height: 240px; overflow-y: auto;
+}
+.tool-result pre {
+  margin: 6px 0 0;
   max-height: 240px; overflow-y: auto;
 }
 .thinking.collapsed, .tool-result.collapsed { padding-bottom: 4px; }
@@ -2692,9 +2710,14 @@ pre.has-copy-btn .code-copy-btn.copied {
    indicator (success / error) remains consistent across kinds.
    ========================================================================== */
 .tool-result-body { margin-top: 6px; }
+/* Default body pre: keep formatting, scroll horizontally. Same convention
+   as bubble code blocks — long log lines shouldn't be silently wrapped. */
 .tool-result-body pre {
-  margin: 0; white-space: pre-wrap; word-break: break-word;
-  color: var(--c-fg-2); max-height: 320px; overflow-y: auto;
+  margin: 0;
+  white-space: pre; word-break: normal; overflow-wrap: normal;
+  color: var(--c-fg-2);
+  max-height: 320px; overflow-y: auto; overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* Bash terminal */
@@ -2705,11 +2728,17 @@ pre.has-copy-btn .code-copy-btn.copied {
   padding: 8px 10px;
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
-  max-height: 360px; overflow-y: auto;
+  max-height: 360px;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
 }
-.bash-term .bash-stdout { color: #d1d5db; margin: 0; white-space: pre-wrap; word-break: break-word; }
+.bash-term .bash-stdout {
+  color: #d1d5db; margin: 0;
+  white-space: pre; word-break: normal; overflow-wrap: normal;
+}
 .bash-term .bash-stderr {
-  color: #f8a4a4; margin: 0; white-space: pre-wrap; word-break: break-word;
+  color: #f8a4a4; margin: 0;
+  white-space: pre; word-break: normal; overflow-wrap: normal;
   border-top: 1px dashed rgba(255,255,255,0.08);
   margin-top: 6px; padding-top: 6px;
 }
@@ -2725,6 +2754,9 @@ pre.has-copy-btn .code-copy-btn.copied {
 .bash-meta.interrupted { background: rgba(255, 200, 80, 0.18); color: #f0c674; }
 
 /* Read with line gutter */
+/* Read with line gutter — long source lines scroll the whole block
+   horizontally rather than wrapping (otherwise the gutter line-number
+   alignment breaks on every wrapped row). */
 .read-gutter {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
@@ -2732,11 +2764,13 @@ pre.has-copy-btn .code-copy-btn.copied {
   border: 1px solid var(--c-fg-4);
   border-radius: var(--r-sm);
   padding: 6px 0;
-  max-height: 360px; overflow-y: auto;
+  max-height: 360px;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
 }
 .read-gutter .read-row {
   display: grid;
-  grid-template-columns: 48px 1fr;
+  grid-template-columns: 48px max-content;
   align-items: baseline;
   padding: 0 8px;
 }
@@ -2749,8 +2783,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .read-gutter .read-code {
   color: var(--c-fg-1);
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: pre;
 }
 
 /* Web cards (WebFetch / WebSearch) */
@@ -2765,24 +2798,34 @@ pre.has-copy-btn .code-copy-btn.copied {
 .web-card-body p { margin: 0.4em 0; }
 .web-card-body a { color: var(--c-accent); }
 
-/* Glob / Grep hit list */
+/* Glob / Grep hit list — preserve formatting, scroll horizontally.
+   Wrapping path:line:content would mangle the columnar alignment that
+   makes the hit list readable. */
 .search-hits {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   background: var(--c-bg-1);
   border-radius: var(--r-sm);
   padding: 6px 8px;
-  max-height: 320px; overflow-y: auto;
+  max-height: 320px;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  white-space: pre;
+  word-break: normal;
 }
 
-/* MCP result */
+/* MCP result — JSON-shaped output, never wrap (would corrupt structure). */
 .mcp-result {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   background: var(--c-bg-1);
   border-radius: var(--r-sm);
   padding: 6px 8px;
-  max-height: 320px; overflow-y: auto;
+  max-height: 320px;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  white-space: pre;
+  word-break: normal;
 }
 
 /* ==========================================================================
@@ -2813,11 +2856,12 @@ pre.has-copy-btn .code-copy-btn.copied {
   font-size: var(--fs-xs);
   max-height: 360px;
   overflow: auto;
+  -webkit-overflow-scrolling: touch;
   padding: 4px 0;
 }
 .diff-line {
   display: grid;
-  grid-template-columns: 18px 1fr;
+  grid-template-columns: 18px max-content;
   padding: 0 4px;
   line-height: 1.4;
 }
@@ -2826,9 +2870,12 @@ pre.has-copy-btn .code-copy-btn.copied {
   text-align: center;
   user-select: none;
 }
+/* Don't wrap diff lines — wrapping mangles the visual correspondence
+   between - / + pairs (a wrapped `del` line lines up with the wrong
+   `ins` line on the next row). Scroll the whole diff strip instead. */
 .diff-line .diff-text {
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: pre;
+  word-break: normal;
 }
 .diff-ins { background: rgba(70, 180, 100, 0.10); }
 .diff-ins .diff-sign { color: #4ec97a; }
