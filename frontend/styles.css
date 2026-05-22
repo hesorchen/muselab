@@ -3999,33 +3999,34 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 
 /* Queued message bubbles — user messages waiting to dispatch after the
-   current turn finishes. Dashed border + accent-tinted background mark
-   them as different from real sent bubbles, but kept fully opaque so
-   the text inside reads at full contrast (an earlier opacity: 0.78
-   wash made the content unreadable on light theme — user feedback
-   2026-05-22). */
+   current turn finishes. Same accent fill + white text as a sent
+   bubble (guarantees contrast on both light and dark themes); the
+   "not yet sent" cue comes from the dashed white border, not from
+   tinting the background or fading the text. Earlier iterations
+   tried color-mix tints and opacity washes — both produced unreadable
+   text on dark theme (user feedback 2026-05-22). */
 .msg.user.queued { align-items: flex-end; }
 .msg.user.queued .bubble {
-  border: 1px dashed var(--c-accent);
-  background: color-mix(in srgb, var(--c-accent) 18%, var(--c-bg-1));
-  color: var(--c-fg-0);
+  background: var(--c-accent);
+  color: white;
+  border: 1px dashed rgba(255, 255, 255, 0.6);
   border-bottom-right-radius: var(--r-sm);
 }
 .queued-header {
   display: flex; align-items: center; gap: 6px;
-  font-size: var(--fs-xs); color: var(--c-fg-1);
+  font-size: var(--fs-xs); color: rgba(255, 255, 255, 0.78);
   margin-bottom: 4px; padding-bottom: 4px;
-  border-bottom: 1px dotted var(--c-bg-4);
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.3);
 }
 .queued-icon { font-size: var(--fs-sm); }
 .queued-label { white-space: nowrap; }
 .queued-act {
   width: 18px; height: 18px;
   display: inline-flex; align-items: center; justify-content: center;
-  background: transparent; border: 0; color: var(--c-fg-2);
+  background: transparent; border: 0; color: rgba(255, 255, 255, 0.78);
   cursor: pointer; padding: 0; border-radius: 4px;
 }
-.queued-act:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.queued-act:hover { background: rgba(255, 255, 255, 0.18); color: white; }
 .queued-act svg { width: 12px; height: 12px; }
 .queued-text {
   white-space: pre-wrap; word-break: break-word;
