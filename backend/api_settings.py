@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import require_token
+# _locate_executable used to live in this module but is now also needed
+# by main.py for the CLI version probe at /api/meta. Both modules import
+# from settings.locate_executable; we keep the underscored alias here so
+# existing call sites in this file continue to work unchanged.
+from .settings import locate_executable as _locate_executable
 
 MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
@@ -522,10 +526,8 @@ _UPGRADE_LOCK = asyncio.Lock()        # serialize upgrades — never run two at 
 _LAST_UPGRADE: dict[str, Any] = {}     # cache last upgrade output for UI replay
 
 
-# Re-export shared helper from settings — _locate_executable used to live
-# here, but it's needed by main.py too (CLI version probe at /api/meta).
-# Both modules now import from settings.locate_executable.
-from .settings import locate_executable as _locate_executable
+# _locate_executable is imported at the top of the module (re-exported
+# from settings) — see the top-level import block.
 
 
 def _current_versions() -> dict:

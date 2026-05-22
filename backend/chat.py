@@ -2160,7 +2160,7 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
         # stderr lines that mention ~/.claude/.credentials.json paths or
         # vendor URLs / 401 echoes carrying API-key prefixes); return a
         # generic message to the client.
-        sys.stderr.write(f"[chat] get_context_usage failed for sid={sid[:8]}: "
+        sys.stderr.write(f"[chat] get_context_usage failed for sid={session_id[:8]}: "
                           f"{type(e).__name__}: {e}\n")
         sys.stderr.flush()
         raise HTTPException(500, "context-usage probe failed") from None
