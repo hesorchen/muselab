@@ -290,20 +290,20 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.2.82"
+version = "0.2.85"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "mcp" },
     { name = "sniffio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/57/3d/f75aaecf476c2b2a903dbba6042171b6683eb91c1f97f3ad894784cec270/claude_agent_sdk-0.2.82.tar.gz", hash = "sha256:3e907b7d2bf52a5917d96a3ce336b8aa5546ea31e29ce826a7f346622cf7f4bf", size = 252053, upload-time = "2026-05-15T03:45:34.251Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/48/db/45b505c472ba11f9434b8f1b77197a465c7dbfca3766ee945159b496734a/claude_agent_sdk-0.2.85.tar.gz", hash = "sha256:179251b285a288e9702fd9af414943c9cd8dc85e4dd86ff8b42cf116523d856f", size = 252062, upload-time = "2026-05-22T01:32:20.694Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/bc/27cf3aec2a24f2ed1f60277de795496b808a761d2a7a3fd34602a2fec37d/claude_agent_sdk-0.2.82-py3-none-macosx_11_0_arm64.whl", hash = "sha256:24ad8ccbcee9afe206ae5d621a9e40a5022ca3eb8c2c672b36916d3e70746e42", size = 61473506, upload-time = "2026-05-15T03:45:38.745Z" },
-    { url = "https://files.pythonhosted.org/packages/96/91/95a83f018dbc8c113233eb542bccf17c1a3f5f689448700daf950602bf5e/claude_agent_sdk-0.2.82-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:13e54d5163d9d4f899c4e2a3f14df597f4e050d5afa104618ccf7bb37b372ad1", size = 63541975, upload-time = "2026-05-15T03:45:46.005Z" },
-    { url = "https://files.pythonhosted.org/packages/be/07/9356fe0e30f988bade6b116ecc602b4a9ae4df34fa055305187a835e36e0/claude_agent_sdk-0.2.82-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:3b0a0e3f0927737f1fc91ee4549185172243a4e8f135d4c1e4f1f1eba91373e1", size = 71212904, upload-time = "2026-05-15T03:45:51.121Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/d9/e2920b4b6c75cf79ec87ebfb4cc4447c78a4f26317cb3fed77e79fcc804e/claude_agent_sdk-0.2.82-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:b05873f9df01c5894930b87f6ca9315f0d97f1563bc2e4dc0fafe0d4a1e31997", size = 71381948, upload-time = "2026-05-15T03:45:56.153Z" },
-    { url = "https://files.pythonhosted.org/packages/89/80/c3ec5a89c735a96d35fe12b6262517169b396ff366149a3b9f4387f797c1/claude_agent_sdk-0.2.82-py3-none-win_amd64.whl", hash = "sha256:71e85e4f50d04cd95e687898092f03648e74e1cd2537583de93370d2da1c0586", size = 71990462, upload-time = "2026-05-15T03:46:01.646Z" },
+    { url = "https://files.pythonhosted.org/packages/32/d0/5d9fa96d3c8e94d6a4055d1ad1ac7c38d247cc20cd65a7f5225448594cd3/claude_agent_sdk-0.2.85-py3-none-macosx_11_0_arm64.whl", hash = "sha256:bbd3ba4bbee6e3878f19c41bfb6855537f9756f522015aca1416398e718f4740", size = 62708299, upload-time = "2026-05-22T01:32:24.548Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/4e/f4d50a8700759bd468a051d18dbfa00283c6be5da6a5dd74434973628f5d/claude_agent_sdk-0.2.85-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:69d2cf2978472aa0d739250a7d20a77fdfb17fedea96c9bda44348b83b92cc45", size = 64753900, upload-time = "2026-05-22T01:32:28.467Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/7a/0f08adee7f9a3d85b496fe6f4a1a88b1ac2ada7b97e2d8bfd582100ec2d2/claude_agent_sdk-0.2.85-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:521a13fbb448ab9fff5fe423a2137ba9482d1e8d76d75f40fa5ed28460955c7e", size = 72391913, upload-time = "2026-05-22T01:32:32.026Z" },
+    { url = "https://files.pythonhosted.org/packages/03/50/cbda24a9cb87ec65f21e4c390d84e83aaaedaee2a3d48bd4d2d136763e84/claude_agent_sdk-0.2.85-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:6f136e24212cb7baa46e1f5153233acfa0ed3da94c13e73e16dbc647ebb7a338", size = 72560984, upload-time = "2026-05-22T01:32:36.175Z" },
+    { url = "https://files.pythonhosted.org/packages/70/73/cc2abce5d1e82a40b8e2e8ce229e1615dabc24b77fcb5998689a7ebdc3af/claude_agent_sdk-0.2.85-py3-none-win_amd64.whl", hash = "sha256:c0b442b7daf96d6e85fe6783f693e6406bbc8a9f873b5f641464373ca7c327bb", size = 73198055, upload-time = "2026-05-22T01:32:40.494Z" },
 ]
 
 [[package]]

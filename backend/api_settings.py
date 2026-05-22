@@ -544,13 +544,28 @@ def _current_versions() -> dict:
 
     The UI should make this distinction clear so users don't think they
     need to install the system CLI when DeepSeek / API-key paths suffice."""
+    import importlib.metadata as _md
     import re
+    # Read SDK version from dist-info (installed package metadata) so a
+    # post-upgrade re-probe sees the NEW version. The obvious
+    # `from claude_agent_sdk import __version__` reads from sys.modules
+    # which still holds the OLD module loaded at process start — uv sync
+    # rewrites site-packages but doesn't touch in-memory imports. With
+    # the import-based probe `after.sdk == before.sdk` always, so
+    # needs_restart stays False and the UI silently skips the restart
+    # prompt — users see "升级完成 ✓" then a table that didn't change.
     sdk_version = None
     try:
-        from claude_agent_sdk import __version__ as _v
-        sdk_version = _v
+        sdk_version = _md.version("claude-agent-sdk")
     except Exception:
-        pass
+        # Editable install / namespace package without dist-info — fall
+        # back to the module attr (gives the cached in-memory version
+        # but at least we report something).
+        try:
+            from claude_agent_sdk import __version__ as _v
+            sdk_version = _v
+        except Exception:
+            pass
 
     def _probe(bin_path: str | None) -> str | None:
         if not bin_path:
