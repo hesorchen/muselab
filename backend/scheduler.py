@@ -52,6 +52,23 @@ _state: dict[str, Any] = {
 }
 
 _scheduler_task: asyncio.Task | None = None
+# Per-task execution lock. Prevents the same scheduled task from running
+# twice concurrently — e.g. user clicks "run now" while the scheduler
+# loop also fires it, or a long-running task overlaps its own next tick.
+# Two concurrent _execute_task calls against the same task share one
+# ClaudeSDKClient (via get_client cache) and the CLI subprocess can only
+# handle one in-flight conversation, so without serialisation the two
+# replies interleave / drop messages. Lock is dict-resident keyed by
+# task id; locks are never deleted (one per task max, negligible memory).
+_task_locks: dict[str, asyncio.Lock] = {}
+
+
+def _task_lock(tid: str) -> asyncio.Lock:
+    lock = _task_locks.get(tid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _task_locks[tid] = lock
+    return lock
 _HISTORY_CAP = 200
 _PREVIEW_CAP_CHARS = 240
 
@@ -345,7 +362,13 @@ async def _execute_task(task: dict) -> None:
     """One full run: send the prompt against the bound session, collect
     the assistant reply, store a history entry. Robust to ANY error in
     the SDK or model — failures are logged into history with the error
-    string so the user sees them in the bell drawer."""
+    string so the user sees them in the bell drawer.
+
+    Serialised per-task: a second concurrent run on the same task id
+    waits for the first to finish. This guards against the "run now"
+    button overlapping the scheduler tick on the same task — both share
+    one ClaudeSDKClient + CLI subprocess and concurrent receive_response
+    calls would interleave / drop messages."""
     from .chat import get_client  # local import — avoids startup cycle
 
     tid = task["id"]
@@ -353,86 +376,87 @@ async def _execute_task(task: dict) -> None:
     reply_text = ""
     error: str | None = None
 
-    try:
-        # Tasks created before the scheduler UI had a model picker stored
-        # model=""; SDK then silently fell back to its built-in default
-        # (which differs from whatever the user has selected in the chat
-        # UI), so the bound session's reply style + capability didn't
-        # match what the user expected. Fall back to muselab's MODEL
-        # default when task.model is empty.
-        from .settings import MODEL as _DEFAULT_MODEL
-        model = task.get("model") or _DEFAULT_MODEL
-        client = await get_client(
-            session_id=sid,
-            model=model,
-            permission="bypassPermissions",
-        )
-        # SDK 0.2.x AssistantMessage.content is a list of dataclass
-        # blocks (TextBlock / ToolUseBlock / ThinkingBlock / …), NOT
-        # plain dicts — so `block.type` doesn't exist as a string. The
-        # original implementation was checking that string and silently
-        # never matching, which left reply_text empty and made every
-        # push notification say "(no reply)". isinstance check is what
-        # chat.py uses too — mirror it here.
-        from claude_agent_sdk import TextBlock
-        await client.query(task["prompt"])
-        async for msg in client.receive_response():
-            tname = type(msg).__name__
-            if tname == "AssistantMessage":
-                for block in getattr(msg, "content", []) or []:
-                    if isinstance(block, TextBlock):
-                        reply_text += getattr(block, "text", "") or ""
-            elif tname == "ResultMessage":
-                break
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-        sys.stderr.write(f"[scheduler] task {tid} ({task['name']}) failed: {error}\n")
-    finally:
-        # Don't touch next_run here — the scheduler_loop already advanced
-        # it before firing, and run_task_now() is explicitly an out-of-band
-        # run that mustn't disturb the regular cadence.
-        now = time.time()
-        task["last_run"] = now
-        preview = reply_text.strip()
-        if len(preview) > _PREVIEW_CAP_CHARS:
-            preview = preview[:_PREVIEW_CAP_CHARS] + "…"
-        entry = {
-            "task_id": tid,
-            "task_name": task["name"],
-            "session_id": sid,
-            "ts": now,
-            "ok": error is None,
-            "error": error,
-            "reply_preview": preview if error is None else None,
-        }
-        _state["history"].append(entry)
-        # Successful runs bump unread; errors also bump so the user
-        # notices them — but they show as red in the UI.
-        _state["unread_count"] = _state.get("unread_count", 0) + 1
-        if len(_state["history"]) > _HISTORY_CAP:
-            _state["history"] = _state["history"][-_HISTORY_CAP:]
-        _save_state()
-        # Fire Web Push to every subscribed device. Gated by the
-        # `notify_scheduled` setting so users can mute scheduled-task pushes
-        # independently from normal turn-done pushes (see api_settings.py).
-        # Errors swallowed — push is best-effort, must never break the loop.
-        if os.environ.get("MUSELAB_NOTIFY_SCHEDULED", "true").lower() != "false":
-            try:
-                from . import push as _push
-                # Prefix with ⏰ so the notification banner is universally
-                # recognizable as muselab scheduler output across both zh
-                # and en users. (Pushes are server-side rendered; we don't
-                # know the user's lang preference, so language-neutral
-                # icon beats either zh or en prose.)
-                title = f"⏰ {task['name']}"
-                if error:
-                    body = f"❌ {error[:120]}"
-                else:
-                    body = (preview[:120] + "…") if len(preview) > 120 else preview
-                _push.send_to_all(title=title, body=body or "—",
-                                  url="/", tag=f"task-{tid}")
-            except Exception as e:
-                sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
+    async with _task_lock(tid):
+        try:
+            # Tasks created before the scheduler UI had a model picker stored
+            # model=""; SDK then silently fell back to its built-in default
+            # (which differs from whatever the user has selected in the chat
+            # UI), so the bound session's reply style + capability didn't
+            # match what the user expected. Fall back to muselab's MODEL
+            # default when task.model is empty.
+            from .settings import MODEL as _DEFAULT_MODEL
+            model = task.get("model") or _DEFAULT_MODEL
+            client = await get_client(
+                session_id=sid,
+                model=model,
+                permission="bypassPermissions",
+            )
+            # SDK 0.2.x AssistantMessage.content is a list of dataclass
+            # blocks (TextBlock / ToolUseBlock / ThinkingBlock / …), NOT
+            # plain dicts — so `block.type` doesn't exist as a string. The
+            # original implementation was checking that string and silently
+            # never matching, which left reply_text empty and made every
+            # push notification say "(no reply)". isinstance check is what
+            # chat.py uses too — mirror it here.
+            from claude_agent_sdk import TextBlock
+            await client.query(task["prompt"])
+            async for msg in client.receive_response():
+                tname = type(msg).__name__
+                if tname == "AssistantMessage":
+                    for block in getattr(msg, "content", []) or []:
+                        if isinstance(block, TextBlock):
+                            reply_text += getattr(block, "text", "") or ""
+                elif tname == "ResultMessage":
+                    break
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            sys.stderr.write(f"[scheduler] task {tid} ({task['name']}) failed: {error}\n")
+        finally:
+            # Don't touch next_run here — the scheduler_loop already advanced
+            # it before firing, and run_task_now() is explicitly an out-of-band
+            # run that mustn't disturb the regular cadence.
+            now = time.time()
+            task["last_run"] = now
+            preview = reply_text.strip()
+            if len(preview) > _PREVIEW_CAP_CHARS:
+                preview = preview[:_PREVIEW_CAP_CHARS] + "…"
+            entry = {
+                "task_id": tid,
+                "task_name": task["name"],
+                "session_id": sid,
+                "ts": now,
+                "ok": error is None,
+                "error": error,
+                "reply_preview": preview if error is None else None,
+            }
+            _state["history"].append(entry)
+            # Successful runs bump unread; errors also bump so the user
+            # notices them — but they show as red in the UI.
+            _state["unread_count"] = _state.get("unread_count", 0) + 1
+            if len(_state["history"]) > _HISTORY_CAP:
+                _state["history"] = _state["history"][-_HISTORY_CAP:]
+            _save_state()
+            # Fire Web Push to every subscribed device. Gated by the
+            # `notify_scheduled` setting so users can mute scheduled-task pushes
+            # independently from normal turn-done pushes (see api_settings.py).
+            # Errors swallowed — push is best-effort, must never break the loop.
+            if os.environ.get("MUSELAB_NOTIFY_SCHEDULED", "true").lower() != "false":
+                try:
+                    from . import push as _push
+                    # Prefix with ⏰ so the notification banner is universally
+                    # recognizable as muselab scheduler output across both zh
+                    # and en users. (Pushes are server-side rendered; we don't
+                    # know the user's lang preference, so language-neutral
+                    # icon beats either zh or en prose.)
+                    title = f"⏰ {task['name']}"
+                    if error:
+                        body = f"❌ {error[:120]}"
+                    else:
+                        body = (preview[:120] + "…") if len(preview) > 120 else preview
+                    _push.send_to_all(title=title, body=body or "—",
+                                      url="/", tag=f"task-{tid}")
+                except Exception as e:
+                    sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 
 
 # ---------- daemon loop ----------
