@@ -29,6 +29,7 @@ to be invisible in the UI after native /compact ran.
 import json
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -95,6 +96,19 @@ def _save_index(items: list[dict]) -> None:
     # so the next caller sees the rename / delete / bump immediately rather
     # than waiting for the TTL to expire.
     invalidate_sessions_cache()
+
+
+# Serialize all index R-M-W. The mutators below (toggle_pin /
+# register_session / delete_session / rename_session / update_*
+# / bump_session) each do _load_index → mutate → _save_index, and two
+# concurrent invocations (e.g. two streams finishing close together
+# both calling bump_session) used to silently drop one update — second
+# write overwrote the first's bump with its own pre-mutation snapshot.
+# threading.Lock works fine because every mutator is called from sync
+# code paths (async handlers either run them directly via FastAPI's
+# threadpool, or via await asyncio.to_thread-style wrappers); the lock
+# is non-reentrant but no mutator calls another while holding it.
+_INDEX_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -189,22 +203,23 @@ def _merge_sdk_with_index(info: Any, m: dict) -> dict:
 def toggle_pin(sid: str) -> bool:
     """Flip the `pinned` flag on a session in the index. Returns the new state.
     Frontend's session picker sorts pinned sessions to the top."""
-    idx = _load_index()
-    for s in idx:
-        if s["id"] == sid:
-            s["pinned"] = not bool(s.get("pinned", False))
-            _save_index(idx)
-            return s["pinned"]
-    # Session exists only in CLI JSONL (no muselab index entry yet) — create
-    # a minimal entry to hold the pin flag.
-    now = time.time()
-    idx.append({
-        "id": sid, "name": "", "model": "", "system_prompt": "",
-        "created_at": now, "updated_at": now,
-        "message_count": 0, "auto_named": True, "pinned": True,
-    })
-    _save_index(idx)
-    return True
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["pinned"] = not bool(s.get("pinned", False))
+                _save_index(idx)
+                return s["pinned"]
+        # Session exists only in CLI JSONL (no muselab index entry yet) — create
+        # a minimal entry to hold the pin flag.
+        now = time.time()
+        idx.append({
+            "id": sid, "name": "", "model": "", "system_prompt": "",
+            "created_at": now, "updated_at": now,
+            "message_count": 0, "auto_named": True, "pinned": True,
+        })
+        _save_index(idx)
+        return True
 
 
 def list_sessions() -> list[dict]:
@@ -278,9 +293,10 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "message_count": message_count,
         "auto_named": auto_named,
     }
-    idx = _load_index()
-    idx.append(meta)
-    _save_index(idx)
+    with _INDEX_LOCK:
+        idx = _load_index()
+        idx.append(meta)
+        _save_index(idx)
     _save_sidecar(sid, {"messages": {}})
     return meta
 
@@ -315,11 +331,12 @@ get_session = get_session_meta
 def delete_session(sid: str) -> bool:
     """Removes muselab's sidecar + index entry. Caller is responsible for
     also calling SDK delete_session() to remove the CLI JSONL."""
-    idx = _load_index()
-    new = [s for s in idx if s["id"] != sid]
-    if len(new) == len(idx):
-        return False
-    _save_index(new)
+    with _INDEX_LOCK:
+        idx = _load_index()
+        new = [s for s in idx if s["id"] != sid]
+        if len(new) == len(idx):
+            return False
+        _save_index(new)
     p = _sidecar_path(sid)
     if p.exists():
         try:
@@ -330,47 +347,51 @@ def delete_session(sid: str) -> bool:
 
 
 def rename_session(sid: str, name: str) -> bool:
-    idx = _load_index()
-    for s in idx:
-        if s["id"] == sid:
-            s["name"] = name
-            s["updated_at"] = time.time()
-            s["auto_named"] = False
-            _save_index(idx)
-            return True
-    return False
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["name"] = name
+                s["updated_at"] = time.time()
+                s["auto_named"] = False
+                _save_index(idx)
+                return True
+        return False
 
 
 def update_model(sid: str, model: str) -> None:
-    idx = _load_index()
-    for s in idx:
-        if s["id"] == sid:
-            s["model"] = model
-            _save_index(idx)
-            return
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["model"] = model
+                _save_index(idx)
+                return
 
 
 # effort is one of: "" (auto/SDK default) | "low" | "medium" | "high" | "xhigh" | "max"
 # Empty string means "let the SDK pick" — same as no override. Stored on the
 # session so picking a deep-research effort on one tab doesn't leak into others.
 def update_effort(sid: str, effort: str) -> None:
-    idx = _load_index()
-    for s in idx:
-        if s["id"] == sid:
-            s["effort"] = effort
-            _save_index(idx)
-            return
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["effort"] = effort
+                _save_index(idx)
+                return
 
 
 def update_system_prompt(sid: str, system_prompt: str) -> bool:
-    idx = _load_index()
-    for s in idx:
-        if s["id"] == sid:
-            s["system_prompt"] = system_prompt
-            s["updated_at"] = time.time()
-            _save_index(idx)
-            return True
-    return False
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["system_prompt"] = system_prompt
+                s["updated_at"] = time.time()
+                _save_index(idx)
+                return True
+        return False
 
 
 # ============================================================================
@@ -409,35 +430,36 @@ def bump_session(sid: str, message_count: int | None = None,
     that `claude --resume` picker shows muselab-created sessions (without
     the ai-title entry, cc's picker silently skips them — only
     `--resume <sid>` explicit resume works)."""
-    idx = _load_index()
-    for s in idx:
-        if s["id"] == sid:
-            s["updated_at"] = time.time()
-            if message_count is not None:
-                s["message_count"] = message_count
-            if turn_count is not None:
-                s["turn_count"] = turn_count
-            is_auto = s.get("auto_named",
-                            s.get("name", "").startswith("新会话"))
-            if is_auto and auto_rename_from:
-                title = title_from_message(auto_rename_from)
-                if title:
-                    s["name"] = title
-                    s["auto_named"] = False
-                    # Propagate to CLI JSONL so cc's `/resume` picker sees us.
-                    # rename_session writes a {"type":"ai-title", "aiTitle":...}
-                    # entry — this is what the picker filters on. Silent on
-                    # FileNotFound (JSONL not created yet) / ValueError.
-                    try:
-                        from claude_agent_sdk import rename_session as _sdk_rn
-                        from .settings import ROOT as _ROOT
-                        if _ROOT is not None:
-                            _sdk_rn(sid, title, directory=str(_ROOT))
-                    except (FileNotFoundError, ValueError):
-                        pass
-                    except Exception as _e:
-                        sys.stderr.write(
-                            f"[sessions] auto-rename ai-title write "
-                            f"failed for {sid}: {type(_e).__name__}: {_e}\n")
-            _save_index(idx)
-            return
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["updated_at"] = time.time()
+                if message_count is not None:
+                    s["message_count"] = message_count
+                if turn_count is not None:
+                    s["turn_count"] = turn_count
+                is_auto = s.get("auto_named",
+                                s.get("name", "").startswith("新会话"))
+                if is_auto and auto_rename_from:
+                    title = title_from_message(auto_rename_from)
+                    if title:
+                        s["name"] = title
+                        s["auto_named"] = False
+                        # Propagate to CLI JSONL so cc's `/resume` picker sees us.
+                        # rename_session writes a {"type":"ai-title", "aiTitle":...}
+                        # entry — this is what the picker filters on. Silent on
+                        # FileNotFound (JSONL not created yet) / ValueError.
+                        try:
+                            from claude_agent_sdk import rename_session as _sdk_rn
+                            from .settings import ROOT as _ROOT
+                            if _ROOT is not None:
+                                _sdk_rn(sid, title, directory=str(_ROOT))
+                        except (FileNotFoundError, ValueError):
+                            pass
+                        except Exception as _e:
+                            sys.stderr.write(
+                                f"[sessions] auto-rename ai-title write "
+                                f"failed for {sid}: {type(_e).__name__}: {_e}\n")
+                _save_index(idx)
+                return
