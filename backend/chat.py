@@ -103,6 +103,17 @@ class TurnBroadcast:
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
         self.subscribers.add(q)
+        # If the turn already finished, finish() has already iterated the
+        # subscriber set and fired the sentinel — but THIS queue wasn't
+        # in it yet. Without seeding the sentinel here, _subscribe_broadcast
+        # would hang on `await q.get()` until the HTTP read times out.
+        # Late subscribers (e.g. a browser reconnecting just after the
+        # turn closed) must still see the replay-then-terminate flow.
+        if self.done:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
