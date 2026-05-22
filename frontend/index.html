@@ -1057,8 +1057,13 @@ window.addEventListener("error", e => {
             <!-- Welcome card — shown ONCE per browser on first chat load.
                  Explains what muselab is + 3 concrete next actions. Dismissed
                  via localStorage flag `muselab.welcomeDismissed`. Stacks
-                 ABOVE the state cards (no-provider / no-claude_md / etc.) —
-                 a new user sees both "welcome" and "set up a model" at once. -->
+                 ABOVE the setup-warn state cards (no-provider / no-claude_md
+                 / empty-archive) — a half-configured user sees both
+                 "welcome" and "set up a model" at once and acts on both.
+                 The "ready / try asking" suggestions card is NOT shown
+                 while welcome is up — see the !showWelcomeCard() guard
+                 below. Two onboarding cards stacked on a fully-set-up
+                 install just feels noisy. -->
             <template x-if="showWelcomeCard()">
               <div class="onboard-card welcome">
                 <button class="welcome-dismiss" @click="dismissWelcome()"
@@ -1107,7 +1112,13 @@ window.addEventListener("error", e => {
                 </div>
               </div>
             </template>
-            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && !contextInfo.archive_empty">
+            <!-- "Try asking Muse" suggestions — defer until the welcome
+                 card is dismissed. Stacking both cards on a fresh, fully-
+                 configured install was redundant (welcome already explains
+                 what to do); user feedback 2026-05-22. The setup-warn
+                 cards above still stack with welcome — those are
+                 actionable and must be visible regardless. -->
+            <template x-if="!showWelcomeCard() && contextInfo.has_any_provider && contextInfo.claude_md_exists && !contextInfo.archive_empty">
               <div class="onboard-card calm">
                 <div class="onboard-card-head">
                   <div class="onboard-card-title" x-text="t('onboard.ready_title')"></div>
