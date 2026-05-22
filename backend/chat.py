@@ -3,6 +3,7 @@ import base64
 import json
 import asyncio
 import re
+import sys
 import time
 import urllib.parse
 import uuid
@@ -16,6 +17,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, TextBlock, ThinkingBlock, ResultMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
+    ClaudeSDKError,
     get_session_messages,
     delete_session as sdk_delete_session,
     rename_session as sdk_rename_session,
@@ -34,15 +36,17 @@ from . import permission_request as perm
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# Clients keyed by (session_id, model) — model is part of the key so that
-# switching model mid-session creates a fresh client for that model (which
-# uses resume=session_id to inherit the conversation history from disk).
-_clients: dict[tuple[str, str], ClaudeSDKClient] = {}
+# Clients keyed by (session_id, model, effort). model + effort are part of
+# the key so that switching model OR reasoning-effort mid-session creates a
+# fresh client (which uses resume=session_id to inherit the conversation
+# history from disk). The effort dimension was added 2026-05-21 so per-tab
+# "research mode" doesn't leak into other tabs of the same session.
+_clients: dict[tuple[str, str, str], ClaudeSDKClient] = {}
 # Tracks the permission_mode currently active on each cached client. SDK
 # doesn't expose a getter, so we shadow what we asked for. Lets a cached
 # client whose mode no longer matches the request swap via
 # client.set_permission_mode() instead of needing a full rebuild.
-_client_permission: dict[tuple[str, str], str] = {}
+_client_permission: dict[tuple[str, str, str], str] = {}
 
 
 class TurnBroadcast:
@@ -508,21 +512,19 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 # only a useless ProcessError. Pre-check and raise a clean message
                 # so the UI can surface "请先配置 Anthropic API key 或运行 claude login"
                 # instead of a generic stream-failure.
-                from claude_agent_sdk._errors import ClaudeSDKError as _SDKErr
                 cred_file = Path.home() / ".claude" / ".credentials.json"
                 if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
                         and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-                    raise _SDKErr(
+                    raise ClaudeSDKError(
                         f"Claude model '{model}' requires auth: either run "
                         f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
                         f"Settings. CLI would exit 1 silently otherwise."
                     )
                 # Capture CLI stderr so vendor 401 / network errors surface
                 # in /tmp/muselab-restart.log instead of vanishing silently.
-                import sys as _sys
                 def _stderr_logger(line: str) -> None:
-                    _sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
-                    _sys.stderr.flush()
+                    sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
+                    sys.stderr.flush()
                 opts_kwargs["stderr"] = _stderr_logger
             # MCP servers: always register the in-process muselab server (for
             # ask_user_question). If user has mcp.json with external servers, merge.
@@ -637,9 +639,10 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 _client_lru.remove(key)
             _client_lru.append(key)
         # Cached client may have been created with a different permission_mode
-        # (the cache key is (sid, model), not (sid, model, permission)). Sync
-        # to the requested mode via SDK's set_permission_mode rather than
-        # rebuilding — saves a CLI subprocess restart.
+        # (the cache key is (sid, model, effort) — permission is NOT part of
+        # the key so swapping permission doesn't trigger a CLI subprocess
+        # rebuild). Sync to the requested mode via SDK's set_permission_mode
+        # — saves a CLI subprocess restart.
         current_perm = _client_permission.get(key)
         if current_perm != permission:
             try:
@@ -2016,7 +2019,10 @@ async def probe_provider(model: str) -> dict:
     key = os.environ.get(p.env_key, "")
     if not key:
         return {"ok": False, "reason": f"{p.env_key} not configured (Settings → Provider API Keys)"}
-    url = p.base_url.rstrip("/") + "/v1/messages"
+    # Use the live-resolved base URL (env override > catalog default) so a
+    # proxy / on-prem URL probe doesn't silently hit the public endpoint.
+    base = endpoints._resolve_base_url(p.env_key) or p.base_url
+    url = base.rstrip("/") + "/v1/messages"
     headers = {
         "x-api-key": key,
         "anthropic-version": "2023-06-01",
@@ -2424,11 +2430,22 @@ async def stream(
     # this session — otherwise the second turn would overwrite the
     # broadcast and the user would lose visibility into the first.
     # Frontend should either reconnect (empty prompt) or wait.
-    if session_id in _active_turns and not _active_turns[session_id].done:
-        async def _busy_gen():
-            yield {"event": "error",
-                    "data": json.dumps({"error": "previous turn still running"})}
-        return EventSourceResponse(_busy_gen())
+    #
+    # The check + reservation MUST happen atomically under _lock — two
+    # near-simultaneous SSE requests on the same sid could otherwise both
+    # pass the "busy?" check (neither sees the other's broadcast yet),
+    # both build their own broadcast, and the later one overwrites
+    # `_active_turns[sid]` — making the first turn's reply silently vanish
+    # from the UI. Reserve a placeholder broadcast under the lock; we'll
+    # fill its `user_text` / images / etc. below once we've parsed them.
+    async with _lock:
+        if session_id in _active_turns and not _active_turns[session_id].done:
+            async def _busy_gen():
+                yield {"event": "error",
+                        "data": json.dumps({"error": "previous turn still running"})}
+            return EventSourceResponse(_busy_gen())
+        broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+        _active_turns[session_id] = broadcast
     # One-session-one-model: if the session already has a locked model,
     # that wins over whatever the frontend's dropdown happens to say. This
     # prevents the "I tried to switch but it didn't take" class of bugs and
@@ -2447,12 +2464,20 @@ async def stream(
     effort_to_use = (s.get("effort") or "").strip()
     # Wrap get_client so SDK / auth pre-check errors surface as SSE error
     # events instead of bubbling up as a 500 (which the frontend can only
-    # render as the generic "stream connection failed" toast).
+    # render as the generic "stream connection failed" toast). Also: release
+    # the reservation we made at the top of NEW-TURN MODE, otherwise this
+    # session's slot stays "busy" forever and subsequent sends get rejected.
     try:
         client = await get_client(session_id, model_to_use, permission,
                                     effort=effort_to_use)
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
+        # Free the reservation so the user can fix their config (e.g. add an
+        # API key) and immediately retry without waiting for any timeout.
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
         async def _early_err_gen():
             yield {"event": "error", "data": json.dumps({"error": err_msg})}
         return EventSourceResponse(_early_err_gen())
@@ -2944,11 +2969,13 @@ async def stream(
     # another subscriber and sees the full reply via replay + live tail.
     BG_TIMEOUT_S = 1800   # 30 minutes — see PR thread for rationale
 
-    broadcast = TurnBroadcast(session_id=session_id, model=model_to_use)
+    # `broadcast` was already reserved under _lock at the top of NEW-TURN
+    # MODE to close the check+insert race. Fill its remaining fields now
+    # that we've parsed prompt + attachments + resolved the actual model.
+    broadcast.model = model_to_use
     broadcast.user_text = prompt
     broadcast.user_images = list(persisted_imgs)
     broadcast.user_docs = list(persisted_docs)
-    _active_turns[session_id] = broadcast
     # Persist an in-flight breadcrumb so a process crash / restart can
     # surface this turn to the user on next boot. Auto-dismiss any
     # stale entry for this sid — starting a new turn supersedes whatever

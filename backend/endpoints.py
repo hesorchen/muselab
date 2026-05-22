@@ -27,13 +27,45 @@ class Provider:
     models: tuple[tuple[str, str], ...]   # ((model_id, short_label), ...)
 
 
+# Default base URLs per provider — used when no env override is set. Resolved
+# at request time (via `_resolve_base_url`) so a Settings UI change to
+# `<PROVIDER>_BASE_URL` takes effect on the next stream() without a restart.
+_DEFAULT_BASE_URLS: dict[str, str] = {
+    "DEEPSEEK_API_KEY":  "https://api.deepseek.com/anthropic",
+    "ZHIPUAI_API_KEY":   "https://open.bigmodel.cn/api/anthropic",
+    # ⚠ 务必用 minimaxi.com (中国主站)；minimax.io 是海外站，
+    # 用同一把 key 测试时返回 401。
+    "MINIMAX_API_KEY":   "https://api.minimaxi.com/anthropic",
+}
+# Map api-key env name → base-url override env name. Self-hosters can point
+# any provider at a proxy / regional mirror via these.
+_BASE_URL_ENV_BY_KEY: dict[str, str] = {
+    "DEEPSEEK_API_KEY":  "DEEPSEEK_BASE_URL",
+    "ZHIPUAI_API_KEY":   "ZHIPUAI_BASE_URL",
+    "MINIMAX_API_KEY":   "MINIMAX_BASE_URL",
+}
+
+
+def _resolve_base_url(env_key: str) -> str:
+    """Look up the current base URL for a provider: env override > default."""
+    override_env = _BASE_URL_ENV_BY_KEY.get(env_key, "")
+    if override_env:
+        v = os.environ.get(override_env, "").strip()
+        if v:
+            return v.rstrip("/")
+    return _DEFAULT_BASE_URLS.get(env_key, "").rstrip("/")
+
+
 # Order matters: longer prefix first wins on match.
+# `base_url` here is the default at module-load time; runtime calls resolve
+# via `_resolve_base_url(env_key)` so users can swap endpoints without
+# restart (handy for proxied / on-prem deployments).
 # Label = full model id (per user preference); the prefix group name in the UI
 # dropdown gives context, model id removes ambiguity.
 CATALOG: tuple[Provider, ...] = (
     Provider(
         prefix="deepseek-",
-        base_url="https://api.deepseek.com/anthropic",
+        base_url=_DEFAULT_BASE_URLS["DEEPSEEK_API_KEY"],
         env_key="DEEPSEEK_API_KEY",
         display="DeepSeek",
         models=(
@@ -45,7 +77,7 @@ CATALOG: tuple[Provider, ...] = (
     ),
     Provider(
         prefix="glm-",
-        base_url="https://open.bigmodel.cn/api/anthropic",
+        base_url=_DEFAULT_BASE_URLS["ZHIPUAI_API_KEY"],
         env_key="ZHIPUAI_API_KEY",
         display="智谱 GLM",
         models=(
@@ -57,9 +89,7 @@ CATALOG: tuple[Provider, ...] = (
     ),
     Provider(
         prefix="minimax-",
-        # ⚠ 务必用 minimaxi.com (中国主站)；minimax.io 是海外站，
-        # 用同一把 key 测试时返回 401。
-        base_url="https://api.minimaxi.com/anthropic",
+        base_url=_DEFAULT_BASE_URLS["MINIMAX_API_KEY"],
         env_key="MINIMAX_API_KEY",
         display="MiniMax",
         models=(
@@ -145,9 +175,13 @@ def env_override(model: str) -> dict[str, str] | None:
     if cred.exists():
         cred.unlink()
 
+    # Resolve base URL at call time so a Settings-UI override (or .env tweak
+    # via `<VENDOR>_BASE_URL`) takes effect on the very next stream() — no
+    # process restart needed. Falls back to the catalog default.
+    base_url = _resolve_base_url(p.env_key) or p.base_url
     merged = dict(os.environ)
     merged.update({
-        "ANTHROPIC_BASE_URL": p.base_url,
+        "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": key,            # primary — x-api-key header
         "ANTHROPIC_AUTH_TOKEN": key,         # belt-and-suspenders for vendors that accept Bearer
         # Defensive: kill OAuth fallback paths.

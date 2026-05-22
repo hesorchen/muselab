@@ -6,6 +6,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`GET /api/settings/mcp/status` 500'd as soon as any client was alive.**
+  Endpoint unpacked the `_clients` cache key into two vars, but the key gained
+  a third dimension (`effort`) on 2026-05-21 — every call after the first
+  turn raised `ValueError: too many values to unpack`. Switched to indexed
+  access (`key[0]`, `key[1]`). Regression test pinned.
+- **Settings → "Default model" didn't actually change new sessions' model.**
+  PUT `/api/settings` wrote `MUSELAB_DEFAULT_MODEL` but `chat.py` reads
+  `settings.MODEL` (← `MUSELAB_MODEL`), so the saved value was echoed back
+  in Settings but ignored everywhere else. Now writes both env vars and
+  hot-patches `settings.MODEL` / `chat.MODEL` in-process so the change
+  takes effect on the very next session. Frontend also updates `this.model`
+  + localStorage so the user's open tabs reflect the new default.
+- **`DEEPSEEK_BASE_URL` (and silent companions for GLM / MiniMax) were dead
+  config.** `.env.example` documented the override and `settings.py` read it,
+  but `endpoints.py` used a hardcoded URL — self-hosters pointing at a
+  proxy / regional mirror got nothing. Added `_resolve_base_url()` that
+  re-reads env at request time and corresponding `ZHIPUAI_BASE_URL` /
+  `MINIMAX_BASE_URL` overrides for parity. Probe endpoint also respects them
+  so the diagnostic "ping" hits the same host as the actual stream.
+- **Scheduler used server-local TZ for `daily / weekly / monthly` windows.**
+  Users running muselab in Docker (default UTC) or on a UTC VPS saw their
+  "daily 09:00" fire at 09:00 UTC = 17:00 Beijing. `ScheduleIn` now accepts
+  `tz_offset_minutes` (east-positive, browser supplies via
+  `-Date.getTimezoneOffset()`); `_compute_next_run` interprets hh:mm in
+  that TZ. Legacy schedules without the field fall back to server-local so
+  existing users' fire times don't shift overnight.
+- **Scheduler silently skipped missed windows after restart.** If muselab
+  was down at the scheduled fire moment, the old code rolled `next_run`
+  forward and that window was just lost. Now `start_scheduler()` fires
+  any enabled task whose `next_run` is in the past once (one catch-up
+  per task even on multi-day outages, to avoid burning N× tokens), then
+  advances. Disabled tasks still get rolled forward without catching up.
+- **`scheduler.create_task` hardcoded `[定时]` prefix on the bound session
+  name.** English users saw a Chinese label in their tab strip. Now uses
+  the same `is_chinese_locale()` probe as the other locale-aware endpoints
+  (profile-intake / organize) — renders `[Scheduled] xxx` for non-zh hosts.
+- **`/api/files/write` was non-atomic + uncapped.** A crash mid-write left
+  the user's file truncated, and there was no size limit (read had a 2 MB
+  cap, write didn't). Switched to `atomic_write_text` (tmpfile + rename)
+  and added a 10 MB hard ceiling — generous for real Markdown but stops a
+  runaway script from filling the disk via this endpoint.
+- **`_backfill_turn_counts` re-walked every JSONL on every restart.** Comment
+  claimed "one-shot" but there was no sentinel; archives with hundreds of
+  sessions paid the IO cost on every boot. Now gated by
+  `sessions/.backfill_done` — delete that file to force a re-run after an
+  SDK upgrade that changes `_is_real_user_prompt` semantics.
+- **`stream()` had a check-then-set race on `_active_turns[sid]`.** Two
+  near-simultaneous sends on the same session could both pass the "busy?"
+  check, both build a `TurnBroadcast`, and the later one would silently
+  clobber the earlier's reply from the UI. Reservation is now done under
+  `_lock`; early-error paths (e.g. `get_client` raises on missing auth)
+  release the reservation so the user can fix config and immediately retry
+  without waiting for any timeout.
+- **`files.grep` used `__import__("os").walk(ROOT)`** even though `os` was
+  already imported at the top — dead style. Replaced with `os.walk(ROOT)`.
+- **Private SDK import.** `chat.get_client` imported `ClaudeSDKError` from
+  the underscore-prefixed `claude_agent_sdk._errors`; moved to the public
+  top-level export so an SDK refactor won't silently break the auth
+  pre-check path.
+- **Stale type annotations in `chat._clients` / `_client_permission`** said
+  `dict[tuple[str, str], ...]` but the actual key has been
+  `(sid, model, effort)` since 2026-05-21. Comments around
+  `set_permission_mode` also referenced the outdated 2-tuple shape.
 - **Docker `docker run` example mounted to `/root/*` instead of `/home/muse/*`.**
   The container's `USER` is `muse` (uid 1000), so bind-mounting host paths
   to `/root` left files unreadable for the running process and OAuth was

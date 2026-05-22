@@ -66,9 +66,16 @@ MODEL = _env("MUSELAB_MODEL", "PORTAL_MODEL", "claude-sonnet-4-6")
 # the read with a try/except, so it's safe if the file doesn't exist yet.
 MCP_CONFIG_PATH = Path(__file__).resolve().parent.parent / "mcp.json"
 
-# Optional non-Claude providers.
+# Optional non-Claude providers. Base URLs default to each vendor's
+# Anthropic-compatible endpoint (NOT the OpenAI-compatible one — Claude
+# Agent SDK speaks Anthropic Messages protocol). Self-hosters can override
+# any of these via env (proxy, regional mirror, on-prem deployment).
+# Read at startup; `endpoints.py` re-reads at request time so a Settings
+# UI tweak takes effect on the next stream without a process restart.
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic")
+ZHIPUAI_BASE_URL = os.environ.get("ZHIPUAI_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
+MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
 
 if not TOKEN:
     raise RuntimeError("MUSELAB_TOKEN must be set in .env")

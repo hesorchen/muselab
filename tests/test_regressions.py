@@ -337,3 +337,165 @@ def test_profile_intake_session_doesnt_clobber_existing_claude_md(
     assert r.status_code == 200
     # File content must be unchanged — seeding only happens when missing.
     assert claude_md.read_text(encoding="utf-8") == custom_content
+
+
+# ============================================================================
+# Bug 9: mcp_status crashed with `too many values to unpack` because the
+# `_clients` cache key gained a third dimension (effort) but this endpoint
+# still unpacked into 2 vars. Caused every call to the MCP status pane to
+# 500 once any client was alive.
+# Fix: index `key[0]`, `key[1]` instead of unpacking.
+# ============================================================================
+
+def test_mcp_status_handles_three_tuple_cache_key(client, auth, monkeypatch):
+    """Stub `_clients` with a 3-tuple key and a fake client, then hit the
+    endpoint — must succeed (return per-session list), not 500."""
+    from backend import chat as _chat
+
+    class _FakeClient:
+        async def get_mcp_status(self):
+            return {"connected": ["muselab"]}
+
+    fake_key = ("fake-sid-abc", "claude-sonnet-4-6", "")
+    saved = dict(_chat._clients)
+    _chat._clients[fake_key] = _FakeClient()
+    try:
+        r = client.get("/api/settings/mcp/status", headers=auth)
+    finally:
+        _chat._clients.clear()
+        _chat._clients.update(saved)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body.get("clients"), list)
+    assert any(c.get("session_id") == "fake-sid-abc" for c in body["clients"])
+
+
+# ============================================================================
+# Bug 10: PUT /api/settings updated MUSELAB_DEFAULT_MODEL but chat.py only
+# reads `settings.MODEL` (← MUSELAB_MODEL). Saving "default model" looked
+# successful but new sessions still used the .env value.
+# Fix: also write MUSELAB_MODEL + push back into settings.MODEL / chat.MODEL.
+# ============================================================================
+
+def test_default_model_change_takes_effect_immediately(client, auth, monkeypatch):
+    """Changing default_model via Settings must update what new sessions get."""
+    from backend import settings as _settings, chat as _chat
+
+    original_model = _settings.MODEL
+    original_chat_model = _chat.MODEL
+    # Avoid mutating the user's real .env during the test — point both at a
+    # temp path. _write_env writes both `MUSELAB_DEFAULT_MODEL` AND
+    # `MUSELAB_MODEL`, and pushes the latter back into the module globals.
+    import tempfile, pathlib
+    tmp_env = pathlib.Path(tempfile.mkstemp(suffix=".env")[1])
+    from backend import api_settings as _api_settings
+    monkeypatch.setattr(_api_settings, "ENV_PATH", tmp_env)
+
+    try:
+        r = client.put(
+            "/api/settings",
+            headers={**auth, "Content-Type": "application/json"},
+            json={"default_model": "claude-haiku-4-5-20251001"},
+        )
+        assert r.status_code == 200, r.text
+        # Both modules must see the new value — without the explicit
+        # push-back, chat.py would keep serving the import-time `MODEL`.
+        assert _settings.MODEL == "claude-haiku-4-5-20251001"
+        assert _chat.MODEL == "claude-haiku-4-5-20251001"
+    finally:
+        _settings.MODEL = original_model
+        _chat.MODEL = original_chat_model
+        tmp_env.unlink(missing_ok=True)
+
+
+# ============================================================================
+# Bug 11: scheduler used naive `datetime.fromtimestamp()` (server-local) for
+# the schedule hh:mm. On a Docker container with default UTC clock, "daily
+# 09:00" fired at 09:00 UTC = 17:00 Beijing — silently shifted vs what the
+# user picked.
+# Fix: ScheduleIn accepts `tz_offset_minutes` (browser supplies east-positive
+# value); _compute_next_run interprets hh:mm in that TZ.
+# ============================================================================
+
+def test_compute_next_run_respects_tz_offset_minutes():
+    """Daily 09:00 in +480 (Beijing) and 09:00 in 0 (UTC) must produce
+    timestamps 8 hours apart for the same calendar day."""
+    from backend.scheduler import _compute_next_run
+    import datetime as _dt
+    # ref_ts = 2026-05-22 00:00:00 UTC (right after midnight, so daily 09:00
+    # today hasn't fired yet in either TZ).
+    ref = _dt.datetime(2026, 5, 22, 0, 0, 0, tzinfo=_dt.timezone.utc).timestamp()
+    beijing = _compute_next_run(
+        {"kind": "daily", "hour": 9, "minute": 0, "tz_offset_minutes": 480}, ref)
+    utc = _compute_next_run(
+        {"kind": "daily", "hour": 9, "minute": 0, "tz_offset_minutes": 0}, ref)
+    assert beijing is not None and utc is not None
+    # Beijing 09:00 = UTC 01:00 — that's 8 hours BEFORE UTC 09:00.
+    assert utc - beijing == 8 * 3600, (
+        f"expected 8h delta, got {(utc - beijing) / 3600:.2f}h "
+        f"(beijing={beijing}, utc={utc})"
+    )
+
+
+# ============================================================================
+# Bug 12: write_file silently used non-atomic write_text → mid-write crash
+# could leave the user's file truncated. And had no size cap → could ingest
+# arbitrarily large bodies.
+# Fix: atomic_write_text + MAX_WRITE_BYTES enforcement.
+# ============================================================================
+
+def test_write_file_uses_atomic_write(client, auth, temp_root):
+    """Writing a file via /api/files/write must leave no .tmp.* siblings
+    behind on success (signature of atomic_write_text vs direct write_text)."""
+    r = client.put(
+        "/api/files/write",
+        headers={**auth, "Content-Type": "application/json"},
+        json={"path": "atomic_test.md", "content": "# hello atomic\n"},
+    )
+    assert r.status_code == 200, r.text
+    target = temp_root / "atomic_test.md"
+    assert target.read_text(encoding="utf-8") == "# hello atomic\n"
+    # No leftover .tmp.<pid> file from atomic_write_text's tmpfile+rename.
+    tmps = list(temp_root.glob("atomic_test.md.tmp.*"))
+    assert tmps == [], f"atomic_write_text left tmpfile behind: {tmps}"
+
+
+def test_write_file_rejects_oversize_payload(client, auth, temp_root):
+    """Body > MAX_WRITE_BYTES must 413 instead of writing the file."""
+    from backend.files import MAX_WRITE_BYTES
+    too_big = "x" * (MAX_WRITE_BYTES + 1)
+    r = client.put(
+        "/api/files/write",
+        headers={**auth, "Content-Type": "application/json"},
+        json={"path": "big.txt", "content": too_big},
+    )
+    assert r.status_code == 413, r.text
+    assert not (temp_root / "big.txt").exists()
+
+
+# ============================================================================
+# Bug 13: backfill_turn_counts re-walked every JSONL on every startup. Should
+# run once, then write a sentinel.
+# ============================================================================
+
+def test_backfill_writes_sentinel_after_run(monkeypatch, tmp_path):
+    """First call writes sentinel; second call is a no-op (early-returns)."""
+    import asyncio
+    from backend import main as _main
+    from backend import sessions as _sess
+
+    saved_sess_dir = _sess.SESS_DIR
+    monkeypatch.setattr(_sess, "SESS_DIR", tmp_path)
+    sentinel = tmp_path / ".backfill_done"
+    try:
+        assert not sentinel.exists()
+        asyncio.run(_main._backfill_turn_counts())
+        assert sentinel.exists(), "sentinel not written after first run"
+        # Second call should early-return without touching anything.
+        mtime_before = sentinel.stat().st_mtime
+        asyncio.run(_main._backfill_turn_counts())
+        assert sentinel.stat().st_mtime == mtime_before, (
+            "backfill ran twice — sentinel gate ineffective"
+        )
+    finally:
+        monkeypatch.setattr(_sess, "SESS_DIR", saved_sess_dir)

@@ -3830,6 +3830,20 @@ function portal() {
           ? `已保存 ${n} 项设置`
           : `Saved ${n} setting${n === 1 ? "" : "s"}`;
         this.toast(msg, "success");
+        // Settings "default model" 改了之后，下一个新建会话应该用新值。
+        // 之前只写了服务端 env，但前端的 this.model 还是 localStorage 里的
+        // 老值 → 用户看不到任何变化。同步前端 + localStorage 让"我改了它生效"
+        // 的预期成立。已建会话有自己 locked model，不受影响。
+        const newDefaultModel = this.settings.draftDefaults.model;
+        if (newDefaultModel && newDefaultModel !== this.model) {
+          this.model = newDefaultModel;
+          this.savePrefs();
+        }
+        const newDefaultPerm = this.settings.draftDefaults.permission;
+        if (newDefaultPerm && newDefaultPerm !== this.permission) {
+          this.permission = newDefaultPerm;
+          this.savePrefs();
+        }
         // 刷新可用 provider 列表
         const r2 = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r2.ok) {
@@ -6602,10 +6616,16 @@ function portal() {
       }
       // Build the schedule dict per kind. Backend's ScheduleIn validates
       // ranges + ignores fields irrelevant to the chosen kind.
+      // tz_offset_minutes is east-positive (Beijing=+480, NYC=-240); JS
+      // reports east-negative so we flip the sign. Sent on every create/
+      // edit so the backend fires at the user's local hh:mm regardless of
+      // where the server clock thinks it is — fixes the Docker/UTC case
+      // where "daily 09:00" fired at 17:00 Beijing time.
       const sched = {
         kind: d.kind,
         hour: Number(d.hour),
         minute: Number(d.minute),
+        tz_offset_minutes: -new Date().getTimezoneOffset(),
       };
       if (d.kind === "weekly") {
         if (!d.weekdays.length) {

@@ -21,7 +21,12 @@ router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
 
 class ScheduleIn(BaseModel):
     """Polymorphic schedule. Frontend sends one shape per kind; only the
-    fields relevant to that kind are required, rest ignored."""
+    fields relevant to that kind are required, rest ignored.
+
+    `tz_offset_minutes` is the user's UTC offset east-positive (Beijing=+480,
+    NYC=-240). Browser supplies via `-new Date().getTimezoneOffset()`. When
+    absent (legacy tasks), scheduler falls back to server-local TZ — keeps
+    existing schedules from drifting after the upgrade."""
     kind: str = Field(pattern="^(daily|weekly|monthly|once)$")
     hour: int = Field(ge=0, le=23)
     minute: int = Field(ge=0, le=59)
@@ -30,6 +35,8 @@ class ScheduleIn(BaseModel):
     year: int | None = Field(default=None, ge=2024, le=2100)   # once
     month: int | None = Field(default=None, ge=1, le=12)       # once
     # 'day' is reused for the day-of-month in `once` too.
+    # ±24h (1440 min) covers every real-world TZ including Kiribati / Samoa.
+    tz_offset_minutes: int | None = Field(default=None, ge=-1440, le=1440)
 
 
 class TaskIn(BaseModel):

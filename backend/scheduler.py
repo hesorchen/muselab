@@ -21,11 +21,26 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .settings import ROOT, atomic_write_text
+from .settings import ROOT, atomic_write_text, is_chinese_locale
+
+
+def _scheduled_label_prefix() -> str:
+    """Locale-aware prefix for scheduler-bound session names. Without this,
+    English users saw `[定时] my task` in their tab strip because the prefix
+    was hardcoded Chinese."""
+    return "[定时] " if is_chinese_locale() else "[Scheduled] "
+
+
+def _server_tz_offset_minutes() -> int:
+    """Server's current UTC offset in minutes (east-positive, matching the
+    cost-dashboard convention). Used as the fallback when a task was
+    persisted before tz_offset_minutes existed."""
+    off = datetime.now().astimezone().utcoffset()
+    return int(off.total_seconds() / 60) if off else 0
 
 # Lazy import target — set at module load
 _STATE_FILE: Path | None = (ROOT / ".muselab" / "scheduler.json") if ROOT else None
@@ -75,8 +90,14 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
     """Return the next epoch-time `schedule` fires (or None if invalid /
     in the past for a one-shot schedule).
 
+    The schedule's hour/minute are interpreted in the user's timezone (passed
+    as `tz_offset_minutes`, east-positive, browser supplies via
+    `-Date.getTimezoneOffset()`). Falls back to the server's current TZ for
+    schedules persisted before the field existed — keeps existing Docker/UTC
+    users from getting their windows shifted overnight.
+
     Supported `kind` values:
-      daily            — every day at hour:minute
+      daily            — every day at hour:minute (user-local)
       weekly           — schedule["weekdays"] is a list of ints 0..6
                           (0=Mon, 6=Sun), at hour:minute
       monthly          — every month on schedule["day"] (1..31), at
@@ -94,7 +115,21 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
         return None
     if not (0 <= h <= 23 and 0 <= m <= 59):
         return None
-    base = datetime.fromtimestamp(ref_ts if ref_ts is not None else time.time())
+    # Resolve target TZ. tz_offset_minutes is east-positive minutes (Beijing
+    # = +480, NYC = -240); 0 is UTC. When the field is missing on a legacy
+    # schedule, mirror the previous behavior (server-local, via
+    # _server_tz_offset_minutes()) so existing users don't see fire times
+    # silently shift.
+    tz_off = schedule.get("tz_offset_minutes")
+    if tz_off is None:
+        tz_off = _server_tz_offset_minutes()
+    try:
+        tz_off = int(tz_off)
+    except (ValueError, TypeError):
+        tz_off = _server_tz_offset_minutes()
+    tz = timezone(timedelta(minutes=tz_off))
+    base = datetime.fromtimestamp(
+        ref_ts if ref_ts is not None else time.time(), tz=tz)
 
     if kind == "daily":
         target = base.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -148,7 +183,7 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
             y = int(schedule["year"])
             mo = int(schedule["month"])
             d = int(schedule["day"])
-            target = datetime(y, mo, d, h, m, 0)
+            target = datetime(y, mo, d, h, m, 0, tzinfo=tz)
         except (KeyError, ValueError, TypeError):
             return None
         if target <= base:
@@ -197,7 +232,8 @@ def create_task(name: str, prompt: str, schedule: dict,
         raise ValueError(f"schedule does not produce a next fire time: {schedule}")
     # Lazy import to avoid backend.sessions ↔ backend.scheduler cycle
     from . import sessions as sess
-    sess_meta = sess.create_session(name=f"[定时] {name}", model=model)
+    sess_meta = sess.create_session(
+        name=f"{_scheduled_label_prefix()}{name}", model=model)
     tid = str(uuid.uuid4())
     task = {
         "id": tid,
@@ -240,7 +276,8 @@ def update_task(tid: str, **changes: Any) -> dict | None:
     if sid and new_name and new_name != old_name:
         try:
             from . import sessions as sess
-            sess.rename_session(sid, f"[定时] {new_name}")
+            sess.rename_session(
+                sid, f"{_scheduled_label_prefix()}{new_name}")
         except Exception as e:
             sys.stderr.write(
                 f"[scheduler] update_task({tid}): bound session {sid} "
@@ -426,14 +463,37 @@ async def _scheduler_loop() -> None:
 
 async def start_scheduler() -> None:
     """Idempotent — main.py startup awaits this. Loads persisted state,
-    recomputes next_run on every task (in case muselab was down past
-    a fire window), and starts the tick loop."""
+    fires any task whose previous window was missed while muselab was
+    down (one catch-up run per task — not N for multi-day outages, to
+    avoid burning N× the tokens on the same prompt), then recomputes
+    next_run and starts the tick loop.
+
+    User-visible behavior: if you scheduled a "daily 09:00" and muselab
+    was offline at 09:00, restarting at 09:30 fires the task once
+    immediately and schedules the next one for tomorrow 09:00 — instead
+    of silently skipping today as the old code did."""
     global _scheduler_task
     if _scheduler_task and not _scheduler_task.done():
         return
     _load_state()
+    now = time.time()
+    missed: list[dict] = []
     for task in _state["tasks"].values():
-        if task.get("schedule"):
-            task["next_run"] = _compute_next_run(task["schedule"])
+        sched = task.get("schedule")
+        if not sched:
+            continue
+        nr = task.get("next_run")
+        # If next_run is in the past AND the task is enabled, the window was
+        # missed while we were down. Disabled tasks just get next_run rolled
+        # forward (no catch-up), matching their "don't fire" intent.
+        if nr and nr <= now and task.get("enabled", True):
+            missed.append(task)
+        task["next_run"] = _compute_next_run(sched)
     _save_state()
+    # Kick off catch-up runs concurrently — same path as scheduler_loop uses.
+    for task in missed:
+        sys.stderr.write(
+            f"[scheduler] catching up missed window for task "
+            f"{task['id']} ({task.get('name','?')})\n")
+        asyncio.create_task(_execute_task(task))
     _scheduler_task = asyncio.create_task(_scheduler_loop())

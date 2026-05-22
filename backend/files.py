@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Q
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
-from .settings import ROOT
+from .settings import ROOT, atomic_write_text
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -457,13 +457,32 @@ class WriteReq(BaseModel):
     content: str
 
 
+# Upper bound on a single editor-save payload. Generous enough for real-world
+# documents (a 10 MB Markdown file is ~3 million words) but stops a runaway
+# script from filling the disk via this endpoint. Matches the spirit of
+# MAX_TEXT_SIZE on the read path.
+MAX_WRITE_BYTES = 10 * 1024 * 1024
+
+
 @router.put("/write", dependencies=[Depends(require_token)])
 def write_file(req: WriteReq) -> dict:
+    """Overwrite a file at `path` with `content`. Atomic (tmpfile + rename),
+    so a crash mid-write leaves the previous content intact instead of a
+    truncated half-file. Capped at MAX_WRITE_BYTES to prevent the editor
+    from accidentally serving as an unbounded ingest path."""
     target = safe_resolve(req.path)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="path is a directory")
+    # Cheap byte count without materializing the encoded bytes twice — Python
+    # caches the str→bytes via the same call atomic_write_text would make,
+    # but this gate runs first so a bad request is rejected before any I/O.
+    if len(req.content.encode("utf-8")) > MAX_WRITE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"content exceeds {MAX_WRITE_BYTES // (1024 * 1024)} MB limit",
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(req.content, encoding="utf-8")
+    atomic_write_text(target, req.content)
     return {"ok": True, "size": target.stat().st_size}
 
 
@@ -635,7 +654,7 @@ def search(q: str, limit: int = 100, show_hidden: bool = False) -> dict:
     if not q_lower:
         return {"entries": []}
     hits: list[dict] = []
-    for dirpath, dirnames, filenames in __import__("os").walk(ROOT):
+    for dirpath, dirnames, filenames in os.walk(ROOT):
         # prune ignored dirs; hidden only when not requested
         dirnames[:] = [d for d in dirnames
                        if d not in SEARCH_IGNORE

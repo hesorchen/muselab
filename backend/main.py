@@ -82,13 +82,19 @@ async def _backfill_turn_counts() -> None:
     """One-shot migration: rewalk each session's JSONL via the SDK and
     rewrite turn_count using the correct (real-prompt-only) filter.
 
-    Idempotent. Safe to run on every startup — sessions whose turn_count
-    is already within tolerance of the recomputed value skip the write.
+    Gated by a sentinel file under sessions/ so we don't re-scan every
+    JSONL on every restart (was adding noticeable boot latency on
+    archives with hundreds of sessions). To force a re-run after an SDK
+    upgrade that changes `_is_real_user_prompt` semantics, delete
+    `sessions/.backfill_done`.
     """
     import asyncio as _asyncio
     from . import sessions as _sess
     from . import chat as _chat
     from .settings import ROOT as _ROOT
+    sentinel = _sess.SESS_DIR / ".backfill_done"
+    if sentinel.exists():
+        return
     try:
         from claude_agent_sdk import get_session_messages as _gsm
     except Exception:
@@ -127,6 +133,12 @@ async def _backfill_turn_counts() -> None:
         sys.stderr.write(
             f"[muselab] backfilled turn_count for {updated} sessions\n")
         sys.stderr.flush()
+    # Drop sentinel even when 0 sessions needed updating — that just means
+    # the archive is already correct; no reason to keep rescanning.
+    try:
+        sentinel.touch()
+    except OSError as e:
+        sys.stderr.write(f"[muselab] backfill sentinel write failed: {e}\n")
 
 
 app = FastAPI(title="muselab", version="0.1.0", lifespan=_lifespan)

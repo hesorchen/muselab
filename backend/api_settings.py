@@ -177,7 +177,12 @@ def put_settings(req: SettingsIn) -> dict:
             updates[env_name] = v
 
     if req.default_model is not None:
+        # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
+        # and the settings GET endpoint (reads `MUSELAB_DEFAULT_MODEL`) agree.
+        # Without this, the user changed "default model" in Settings and saw it
+        # echoed back, but new sessions still used the .env's `MUSELAB_MODEL`.
         updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
+        updates["MUSELAB_MODEL"] = req.default_model
     if req.default_permission is not None:
         updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
     if req.thinking_budget is not None:
@@ -190,6 +195,14 @@ def put_settings(req: SettingsIn) -> dict:
         updates["MUSELAB_NOTIFY_NORMAL"] = "true" if req.notify_normal else "false"
 
     _write_env(updates)
+    # The `chat.py` module captured `MODEL` at import time; if we just touched
+    # `MUSELAB_MODEL` here, existing imports won't see the new value. Push it
+    # back so subsequent stream() calls pick up the new default.
+    if "MUSELAB_MODEL" in updates:
+        from . import settings as _settings
+        _settings.MODEL = updates["MUSELAB_MODEL"]
+        from . import chat as _chat
+        _chat.MODEL = updates["MUSELAB_MODEL"]
     return {"ok": True, "updated": list(updates.keys())}
 
 
@@ -364,7 +377,9 @@ async def mcp_status() -> dict:
         live = list(_chat._clients.items())
     out: list[dict] = []
     for key, client in live:
-        sid, model = key
+        # Cache key is (sid, model, effort) — 3-tuple since 2026-05-21.
+        # Unpacking into 2 vars would crash with ValueError; index instead.
+        sid, model = key[0], key[1]
         try:
             status = await client.get_mcp_status()
             out.append({"session_id": sid, "model": model, "status": status})
