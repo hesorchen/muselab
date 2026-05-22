@@ -15,7 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
-    AssistantMessage, TextBlock, ThinkingBlock, ResultMessage,
+    AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
     ClaudeSDKError,
     get_session_messages,
@@ -2935,6 +2935,26 @@ async def stream(
                            "data": json.dumps(
                                _render_tool_result(block, tool_name=tname))}
 
+        async def _handle_user_message(msg):
+            """SDK emits a `UserMessage` after every tool the agent ran —
+            its `content` list carries `ToolResultBlock`s. Without this
+            handler the result of every Read/Bash/Edit/etc. was silently
+            dropped on the floor (the FE only ever saw the `tool_use`
+            half of the round trip). 2026-05-22 audit fix.
+
+            tool_use_id matches the prior ToolUseBlock; we look up its
+            name from `tool_use_names` so the FE renderer (Bash terminal,
+            Read gutter, …) can pick the right per-tool view."""
+            content = getattr(msg, "content", None)
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, ToolResultBlock):
+                        tu_id = getattr(block, "tool_use_id", "") or ""
+                        tname = tool_use_names.get(tu_id, "")
+                        yield {"event": "tool_result",
+                               "data": json.dumps(
+                                   _render_tool_result(block, tool_name=tname))}
+
         async def _handle_result_message(msg):
             """ResultMessage = turn complete. Update cumulative cost / stats,
             write per-message sidecar annotations, bump session metadata, then
@@ -3163,6 +3183,14 @@ async def stream(
                         yield ev
                 elif isinstance(msg, AssistantMessage):
                     async for ev in _handle_assistant_message(msg):
+                        yield ev
+                elif isinstance(msg, UserMessage):
+                    # SDK emits a UserMessage after every tool the agent
+                    # invoked — its content carries the ToolResultBlocks.
+                    # Without this dispatch, every Read/Bash/Edit result
+                    # was silently dropped on the floor; the FE only saw
+                    # the tool_use half of the round trip.
+                    async for ev in _handle_user_message(msg):
                         yield ev
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):
