@@ -5694,12 +5694,6 @@ function portal() {
       if (s.budget_usd > 0) parts.push(`${this.t("cost.budget")} ${s.budget_used_pct}% of $${s.budget_usd}`);
       return parts.join("\n");
     },
-    ctxMeterTitle() {
-      const u = this.sessionUsage;
-      return `${this.t("ctx.tip_line1")}\n` +
-             `${(u.context_used || u.input_tokens || 0).toLocaleString()} / ${u.context_limit.toLocaleString()} tokens (${u.context_used_pct}%)\n\n` +
-             `${this.t("ctx.tip_line2")}`;
-    },
     ctxMeterLabel() {
       const limit = this.sessionUsage.context_limit || 0;
       // Pre-fetch state — backend hasn't told us the real limit yet.

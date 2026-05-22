@@ -523,12 +523,13 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
   .pane.preview .pane-head .btn-primary { display: none; }
 
-  /* Chat toolbar: keep attach + model + send. Permission / effort /
-     ctx-ring are low-frequency or have other entry points (Settings,
-     the slim ctx-progress bar above the toolbar). */
+  /* Chat toolbar: keep attach + model + ctx-ring + send. Permission and
+     effort are low-frequency on mobile (Settings still provides them).
+     ctx-ring stays since the old hairline progress bar above the toolbar
+     was removed (2026-05-22) — ring is now the sole context-usage
+     surface, on every viewport. */
   .chat-toolbar-permission,
-  .chat-toolbar-effort,
-  .chat-toolbar-ring { display: none; }
+  .chat-toolbar-effort { display: none; }
 
   /* Chat tab strip: horizontal-scroll session list eats vertical
      room and is fiddly on touch. Replace with a single "current
@@ -3837,27 +3838,6 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .jump-bottom:hover { background: var(--c-accent-hover); transform: scale(1.05); }
 .jump-bottom svg { width: 18px; height: 18px; }
-
-/* Hairline progress bar under the chat header — replaces the older
-   .ctx-meter strip. Just shows raw percentage; text/actions moved to
-   the chat-input toolbar below. */
-.ctx-progress {
-  height: 2px; background: var(--c-bg-2);
-  flex-shrink: 0; overflow: hidden;
-}
-.ctx-progress-fill {
-  height: 100%; background: var(--c-accent);
-  transition: width var(--t-base), background var(--t-base);
-}
-.ctx-progress.warn .ctx-progress-fill { background: #f59e0b; }
-.ctx-progress.danger .ctx-progress-fill { background: var(--c-danger, #dc3545); }
-.ctx-progress.compacting .ctx-progress-fill {
-  width: 100% !important;
-  background: linear-gradient(90deg,
-    var(--c-accent) 0%, rgba(255,255,255,0.4) 50%, var(--c-accent) 100%);
-  background-size: 200% 100%;
-  animation: ctx-meter-shimmer 1.2s linear infinite;
-}
 
 /* VSCode-Claude style bottom input area:
      row 1: pending attachments (when any)

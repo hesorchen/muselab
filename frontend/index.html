@@ -770,20 +770,6 @@ window.addEventListener("error", e => {
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
 
-      <!-- Hairline progress bar (was the prominent ctx-meter strip). The
-           text + actions moved into the chat-input toolbar below. Bar stays
-           for at-a-glance percentage. Color shifts warn → danger via class. -->
-      <div class="ctx-progress"
-           :class="{
-             warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
-             danger: sessionUsage.context_used_pct >= 90,
-             compacting: _compacting,
-           }"
-           :title="ctxMeterTitle()">
-        <div class="ctx-progress-fill"
-             :style="`width: ${Math.min(100, sessionUsage.context_used_pct || 0)}%`"></div>
-      </div>
-
       <!-- Context breakdown popup — shows SDK get_context_usage() output
            with per-category token counts so the user can see which slice
            (system prompt / tools / memory / messages / mcp) is dominating. -->
