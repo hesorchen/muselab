@@ -5661,6 +5661,18 @@ function portal() {
       // Only on the empty-chat screen — once the user has sent a turn,
       // they've clearly oriented themselves and the welcome card is noise.
       if (this.messages && this.messages.length) return false;
+      // Once the user has crossed the setup finish line (provider auth
+      // + CLAUDE.md), the suggestions card is more useful than the
+      // "what is muselab" intro. The welcome card stays for users
+      // who still need to finish onboarding (it sits ABOVE the
+      // setup-warn cards to frame the steps they're about to take).
+      // User feedback 2026-05-22: configured users were seeing welcome
+      // every new session and missing the prompt suggestions.
+      if (this.contextInfo
+          && this.contextInfo.has_any_provider
+          && this.contextInfo.claude_md_exists) {
+        return false;
+      }
       return true;
     },
     dismissWelcome() {
