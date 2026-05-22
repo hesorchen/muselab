@@ -502,6 +502,14 @@ async def start_scheduler() -> None:
     _load_state()
     now = time.time()
     missed: list[dict] = []
+    # Cap catch-up window at 24 h. Without this, a task whose next_run
+    # is N days stale (muselab was offline a week, or the task was
+    # disabled-then-re-enabled mid-flight weeks ago and its stale
+    # next_run got carried forward) fires immediately on startup with
+    # a prompt that was contextually relevant a week ago. 24 h is
+    # generous enough to cover overnight outages while filtering
+    # actually-stale entries.
+    _CATCHUP_MAX_AGE_S = 24 * 3600
     for task in _state["tasks"].values():
         sched = task.get("schedule")
         if not sched:
@@ -510,8 +518,14 @@ async def start_scheduler() -> None:
         # If next_run is in the past AND the task is enabled, the window was
         # missed while we were down. Disabled tasks just get next_run rolled
         # forward (no catch-up), matching their "don't fire" intent.
-        if nr and nr <= now and task.get("enabled", True):
+        if (nr and nr <= now and task.get("enabled", True)
+                and (now - nr) < _CATCHUP_MAX_AGE_S):
             missed.append(task)
+        elif nr and nr <= now and task.get("enabled", True):
+            sys.stderr.write(
+                f"[scheduler] skipping stale catch-up for task "
+                f"{task.get('id','?')} ({task.get('name','?')}): "
+                f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
         task["next_run"] = _compute_next_run(sched)
     _save_state()
     # Kick off catch-up runs concurrently — same path as scheduler_loop uses.
