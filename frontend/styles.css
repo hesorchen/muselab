@@ -4797,8 +4797,25 @@ pre.has-copy-btn .code-copy-btn.copied {
   padding: 1px 8px; border-radius: 999px;
   font-size: 10px; font-weight: var(--fw-semibold);
   background: var(--c-accent-soft); color: var(--c-accent);
+  /* Without nowrap a narrow viewport (mobile, the rightmost column
+     squeezed by the long-Chinese-name first column) wraps "有更新"
+     into three vertical glyphs. Badges are short labels — they must
+     stay on one line or be hidden entirely. */
+  white-space: nowrap;
 }
 .upgrade-badge.ok { background: var(--c-bg-2); color: var(--c-fg-3); }
+/* Same problem on the inline "升级" / "Upgrade" button — wraps to
+   "升 / 级" on mobile. Force one-line + give it breathing room. */
+.version-table .btn-ghost.xs { white-space: nowrap; }
+/* Mobile: stack the action cell vertically (badge above, button below)
+   so the rightmost column doesn't compete for horizontal width with
+   the long Chinese label in the first column. */
+@media (max-width: 720px) {
+  .version-table td:last-child {
+    display: flex; flex-direction: column;
+    align-items: flex-end; gap: 4px;
+  }
+}
 .settings-hint.warn { color: var(--c-warning, #b45309); margin-top: 8px; }
 
 .upgrade-result {
