@@ -3979,14 +3979,10 @@ pre.has-copy-btn .code-copy-btn.copied {
 .chat-toolbar-send svg { width: 14px; height: 14px; }
 .chat-toolbar-send.btn-danger { background: var(--c-danger, #dc3545); }
 .chat-toolbar-send.btn-danger:hover { background: #b91c2c; }
-/* Secondary variant — same 26×26 base as send/stop, neutral fill.
-   Used by the queue button so it visually pairs with stop (the two
-   only differ in color, not shape/size/border). */
-.chat-toolbar-send.neutral { background: var(--c-bg-3); color: var(--c-fg-0); }
-.chat-toolbar-send.neutral:hover:not(:disabled) { background: var(--c-bg-4); }
-/* The Send label inside the button — hidden by default (icon-only).
-   .show-label class would expose it for users who want the wider button. */
-.chat-toolbar-send > span:last-child { display: none; }
+/* The Send / Stop label inside the button — hidden by default
+   (icon-only). Use nth-child(2) instead of :last-child because the
+   queue badge is a 3rd <span> sibling that must stay visible. */
+.chat-toolbar-send > span:nth-child(2) { display: none; }
 /* Queue button: full sizing inherits from .chat-toolbar-send +
    .neutral above. This class only carries the position context for
    the absolute-positioned badge below. */

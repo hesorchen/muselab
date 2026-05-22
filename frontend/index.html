@@ -1998,24 +1998,19 @@ window.addEventListener("error", e => {
                  the click effectively becomes synchronous from the user's
                  POV. Without this disabling, double-tap could queue two
                  sends for the same upload. -->
-            <button x-show="!streaming" @click="send()"
+            <!-- Send button — always visible. send() routes the click:
+                 idle → fire SSE; streaming/compacting → enqueue onto
+                 tabState[currentId].pendingQueue. A small badge in the
+                 corner surfaces the current backlog count. The title
+                 swaps to reflect what the click will actually do, so
+                 the user always knows. The neighboring stop button only
+                 shows while streaming. Same shape + size + fill — they
+                 read as a sibling pair (blue send / red stop). -->
+            <button @click="send()"
                     :disabled="_sendWaitingForUpload || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
-                    class="btn-primary chat-toolbar-send" :title="t('btn.send')">
+                    class="btn-primary chat-toolbar-send chat-toolbar-queue"
+                    :title="streaming ? t('queue.button_hint') : t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
-            </button>
-            <!-- Queue-send: visible while streaming/compact. send() detects
-                 the busy state and routes to _enqueueMessage. Disabled when
-                 input + attachments are empty, otherwise click parks the
-                 message on tabState[currentId].pendingQueue. Sized as a
-                 26×26 square to match the stop button right next to it
-                 (icon-only siblings read as a pair); a small badge in the
-                 corner surfaces the current backlog count. -->
-            <button x-show="streaming"
-                    @click="send()"
-                    :disabled="!input.trim() && !pendingImages.length && !pendingDocs.length"
-                    class="chat-toolbar-send chat-toolbar-queue neutral"
-                    :title="t('queue.button_hint')">
-              <svg><use href="#i-plus"/></svg>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>

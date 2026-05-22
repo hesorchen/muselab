@@ -2525,15 +2525,15 @@ function portal() {
       if (!this.tabState[id]) {
         this.tabState[id] = this._blankTabState();
         // First-time creation: pull any queue items localStorage saved
-        // for this sid from a previous session. If restore brings back
-        // pending items, kick a drain on next tick — _drainPendingQueue
-        // self-gates on busy / paused / sid===currentId, so it's safe to
-        // call unconditionally (e.g. for inactive tabs it just no-ops).
+        // for this sid from a previous session. We deliberately do NOT
+        // trigger a drain here — if the session has an in-flight turn
+        // from before the reload, _checkActiveTurn() will fire a
+        // reconnect SSE, and an eager drain would race it (backend
+        // rejects the second SSE with "previous turn still running",
+        // surfacing as a spurious "send failed" toast right at boot).
+        // Drain is fired from _checkActiveTurn / activateTab / done
+        // events — all of which know the live streaming state.
         this._loadQueueFromStorage(id);
-        const st = this.tabState[id];
-        if (st.pendingQueue && st.pendingQueue.length && !st._queuePaused) {
-          this.$nextTick(() => this._drainPendingQueue(id));
-        }
       }
       return this.tabState[id];
     },
@@ -3807,15 +3807,27 @@ function portal() {
                                { headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
-        if (!d.active || this.currentId !== sid) return;
-        if (this.streaming) return;
-        // Reconnect any time the backend says there's an active turn.
-        // get_session_api returns SDK-only messages (no broadcast
-        // overlay), so loadSession's view is just the user msg — the
-        // SSE replay we kick off here will refill thinking / text /
-        // tool blocks live. Fire-and-forget; the SSE handlers populate
-        // messages as events arrive.
-        this.send({ reconnect: true });
+        if (this.currentId !== sid) return;
+        if (d.active && !this.streaming) {
+          // Reconnect any time the backend says there's an active turn.
+          // get_session_api returns SDK-only messages (no broadcast
+          // overlay), so loadSession's view is just the user msg — the
+          // SSE replay we kick off here will refill thinking / text /
+          // tool blocks live. Fire-and-forget; the SSE handlers populate
+          // messages as events arrive. Drain (if any pending queue) will
+          // fire automatically when this reconnected turn's done event
+          // lands, via the done-handler's _drainPendingQueue hook.
+          this.send({ reconnect: true });
+          return;
+        }
+        // No active turn — safe to drain a restored queue right now.
+        // Without this hook a queue saved to localStorage stays parked
+        // after page reload until the user types something or switches
+        // tabs (no done event will ever fire for a freshly-loaded
+        // session with no streaming).
+        if (!d.active && !this.streaming) {
+          this._drainPendingQueue(sid);
+        }
       } catch (e) { /* silent */ }
     },
 
@@ -6006,6 +6018,11 @@ function portal() {
         this.pendingDocs = [];
         this.input = "";
         this.$nextTick(() => { if (this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
+        // Scroll the chat-body to the bottom so the new queued bubble is
+        // visible. Without this the user can be scrolled mid-history and
+        // would never see their just-enqueued message land.
+        this.atBottom = true;
+        this.scrollToBottom(true);
         return;
       }
       // If any attachment is still mid-upload, silently wait for it to
