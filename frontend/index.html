@@ -2013,7 +2013,12 @@ window.addEventListener("error", e => {
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
             </button>
-            <button x-show="streaming" @click="stop()" class="btn-danger chat-toolbar-send" :title="t('btn.stop') + ' (Esc)'">
+            <button x-show="streaming" @click="stop()" class="btn-danger chat-toolbar-send"
+                    :title="_currentQueueLen() > 0
+                              ? (lang==='zh'
+                                  ? '撤回队尾（队列 ' + _currentQueueLen() + ' 条）'
+                                  : 'Pop last queued (' + _currentQueueLen() + ' waiting)')
+                              : (t('btn.stop') + ' (Esc)')">
               <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
             </button>
           </div>

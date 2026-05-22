@@ -6580,13 +6580,31 @@ function portal() {
       };
     },
     stop() {
-      // Stop only the active tab's stream — other tabs keep running their
-      // own. Uses tabState[currentId] as the authoritative source for what
-      // ES to close. Backend uses SDK's client.interrupt() — keeps the
-      // client / CLI subprocess alive so the next message continues the
-      // same conversation without reloading CLAUDE.md / MCP / system prompt.
+      // Two-stage stop:
+      //   1. If the pending queue is non-empty, pop the TAIL (the
+      //      most-recently enqueued message) and toast what was removed.
+      //      The current streaming turn is left alone — the assumption
+      //      is "I just typed something I want to take back, but keep
+      //      the reply that's already running."
+      //   2. Once the queue is empty, the same button interrupts the
+      //      in-flight turn (the original stop behaviour).
+      // The button title swaps to communicate which action will fire.
       const sid = this.currentId;
       const st = this._ensureTabState(sid);
+      if (st && st.pendingQueue && st.pendingQueue.length > 0) {
+        const removed = st.pendingQueue.pop();
+        this._saveQueueToStorage(sid);
+        const preview = (removed.text || "").trim().slice(0, 40);
+        this.toast(this.lang === "zh"
+                    ? `已撤回队列最后一条：${preview}…`
+                    : `Removed last queued: ${preview}…`,
+                    "info", 2200);
+        return;
+      }
+      // Queue empty — interrupt the active turn (original behaviour).
+      // Backend uses SDK's client.interrupt() — keeps the client / CLI
+      // subprocess alive so the next message continues the same
+      // conversation without reloading CLAUDE.md / MCP / system prompt.
       if (st.es) { try { st.es.close(); } catch {} st.es = null; }
       st.streaming = false;
       this.streaming = false; this.es = null;
