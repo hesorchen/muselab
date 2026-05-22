@@ -2123,7 +2123,14 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
         # whichever fields it wants to render.
         return dict(breakdown)
     except Exception as e:
-        raise HTTPException(500, f"get_context_usage failed: {e}")
+        # Log the raw exception to stderr (it can contain CLI subprocess
+        # stderr lines that mention ~/.claude/.credentials.json paths or
+        # vendor URLs / 401 echoes carrying API-key prefixes); return a
+        # generic message to the client.
+        sys.stderr.write(f"[chat] get_context_usage failed for sid={sid[:8]}: "
+                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "context-usage probe failed") from None
 
 
 @router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
@@ -2145,7 +2152,10 @@ async def native_compact_session_api(sid: str) -> dict:
         async for _ in client.receive_response():
             pass
     except Exception as e:
-        raise HTTPException(500, f"native /compact failed: {e}")
+        sys.stderr.write(f"[chat] native /compact failed for sid={sid[:8]}: "
+                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "native /compact failed — see server log") from None
     # Refresh message_count + turn_count so the sidebar reflects the
     # compacted size. turn_count uses the real-prompt filter — see the
     # comment on _is_real_user_prompt for why bare `type == "user"` over-
@@ -2191,7 +2201,10 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(500, f"fork failed: {e}")
+        sys.stderr.write(f"[chat] fork session failed for sid={sid[:8]}: "
+                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "fork failed — see server log") from None
     new_sid = result.session_id
     new_name = req.title or ((src_meta.get("name") or "会话") + " (分支)")
     sess.register_session(
@@ -2961,6 +2974,10 @@ async def stream(
     persisted_imgs: list[dict] = []
     persisted_docs: list[dict] = []
     if image_ids:
+        # Sweep expired entries before consuming. Previously _gc_images
+        # only ran on upload, so a user who never uploaded again would
+        # leak their old attachments in memory past TTL. Reads check too.
+        _gc_images()
         for aid in [x.strip() for x in image_ids.split(",") if x.strip()]:
             entry = _image_store.pop(aid, None)
             if entry is None:

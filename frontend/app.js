@@ -2640,27 +2640,42 @@ function portal() {
       // Per design: only drain when the queue's tab is the active one.
       // Otherwise activateTab(sid) will pick it up when the user returns.
       if (sid !== this.currentId) return;
-      const item = st.pendingQueue.shift();
+      // Skip every expired-attachment item up front instead of recursing
+      // (an earlier version recursed once per expired item, stacking N
+      // toasts + N localStorage writes for N adjacent dead items). The
+      // loop ends as soon as we find a sendable head OR run out of items.
+      let item = null;
+      let expiredCount = 0;
+      while (st.pendingQueue.length) {
+        const candidate = st.pendingQueue[0];
+        const enqAgeS = (Date.now() - (candidate.enqueuedAt || 0)) / 1000;
+        const hasAttach = (candidate.pendingImages && candidate.pendingImages.length)
+                         || (candidate.pendingDocs && candidate.pendingDocs.length);
+        if (hasAttach && enqAgeS > 600) {
+          st.pendingQueue.shift();
+          expiredCount++;
+          continue;
+        }
+        if (hasAttach && enqAgeS > 540) {
+          try { this.toast(this.t("queue.attach_expiring"), "warn", 4000); }
+          catch (_) {}
+        }
+        item = st.pendingQueue.shift();
+        break;
+      }
+      // One write covers however many items we dropped + the one we shifted.
       this._saveQueueToStorage(sid);
-      // Backend evicts uploaded attachments after 600 s. Warn at 9 min so
-      // the user knows; the actual abort threshold (10 min) is handled in
-      // send() by checking the upload IDs against pendingImages cache.
-      const enqAgeS = (Date.now() - (item.enqueuedAt || 0)) / 1000;
-      const hasAttach = (item.pendingImages && item.pendingImages.length)
-                       || (item.pendingDocs && item.pendingDocs.length);
-      if (hasAttach && enqAgeS > 540 && enqAgeS <= 600) {
-        try { this.toast(this.t("queue.attach_expiring"), "warn", 4000); }
-        catch (_) {}
+      if (expiredCount > 0) {
+        try {
+          this.toast(this.lang === "zh"
+                      ? `跳过 ${expiredCount} 条附件过期的消息`
+                      : `Skipped ${expiredCount} message(s) with expired attachments`,
+                      "error", 5000);
+        } catch (_) {}
       }
-      if (hasAttach && enqAgeS > 600) {
-        // Drop the message — attachment IDs are dead. Tell the user so
-        // they can re-attach + re-send.
-        try { this.toast(this.t("queue.attach_expired"), "error", 5000); }
-        catch (_) {}
-        // Recurse to keep draining — the next item might be attachment-free.
-        return this._drainPendingQueue(sid);
+      if (item) {
+        this.send({ resumedItem: item });
       }
-      this.send({ resumedItem: item });
     },
     removePendingQueueItem(sid, idx) {
       const st = this.tabState[sid];
@@ -6353,21 +6368,23 @@ function portal() {
         if (this.currentId !== streamSid) {
           streamState.unread = true;
         }
-        // Stamp the tail block of the just-finished turn with a
-        // completion timestamp. A "turn" = a contiguous run of muse-
-        // side messages between two user messages; only its tail msg
-        // carries .ts, and the .turn-footer in index.html renders
-        // "HH:MM" off it. Walk from the end backwards to find the
-        // last non-user message and stamp it (idempotent — we don't
-        // overwrite an existing ts so reconnect scenarios stay clean).
-        // Walking backwards is cheap and avoids needing to track
-        // turn boundaries explicitly.
+        // Stamp the tail of the just-finished turn with a completion
+        // timestamp. A "turn" = contiguous run of muse-side messages
+        // between two user messages; only the tail assistant TEXT
+        // bubble carries .ts so .turn-footer (HH:MM) renders under the
+        // actual reply, not a stray tool_result row that happened to
+        // close the turn. Walk backwards past tool_use / tool_result /
+        // thinking blocks until we hit an assistant text or hit the
+        // user message that started the turn.
         const _now = Date.now();
         for (let k = streamState.messages.length - 1; k >= 0; k--) {
           const m = streamState.messages[k];
           if (m.role === "user") break;          // entered the previous turn
-          if (!m.ts) { m.ts = _now; break; }     // found the tail of this turn
-          break;                                  // already stamped — nothing to do
+          // Skip tool blocks / standalone thinking; they're not the
+          // "reply" the user reads time off.
+          if (m.role !== "assistant") continue;
+          if (!m.ts) m.ts = _now;                // found the tail text bubble
+          break;                                  // stop after the first one (most recent)
         }
         if (this.currentId === streamSid) {
           this.streaming = false;

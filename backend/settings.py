@@ -53,9 +53,16 @@ def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     Survives crash / OOM-kill mid-write — the destination either holds the
     old content or the new content, never a truncated half-write.
     """
+    import secrets
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    # Tmp name must be unique per concurrent caller. PID alone collides
+    # when two asyncio.create_task'd writers (e.g. chat stream's sidecar
+    # writer + sessions.bump_session firing at the same moment) target
+    # the same path inside one process — the second write would overwrite
+    # the first's half-written tmp, then both os.replace race. Add a
+    # random suffix so each call's tmp is distinct.
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
         tmp.write_text(data, encoding=encoding)
         os.replace(tmp, path)
