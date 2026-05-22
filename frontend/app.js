@@ -3779,6 +3779,13 @@ function portal() {
       const max = Math.max(1, ...(this.cost.data?.by_model || []).map(m => this.totalTokens(m)));
       return Math.min(100, (tokens / max) * 100);
     },
+    costVendorPct(tokens) {
+      // Same widget as costModelPct, but normalized against the vendor
+      // rollup so the bars in "By vendor" reflect the relative size of
+      // each vendor's total rather than its largest constituent model.
+      const max = Math.max(1, ...(this.cost.data?.by_vendor || []).map(v => this.totalTokens(v)));
+      return Math.min(100, (tokens / max) * 100);
+    },
     async refreshSkillList() {
       try {
         const r = await fetch("/api/settings/skills", { headers: this.hdr() });

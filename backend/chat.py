@@ -1712,6 +1712,32 @@ def _empty_bucket() -> dict:
              "cost": 0.0, "turns": 0}
 
 
+def _vendor_label_for(model_id: str) -> str:
+    """Pretty vendor name for the cost-dashboard `by_vendor` rollup.
+    Claude lives outside CATALOG (we serve OAuth Pro/Max directly, not via
+    a third-party endpoint) so map it explicitly; third-parties fall through
+    to their CATALOG `display` field; truly unknown ids land in 'Unknown'."""
+    if not model_id:
+        return "Unknown"
+    low = model_id.lower()
+    if low.startswith("claude-"):
+        return "Claude"
+    p = endpoints.lookup(model_id)
+    if p is not None:
+        return p.display
+    return "Unknown"
+
+
+def _cost_reported_for(model_id: str) -> bool:
+    """True when this vendor actually reports USD cost in muselab sidecar
+    (= the FE can trust the $-figure). Currently only the Claude path
+    (Anthropic Pro/Max OAuth or direct API key) populates ResultMessage's
+    `total_cost_usd`; DeepSeek / GLM / MiniMax always come through as 0 and
+    we don't want the dashboard pretending they're free. FE uses this to
+    show a 'cost not tracked — vendor doesn't report USD' footnote."""
+    return (model_id or "").lower().startswith("claude-")
+
+
 def _add_bucket(dst: dict, src: dict) -> None:
     for k, v in src.items():
         if k in dst:
@@ -1782,6 +1808,7 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     last_30d    = _empty_bucket()
     by_day:   dict[str, dict] = defaultdict(_empty_bucket)
     by_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_vendor: dict[str, dict] = defaultdict(_empty_bucket)
 
     # Discover all JSONLs for muselab-tracked sessions. SDK CLI keys
     # the projects dir by the cwd that ran the session, so a single
@@ -1895,6 +1922,12 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
                     }
                     _add_bucket(all_total, turn)
                     _add_bucket(by_model[model_name], turn)
+                    # Roll up to vendor too — same data, vendor granularity.
+                    # "Claude" for Anthropic, vendor display for third-parties
+                    # (DeepSeek / GLM / MiniMax), "Unknown" for stray model
+                    # ids we can't map (rare; CLI / vendor wrapper artifacts).
+                    vendor = _vendor_label_for(model_name)
+                    _add_bucket(by_vendor[vendor], turn)
                     if day_str >= cutoff_day:
                         _add_bucket(by_day[day_str], turn)
                         _add_bucket(last_30d, turn)
@@ -1913,7 +1946,38 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
         dense_days.append({"date": d, **_round_bucket(bucket)})
 
     by_model_list = sorted(
-        [{"model": k, **_round_bucket(v)} for k, v in by_model.items()],
+        [
+            {
+                "model": k,
+                # Friendly label (e.g. "Sonnet 4.6" instead of
+                # "claude-sonnet-4-6") so the FE can show readable names
+                # without re-implementing the mapping.
+                "label": endpoints.label_for(k),
+                "vendor": _vendor_label_for(k),
+                # FE uses this to decorate rows whose cost is "untracked,
+                # not free" with a footnote instead of pretending the
+                # vendor was free.
+                "cost_reported": _cost_reported_for(k),
+                **_round_bucket(v),
+            }
+            for k, v in by_model.items()
+        ],
+        key=lambda x: (x["input_tokens"] + x["output_tokens"]
+                        + x["cache_read_tokens"] + x["cache_creation_tokens"]),
+        reverse=True)
+
+    by_vendor_list = sorted(
+        [
+            {
+                "vendor": k,
+                # Same "we report USD" flag at vendor granularity. A vendor
+                # is cost-reported when at least one of its model ids is —
+                # currently equivalent to "vendor == 'Claude'".
+                "cost_reported": k == "Claude",
+                **_round_bucket(v),
+            }
+            for k, v in by_vendor.items()
+        ],
         key=lambda x: (x["input_tokens"] + x["output_tokens"]
                         + x["cache_read_tokens"] + x["cache_creation_tokens"]),
         reverse=True)
@@ -1927,6 +1991,7 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
         "all_time": _round_bucket(all_total),
         "by_day":   dense_days,
         "by_model": by_model_list,
+        "by_vendor": by_vendor_list,
     }
 
 
@@ -1950,6 +2015,7 @@ def _empty_dashboard_response(days: int, tz_offset_minutes: int, now) -> dict:
         "all_time": _round_bucket(_empty_bucket()),
         "by_day":   dense,
         "by_model": [],
+        "by_vendor": [],
     }
 
 

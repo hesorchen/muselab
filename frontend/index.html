@@ -2406,18 +2406,56 @@ window.addEventListener("error", e => {
                 </template>
               </div>
 
+              <!-- Per-vendor rollup. Lets the user see "GLM total" vs
+                   "Claude total" at a glance instead of mentally summing
+                   sibling rows in the model breakdown below. Same widget
+                   shape so it reads as one continuous section. -->
+              <template x-if="cost.data.by_vendor && cost.data.by_vendor.length > 1">
+                <div>
+                  <div class="cost-block-title"
+                       x-text="lang==='zh' ? '按厂商汇总' : 'By vendor'"></div>
+                  <div class="cost-models">
+                    <template x-for="v in cost.data.by_vendor" :key="v.vendor">
+                      <div class="cost-model-row">
+                        <div class="cost-model-name" x-text="v.vendor"></div>
+                        <div class="cost-model-bar-track">
+                          <div class="cost-model-bar-fill"
+                               :style="`width: ${costVendorPct(totalTokens(v))}%`"></div>
+                        </div>
+                        <div class="cost-model-amount"
+                             x-text="fmtTokens(totalTokens(v)) + ' · ' + v.turns + 'x' + (v.cost_reported ? (v.cost > 0 ? ' · $' + v.cost.toFixed(2) : '') : (lang==='zh' ? ' · $ —' : ' · $ —'))"
+                             :title="!v.cost_reported ? (lang==='zh' ? '该厂商不报告 USD 费用，前端只跟踪 token 数；请去对应 console 看实际账单' : 'Vendor does not report USD cost — track tokens here, see vendor console for real billing') : ''"></div>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
               <!-- Per-model breakdown — tokens primary, cost secondary -->
               <div class="cost-block-title" x-text="t('set.cost.by_model')"></div>
               <div class="cost-models">
                 <template x-for="m in cost.data.by_model" :key="m.model">
                   <div class="cost-model-row">
-                    <div class="cost-model-name" x-text="m.model"></div>
+                    <!-- Show the friendly label + vendor chip; raw model id
+                         is on title= so power users can hover to see e.g.
+                         "claude-sonnet-4-6" while the row reads "Sonnet 4.6". -->
+                    <div class="cost-model-name" :title="m.model">
+                      <span x-show="m.vendor && m.vendor !== 'Claude' && m.vendor !== 'Unknown'"
+                            class="cost-model-vendor-chip" x-text="m.vendor"></span>
+                      <span x-text="m.label || m.model"></span>
+                    </div>
                     <div class="cost-model-bar-track">
                       <div class="cost-model-bar-fill"
                            :style="`width: ${costModelPct(totalTokens(m))}%`"></div>
                     </div>
+                    <!-- For Claude rows show real cost; for vendors without
+                         USD reporting show "$ —" with a tooltip explaining
+                         that token counts are accurate but USD comes from
+                         the vendor's own console. Hiding the $ entirely
+                         (old behavior) made GLM look free, which it isn't. -->
                     <div class="cost-model-amount"
-                         x-text="fmtTokens(totalTokens(m)) + ' · ' + m.turns + 'x' + (m.cost > 0 ? ' · $' + m.cost.toFixed(2) : '')"></div>
+                         x-text="fmtTokens(totalTokens(m)) + ' · ' + m.turns + 'x' + (m.cost_reported ? (m.cost > 0 ? ' · $' + m.cost.toFixed(2) : '') : ' · $ —')"
+                         :title="!m.cost_reported ? (lang==='zh' ? '该厂商不报告 USD 费用，前端只跟踪 token 数；请去对应 console 看实际账单' : 'Vendor does not report USD cost — track tokens here, see vendor console for real billing') : ''"></div>
                   </div>
                 </template>
               </div>

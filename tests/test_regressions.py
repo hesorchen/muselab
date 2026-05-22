@@ -635,3 +635,58 @@ def test_normalize_questions_passes_preview_through():
     # Options without `preview` must not get a fake one (FE checks
     # `opt.preview` truthiness to decide whether to show the footnote).
     assert "preview" not in opts[1]
+
+
+# ============================================================================
+# cost_dashboard vendor + label fields — "GLM/MiniMax 看不懂" UX fix.
+# Before, by_model rows were bare model ids ("glm-4.7") with `cost: 0` for
+# every third-party vendor (vendor doesn't report USD), giving the false
+# impression that GLM/MiniMax were free. Now each row carries:
+#   - label   : friendly name (endpoints.label_for)
+#   - vendor  : group ("Claude" / "DeepSeek" / "GLM" / "MiniMax" / "Unknown")
+#   - cost_reported: false for vendors that don't emit USD so FE can mark "$ —"
+# Plus a top-level by_vendor rollup for at-a-glance totals.
+# ============================================================================
+
+def test_vendor_label_for_known_models():
+    from backend.chat import _vendor_label_for
+    assert _vendor_label_for("claude-sonnet-4-6")   == "Claude"
+    assert _vendor_label_for("claude-haiku-4-5")    == "Claude"
+    assert _vendor_label_for("deepseek-v4-pro")     == "DeepSeek"
+    assert _vendor_label_for("glm-4.7")             == "智谱 GLM"
+    assert _vendor_label_for("minimax-m2.7")        == "MiniMax"
+    # Unknown / vendor wrapper id
+    assert _vendor_label_for("kimi-mystery")        == "Unknown"
+    assert _vendor_label_for("")                    == "Unknown"
+
+
+def test_cost_reported_only_for_claude():
+    from backend.chat import _cost_reported_for
+    assert _cost_reported_for("claude-sonnet-4-6") is True
+    assert _cost_reported_for("deepseek-v4-pro")   is False
+    assert _cost_reported_for("glm-4.7")           is False
+    assert _cost_reported_for("minimax-m2.7")      is False
+    assert _cost_reported_for("")                  is False
+
+
+def test_cost_dashboard_includes_vendor_rollup_and_label(client, auth):
+    """The endpoint must always return by_vendor + label / vendor /
+    cost_reported on by_model rows so the FE doesn't have to fall back
+    on its own mapping when the backend already knows the vendor."""
+    r = client.get("/api/chat/cost-dashboard?days=7", headers=auth)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "by_vendor" in body
+    assert isinstance(body["by_vendor"], list)
+    # Per-model rows must carry the new keys whenever there's data; the
+    # default-fixture archive may produce an empty by_model, so we only
+    # check shape when populated.
+    for row in body.get("by_model", []):
+        assert "label" in row
+        assert "vendor" in row
+        assert "cost_reported" in row
+        assert isinstance(row["cost_reported"], bool)
+    for row in body["by_vendor"]:
+        assert "vendor" in row
+        assert "cost_reported" in row
+        assert isinstance(row["cost_reported"], bool)

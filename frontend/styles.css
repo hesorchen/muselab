@@ -5092,6 +5092,22 @@ pre.has-copy-btn .code-copy-btn.copied {
   font-family: var(--font-mono);
   color: var(--c-fg-2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+}
+/* Small vendor chip in the model row — only shown for non-Claude (we don't
+   chip Claude rows since the friendly name "Sonnet 4.6" is already clear).
+   Acts as a vendor-group visual marker so the user can tell at a glance
+   which provider a given row belongs to without reading the model id. */
+.cost-model-vendor-chip {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--c-bg-2);
+  color: var(--c-fg-3);
+  flex-shrink: 0;
+  text-transform: none;
+  letter-spacing: 0.02em;
 }
 .cost-model-bar-track {
   height: 8px;
