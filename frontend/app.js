@@ -2543,6 +2543,16 @@ function portal() {
       const st = this.tabState[this.currentId];
       return (st && st.pendingQueue) ? st.pendingQueue.length : 0;
     },
+    queueBtnLabel() {
+      // Compact label for the queue-send button during streaming. Shows
+      // current backlog so the user knows they're stacking up — not just
+      // re-clicking a dead button.
+      const n = this._currentQueueLen();
+      if (n > 0) {
+        return this.lang === "zh" ? `排队 +${n}` : `Queue +${n}`;
+      }
+      return this.lang === "zh" ? "加入队列" : "Queue";
+    },
     _enqueueMessage(sid, item) {
       const st = this._ensureTabState(sid);
       if (!Array.isArray(st.pendingQueue)) st.pendingQueue = [];

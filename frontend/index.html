@@ -1698,6 +1698,72 @@ window.addEventListener("error", e => {
                the tail block of each turn and shows dots while
                streaming + HH:MM once done. -->
 
+          <!-- Pending queue: messages the user sent while Muse was still
+               replying (or while a compact was running). They auto-drain on
+               the next done event / compact-finally / activateTab. Faded
+               + dashed border distinguishes them from real user bubbles. -->
+          <template x-for="(q, qi) in (tabState[currentId] && tabState[currentId].pendingQueue || [])"
+                    :key="q.id">
+            <div class="msg user queued">
+              <div class="msg-row queued-row">
+                <div class="bubble user-bubble queued-bubble">
+                  <div class="queued-header">
+                    <span class="queued-icon">🕓</span>
+                    <span class="queued-label"
+                          x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
+                                   + (tabState[currentId].pendingQueue.length)"></span>
+                    <span style="flex:1"></span>
+                    <button class="queued-act icon-btn sm"
+                            @click="editPendingQueueItem(currentId, qi)"
+                            :title="lang==='zh' ? '编辑' : 'Edit'">
+                      <svg><use href="#i-edit"/></svg>
+                    </button>
+                    <button class="queued-act icon-btn sm"
+                            @click="removePendingQueueItem(currentId, qi)"
+                            :title="lang==='zh' ? '移除' : 'Remove'">
+                      <svg><use href="#i-x"/></svg>
+                    </button>
+                  </div>
+                  <div class="queued-text" x-show="q.text" x-text="q.text"></div>
+                  <div class="queued-attach"
+                       x-show="(q.pendingImages && q.pendingImages.length)
+                                || (q.pendingDocs && q.pendingDocs.length)">
+                    <template x-for="(img, ii) in (q.pendingImages || [])" :key="'qi-'+ii">
+                      <img class="queued-img" :src="img.preview" alt="" />
+                    </template>
+                    <template x-for="(doc, di) in (q.pendingDocs || [])" :key="'qd-'+di">
+                      <span class="queued-doc-chip">
+                        <svg><use href="#i-file-text"/></svg>
+                        <span x-text="doc.name"></span>
+                      </span>
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <!-- Queue paused: an error during a queued chain stops auto-drain
+               so the user can fix the root cause (quota / auth / cross-
+               vendor) before continuing. Resume / Discard are explicit. -->
+          <div x-show="tabState[currentId] && tabState[currentId]._queuePaused
+                        && tabState[currentId].pendingQueue
+                        && tabState[currentId].pendingQueue.length"
+               class="queue-paused-banner">
+            <span class="queue-paused-icon">⚠️</span>
+            <span class="queue-paused-text"
+                  x-text="(lang==='zh' ? '上一条出错，队列已暂停（' : 'Queue paused after error (')
+                          + ((tabState[currentId] && tabState[currentId].pendingQueue
+                              && tabState[currentId].pendingQueue.length) || 0)
+                          + (lang==='zh' ? ' 条等待）' : ' waiting)')"></span>
+            <button class="queue-paused-btn primary"
+                    @click="resumeQueueDrain(currentId)"
+                    x-text="lang==='zh' ? '续发' : 'Resume'"></button>
+            <button class="queue-paused-btn"
+                    @click="discardQueue(currentId)"
+                    x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
+          </div>
+
           <!-- Compact-in-progress placeholder bubble. Mirrors the streaming
                pending bubble above so the user sees a familiar "something is
                working" cue at the bottom of the chat (not just the silent
@@ -1931,6 +1997,18 @@ window.addEventListener("error", e => {
                     :disabled="_sendWaitingForUpload || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send" :title="t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
+            </button>
+            <!-- Queue-send: visible while streaming/compact. send() detects
+                 the busy state and routes to _enqueueMessage. Disabled when
+                 input + attachments are empty, otherwise click parks the
+                 message on tabState[currentId].pendingQueue. -->
+            <button x-show="streaming"
+                    @click="send()"
+                    :disabled="!input.trim() && !pendingImages.length && !pendingDocs.length"
+                    class="btn-secondary chat-toolbar-queue"
+                    :title="t('queue.button_hint')">
+              <span class="icon"><svg><use href="#i-plus"/></svg></span>
+              <span x-text="queueBtnLabel()"></span>
             </button>
             <button x-show="streaming" @click="stop()" class="btn-danger chat-toolbar-send" :title="t('btn.stop') + ' (Esc)'">
               <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
