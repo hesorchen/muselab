@@ -482,14 +482,20 @@ def write_file(req: WriteReq) -> dict:
     target = safe_resolve(req.path)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="path is a directory")
-    # Cheap byte count without materializing the encoded bytes twice — Python
-    # caches the str→bytes via the same call atomic_write_text would make,
-    # but this gate runs first so a bad request is rejected before any I/O.
-    if len(req.content.encode("utf-8")) > MAX_WRITE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"content exceeds {MAX_WRITE_BYTES // (1024 * 1024)} MB limit",
-        )
+    # Two-stage size gate. Each char is 1-4 UTF-8 bytes, so the upper
+    # bound `len(s) * 4` is cheap (no encoding); if it already exceeds
+    # the limit we reject without materializing the encoded bytes at
+    # all. Only the borderline case (str length close to limit) needs
+    # the precise encode. Saves ~10 MB transient RSS on a max-size
+    # payload that was previously rejected anyway.
+    char_len = len(req.content)
+    if char_len * 4 > MAX_WRITE_BYTES:
+        if char_len > MAX_WRITE_BYTES \
+                or len(req.content.encode("utf-8")) > MAX_WRITE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"content exceeds {MAX_WRITE_BYTES // (1024 * 1024)} MB limit",
+            )
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, req.content)
     return {"ok": True, "size": target.stat().st_size}

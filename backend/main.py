@@ -5,7 +5,8 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from .auth import require_token
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
@@ -309,8 +310,13 @@ def robots():
     )
 
 
-@app.get("/api/meta")
+@app.get("/api/meta", dependencies=[Depends(require_token)])
 def meta() -> dict:
+    # Auth-gated: ROOT is the user's actual filesystem path on disk,
+    # which is useful to any attacker on the LAN trying to recon a
+    # muselab instance. Defence-in-depth — token is already required
+    # for every meaningful endpoint, this just stops drive-by probes
+    # from getting the path + SDK / CLI versions for free.
     return {"root": str(ROOT), **_VERSIONS}
 
 

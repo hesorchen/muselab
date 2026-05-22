@@ -546,8 +546,14 @@ async def _build_and_connect_client(
                 clean = {k: v for k, v in spec.items() if k != "disabled"} \
                         if isinstance(spec, dict) else spec
                 mcp_dict[name] = clean
-        except Exception:
-            pass  # fall through with just muselab
+        except Exception as e:
+            # Don't silently drop every configured MCP server — a typo
+            # in one entry shouldn't make all servers vanish without
+            # any user-visible signal. Log + carry on with built-ins.
+            sys.stderr.write(
+                f"[chat] mcp.json parse failed for sid={session_id[:8]}: "
+                f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
+            sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
     # Always enable extended thinking. Without an explicit config the
     # model uses adaptive thinking and silently pauses mid-reply for
@@ -943,7 +949,12 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
         sid = jsonl.stem
         per_sess = 0
         try:
-            with jsonl.open("r", encoding="utf-8") as f:
+            # utf-8-sig strips a leading BOM so JSONL writers that emit
+            # U+FEFF at the start (some CLI versions did, briefly) don't
+            # poison the "fast reject" qlower-in-line check at the start
+            # of every line — `"﻿{...}".lower()` would mismatch a
+            # qlower hitting the literal first chars.
+            with jsonl.open("r", encoding="utf-8-sig") as f:
                 for line in f:
                     if qlower not in line.lower():
                         continue   # fast reject before JSON parse
@@ -1548,18 +1559,40 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             (old_key, client) = live[0]
             try:
                 await client.set_model(req.model)
+                # Re-validate under _lock — between the snapshot above
+                # and now, another request could have evicted / replaced
+                # _clients[old_key] (eviction from a parallel get_client,
+                # an interrupt, or even a competing model swap). Without
+                # this check we'd silently pop whatever's there now and
+                # leak the original client OR clobber a fresh handle the
+                # next turn just created.
+                snapshot_still_valid = False
                 async with _lock:
-                    _clients.pop(old_key, None)
-                    perm = _client_permission.pop(old_key, "bypassPermissions")
-                    if old_key in _client_lru:
-                        _client_lru.remove(old_key)
-                    # Preserve the effort dimension when remapping under the
-                    # new model — set_model() keeps the SDK options object,
-                    # which still has the prior effort baked in.
-                    new_key = (sid, req.model, old_key[2])
-                    _clients[new_key] = client
-                    _client_permission[new_key] = perm
-                    _client_lru.append(new_key)
+                    if _clients.get(old_key) is client:
+                        snapshot_still_valid = True
+                        _clients.pop(old_key, None)
+                        perm = _client_permission.pop(old_key, "bypassPermissions")
+                        if old_key in _client_lru:
+                            _client_lru.remove(old_key)
+                        # Preserve the effort dimension when remapping under
+                        # the new model — set_model() keeps the SDK options
+                        # object, which still has the prior effort baked in.
+                        new_key = (sid, req.model, old_key[2])
+                        _clients[new_key] = client
+                        _client_permission[new_key] = perm
+                        _client_lru.append(new_key)
+                if not snapshot_still_valid:
+                    # Our client is orphaned now (the cache entry was
+                    # replaced under us). Disconnect it so the CLI
+                    # subprocess goes away; next turn will rebuild.
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat] set_model {old_key[1]}→{req.model} raced "
+                        f"with cache mutation; disconnecting orphan\n")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
             except Exception as e:
                 import sys as _sys
                 _sys.stderr.write(
@@ -2954,6 +2987,18 @@ async def stream(
     try:
         client = await get_client(session_id, model_to_use, permission,
                                     effort=effort_to_use)
+    except asyncio.CancelledError:
+        # FastAPI cancels the handler when the client disconnects mid-
+        # await (browser tab closed, request aborted). Without this the
+        # reservation we made above stays in _active_turns forever and
+        # every subsequent send on this sid is rejected as "previous
+        # turn still running." CancelledError is a BaseException, NOT
+        # an Exception, so the broader handler below would miss it.
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
         # Free the reservation so the user can fix their config (e.g. add an
