@@ -5748,19 +5748,29 @@ function portal() {
     // copy / use as basis. The "true" compact is a feature of the underlying
     // CLI we don't have direct API for, so we implement it as a synthesized
     // summarize-and-fork workflow.
-    async runCompact() {
-      if (!this.currentId) return;
-      if (this.streaming) {
+    async runCompact(targetSid) {
+      // Default to the active session — the manual ctx-ring click + the
+      // command palette both want "compact what I'm looking at". The
+      // auto-compact path (done event when ctx >= 95%) passes streamSid
+      // explicitly so a mid-stream tab switch doesn't end up compacting
+      // a different session than the one whose context filled up.
+      const sid = targetSid || this.currentId;
+      if (!sid) return;
+      const st = this.tabState[sid];
+      // streaming check is per-target-session, not on `this.streaming`
+      // (which mirrors the active tab — wrong source of truth when the
+      // call comes from a background stream's done handler).
+      if (st && st.streaming) {
         this.toast(this.t("ctx.compact_wait_streaming"), "warn", 2500);
         return;
       }
-      // Empty-session guard. Frontend `messages` may be transiently empty
-      // right after a page refresh (loadSession is still running async),
-      // so fall back to the session metadata's message_count from the
-      // backend — that survives reloads.
-      const hasFrontendContent = this.messages.some(
+      // Empty-session guard. The target session's frontend message
+      // mirror may be transiently empty (loadSession in flight on
+      // background tabs), so fall back to backend's message_count.
+      const targetMessages = (st && st.messages) || (sid === this.currentId ? this.messages : []);
+      const hasFrontendContent = targetMessages.some(
         m => m.role === "assistant" && m.text);
-      const meta = this.sessions.find(s => s.id === this.currentId);
+      const meta = this.sessions.find(s => s.id === sid);
       const backendCount = (meta && meta.message_count) || 0;
       if (!hasFrontendContent && backendCount < 2) {
         this.toast(this.t("ctx.compact_empty"), "warn", 2500);
@@ -5777,39 +5787,41 @@ function portal() {
       // (CSS-only, see .ctx-meter.compacting). A short toast confirms the kick
       // — the long banner is what the user actually watches, not a 2-min toast.
       this.toast(this.lang === "zh" ? "📦 开始压缩..." : "📦 Compacting…", "info", 2000);
-      // Scroll to the bottom so the .compact-pending placeholder bubble (added
-      // at the tail of the message list via x-show="_compacting") is in view
-      // the moment compact kicks. Without this the user could be scrolled up
-      // mid-history and never see the bottom indicator at all.
-      this.$nextTick(() => this.scrollToBottom(true));
+      // Scroll to the bottom (active tab only — scrolling a background
+      // tab the user isn't looking at is wasted work).
+      if (sid === this.currentId) {
+        this.$nextTick(() => this.scrollToBottom(true));
+      }
 
       try {
-        const r = await fetch(`/api/chat/sessions/${this.currentId}/native-compact`,
+        const r = await fetch(`/api/chat/sessions/${sid}/native-compact`,
                                 { method: "POST", headers: this.hdr() });
         if (!r.ok) {
           const txt = await r.text();
           this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + txt, "error", 5000);
           return;
         }
-        // Reload current session so the new compact-marker shows up.
-        await this.loadSession(this.currentId);
+        // Reload the compacted session if it's the active one; on a
+        // background tab activateTab will reload it lazily later.
+        if (sid === this.currentId) {
+          await this.loadSession(sid);
+        }
         await this.refreshSessions();
         // Refresh ctx-meter — sessionUsage is only auto-updated on stream
         // 'done' events, so without this the meter shows the pre-compact
         // (large) value until the user sends a new message.
-        await this._refreshCtxMeter();
+        if (sid === this.currentId) {
+          await this._refreshCtxMeter();
+        }
         this.toast(this.lang === "zh" ? "📦 压缩完成" : "📦 Compacted", "success", 2000);
       } catch (e) {
         this.toast((this.lang === "zh" ? "压缩失败：" : "Compact failed: ") + e.message, "error", 5000);
       } finally {
         this._compacting = false;
-        // Queued messages auto-drain. Same pendingQueue + drain path as
-        // streaming-in-flight (see _drainPendingQueue). Earlier versions
-        // used a confirm dialog asking "send N queued?" — user feedback
-        // (2026-05-22) made it automatic to match the streaming queue UX.
-        // If a message errors out, _queuePaused stops the chain and the
-        // failed user bubble shows a resume/discard CTA.
-        this.$nextTick(() => this._drainPendingQueue(this.currentId));
+        // Auto-drain runs against the compacted session, not currentId —
+        // a background auto-compact must drain its own queue, not the
+        // user's currently-visible tab's queue.
+        this.$nextTick(() => this._drainPendingQueue(sid));
       }
     },
 
@@ -6395,20 +6407,23 @@ function portal() {
         if (ctxPct >= 95 && !this._autoCompacted[streamSid] && !this._compacting) {
           this._autoCompacted[streamSid] = true;
           // Schedule on next tick so the stream's done handler fully
-          // unwinds first (runCompact checks `streaming` flag).
+          // unwinds first (runCompact's per-session streaming check
+          // needs to see streaming === false). Pass streamSid explicitly
+          // so a mid-stream tab switch doesn't redirect the compact
+          // onto the user's current (often unrelated) session.
           this.$nextTick(() => {
             const zh = this.lang === "zh";
             this.toast(zh ? `上下文 ${Math.round(ctxPct)}%，自动压缩中…`
                           : `Context ${Math.round(ctxPct)}% — auto-compacting…`,
                        "info", 3000);
-            this.runCompact();
+            this.runCompact(streamSid);
           });
         } else if (ctxPct >= 85 && ctxPct < 95 && !this._ctxWarned[streamSid]) {
           this._ctxWarned[streamSid] = true;
           this.toast(
             this.t("ctx.window_warn", { pct: Math.round(ctxPct) }),
             "warn", 6000,
-            { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact() },
+            { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact(streamSid) },
           );
         }
         es.close(); _markDone(); _stopTimer();
