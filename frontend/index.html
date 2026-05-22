@@ -2243,12 +2243,18 @@ window.addEventListener("error", e => {
           </template>
           <template x-if="cost.data">
             <div>
-              <!-- 4 KPI cards: total tokens up top, cost as secondary line -->
+              <!-- 4 KPI cards: total tokens up top, cost as secondary line.
+                   `last_30d` is actually the user-selected window — backend
+                   field name is historical. Label it dynamically with the
+                   real window days so "30" doesn't show when user picked 7/60/90. -->
               <div class="cost-kpis">
                 <template x-for="key in ['today','last_7d','last_30d','all_time']" :key="key">
                   <div class="cost-kpi">
                     <div class="cost-kpi-label"
-                         x-text="t('set.cost.' + (key === 'last_7d' ? '7d' : key === 'last_30d' ? '30d' : key === 'all_time' ? 'all' : 'today'))"></div>
+                         x-text="key === 'today'    ? t('set.cost.today')
+                               : key === 'last_7d'  ? t('set.cost.7d')
+                               : key === 'all_time' ? t('set.cost.all')
+                               : (lang==='zh' ? `最近 ${cost.windowDays} 天` : `Last ${cost.windowDays}d`)"></div>
                     <div class="cost-kpi-value"
                          x-text="fmtTokens(totalTokens(cost.data[key]))"></div>
                     <div class="cost-kpi-sub"
@@ -2259,7 +2265,8 @@ window.addEventListener("error", e => {
                   </div>
                 </template>
               </div>
-              <!-- Token-class legend explains the 4 numbers below the chart -->
+              <!-- Token-class legend explains the 4 numbers below the chart.
+                   Uses the window bucket (last_30d field name is historical). -->
               <div class="cost-token-breakdown"
                    x-show="cost.data.all_time.turns > 0">
                 <span class="cost-token-chip in"

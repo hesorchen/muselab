@@ -144,3 +144,70 @@ def test_cost_dashboard_validates_days(client, auth):
     assert r.status_code == 422
     r = client.get("/api/chat/cost-dashboard?days=999", headers=auth)
     assert r.status_code == 422
+
+
+def test_cost_dashboard_discovers_vendor_config_dir_jsonl(
+    client, auth, app_module, temp_root, tmp_path, monkeypatch, request,
+):
+    """Third-party providers (DeepSeek / GLM / MiniMax) run the CLI with
+    CLAUDE_CONFIG_DIR=/tmp/muselab-vendor-cli-config so Pro OAuth never
+    leaks out. The CLI then writes its JSONL to
+    <CLAUDE_CONFIG_DIR>/projects/, NOT ~/.claude/projects/. Dashboard
+    must scan both roots — otherwise GLM/MiniMax token usage is invisible
+    even though we already build the env_for_model isolation path."""
+    import tempfile
+    from backend import sessions as sess_mod
+
+    # Build a fake vendor projects dir like the real CLI would.
+    vendor_root = (Path(tempfile.gettempdir())
+                    / "muselab-vendor-cli-config" / "projects")
+    proj = vendor_root / str(temp_root).replace("/", "-")
+    proj.mkdir(parents=True, exist_ok=True)
+
+    sid = str(uuid.uuid4())
+    # Sidecar in SESS_DIR registers the session as muselab-known (one of
+    # the two ways known_sids gets populated). Cost stays empty —
+    # third-party vendors don't report cost.
+    (sess_mod.SESS_DIR / f"{sid}.sidecar.json").write_text(
+        json.dumps({"messages": {}}))
+
+    jsonl = proj / f"{sid}.jsonl"
+    now = dt.datetime.now(dt.timezone.utc)
+    jsonl.write_text(json.dumps({
+        "type": "assistant",
+        "uuid": "u-glm-vendor",
+        "timestamp": now.isoformat().replace("+00:00", "Z"),
+        "message": {
+            "model": "glm-4.7",
+            "usage": {
+                "input_tokens": 12345, "output_tokens": 678,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            },
+            "content": [{"type": "text", "text": "ok"}],
+        },
+    }) + "\n")
+
+    def _cleanup():
+        try:
+            jsonl.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            proj.rmdir()
+        except OSError:
+            pass
+    request.addfinalizer(_cleanup)
+
+    r = client.get("/api/chat/cost-dashboard?days=7&tz_offset_minutes=0",
+                    headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    by_model = {m["model"]: m for m in data["by_model"]}
+    assert "glm-4.7" in by_model, (
+        "vendor-config-dir JSONL was not picked up — dashboard only "
+        "scanned ~/.claude/projects/ and missed third-party turns"
+    )
+    assert by_model["glm-4.7"]["input_tokens"] == 12345
+    assert by_model["glm-4.7"]["output_tokens"] == 678
+    # Vendor doesn't report cost — sidecar has no entry — must be $0.
+    assert by_model["glm-4.7"]["cost"] == 0.0

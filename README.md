@@ -3,7 +3,7 @@
 > A self-hosted web UI that runs the **Claude Agent SDK** on top of *your own files*.
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-185_passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-186_passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)

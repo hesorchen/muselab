@@ -1626,8 +1626,23 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     # something muselab knows about (sidecar OR sess.list_sessions()) —
     # this catches early sessions on prior cwds without picking up
     # totally unrelated projects.
-    projects_root = Path.home() / ".claude" / "projects"
-    if not projects_root.exists():
+    #
+    # Third-party providers (DeepSeek / GLM / MiniMax) run the CLI with
+    # `CLAUDE_CONFIG_DIR=/tmp/muselab-vendor-cli-config` (see
+    # endpoints.env_for_model — defensive isolation so Pro OAuth never
+    # leaks to a non-Anthropic vendor). The CLI then writes its JSONL to
+    # `<CLAUDE_CONFIG_DIR>/projects/` instead of `~/.claude/projects/`,
+    # so we have to walk BOTH roots — otherwise vendor turns are
+    # invisible in the cost dashboard. Tokens are reported per-vendor in
+    # message.usage just like Anthropic, only the cost USD field stays
+    # 0 (sidecar overlay).
+    import tempfile as _tempfile
+    project_roots: list[Path] = [Path.home() / ".claude" / "projects"]
+    vendor_root = Path(_tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects"
+    if vendor_root.exists():
+        project_roots.append(vendor_root)
+    project_roots = [r for r in project_roots if r.exists()]
+    if not project_roots:
         return _empty_dashboard_response(days, tz_offset_minutes, now)
 
     known_sids: set[str] = set()
@@ -1642,12 +1657,16 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
         pass
 
     jsonl_paths: list[Path] = []
-    for proj_sub in projects_root.iterdir():
-        if not proj_sub.is_dir():
+    for projects_root in project_roots:
+        try:
+            for proj_sub in projects_root.iterdir():
+                if not proj_sub.is_dir():
+                    continue
+                for jsonl in proj_sub.glob("*.jsonl"):
+                    if jsonl.stem in known_sids:
+                        jsonl_paths.append(jsonl)
+        except OSError:
             continue
-        for jsonl in proj_sub.glob("*.jsonl"):
-            if jsonl.stem in known_sids:
-                jsonl_paths.append(jsonl)
 
     for jsonl in jsonl_paths:
         sid = jsonl.stem
