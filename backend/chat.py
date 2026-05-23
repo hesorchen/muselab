@@ -1,9 +1,11 @@
 import os
+import threading
 import base64
 import json
 import asyncio
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -33,6 +35,81 @@ from .ask_user_question import (
     unregister_session_queue, submit_answer,
 )
 from . import permission_request as perm
+
+# Lock serialises CLAUDE_CONFIG_DIR overrides so two concurrent
+# get_session_messages() calls for vendor sessions don't race on
+# the shared os.environ entry.
+_vendor_msg_lock = threading.Lock()
+
+
+def _cli_project_roots() -> list[Path]:
+    """Return the directories where Claude CLI writes session JSONLs:
+
+    1. ``~/.claude/projects`` — default root used by Claude (Pro OAuth /
+       Anthropic API key).
+    2. ``<tmp>/muselab-vendor-cli-config/projects`` — vendor-isolated
+       root used when muselab routes the CLI subprocess to a third-party
+       Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax / Kimi /
+       Qwen / MiMo).  See ``endpoints.env_override`` for the isolation
+       rationale.
+
+    Callers reading transcripts MUST walk both. Forgetting the vendor
+    root has caused real bugs across the codebase — vendor sessions
+    silently invisible to cost dashboard, context-meter rebuild, full-
+    text search, compact marker detection, and the JSONL existence
+    check in :func:`get_client` that picks ``session_id=`` vs
+    ``resume=`` when spawning the CLI (the wrong call → CLI exits with
+    "Session ID already in use"). The single-helper pattern makes
+    forgetting impossible.
+
+    Only existing roots are returned, so callers don't need a separate
+    ``.exists()`` guard before iterating.
+    """
+    candidates = [
+        Path.home() / ".claude" / "projects",
+        Path(tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects",
+    ]
+    return [r for r in candidates if r.exists()]
+
+
+def _find_session_jsonl(sid: str) -> Path | None:
+    """Locate the CLI JSONL for ``sid`` across both project roots.
+
+    A session lives in exactly one root (Pro/Claude vs vendor — they're
+    mutually exclusive per session), so the first match wins. Returns
+    ``None`` when the session has no on-disk transcript yet (truly new
+    session)."""
+    for projects_root in _cli_project_roots():
+        for hit in projects_root.glob(f"*/{sid}.jsonl"):
+            if hit.is_file():
+                return hit
+    return None
+
+
+def _get_session_msgs(sid: str, model: str = "") -> list:
+    """Wrapper around the SDK's get_session_messages() that temporarily sets
+    CLAUDE_CONFIG_DIR to the vendor-isolated temp dir when the session uses a
+    third-party model.
+
+    Without this, vendor-session JSONLs (written by the CLI subprocess into
+    /tmp/muselab-vendor-cli-config/projects/) are invisible to the parent
+    process, which defaults to ~/.claude/projects/.  The result is that
+    refreshing a DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo session shows
+    zero messages."""
+    if model and endpoints.is_third_party(model):
+        vendor_dir = str(endpoints._vendor_config_dir())
+        with _vendor_msg_lock:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            try:
+                os.environ["CLAUDE_CONFIG_DIR"] = vendor_dir
+                return get_session_messages(sid, directory=str(ROOT))
+            finally:
+                if old is not None:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+                else:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    return get_session_messages(sid, directory=str(ROOT))
+
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -469,17 +546,15 @@ async def _build_and_connect_client(
     # Detect JSONL existence by RECURSIVELY scanning the CLI's projects
     # root — SDK's _find_project_dir relies on path-hash matching that
     # was unreliable on Windows in practice (user's CLI saw the JSONL
-    # but the SDK helper didn't).
+    # but the SDK helper didn't). _find_session_jsonl walks BOTH default
+    # and vendor roots so vendor sessions don't look "new" here — passing
+    # `session_id=` for an existing JSONL makes the CLI exit with
+    # "Session ID already in use", and the fallback at the bottom of
+    # this function doesn't catch it (the CLI dies inside the SDK's
+    # background message reader, not during `client.connect()`).
     jsonl_exists = False
     try:
-        projects_root = Path.home() / ".claude" / "projects"
-        if projects_root.exists():
-            # Glob is faster than recursive walk and matches any sub-
-            # project dir layout. Fine for muselab's session counts.
-            for hit in projects_root.glob(f"*/{session_id}.jsonl"):
-                if hit.is_file():
-                    jsonl_exists = True
-                    break
+        jsonl_exists = _find_session_jsonl(session_id) is not None
     except Exception as e:
         import sys as _sys
         _sys.stderr.write(f"[muselab] jsonl_exists check failed for {session_id}: {e}\n")
@@ -1013,17 +1088,24 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
     qlower = query.lower()
     if ROOT is None:
         return {"hits": [], "total": 0}
-    projects_root = Path.home() / ".claude" / "projects"
     cwd_key = str(ROOT).replace("/", "-")
-    proj_dir = projects_root / cwd_key
-    if not proj_dir.exists():
+    # Walk per-cwd subdirs under each CLI project root — both default
+    # and vendor-isolated. Skipping vendor would silently hide every
+    # third-party session from search.
+    proj_dirs = [r / cwd_key for r in _cli_project_roots()
+                 if (r / cwd_key).exists()]
+    if not proj_dirs:
         return {"hits": [], "total": 0}
 
     name_map = {s["id"]: s.get("name", "") for s in sess.list_sessions()}
 
     hits: list[dict] = []
     PER_SESSION_CAP = 5   # avoid one chatty session swamping results
-    for jsonl in proj_dir.glob("*.jsonl"):
+    # Iterate JSONLs across both roots. A given sid only lives in one root
+    # at a time (vendor vs Claude is mutually exclusive per session), so
+    # PER_SESSION_CAP keyed by stem still applies cleanly.
+    jsonl_paths = [p for d in proj_dirs for p in d.glob("*.jsonl")]
+    for jsonl in jsonl_paths:
         sid = jsonl.stem
         per_sess = 0
         try:
@@ -1306,17 +1388,11 @@ def _compact_summary_uuids(sid: str) -> set[str]:
     their UUIDs. SDK get_session_messages strips this flag, so to render a
     "📦 已压缩" indicator we have to detect it ourselves at the JSONL level.
 
-    Glob-based JSONL lookup — same pattern as get_client's existence check.
-    SDK's _find_project_dir was unreliable on Windows."""
+    Glob-based JSONL lookup via _find_session_jsonl — covers both default
+    and vendor-isolated roots so vendor sessions keep their compact
+    markers too."""
     try:
-        projects_root = Path.home() / ".claude" / "projects"
-        if not projects_root.exists():
-            return set()
-        jsonl_path = None
-        for hit in projects_root.glob(f"*/{sid}.jsonl"):
-            if hit.is_file():
-                jsonl_path = hit
-                break
+        jsonl_path = _find_session_jsonl(sid)
         if jsonl_path is None:
             return set()
         uuids: set[str] = set()
@@ -1350,8 +1426,9 @@ def get_session_api(sid: str) -> dict:
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
+    model = meta.get("model", "")
     try:
-        sdk_msgs = get_session_messages(sid, directory=str(ROOT))
+        sdk_msgs = _get_session_msgs(sid, model)
     except Exception:
         sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
@@ -1465,8 +1542,9 @@ def export_session_markdown(sid: str) -> Response:
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
+    model = meta.get("model", "")
     try:
-        sdk_msgs = get_session_messages(sid, directory=str(ROOT))
+        sdk_msgs = _get_session_msgs(sid, model)
     except Exception:
         sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
@@ -1721,22 +1799,7 @@ def _session_usage_from_jsonl(sid: str) -> dict | None:
     """
     if ROOT is None:
         return None
-    # Walk CLI projects roots — same dual-root logic as cost_dashboard
-    # to also catch vendor-isolated sessions (CLAUDE_CONFIG_DIR isolation
-    # for DeepSeek / GLM / MiniMax writes JSONL to /tmp/muselab-vendor-cli-config).
-    import tempfile as _tempfile
-    project_roots = [Path.home() / ".claude" / "projects",
-                     Path(_tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects"]
-    jsonl_path: Path | None = None
-    for root in project_roots:
-        if not root.exists():
-            continue
-        for hit in root.glob(f"*/{sid}.jsonl"):
-            if hit.is_file():
-                jsonl_path = hit
-                break
-        if jsonl_path:
-            break
+    jsonl_path = _find_session_jsonl(sid)
     if jsonl_path is None:
         return None
     last_usage: dict[str, int] = {}
@@ -1984,27 +2047,12 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     # Discover all JSONLs for muselab-tracked sessions. SDK CLI keys
     # the projects dir by the cwd that ran the session, so a single
     # logical archive (one ROOT) can have JSONL spread across multiple
-    # `~/.claude/projects/<encoded-cwd>/` dirs if ROOT (or working dir)
+    # `<projects-root>/<encoded-cwd>/` dirs if ROOT (or working dir)
     # changed over time. We track every JSONL whose session id matches
     # something muselab knows about (sidecar OR sess.list_sessions()) —
     # this catches early sessions on prior cwds without picking up
     # totally unrelated projects.
-    #
-    # Third-party providers (DeepSeek / GLM / MiniMax) run the CLI with
-    # `CLAUDE_CONFIG_DIR=/tmp/muselab-vendor-cli-config` (see
-    # endpoints.env_for_model — defensive isolation so Pro OAuth never
-    # leaks to a non-Anthropic vendor). The CLI then writes its JSONL to
-    # `<CLAUDE_CONFIG_DIR>/projects/` instead of `~/.claude/projects/`,
-    # so we have to walk BOTH roots — otherwise vendor turns are
-    # invisible in the cost dashboard. Tokens are reported per-vendor in
-    # message.usage just like Anthropic, only the cost USD field stays
-    # 0 (sidecar overlay).
-    import tempfile as _tempfile
-    project_roots: list[Path] = [Path.home() / ".claude" / "projects"]
-    vendor_root = Path(_tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects"
-    if vendor_root.exists():
-        project_roots.append(vendor_root)
-    project_roots = [r for r in project_roots if r.exists()]
+    project_roots = _cli_project_roots()
     if not project_roots:
         return _empty_dashboard_response(days, tz_offset_minutes, now)
 
@@ -2259,7 +2307,7 @@ async def native_compact_session_api(sid: str) -> dict:
     # comment on _is_real_user_prompt for why bare `type == "user"` over-
     # counts by 5-10× in tool-heavy sessions.
     try:
-        new_msgs = get_session_messages(sid, directory=str(ROOT))
+        new_msgs = _get_session_msgs(sid, model)
         n_turns = sum(1 for sm in new_msgs if _is_real_user_prompt(sm))
         sess.bump_session(sid, message_count=len(new_msgs),
                            turn_count=n_turns)
@@ -3475,7 +3523,7 @@ async def stream(
             # new user/assistant UUIDs, then write cost / model / images /
             # docs against those rows in muselab's per-session sidecar.
             try:
-                all_msgs = get_session_messages(session_id, directory=str(ROOT))
+                all_msgs = _get_session_msgs(session_id, model)
             except Exception:
                 all_msgs = []
             new_asst_uuid = None

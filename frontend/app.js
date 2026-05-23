@@ -4434,9 +4434,12 @@ function portal() {
     async probeProvider(envKey) {
       // Pick a representative model id for this env key.
       const ENV_TO_MODEL = {
-        DEEPSEEK_API_KEY: "deepseek-v4-flash",
-        ZHIPUAI_API_KEY:  "glm-4.7",
-        MINIMAX_API_KEY:  "minimax-m2.7",
+        DEEPSEEK_API_KEY:    "deepseek-v4-flash",
+        ZHIPUAI_API_KEY:     "glm-4.7",
+        MINIMAX_API_KEY:     "minimax-m2.7",
+        MOONSHOT_API_KEY:    "kimi-k2.6",
+        DASHSCOPE_API_KEY:   "qwen-plus",
+        XIAOMI_MIMO_API_KEY: "mimo-v2.5-pro",
       };
       const m = ENV_TO_MODEL[envKey];
       if (!m) return;

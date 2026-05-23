@@ -65,6 +65,20 @@ _BASE_URL_ENV_BY_KEY: dict[str, str] = {
 }
 
 
+_VENDOR_CONFIG_DIR = Path(tempfile.gettempdir()) / "muselab-vendor-cli-config"
+
+
+def _vendor_config_dir() -> Path:
+    """Returns the isolated config dir used by third-party providers. Shared
+    across all three-party sessions — it has no .credentials.json, so the CLI
+    subprocess cannot fall back to Pro OAuth and send the wrong token to vendor.
+
+    chat.py also reads from here when loading session messages for vendor
+    sessions."""
+    _VENDOR_CONFIG_DIR.mkdir(exist_ok=True)
+    return _VENDOR_CONFIG_DIR
+
+
 def _resolve_base_url(env_key: str) -> str:
     """Look up the current base URL for a provider: env override > default."""
     override_env = _BASE_URL_ENV_BY_KEY.get(env_key, "")
@@ -266,8 +280,7 @@ def env_override(model: str) -> dict[str, str] | None:
     # token to that vendor → vendor 401 "invalid api key". So for third-party
     # providers we redirect the CLI to a throwaway CLAUDE_CONFIG_DIR with no
     # credentials.json — forcing it to fall back to env-based auth.
-    isolated_cfg = Path(tempfile.gettempdir()) / "muselab-vendor-cli-config"
-    isolated_cfg.mkdir(exist_ok=True)
+    isolated_cfg = _vendor_config_dir()
     # Make sure NO credentials file leaks in.
     cred = isolated_cfg / ".credentials.json"
     if cred.exists():
