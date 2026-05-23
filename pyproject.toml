@@ -44,7 +44,7 @@ dependencies = [
     "claude-agent-sdk>=0.2.82",
     "fastapi>=0.136.1",
     "python-dotenv>=1.2.2",
-    "python-multipart>=0.0.28",
+    "python-multipart>=0.0.29",
     "uvicorn[standard]>=0.47.0",
     # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
     # native deps; safe to ship in the muselab Docker image.
