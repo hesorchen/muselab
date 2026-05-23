@@ -138,10 +138,19 @@ fi
 
 echo
 bold "6. Provider keys"
-[[ -n "${DEEPSEEK_API_KEY:-}" ]] || DEEPSEEK_API_KEY=$(grep -oP 'DEEPSEEK_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${ZHIPUAI_API_KEY:-}"  ]] || ZHIPUAI_API_KEY=$(grep -oP 'ZHIPUAI_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${MINIMAX_API_KEY:-}"  ]] || MINIMAX_API_KEY=$(grep -oP 'MINIMAX_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-for entry in "DEEPSEEK_API_KEY:DeepSeek" "ZHIPUAI_API_KEY:GLM" "MINIMAX_API_KEY:MiniMax"; do
+[[ -n "${DEEPSEEK_API_KEY:-}"    ]] || DEEPSEEK_API_KEY=$(grep -oP 'DEEPSEEK_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+[[ -n "${ZHIPUAI_API_KEY:-}"     ]] || ZHIPUAI_API_KEY=$(grep -oP 'ZHIPUAI_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+[[ -n "${MINIMAX_API_KEY:-}"     ]] || MINIMAX_API_KEY=$(grep -oP 'MINIMAX_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+[[ -n "${MOONSHOT_API_KEY:-}"    ]] || MOONSHOT_API_KEY=$(grep -oP 'MOONSHOT_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+[[ -n "${DASHSCOPE_API_KEY:-}"   ]] || DASHSCOPE_API_KEY=$(grep -oP 'DASHSCOPE_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+[[ -n "${XIAOMI_MIMO_API_KEY:-}" ]] || XIAOMI_MIMO_API_KEY=$(grep -oP 'XIAOMI_MIMO_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+for entry in \
+    "DEEPSEEK_API_KEY:DeepSeek" \
+    "ZHIPUAI_API_KEY:GLM" \
+    "MINIMAX_API_KEY:MiniMax" \
+    "MOONSHOT_API_KEY:Kimi" \
+    "DASHSCOPE_API_KEY:Qwen" \
+    "XIAOMI_MIMO_API_KEY:Xiaomi MiMo"; do
   envk="${entry%%:*}"; name="${entry##*:}"
   val="${!envk:-}"
   if [[ -n "$val" ]]; then

@@ -1,9 +1,9 @@
 # muselab
 
-> A self-hosted web UI that runs the **Claude Agent SDK** on top of *your own files*.
+> A self-hosted Web UI that talks to your files using the **Claude Agent SDK**.
+> Sessions sync across desktop, tablet, and phone; Claude, DeepSeek, GLM, Kimi, and Qwen all run on the same agent loop.
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-186_passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
@@ -12,9 +12,10 @@
 - 🧠 **Your archive is the working set.** `MUSELAB_ROOT` is a directory
   you own — files there are first-class context, not RAG documents.
 - 🤖 **Full agent loop on every model.** MCP / Skills / Subagents / plan
-  mode work the same on Claude, DeepSeek, GLM, MiniMax.
+  mode work the same on Claude, DeepSeek, GLM, MiniMax, Kimi, Qwen,
+  Xiaomi MiMo.
 - 💸 **Reuse your Claude Pro / Max subscription** via OAuth — no
-  per-token bill. Or bring a vendor API key.
+  per-token billing. Or bring a vendor API key.
 - 🔄 **Multi-device, one server.** Phone / tablet / desktop share
   sessions; archive never leaves your host.
 - 🛠 **No build step.** Vanilla HTML + Alpine.js + CSS, served as static
@@ -25,6 +26,15 @@
 > you need a multi-tenant deployment, this isn't it (yet).
 
 ## Install
+
+**One-line (Linux + macOS + WSL2)** — installs `uv`, clones the repo into
+`~/muselab`, then runs the platform installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+```
+
+**Manual** — if you'd rather see every step:
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
@@ -49,8 +59,8 @@ For prerequisites, Docker, dev mode and per-OS detail, see
 
 ## Status
 
-Pre-1.0, personal project, used daily by the author. PRs welcome — see
-[CONTRIBUTING.md](CONTRIBUTING.md). Roadmap and known issues in
-[TODO.md](TODO.md).
+Pre-1.0, personal project, used daily by the author. PRs are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). The roadmap and known issues are tracked on
+[GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
 [MIT](LICENSE)

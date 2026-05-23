@@ -1,11 +1,14 @@
 """CRUD + bell-chip read/ack endpoints for the scheduler.
 
-GET    /api/scheduler/tasks       — list + current unread count
-POST   /api/scheduler/tasks       — create
-PATCH  /api/scheduler/tasks/{id}  — edit (rename / change time / toggle enabled)
-DELETE /api/scheduler/tasks/{id}  — remove (does NOT delete the bound session)
-GET    /api/scheduler/history     — most-recent-first run log
-POST   /api/scheduler/ack         — mark unread = 0 (called when user opens the bell drawer)
+GET    /api/scheduler/tasks         — list + current unread count
+POST   /api/scheduler/tasks         — create
+PATCH  /api/scheduler/tasks/{id}    — edit (rename / change time / toggle enabled)
+DELETE /api/scheduler/tasks/{id}    — remove (does NOT delete the bound session)
+GET    /api/scheduler/history       — most-recent-first run log
+DELETE /api/scheduler/history       — clear ALL history entries
+DELETE /api/scheduler/history/{ts}  — delete a single history entry (by timestamp,
+                                       optional ?task_id= to disambiguate same-second runs)
+POST   /api/scheduler/ack           — mark unread = 0 (called when user opens the bell drawer)
 """
 from __future__ import annotations
 
@@ -120,6 +123,28 @@ def history_endpoint(limit: int = Query(50, ge=1, le=500)) -> dict:
         "history": sched.list_history(limit=limit),
         "unread_count": sched.get_unread(),
     }
+
+
+@router.delete("/history", dependencies=[Depends(require_token)])
+def clear_history_endpoint() -> dict:
+    """Drop ALL run-history entries. Doesn't touch the unread badge —
+    user can call POST /ack separately if they also want to zero that.
+    Returns the count of entries removed."""
+    n = sched.clear_history()
+    return {"cleared": n}
+
+
+@router.delete("/history/{ts}", dependencies=[Depends(require_token)])
+def delete_history_entry_endpoint(
+    ts: float,
+    task_id: str = Query("", description="optional disambiguator when two tasks share a ts"),
+) -> dict:
+    """Delete a single history row identified by its timestamp.
+    Returns 200 even if nothing matched — the row may already have been
+    pruned by _HISTORY_CAP between the user seeing it and clicking. UI
+    just unconditionally refreshes after; idempotence keeps that simple."""
+    sched.delete_history_entry(ts, task_id)
+    return {"deleted": True}
 
 
 @router.post("/ack", dependencies=[Depends(require_token)])

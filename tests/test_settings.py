@@ -8,11 +8,14 @@ def test_get_settings_shape(client, auth):
     d = r.json()
     assert "providers" in d and "defaults" in d and "params" in d
     keys = {p["env_key"] for p in d["providers"]}
+    # Original 4
     assert "DEEPSEEK_API_KEY" in keys
     assert "ZHIPUAI_API_KEY" in keys
-    # MiMo / Qwen 暂不支持 (no Anthropic-compat endpoint)
-    assert "MIMO_API_KEY" not in keys
-    assert "DASHSCOPE_API_KEY" not in keys
+    assert "MINIMAX_API_KEY" in keys
+    # Added 2026-05-22 (Kimi / Qwen / MiMo gained Anthropic-compat endpoints)
+    assert "MOONSHOT_API_KEY" in keys
+    assert "DASHSCOPE_API_KEY" in keys
+    assert "XIAOMI_MIMO_API_KEY" in keys
 
 
 def test_get_settings_masks_existing_key(client, auth, monkeypatch):
@@ -132,21 +135,79 @@ def test_put_settings_requires_auth(client, monkeypatch, tmp_path):
     assert r.status_code == 401
 
 
+def test_put_settings_generic_provider_keys_writes_new_vendors(
+    client, auth, monkeypatch, tmp_path
+):
+    """The generic `provider_keys` map (added 2026-05-22) lets new vendors
+    write through Settings without adding individual Pydantic fields. This
+    is how Kimi / Qwen / MiMo reach .env — they don't have legacy
+    `moonshot_api_key` etc. fields."""
+    from backend import api_settings as api_s
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("MUSELAB_TOKEN=existing-test-token-1234567890\n")
+    monkeypatch.setattr(api_s, "ENV_PATH", fake_env)
+    r = client.put("/api/settings", headers=auth, json={
+        "provider_keys": {
+            "MOONSHOT_API_KEY":     "sk-kimi-test",
+            "DASHSCOPE_API_KEY":    "sk-qwen-test",
+            "XIAOMI_MIMO_API_KEY":  "sk-mimo-test",
+        },
+    })
+    assert r.status_code == 200
+    content = fake_env.read_text()
+    assert "MOONSHOT_API_KEY=sk-kimi-test" in content
+    assert "DASHSCOPE_API_KEY=sk-qwen-test" in content
+    assert "XIAOMI_MIMO_API_KEY=sk-mimo-test" in content
+
+
+def test_put_settings_generic_provider_keys_rejects_unknown_env(
+    client, auth, monkeypatch, tmp_path
+):
+    """Whitelist via PROVIDER_KEYS — random env names sent through the
+    generic channel are silently dropped, not written to .env. Guards
+    against a credential-stealing route in the unlikely event of XSS."""
+    from backend import api_settings as api_s
+    fake_env = tmp_path / ".env"
+    fake_env.write_text("MUSELAB_TOKEN=existing-test-token-1234567890\n")
+    monkeypatch.setattr(api_s, "ENV_PATH", fake_env)
+    client.put("/api/settings", headers=auth, json={
+        "provider_keys": {
+            "PATH":                 "/tmp/evil",
+            "MUSELAB_TOKEN":        "stolen",
+            "MOONSHOT_API_KEY":     "sk-legit",  # this one survives
+        },
+    })
+    content = fake_env.read_text()
+    assert "MOONSHOT_API_KEY=sk-legit" in content
+    assert "PATH=/tmp/evil" not in content
+    # MUSELAB_TOKEN was already there; should NOT be overwritten via this
+    # endpoint (it's not in PROVIDER_KEYS — defence in depth).
+    assert "MUSELAB_TOKEN=stolen" not in content
+    assert "MUSELAB_TOKEN=existing-test-token-1234567890" in content
+
+
 def test_get_settings_requires_auth(client):
     r = client.get("/api/settings")
     assert r.status_code == 401
 
 
 def test_settings_provider_count_matches_catalog(client, auth):
-    """Settings UI should expose the four providers: Anthropic (Claude API)
-    plus the three Anthropic-compat third parties (DeepSeek / GLM / MiniMax).
-    New ones must be added to both PROVIDER_KEYS and CATALOG."""
+    """Settings UI should auto-sync with endpoints.CATALOG — PROVIDER_KEYS
+    is now derived from it (api_settings._build_provider_keys), so adding
+    a Provider to the catalog automatically surfaces a Settings input row
+    without parallel code edits. This test guards that contract."""
+    from backend import endpoints as _ep
     r = client.get("/api/settings", headers=auth)
     d = r.json()
-    assert len(d["providers"]) == 4
     keys = {p["env_key"] for p in d["providers"]}
-    assert keys == {"ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY",
-                     "ZHIPUAI_API_KEY", "MINIMAX_API_KEY"}
+    # Anthropic is added explicitly (not in CATALOG — it routes via OAuth).
+    # Every other catalog provider must appear.
+    assert "ANTHROPIC_API_KEY" in keys
+    catalog_env_keys = {p.env_key for p in _ep.CATALOG}
+    assert catalog_env_keys.issubset(keys), \
+        f"Settings missing catalog providers: {catalog_env_keys - keys}"
+    # And we don't smuggle anything extra in.
+    assert keys == {"ANTHROPIC_API_KEY"} | catalog_env_keys
 
 
 def test_is_chinese_locale_zh(monkeypatch, app_module):
@@ -181,3 +242,77 @@ def test_is_chinese_locale_picks_up_lc_messages(monkeypatch, app_module):
     monkeypatch.setenv("LC_MESSAGES", "zh_CN.UTF-8")
     monkeypatch.delenv("LC_ALL", raising=False)
     assert is_chinese_locale() is True
+
+
+# ===== Prompt cache TTL opt-in (added 2026-05-22) =====
+# Defends muselab's "make long sessions cheap to resume" decision: 1h cache
+# is the recommended default since Anthropic's 2026-03-06 silent regression
+# from 1h → 5min global. These tests exercise configure_prompt_cache() with
+# an isolated dict so they don't depend on module reload / sys.modules
+# caching (which conflicts with pytest's monkeypatch teardown). Actual cache
+# behaviour lives in the claude CLI subprocess — out of unit-test scope; we
+# only validate the env-var contract muselab promises to the CLI.
+
+def test_prompt_cache_default_is_1h():
+    """No MUSELAB_PROMPT_CACHE_TTL → 1h opt-in by default."""
+    from backend.settings import configure_prompt_cache
+    env: dict[str, str] = {}
+    configure_prompt_cache(env)
+    assert env.get("ENABLE_PROMPT_CACHING_1H") == "1"
+    assert env.get("FORCE_PROMPT_CACHING_5M") is None
+
+
+def test_prompt_cache_explicit_1h():
+    from backend.settings import configure_prompt_cache
+    env = {"MUSELAB_PROMPT_CACHE_TTL": "1h"}
+    configure_prompt_cache(env)
+    assert env.get("ENABLE_PROMPT_CACHING_1H") == "1"
+    assert env.get("FORCE_PROMPT_CACHING_5M") is None
+
+
+def test_prompt_cache_5m_opts_out():
+    """User can opt into Anthropic's regressed default (5min) explicitly.
+    Must also unset any pre-existing ENABLE_PROMPT_CACHING_1H so the 5m
+    choice actually takes effect (otherwise the CLI sees both flags and
+    falls back to 1h)."""
+    from backend.settings import configure_prompt_cache
+    env = {
+        "MUSELAB_PROMPT_CACHE_TTL": "5m",
+        "ENABLE_PROMPT_CACHING_1H": "1",   # pre-set; must be cleared
+    }
+    configure_prompt_cache(env)
+    assert env.get("ENABLE_PROMPT_CACHING_1H") is None
+    assert env.get("FORCE_PROMPT_CACHING_5M") == "1"
+
+
+def test_prompt_cache_empty_leaves_cli_default():
+    """Empty string means 'don't touch' — useful if user wants whatever
+    upstream Anthropic decides without muselab overriding."""
+    from backend.settings import configure_prompt_cache
+    env = {"MUSELAB_PROMPT_CACHE_TTL": ""}
+    configure_prompt_cache(env)
+    assert env.get("ENABLE_PROMPT_CACHING_1H") is None
+    assert env.get("FORCE_PROMPT_CACHING_5M") is None
+
+
+def test_prompt_cache_case_insensitive_and_trim():
+    """`1H`, ` 1h `, ` 5M `, etc. all normalise correctly — user typos
+    in .env shouldn't silently break the opt-in."""
+    from backend.settings import configure_prompt_cache
+    for val in ("1H", " 1h", "1h ", " 1H "):
+        env: dict[str, str] = {"MUSELAB_PROMPT_CACHE_TTL": val}
+        configure_prompt_cache(env)
+        assert env.get("ENABLE_PROMPT_CACHING_1H") == "1", f"failed for {val!r}"
+    for val in ("5M", " 5m", "5m ", " 5M "):
+        env = {"MUSELAB_PROMPT_CACHE_TTL": val}
+        configure_prompt_cache(env)
+        assert env.get("FORCE_PROMPT_CACHING_5M") == "1", f"failed for {val!r}"
+
+
+def test_prompt_cache_unknown_value_is_noop():
+    """Garbage like `2h` or `forever` shouldn't crash — just be a no-op."""
+    from backend.settings import configure_prompt_cache
+    env: dict[str, str] = {"MUSELAB_PROMPT_CACHE_TTL": "2h"}
+    configure_prompt_cache(env)
+    assert env.get("ENABLE_PROMPT_CACHING_1H") is None
+    assert env.get("FORCE_PROMPT_CACHING_5M") is None

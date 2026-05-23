@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import subprocess
@@ -14,6 +15,20 @@ from .api_settings import router as settings_router
 from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
 from .settings import ROOT, PORT, HOST
+
+
+class _TokenFilter(logging.Filter):
+    """Strip token= query param from uvicorn access log URLs."""
+    _re = re.compile(r'token=[^&\s"]+')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.getMessage():
+            record.msg = self._re.sub("token=***", record.msg)
+        return True
+
+
+# Apply to uvicorn access logger
+logging.getLogger("uvicorn.access").addFilter(_TokenFilter())
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -67,6 +82,19 @@ async def _lifespan(app: FastAPI):
         sys.stderr.write(
             f"[muselab] scheduler start failed (continuing without scheduler): "
             f"{type(e).__name__}: {e}\n{traceback.format_exc()}\n")
+        sys.stderr.flush()
+    # Prune empty sessions left over from the previous run (e.g. new-session
+    # clicks that were never used). Runs before the first request so the
+    # session list is clean immediately on page load.
+    try:
+        from . import sessions as _sess_mod
+        pruned = _sess_mod.prune_empty_sessions()
+        if pruned:
+            sys.stderr.write(
+                f"[muselab] pruned {len(pruned)} empty session(s) on startup\n")
+            sys.stderr.flush()
+    except Exception as _e:
+        sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
         sys.stderr.flush()
     # Fire-and-forget: rewrite turn_count for any session whose value was
     # written by the old algorithm (which counted every type="user" SDK

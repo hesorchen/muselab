@@ -25,7 +25,7 @@ from claude_agent_sdk import (
     fork_session as sdk_fork_session,
 )
 from .auth import require_token_query, require_token
-from .settings import ROOT, MODEL, MCP_CONFIG_PATH, atomic_write_text, is_chinese_locale
+from .settings import ROOT, MODEL, atomic_write_text, is_chinese_locale
 from . import sessions as sess
 from . import endpoints
 from .ask_user_question import (
@@ -35,6 +35,39 @@ from .ask_user_question import (
 from . import permission_request as perm
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _plain_preview(text: str, limit: int = 120) -> str:
+    """Convert markdown assistant reply to a short plain-text push body.
+    Skips table rows, code fences, heading markers and horizontal rules so
+    the notification banner shows readable prose instead of markdown noise."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    buf: list[str] = []
+    in_code = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if stripped.startswith("|"):          # table row / separator
+            continue
+        if set(stripped) <= {"-", "*", "_", " "} and len(stripped) > 2:
+            continue                           # horizontal rule
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+        cleaned = re.sub(r"[*_`]+", "", stripped)
+        if cleaned:
+            buf.append(cleaned)
+            if sum(len(s) for s in buf) >= limit:
+                break
+    result = " ".join(buf)
+    if len(result) > limit:
+        result = result[: limit - 1] + "…"
+    return result
 
 # Clients keyed by (session_id, model, effort). model + effort are part of
 # the key so that switching model OR reasoning-effort mid-session creates a
@@ -99,6 +132,10 @@ class TurnBroadcast:
                 q.put_nowait(None)   # sentinel — subscribers stop yielding
             except Exception:
                 pass
+        # Do NOT clear self.events here — late subscribers (reconnecting
+        # browsers) still need the replay buffer. The list is small and
+        # will be GC'd when the broadcast object itself is removed from
+        # _active_turns.
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
@@ -319,7 +356,11 @@ def _budget_usd() -> float:
         return 0.0
 
 
-_MEMORY_DIR_PATH = f"~/.claude/projects/{str(ROOT).replace('/', '-')}/memory/"
+_MEMORY_DIR_PATH = (
+    f"~/.claude/projects/{str(ROOT).replace('/', '-')}/memory/"
+    if ROOT is not None
+    else "~/.claude/memory/"
+)
 
 SYSTEM_PROMPT = f"""\
 You are Muse, a personal assistant running inside muselab — a self-hosted AI
@@ -395,11 +436,7 @@ _creation_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
 
 
 def _creation_lock_for(key: tuple[str, str, str]) -> asyncio.Lock:
-    lock = _creation_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _creation_locks[key] = lock
-    return lock
+    return _creation_locks.setdefault(key, asyncio.Lock())
 
 
 async def _build_and_connect_client(
@@ -533,27 +570,42 @@ async def _build_and_connect_client(
             sys.stderr.flush()
         opts_kwargs["stderr"] = _stderr_logger
     # MCP servers: always register the in-process muselab server (for
-    # ask_user_question). If user has mcp.json with external servers, merge.
+    # ask_user_question). Then merge in:
+    #   - muselab's own mcp.json (UI-managed)
+    #   - Claude Code's standard MCP config locations (~/.claude.json,
+    #     ~/.claude/settings.json, <archive>/.mcp.json) so any MCP the
+    #     user already added via `claude mcp add` "just works" without
+    #     re-entering — muselab is positioned as a Claude Code replacement.
+    # See backend/api_settings.py _load_mcp_merged for the merge rules.
     mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
-    if MCP_CONFIG_PATH.exists():
-        try:
-            cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
-            for name, spec in (cfg.get("mcpServers") or {}).items():
-                # Skip explicitly disabled servers (UI toggle).
-                if isinstance(spec, dict) and spec.get("disabled"):
-                    continue
-                # Strip our muselab-local `disabled` key before handing to SDK.
-                clean = {k: v for k, v in spec.items() if k != "disabled"} \
-                        if isinstance(spec, dict) else spec
-                mcp_dict[name] = clean
-        except Exception as e:
-            # Don't silently drop every configured MCP server — a typo
-            # in one entry shouldn't make all servers vanish without
-            # any user-visible signal. Log + carry on with built-ins.
-            sys.stderr.write(
-                f"[chat] mcp.json parse failed for sid={session_id[:8]}: "
-                f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
-            sys.stderr.flush()
+    try:
+        from .api_settings import _load_mcp_merged
+        for name, spec in _load_mcp_merged().items():
+            if not isinstance(spec, dict):
+                continue
+            # Skip disabled servers (UI toggle OR override stub).
+            if spec.get("disabled"):
+                continue
+            # Strip muselab-local metadata keys before handing to SDK —
+            # `_source` / `_overridden_by_muselab` / `disabled` are
+            # display/control fields, not part of the MCP spec.
+            clean = {k: v for k, v in spec.items()
+                     if not k.startswith("_") and k != "disabled"}
+            # Defensive: external sources may have entries without
+            # `command` (e.g. broken Claude Code config). Skip rather
+            # than hand the SDK an unconnectable spec.
+            if "command" not in clean and "url" not in clean:
+                continue
+            mcp_dict[name] = clean
+    except Exception as e:
+        # Don't silently drop EVERY MCP server because one source had a
+        # parse error — log + carry on with the built-in. _load_mcp_merged
+        # already swallows per-file errors and stderr's them; this catch
+        # is for unexpected programmer errors only.
+        sys.stderr.write(
+            f"[chat] mcp merge failed for sid={session_id[:8]}: "
+            f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
+        sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
     # Always enable extended thinking. Without an explicit config the
     # model uses adaptive thinking and silently pauses mid-reply for
@@ -576,10 +628,21 @@ async def _build_and_connect_client(
     _VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
     if effort and effort in _VALID_EFFORT:
         opts_kwargs["effort"] = effort
-    # When permission_mode is not bypassPermissions, wire the SDK's
-    # can_use_tool callback to muselab's permission_request UI bridge.
-    if permission != "bypassPermissions":
-        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
+    # Wire the SDK's can_use_tool callback UNCONDITIONALLY (2026-05-23).
+    # Two responsibilities:
+    #   1. Per-tool permission prompts (only when permission != bypass).
+    #   2. Routing built-in AskUserQuestion calls to muselab's UI — needed
+    #      ALWAYS, even on bypassPermissions. Without this, when the model
+    #      calls SDK's built-in `AskUserQuestion` (the shorter name —
+    #      models often forget the longer `mcp__muselab__ask_user_question`
+    #      MCP alias), the SDK's default tool handler tries to surface a
+    #      terminal-style prompt that obviously can't render in the web
+    #      UI → user sees "no options to pick" and is stuck waiting.
+    # The `bypass` flag tells the callback to auto-allow everything except
+    # AskUserQuestion, preserving the no-prompts UX while still surfacing
+    # the model's questions.
+    opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
+        session_id, bypass=(permission == "bypassPermissions"))
     try:
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
         await client.connect()
@@ -743,6 +806,7 @@ async def disconnect_client(session_id: str) -> None:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
+            _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
             if c is not None:
@@ -763,56 +827,42 @@ class CreateReq(BaseModel):
 
 @router.get("/sessions", dependencies=[Depends(require_token)])
 def list_sessions_api() -> dict:
-    return {"sessions": sess.list_sessions()}
+    sessions = sess.list_sessions()
+    # Truncate heavy fields for the list view — full content fetched per-session
+    for i, s in enumerate(sessions):
+        if s.get("system_prompt") and len(s["system_prompt"]) > 200:
+            s = dict(s)  # don't mutate cache
+            s["system_prompt"] = s["system_prompt"][:200] + "…"
+            sessions[i] = s
+    return {"sessions": sessions}
 
 
 @router.post("/sessions", dependencies=[Depends(require_token)])
 def create_session_api(req: CreateReq) -> dict:
     meta = sess.create_session(name=req.name or "", model=req.model or MODEL)
+    # Auto-prune: delete any empty sessions left over from previous tabs /
+    # accidental new-session clicks. Skip the one we just created so it
+    # stays available for the user's first message.
+    sess.prune_empty_sessions(keep_ids=[meta["id"]])
     return meta
 
 
-@router.post("/sessions/organize", dependencies=[Depends(require_token)])
-def create_organize_session_api(req: CreateReq | None = None) -> dict:
-    """Create a session preconfigured with the archive-curator system
-    prompt. Returns the session metadata + an initial_message the
-    frontend should immediately send to kick off the curator workflow.
-    See backend/prompts.py for the actual prompt + bilingual seed."""
-    from .prompts import CURATOR_SYSTEM_PROMPT, CURATOR_INITIAL_MESSAGE
-    import datetime as _dt
-    # Locale-aware default label so English users don't see "[整理档案]" in
-    # their tab strip. Mirrors profile-intake + install scripts.
-    _label = "[整理档案] " if is_chinese_locale() else "[Organize] "
-    name = (req.name if req else None) or (
-        _label + _dt.datetime.now().strftime("%m-%d %H:%M"))
-    model = (req.model if req else None) or MODEL
-    meta = sess.create_session(
-        name=name, model=model, system_prompt=CURATOR_SYSTEM_PROMPT)
-    return {**meta, "initial_message": CURATOR_INITIAL_MESSAGE}
-
-
-@router.post("/sessions/profile-intake", dependencies=[Depends(require_token)])
-def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
-    """Create a session preconfigured for CLAUDE.md profile intake —
-    Muse asks questions conversationally and Edits the file as the
-    user answers. Side-effect: if CLAUDE.md doesn't exist yet at the
-    archive root, seed it from the template (locale-aware) so the
-    chat workflow has something to Read on its first tool call.
-
-    See backend/prompts.py for the system prompt + bilingual seed."""
-    from .prompts import PROFILE_INTAKE_SYSTEM_PROMPT, PROFILE_INTAKE_INITIAL_MESSAGE
+def _seed_claude_md_and_archive_skeleton() -> None:
+    """If CLAUDE.md / archive skeleton dirs are missing under ROOT, seed
+    them from the locale-aware template files in scripts/templates/.
+    Idempotent — every step skips if the target already exists. Called
+    by /sessions/organize (and historically by /sessions/profile-intake)
+    so the curator agent's first Read tool call has something to read on
+    a brand-new install.
+    """
     import datetime as _dt
     import shutil as _shutil
 
-    # If no CLAUDE.md yet, drop the template in so the agent's first
-    # Read tool call succeeds. Locale-aware: zh if any of LANG / LC_ALL /
-    # LC_MESSAGES env vars contains "zh" (matches the install/intake
-    # scripts' detection logic — see scripts/install-linux.sh and
-    # settings.is_chinese_locale).
     project_claude_md = ROOT / "CLAUDE.md"
+    is_zh = is_chinese_locale()
+    repo_root = Path(__file__).resolve().parent.parent
+
     if not project_claude_md.exists():
-        is_zh = is_chinese_locale()
-        repo_root = Path(__file__).resolve().parent.parent
         tpl_name = "default-CLAUDE.md" if is_zh else "default-CLAUDE.en.md"
         tpl_path = repo_root / "scripts" / "templates" / tpl_name
         if tpl_path.exists():
@@ -826,52 +876,80 @@ def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
                 # informatively when it tries to Read a non-existent file.
                 import sys as _sys
                 _sys.stderr.write(
-                    f"[profile-intake] couldn't seed CLAUDE.md: {e}\n")
+                    f"[organize] couldn't seed CLAUDE.md: {e}\n")
                 _sys.stderr.flush()
 
-        # Also drop archive-skeleton subdirs so the user's first
-        # interaction has the right shape on disk. Skip ones that exist.
-        # Mirrors what scripts/install-*.sh and intake.* do — README +
-        # concrete _example-*.md per supported subdir, so the chat-driven
-        # path produces the same starter skeleton as the installer path.
-        skel_root = repo_root / "scripts" / "templates" / "archive-skeleton"
-        readme_src = "README.md" if is_zh else "README.en.md"
-        example_suffix = ".zh.md" if is_zh else ".en.md"
-        examples_for_sub = {
-            "health":  "_example-checkup",
-            "work":    "_example-project-log",
-            "money":   "_example-budget",
-            "notes":   "_example-weekly-review",
-            "people":  "_example-person-card",
-            # archives/ intentionally has no example — it's a raw-source dir
-        }
-        for sub in ("health", "work", "money", "people", "notes", "archives"):
-            sd = ROOT / sub
-            if not sd.exists():
-                try:
-                    sd.mkdir(parents=True, exist_ok=True)
-                    src = skel_root / sub / readme_src
-                    if src.exists():
-                        _shutil.copy(src, sd / "README.md")
-                    ex_basename = examples_for_sub.get(sub)
-                    if ex_basename:
-                        ex_src = skel_root / sub / (ex_basename + example_suffix)
-                        ex_dst = sd / (ex_basename + ".md")
-                        if ex_src.exists() and not ex_dst.exists():
-                            _shutil.copy(ex_src, ex_dst)
-                except OSError:
-                    pass
+    # Drop archive-skeleton subdirs so the user's first interaction has
+    # the right shape on disk. Skip ones that already exist. Mirrors
+    # what scripts/install-*.sh and intake.* do — README + concrete
+    # _example-*.md per supported subdir, so the chat-driven path
+    # produces the same starter skeleton as the installer path.
+    skel_root = repo_root / "scripts" / "templates" / "archive-skeleton"
+    readme_src = "README.md" if is_zh else "README.en.md"
+    example_suffix = ".zh.md" if is_zh else ".en.md"
+    examples_for_sub = {
+        "health":  "_example-checkup",
+        "work":    "_example-project-log",
+        "money":   "_example-budget",
+        "notes":   "_example-weekly-review",
+        "people":  "_example-person-card",
+        # archives/ intentionally has no example — it's a raw-source dir
+    }
+    for sub in ("health", "work", "money", "people", "notes", "archives"):
+        sd = ROOT / sub
+        if not sd.exists():
+            try:
+                sd.mkdir(parents=True, exist_ok=True)
+                src = skel_root / sub / readme_src
+                if src.exists():
+                    _shutil.copy(src, sd / "README.md")
+                ex_basename = examples_for_sub.get(sub)
+                if ex_basename:
+                    ex_src = skel_root / sub / (ex_basename + example_suffix)
+                    ex_dst = sd / (ex_basename + ".md")
+                    if ex_src.exists() and not ex_dst.exists():
+                        _shutil.copy(ex_src, ex_dst)
+            except OSError:
+                pass
 
-    # Session label follows the same locale check used for the template.
-    # English users were seeing "[设置档案] 05-22 14:30" in their tab strip
-    # because we always used the Chinese label.
-    default_label = "[设置档案] " if is_chinese_locale() else "[Set up profile] "
+
+@router.post("/sessions/organize", dependencies=[Depends(require_token)])
+def create_organize_session_api(req: CreateReq | None = None) -> dict:
+    """Create a session preconfigured with the archive-curator system
+    prompt. The curator does BOTH archive tidying AND CLAUDE.md profile
+    completion (merged 2026-05-23 — used to be two separate buttons /
+    endpoints). If CLAUDE.md / archive subdirs are missing, they're
+    seeded from templates so the curator's first Read tool call has
+    something to work with.
+
+    Returns session metadata + an initial_message the frontend should
+    auto-send to kick off the workflow. See backend/prompts.py."""
+    from .prompts import CURATOR_SYSTEM_PROMPT, CURATOR_INITIAL_MESSAGE
+    import datetime as _dt
+    _seed_claude_md_and_archive_skeleton()
+    # Locale-aware default label so English users don't see "[整理档案]" in
+    # their tab strip. Mirrors install scripts.
+    _label = "[整理档案] " if is_chinese_locale() else "[Organize] "
     name = (req.name if req else None) or (
-        default_label + _dt.datetime.now().strftime("%m-%d %H:%M"))
+        _label + _dt.datetime.now().strftime("%m-%d %H:%M"))
     model = (req.model if req else None) or MODEL
     meta = sess.create_session(
-        name=name, model=model, system_prompt=PROFILE_INTAKE_SYSTEM_PROMPT)
-    return {**meta, "initial_message": PROFILE_INTAKE_INITIAL_MESSAGE}
+        name=name, model=model, system_prompt=CURATOR_SYSTEM_PROMPT)
+    return {**meta, "initial_message": CURATOR_INITIAL_MESSAGE}
+
+
+@router.post("/sessions/profile-intake", dependencies=[Depends(require_token)])
+def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
+    """DEPRECATED 2026-05-23 — kept for external API back-compat. The
+    profile-intake flow has been merged into /sessions/organize (single
+    button in the UI). New callers should hit /sessions/organize; this
+    endpoint now just forwards to it so any old saved bookmark / curl
+    script still works.
+
+    The old PROFILE_INTAKE_SYSTEM_PROMPT remains exported from
+    backend/prompts.py for anyone embedding muselab who wants the
+    narrower profile-only behavior."""
+    return create_organize_session_api(req)
 
 
 def _extract_searchable_text(content: Any) -> str:
@@ -1483,22 +1561,8 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
             raise HTTPException(409, f"cannot tag session before first turn: {e}")
     if req.pinned is not None:
         # Pin is muselab-local (not stored in CLI JSONL). Always idempotent.
-        idx = sess._load_index()
-        found = False
-        for s in idx:
-            if s["id"] == sid:
-                s["pinned"] = bool(req.pinned)
-                found = True
-                break
-        if not found:
-            import time as _time
-            idx.append({
-                "id": sid, "name": "", "model": "", "system_prompt": "",
-                "created_at": _time.time(), "updated_at": _time.time(),
-                "message_count": 0, "auto_named": True,
-                "pinned": bool(req.pinned),
-            })
-        sess._save_index(idx)
+        # set_pin runs the load-mutate-save sequence under _INDEX_LOCK.
+        sess.set_pin(sid, req.pinned)
         ok = True
     if req.system_prompt is not None:
         ok = sess.update_system_prompt(sid, req.system_prompt) or ok
@@ -1763,15 +1827,6 @@ def session_usage(session_id: str, model: str = "") -> dict:
     stored = int(u.get("context_limit", 0) or 0)
     hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
     limit = max(stored, hardcoded)
-    # Diagnostic: every /usage call writes which value won. Lets you confirm
-    # in stderr.log whether your meter is showing hardcoded fallback, stored
-    # SDK value, or whether the model name even resolves in the table.
-    import sys as _sys
-    in_table = m in MODEL_CONTEXT_LIMITS
-    _sys.stderr.write(
-        f"[usage] sid={session_id[:8]} model={m!r} in_table={in_table} "
-        f"stored={stored} hardcoded={hardcoded} → limit={limit}\n")
-    _sys.stderr.flush()
     # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
     # handler. Fall back to the legacy estimate only if no turn has completed
     # yet (in which case `context_used` is 0 anyway → 0% display, correct).
@@ -2150,8 +2205,11 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
         # than returning fake data; frontend can fall back to /usage.
         raise HTTPException(409, "no live client for this session — send a message first")
     key = matched[0]
+    client = _clients.get(key)
+    if client is None:
+        raise HTTPException(409, "no live client for this session — send a message first")
     try:
-        breakdown = await _clients[key].get_context_usage()
+        breakdown = await client.get_context_usage()
         # Pass through the SDK's response shape directly. Frontend can pick
         # whichever fields it wants to render.
         return dict(breakdown)
@@ -2302,12 +2360,10 @@ def context_info() -> dict:
     claude_oauth = (Path.home() / ".claude" / ".credentials.json").exists()
     anthropic_api = bool(os.environ.get("ANTHROPIC_API_KEY")
                           or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    from . import endpoints as _ep
     third_party_configured = [
-        name for env_key, name in (
-            ("DEEPSEEK_API_KEY", "DeepSeek"),
-            ("ZHIPUAI_API_KEY",  "GLM"),
-            ("MINIMAX_API_KEY",  "MiniMax"),
-        ) if os.environ.get(env_key)
+        p.env_key for p in _ep.CATALOG
+        if os.environ.get(p.env_key)
     ]
     # Back-compat: keep claude_md_exists / lines / mtime fields for any
     # consumer that hasn't migrated to the new claude_md_sources list.
@@ -2408,17 +2464,24 @@ async def set_budget(req: BudgetReq) -> dict:
 
 @router.get("/mcp", dependencies=[Depends(require_token)])
 def mcp_status() -> dict:
-    """Return configured MCP servers (parsed from mcp.json) for UI display."""
-    if not MCP_CONFIG_PATH.exists():
-        return {"configured": False, "servers": []}
+    """Return configured MCP servers (merged view: muselab's mcp.json +
+    Claude Code's standard config locations) for UI display. Source field
+    tells the caller where each entry came from. `configured: True` if at
+    least one server resolved from anywhere."""
     try:
-        cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
-        servers = cfg.get("mcpServers", {})
+        from .api_settings import _load_mcp_merged
+        merged = _load_mcp_merged()
         return {
-            "configured": True,
+            "configured": bool(merged),
             "servers": [
-                {"name": name, "command": s.get("command", ""), "args": s.get("args", [])}
-                for name, s in servers.items()
+                {
+                    "name": name,
+                    "command": s.get("command", ""),
+                    "args": s.get("args", []),
+                    "source": s.get("_source", "muselab"),
+                    "disabled": bool(s.get("disabled", False)),
+                }
+                for name, s in merged.items()
             ],
         }
     except Exception as e:
@@ -2907,9 +2970,10 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
     # "total" (incl. base64 / dict insert) so we know where the time
     # actually went on the server side.
     _t_end = time.perf_counter()
+    _safe_name = Path(file.filename or "upload").name
     _sys.stderr.write(
         f"[upload] kind={kind} mime={mime} bytes={len(body)} "
-        f"name={name!r} read_ms={(_t_read_end - _t_read_start)*1000:.0f} "
+        f"name={_safe_name!r} read_ms={(_t_read_end - _t_read_start)*1000:.0f} "
         f"total_ms={(_t_end - _t0)*1000:.0f}\n")
     _sys.stderr.flush()
     return {"id": aid, "mime": mime, "bytes": len(body),
@@ -2985,8 +3049,16 @@ async def stream(
     # the reservation we made at the top of NEW-TURN MODE, otherwise this
     # session's slot stays "busy" forever and subsequent sends get rejected.
     try:
-        client = await get_client(session_id, model_to_use, permission,
-                                    effort=effort_to_use)
+        client = await asyncio.wait_for(
+            get_client(session_id, model_to_use, permission, effort=effort_to_use),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise HTTPException(504, "Client connection timed out — CLI process may be hung")
     except asyncio.CancelledError:
         # FastAPI cancels the handler when the client disconnects mid-
         # await (browser tab closed, request aborted). Without this the
@@ -3037,7 +3109,26 @@ async def stream(
                         "data": entry["b64"],
                     },
                 })
-                persisted_imgs.append({"mime": entry["mime"]})
+                # Store a small thumbnail (≤ 160 px, JPEG 60 %) in the
+                # sidecar so reloaded sessions can still show the image.
+                # Falls back gracefully if Pillow is not installed or the
+                # image bytes are corrupt — the frontend shows a placeholder.
+                thumb_b64 = None
+                try:
+                    import io as _io, base64 as _b64
+                    from PIL import Image as _Img
+                    raw_bytes = _b64.b64decode(entry["b64"])
+                    with _Img.open(_io.BytesIO(raw_bytes)) as _img:
+                        _img.thumbnail((160, 160))
+                        buf = _io.BytesIO()
+                        _img.convert("RGB").save(buf, "JPEG", quality=60)
+                        thumb_b64 = _b64.b64encode(buf.getvalue()).decode()
+                except Exception:
+                    pass
+                _item: dict = {"mime": entry["mime"]}
+                if thumb_b64:
+                    _item["thumb"] = thumb_b64
+                persisted_imgs.append(_item)
             elif kind == "pdf":
                 pdf_blocks.append({
                     "type": "document",
@@ -3356,7 +3447,22 @@ async def stream(
                 if sm.type == "assistant" and not new_asst_uuid:
                     new_asst_uuid = sm.uuid
                 elif sm.type == "user" and not new_user_uuid:
-                    new_user_uuid = sm.uuid
+                    if persisted_imgs:
+                        # When images were sent, match the user message that
+                        # actually contains image blocks — not just any last
+                        # user message. Without this, if the user sends more
+                        # messages while the stream is running, reversed()
+                        # finds a later (non-image) user UUID and the image
+                        # annotation ends up on the wrong message.
+                        content = (sm.message or {}).get("content") or []
+                        has_img_block = isinstance(content, list) and any(
+                            isinstance(b, dict) and b.get("type") == "image"
+                            for b in content
+                        )
+                        if has_img_block:
+                            new_user_uuid = sm.uuid
+                    else:
+                        new_user_uuid = sm.uuid
                 if new_asst_uuid and new_user_uuid:
                     break
             if new_asst_uuid and assistant_acc:
@@ -3440,9 +3546,10 @@ async def stream(
                                     break
                         except Exception:
                             pass
+                        _body = _plain_preview(assistant_acc) or "Muse 已回复"
                         _push.send_to_all(
                             title=sname or "muselab",
-                            body="💬 Muse 已回复",
+                            body=_body,
                             url="/",
                             tag=f"turn-{session_id}",
                         )
@@ -3616,7 +3723,11 @@ async def _subscribe_broadcast(broadcast: TurnBroadcast):
         # Replay the buffered prefix (events published BEFORE we
         # subscribed — they're not in our queue).
         for i in range(snap_len):
-            yield broadcast.events[i]
+            try:
+                chunk = broadcast.events[i]
+            except IndexError:
+                break  # events 被意外清空，停止 replay
+            yield chunk
         # If the turn already finished before we subscribed, the queue
         # holds nothing but the None sentinel.
         while True:

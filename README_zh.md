@@ -1,38 +1,40 @@
 # muselab
 
-> 自托管 Web UI，把 **Claude Agent SDK** 跑在**你自己的文件**之上。
+> 自部署 Web UI，让 **Claude Agent SDK** 跟你自己的文件对话。
+> 桌面、平板、手机共享会话；Claude、DeepSeek、GLM、Kimi、Qwen 共用同一套 agent loop。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-186_passing-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart_zh.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
-- 🧠 **你的 archive 就是工作集**。`MUSELAB_ROOT` 指向你自己的目录——
-  里面的文件是一等上下文，不是 RAG 召回对象。
-- 🤖 **所有模型同一套 agent loop**。MCP / Skills / Subagent / plan 模式
-  在 Claude、DeepSeek、GLM、MiniMax 上行为一致。
-- 💸 **复用 Claude Pro / Max 订阅**（OAuth），无 token 计费。也可填
-  第三方 vendor key。
-- 🔄 **多端共享一台 server**。手机 / 平板 / 桌面共用会话；archive
-  始终留在你自己的主机上。
-- 🛠 **无构建链**。原生 HTML + Alpine.js + CSS，作为静态文件直出——
-  编辑文件刷新浏览器即生效。
+- 🧠 **归档即工作集**。`MUSELAB_ROOT` 指向用户自有目录——其中的文件是一等上下文，而非 RAG 召回对象。
+- 🤖 **所有模型共用同一套 agent loop**。MCP / Skills / Subagent / plan 模式在 Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo 上行为一致。
+- 💸 **复用 Claude Pro / Max 订阅**（OAuth），无按令牌计费。也可填入第三方 API key。
+- 🔄 **多端共享一台服务器**。手机 / 平板 / 桌面共用会话；归档数据始终保存在用户自己的主机上。
+- 🛠 **无构建步骤**。原生 HTML + Alpine.js + CSS，以静态文件形式直接提供——修改文件后刷新浏览器即可生效。
 
-> **单用户专属**。muselab 设计在你自己的机器上为你一个人服务：一个 token、
-> 一个 archive、无多用户隔离。如果你需要多租户部署，这个项目不适合（暂时）。
+> **单用户专属。** muselab 设计为在用户自己的机器上单人使用：一个 token、一个归档目录、无多用户隔离。如需多租户部署，本项目暂不适用。
 
 ## 安装
+
+**一行命令**（Linux + macOS + WSL2 通用）——安装 `uv`，克隆仓库至 `~/muselab`，再调用平台安装程序：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+```
+
+**手动安装**——逐步执行每条命令：
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
 bash scripts/install-linux.sh    # 或 install-macos.sh / install-windows.ps1
 ```
 
-访问 `http://localhost:8765`，粘贴 `.env` 里的 token。
+访问 `http://localhost:8765`，粘贴 `.env` 中的 token。
 
-前置准备、Docker、开发模式与各 OS 详细指南，见 [Quick start](docs/quickstart_zh.md)。
+前置准备、Docker、开发模式与各平台详细说明，参见 [快速入门](docs/quickstart_zh.md)。
 
 ## 文档
 
@@ -47,7 +49,6 @@ bash scripts/install-linux.sh    # 或 install-macos.sh / install-windows.ps1
 
 ## 状态
 
-Pre-1.0，作者每日使用中。欢迎 PR——见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-路线图与已知问题：[TODO.md](TODO.md)。
+Pre-1.0，作者每日使用中。欢迎提交 PR——参见 [CONTRIBUTING.md](CONTRIBUTING.md)。路线图与已知问题见 [GitHub Issues](https://github.com/hesorchen/muselab/issues)。
 
 [MIT](LICENSE)

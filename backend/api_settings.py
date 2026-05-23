@@ -29,17 +29,21 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
-# Providers exposed in the settings UI. Only list厂商 with verified Anthropic-
-# compatible Messages API endpoints (so Claude SDK can call them directly).
-# 小米 MiMo / Qwen / Doubao 暂只支持 OpenAI 协议，等他们出 /anthropic 端点再加。
-PROVIDER_KEYS = [
-    # Anthropic 排第一 — 是 muselab 的默认/推荐 provider。
-    # 用户也可以走 `claude login`（Pro/Max OAuth），那种情况下这一栏可以留空。
-    ("ANTHROPIC_API_KEY", "Anthropic (Claude API)"),
-    ("DEEPSEEK_API_KEY", "DeepSeek"),
-    ("ZHIPUAI_API_KEY", "智谱 GLM"),
-    ("MINIMAX_API_KEY", "MiniMax"),
-]
+# Providers exposed in the settings UI. Derived from endpoints.CATALOG so a
+# new entry there automatically surfaces in Settings — no parallel list to
+# keep in sync. Anthropic is added explicitly (Claude isn't in CATALOG —
+# it routes through `claude login` OAuth, not a third-party adapter).
+def _build_provider_keys() -> list[tuple[str, str]]:
+    # Anthropic first — recommended primary provider. Empty here is fine if
+    # the user authenticates via `claude login` Pro/Max OAuth instead.
+    out: list[tuple[str, str]] = [("ANTHROPIC_API_KEY", "Anthropic (Claude API)")]
+    from . import endpoints as _ep
+    for p in _ep.CATALOG:
+        out.append((p.env_key, p.display))
+    return out
+
+
+PROVIDER_KEYS = _build_provider_keys()
 
 DEFAULT_KEYS = [
     "MUSELAB_DEFAULT_MODEL",
@@ -59,11 +63,23 @@ def _mask(v: str) -> str:
 
 
 class SettingsIn(BaseModel):
-    # Provider keys — empty string = "don't change", explicit null = remove.
+    # Provider keys — kept as individual fields for the 4 original providers
+    # (FE still sends them this way for backwards compat). Plus a generic
+    # `provider_keys` map for any provider added later — FE sends
+    # `{"DEEPSEEK_API_KEY": "sk-...", "DASHSCOPE_API_KEY": "sk-..."}` etc.
+    # The generic map wins if both forms set the same env var. Whitelist of
+    # accepted env names lives in PROVIDER_KEYS (derived from CATALOG), so
+    # a typo / unrelated env var like PATH can't be smuggled through here.
+    # Each value semantics:
+    #   None / unset → don't touch
+    #   "" (empty)   → don't touch (FE legacy form)
+    #   "_delete_"   → remove the env entry
+    #   anything else → write that value
     anthropic_api_key: str | None = None
     deepseek_api_key: str | None = None
     zhipuai_api_key: str | None = None
     minimax_api_key: str | None = None
+    provider_keys: dict[str, str] | None = None
     # Defaults
     default_model: str | None = None
     default_permission: str | None = None
@@ -131,6 +147,31 @@ def _write_env(updates: dict[str, str]) -> None:
             os.environ[k] = v
 
 
+# Single source of truth for setting defaults — keys = env var name, values
+# = string default returned when env is unset. Both GET (echoes the value
+# to the frontend) and PUT (compares incoming value against the "current"
+# value to detect actual changes) must use the SAME default, otherwise
+# saving a never-edited setting wrongly counts as "changed" — the env is
+# unset, GET reported the default to the FE, FE sends the default back,
+# PUT compares to None and sees a diff. (2026-05-23 — second pass at the
+# "saved 7 settings" bug. First pass forgot to use defaults in compare.)
+_SETTING_DEFAULTS: dict[str, str] = {
+    "MUSELAB_MODEL":                "claude-sonnet-4-6",
+    "MUSELAB_DEFAULT_MODEL":        "claude-sonnet-4-6",
+    "MUSELAB_DEFAULT_PERMISSION":   "bypassPermissions",
+    "MUSELAB_THINKING_BUDGET":      "4000",
+    "MUSELAB_MAX_TURNS":            "0",
+    "MUSELAB_NOTIFY_SCHEDULED":     "true",
+    "MUSELAB_NOTIFY_NORMAL":        "true",
+}
+
+
+def _current(env_key: str) -> str:
+    """Read the current effective value of a setting env, falling back to the
+    canonical default when unset. Used by put_settings's change-detection."""
+    return os.environ.get(env_key, _SETTING_DEFAULTS.get(env_key, ""))
+
+
 @router.get("", dependencies=[Depends(require_token)])
 def get_settings() -> dict:
     """Return current settings with API keys masked."""
@@ -146,14 +187,19 @@ def get_settings() -> dict:
     return {
         "providers": providers,
         "defaults": {
-            "model": os.environ.get("MUSELAB_DEFAULT_MODEL", os.environ.get("MUSELAB_MODEL", "claude-sonnet-4-6")),
-            "permission": os.environ.get("MUSELAB_DEFAULT_PERMISSION", "bypassPermissions"),
+            # Model: prefer MUSELAB_DEFAULT_MODEL, fall back to MUSELAB_MODEL,
+            # then to the canonical default. The two-key dance exists because
+            # chat.py historically read MUSELAB_MODEL.
+            "model": os.environ.get(
+                "MUSELAB_DEFAULT_MODEL",
+                os.environ.get("MUSELAB_MODEL", _SETTING_DEFAULTS["MUSELAB_MODEL"])),
+            "permission": _current("MUSELAB_DEFAULT_PERMISSION"),
         },
         "params": {
-            "thinking_budget": int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000")),
-            "max_turns": int(os.environ.get("MUSELAB_MAX_TURNS", "0")),
-            "notify_scheduled": (os.environ.get("MUSELAB_NOTIFY_SCHEDULED", "true").lower() != "false"),
-            "notify_normal":    (os.environ.get("MUSELAB_NOTIFY_NORMAL",    "true").lower() != "false"),
+            "thinking_budget": int(_current("MUSELAB_THINKING_BUDGET")),
+            "max_turns": int(_current("MUSELAB_MAX_TURNS")),
+            "notify_scheduled": _current("MUSELAB_NOTIFY_SCHEDULED").lower() != "false",
+            "notify_normal":    _current("MUSELAB_NOTIFY_NORMAL").lower()    != "false",
         },
     }
 
@@ -165,13 +211,15 @@ def put_settings(req: SettingsIn) -> dict:
 
     # Provider keys: empty string means "keep current"; we ignore them.
     # Explicit non-empty string writes; "_delete_" sentinel removes.
-    key_map = {
+    # Legacy form: individual snake-case fields for the original 4
+    # providers. Kept for FE backwards-compat.
+    legacy_key_map = {
         "anthropic_api_key": "ANTHROPIC_API_KEY",
         "deepseek_api_key": "DEEPSEEK_API_KEY",
         "zhipuai_api_key": "ZHIPUAI_API_KEY",
         "minimax_api_key": "MINIMAX_API_KEY",
     }
-    for field, env_name in key_map.items():
+    for field, env_name in legacy_key_map.items():
         v = getattr(req, field)
         if v is None or v == "":   # skip unchanged
             continue
@@ -179,24 +227,75 @@ def put_settings(req: SettingsIn) -> dict:
             updates[env_name] = None  # type: ignore[assignment]  # signals removal
         else:
             updates[env_name] = v
+    # Generic form: `provider_keys: {ENV_NAME: value}`. Reuses PROVIDER_KEYS
+    # as a whitelist so the user can't shove arbitrary env names through
+    # this endpoint (the endpoint runs with token auth, but defence-in-depth
+    # keeps a credential-stealing route from existing on principle —
+    # otherwise a future XSS could PUT `PATH=/tmp/evil` here).
+    if req.provider_keys is not None:
+        allowed_envs = {k for k, _ in PROVIDER_KEYS}
+        for env_name, v in req.provider_keys.items():
+            if env_name not in allowed_envs:
+                continue   # silently drop typo'd / disallowed envs
+            if not isinstance(v, str) or v == "":
+                continue
+            if v == "_delete_":
+                updates[env_name] = None  # type: ignore[assignment]
+            else:
+                updates[env_name] = v
+
+    # Per-field "did it actually change?" gate. The frontend sends every
+    # draftDefaults / draftParams field on every save (it doesn't track
+    # which ones the user edited), so without this gate `req.X is not None`
+    # treats unchanged fields as updates and the response's `updated`
+    # list inflates. Symptom: user only flipped the language toggle (which
+    # is pure client-side localStorage, doesn't even hit this endpoint) and
+    # the toast says "已修改 7 项设置" — model writes 2 env keys, plus
+    # permission/thinking_budget/max_turns/notify_scheduled/notify_normal
+    # = 7, all of them just re-asserting their current value (2026-05-23
+    # user feedback). Comparing against _current() (which falls back to
+    # the canonical default for unset envs) keeps the count honest AND
+    # avoids pointless .env rewrites on no-op saves.
+    #
+    # CRITICAL: must use _current(), not os.environ.get(). When an env is
+    # unset, os.environ.get returns None, GET endpoint returned the default
+    # to the FE, FE sends the default back, naive `None != default` → diff
+    # → "changed" → bogus count. _current() bakes in the default so the
+    # round-trip is comparable. (First fix attempt 2026-05-23 only handled
+    # notify_* this way; missed the other 5 fields. Second pass fixes all.)
+    def _changed(env_key: str, new_val: str) -> bool:
+        return _current(env_key).lower() != new_val.lower() \
+            if env_key.startswith("MUSELAB_NOTIFY_") \
+            else _current(env_key) != new_val
 
     if req.default_model is not None:
         # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
         # and the settings GET endpoint (reads `MUSELAB_DEFAULT_MODEL`) agree.
         # Without this, the user changed "default model" in Settings and saw it
         # echoed back, but new sessions still used the .env's `MUSELAB_MODEL`.
-        updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
-        updates["MUSELAB_MODEL"] = req.default_model
-    if req.default_permission is not None:
+        # Count as ONE updated field (both keys flip together — they're an
+        # implementation detail, not two separate settings).
+        if (_changed("MUSELAB_DEFAULT_MODEL", req.default_model)
+                or _changed("MUSELAB_MODEL", req.default_model)):
+            updates["MUSELAB_DEFAULT_MODEL"] = req.default_model
+            updates["MUSELAB_MODEL"] = req.default_model
+    if req.default_permission is not None and _changed(
+            "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
         updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
-    if req.thinking_budget is not None:
+    if req.thinking_budget is not None and _changed(
+            "MUSELAB_THINKING_BUDGET", str(req.thinking_budget)):
         updates["MUSELAB_THINKING_BUDGET"] = str(req.thinking_budget)
-    if req.max_turns is not None:
+    if req.max_turns is not None and _changed(
+            "MUSELAB_MAX_TURNS", str(req.max_turns)):
         updates["MUSELAB_MAX_TURNS"] = str(req.max_turns)
     if req.notify_scheduled is not None:
-        updates["MUSELAB_NOTIFY_SCHEDULED"] = "true" if req.notify_scheduled else "false"
+        new_v = "true" if req.notify_scheduled else "false"
+        if _changed("MUSELAB_NOTIFY_SCHEDULED", new_v):
+            updates["MUSELAB_NOTIFY_SCHEDULED"] = new_v
     if req.notify_normal is not None:
-        updates["MUSELAB_NOTIFY_NORMAL"] = "true" if req.notify_normal else "false"
+        new_v = "true" if req.notify_normal else "false"
+        if _changed("MUSELAB_NOTIFY_NORMAL", new_v):
+            updates["MUSELAB_NOTIFY_NORMAL"] = new_v
 
     _write_env(updates)
     # The `chat.py` module captured `MODEL` at import time; if we just touched
@@ -207,7 +306,22 @@ def put_settings(req: SettingsIn) -> dict:
         _settings.MODEL = updates["MUSELAB_MODEL"]
         from . import chat as _chat
         _chat.MODEL = updates["MUSELAB_MODEL"]
-    return {"ok": True, "updated": list(updates.keys())}
+    # `updated_count` is the user-facing tally for the "Saved N settings" toast.
+    # Differs from len(updated) in one case: model changes write two env keys
+    # (MUSELAB_MODEL + MUSELAB_DEFAULT_MODEL — they're an implementation detail
+    # kept in sync) but represent ONE setting from the user's perspective. Without
+    # this de-dup the toast says "Saved 2 settings" when the user only changed
+    # the model dropdown. Old `updated` list is preserved unchanged for any
+    # caller that wants the raw env-key list.
+    updated_keys = list(updates.keys())
+    paired_model_keys = {"MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL"}
+    model_pair_count = sum(1 for k in updated_keys if k in paired_model_keys)
+    updated_count = len(updated_keys) - max(0, model_pair_count - 1)
+    return {
+        "ok": True,
+        "updated": updated_keys,
+        "updated_count": updated_count,
+    }
 
 
 # ====== MCP server management ======
@@ -238,6 +352,132 @@ def _load_mcp() -> dict:
         return d
     except (json.JSONDecodeError, OSError):
         return {"mcpServers": {}}
+
+
+# ====== Claude Code MCP auto-detection (2026-05-23) ======
+# muselab is positioned as a Claude Code replacement, so we want every MCP
+# the user has already configured via `claude mcp add` / `~/.claude.json` /
+# project `.mcp.json` to "just work" without re-entering. The four standard
+# Claude Code MCP config locations are scanned at session-build time; any
+# servers found get merged into the SDK options. muselab's own mcp.json
+# always wins on name conflict so the user can override or disable any
+# inherited entry from the muselab UI.
+
+_CLAUDE_USER_JSON = Path.home() / ".claude.json"
+_CLAUDE_USER_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+
+def _load_external_mcp_sources() -> dict[str, dict]:
+    """Scan Claude Code's standard MCP config locations and return a flat
+    {server_name: spec_dict_with_source} mapping. The `_source` field is
+    added so the UI can show a "from Claude Code (user-global)" tag.
+
+    Priority order (later sources override earlier on name conflict):
+      1. ~/.claude.json top-level `mcpServers`        — user-global
+      2. ~/.claude/settings.json `mcpServers`         — newer user-global schema
+      3. ~/.claude.json projects.{archive}.mcpServers — per-project user-level
+      4. <archive>/.mcp.json                          — per-project shared
+                                                        (typically git-committed)
+
+    Robust: any unreadable / malformed file is silently skipped so a broken
+    Claude Code config doesn't break muselab boot. Each "skip" hits stderr
+    once so the user can debug if needed.
+    """
+    from .settings import ROOT
+    out: dict[str, dict] = {}
+
+    def _add(name: str, spec: Any, source: str) -> None:
+        if not isinstance(spec, dict) or not name:
+            return
+        out[name] = {**spec, "_source": source}
+
+    def _ingest(payload: Any, mc_path: str, source: str) -> None:
+        """Walk a dict-shaped JSON and slot every server under `mcpServers`
+        into the output. `mc_path` is just for error messages."""
+        if not isinstance(payload, dict):
+            return
+        servers = payload.get("mcpServers")
+        if not isinstance(servers, dict):
+            return
+        for name, spec in servers.items():
+            _add(name, spec, source)
+
+    # 1. ~/.claude.json (top-level user-global)
+    if _CLAUDE_USER_JSON.exists():
+        try:
+            cc = json.loads(_CLAUDE_USER_JSON.read_text(encoding="utf-8"))
+            _ingest(cc, str(_CLAUDE_USER_JSON), "claude_user_global")
+        except (json.JSONDecodeError, OSError) as e:
+            sys.stderr.write(
+                f"[mcp] could not read {_CLAUDE_USER_JSON}: "
+                f"{type(e).__name__}: {e}\n")
+        else:
+            # 3. Per-project section inside the same file. Match by absolute
+            # archive ROOT — Claude Code keys projects by exact path string.
+            projects = cc.get("projects") if isinstance(cc, dict) else None
+            if isinstance(projects, dict):
+                proj_entry = projects.get(str(ROOT))
+                if isinstance(proj_entry, dict):
+                    _ingest(proj_entry, f"{_CLAUDE_USER_JSON}#projects.{ROOT}",
+                             "claude_user_project")
+
+    # 2. ~/.claude/settings.json — newer schema. Some installs only have this.
+    if _CLAUDE_USER_SETTINGS.exists():
+        try:
+            cs = json.loads(_CLAUDE_USER_SETTINGS.read_text(encoding="utf-8"))
+            _ingest(cs, str(_CLAUDE_USER_SETTINGS), "claude_user_settings")
+        except (json.JSONDecodeError, OSError) as e:
+            sys.stderr.write(
+                f"[mcp] could not read {_CLAUDE_USER_SETTINGS}: "
+                f"{type(e).__name__}: {e}\n")
+
+    # 4. <archive>/.mcp.json — convention for project-shared, git-committed MCP.
+    proj_mcp = ROOT / ".mcp.json"
+    if proj_mcp.exists():
+        try:
+            pm = json.loads(proj_mcp.read_text(encoding="utf-8"))
+            _ingest(pm, str(proj_mcp), "archive_project")
+        except (json.JSONDecodeError, OSError) as e:
+            sys.stderr.write(
+                f"[mcp] could not read {proj_mcp}: "
+                f"{type(e).__name__}: {e}\n")
+
+    return out
+
+
+def _load_mcp_merged() -> dict[str, dict]:
+    """Final {name: spec} mapping after merging muselab's own mcp.json with
+    every Claude Code MCP source. muselab's entries override external ones
+    on name conflict — that's the override channel for "I configured this
+    in Claude Code but I want it disabled / customised in muselab".
+
+    Special-case: a muselab entry that ONLY carries {disabled: bool} (no
+    `command`) is treated as an override-flag on the external entry: the
+    full external spec is kept, just with `disabled` flipped. Without this
+    the user couldn't disable a Claude Code-only MCP without re-entering
+    its full command + args in muselab's mcp.json.
+
+    Every returned spec carries a `_source` field for UI display:
+      "muselab" / "claude_user_global" / "claude_user_settings" /
+      "claude_user_project" / "archive_project".
+    """
+    external = _load_external_mcp_sources()
+    own = _load_mcp().get("mcpServers") or {}
+    merged: dict[str, dict] = dict(external)
+    for name, spec in own.items():
+        if not isinstance(spec, dict):
+            continue
+        # Override-only entry: pure {disabled: true|false} with no command.
+        # Layer on top of the existing external spec.
+        if "command" not in spec and "disabled" in spec and name in merged:
+            merged[name] = {**merged[name], "disabled": bool(spec["disabled"])}
+            # Note: keeps `_source` from the external entry so UI shows
+            # original source + an "(overridden)" tag if it wants.
+            merged[name]["_overridden_by_muselab"] = True
+        else:
+            # Full muselab entry — replaces external completely.
+            merged[name] = {**spec, "_source": "muselab"}
+    return merged
 
 
 def _save_mcp(cfg: dict) -> None:
@@ -278,22 +518,40 @@ def _load_examples() -> list[dict]:
 
 @router.get("/mcp", dependencies=[Depends(require_token)])
 def get_mcp_servers() -> dict:
-    cfg = _load_mcp()
+    """List every MCP server muselab knows about — muselab's own mcp.json
+    PLUS Claude Code's standard config locations (auto-detected). The
+    `source` field tells the UI where each came from so users can see at
+    a glance which MCPs are inherited from Claude Code vs. configured
+    explicitly in muselab."""
+    merged = _load_mcp_merged()
     servers = []
-    for name, spec in (cfg.get("mcpServers") or {}).items():
+    for name, spec in merged.items():
         servers.append({
             "name": name,
             "command": spec.get("command", ""),
             "args": spec.get("args", []),
             "env": {k: _mask(v) for k, v in (spec.get("env") or {}).items()},
             "disabled": bool(spec.get("disabled", False)),
+            # Source tag for UI badge. "muselab" = explicit muselab entry;
+            # everything else came from a Claude Code config file.
+            "source": spec.get("_source", "muselab"),
+            # When an external entry is disabled-overridden by a muselab
+            # stub entry, the UI may want to show "disabled by you" instead
+            # of "this MCP is broken".
+            "overridden": bool(spec.get("_overridden_by_muselab", False)),
         })
+    # Sort: muselab-source first (user-curated), then external by name.
+    servers.sort(key=lambda s: (s["source"] != "muselab", s["name"].lower()))
     return {"servers": servers, "examples": _load_examples()}
 
 
 @router.put("/mcp/{name}", dependencies=[Depends(require_token)])
 def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
-    """Create or replace one MCP server entry. Path `name` wins over body `name`."""
+    """Create or replace one MCP server entry in muselab's own mcp.json.
+    External (Claude Code) entries are NOT touched — they live in their
+    own files; muselab only owns its mcp.json. If `name` happens to also
+    exist in a Claude Code config, this muselab entry will win in the
+    merged view (see _load_mcp_merged)."""
     cfg = _load_mcp()
     cfg["mcpServers"][name] = {
         "command": spec.command,
@@ -307,6 +565,11 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
 
 @router.delete("/mcp/{name}", dependencies=[Depends(require_token)])
 def delete_mcp_server(name: str) -> dict:
+    """Remove `name` from muselab's own mcp.json. Does NOT touch Claude
+    Code's config files — if the same name exists there too, the external
+    entry will reappear in the merged list (no longer overridden). To
+    "hide" an external MCP from muselab, use the toggle endpoint instead
+    (it writes a stub override into muselab's mcp.json)."""
     cfg = _load_mcp()
     if name not in (cfg.get("mcpServers") or {}):
         raise HTTPException(404, f"MCP server not found: {name}")
@@ -321,10 +584,31 @@ class MCPToggleReq(BaseModel):
 
 @router.patch("/mcp/{name}/toggle", dependencies=[Depends(require_token)])
 async def toggle_mcp_server(name: str, req: MCPToggleReq) -> dict:
+    """Toggle the enabled/disabled state of an MCP server.
+
+    Three cases:
+      a. Entry exists in muselab's mcp.json with full command → flip its
+         `disabled` flag in place.
+      b. Entry exists only in an external (Claude Code) config → write a
+         stub override `{"disabled": <bool>}` into muselab's mcp.json
+         under the same name. The merge step (_load_mcp_merged) layers
+         the disabled flag on top of the external spec so the UI toggle
+         "just works" without re-entering command/args.
+      c. Name doesn't exist anywhere → 404.
+    """
     cfg = _load_mcp()
-    if name not in (cfg.get("mcpServers") or {}):
+    own_servers = cfg.setdefault("mcpServers", {})
+    merged = _load_mcp_merged()
+    if name not in merged:
         raise HTTPException(404, f"MCP server not found: {name}")
-    cfg["mcpServers"][name]["disabled"] = req.disabled
+
+    if name in own_servers:
+        own_servers[name]["disabled"] = req.disabled
+    else:
+        # External-only entry — write a stub override. _load_mcp_merged
+        # recognises {disabled: ...} without `command` and layers it
+        # onto the external spec.
+        own_servers[name] = {"disabled": req.disabled}
     _save_mcp(cfg)
     # Apply to every live SDK client too — otherwise the toggle would only
     # take effect on the next client rebuild, leaving the user staring at a
@@ -544,6 +828,14 @@ def _current_versions() -> dict:
 
     The UI should make this distinction clear so users don't think they
     need to install the system CLI when DeepSeek / API-key paths suffice."""
+    # Invalidate the import machinery's path-based finder cache so that
+    # importlib.metadata sees freshly-installed .dist-info dirs after uv sync.
+    # Without this, repeated calls within the same process return the CACHED
+    # old version (importlib.metadata.version() reuses MetadataPathFinder's
+    # path_importer_cache). _semver_gt(latest, cached-old) stays True, so the
+    # upgrade button never disappears after a successful SDK upgrade.
+    import importlib
+    importlib.invalidate_caches()
     import importlib.metadata as _md
     import re
     # Read SDK version from dist-info (installed package metadata) so a
@@ -830,6 +1122,73 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
         _LAST_UPGRADE.clear()
         _LAST_UPGRADE.update(result)
         return result
+
+
+# ---------------------------------------------------------------------------
+# UI state — lightweight cross-device state that doesn't belong in .env
+# (e.g. last active session ID). Stored in sessions/.ui-state.json.
+# ---------------------------------------------------------------------------
+_UI_STATE_PATH = Path(__file__).resolve().parent.parent / "sessions" / ".ui-state.json"
+
+
+def _read_ui_state() -> dict:
+    try:
+        return json.loads(_UI_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_ui_state(data: dict) -> None:
+    from .settings import atomic_write_text
+    _UI_STATE_PATH.parent.mkdir(exist_ok=True)
+    atomic_write_text(_UI_STATE_PATH, json.dumps(data, ensure_ascii=False))
+
+
+@router.get("/ui-state", dependencies=[Depends(require_token)])
+def get_ui_state() -> dict:
+    """Lightweight cross-device UI state (last active session, etc.)."""
+    return _read_ui_state()
+
+
+class UIStateIn(BaseModel):
+    last_session_id: str | None = None
+
+
+@router.put("/ui-state", dependencies=[Depends(require_token)])
+def put_ui_state(req: UIStateIn) -> dict:
+    """Persist UI state fields. Only provided (non-None) fields are updated."""
+    state = _read_ui_state()
+    if req.last_session_id is not None:
+        state["last_session_id"] = req.last_session_id
+    _write_ui_state(state)
+    return state
+
+
+@router.post("/restart", dependencies=[Depends(require_token)])
+async def restart_service() -> dict:
+    """Restart the muselab process so a freshly-installed SDK is loaded.
+    Sends the 200 response first, then schedules the actual restart after a
+    short delay so the HTTP response has time to flush to the client."""
+    asyncio.create_task(_do_restart())
+    return {"ok": True, "restarting": True}
+
+
+async def _do_restart() -> None:
+    """Try platform restart command first; fall back to os.execv."""
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.8)   # let the HTTP response reach the browser
+    hint = _restart_hint()
+    if hint:
+        try:
+            rc = subprocess.run(hint, shell=True, timeout=8)
+            if rc.returncode == 0:
+                return          # systemd/launchctl handled it
+        except Exception:
+            pass
+    # Fallback: replace current process with a fresh copy.
+    # Works for both `uv run python -m backend.main` and direct invocations.
+    import os as _os
+    _os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def _restart_hint() -> str:

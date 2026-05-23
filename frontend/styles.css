@@ -68,6 +68,19 @@
   --fw-normal: 400;
   --fw-medium: 500;
   --fw-semibold: 600;
+  --fw-bold: 700;
+  --c-text-2: var(--c-fg-2);
+  --c-warning: #f59e0b;
+  --c-error: #ef4444;
+  --c-error-soft: rgba(239, 68, 68, 0.12);
+
+  /* Token chip colors */
+  --c-token-in:    #2563eb;
+  --c-token-out:   #7c3aed;
+  --c-token-cache: #059669;
+
+  /* Scrollbar resting thumb */
+  --c-scrollbar: rgba(128, 128, 128, 0.25);
 
   /* Elevation */
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
@@ -99,7 +112,7 @@ a:hover { color: var(--c-accent-hover); }
 /* 表单 focus 已用 accent — 这里加强 outline */
 input:focus-visible, textarea:focus-visible, select:focus-visible,
 button:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 1px; }
-button:focus { outline: none; }
+button:focus:not(:focus-visible) { outline: none; }
 
 /* =========================================================================
    Light theme — overrides dark tokens when data-theme="light" on <html>
@@ -284,8 +297,9 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
 }
 .conn-banner.reconnecting {
-  background: #fef3c7;            /* amber-100 */
-  color: #92400e;                 /* amber-900 */
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--c-warning);
+  border-color: rgba(245, 158, 11, 0.3);
 }
 .conn-banner.reconnected {
   background: var(--c-accent-soft);
@@ -385,10 +399,36 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 .mobile-tab-bar button .icon svg { width: 14px; height: 14px; }
 
 /* ==========================================================================
+   Desktop "fullscreen one pane" — `.layout[data-desktop-full="preview|chat"]`
+   hides everything except the chosen pane so the user gets immersive
+   reading / immersive conversation without the side gutters. layoutStyle()
+   in JS collapses gridTemplateColumns to a single "1fr" when active; these
+   rules just hide the now-unused children + the resizers. Toggled by the
+   maximize button in each pane header; ESC also exits (window keydown
+   handler on the layout element). Mobile @media below has higher source-
+   order priority for the panes, so this whole block is effectively
+   no-op on phones — single-pane mobile layout already provides the
+   "focused view" experience.
+   ========================================================================== */
+.layout[data-desktop-full="preview"] .pane.files,
+.layout[data-desktop-full="preview"] .pane.chat,
+.layout[data-desktop-full="preview"] .resizer,
+.layout[data-desktop-full="chat"] .pane.files,
+.layout[data-desktop-full="chat"] .pane.preview,
+.layout[data-desktop-full="chat"] .resizer { display: none; }
+
+/* ==========================================================================
    Mobile responsive: < 900px collapses the 3-column grid into a single
    visible pane chosen by the bottom tab bar.
+
+   Also matches "phone in landscape" (touch device with viewport height
+   ≤ 500px) — e.g. iPhone 15 Pro Max landscape is 932×430, which exceeds
+   the 900px width breakpoint but is clearly still a phone and should
+   stay single-pane. iPad in landscape has height ≥ 810px so it keeps
+   the desktop 3-pane layout. The `(pointer: coarse)` clause excludes
+   small desktop windows that just happen to be short.
    ========================================================================== */
-@media (max-width: 900px) {
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
   /* Force single-column grid regardless of inline :style="layoutStyle()". */
   .layout {
     grid-template-columns: 1fr !important;
@@ -452,6 +492,11 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      / delete) are all reachable from the picker (📁), the mobile-primary
      navigation surface. Avoids competing with × for the right edge. */
   .chat-tab-kebab { display: none; }
+  /* Desktop-only fullscreen-pane toggle — mobile @media already gives
+     single-pane via the bottom tab bar, so the button is redundant +
+     confusing (clicking it would collapse the grid but the bottom bar
+     would still try to drive mobileTab → state mismatch). */
+  .pane-fullscreen-btn { display: none; }
   .session-picker-kebab {
     display: inline-flex; align-items: center; justify-content: center;
     width: 32px; height: 32px;
@@ -523,13 +568,26 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
   .pane.preview .pane-head .btn-primary { display: none; }
 
-  /* Chat toolbar: keep attach + model + ctx-ring + send. Permission and
-     effort are low-frequency on mobile (Settings still provides them).
-     ctx-ring stays since the old hairline progress bar above the toolbar
-     was removed (2026-05-22) — ring is now the sole context-usage
-     surface, on every viewport. */
-  .chat-toolbar-permission,
-  .chat-toolbar-effort { display: none; }
+  /* Chat toolbar: keep attach + model + effort + ctx-ring + send.
+     Permission is still hidden — it's low-frequency on mobile and
+     Settings provides a default. Effort restored on mobile per user
+     request (2026-05-22): users want per-turn reasoning depth control
+     on phone too, e.g. dropping to "low" before a quick lookup.
+     ctx-ring stays since the old hairline progress bar above the
+     toolbar was removed (2026-05-22) — ring is now the sole context-
+     usage surface, on every viewport. */
+  .chat-toolbar-permission { display: none; }
+  /* Effort dropdown — share the toolbar row with the model picker without
+     pushing the send button off-screen. ⚠ Do NOT set font-size below
+     16px here: the end-of-file iOS auto-zoom defeat (line ~5703) forces
+     all <select> to 16px on pointer:coarse to stop iOS Safari from
+     auto-zooming the page when the select is tapped — overriding with
+     11px brings that bug back (user reported "屏幕会自动聚焦"
+     2026-05-22). Width caps the visible portion; long labels truncate
+     with ellipsis via the .chat-toolbar-select base rule. */
+  .chat-toolbar-effort {
+    max-width: 110px;
+  }
 
   /* Chat tab strip: horizontal-scroll session list eats vertical
      room and is fiddly on touch. Replace with a single "current
@@ -586,6 +644,28 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .sched-create-foot .btn-primary,
   .sched-create-foot .btn-ghost { flex: 1 1 auto; min-width: 80px; }
   .sched-create-hint { font-size: var(--fs-xs); flex-basis: 100%; }
+}
+
+/* Landscape phone override — hide the bottom mobile-tab-bar to reclaim
+   the ~36px it eats out of an already tiny vertical (~430px on iPhone
+   15 Pro Max landscape). The user keeps whichever pane was active at
+   rotation; switching panes requires rotating back to portrait, where
+   the bar re-appears. `(orientation: landscape)` is a safety guard
+   against very-tall keyboards squeezing height < 500 while still in
+   portrait — we don't want the bar vanishing mid-typing. */
+@media (pointer: coarse) and (max-height: 500px) and (orientation: landscape) {
+  .mobile-tab-bar { display: none; }
+  /* Reclaim the row the tab bar used to occupy AND give the pane the
+     full viewport height (no bar to subtract). !important needed to
+     beat the inline `:style="layoutStyle()"` and the row template set
+     by the main mobile block above. */
+  .layout {
+    grid-template-rows: 1fr !important;
+  }
+  .pane {
+    height: 100vh;
+    height: 100dvh;
+  }
 }
 
 /* Desktop default — current-session button is mobile-only. */
@@ -778,7 +858,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   border-color: var(--c-accent);
   background: var(--c-accent-soft);
 }
-@media (max-width: 900px) {
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
   .chat-tab-outline { display: none; }
 }
 
@@ -811,7 +891,7 @@ body.kb-open .mobile-tab-bar { display: none; }
    content reflows causes a 1-2px left-right shift each frame. On phones we
    never want horizontal scroll at the body level (wide elements like <pre>
    / <table> handle their own internal scroll), so hide it hard. */
-@media (max-width: 900px) {
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
   .pane.preview .preview-body {
     overflow-x: hidden;
   }
@@ -832,7 +912,7 @@ body.kb-open .mobile-tab-bar { display: none; }
    bottom mobile-tab-bar out of view, AND reclaims the row + pane height the
    bar used to occupy — otherwise the bar disappears but the pane stays
    42px short and the content area shows a blank strip at the bottom. */
-@media (max-width: 900px) {
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
   body.preview-immersive .pane.preview .pane-head,
   body.preview-immersive .pane.preview .tab-bar {
     display: none;
@@ -854,7 +934,7 @@ body.kb-open .mobile-tab-bar { display: none; }
    events to the parent, so the scroll-direction auto-toggle can only fire
    for markdown / text. Tap to enter/exit immersive on those modes. */
 .preview-immersive-toggle { display: none; }
-@media (max-width: 900px) {
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
   .pane.preview .preview-immersive-toggle {
     display: flex;
     position: fixed;
@@ -908,6 +988,11 @@ body.kb-open .mobile-tab-bar { display: none; }
     min-width: 0;
     width: 100vw; max-width: 100vw;
   }
+  /* Confirm / prompt dialog carve-out lives in the end-of-file sentinel
+     block (search ":confirm-modal" in this file) — putting it here got
+     trampled by the sentinel's generic `.modal { width: 100vw }` rule
+     since same-specificity collisions there win on source order.
+     See the comment at the sentinel block for the structural reason. */
   .modal-head { flex-shrink: 0; }
   .modal-body {
     flex: 1 1 auto;
@@ -1141,7 +1226,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   overflow-y: auto;
 }
 /* Match the unobtrusive scrollbar style of the tab strips. */
-.open-files-list { scrollbar-width: thin; scrollbar-color: rgba(128,128,128,0.25) transparent; }
+.open-files-list { scrollbar-width: thin; scrollbar-color: var(--c-scrollbar) transparent; }
 .open-files-list:hover { scrollbar-color: var(--c-fg-4) transparent; }
 .open-files-list::-webkit-scrollbar { width: 6px; }
 .open-files-list::-webkit-scrollbar-track { background: transparent; }
@@ -1356,7 +1441,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   /* Overlay-style scrollbar — invisible at rest, fades in on hover. Matches
      .chat-tabs-list so both tab strips feel the same. */
   scrollbar-width: thin;
-  scrollbar-color: rgba(128,128,128,0.25) transparent;
+  scrollbar-color: var(--c-scrollbar) transparent;
 }
 .tab-bar:hover { scrollbar-color: var(--c-fg-4) transparent; }
 .tab-bar::-webkit-scrollbar { height: 3px; }
@@ -1630,22 +1715,14 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
    Chat pane
    ========================================================================== */
 /* Pane-head 右侧 badge 统一高度 (22px)，与 icon-btn.sm 视觉对齐 */
-.cost-badge, .mcp-badge {
+.mcp-badge {
   font-size: var(--fs-xs);
   padding: 0 8px;
   height: 22px;
   display: inline-flex; align-items: center; gap: 4px;
   border-radius: var(--r-full);
-  font-family: var(--font-mono);
-}
-.cost-badge {
-  color: var(--c-fg-2);
-  background: var(--c-bg-2); border: 1px solid var(--c-border-strong);
-}
-.mcp-badge {
   color: var(--c-accent-fg);
   background: var(--c-accent-soft); border: 1px solid var(--c-accent);
-  font-family: var(--font-sans);
   cursor: default;
 }
 
@@ -1847,6 +1924,20 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-picker-empty {
   padding: 14px; text-align: center; color: var(--c-fg-3); font-size: var(--fs-xs);
 }
+/* Status dots inside the session picker — same visual as tab strip but
+   flex-shrink: 0 already set; just ensure they don't stretch the row */
+.picker-status-dot {
+  flex-shrink: 0;
+  margin-right: 2px;
+}
+.session-picker-show-more {
+  display: block; width: 100%; padding: 5px 12px;
+  font-size: var(--fs-xs); color: var(--c-accent);
+  background: none; border: none; cursor: pointer;
+  text-align: left; opacity: 0.8;
+  transition: opacity 0.15s;
+}
+.session-picker-show-more:hover { opacity: 1; }
 .session-picker-row.open:not(.active) {
   /* Visual marker so users can tell which sessions are already open as tabs. */
   background: var(--c-bg-2);
@@ -1899,7 +1990,7 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 }
 /* Firefox: doesn't support per-state scrollbar-color, so use a subtle
    semi-transparent thumb always (less heavy than the prior solid). */
-.chat-tabs-list { scrollbar-color: rgba(128,128,128,0.25) transparent; }
+.chat-tabs-list { scrollbar-color: var(--c-scrollbar) transparent; }
 .chat-tabs-list:hover { scrollbar-color: var(--c-fg-4) transparent; }
 /* Back-compat alias — some older selectors reference .chat-tabs directly. */
 .chat-tabs { display: contents; }
@@ -2088,6 +2179,22 @@ html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
      clipping its own runaway content, not the whole layout breaking. */
   overflow-x: hidden;
   padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2);
+  /* Centered reading column — 2026-05-23 user feedback after seeing
+     Gemini's layout: bubbles stretching the full viewport width on
+     desktop-fullscreen (or on an ultrawide monitor) gives ~140-200
+     chars per line and is exhausting to read; web typography research
+     puts the comfortable range at 45-90 chars (~700-900 px at our font
+     size).
+     The `max(sp-3, calc(50% - 440px))` trick degrades gracefully:
+       - narrow pane (3-column desktop ~600px chat, mobile <480px):
+         50%-440px goes negative → falls back to sp-3, layout unchanged
+       - wide pane (chat-fullscreen on 1920px monitor):
+         50%-440px = 520px → content column caps at 880px, auto-centered
+     The threshold where the cap kicks in is ~904px of chat-pane width
+     (=880 column + 2×sp-3). Below that, you get the old behavior.
+     Applied to .chat-input too (below) so the bottom textarea aligns
+     with the message column visually. */
+  padding-inline: max(var(--sp-3), calc(50% - 440px));
 }
 .msg { display: flex; flex-direction: column; position: relative; animation: msg-in var(--t-base); }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -2494,10 +2601,21 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   .turn-footer { padding-left: 34px; }
 }
 
-.thinking-dots { display: inline-flex; gap: 4px; }
+.thinking-dots { display: inline-flex; gap: 4px; align-items: center; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
   animation: thinking-pulse 1.2s ease-in-out infinite;
+}
+/* Elapsed counter next to the dots in turn-footer. Mono so the digits
+   don't jitter as seconds tick. Muted color — supporting info, not
+   primary. Pending-bubble version is sibling-inline so it inherits the
+   .thinking-label parent's styling; this rule covers the standalone
+   turn-footer usage only. */
+.turn-footer .stream-elapsed {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  letter-spacing: 0.3px;
 }
 .thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
 .thinking-dots span:nth-child(3) { animation-delay: 0.30s; }
@@ -2757,13 +2875,75 @@ pre.has-copy-btn .code-copy-btn.copied {
 .bash-meta {
   margin-top: 6px;
   font-size: 11px;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 1px 6px;
   border-radius: var(--r-sm);
 }
 .bash-meta.ok { background: rgba(80, 200, 120, 0.15); color: #7fd49a; }
 .bash-meta.err { background: rgba(255, 90, 90, 0.18); color: #ff9c9c; }
 .bash-meta.interrupted { background: rgba(255, 200, 80, 0.18); color: #f0c674; }
+html[data-theme="light"] .bash-meta.ok          { color: #166534; background: rgba(22, 101, 52, 0.08); }
+html[data-theme="light"] .bash-meta.err         { color: #991b1b; background: rgba(153, 27, 27, 0.08); }
+html[data-theme="light"] .bash-meta.interrupted { color: #92400e; background: rgba(146, 64, 14, 0.08); }
+/* SVG icon inside .bash-meta.interrupted (used to be the ⚠ emoji prefix) */
+.bash-meta-icon {
+  width: 1em; height: 1em;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  flex-shrink: 0;
+}
+/* SVG icon inside settings modal title (used to be the ⚙ emoji prefix) */
+.modal-title-icon {
+  width: 1.1em; height: 1.1em;
+  vertical-align: -0.15em;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  margin-right: 6px;
+}
+/* Probe result indicators (used to be ✅ / ❌ emoji next to provider key
+   inputs). Color them green / red to keep the at-a-glance meaning. */
+.probe-result-icon {
+  width: 16px; height: 16px;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  fill: none;
+  vertical-align: -0.2em;
+  margin-left: 4px;
+}
+.probe-result-icon.ok  { stroke: #50c878; }
+.probe-result-icon.err { stroke: #ff6464; }
+/* Settings-hint inline icon (used to be the ⚠ emoji prefix on the
+   "SDK expects CLI X" warn row). */
+.settings-hint-icon {
+  width: 1em; height: 1em;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  vertical-align: -0.15em;
+  margin-right: 4px;
+}
+/* Upgrade-result inline icon. ok variant is colored green, err red — the
+   wrapper .upgrade-result.ok / .err already provides text color, the SVG
+   inherits via currentColor. */
+.upgrade-result-status {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: var(--fw-semibold);
+}
+.upgrade-result-icon {
+  width: 1.2em; height: 1.2em;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  flex-shrink: 0;
+}
+/* Inline icon prefix on push-notification toggle labels (replaces ⏰ / 💬). */
+.settings-row-label-icon {
+  width: 1em; height: 1em;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  vertical-align: -0.15em;
+  margin-right: 6px;
+  color: var(--c-fg-2);
+}
 
 /* Read with line gutter */
 /* Read with line gutter — long source lines scroll the whole block
@@ -3011,13 +3191,21 @@ pre.has-copy-btn .code-copy-btn.copied {
 .ask-options {
   display: flex; flex-direction: column; gap: 6px;
 }
+/* Rendered as <div role="button"> (not <button>) so the option can host
+   a markdown preview <div> without HTML5 nesting violations — see
+   ask_user_question template comment for background. The styles below
+   replicate the relevant button look + behavior on a plain div. */
 .ask-option {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   text-align: left;
   background: var(--c-bg-0);
   border: 1px solid var(--c-border-strong);
   border-radius: var(--r-md);
   padding: 8px 12px;
   cursor: pointer;
+  user-select: none;
   transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
   font-family: inherit;
   color: var(--c-fg-0);
@@ -3025,6 +3213,10 @@ pre.has-copy-btn .code-copy-btn.copied {
 .ask-option:hover:not(.disabled) {
   background: var(--c-accent-soft);
   border-color: var(--c-accent);
+}
+.ask-option:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
 }
 .ask-option.picked {
   background: var(--c-accent-soft);
@@ -3191,6 +3383,17 @@ pre.has-copy-btn .code-copy-btn.copied {
   cursor: zoom-in; transition: transform 100ms;
 }
 .user-msg-img:hover { transform: scale(1.02); }
+.user-msg-img-wrap {
+  display: inline-block; position: relative; vertical-align: top;
+}
+.user-msg-img-placeholder {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 48px; height: 48px;
+  border-radius: var(--r-md);
+  border: 1px dashed var(--c-border-strong);
+  color: var(--c-fg-3);
+  flex-shrink: 0;
+}
 .user-msg-doc {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: var(--r-md);
@@ -3447,7 +3650,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   border-left-color: var(--c-accent);
 }
 .onboard-card.welcome code {
-  font-family: var(--ff-mono, monospace);
+  font-family: var(--font-mono, monospace);
   font-size: 0.85em;
   padding: 1px 5px;
   border-radius: 4px;
@@ -3494,7 +3697,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   display: inline-flex; align-items: center; justify-content: center;
 }
 .welcome-steps code {
-  font-family: var(--ff-mono, monospace);
+  font-family: var(--font-mono, monospace);
   font-size: 0.85em;
   padding: 1px 5px;
   border-radius: 3px;
@@ -3580,6 +3783,42 @@ pre.has-copy-btn .code-copy-btn.copied {
 .skill-chip:hover { filter: brightness(1.05); }
 .skill-chip-icon { font-size: 0.9em; }
 
+/* ===== Emoji-to-SVG icon wrappers (added 2026-05-22) ============================
+   Each of these wrapper classes used to contain a single emoji char (🧩 / 🔌 /
+   🕓 / 📦 / etc.); the icon-sweep replaced the emoji with an inline `<use>` of
+   a Lucide-style SVG symbol from the sprite. CSS already sized the wrapper as
+   text (font-size: Xpx); we now also size the inner SVG to 1em so it matches
+   the visual footprint of the prior emoji exactly. currentColor + Lucide
+   stroke conventions inherit from the wrapper's color (theme variables).
+   ============================================================================ */
+.skill-chip-icon svg,
+.tool-prefix-icon svg,
+.queued-icon svg,
+.compact-pending-icon svg,
+.queue-paused-icon svg,
+.settings-menu-icon svg,
+.skill-card-icon svg,
+.ctx-chip-icon,
+.mcp-badge-icon {
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.15em;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  display: inline-block;
+  flex-shrink: 0;
+}
+/* Direct-class SVGs (chips that put the SVG itself in the icon slot rather
+   than a wrapper around emoji) get a tiny extra margin for breathing room
+   against the adjacent text. */
+.ctx-chip-icon,
+.mcp-badge-icon {
+  margin-right: 4px;
+}
+
 /* CLAUDE.md context chip */
 .ctx-chip {
   display: inline-flex; align-items: center; gap: 4px;
@@ -3595,11 +3834,6 @@ pre.has-copy-btn .code-copy-btn.copied {
   cursor: pointer;
 }
 .ctx-chip.warn:hover { filter: brightness(1.05); }
-
-/* over-budget cost badge */
-.cost-badge.over-budget {
-  background: var(--c-danger, #dc3545); color: white;
-}
 
 /* ===== Slash command popup ===== */
 .slash-pop .mention-item { display: flex; gap: 10px; align-items: baseline; }
@@ -3848,6 +4082,13 @@ pre.has-copy-btn .code-copy-btn.copied {
   gap: 6px; padding: 8px;
   border-top: 1px solid var(--c-border); background: var(--c-bg-1);
   position: relative;
+  /* Match .chat-body's centered reading column on wide viewports so
+     the input field aligns visually with the message bubbles instead
+     of stretching corner-to-corner under a narrow message column.
+     Same max() trick — falls back to flat `padding: 8px` on narrow
+     panes. Threshold: ~896px of chat-pane width. See .chat-body for
+     the full rationale. */
+  padding-inline: max(8px, calc(50% - 440px));
 }
 /* The whole input area is one visual unit. Subtle 1px border, soft radius,
    focus-within nudges border-color to accent. Internal hairline separates
@@ -3862,7 +4103,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .chat-input-wrap:focus-within {
   border-color: var(--c-accent);
-  box-shadow: 0 0 0 3px rgba(96, 147, 255, 0.12);
+  box-shadow: 0 0 0 3px var(--c-accent-soft);
 }
 .chat-input-wrap.drag-hover {
   border-color: var(--c-accent);
@@ -3900,7 +4141,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   width: 26px; height: 26px; flex-shrink: 0;
   background: transparent; border: 0; cursor: pointer;
   color: var(--c-fg-3);
-  border-radius: 6px;
+  border-radius: var(--r-md);
   padding: 0;
   transition: background var(--t-fast), color var(--t-fast);
 }
@@ -3916,6 +4157,16 @@ pre.has-copy-btn .code-copy-btn.copied {
 .chat-toolbar-btn.warn:hover { background: rgba(245, 158, 11, 0.15); }
 .chat-toolbar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .chat-toolbar-btn svg { width: 14px; height: 14px; }
+/* (2026-05-23: removed .chat-toolbar-btn-with-badge / -badge — count
+   badge on the MCP button was visual noise without telling the user
+   anything actionable. Also removed the .mcp-source-* pill colors that
+   went with the source chip — chip itself was deleted from the cards
+   on the same UX feedback pass.) */
+/* Disabled MCP cards: dim body to telegraph "this won't run this turn"
+   while keeping the name readable so the user still knows what's there. */
+.skill-card.is-disabled .skill-card-desc { opacity: 0.5; }
+.skill-card.is-disabled .skill-card-icon { opacity: 0.5; }
+.skill-card.is-disabled .skill-card-try { opacity: 0.4; cursor: not-allowed; }
 /* Selects styled as borderless pills — feel like buttons not form inputs. */
 .chat-toolbar-select {
   height: 26px;
@@ -3923,7 +4174,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   padding: 0 22px 0 8px;
   background-color: transparent;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--r-md);
   color: var(--c-fg-2);
   font-size: var(--fs-xs);
   font-family: inherit;
@@ -3952,7 +4203,7 @@ pre.has-copy-btn .code-copy-btn.copied {
   width: 26px; height: 26px;
   background: transparent; border: 0; cursor: pointer;
   color: var(--c-accent);
-  border-radius: 6px;
+  border-radius: var(--r-md);
   padding: 0;
   transition: background var(--t-fast);
 }
@@ -3969,7 +4220,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 .chat-toolbar-send {
   height: 26px; width: 26px; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
-  border: 0; border-radius: 6px; cursor: pointer;
+  border: 0; border-radius: var(--r-md); cursor: pointer;
   background: var(--c-accent); color: white;
   transition: background var(--t-fast), opacity var(--t-fast), transform 80ms;
 }
@@ -5076,30 +5327,39 @@ pre.has-copy-btn .code-copy-btn.copied {
   color: var(--c-fg-1);
   font-variant-numeric: tabular-nums;
 }
-.cost-kpi-sub {
-  font-size: var(--fs-xs);
-  color: var(--c-fg-3);
-  margin-top: 2px;
-}
-.cost-token-breakdown {
+/* Token-class filter chips — clickable to toggle a category's inclusion
+   in every aggregate below. .inactive = user has hidden this class
+   (greyed + line-through so the chip still acts as a "click to re-add"
+   affordance, not a "what's gone" mystery). */
+.cost-token-filters {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin: 6px 0 18px;
+  margin: 6px 0 14px;
 }
 .cost-token-chip {
   display: inline-block;
-  padding: 3px 10px;
+  padding: 4px 12px;
   border-radius: 999px;
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
   color: var(--c-fg-2);
+  cursor: pointer;
+  font-family: inherit;
+  transition: opacity var(--t-fast), background var(--t-fast),
+              color var(--t-fast), border-color var(--t-fast);
 }
-.cost-token-chip.in    { color: #2563eb; border-color: rgba(37,99,235,0.4); }
-.cost-token-chip.out   { color: #7c3aed; border-color: rgba(124,58,237,0.4); }
-.cost-token-chip.cache { color: #059669; border-color: rgba(5,150,105,0.4); }
+.cost-token-chip:hover { background: var(--c-bg-3); }
+.cost-token-chip.in    { color: var(--c-token-in);    border-color: rgba(37,99,235,0.4); }
+.cost-token-chip.out   { color: var(--c-token-out);   border-color: rgba(124,58,237,0.4); }
+.cost-token-chip.cache { color: var(--c-token-cache); border-color: rgba(5,150,105,0.4); }
+.cost-token-chip.inactive {
+  opacity: 0.42;
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
 .cost-block-title {
   font-size: var(--fs-sm);
   color: var(--c-fg-2);
@@ -5168,21 +5428,6 @@ pre.has-copy-btn .code-copy-btn.copied {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   display: flex; align-items: center; gap: 6px; min-width: 0;
 }
-/* Small vendor chip in the model row — only shown for non-Claude (we don't
-   chip Claude rows since the friendly name "Sonnet 4.6" is already clear).
-   Acts as a vendor-group visual marker so the user can tell at a glance
-   which provider a given row belongs to without reading the model id. */
-.cost-model-vendor-chip {
-  font-family: var(--font-sans);
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 8px;
-  background: var(--c-bg-2);
-  color: var(--c-fg-3);
-  flex-shrink: 0;
-  text-transform: none;
-  letter-spacing: 0.02em;
-}
 .cost-model-bar-track {
   height: 8px;
   background: var(--c-bg-2);
@@ -5191,7 +5436,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .cost-model-bar-fill {
   height: 100%;
-  background: linear-gradient(90deg, #6366f1 0%, #8b5cf6 100%);
+  background: var(--c-accent);
   border-radius: 4px;
   transition: width 200ms;
 }
@@ -5440,6 +5685,31 @@ pre.has-copy-btn .code-copy-btn.copied {
   margin-bottom: 8px; padding-bottom: 4px;
   border-bottom: 1px solid var(--c-border);
 }
+/* Section head wrapper — title on the left, bulk-action button(s) on
+   the right (e.g. "清空" on the recent-runs section). Inherits the
+   border-bottom from .sched-section-title so the wrapper as a whole
+   reads as a single header band. */
+.sched-section-head {
+  display: flex; align-items: baseline; gap: 8px;
+  margin-bottom: 8px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--c-border);
+}
+.sched-section-head > .sched-section-title {
+  margin-bottom: 0; padding-bottom: 0;
+  border-bottom: 0;
+  flex: 1; min-width: 0;
+}
+.sched-hist-clear {
+  font-size: var(--fs-xs); padding: 2px 8px;
+  border: 1px solid var(--c-border); border-radius: var(--r-sm);
+  background: transparent; color: var(--c-fg-3); cursor: pointer;
+  flex-shrink: 0;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.sched-hist-clear:hover {
+  color: var(--c-danger, #ef4444);
+  border-color: var(--c-danger, #ef4444);
+}
 .sched-empty {
   padding: 14px; text-align: center;
   font-size: var(--fs-sm); color: var(--c-fg-3);
@@ -5515,6 +5785,23 @@ pre.has-copy-btn .code-copy-btn.copied {
   background: var(--c-bg-1); color: var(--c-fg-0);
 }
 .sched-hist-retry[disabled] { opacity: 0.5; cursor: not-allowed; }
+/* Per-row delete (×). Lives at the right edge of .sched-hist-head, sized
+   to match a touch target (28×28) — small enough not to dominate but
+   big enough that mis-tap rate stays low on phones. Color stays muted
+   until hover/active so the row's name + time read first. */
+.sched-hist-del {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0;
+  background: transparent; border: 0; border-radius: var(--r-sm);
+  color: var(--c-fg-3); font-size: 18px; line-height: 1;
+  cursor: pointer; flex-shrink: 0;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.sched-hist-del:hover {
+  background: var(--c-bg-1);
+  color: var(--c-danger, #ef4444);
+}
+.sched-hist-del:active { background: var(--c-bg-3); }
 .sched-hist-body {
   font-size: var(--fs-sm); color: var(--c-fg-2);
   line-height: 1.4;
@@ -5567,9 +5854,10 @@ pre.has-copy-btn .code-copy-btn.copied {
    outs); same-specificity collisions are what this block defeats.
    ========================================================================== */
 @media (max-width: 720px) {
-  /* All modals go full-screen on phones. Background, header, body,
+  /* Most modals go full-screen on phones. Background, header, body,
      footer all collaborate via flex so the body scrolls internally
-     and the keyboard / safe-area doesn't clip the footer buttons. */
+     and the keyboard / safe-area doesn't clip the footer buttons.
+     The confirm/prompt dialog is the exception — see further below. */
   .modal-backdrop {
     align-items: stretch; justify-content: stretch;
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
@@ -5588,6 +5876,30 @@ pre.has-copy-btn .code-copy-btn.copied {
     flex: 1 1 auto;
     max-height: none;
     overflow-y: auto;
+  }
+
+  /* Confirm / prompt dialog carve-out — 2026-05-23 user feedback:
+     a 2-line "create a new session?" prompt filling the entire phone
+     screen felt heavy and disorienting. The selectors above hit
+     `.modal` (which the confirm also has), and since source-order
+     wins in this sentinel block, we have to ALSO override it here
+     (an earlier-in-file rule on `.confirm-modal` got silently
+     trampled). Same-specificity selectors, just placed AFTER the
+     full-screen rules in source order so they win for the confirm.
+
+     Visual: short centered card, 16px breathing room on every side,
+     soft corners, max width capped so it doesn't sprawl on tablets. */
+  .confirm-backdrop {
+    align-items: center; justify-content: center;
+    padding: 16px;
+  }
+  .confirm-modal {
+    width: auto; max-width: min(92vw, 420px);
+    min-width: 0;
+    max-height: 80dvh;
+    height: auto;
+    border-radius: var(--r-lg);
+    display: flex; flex-direction: column;
   }
 
   /* Empty-state keyboard hints ("press Enter", "@ for files") don't
@@ -5665,5 +5977,51 @@ pre.has-copy-btn .code-copy-btn.copied {
   .chat-input-textarea {
     min-height: 36px;
     height: 36px;
+  }
+}
+
+/* ── Edit-in-place (user message) ──────────────────────────────────────
+   The textarea lives inside .msg.user .bubble which has
+   background: var(--c-accent) + color: white. We inherit that color
+   and use a semi-transparent dark layer for the textarea background so
+   the text stays readable against the blue bubble. */
+.edit-msg-wrap { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.edit-msg-ta {
+  width: 100%; min-height: 52px; max-height: 320px;
+  padding: 6px 8px; border-radius: var(--r-sm);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(0, 0, 0, 0.18);
+  color: inherit; /* white from .msg.user .bubble */
+  font-size: var(--fs-base); font-family: inherit;
+  resize: none; overflow-y: auto; line-height: 1.5;
+  outline: none; caret-color: white;
+  box-sizing: border-box;
+}
+.edit-msg-ta:focus {
+  border-color: rgba(255, 255, 255, 0.65);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.12);
+}
+.edit-msg-ta::selection { background: rgba(255, 255, 255, 0.25); }
+.edit-msg-footer {
+  display: flex; justify-content: flex-end; gap: 6px;
+}
+/* Override btn colors inside the white-text bubble context */
+.edit-msg-footer button.btn-ghost {
+  color: rgba(255, 255, 255, 0.8); border-color: transparent; margin-left: 0;
+}
+.edit-msg-footer button.btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.15); color: white;
+}
+.edit-msg-footer button.btn-primary {
+  background: rgba(255, 255, 255, 0.92); color: var(--c-accent);
+  border-color: transparent; margin-left: 0;
+}
+.edit-msg-footer button.btn-primary:hover { background: white; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

@@ -24,3 +24,12 @@ build/
 .idea/
 *.log
 node_modules/
+
+# Internal working docs — kept locally for the maintainer's own use but
+# NOT published in the open-source repo (decision 2026-05-22).
+# - TODO.md: 21KB roadmap + launch checklist + personal scheduling notes.
+#   Public roadmap lives in GitHub Issues / Discussions instead.
+# - docs/competitive-analysis.md: candid positioning + launch-strategy
+#   memo; reads as internal pitch deck if published, not user docs.
+TODO.md
+docs/competitive-analysis.md

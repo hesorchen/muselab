@@ -70,11 +70,12 @@
 <script defer src="/static/vendor/cm/mode/shell/shell.min.js"></script>
 <script defer src="/static/vendor/cm/mode/go/go.min.js"></script>
 <script defer src="/static/vendor/cm/mode/rust/rust.min.js"></script>
-<!-- TEMP: dev (unminified) Alpine so the "Cannot read properties of
-     undefined (reading 'after')" stack trace has function names + line
-     numbers we can grep. Switch back to alpine.min.js once root cause
-     is found. -->
-<script defer src="/static/vendor/alpine.dev.js"></script>
+<!-- Production: minified Alpine. The dev build (alpine.dev.js) ships
+     more verbose error messages + heavier source size; only swap back
+     when actively chasing an Alpine-internal bug. (The TEMP comment
+     here used to defer the switch — root cause found, switched back
+     2026-05-23.) -->
+<script defer src="/static/vendor/alpine.min.js"></script>
 </head>
 <body>
 <noscript><div style="padding:40px;color:red;font-size:20px;background:white">需要启用 JavaScript · JavaScript required</div></noscript>
@@ -105,12 +106,28 @@
 </script>
 <div id="jserr"></div>
 <script>
-window.addEventListener("error", e => {
-  const d = document.getElementById("jserr");
-  d.style.display = "block";
-  d.style.cssText = "display:block;padding:20px;color:red;background:#fff;font-family:monospace;white-space:pre-wrap;position:fixed;top:0;left:0;right:0;z-index:9999;max-height:50vh;overflow:auto";
-  d.textContent += "[error] " + e.message + " at " + e.filename + ":" + e.lineno + "\n";
-});
+// Dev-only on-screen error banner. Gated to localhost / 127.0.0.1 /
+// *.local so end-users on a deployed muselab never see raw JS stack
+// traces in a red strip across the top — that's a "looks broken / I'm
+// in over my head" UX moment users don't recover from. Errors still
+// flow through the app.js capture path (window.__museErrors__ + POST
+// /api/log/client-error) so the operator can debug from server logs.
+// Opting back in on a deployed instance: set localStorage.muselab_devmode = "1"
+// (manual escape hatch for remote debugging).
+(function () {
+  var h = location.hostname;
+  var isDev = h === "localhost" || h === "127.0.0.1" || h === "::1"
+            || /\.local$/.test(h);
+  var optIn = false;
+  try { optIn = localStorage.getItem("muselab_devmode") === "1"; } catch (_) {}
+  if (!isDev && !optIn) return;
+  window.addEventListener("error", function (e) {
+    var d = document.getElementById("jserr");
+    if (!d) return;
+    d.style.cssText = "display:block;padding:20px;color:red;background:#fff;font-family:monospace;white-space:pre-wrap;position:fixed;top:0;left:0;right:0;z-index:9999;max-height:50vh;overflow:auto";
+    d.textContent += "[error] " + e.message + " at " + e.filename + ":" + e.lineno + "\n";
+  });
+})();
 </script>
 
 <!-- ============ SVG icon sprite (Lucide-style stroke icons) ============ -->
@@ -163,6 +180,24 @@ window.addEventListener("error", e => {
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
   <symbol id="i-chevron-left" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-maximize" viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></symbol>
+  <symbol id="i-minimize" viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></symbol>
+
+  <!-- ===== Added 2026-05-22 (icon emoji-to-svg sweep) — Lucide stroke style ===== -->
+  <!-- Clock — queued / pending state. Replaces 🕓 -->
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <!-- Key — provider API keys. Replaces 🔑 -->
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.6 12.4 21 2"/><path d="m18 7-3-3"/></symbol>
+  <!-- Palette — theme picker. Replaces 🎨 -->
+  <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10c0-1.1-.9-2-2-2h-3a2 2 0 0 1 0-4h1a2 2 0 0 0 2-2 6 6 0 0 0-8-2"/><circle cx="7.5" cy="10.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="7.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="16.5" cy="10.5" r="1.5" fill="currentColor" stroke="none"/></symbol>
+  <!-- Package — compact-pending bubble. Replaces 📦 -->
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.29 7 12 12 20.71 7"/><line x1="12" y1="22" x2="12" y2="12"/></symbol>
+  <!-- Plug — MCP server / external tool. Replaces 🔌 -->
+  <symbol id="i-plug" viewBox="0 0 24 24"><path d="M12 22v-5"/><path d="M9 7V2"/><path d="M15 7V2"/><path d="M6 13V8h12v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4Z"/></symbol>
+  <!-- Bell — notifications settings menu. Replaces 🔔 -->
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+  <!-- Dollar sign — cost / usage dashboard menu. Replaces 💰 -->
+  <symbol id="i-dollar" viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
 
   <!-- ===== Nine Muses (希腊九缪斯) — 抽象几何形象，按日期+小时哈希挑一个 =====
        每个 id 对应 app.js MASCOTS 表里的一位缪斯（Calliope/Clio/Erato/...）。 -->
@@ -224,7 +259,8 @@ window.addEventListener("error", e => {
   </template>
 
   <!-- 主界面 -->
-  <div class="layout" x-show="authed" :style="layoutStyle()" :data-mobile-tab="mobileTab">
+  <div class="layout" x-show="authed" :style="layoutStyle()"
+       :data-mobile-tab="mobileTab" :data-desktop-full="desktopFullPane">
 
     <!-- ============ 左：文件树 ============ -->
     <aside class="pane files" :class="{'pane-hidden': !leftOpen}">
@@ -269,7 +305,7 @@ window.addEventListener("error", e => {
           <span class="open-files-label"
                 x-text="(lang==='zh'?'打开的文件 ':'Open ') + '(' + tabs.length + ')'"></span>
           <button class="open-files-close-all icon-btn sm"
-                  @click.stop="tabs = []; selected = ''; savePrefs()"
+                  @click.stop="closeAllTabs()"
                   :title="lang==='zh'?'关闭全部':'Close all'"><svg><use href="#i-x"/></svg></button>
         </div>
         <ul class="open-files-list" x-show="!openFilesCollapsed"
@@ -411,6 +447,15 @@ window.addEventListener("error", e => {
         <button x-show="editing" @click="saveEdit()" class="btn-primary" style="padding:4px 12px;font-size:12px" x-text="t('btn.save')"></button>
         <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
         <a x-show="selected" :href="downloadUrl(selected)" :download="selected.split('/').pop()" class="icon-btn preview-keep-mobile" :title="t('btn.download')"><svg><use href="#i-download"/></svg></a>
+        <!-- Desktop fullscreen toggle (hidden on mobile via .pane-fullscreen-btn
+             @media in styles.css). Click → preview pane takes whole viewport;
+             click again to restore the 3-column layout. -->
+        <button @click="toggleDesktopFull('preview')" class="icon-btn pane-fullscreen-btn"
+                :title="desktopFullPane==='preview' ? (lang==='zh' ? '退出全屏' : 'Exit fullscreen') : (lang==='zh' ? '全屏预览' : 'Fullscreen preview')"
+                :aria-pressed="desktopFullPane==='preview'">
+          <svg x-show="desktopFullPane!=='preview'"><use href="#i-maximize"/></svg>
+          <svg x-show="desktopFullPane==='preview'"><use href="#i-minimize"/></svg>
+        </button>
         <button @click="rightOpen=!rightOpen; savePrefs()" class="icon-btn" :title="rightOpen?t('btn.hide_right'):t('btn.show_right')">
           <svg x-show="rightOpen"><use href="#i-chevron-right"/></svg>
           <svg x-show="!rightOpen"><use href="#i-chevron-left"/></svg>
@@ -652,11 +697,12 @@ window.addEventListener("error", e => {
               <span x-text="t('preview.action_upload')"></span>
             </button>
           </div>
-          <div class="brand-tips">
-            <div class="brand-tip" x-text="t('empty.preview_tip1')"></div>
-            <div class="brand-tip"><span class="kbd">@</span><span x-text="t('empty.preview_tip2')"></span></div>
-            <div class="brand-tip" x-text="t('empty.preview_tip3')"></div>
-          </div>
+          <!-- 2026-05-23: 移除 preview 空态下方的三行操作提示
+               （「从左侧选文件」/「@ 递给 Muse」/「右键查看更多操作」）。
+               用户反馈：「新建笔记/上传文档」两个按钮已经把核心操作摆明，
+               下方再堆三行小字解释左侧/右侧/右键反而是噪音。
+               i18n keys empty.preview_tip{1,2,3} 暂时保留在 i18n/index.js
+               里以防别处引用，但 UI 不再渲染。 -->
         </div>
       </div>
     </section>
@@ -681,16 +727,16 @@ window.addEventListener("error", e => {
         <span class="ctx-chip warn"
               x-show="contextInfo._fetched && !contextInfo.claude_md_exists"
               :title="claudeMdChipTitle()"
-              @click="openClaudeMdHelp()"
-              x-text="lang==='zh' ? '⚠ 未配档案' : '⚠ no archive'"></span>
-        <span x-show="mcp.servers.length" class="mcp-badge"
-              :title="(lang==='zh'?'MCP 服务: ':'MCP servers: ') + mcp.servers.map(s=>s.name).join(', ')">
-          🔌 <span x-text="mcp.servers.length"></span>
+              @click="openClaudeMdHelp()">
+          <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
+          <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
         </span>
-        <span class="cost-badge"
-              :class="{ 'over-budget': stats.budget_used_pct >= 90 }"
-              :title="costBadgeTitle()"
-              x-text="tokenBadgeText()"></span>
+        <!-- 2026-05-23: 顶 bar 的 MCP 数量 badge 已移除。原来只是一个数字
+             气泡（hover 才看得到详情），跟旁边的功能按钮信息密度不一致，
+             在移动端把 toolbar 挤窄。改成在 chat-input 底 bar 加一个独立
+             MCP drawer 按钮（toggleMcpDrawer），点开能完整看每条来源 +
+             状态，比顶 bar 一个干巴巴的数字有用。 -->
+
         <!-- Set up / refresh profile — opens a dedicated chat session
              where Muse walks the user through CLAUDE.md interactively,
              one or two questions at a time, Edit-ing the file as
@@ -702,21 +748,17 @@ window.addEventListener("error", e => {
              Deliberately NOT a "raw edit" button — direct editing of
              CLAUDE.md works (it's just a file) but is a worse UX:
              nobody wants to stare at a 9-section form. -->
-        <button @click="startProfileIntake()" class="icon-btn"
-                :title="lang==='zh' ? '设置 / 更新档案（让 Muse 通过对话引导）' : 'Set up profile (Muse walks you through it)'"
-                aria-label="Set up profile">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
-               stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="8" r="4"/>
-            <path d="M4 21v-2a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4v2"/>
-            <circle cx="18" cy="6" r="2.5" fill="currentColor" stroke="none"/>
-          </svg>
-        </button>
+        <!-- 2026-05-23: 「设置档案」按钮已并入「整理档案」。整理档案 workflow
+             现在同时覆盖 archive 整理 + CLAUDE.md profile 补全（curator prompt
+             第 3 步 3b 节）。两个按钮职责重合 + 移动端 toolbar 拥挤，合并为一。
+             历史 startProfileIntake / /sessions/profile-intake 端点保留做向后
+             兼容，外部 API 调用不会断；但 UI 不再暴露独立入口。-->
         <!-- Organize archive — creates a curator-mode session that walks
-             Muse through scan → suggest → confirm-per-item → execute.
-             Sits next to the scheduled-tasks bell because both are
-             "agent-driven background work" entry points. -->
+             Muse through scan → suggest → confirm-per-item → execute,
+             AND walks the user through any blank CLAUDE.md profile
+             sections conversationally. Sits next to the scheduled-tasks
+             bell because both are "agent-driven background work" entry
+             points. -->
         <button @click="startOrganize()" class="icon-btn"
                 :title="lang==='zh' ? '整理档案 — 让 Muse 帮我梳理 archive' : 'Organize — have Muse tidy the archive'"
                 aria-label="Organize archive">
@@ -735,10 +777,20 @@ window.addEventListener("error", e => {
              picks up any still-running backend turn. The toast gives a
              visible confirmation so the user knows the click registered
              before the page actually unloads. -->
-        <button @click="reloadApp()" class="icon-btn"
-                :title="lang==='zh' ? '刷新页面（chat 卡住时点这里）' : 'Reload page (use if chat is stuck)'"
-                aria-label="Reload page">
+        <button @click="refreshChat()" class="icon-btn"
+                :title="lang==='zh' ? '刷新 chat（会话/消息/模型重新加载，不刷整个页面）' : 'Refresh chat (reloads sessions, messages and models without a full page reload)'"
+                aria-label="Refresh chat">
           <svg><use href="#i-refresh"/></svg>
+        </button>
+        <!-- Desktop fullscreen toggle — pair of preview-pane's button. Click
+             → chat pane takes whole viewport for immersive conversation;
+             click again or ESC → restore 3-column. Hidden on mobile (the
+             single-pane @media already covers focus mode there). -->
+        <button @click="toggleDesktopFull('chat')" class="icon-btn pane-fullscreen-btn"
+                :title="desktopFullPane==='chat' ? (lang==='zh' ? '退出全屏' : 'Exit fullscreen') : (lang==='zh' ? '全屏聊天' : 'Fullscreen chat')"
+                :aria-pressed="desktopFullPane==='chat'">
+          <svg x-show="desktopFullPane!=='chat'"><use href="#i-maximize"/></svg>
+          <svg x-show="desktopFullPane==='chat'"><use href="#i-minimize"/></svg>
         </button>
         <!-- Scheduled-tasks bell — unread badge when any scheduled
              prompt has produced output since the user last opened
@@ -854,7 +906,8 @@ window.addEventListener("error", e => {
           </button>
           <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
                class="session-picker-pop"
-               :style="historyPickerStyle">
+               :style="historyPickerStyle"
+               role="listbox">
             <input class="session-picker-search"
                    type="text"
                    x-model="sessionPickerSearch"
@@ -863,12 +916,13 @@ window.addEventListener("error", e => {
                    @keydown.escape="sessionPickerOpen = false" />
             <template x-for="g in groupedFilteredSessions()" :key="g.key">
               <div class="session-picker-group">
-                <div class="session-picker-group-label" x-text="g.label"></div>
-                <template x-for="s in g.items" :key="s.id">
+                <div class="session-picker-group-label" x-text="g.label + (g.hiddenCount > 0 ? ' (' + g.items.length + ')' : '')"></div>
+                <template x-for="s in g.visibleItems" :key="s.id">
                   <div class="session-picker-row"
                        :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
                        @click="pickerOpenSession(s.id)"
-                       @contextmenu.prevent="pickerRowMenu($event, s.id)">
+                       @contextmenu.prevent="pickerRowMenu($event, s.id)"
+                       role="option">
                     <button class="session-picker-pin"
                             :class="{ active: s.pinned }"
                             @click.stop="togglePinSession(s.id)"
@@ -887,13 +941,16 @@ window.addEventListener("error", e => {
                          the original user-gesture context (iOS Safari only
                          shows the on-screen keyboard for focus() inside the
                          same synchronous tick as the click). -->
+                    <!-- Streaming / unread dots — mirrors tab-strip behavior -->
+                    <span class="chat-tab-stream-dot picker-status-dot"
+                          x-show="renamingPickerSid !== s.id && isTabStreaming(s.id)"
+                          :title="lang==='zh' ? '正在生成…' : 'Streaming…'"></span>
+                    <span class="chat-tab-unread-dot picker-status-dot"
+                          x-show="renamingPickerSid !== s.id && isTabUnread(s.id)"
+                          :title="lang==='zh' ? '有新回复' : 'New reply ready'"></span>
                     <span class="ellipsis"
                           x-show="renamingPickerSid !== s.id"
                           x-text="s.name"></span>
-                    <span class="session-picker-count"
-                          x-show="renamingPickerSid !== s.id"
-                          :title="(lang==='zh' ? 'Turn 数（用户发言次数）' : 'Turn count (user prompts)') + ' · msg=' + s.message_count"
-                          x-text="s.turn_count ?? Math.max(0, Math.floor((s.message_count||0)/2))"></span>
                     <button class="session-picker-rename"
                             x-show="renamingPickerSid !== s.id"
                             @click="pickerStartInlineRename($event, s.id)"
@@ -924,13 +981,23 @@ window.addEventListener("error", e => {
                     <button class="session-picker-rename-ok"
                             x-show="renamingPickerSid === s.id"
                             @click.stop="pickerCommitInlineRename()"
-                            :title="lang==='zh' ? '确定' : 'Save'">✓</button>
+                            :title="lang==='zh' ? '确定' : 'Save'">
+                      <svg><use href="#i-check"/></svg>
+                    </button>
                     <button class="session-picker-rename-cancel"
                             x-show="renamingPickerSid === s.id"
                             @click.stop="pickerCancelInlineRename()"
-                            :title="lang==='zh' ? '取消' : 'Cancel'">✕</button>
+                            :title="lang==='zh' ? '取消' : 'Cancel'">
+                      <svg><use href="#i-x"/></svg>
+                    </button>
                   </div>
                 </template>
+                <!-- "展开更多" button — only when group is limited and has hidden items -->
+                <button x-show="g.hiddenCount > 0"
+                        class="session-picker-show-more"
+                        @click.stop="pickerGroupExpanded = { ...pickerGroupExpanded, [g.key]: true }"
+                        x-text="(lang==='zh' ? '展开更多 · ' : 'Show more · ') + g.hiddenCount + (lang==='zh' ? ' 条' : ' more')">
+                </button>
               </div>
             </template>
             <div x-show="filteredSessions().length === 0" class="session-picker-empty"
@@ -1084,7 +1151,10 @@ window.addEventListener("error", e => {
               <div class="onboard-card warn">
                 <div class="onboard-card-title" x-text="t('onboard.no_claude_md_title')"></div>
                 <div class="onboard-card-body" x-text="t('onboard.no_claude_md_body')"></div>
-                <button class="btn-primary" @click="startProfileIntake()" x-text="t('onboard.no_claude_md_cta')"></button>
+                <!-- 2026-05-23: 改走 startOrganize() —— 整理档案 workflow 现在
+                     也覆盖 CLAUDE.md profile 补全（curator prompt 3b），
+                     startProfileIntake 已弃用。 -->
+                <button class="btn-primary" @click="startOrganize()" x-text="t('onboard.no_claude_md_cta')"></button>
               </div>
             </template>
             <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && contextInfo.archive_empty">
@@ -1144,7 +1214,7 @@ window.addEventListener("error", e => {
                       <template x-for="sk in skillSuggestions()" :key="sk.name">
                         <button class="skill-chip" @click="useSuggestedPrompt(sk.prompt)"
                                 :title="sk.description">
-                          <span class="skill-chip-icon">🧩</span>
+                          <span class="skill-chip-icon"><svg><use href="#i-puzzle"/></svg></span>
                           <span x-text="sk.label"></span>
                         </button>
                       </template>
@@ -1185,13 +1255,23 @@ window.addEventListener("error", e => {
                 <div>
                   <div class="msg-row">
                     <span class="msg-avatar user-avatar" x-text="userAvatarText()"></span>
-                    <div class="bubble user-bubble">
+                    <div class="bubble user-bubble" @click="onUserBubbleClick(m)">
                       <template x-if="(m.images && m.images.length) || (m.docs && m.docs.length)">
                         <div class="user-msg-imgs">
                           <template x-for="(im, ii) in (m.images || [])" :key="'i'+ii">
-                            <img class="user-msg-img" :src="im.preview || ''" alt=""
-                                 @click="openLightbox(im.preview)"
-                                 :title="lang==='zh'?'点击放大':'Click to enlarge'" />
+                            <!-- Single root element required by x-for.
+                                 imgSrc(): blob URL (live) → base64 thumb (reload) → '' (placeholder via onerror) -->
+                            <span class="user-msg-img-wrap">
+                              <img class="user-msg-img"
+                                   :src="im.preview || (im.thumb ? 'data:image/jpeg;base64,' + im.thumb : '')"
+                                   :alt="im.name || 'image'"
+                                   @click="(im.preview || im.thumb) && openLightbox(im.preview || 'data:image/jpeg;base64,' + im.thumb, im.name)"
+                                   :title="lang==='zh'?'点击放大':'Click to enlarge'"
+                                   @error="$el.style.display='none'; $el.nextElementSibling.style.display='inline-flex'" />
+                              <span class="user-msg-img-placeholder" style="display:none" :title="im.mime || 'image'">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                              </span>
+                            </span>
                           </template>
                           <template x-for="(doc, di) in (m.docs || [])" :key="'d'+di">
                             <span class="user-msg-doc" :title="doc.name">
@@ -1201,7 +1281,24 @@ window.addEventListener("error", e => {
                           </template>
                         </div>
                       </template>
-                      <span class="user-msg-text" x-html="userTextHtml(m.text)"></span>
+                      <template x-if="m._editing">
+                        <div class="edit-msg-wrap">
+                          <textarea class="edit-msg-ta"
+                                    x-model="m._editText"
+                                    x-init="$el.style.height='auto'; $el.style.height=$el.scrollHeight+'px'; $nextTick(() => { $el.focus(); const l=$el.value.length; $el.setSelectionRange(l,l); })"
+                                    @input="$el.style.height='auto'; $el.style.height=$el.scrollHeight+'px'"
+                                    @keydown.ctrl.enter.prevent="commitEditMessage(m)"
+                                    @keydown.meta.enter.prevent="commitEditMessage(m)"
+                                    @keydown.escape.prevent="cancelEditMessage(m)"></textarea>
+                          <div class="edit-msg-footer">
+                            <button class="btn-ghost xs" @click.stop="cancelEditMessage(m)" x-text="t('btn.cancel')"></button>
+                            <button class="btn-primary xs" @click.stop="commitEditMessage(m)" x-text="t('btn.send')"></button>
+                          </div>
+                        </div>
+                      </template>
+                      <template x-if="!m._editing">
+                        <span class="user-msg-text" x-html="userTextHtml(m.text)"></span>
+                      </template>
                     </div>
                   </div>
                   <div class="msg-actions">
@@ -1210,6 +1307,11 @@ window.addEventListener("error", e => {
                             :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
                       <svg x-show="!m._copied"><use href="#i-copy"/></svg>
                       <svg x-show="m._copied"><use href="#i-check"/></svg>
+                    </button>
+                    <button x-show="!streaming && !m._editing"
+                            @click="startEditMessage(m)" class="icon-btn sm"
+                            :title="t('btn.edit')">
+                      <svg><use href="#i-edit"/></svg>
                     </button>
                     <button x-show="m._failed"
                             @click="retryFailedMessage(m)" class="icon-btn sm retry-btn"
@@ -1386,8 +1488,8 @@ window.addEventListener("error", e => {
                   <div class="tool"
                        :class="{ 'tool-mcp': m.name && m.name.startsWith('mcp__'), 'tool-skill': m.name === 'Skill' }">
                     <span class="tool-name">
-                      <span x-show="m.name && m.name.startsWith('mcp__')" class="tool-prefix-icon">🔌</span>
-                      <span x-show="m.name === 'Skill'" class="tool-prefix-icon">🧩</span>
+                      <span x-show="m.name && m.name.startsWith('mcp__')" class="tool-prefix-icon"><svg><use href="#i-plug"/></svg></span>
+                      <span x-show="m.name === 'Skill'" class="tool-prefix-icon"><svg><use href="#i-puzzle"/></svg></span>
                       <span x-text="renderToolName(m.name)"></span>
                     </span>
                     <template x-if="toolFilePath(m)">
@@ -1460,7 +1562,10 @@ window.addEventListener("error", e => {
                               <pre class="bash-stderr" x-text="bashResultText(m).stderr"></pre>
                             </template>
                             <template x-if="bashResultText(m).interrupted">
-                              <div class="bash-meta interrupted" x-text="lang==='zh' ? '⚠ 被打断' : '⚠ interrupted'"></div>
+                              <div class="bash-meta interrupted">
+                                <svg class="bash-meta-icon"><use href="#i-alert-triangle"/></svg>
+                                <span x-text="lang==='zh' ? '被打断' : 'interrupted'"></span>
+                              </div>
                             </template>
                             <template x-if="typeof bashResultText(m).exit_code === 'number'">
                               <div class="bash-meta" :class="{ ok: bashResultText(m).exit_code === 0, err: bashResultText(m).exit_code !== 0 }"
@@ -1537,11 +1642,26 @@ window.addEventListener("error", e => {
                              belt+suspenders for "user is running new frontend
                              against old backend" scenarios. -->
                         <div class="ask-options">
+                          <!-- role="button" instead of <button> tag because
+                               the option may contain a markdown <div> preview;
+                               <button><div></div></button> is invalid HTML5
+                               (button only allows phrasing content) and some
+                               browsers / touch contexts intermittently swallow
+                               the click — symptom: card renders, click does
+                               nothing, user "can't select" (reproduced
+                               2026-05-21 / 2026-05-23). Div + role="button" +
+                               keydown handlers preserve a11y while avoiding
+                               the nesting trap. -->
                           <template x-for="(opt, optIdx) in (q.options || [])" :key="optIdx">
-                            <button class="ask-option"
-                                    :class="{ picked: isAskOptionPicked(m, qIdx, askOptionLabel(opt)), disabled: m.submitted, 'has-preview': !!(opt && opt.preview) }"
-                                    :disabled="m.submitted"
-                                    @click="q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt))">
+                            <div class="ask-option"
+                                 role="button"
+                                 :tabindex="m.submitted ? -1 : 0"
+                                 :aria-disabled="m.submitted"
+                                 :aria-pressed="isAskOptionPicked(m, qIdx, askOptionLabel(opt))"
+                                 :class="{ picked: isAskOptionPicked(m, qIdx, askOptionLabel(opt)), disabled: m.submitted, 'has-preview': !!(opt && opt.preview) }"
+                                 @click="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt)))"
+                                 @keydown.enter.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt)))"
+                                 @keydown.space.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt)))">
                               <div class="ask-option-label" x-text="askOptionLabel(opt)"></div>
                               <div x-show="askOptionDesc(opt)" class="ask-option-desc" x-text="askOptionDesc(opt)"></div>
                               <!-- Optional preview (markdown / mockup / code).
@@ -1552,7 +1672,7 @@ window.addEventListener("error", e => {
                               <div x-show="opt && opt.preview"
                                    class="ask-option-preview"
                                    x-html="mdRender(opt && opt.preview || '')"></div>
-                            </button>
+                            </div>
                           </template>
                         </div>
                       </div>
@@ -1655,6 +1775,12 @@ window.addEventListener("error", e => {
                       class="thinking-dots">
                   <span></span><span></span><span></span>
                 </span>
+                <!-- Elapsed counter next to the streaming dots — kicks in
+                     after 1s so fast replies don't flash a "0s" label.
+                     Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
+                <span x-show="streaming && i === messages.length - 1 && streamElapsed >= 1"
+                      class="stream-elapsed"
+                      x-text="fmtStreamElapsed(streamElapsed)"></span>
                 <span x-show="m.ts && !(streaming && i === messages.length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
@@ -1686,8 +1812,11 @@ window.addEventListener("error", e => {
                 <span class="thinking-dots"><span></span><span></span><span></span></span>
                 <span class="thinking-label">
                   <span x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
+                  <!-- 2026-05-23: 用统一 fmtStreamElapsed（"12s"/"2m50s"/"1h05m"），
+                       跟下方 turn-footer 一致；之前是 `12.3s` 一种格式，长 turn
+                       会变 187.4s 这种难读的大数字。-->
                   <span x-show="streamElapsed > 1" class="stream-elapsed"
-                        x-text="' · ' + streamElapsed.toFixed(1) + 's'"></span>
+                        x-text="' · ' + fmtStreamElapsed(streamElapsed)"></span>
                 </span>
               </div>
             </div>
@@ -1708,10 +1837,19 @@ window.addEventListener("error", e => {
               <div class="msg-row queued-row">
                 <div class="bubble user-bubble queued-bubble">
                   <div class="queued-header">
-                    <span class="queued-icon">🕓</span>
+                    <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
+                    <!-- "/N" uses _currentQueueLen() (which guards
+                         tabState[currentId] being undefined) instead of
+                         tabState[currentId].pendingQueue.length directly:
+                         during a tab switch, Alpine briefly re-evaluates
+                         this child binding while currentId already points
+                         at a fresh-but-uninitialized tabState entry,
+                         which threw "undefined is not an object" in the
+                         wild (reported via /api/log/client-error
+                         2026-05-22). -->
                     <span class="queued-label"
                           x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
-                                   + (tabState[currentId].pendingQueue.length)"></span>
+                                   + _currentQueueLen()"></span>
                     <span style="flex:1"></span>
                     <button class="queued-act icon-btn sm"
                             @click="editPendingQueueItem(currentId, qi)"
@@ -1750,7 +1888,7 @@ window.addEventListener("error", e => {
                         && tabState[currentId].pendingQueue
                         && tabState[currentId].pendingQueue.length"
                class="queue-paused-banner">
-            <span class="queue-paused-icon">⚠️</span>
+            <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
             <span class="queue-paused-text"
                   x-text="(lang==='zh' ? '上一条出错，队列已暂停（' : 'Queue paused after error (')
                           + ((tabState[currentId] && tabState[currentId].pendingQueue
@@ -1770,20 +1908,20 @@ window.addEventListener("error", e => {
                shimmer in the top ctx-meter). Appears for the full window
                between native-compact POST and loadSession completing — can
                be ~20-60s on a long session. -->
-          <div x-show="_compacting" class="msg assistant compact-pending">
+          <div x-show="tabState[currentId] && tabState[currentId].compacting" class="msg assistant compact-pending">
             <div class="msg-row">
               <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
                 <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
               </span>
               <div class="bubble pending">
-                <span class="compact-pending-icon">📦</span>
+                <span class="compact-pending-icon"><svg><use href="#i-package"/></svg></span>
                 <span class="thinking-dots"><span></span><span></span><span></span></span>
                 <span class="thinking-label" x-text="lang==='zh' ? '压缩对话中…' : 'Compacting conversation…'"></span>
               </div>
             </div>
           </div>
         </div>
-        <button class="jump-bottom" x-show="!atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
+        <button class="jump-bottom" x-show="!atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
         <!-- Outline FAB — sits right above jump-bottom in the same chat
              pane. Same visibility rule as jump-bottom (x-show="!atBottom")
              so the two appear/disappear together as a pair. -->
@@ -1930,6 +2068,19 @@ window.addEventListener("error", e => {
                     aria-label="Open skills list">
               <svg><use href="#i-puzzle"/></svg>
             </button>
+            <!-- MCP drawer toggle — sits next to skills (both are "what
+                 capabilities does this turn have available"). Reuses the
+                 i-plug icon that used to live in the top bar. Replaces
+                 the read-only top-bar mcp-badge (2026-05-23). No count
+                 badge: a raw number adds visual noise without telling
+                 the user anything actionable — they open the drawer to
+                 see which MCPs anyway. -->
+            <button @click="toggleMcpDrawer()"
+                    class="chat-toolbar-btn"
+                    :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
+                    aria-label="Open MCP servers">
+              <svg><use href="#i-plug"/></svg>
+            </button>
             <!-- Model selector -->
             <select x-model="model" @change="onModelChange()"
                     class="chat-toolbar-select"
@@ -1955,16 +2106,24 @@ window.addEventListener("error", e => {
             </select>
             <!-- Reasoning effort. Empty = SDK adaptive default (Opus 4.7's
                  adaptive thinking picks per turn). Overrides apply session-
-                 wide and trigger a client rebuild on next turn. -->
+                 wide and trigger a client rebuild on next turn.
+
+                 Options visibility tracks current model: non-Claude models
+                 hide the whole dropdown (effort is Anthropic-API specific;
+                 vendor proxies don't reliably honor it). Among Claude
+                 models, xhigh is Opus-4.7-only — SDK falls back to high on
+                 Sonnet/Haiku, so we hide rather than mislead. See
+                 _supportsEffort / _effortAllowed in app.js. -->
             <select x-model="effort" @change="onEffortChange()"
+                    x-show="_supportsEffort(model)"
                     class="chat-toolbar-select chat-toolbar-effort"
                     :title="t('effort.title')">
               <option value="" x-text="t('effort.auto')"></option>
-              <option value="low" x-text="t('effort.low')"></option>
-              <option value="medium" x-text="t('effort.medium')"></option>
-              <option value="high" x-text="t('effort.high')"></option>
-              <option value="xhigh" x-text="t('effort.xhigh')"></option>
-              <option value="max" x-text="t('effort.max')"></option>
+              <option value="low" x-show="_effortAllowed('low', model)" x-text="t('effort.low')"></option>
+              <option value="medium" x-show="_effortAllowed('medium', model)" x-text="t('effort.medium')"></option>
+              <option value="high" x-show="_effortAllowed('high', model)" x-text="t('effort.high')"></option>
+              <option value="xhigh" x-show="_effortAllowed('xhigh', model)" x-text="t('effort.xhigh')"></option>
+              <option value="max" x-show="_effortAllowed('max', model)" x-text="t('effort.max')"></option>
             </select>
             <!-- Context ring — % used. Click to compact. Right-click
                  opens the SDK breakdown popup (the dedicated magnifier
@@ -2088,9 +2247,10 @@ window.addEventListener("error", e => {
        @click="lightbox.show = false"
        @keydown.escape.window="lightbox.show = false">
     <img :src="lightbox.src" class="lightbox-img"
-         @click.stop="lightbox.show = false" alt="" />
+         @click.stop="lightbox.show = false" :alt="lightbox.alt || (lang==='zh' ? '图片预览' : 'Image preview')" />
     <button class="lightbox-close"
             :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'"
+            :aria-label="lang==='zh' ? '关闭（Esc）' : 'Close (Esc)'"
             @click.stop="lightbox.show = false">×</button>
   </div>
 
@@ -2156,9 +2316,13 @@ window.addEventListener("error", e => {
 
   <!-- ============ Settings Modal ============ -->
   <div class="modal-backdrop" x-show="settings.show" @click.self="settings.show=false">
-    <div class="modal settings-modal" @keydown.escape.window="settings.show=false">
+    <div class="modal settings-modal" @keydown.escape.window="settings.show=false"
+         role="dialog" aria-modal="true" :aria-label="t('set.title')">
       <div class="modal-head">
-        <span class="modal-title">⚙ <span x-text="t('set.title')"></span></span>
+        <span class="modal-title">
+          <svg class="modal-title-icon"><use href="#i-cog"/></svg>
+          <span x-text="t('set.title')"></span>
+        </span>
         <button class="modal-close" @click="settings.show=false"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
@@ -2172,55 +2336,55 @@ window.addEventListener("error", e => {
         <ul class="settings-menu"
             x-show="!isWideScreen && !settings.activePage">
           <li class="settings-menu-item" @click="settings.activePage='lang'">
-            <span class="settings-menu-icon">🌐</span>
+            <span class="settings-menu-icon"><svg><use href="#i-globe"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='provider'">
-            <span class="settings-menu-icon">🔑</span>
+            <span class="settings-menu-icon"><svg><use href="#i-key"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='appearance'">
-            <span class="settings-menu-icon">🎨</span>
+            <span class="settings-menu-icon"><svg><use href="#i-palette"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.appearance')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='notification'">
-            <span class="settings-menu-icon">🔔</span>
+            <span class="settings-menu-icon"><svg><use href="#i-bell"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='defaults'">
-            <span class="settings-menu-icon">⚙️</span>
+            <span class="settings-menu-icon"><svg><use href="#i-cog"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='model_params'">
-            <span class="settings-menu-icon">🧠</span>
+            <span class="settings-menu-icon"><svg><use href="#i-brain"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.model_params')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='skills'">
-            <span class="settings-menu-icon">🧩</span>
+            <span class="settings-menu-icon"><svg><use href="#i-puzzle"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='mcp'">
-            <span class="settings-menu-icon">🔌</span>
+            <span class="settings-menu-icon"><svg><use href="#i-plug"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.mcp')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='versions'">
-            <span class="settings-menu-icon">🛠</span>
+            <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item"
               @click="settings.activePage='cost'; loadCostDashboard();">
-            <span class="settings-menu-icon">💰</span>
+            <span class="settings-menu-icon"><svg><use href="#i-dollar"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.cost')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
@@ -2275,8 +2439,8 @@ window.addEventListener("error", e => {
                    class="probe-result"
                    :class="{ ok: settings.probeResults[p.env_key]?.ok,
                               err: !settings.probeResults[p.env_key]?.ok }">
-                <span x-show="settings.probeResults[p.env_key]?.ok">✅</span>
-                <span x-show="!settings.probeResults[p.env_key]?.ok">❌</span>
+                <svg class="probe-result-icon ok" x-show="settings.probeResults[p.env_key]?.ok"><use href="#i-check-circle"/></svg>
+                <svg class="probe-result-icon err" x-show="!settings.probeResults[p.env_key]?.ok"><use href="#i-alert-circle"/></svg>
                 <span x-text="settings.probeResults[p.env_key]?.text"></span>
               </div>
             </div>
@@ -2381,7 +2545,8 @@ window.addEventListener("error", e => {
               <div x-show="settings.versions.expected_cli_version && settings.versions.current?.cli &&
                             settings.versions.expected_cli_version !== settings.versions.current?.cli"
                    class="settings-hint warn">
-                <span x-text="(lang==='zh' ? '⚠ SDK 期望 CLI 版本 ' : '⚠ SDK expects CLI ') + (settings.versions.expected_cli_version || '?')"></span>
+                <svg class="settings-hint-icon"><use href="#i-alert-triangle"/></svg>
+                <span x-text="(lang==='zh' ? 'SDK 期望 CLI 版本 ' : 'SDK expects CLI ') + (settings.versions.expected_cli_version || '?')"></span>
               </div>
               <div class="settings-row" style="margin-top: 10px;">
                 <button class="btn-primary sm" @click="runUpgrade()"
@@ -2391,12 +2556,25 @@ window.addEventListener("error", e => {
               </div>
               <template x-if="settings.upgradeResult">
                 <div class="upgrade-result" :class="{ ok: settings.upgradeResult.ok, err: !settings.upgradeResult.ok }">
-                  <div x-show="settings.upgradeResult.ok"
-                       x-text="lang==='zh' ? '✅ 升级完成' : '✅ Upgrade complete'"></div>
-                  <div x-show="!settings.upgradeResult.ok"
-                       x-text="lang==='zh' ? '❌ 升级失败 — 查看下方步骤' : '❌ Upgrade failed — see steps below'"></div>
+                  <div x-show="settings.upgradeResult.ok" class="upgrade-result-status ok">
+                    <svg class="upgrade-result-icon"><use href="#i-check-circle"/></svg>
+                    <span x-text="lang==='zh' ? '升级完成' : 'Upgrade complete'"></span>
+                  </div>
+                  <div x-show="!settings.upgradeResult.ok" class="upgrade-result-status err">
+                    <svg class="upgrade-result-icon"><use href="#i-alert-circle"/></svg>
+                    <span x-text="lang==='zh' ? '升级失败 — 查看下方步骤' : 'Upgrade failed — see steps below'"></span>
+                  </div>
                   <div x-show="settings.upgradeResult.needs_restart" class="restart-hint">
                     <div x-text="lang==='zh' ? '需要重启服务以加载新版 SDK：' : 'Restart service to load new SDK:'"></div>
+                    <div class="restart-actions">
+                      <button class="btn-primary btn-sm"
+                              :disabled="settings.restarting"
+                              @click="restartService()"
+                              x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '一键重启' : 'Restart now')">
+                      </button>
+                      <span class="settings-hint" style="margin-left:8px"
+                            x-text="lang==='zh' ? '或手动执行：' : 'Or run manually:'"></span>
+                    </div>
                     <pre x-text="settings.upgradeResult.restart_hint"></pre>
                   </div>
                   <details>
@@ -2412,6 +2590,17 @@ window.addEventListener("error", e => {
               </template>
             </div>
           </template>
+          <!-- Standalone restart button — useful any time, not just after upgrade -->
+          <div class="settings-row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--c-border)">
+            <label x-text="lang==='zh' ? '重启服务' : 'Restart service'"></label>
+            <button class="btn-ghost btn-sm"
+                    :disabled="settings.restarting"
+                    @click="restartService()"
+                    x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '重启' : 'Restart')">
+            </button>
+            <div class="settings-hint"
+                 x-text="lang==='zh' ? '升级 SDK / 修改 .env 后，重启让新配置生效。' : 'Use after upgrading the SDK or editing .env.'"></div>
+          </div>
           <template x-if="!settings.versions && !settings.versionsLoading">
             <div class="settings-hint"
                  x-text="lang==='zh' ? '点击「检查更新」查询 PyPI + npm 上的最新版本。' : 'Click Check to query PyPI + npm for the latest versions.'"></div>
@@ -2436,11 +2625,38 @@ window.addEventListener("error", e => {
           </template>
           <template x-if="cost.data">
             <div>
-              <!-- 4 KPI cards: total tokens up top, cost as secondary line.
-                   Time windows are fixed (today / 7d / 30d / all-time) —
-                   the previous adjustable window dropdown was removed
-                   per user feedback (2026-05-22) since at-a-glance
-                   trends rarely need anything beyond these four. -->
+              <!-- Filter chips — click to include/exclude a token class
+                   from every aggregate below (KPI cards, day bars, vendor
+                   rollup, per-model rows). Per user feedback 2026-05-22:
+                   the old dashboard piled $ figures + turn counts + vendor
+                   USD-not-reported notes; user wanted pure token view with
+                   one click to hide individual classes. Numbers on the
+                   chips are the last-30-day totals for that class so the
+                   filter row also serves as a quick legend. -->
+              <div class="cost-token-filters"
+                   x-show="cost.data.all_time.input_tokens + cost.data.all_time.output_tokens
+                           + cost.data.all_time.cache_read_tokens + cost.data.all_time.cache_creation_tokens > 0">
+                <button class="cost-token-chip in"
+                        :class="{ inactive: !cost.filters.input }"
+                        @click="cost.filters.input = !cost.filters.input"
+                        :title="lang==='zh' ? '点击隐藏 / 显示输入 token' : 'Toggle input tokens'"
+                        x-text="t('set.cost.in_tokens') + ': ' + fmtTokens(cost.data.last_30d.input_tokens)"></button>
+                <button class="cost-token-chip out"
+                        :class="{ inactive: !cost.filters.output }"
+                        @click="cost.filters.output = !cost.filters.output"
+                        :title="lang==='zh' ? '点击隐藏 / 显示输出 token' : 'Toggle output tokens'"
+                        x-text="t('set.cost.out_tokens') + ': ' + fmtTokens(cost.data.last_30d.output_tokens)"></button>
+                <button class="cost-token-chip cache"
+                        :class="{ inactive: !cost.filters.cache }"
+                        @click="cost.filters.cache = !cost.filters.cache"
+                        :title="lang==='zh' ? '点击隐藏 / 显示缓存 token' : 'Toggle cache tokens'"
+                        x-text="t('set.cost.cache_tokens') + ': ' + fmtTokens(cost.data.last_30d.cache_read_tokens + cost.data.last_30d.cache_creation_tokens)"></button>
+              </div>
+
+              <!-- 4 KPI cards: token total only. No $ figure (vendors don't
+                   report USD consistently — user only wants token counts).
+                   No turns-count ("Nx" looked like a multiplier per user
+                   feedback). -->
               <div class="cost-kpis">
                 <template x-for="key in ['today','last_7d','last_30d','all_time']" :key="key">
                   <div class="cost-kpi">
@@ -2451,32 +2667,17 @@ window.addEventListener("error", e => {
                                : t('set.cost.30d')"></div>
                     <div class="cost-kpi-value"
                          x-text="fmtTokens(totalTokens(cost.data[key]))"></div>
-                    <div class="cost-kpi-sub"
-                         x-text="cost.data[key].turns + ' ' + t('set.cost.turns') +
-                                  (cost.data[key].cost > 0
-                                    ? ' · $' + cost.data[key].cost.toFixed(2)
-                                    : '')"></div>
                   </div>
                 </template>
               </div>
-              <!-- Token-class legend explains the 4 numbers below the chart.
-                   Uses the 30-day window bucket. -->
-              <div class="cost-token-breakdown"
-                   x-show="cost.data.all_time.turns > 0">
-                <span class="cost-token-chip in"
-                      x-text="t('set.cost.in_tokens') + ': ' + fmtTokens(cost.data.last_30d.input_tokens)"></span>
-                <span class="cost-token-chip out"
-                      x-text="t('set.cost.out_tokens') + ': ' + fmtTokens(cost.data.last_30d.output_tokens)"></span>
-                <span class="cost-token-chip cache"
-                      x-text="t('set.cost.cache_tokens') + ': ' + fmtTokens(cost.data.last_30d.cache_read_tokens)"></span>
-              </div>
 
-              <!-- Per-day bar chart: stacked input + cache (visual hint of cache hit rate) -->
+              <!-- Per-day bar chart. Tooltip shows the per-class breakdown
+                   so the user can drill down without cluttering the bar. -->
               <div class="cost-block-title" x-text="t('set.cost.by_day')"></div>
               <div class="cost-bars">
                 <template x-for="d in cost.data.by_day" :key="d.date">
                   <div class="cost-bar"
-                       :title="`${d.date}: in=${fmtTokens(d.input_tokens)} out=${fmtTokens(d.output_tokens)} cache_read=${fmtTokens(d.cache_read_tokens)} · ${d.turns} turns · $${d.cost.toFixed(4)}`">
+                       :title="`${d.date} — in=${fmtTokens(d.input_tokens)} · out=${fmtTokens(d.output_tokens)} · cache=${fmtTokens(d.cache_read_tokens + d.cache_creation_tokens)}`">
                     <div class="cost-bar-fill"
                          :style="`height: ${costBarHeight(totalTokens(d))}%`"></div>
                     <div class="cost-bar-label" x-text="d.date.slice(5)"></div>
@@ -2484,61 +2685,36 @@ window.addEventListener("error", e => {
                 </template>
               </div>
 
-              <!-- Per-vendor rollup. Lets the user see "GLM total" vs
-                   "Claude total" at a glance instead of mentally summing
-                   sibling rows in the model breakdown below. Same widget
-                   shape so it reads as one continuous section. -->
-              <template x-if="cost.data.by_vendor && cost.data.by_vendor.length > 1">
-                <div>
-                  <div class="cost-block-title"
-                       x-text="lang==='zh' ? '按厂商汇总' : 'By vendor'"></div>
-                  <div class="cost-models">
-                    <template x-for="v in cost.data.by_vendor" :key="v.vendor">
-                      <div class="cost-model-row">
-                        <div class="cost-model-name" x-text="v.vendor"></div>
-                        <div class="cost-model-bar-track">
-                          <div class="cost-model-bar-fill"
-                               :style="`width: ${costVendorPct(totalTokens(v))}%`"></div>
-                        </div>
-                        <div class="cost-model-amount"
-                             x-text="fmtTokens(totalTokens(v)) + ' · ' + v.turns + 'x' + (v.cost_reported ? (v.cost > 0 ? ' · $' + v.cost.toFixed(2) : '') : (lang==='zh' ? ' · $ —' : ' · $ —'))"
-                             :title="!v.cost_reported ? (lang==='zh' ? '该厂商不报告 USD 费用，前端只跟踪 token 数；请去对应 console 看实际账单' : 'Vendor does not report USD cost — track tokens here, see vendor console for real billing') : ''"></div>
-                      </div>
-                    </template>
-                  </div>
-                </div>
-              </template>
-
-              <!-- Per-model breakdown — tokens primary, cost secondary -->
+              <!-- Per-model breakdown — token total only. by_vendor rollup
+                   dropped 2026-05-22 per user feedback "就按模型汇总就行了":
+                   model granularity is what users actually want to see;
+                   vendor totals are easy to mentally sum from the per-model
+                   list (≤ 5 vendors), and the extra section ate vertical
+                   space without earning it. -->
+              <!-- ===== by_model ===== -->
               <div class="cost-block-title" x-text="t('set.cost.by_model')"></div>
               <div class="cost-models">
                 <template x-for="m in cost.data.by_model" :key="m.model">
                   <div class="cost-model-row">
-                    <!-- Show the friendly label + vendor chip; raw model id
-                         is on title= so power users can hover to see e.g.
-                         "claude-sonnet-4-6" while the row reads "Sonnet 4.6". -->
+                    <!-- Friendly label only; raw model id on title= so power
+                         users can hover to see e.g. "claude-sonnet-4-6"
+                         while the row reads "Sonnet 4.6". Vendor chip + the
+                         by_vendor rollup section were both dropped
+                         2026-05-22 — model granularity is what users
+                         actually want, vendor totals are easy to mentally
+                         sum from the per-model list. -->
                     <div class="cost-model-name" :title="m.model">
-                      <span x-show="m.vendor && m.vendor !== 'Claude' && m.vendor !== 'Unknown'"
-                            class="cost-model-vendor-chip" x-text="m.vendor"></span>
                       <span x-text="m.label || m.model"></span>
                     </div>
                     <div class="cost-model-bar-track">
                       <div class="cost-model-bar-fill"
                            :style="`width: ${costModelPct(totalTokens(m))}%`"></div>
                     </div>
-                    <!-- For Claude rows show real cost; for vendors without
-                         USD reporting show "$ —" with a tooltip explaining
-                         that token counts are accurate but USD comes from
-                         the vendor's own console. Hiding the $ entirely
-                         (old behavior) made GLM look free, which it isn't. -->
                     <div class="cost-model-amount"
-                         x-text="fmtTokens(totalTokens(m)) + ' · ' + m.turns + 'x' + (m.cost_reported ? (m.cost > 0 ? ' · $' + m.cost.toFixed(2) : '') : ' · $ —')"
-                         :title="!m.cost_reported ? (lang==='zh' ? '该厂商不报告 USD 费用，前端只跟踪 token 数；请去对应 console 看实际账单' : 'Vendor does not report USD cost — track tokens here, see vendor console for real billing') : ''"></div>
+                         x-text="fmtTokens(totalTokens(m))"></div>
                   </div>
                 </template>
               </div>
-              <div class="settings-hint" style="margin-top: 12px;"
-                   x-text="t('set.cost.cost_note')"></div>
             </div>
           </template>
         </div>
@@ -2629,14 +2805,20 @@ window.addEventListener("error", e => {
                  ? '关掉对应分类后，muselab 后端就不会再为该类事件发推送（独立控制）。'
                  : 'Disabling a class stops the backend from sending pushes of that class entirely.'"></div>
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '⏰ 定时任务完成' : '⏰ Scheduled task done'"></label>
+            <label>
+              <svg class="settings-row-label-icon"><use href="#i-clock"/></svg>
+              <span x-text="lang==='zh' ? '定时任务完成' : 'Scheduled task done'"></span>
+            </label>
             <label class="switch">
               <input type="checkbox" x-model="settings.draftParams.notify_scheduled" />
               <span class="switch-slider"></span>
             </label>
           </div>
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '💬 普通会话回复完成' : '💬 Normal chat turn done'"></label>
+            <label>
+              <svg class="settings-row-label-icon"><use href="#i-msg"/></svg>
+              <span x-text="lang==='zh' ? '普通会话回复完成' : 'Normal chat turn done'"></span>
+            </label>
             <label class="switch">
               <input type="checkbox" x-model="settings.draftParams.notify_normal" />
               <span class="switch-slider"></span>
@@ -2671,13 +2853,14 @@ window.addEventListener("error", e => {
                a concrete demo prompt, others get a generic seed. -->
           <div class="skills-grid">
             <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
-              <div class="skill-card">
+              <!-- 2026-05-23: scope/source chip removed. 用户反馈"显示来源
+                   反而提升理解成本" —— project/user/plugin/marketplace 这套
+                   分类对普通用户是噪音。如需溯源，hover skill name 的 title
+                   或去 Settings → Skills 看完整路径。-->
+              <div class="skill-card" :title="sk.source || ''">
                 <div class="skill-card-head">
-                  <span class="skill-card-icon">🧩</span>
+                  <span class="skill-card-icon"><svg><use href="#i-puzzle"/></svg></span>
                   <span class="skill-card-name mono" x-text="sk.name"></span>
-                  <span class="skill-card-scope" :class="'skill-scope-' + sk.scope"
-                        :title="sk.source || ''"
-                        x-text="sk.source ? sk.scope + '·' + sk.source.split('/').slice(-1)[0] : sk.scope"></span>
                 </div>
                 <div class="skill-card-desc" x-text="sk.description || (lang==='zh' ? '（无描述）' : '(no description)')"></div>
                 <div class="skill-card-actions">
@@ -2773,7 +2956,8 @@ window.addEventListener("error", e => {
   <div class="modal-backdrop" x-show="cheatSheet.show"
        @click.self="cheatSheet.show=false">
     <div class="modal cheatsheet-modal"
-         @keydown.escape.window="cheatSheet.show=false">
+         @keydown.escape.window="cheatSheet.show=false"
+         role="dialog" aria-modal="true">
       <div class="modal-head">
         <span class="modal-title">⌨ <span x-text="lang==='zh' ? '键盘快捷键' : 'Keyboard shortcuts'"></span></span>
         <button class="modal-close" @click="cheatSheet.show=false"
@@ -2851,6 +3035,72 @@ window.addEventListener("error", e => {
        card pre-fills the input with a seed prompt and focuses the
        textarea — works regardless of whether the user is on the empty
        chat or mid-conversation. -->
+  <!-- MCP drawer — chat-input 🔌 entry point. Read-only list of every MCP
+       server muselab will actually mount on the next turn (merged view:
+       muselab's mcp.json + Claude Code's standard config files). Each row
+       shows source badge (where it came from) + enabled toggle + reconnect
+       button. For full editing (add / delete / edit env), link to Settings.
+       2026-05-23 replaces the top-bar mcp-badge with this richer view. -->
+  <div class="skills-drawer-overlay" x-show="mcpDrawerOpen"
+       @click.self="mcpDrawerOpen = false"
+       @keydown.escape.window="mcpDrawerOpen = false"
+       x-cloak>
+    <div class="skills-drawer">
+      <div class="skills-drawer-head">
+        <div>
+          <div class="skills-drawer-title"
+               x-text="(lang==='zh'?'MCP 服务':'MCP servers') + ' · ' + mcp.servers.length"></div>
+          <!-- Unicode curly apostrophes (U+2019) instead of straight `'`
+               so the JS string literal stays valid inside an HTML double-
+               quoted attribute. Earlier `muselab\\'s` was wrong: HTML
+               doesn't escape backslashes, so JS saw `\\` → literal `\` +
+               then `'` closed the string early → SyntaxError: Unexpected
+               identifier 's'. Lesson: never put straight ASCII apostrophes
+               inside Alpine x-text JS strings — use U+2019 (which is the
+               proper typographic apostrophe anyway). -->
+          <div class="skills-drawer-subtitle"
+               x-text="lang==='zh'
+                 ? '已合并 muselab 自有配置 + Claude Code 标准配置位置（~/.claude.json / .mcp.json）'
+                 : 'Merged: muselab’s own config + Claude Code’s standard MCP files'"></div>
+        </div>
+        <button class="skills-drawer-close" @click="mcpDrawerOpen = false"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="skills-drawer-body">
+        <div x-show="!mcp.servers.length" class="settings-empty"
+             x-text="lang==='zh'
+               ? '没有配置 MCP 服务。可去 Settings → MCP 添加，或在 ~/.claude.json mcpServers 里加（会自动合并）。'
+               : 'No MCP servers configured. Add via Settings → MCP, or edit ~/.claude.json mcpServers (auto-merged).'"></div>
+        <div class="skills-grid">
+          <template x-for="s in mcp.servers" :key="s.name + ':' + (s.source || 'muselab')">
+            <!-- Source chip removed 2026-05-23 同 skills 卡片，详细溯源信息
+                 通过外层 div :title 提供给好奇的用户 hover 即可。-->
+            <div class="skill-card" :class="{'is-disabled': s.disabled}"
+                 :title="mcpSourceLabel(s.source) + (s.disabled ? (lang==='zh' ? ' · 已禁用' : ' · disabled') : '')">
+              <div class="skill-card-head">
+                <span class="skill-card-icon"><svg><use href="#i-plug"/></svg></span>
+                <span class="skill-card-name mono" x-text="s.name"></span>
+              </div>
+              <div class="skill-card-desc mono"
+                   x-text="(s.command || '(remote)') + (s.args && s.args.length ? ' ' + s.args.join(' ') : '')"></div>
+              <div class="skill-card-actions">
+                <!-- "Try" mirrors skill cards: pre-fill chat input with a
+                     seed prompt referencing this MCP server's name, so the
+                     model picks an appropriate tool from that server on
+                     the first turn. Disabled MCPs can't be tried — the
+                     SDK won't have mounted them this turn. -->
+                <button class="skill-card-try"
+                        :disabled="s.disabled"
+                        @click="tryMcp(s)"
+                        x-text="t('set.skills.try')"></button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="skills-drawer-overlay" x-show="skillsDrawerOpen"
        @click.self="skillsDrawerOpen = false"
        @keydown.escape.window="skillsDrawerOpen = false"
@@ -2871,13 +3121,12 @@ window.addEventListener("error", e => {
              x-text="t('set.skills.empty')"></div>
         <div class="skills-grid">
           <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
-            <div class="skill-card">
+            <!-- scope chip removed 2026-05-23, 同 Settings → Skills 卡片 —— 见
+                 那段注释。-->
+            <div class="skill-card" :title="sk.source || ''">
               <div class="skill-card-head">
-                <span class="skill-card-icon">🧩</span>
+                <span class="skill-card-icon"><svg><use href="#i-puzzle"/></svg></span>
                 <span class="skill-card-name mono" x-text="sk.name"></span>
-                <span class="skill-card-scope" :class="'skill-scope-' + sk.scope"
-                      :title="sk.source || ''"
-                      x-text="sk.source ? sk.scope + '·' + sk.source.split('/').slice(-1)[0] : sk.scope"></span>
               </div>
               <div class="skill-card-desc" x-text="sk.description || (lang==='zh' ? '（无描述）' : '(no description)')"></div>
               <div class="skill-card-actions">
@@ -2892,8 +3141,9 @@ window.addEventListener("error", e => {
   </div>
 
   <!-- ============ Modal ============ -->
-  <div class="modal-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
-    <div class="modal" @keydown.escape.window="modal.cancel && modal.cancel()">
+  <div class="modal-backdrop confirm-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
+    <div class="modal confirm-modal" @keydown.escape.window="modal.cancel && modal.cancel()"
+         role="alertdialog" aria-modal="true">
       <div class="modal-head">
         <span class="modal-title" x-text="modal.title"></span>
         <button class="modal-close" @click="modal.cancel && modal.cancel()"
@@ -3093,13 +3343,28 @@ window.addEventListener("error", e => {
 
         <!-- Recent runs -->
         <div class="sched-section">
-          <div class="sched-section-title" x-text="lang==='zh'
-              ? `最近运行（${scheduler.history.length}）`
-              : `Recent runs (${scheduler.history.length})`"></div>
+          <div class="sched-section-head">
+            <div class="sched-section-title" x-text="lang==='zh'
+                ? `最近运行（${scheduler.history.length}）`
+                : `Recent runs (${scheduler.history.length})`"></div>
+            <!-- Clear-all only shown when history is non-empty (otherwise
+                 the button is dead weight). Sits at the section head as
+                 a single "bulk action" affordance; per-row × is below. -->
+            <button class="btn-text sm sched-hist-clear"
+                    x-show="scheduler.history.length"
+                    @click="clearAllSchedHistory()"
+                    x-text="lang==='zh' ? '清空' : 'Clear all'"></button>
+          </div>
           <div class="sched-empty" x-show="!scheduler.history.length"
                x-text="lang==='zh' ? '还没有运行记录。'
                                    : 'No runs yet.'"></div>
-          <template x-for="(h, i) in scheduler.history" :key="i">
+          <!-- Use ts+task_id as :key (not array index) so Alpine doesn't
+               re-render the wrong row when one is deleted mid-list. With
+               index keys, optimistic delete of row 2 in a 3-row list
+               would make row 3's DOM slot inherit row 2's :class/x-text
+               binding until the next refetch — surfaces as the "wrong
+               row got crossed out" bug. -->
+          <template x-for="h in scheduler.history" :key="h.ts + ':' + (h.task_id || '')">
             <div class="sched-hist-row sched-row-clickable"
                  :class="{ err: !h.ok }"
                  @click="openSchedTaskSession(h)"
@@ -3114,6 +3379,14 @@ window.addEventListener("error", e => {
                         x-text="schedRunning[h.task_id]
                           ? (lang==='zh' ? '执行中…' : 'Running…')
                           : (lang==='zh' ? '重试' : 'Retry')"></button>
+                <!-- Per-row delete. No confirm — single-row delete is
+                     cheap to undo (just re-run the task) and a confirm
+                     modal per × would be noisy on a long history list,
+                     especially on phones. -->
+                <button class="sched-hist-del"
+                        @click.stop="deleteSchedHistoryEntry(h)"
+                        :title="lang==='zh' ? '删除这条记录' : 'Delete this entry'"
+                        :aria-label="lang==='zh' ? '删除' : 'Delete'">×</button>
               </div>
               <div class="sched-hist-body"
                    x-text="h.ok ? h.reply_preview : ('Error: ' + (h.error || 'unknown'))"></div>

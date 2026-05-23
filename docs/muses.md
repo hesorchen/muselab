@@ -3,13 +3,13 @@
 > [简体中文](muses_zh.md)
 
 muselab takes its name from the **nine Muses** of Greek mythology — the
-goddesses who inspire art and learning. **Muse** is the AI persona inside;
-**muselab** is the workshop she lives in.
+goddesses who inspire art and learning. **Muse** is the AI persona within;
+**muselab** is the workspace it inhabits.
 
-Each session boots a different muse (hashed from date + hour — stable
-within an hour, rotates daily). Click the mascot in the chat header to
-cycle. The favicon follows along — your browser tab quietly carries
-today's muse.
+Each session is assigned a different Muse (derived from a hash of the date
+and hour — stable within an hour, rotating daily). Click the mascot in the
+chat header to cycle through them. The favicon updates accordingly, so the
+browser tab reflects the current Muse.
 
 | Muse | Domain | Geometric form |
 |---|---|---|

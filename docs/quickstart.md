@@ -2,9 +2,9 @@
 
 > [简体中文](quickstart_zh.md)
 
-From clone to running, in three commands. Default bind is `127.0.0.1`, so it
-is only reachable from the same machine until you choose a remote-access
-pattern (see [SSH tunnel](#vps) below).
+From clone to running in three commands. The default bind address is `127.0.0.1`,
+so the service is only reachable from the local machine until you configure a
+remote-access method (see [SSH tunnel](#vps) below).
 
 ## 0. Prerequisites
 
@@ -13,12 +13,12 @@ pattern (see [SSH tunnel](#vps) below).
 | If you have… | Setup |
 |----------------|-------|
 | **Claude Pro / Max** subscription | Install [`claude` CLI](https://docs.claude.com/claude-code) then run `claude login` once. OAuth lives in `~/.claude/.credentials.json` |
-| Just want a cheap key | Get one from [DeepSeek](https://platform.deepseek.com) / [智谱 GLM](https://bigmodel.cn) / [MiniMax 国内站](https://minimaxi.com). Paste it in Settings after install — no CLI required |
-| Both | Use Claude for hard reasoning, DeepSeek for cheap. Switch model in a dropdown click |
+| Just want a cheap key | Get one from [DeepSeek](https://platform.deepseek.com) / [智谱 GLM](https://bigmodel.cn) / [MiniMax](https://minimaxi.com) / [Kimi](https://platform.moonshot.cn) / [Qwen](https://dashscope.console.aliyun.com). Paste it in Settings after install — no CLI required |
+| Both | Use Claude for demanding reasoning tasks, DeepSeek for cost-sensitive workloads. Switch models with a single dropdown click |
 
-Without any provider configured, muselab installs fine but the first chat
-will error. The UI explicitly says "no provider configured — open Settings"
-so you won't be left confused.
+Without any provider configured, muselab installs successfully but the first
+chat request will fail. The UI displays "no provider configured — open Settings"
+to make the cause clear.
 
 ### Install `uv`
 
@@ -28,9 +28,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```powershell
-# Windows PowerShell — clean Windows needs three one-time setups.
-# 🚨 CLOSE + REOPEN POWERSHELL AFTER EACH STEP so PATH refreshes 🚨
-# (Skip the reopen and the next step will fail with "'git' / 'uv' is not recognized")
+# Windows PowerShell — a clean Windows installation requires three one-time setup steps.
+# CLOSE AND REOPEN POWERSHELL AFTER EACH STEP so that PATH changes take effect.
+# (Skipping the reopen causes the next step to fail with "'git' / 'uv' is not recognized")
 
 # (a) allow scripts to run (default policy is Restricted)
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
@@ -44,7 +44,26 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ## 1. One-shot installer
 
-Autostart at login, localhost-only, ~3 min on a decent machine (10+ on slow VPS).
+Configures autostart on login, binds to localhost only. Takes approximately 3 minutes on a modern machine (10 or more on a slow VPS).
+
+### 1a. One-line bootstrap (Linux + macOS + WSL2)
+
+Installs `uv` if not already present, clones the repository into `~/muselab`,
+then runs the platform installer end-to-end. Recommended for first-time installs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+```
+
+To audit the script before piping it to the shell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh -o quick-install.sh
+less quick-install.sh   # audit
+bash quick-install.sh
+```
+
+### 1b. Manual install (step-by-step)
 
 ```bash
 # Linux / macOS
@@ -61,8 +80,8 @@ cd muselab
 powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
 ```
 
-What it does: pre-flight checks → `uv sync` → write `.env` with random token →
-7-question profile intake → register autostart → wait up to 30s for service.
+Script steps: pre-flight checks → `uv sync` → write `.env` with a random token →
+7-question profile intake → register autostart → wait up to 30 seconds for the service to become available.
 
 ## 2. Open it
 
@@ -70,7 +89,7 @@ Local machine: `http://localhost:8765` → paste the token from `.env`.
 
 ### VPS
 
-Don't open the port to the internet. SSH tunnel from your laptop:
+Do not expose the port directly to the internet. Use an SSH tunnel from your local machine:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
@@ -87,8 +106,8 @@ powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
 ```
 
 `doctor` checks every layer (uv / claude CLI / `.env` / service / HTTP /
-token / provider keys) and gives specific advice on any failure. Run it
-when something feels off.
+token / provider keys) and gives specific guidance on any failure. Run it
+when something appears to be wrong.
 
 ## Survives reboot?
 
@@ -115,17 +134,17 @@ docker run -d --name muselab \
   ghcr.io/hesorchen/muselab:latest
 ```
 
-The container runs as a non-root `muse` user (uid 1000), so its home is
-`/home/muse/.claude` — bind-mount your host's `~/.claude` there to reuse
+The container runs as a non-root `muse` user (uid 1000) with home directory
+`/home/muse/.claude`. Bind-mount the host's `~/.claude` to that path to reuse
 the OAuth credentials from `claude login`.
 
 > **Host UID note.** The container's `muse` user is uid 1000. On most
-> single-user Linux/macOS hosts your account is also uid 1000, so the
-> bind-mounts work. If your host UID differs (multi-user box, custom
-> mac admin account, …), either run `chmod -R go+rX ~/.claude` and
-> `chown -R 1000:1000 ~/muselab-archive` before starting the container,
-> or pass `--user $(id -u):$(id -g)` and accept that the in-container
-> `~/.claude` may be read-only.
+> single-user Linux/macOS hosts the primary account is also uid 1000, so
+> bind-mounts work without adjustment. If the host UID differs (multi-user
+> host, custom macOS admin account, etc.), either run
+> `chmod -R go+rX ~/.claude` and `chown -R 1000:1000 ~/muselab-archive`
+> before starting the container, or pass `--user $(id -u):$(id -g)` and
+> accept that the in-container `~/.claude` may be read-only.
 
 Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 

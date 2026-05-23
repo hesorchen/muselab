@@ -131,13 +131,15 @@ _INDEX_LOCK = threading.Lock()
 
 _LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
 _LIST_CACHE_TTL_S = 2.0
+_LIST_CACHE_LOCK = threading.Lock()
 
 
 def invalidate_sessions_cache() -> None:
     """Drop the cached list_sessions() snapshot. Call after any mutation that
     changes index.json or adds/removes a session sidecar."""
-    _LIST_CACHE["at"] = 0.0
-    _LIST_CACHE["data"] = None
+    with _LIST_CACHE_LOCK:
+        _LIST_CACHE["at"] = 0.0
+        _LIST_CACHE["data"] = None
 
 
 def _load_sidecar(sid: str) -> dict:
@@ -222,6 +224,29 @@ def toggle_pin(sid: str) -> bool:
         return True
 
 
+def set_pin(sid: str, val: bool) -> bool:
+    """Set the `pinned` flag on a session to a specific value. The entire
+    load-mutate-save sequence runs under _INDEX_LOCK to prevent races.
+    Returns the new state (== val). If no index entry exists yet, a
+    minimal stub is created so the flag survives the first bump_session."""
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["pinned"] = bool(val)
+                _save_index(idx)
+                return bool(val)
+        # No muselab index entry yet — create a minimal stub.
+        now = time.time()
+        idx.append({
+            "id": sid, "name": "", "model": "", "system_prompt": "",
+            "created_at": now, "updated_at": now,
+            "message_count": 0, "auto_named": True, "pinned": bool(val),
+        })
+        _save_index(idx)
+        return bool(val)
+
+
 def list_sessions() -> list[dict]:
     """List sessions, preferring SDK truth (CLI JSONL last_modified +
     custom_title) and falling back to muselab index for muselab-specific
@@ -231,12 +256,13 @@ def list_sessions() -> list[dict]:
     Mutations call `invalidate_sessions_cache()` so cache staleness only
     affects external-to-muselab JSONL writes."""
     now = time.time()
-    cached = _LIST_CACHE.get("data")
-    if cached is not None and (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S:
-        # Return a shallow copy of the list so callers that mutate-in-place
-        # (e.g. add a transient field for rendering) don't poison the cache.
-        # Inner dicts are still shared — read-only callers won't notice.
-        return list(cached)
+    with _LIST_CACHE_LOCK:
+        cached = _LIST_CACHE.get("data")
+        if cached is not None and (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S:
+            # Return a shallow copy of the list so callers that mutate-in-place
+            # (e.g. add a transient field for rendering) don't poison the cache.
+            # Inner dicts are still shared — read-only callers won't notice.
+            return list(cached)
     index = _load_index()
     index_by_id = {s["id"]: s for s in index}
     sdk_list: list[Any] = []
@@ -265,8 +291,9 @@ def list_sessions() -> list[dict]:
         key=lambda s: (1 if s.get("pinned") else 0, s.get("updated_at", 0)),
         reverse=True,
     )
-    _LIST_CACHE["data"] = result
-    _LIST_CACHE["at"] = now
+    with _LIST_CACHE_LOCK:
+        _LIST_CACHE["data"] = result
+        _LIST_CACHE["at"] = now
     # Return a shallow copy so caller mutations don't bleed back into cache.
     return list(result)
 
@@ -297,7 +324,10 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         idx = _load_index()
         idx.append(meta)
         _save_index(idx)
-    _save_sidecar(sid, {"messages": {}})
+    try:
+        _save_sidecar(sid, {"messages": {}})
+    except Exception as e:
+        sys.stderr.write(f"[sessions] warning: sidecar write failed for {sid}: {e}\n")
     return meta
 
 
@@ -344,6 +374,47 @@ def delete_session(sid: str) -> bool:
         except OSError:
             pass
     return True
+
+
+def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
+    """Delete all sessions with message_count == 0 that are not pinned.
+    `keep_ids` — session IDs to skip regardless (e.g. the one just created).
+    Returns the list of deleted session IDs. Safe to call concurrently;
+    the index is patched under _INDEX_LOCK in one shot."""
+    import time as _time
+    from claude_agent_sdk import delete_session as sdk_delete_session
+    keep = set(keep_ids)
+    cutoff = _time.time() - 2 * 3600  # 2 小时
+    with _INDEX_LOCK:
+        idx = _load_index()
+        to_delete = [
+            s["id"] for s in idx
+            if s.get("message_count", 0) == 0
+            and not s.get("pinned")
+            and s.get("auto_named", True)
+            and s.get("created_at", 0) > cutoff  # 只删 2 小时内的空会话
+            and s["id"] not in keep
+        ]
+        if not to_delete:
+            return []
+        to_delete_set = set(to_delete)
+        _save_index([s for s in idx if s["id"] not in to_delete_set])
+    # Outside the lock: remove sidecar files + SDK JSOBLs (best-effort).
+    for sid in to_delete:
+        p = _sidecar_path(sid)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        if ROOT is not None:
+            try:
+                sdk_delete_session(sid, directory=str(ROOT))
+            except Exception:
+                pass  # JSONL may not exist yet — that's fine
+    if to_delete:
+        invalidate_sessions_cache()
+    return to_delete
 
 
 def rename_session(sid: str, name: str) -> bool:

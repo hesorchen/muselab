@@ -342,6 +342,40 @@ def list_history(limit: int = 50) -> list[dict]:
     return h[-limit:][::-1]
 
 
+def delete_history_entry(ts: float, task_id: str = "") -> bool:
+    """Delete a single history entry identified by its timestamp (the
+    composite (ts, task_id) is unique within a user's records — two runs
+    of the same task can't share a ts since execution is serialized per
+    task; two different tasks could theoretically share a ts if they
+    fire in the same second, hence the optional task_id disambiguator).
+
+    Returns True if an entry was removed, False if no match. Safe to
+    call with a `ts` that no longer exists (caller can ignore False —
+    history may have been pruned by _HISTORY_CAP between display and
+    click).
+    """
+    h = _state.get("history", [])
+    for i, entry in enumerate(h):
+        if entry.get("ts") == ts and (not task_id or entry.get("task_id") == task_id):
+            h.pop(i)
+            _save_state()
+            return True
+    return False
+
+
+def clear_history() -> int:
+    """Drop ALL history entries. Returns count cleared. Does NOT touch
+    `unread_count` — that's an orthogonal flag (the user might want a
+    clean history list while still seeing the bell badge for unread
+    runs that arrived after their last drawer-open). If you want both
+    cleared, also call ack_unread() at the call site.
+    """
+    n = len(_state.get("history", []))
+    _state["history"] = []
+    _save_state()
+    return n
+
+
 def get_unread() -> int:
     return _state.get("unread_count", 0)
 
@@ -460,9 +494,12 @@ async def _execute_task(task: dict) -> None:
                     # icon beats either zh or en prose.)
                     title = f"⏰ {task['name']}"
                     if error:
-                        body = f"❌ {error[:120]}"
+                        body = f"❌ {' '.join(error.split())[:120]}"
                     else:
-                        body = (preview[:120] + "…") if len(preview) > 120 else preview
+                        # Strip markdown so the banner shows readable prose
+                        # instead of table rows, code fences, etc.
+                        from .chat import _plain_preview
+                        body = _plain_preview(preview or "")
                     _push.send_to_all(title=title, body=body or "—",
                                       url="/", tag=f"task-{tid}")
                 except Exception as e:
@@ -489,7 +526,16 @@ async def _scheduler_loop() -> None:
                     # finishes.
                     task["next_run"] = _compute_next_run(task["schedule"])
                     _save_state()
-                    asyncio.create_task(_execute_task(task))
+                    task_obj = asyncio.create_task(_execute_task(task))
+
+                    def _task_done(t, _tid=task.get("id", "?")):
+                        if not t.cancelled() and t.exception():
+                            import traceback
+                            sys.stderr.write(
+                                f"[scheduler] unhandled exception in task {_tid}: "
+                                f"{traceback.format_exception(type(t.exception()), t.exception(), t.exception().__traceback__)[-1]}\n"
+                            )
+                    task_obj.add_done_callback(_task_done)
         except Exception as e:
             sys.stderr.write(f"[scheduler] loop error: {e}\n")
         await asyncio.sleep(60)

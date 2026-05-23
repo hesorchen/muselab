@@ -82,6 +82,46 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # AUTH_TOKEN 仍清理，避免某些场景下被误当成 OAuth bearer 发出去。
 os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+def configure_prompt_cache(env: dict | None = None) -> str:
+    """Set the claude CLI's prompt-cache-TTL env flags based on
+    `MUSELAB_PROMPT_CACHE_TTL`. Returns the resolved TTL string for logging.
+
+    Default 1h, because Anthropic silently dropped the global default from
+    1h → 5min on 2026-03-06 (claude-code issue #46829), making "first turn
+    after any >5min idle" re-create the entire context cache at 1.25× input
+    price. For long muselab sessions (100K-500K tokens) that's tens of
+    dollars per day of casual use. `ENABLE_PROMPT_CACHING_1H=1` opts the
+    spawned claude CLI back into the 1-hour TTL.
+
+    Trade-off: cache_creation tokens cost 2× base price under 1h (vs 1.25×
+    for 5min default), so a session touched only once per day is slightly
+    more expensive to seed. Any session touched ≥2 times in an hour comes
+    out ahead.
+
+    Values:
+      "1h" (default, recommended) — set ENABLE_PROMPT_CACHING_1H=1
+      "5m"                        — set FORCE_PROMPT_CACHING_5M=1
+      ""                          — leave CLI defaults alone
+      anything else                — same as ""
+
+    Exposed as a function so tests can exercise it without relying on
+    module reload semantics (which interact unpredictably with pytest's
+    monkeypatch and sys.modules caching).
+    """
+    env = env if env is not None else os.environ
+    ttl = (env.get("MUSELAB_PROMPT_CACHE_TTL", "1h") or "").strip().lower()
+    if ttl == "1h":
+        env["ENABLE_PROMPT_CACHING_1H"] = "1"
+        env.pop("FORCE_PROMPT_CACHING_5M", None)
+    elif ttl == "5m":
+        env["FORCE_PROMPT_CACHING_5M"] = "1"
+        env.pop("ENABLE_PROMPT_CACHING_1H", None)
+    # Anything else (empty / unrecognised) → leave CLI defaults alone.
+    return ttl
+
+
+configure_prompt_cache()
+
 
 def _env(new_name: str, old_name: str = "", default: str = "") -> str:
     """Read MUSELAB_X with fallback to legacy PORTAL_X (deprecation warning).

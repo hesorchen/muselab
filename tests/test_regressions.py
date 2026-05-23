@@ -655,8 +655,17 @@ def test_vendor_label_for_known_models():
     assert _vendor_label_for("deepseek-v4-pro")     == "DeepSeek"
     assert _vendor_label_for("glm-4.7")             == "智谱 GLM"
     assert _vendor_label_for("minimax-m2.7")        == "MiniMax"
-    # Unknown / vendor wrapper id
-    assert _vendor_label_for("kimi-mystery")        == "Unknown"
+    # Re-added / new in 2026-05-22 wave — kimi/qwen/mimo now route to
+    # their own provider, not the historical "Unknown" fallback.
+    assert _vendor_label_for("kimi-k2.6")           == "Kimi"
+    assert _vendor_label_for("qwen3-max")           == "Qwen"
+    assert _vendor_label_for("qwen-plus")           == "Qwen"
+    assert _vendor_label_for("mimo-v2.5-pro")       == "Xiaomi MiMo"
+    # Unknown / vendor wrapper id — note "kimi-mystery" used to land here
+    # back when Kimi was uncatalogued; after 2026-05-22 it routes to Kimi
+    # (longest-prefix match treats it as a Kimi variant), so the unknown
+    # case is now genuinely-foreign vendors like the gpt-5 line.
+    assert _vendor_label_for("gpt-5")               == "Unknown"
     assert _vendor_label_for("")                    == "Unknown"
 
 
@@ -666,6 +675,9 @@ def test_cost_reported_only_for_claude():
     assert _cost_reported_for("deepseek-v4-pro")   is False
     assert _cost_reported_for("glm-4.7")           is False
     assert _cost_reported_for("minimax-m2.7")      is False
+    assert _cost_reported_for("kimi-k2.6")         is False
+    assert _cost_reported_for("qwen3-max")         is False
+    assert _cost_reported_for("mimo-v2.5-pro")     is False
     assert _cost_reported_for("")                  is False
 
 

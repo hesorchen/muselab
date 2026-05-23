@@ -2,10 +2,8 @@
 
 > [简体中文](comparison_zh.md)
 
-These tables exist so you can decide quickly whether muselab fits your
-use case — or whether one of the alternatives is a better match. The
-author's own positioning notes (more candid, undated) live in
-[competitive-analysis.md](competitive-analysis.md).
+These tables are provided to help you determine quickly whether muselab fits
+your use case, or whether one of the alternatives is a better match.
 
 ## vs. general chat UIs
 
@@ -20,12 +18,12 @@ author's own positioning notes (more candid, undated) live in
 | Lines of code | ~22 k | tens of k | hundreds of k | ~150 k | closed |
 | Install command count | 3 | many | docker compose | docker | brew / npm |
 
-If you want **IDE breadth**, pick claudecodeui or code-server.
-If you want a **plugin marketplace**, LobeChat.
-If you want **chat over crawled docs**, AnythingLLM.
+For **IDE breadth**, consider claudecodeui or code-server.
+For a **plugin marketplace**, consider LobeChat.
+For **chat over crawled documents**, consider AnythingLLM.
 
-muselab's pitch is opposite: **the smallest readable archive + AI surface
-that gives every model Claude's full agent power.**
+muselab's design is the opposite: **a minimal, fully auditable archive and AI
+interface that gives every model Claude's full agent capabilities.**
 
 ## vs. other Claude harnesses
 
@@ -38,29 +36,31 @@ that gives every model Claude's full agent power.**
 | Self-host friendly | ✅ | n/a (you already have it) | ❌ closed binary | ✅ | ✅ |
 | Open source | ✅ MIT | ❌ | ❌ | ✅ MIT | ✅ MIT |
 
-"muselab is to your archive what Claude Code is to your codebase" is the
-shortest accurate one-liner.
+"muselab is to your archive what Claude Code is to your codebase" — the
+shortest accurate description.
 
 ## What muselab is **not**
 
-A few cases where another tool is the right answer:
+The following use cases are better served by other tools:
 
 - **Multi-tenant SaaS** — muselab is single-user by design: one token,
-  one archive, no per-user isolation. If two people share an install,
-  they share everything. For team / family deployments, run one
+  one archive, no per-user isolation. If two people share an instance,
+  they share everything. For team or family deployments, run one
   instance per person.
-- **A coding IDE** — muselab can read and edit code in your archive,
-  but it's not a code workspace. Use [claudecodeui](https://github.com/siteboon/claudecodeui),
+- **A coding IDE** — muselab can read and edit code within the archive,
+  but it is not a code workspace. Use [claudecodeui](https://github.com/siteboon/claudecodeui),
   [code-server](https://github.com/coder/code-server), or
   [Claude Code](https://github.com/anthropics/claude-code) directly
-  for serious software work.
-- **A RAG document chatbot** — muselab reads your files on demand
-  (file tree + grep + read tools), it does not pre-embed your archive
-  into a vector store. For chat over a large crawl of web pages or
+  for software development work.
+- **A RAG document chatbot** — muselab reads files on demand
+  (file tree + grep + read tools) and does not pre-embed the archive
+  into a vector store. For chat over a large collection of web pages or
   PDFs, [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
-  is the right tool.
-- **A plugin marketplace** — muselab carries seven curated skills out
-  of the box and discovers any Claude Code plugin you install
-  separately, but it does not run an in-app marketplace.
-  [LobeChat](https://github.com/lobehub/lobe-chat) is the right tool
-  if that's what you want.
+  is the appropriate tool.
+- **A plugin marketplace** — muselab ships eleven curated skills
+  out of the box (code review, diagrams, summaries, web search, PPTX
+  generation, data analysis, translation, meeting notes, and more) and
+  discovers any Claude Code plugin installed separately, but it does not
+  include an in-app marketplace.
+  [LobeChat](https://github.com/lobehub/lobe-chat) is the appropriate
+  tool for that use case.

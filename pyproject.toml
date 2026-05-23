@@ -1,6 +1,44 @@
 [project]
 name = "muselab"
 version = "0.1.0"
+description = "Self-hosted web UI for the Claude Agent SDK — talk to your own files with Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "chenxiaosen", email = "hesorchen@gmail.com" },
+]
+keywords = [
+    "claude",
+    "anthropic",
+    "claude-agent-sdk",
+    "mcp",
+    "self-hosted",
+    "llm",
+    "ai-assistant",
+    "personal-archive",
+    "deepseek",
+    "pwa",
+]
+classifiers = [
+    # PyPI Trove classifiers — surface project status / audience / license /
+    # platform / Python version so PyPI search and dependency-graph tools
+    # can categorise muselab even though it's not meant to be `pip install`-able
+    # (it's a server you self-host, not a library).
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Office/Business",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.2.82",
@@ -15,7 +53,16 @@ dependencies = [
     # /api/push/subscribe. Has a transitive cryptography dep but no
     # external binaries.
     "pywebpush>=2.0.0",
+    "pillow>=12.2.0",
 ]
+
+[project.urls]
+Homepage      = "https://github.com/hesorchen/muselab"
+Source        = "https://github.com/hesorchen/muselab"
+Issues        = "https://github.com/hesorchen/muselab/issues"
+Changelog     = "https://github.com/hesorchen/muselab/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/hesorchen/muselab/blob/main/docs/quickstart.md"
+Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 
 [dependency-groups]
 dev = [

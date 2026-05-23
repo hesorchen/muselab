@@ -20,31 +20,31 @@ flowchart TB
   V --> MM[api.minimaxi.com/anthropic]
 ```
 
-## Key design choices
+## Key design decisions
 
-- **SDK > raw API.** We use the Claude Agent SDK (same engine as Claude
-  Code), so MCP / Skills / Subagents / plan mode / `CLAUDE.md` auto-load
-  work uniformly across providers. Adding a new provider = 3 lines, not
-  300.
+- **SDK over raw API.** muselab uses the Claude Agent SDK (the same engine
+  as Claude Code), so MCP / Skills / Subagents / plan mode / `CLAUDE.md`
+  auto-load work uniformly across providers. Adding a new provider requires
+  3 lines, not 300.
 
-- **`env=` override per session.** SDK passes a fresh env dict to its
-  subprocess. For DeepSeek / GLM / MiniMax we set `ANTHROPIC_BASE_URL` +
-  `ANTHROPIC_API_KEY` and an isolated `CLAUDE_CONFIG_DIR` — otherwise the
-  CLI silently falls back to Pro OAuth and bills Anthropic for traffic
-  meant for a third-party vendor.
+- **Per-session `env=` override.** The SDK passes a fresh env dict to its
+  subprocess. For DeepSeek / GLM / MiniMax, `ANTHROPIC_BASE_URL` +
+  `ANTHROPIC_API_KEY` and an isolated `CLAUDE_CONFIG_DIR` are set —
+  without this, the CLI silently falls back to Pro OAuth and routes
+  third-party traffic through the Anthropic account.
 
 - **No bundler, no transpiler.** Edit a file, refresh, done. `vendor/`
-  carries vetted runtime (Alpine, marked, DOMPurify, KaTeX, hljs,
-  CodeMirror) so install never hits npm. Each library's license is
+  bundles vetted runtime libraries (Alpine, marked, DOMPurify, KaTeX, hljs,
+  CodeMirror), so installation never touches npm. Each library's license is
   attributed in [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md).
 
-- **Session = `(session_id, model)`** cached client. Switching model
-  spawns a fresh client; per-message `model` field on assistant bubbles
-  keeps badges accurate after reload.
+- **Session = `(session_id, model)`** cached client. Switching models
+  spawns a fresh client; the per-message `model` field on assistant bubbles
+  keeps badges accurate after page reload.
 
 - **Personal context as first-class data.** `MUSELAB_ROOT` points at a
-  directory you own. The installer creates six sub-directories —
-  `health / work / money / people / notes / archives` — and a
-  project-level `CLAUDE.md` auto-loaded into every conversation. The
-  assistant treats files in those directories as the working set, not as
+  directory the user owns. The installer creates six subdirectories —
+  `health / work / money / people / notes / archives` — and a root-level
+  `CLAUDE.md` that is auto-loaded into every conversation. The assistant
+  treats files in those directories as the active working set, not as
   documents to be retrieved on demand.

@@ -1,33 +1,30 @@
-# 加新 LLM provider 到 muselab
+# 向 muselab 接入新模型提供商
 
 > [English](add-provider.md)
 
-muselab 不锁 Claude，只要厂商提供 **Anthropic Messages API 兼容端点**，就能直连，
-**3 步、3 行配置、~5 分钟** 完成。所有 Claude SDK 的能力（Read/Edit/Bash/Grep/MCP/
-Skills/CLAUDE.md auto-load）都自动跨厂可用。
+muselab 不绑定 Claude。只要厂商提供 **Anthropic Messages API 兼容端点**，即可直接接入，**3 步、3 行配置、约 5 分钟**完成。Claude SDK 的全部能力（Read/Edit/Bash/Grep/MCP/Skills/CLAUDE.md 自动加载）均可跨厂使用。
 
-## 前提：确认厂商有 Anthropic 兼容端点
+## 前提：确认厂商提供 Anthropic 兼容端点
 
-去厂商文档搜 "Anthropic compatible" / "anthropic-compatible" / "/anthropic"。
-2026 年起，国产 LLM 大多支持，目前已知：
+在厂商文档中搜索 "Anthropic compatible"、"anthropic-compatible" 或 "/anthropic"。2026 年起，国内主流大模型厂商大多已支持。目前已知情况：
 
 | 厂商 | Anthropic 端点 | 状态 |
 |------|---------------|------|
 | DeepSeek | `https://api.deepseek.com/anthropic` | ✅ 内置 |
 | 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` | ✅ 内置 |
 | MiniMax | `https://api.minimaxi.com/anthropic` | ✅ 内置 |
-| 小米 MiMo | – | ❌ 暂只支持 OpenAI 协议 |
-| Qwen | – | ❌ 暂只支持 OpenAI 协议 |
+| Kimi（月之暗面）| `https://api.moonshot.ai/anthropic` | ✅ 内置 |
+| Qwen（DashScope）| `https://dashscope-intl.aliyuncs.com/apps/anthropic` | ✅ 内置 |
+| 小米 MiMo | `https://api.xiaomimimo.com/anthropic` | ✅ 内置 |
+| 豆包（字节火山）| 仅 `Doubao-Seed-Code` 兼容 | 🟡 暂未内置 |
 
-**没 Anthropic 端点的厂商**目前不支持。可以推动厂商出兼容端点，或考虑用
-[claude-code-router](https://github.com/musistudio/claude-code-router) 做协议翻译
-（损耗大、需要额外进程）。
+**未提供 Anthropic 端点的厂商**暂不支持。可推动厂商发布兼容端点，或使用 [claude-code-router](https://github.com/musistudio/claude-code-router) 进行协议转换（存在功能损耗，需额外进程）。
 
 ---
 
-## 加新 provider 的 3 步
+## 接入步骤
 
-### 1. 在 `backend/endpoints.py` 加一条 catalog
+### 1. 在 `backend/endpoints.py` 中添加一条配置项
 
 ```python
 # backend/endpoints.py — CATALOG 元组中追加
@@ -46,7 +43,7 @@ Provider(
 echo "DASHSCOPE_API_KEY=sk-xxx" >> .env
 ```
 
-或通过 Settings modal UI 填入（更安全，会自动写入并刷新 `os.environ`）。
+也可通过界面中的设置弹窗填入（推荐方式，会自动写入文件并刷新 `os.environ`）。
 
 ### 3. 重启服务
 
@@ -58,7 +55,7 @@ docker compose restart
 # kill 旧 uvicorn 进程, 重新 uv run uvicorn ...
 ```
 
-完成。浏览器**模型下拉**会自动多出 "Qwen" 分组。选了立刻能聊 + 用工具。
+完成。浏览器的**模型下拉菜单**将出现 "Qwen" 分组，选中即可立即使用对话和工具调用功能。
 
 ---
 
@@ -77,16 +74,14 @@ chat.py 看 model 前缀
                           → 厂商端点把 Anthropic 协议翻成自己的，返回时翻回来
 ```
 
-**关键点**：muselab 一行业务代码都不用改，SDK 也不用知道。env override 在每次
-`get_client(session_id, model, ...)` 调用时通过 `ClaudeAgentOptions(env=...)`
-传给底层 claude CLI 子进程。
+**关键点：** muselab 的业务代码无需任何改动，SDK 也无需感知此重定向。环境变量覆盖在每次 `get_client(session_id, model, ...)` 调用时，通过 `ClaudeAgentOptions(env=...)` 传入底层 claude CLI 子进程。
 
 ---
 
-## 测试新 provider
+## 测试新提供商
 
 ```bash
-# 1. 验证 endpoint 可达
+# 1. 验证端点可达
 curl https://你的厂商.com/anthropic/v1/messages -X POST \
   -H "Authorization: Bearer sk-xxx" \
   -H "Content-Type: application/json" \
@@ -96,27 +91,23 @@ curl https://你的厂商.com/anthropic/v1/messages -X POST \
 # 3. 检查是否触发工具调用（让它 "Read README.md"）
 ```
 
-如果**对话能通但工具不行**，多半是厂商的 Anthropic 兼容端点没实现 tool use。
-可向厂商提 issue，或暂时只把它当"纯对话"用。
+若**对话正常但工具调用失败**，通常是厂商的 Anthropic 兼容端点尚未实现工具调用功能。可向厂商提交问题反馈，或暂时将其作为纯对话模型使用。
 
 ---
 
-## 已知踩坑
+## 已知注意事项
 
-### DeepSeek thinking 模式
+### DeepSeek 思考模式
 
-DeepSeek 推理模型（`deepseek-reasoner`）要求把 `reasoning_content` 在下一轮回传。
-SDK 走 Anthropic 协议时，这个映射由 DeepSeek 自家端点处理；如果未来端点行为变化
-导致丢上下文，临时方案是关掉 thinking 或切到 chat 模型。
+DeepSeek 推理模型（`deepseek-reasoner`）要求在下一轮对话中回传 `reasoning_content`。SDK 使用 Anthropic 协议时，该映射由 DeepSeek 自身的端点处理。若端点行为变化导致上下文丢失，临时方案是关闭思考模式或切换至对话模型。
 
-### Pro OAuth 不会被影响
+### Pro OAuth 不受影响
 
-只有 catalog 命中前缀的模型才会被 env override。Claude 模型 (`claude-*`) **不会**走
-override，继续用 `claude login` 的 OAuth → 不付 API key 费。
+仅配置项前缀匹配的模型才会应用环境变量覆盖。Claude 模型（`claude-*`）不经过覆盖，继续使用 `claude login` 的 OAuth 凭据，不产生 API 费用。
 
-### 测试当然要补
+### 补充测试
 
-加新 provider 时，请在 `tests/test_endpoints.py` 里加：
+接入新提供商时，请在 `tests/test_endpoints.py` 中添加对应测试：
 
 ```python
 @pytest.mark.parametrize("model,expected_host", [
@@ -127,26 +118,23 @@ def test_provider_routing_correct(monkeypatch, model, expected_host):
     assert expected_host in ep.lookup(model).base_url
 ```
 
-跑 `make test` 保证没破回归。
+执行 `make test` 确认无回归。
 
 ---
 
-## FAQ
+## 常见问题
 
-**Q: 厂商要先充值才能用？**  
-A: 是。muselab 不替你管账。Pro OAuth 才走订阅免费配额。
+**Q：厂商需要先充值才能使用？**
+A：是的。muselab 不负责账单管理。仅 Pro OAuth 使用订阅包含的免费配额。
 
-**Q: 能让一个 session 跨厂连续聊吗？**  
-A: 可以。session 是 model-agnostic，切下拉就生效，历史不丢。但跨厂时新模型看不到
-对方厂特有的内部 tool_use 上下文，纯文字对话没问题。
+**Q：同一个会话可以跨厂商连续对话吗？**
+A：可以。会话与模型无关，切换下拉菜单即时生效，历史记录保留。跨厂商切换后，新模型无法访问另一家厂商内部的 `tool_use` 上下文，纯文本对话不受影响。
 
-**Q: catalog 里 `prefix` 和 `models` 重不重？**  
-A: `prefix` 是 dispatcher 匹配用的；`models` 是 UI 下拉显示的具体型号。`models`
-里每个值必须以 `prefix` 开头。
+**Q：配置项中 `prefix` 和 `models` 是否重复？**
+A：`prefix` 供分发器匹配路由使用；`models` 是界面下拉菜单显示的具体型号列表。`models` 中的每个值均须以 `prefix` 开头。
 
-**Q: 改 catalog 后要不要重启？**  
-A: 要。它是 Python 模块的常量，热重载是另一个工程问题。
+**Q：修改配置项后是否需要重启？**
+A：需要。配置项是 Python 模块级常量，热重载属于独立的工程问题。
 
-**Q: 想做厂商间智能路由（如 plan task 走 Sonnet、code task 走 DeepSeek）？**  
-A: 不建议在 muselab 里做。该用 [claude-code-router](https://github.com/musistudio/claude-code-router)
-独立处理。muselab 的设计哲学是"thin layer + 用户自己选模型"。
+**Q：想实现厂商间智能路由（如 plan 任务走 Sonnet、代码任务走 DeepSeek）？**
+A：不建议在 muselab 内部实现。[claude-code-router](https://github.com/musistudio/claude-code-router) 是处理此类需求的合适工具。muselab 的设计原则是"精简层+用户自主选择模型"。

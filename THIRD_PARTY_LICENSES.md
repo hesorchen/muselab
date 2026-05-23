@@ -43,6 +43,34 @@ step** and runs offline after install.
   endorse" clause applies; muselab does not use the highlight.js name
   for endorsement.
 
+## Skills — bundled under `skills/`
+
+These are SKILL.md instruction files (plain text, no compiled code)
+shipped with muselab to give Muse out-of-the-box capabilities.
+The first four are muselab-native; the four below are community-authored
+and included here with attribution.
+
+| Skill | Author / Repo | License | Upstream |
+|---|---|---|---|
+| `citation-formatter` | muselab contributors | MIT | this repo |
+| `code-reviewer` | muselab contributors | MIT | this repo |
+| `markdown-formatter` | muselab contributors | MIT | this repo |
+| `mermaid-helper` | muselab contributors | MIT | this repo |
+| `summary-distiller` | muselab contributors | MIT | this repo |
+| `task-decomposer` | muselab contributors | MIT | this repo |
+| `web-search` | muselab contributors | MIT | this repo |
+| `pptx` | tfriedel / claude-office-skills | not specified† | <https://github.com/tfriedel/claude-office-skills> |
+| `csv-analyzer` | coffeefuelbump | not specified† | <https://github.com/coffeefuelbump/csv-data-summarizer-claude-skill> |
+| `translate` | feiskyer | MIT | <https://github.com/feiskyer/claude-code-settings> |
+| `meeting-notes` | claude-office-skills contributors | MIT | <https://github.com/claude-office-skills/skills> |
+
+† These repositories do not include an explicit `LICENSE` file at the
+time of inclusion (2026-05-23). The SKILL.md files are plain natural-
+language instructions with no executable code. If you are a copyright
+holder of either upstream repository and wish to add a license, please
+open an issue at the upstream URL above. muselab will update attribution
+accordingly.
+
 ## Backend — Python dependencies (from `pyproject.toml`)
 
 These are not vendored — they are installed via `uv` / `pip` at install

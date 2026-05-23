@@ -55,6 +55,10 @@ def test_is_third_party(monkeypatch):
     assert ep.is_third_party("deepseek-v4-pro")
     assert ep.is_third_party("glm-5")
     assert ep.is_third_party("minimax-m2.7")
+    assert ep.is_third_party("kimi-k2.6")
+    assert ep.is_third_party("qwen3-max")
+    assert ep.is_third_party("qwen-plus")
+    assert ep.is_third_party("mimo-v2.5-pro")
     assert not ep.is_third_party("claude-sonnet-4-6")
 
 
@@ -73,9 +77,18 @@ def test_available_groups_only_lists_configured(monkeypatch):
 
 
 @pytest.mark.parametrize("model,expected_host", [
-    ("deepseek-v4-pro", "api.deepseek.com"),
-    ("glm-5", "bigmodel.cn"),
-    ("minimax-m2.7", "minimaxi.com"),
+    ("deepseek-v4-pro",      "api.deepseek.com"),
+    ("glm-5",                "bigmodel.cn"),
+    ("minimax-m2.7",         "minimaxi.com"),
+    # Re-added / new providers (2026-05-22) — keep the regression matrix
+    # honest: a future endpoint URL typo would route a vendor's traffic to
+    # the wrong host and we'd only catch it via "all my Kimi turns fail".
+    ("kimi-k2.6",            "api.moonshot.ai"),
+    ("kimi-k2-thinking",     "api.moonshot.ai"),
+    ("qwen3-max",            "dashscope-intl.aliyuncs.com"),
+    ("qwen-plus",            "dashscope-intl.aliyuncs.com"),  # mixed naming
+    ("qwen3.5-flash",        "dashscope-intl.aliyuncs.com"),
+    ("mimo-v2.5-pro",        "api.xiaomimimo.com"),
 ])
 def test_all_providers_route_to_correct_host(monkeypatch, model, expected_host):
     """Each catalog entry's base_url contains the expected vendor domain."""
@@ -118,10 +131,17 @@ def test_env_override_merges_with_os_environ(monkeypatch):
 
 
 def test_all_catalog_providers_have_valid_fields(monkeypatch):
-    """Every catalog entry should be self-consistent and complete."""
+    """Every catalog entry should be self-consistent and complete.
+
+    Prefix-ending convention was relaxed 2026-05-22 when Qwen joined: model
+    ids alternate `qwen-plus` and `qwen3-max`, so the shared prefix is the
+    bare string `qwen` (no trailing dash). The harder invariant — every
+    model id starts with its provider's prefix — is checked below regardless.
+    """
     ep = _reload_endpoints(monkeypatch, {})
     for p in ep.CATALOG:
-        assert p.prefix.endswith("-"), f"prefix should end with '-': {p.prefix}"
+        assert p.prefix, "prefix must be non-empty"
+        assert p.prefix == p.prefix.lower(), f"prefix should be lowercase: {p.prefix}"
         assert p.base_url.startswith("https://"), f"base_url should be https: {p.base_url}"
         assert "anthropic" in p.base_url, "base_url should hit /anthropic endpoint"
         assert p.env_key.endswith("_API_KEY"), f"env_key convention: {p.env_key}"

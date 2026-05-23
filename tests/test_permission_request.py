@@ -61,7 +61,9 @@ async def test_full_roundtrip_allow():
     driver_task = asyncio.create_task(driver())
     result = await cb("Bash", {"command": "ls"}, None)
     await driver_task
-    assert result["behavior"] == "allow"
+    # SDK contract: callback returns PermissionResultAllow / PermissionResultDeny
+    # objects, not dicts. Accessing as attribute, not subscript.
+    assert result.behavior == "allow"
 
 
 @pytest.mark.asyncio
@@ -79,8 +81,8 @@ async def test_full_roundtrip_deny_with_message():
     driver_task = asyncio.create_task(driver())
     result = await cb("Bash", {"command": "rm -rf /"}, None)
     await driver_task
-    assert result["behavior"] == "deny"
-    assert result["message"] == "no thanks"
+    assert result.behavior == "deny"
+    assert result.message == "no thanks"
 
 
 @pytest.mark.asyncio
@@ -98,11 +100,11 @@ async def test_always_allow_caches_subsequent_calls():
     driver_task = asyncio.create_task(driver())
     r1 = await cb("Bash", {"command": "ls -la"}, None)
     await driver_task
-    assert r1["behavior"] == "allow"
+    assert r1.behavior == "allow"
 
     # Second call to same tool+key — should NOT prompt (queue stays empty)
     r2 = await cb("Bash", {"command": "ls /tmp"}, None)
-    assert r2["behavior"] == "allow"
+    assert r2.behavior == "allow"
     assert perm._session_queues[sid].empty()
 
 
@@ -110,7 +112,7 @@ async def test_always_allow_caches_subsequent_calls():
 async def test_no_active_session_denies():
     cb = perm.build_callback_for_session("never-registered")
     result = await cb("Bash", {"command": "ls"}, None)
-    assert result["behavior"] == "deny"
+    assert result.behavior == "deny"
 
 
 @pytest.mark.asyncio
@@ -123,4 +125,4 @@ async def test_unregister_cancels_pending():
     await asyncio.sleep(0.05)
     perm.unregister_session_queue(sid)
     result = await cb_task
-    assert result["behavior"] == "deny"
+    assert result.behavior == "deny"

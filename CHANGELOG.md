@@ -6,6 +6,160 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Four new bundled skills.** `skills/pptx` (PowerPoint creation via
+  python-pptx / OOXML), `skills/csv-analyzer` (pandas + matplotlib data
+  analysis), `skills/translate` (English / Japanese → Chinese), and
+  `skills/meeting-notes` (structured meeting minutes) ship out of the
+  box. Muse picks them automatically on relevant requests — no manual
+  `/skill` invocation required. Sources and license attribution added to
+  `THIRD_PARTY_LICENSES.md`.
+- **Session picker status dots.** Streaming (animated blue) and unread
+  (static green) indicators now appear on session rows in the history
+  picker, mirroring the tab-strip dots.
+- **Session picker lazy expansion.** "Last 30 days" and "Earlier" groups
+  collapse to 20 rows by default; a "Show more · N" button expands them.
+  Search bypasses the limit so all sessions are always reachable.
+- **Cross-tab message queue sync.** Typing a message in one browser tab
+  while Muse is replying in another now queues correctly — the
+  `localStorage` storage event propagates the queue to all open tabs in
+  real time.
+- **Soft chat refresh.** The refresh button in the chat header now
+  re-fetches sessions, messages, models, and context info without a full
+  `location.reload()`. Browser state (open file tabs, scroll position,
+  typed draft) is preserved.
+- **Empty-session auto-prune.** Creating a new session silently deletes
+  other empty sessions (message_count=0, auto-named, created < 2 h ago).
+  Server startup also prunes leftover empty sessions from the previous
+  run.
+- **Desktop Enter key queues while streaming.** On desktop, Enter
+  during a streaming reply now enqueues the message instead of inserting
+  a newline, consistent with the Send button.
+
+### Changed
+- `docs/providers.md` and `docs/providers_zh.md` updated to list all
+  seven providers (added Kimi / Qwen / Xiaomi MiMo rows).
+- `docs/quickstart.md` prerequisite table now lists Kimi and Qwen
+  alongside DeepSeek / GLM / MiniMax as cheap-key options.
+- `docs/comparison.md` skill count updated from 7 → 11.
+- Turn footer timestamp format changed from `YYYYMMDD HH:MM` to
+  `MM-DD HH:MM` (same year) or `HH:MM` (today).
+- i18n: several zh-side strings translated (`pane.files`, `pane.preview`,
+  `set.sec.provider`, `empty.preview_tagline`, `ctx.compact_step1`,
+  `login.go`); en-side `effort.xhigh` → "Effort · very high".
+
+### Fixed
+- `grep` endpoint no longer returns content from sensitive files
+  (`.bash_history`, `.netrc`, etc.) when `show_hidden=True`.
+- File upload is now atomic (tmpfile + rename with unique suffix);
+  concurrent uploads of the same filename no longer race.
+- HTML preview iframe CSP: removed `unsafe-eval`, narrowed `connect-src`
+  to `'self'`.
+- Token value is now redacted from uvicorn access logs (`token=***`).
+- `context_info` `third_party_configured` now derives from
+  `endpoints.CATALOG` dynamically — Kimi / Qwen / MiMo keys no longer
+  trigger the spurious "no provider" onboarding card.
+- `_LIST_CACHE` reads and writes are now protected by `_LIST_CACHE_LOCK`,
+  eliminating a multi-thread race that could permanently stale the cache.
+- `patch_session_api` `pinned` write is now executed under `_INDEX_LOCK`
+  via `sess.set_pin()`, preventing silent lost-update races.
+- `context_breakdown` endpoint uses `_clients.get(key)` + None check;
+  LRU eviction between key enumeration and access can no longer raise
+  `KeyError` 500.
+- `_creation_locks` entries are now cleaned up in `disconnect_client`,
+  stopping the dict from growing indefinitely.
+- `_creation_lock_for` uses `dict.setdefault` for atomic lock creation.
+- `TurnBroadcast` replay loop adds `try/except IndexError` guard.
+- `_MEMORY_DIR_PATH` falls back to `~/.claude/memory/` when
+  `ROOT is None`, preventing a literal `"None"` from being injected into
+  the system prompt.
+- `prune_empty_sessions` now guards `sdk_delete_session` with
+  `if ROOT is not None`.
+- `scheduler` tasks register an `add_done_callback` to surface
+  `BaseException` (e.g. `CancelledError`) that escaped the inner
+  `except Exception` block.
+- `_budgetWarned` is now keyed by session ID, so a budget warning on
+  session A no longer suppresses the warning on session B.
+- `childCache` keys now include `showHidden` state; toggling hidden-file
+  visibility correctly invalidates the directory cache.
+- Blob URL memory leak: `removePendingImage`, tab close, and post-send
+  cleanup now call `URL.revokeObjectURL` on all preview URLs.
+- `_fetchTabUsage` is guarded by `_usageFetching` flag to prevent
+  concurrent duplicate requests.
+- `closeAll` (file tabs context menu) now clears `previewMode`,
+  `rawText`, `renderedMd`, and `editing`.
+- `compact` finally block now refreshes the context meter.
+- Error attachments are no longer silently dropped on send; a toast
+  reports how many were skipped.
+- Session and file delete confirmations now use i18n keys instead of
+  inline lang-ternary strings.
+- `savePrefs` now writes `schema: 2`; `loadPrefs` detects and discards
+  stale pre-v2 prefs instead of partially restoring an incompatible
+  layout.
+- `childCache` capped at 100 LRU entries; deep file-tree browsing no
+  longer grows the cache without bound.
+- Message list capped at 300 displayed entries; full history is
+  preserved in the JSONL transcript.
+- Pending message queue capped at 10 entries; overflow shows a toast.
+- Chat tab count capped at 20; oldest non-active tab auto-closes on
+  overflow.
+- `fetchMention` now debounces 200 ms, matching the command-palette
+  search behavior.
+- Various CSS variables completed (`--fw-bold`, `--c-text-2`,
+  `--c-warning`, `--c-error`, `--c-error-soft`, `--c-token-*`,
+  `--c-scrollbar`); fixed `--ff-mono` → `--font-mono` mismatch; conn
+  banner deep-mode color corrected; chat toolbar `border-radius`
+  variablised; `prefers-reduced-motion` global suppression added; cost
+  bar and focus glow now use CSS variables.
+- `.bash-meta.ok/err/interrupted` colours overridden for light theme
+  (previous deep-mode-optimised values were unreadable on white).
+- All modals gain `role="dialog" aria-modal="true"`; session picker
+  gains `role="listbox"`; lightbox alt and aria-label wired up.
+
+### Added (earlier in [Unreleased])
+- **1-hour prompt cache TTL by default.** muselab now sets
+  `ENABLE_PROMPT_CACHING_1H=1` on the spawned claude CLI subprocess at
+  startup, opting back into the longer cache lifetime that Anthropic
+  silently regressed to 5 minutes on 2026-03-06
+  ([claude-code#46829](https://github.com/anthropics/claude-code/issues/46829)).
+  Long muselab sessions (often 100K-500K tokens) were hit hardest by the
+  regression — every casual >5-min idle re-created the entire context
+  cache at 1.25× input price; with 1h TTL the cache survives normal
+  workday gaps (coffee breaks, meetings) and most "first turn back"
+  charges drop to 0.1× cache_read pricing instead. Trade-off:
+  cache_creation costs 2× base under 1h (vs 1.25× for 5m), so once-per-day
+  sessions are slightly more expensive to seed — any session touched ≥2
+  times in an hour comes out ahead. Override via `MUSELAB_PROMPT_CACHE_TTL`
+  in `.env`: `1h` (default) / `5m` (Anthropic regressed default) /
+  empty (leave CLI defaults alone). See `backend/settings.py
+  configure_prompt_cache()`.
+- **One-line `curl | bash` installer (`scripts/quick-install.sh`).**
+  Replaces the three-step `git clone && cd && bash install-X.sh` ritual
+  with a single command:
+  ```
+  curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+  ```
+  Installs `uv` if missing, detects WSL with a one-shot systemd-enable
+  hint, clones into `~/muselab` (or wherever the user picks), then hands
+  off to `install-{linux,macos}.sh`. /dev/tty is re-attached for both
+  our own and the platform installer's `read` prompts so curl-piped
+  shells still get interactive input. Refuses root, refuses Windows
+  native (points to WSL).
+- **Three new providers wired in (Kimi / Qwen / Xiaomi MiMo).** Each
+  vendor shipped a stable Anthropic-compatible Messages endpoint between
+  Jan and Apr 2026, finally letting muselab route all SDK features
+  (Read/Edit/Bash/Grep/MCP/Skills) through them. Catalog entries:
+  - **Kimi (Moonshot)** — K2 / K2.5 / K2.6 / K2 Thinking via
+    `api.moonshot.ai/anthropic`. Re-added after the 2026-05-17 removal:
+    the new K2.5+ stack landed on a more reliable endpoint. ⚠ vendor
+    maps `temperature * 0.6` internally — irrelevant for SDK defaults.
+  - **Qwen (Alibaba DashScope)** — Qwen3 Max / Plus / Flash / Coder via
+    `dashscope-intl.aliyuncs.com/apps/anthropic`. Prefix is bare `qwen`
+    (no trailing dash) because model ids alternate `qwen-plus` and
+    `qwen3-max`; both forms route through the same provider entry.
+  - **Xiaomi MiMo** — V2.5 Pro / V2 Flash via `api.xiaomimimo.com/anthropic`.
+    MIT-licensed weights, V2.5-Pro public beta 2026-04-22.
+  Doctor scripts (`doctor.sh` / `doctor.ps1`) probe the new key envs too.
+  `add-provider.md` matrix and `.env.example` updated accordingly.
 - **Rich per-tool result rendering.** `tool_result` events now carry the
   full body (up to 50 KB), the originating `tool_name`, and — for Bash —
   pre-parsed `{stdout, stderr, exit_code, interrupted}`. Frontend picks a

@@ -22,6 +22,8 @@ import json
 import uuid
 from typing import Any
 
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
 from . import ask_user_question as auq  # share its _pending + _session_queues
 
 # (session_id, request_id) -> Future of {"decision": "allow"|"deny"|"always",
@@ -83,25 +85,42 @@ def _input_key(tool_name: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
-async def _handle_ask_user_question(session_id: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+async def _handle_ask_user_question(
+        session_id: str, tool_input: dict[str, Any]
+) -> PermissionResultAllow | PermissionResultDeny:
     """SDK calls can_use_tool with tool_name='AskUserQuestion' when the model
     invokes the trained-in multiple-choice tool. We forward the questions to
     muselab's existing ask UI (same SSE event + Future registry as the MCP
-    fallback), then return the answers via SDK's expected shape:
-        {behavior: 'allow', updatedInput: {questions, answers}}"""
-    questions = tool_input.get("questions") or []
+    fallback), then return PermissionResultAllow(updated_input=...) per SDK
+    contract.
+
+    IMPORTANT: must return PermissionResultAllow / PermissionResultDeny class
+    instances, NOT plain dicts. Older code returned `{behavior, ...}` dicts
+    that worked with a previous SDK shape; current SDK raises
+    "Tool permission callback must return PermissionResult" if you hand it a
+    dict. Discovered the hard way 2026-05-23 when my first attempt at this
+    fix made every AskUserQuestion call crash on the SDK side.
+
+    Questions go through `auq._normalize_questions` first so the frontend
+    always sees the canonical `{question, header, multiSelect, options:
+    [{label, description}]}` shape — same as the MCP fallback. Without
+    normalization, a model that emits options as bare strings (`["yes",
+    "no"]`) or with `text`/`name`/`value` keys would render a question
+    card with no clickable buttons (silent "user can't pick" symptom).
+    """
+    raw_questions = tool_input.get("questions") or []
+    if not raw_questions:
+        return PermissionResultDeny(
+            message="AskUserQuestion called with empty questions list.")
+    questions = auq._normalize_questions(raw_questions)
     if not questions:
-        return {
-            "behavior": "deny",
-            "message": "AskUserQuestion called with empty questions list.",
-        }
+        return PermissionResultDeny(
+            message="AskUserQuestion: no usable options after normalization.")
 
     q = auq._session_queues.get(session_id)
     if q is None:
-        return {
-            "behavior": "deny",
-            "message": "No active UI session; cannot prompt for question.",
-        }
+        return PermissionResultDeny(
+            message="No active UI session; cannot prompt for question.")
 
     question_id = uuid.uuid4().hex[:12]
     loop = asyncio.get_running_loop()
@@ -117,47 +136,69 @@ async def _handle_ask_user_question(session_id: str, tool_input: dict[str, Any])
     try:
         answers = await asyncio.wait_for(fut, timeout=auq.ANSWER_TIMEOUT_S)
     except asyncio.TimeoutError:
-        return {"behavior": "deny",
-                "message": "User did not respond within 10 minutes."}
+        return PermissionResultDeny(
+            message="User did not respond within 10 minutes.")
     except asyncio.CancelledError:
-        return {"behavior": "deny",
-                "message": "User session ended before answering."}
+        return PermissionResultDeny(
+            message="User session ended before answering.")
     finally:
         auq._pending.pop((session_id, question_id), None)
 
     # answers shape: {question_text: chosen_label_or_list}
     # SDK requires both `questions` and `answers` in updated_input.
-    return {
-        "behavior": "allow",
-        "updatedInput": {"questions": questions, "answers": answers},
-    }
+    return PermissionResultAllow(
+        updated_input={"questions": questions, "answers": answers})
 
 
-def build_callback_for_session(session_id: str):
+def build_callback_for_session(session_id: str, bypass: bool = False):
     """Return an async callable matching the SDK's can_use_tool signature.
 
-    Only wired when permission_mode != bypassPermissions (see chat.py). The
-    `_handle_ask_user_question` helper is retained for a future SDK version
-    that actually routes the trained-in AskUserQuestion through can_use_tool;
-    SDK 0.2.82 does not, so we currently rely on the MCP fallback
-    (mcp__muselab__ask_user_question) for that flow."""
+    Wired UNCONDITIONALLY now (2026-05-23) — not just when permission_mode
+    requires per-tool prompts. Reason: the SDK routes the built-in
+    `AskUserQuestion` tool calls through `can_use_tool`, so without a
+    callback the model's questions silently vanish on bypassPermissions
+    (the default). The MCP fallback `mcp__muselab__ask_user_question` is
+    great when the model remembers to use that name, but models often
+    forget and call the shorter built-in instead.
 
-    async def can_use_tool(tool_name: str, tool_input: dict[str, Any],
-                            context: Any) -> dict[str, Any]:
+    `bypass=True` (set when permission_mode == bypassPermissions): every
+    non-AskUserQuestion tool is auto-allowed without showing a permission
+    card to the user. AskUserQuestion still gets forwarded to the UI
+    because it's interactive by design — there's no other meaningful
+    response than asking the human.
+
+    `bypass=False`: full per-tool prompting (the original behavior)."""
+
+    async def can_use_tool(
+            tool_name: str, tool_input: dict[str, Any], context: Any
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        # AskUserQuestion is interactive — always route to the muselab UI
+        # regardless of permission_mode. Without this, models that call
+        # the SDK's built-in `AskUserQuestion` (rather than the MCP
+        # alias) get no UI prompt on bypassPermissions and the user
+        # sees no options to pick. See _handle_ask_user_question above
+        # for the SDK-contract details.
+        if tool_name == "AskUserQuestion":
+            return await _handle_ask_user_question(session_id, tool_input)
+
+        # Bypass: auto-allow everything else without prompting. This
+        # keeps the "no permission cards" UX promise of bypassPermissions
+        # while still letting AskUserQuestion above route through the UI.
+        if bypass:
+            return PermissionResultAllow(updated_input=tool_input)
+
         # Always-allow cache check. Empty set is falsy, so don't use `or`.
         key = _input_key(tool_name, tool_input)
         cache = _always_allow.setdefault(session_id, set())
         if (tool_name, key) in cache:
-            return {"behavior": "allow", "updatedInput": tool_input}
+            return PermissionResultAllow(updated_input=tool_input)
 
         q = _session_queues.get(session_id)
         if q is None:
             # No UI subscribed — fail closed (deny) so the model gets a clear
             # signal instead of hanging.
-            return {
-                "behavior": "deny",
-                "message": "No active UI session; cannot prompt for permission.",
-            }
+            return PermissionResultDeny(
+                message="No active UI session; cannot prompt for permission.")
 
         request_id = uuid.uuid4().hex[:12]
         loop = asyncio.get_running_loop()
@@ -188,27 +229,21 @@ def build_callback_for_session(session_id: str):
         try:
             result = await asyncio.wait_for(fut, timeout=DECISION_TIMEOUT_S)
         except asyncio.TimeoutError:
-            return {
-                "behavior": "deny",
-                "message": "User did not respond within 10 minutes.",
-            }
+            return PermissionResultDeny(
+                message="User did not respond within 10 minutes.")
         except asyncio.CancelledError:
-            return {
-                "behavior": "deny",
-                "message": "User session ended before answering.",
-            }
+            return PermissionResultDeny(
+                message="User session ended before answering.")
         finally:
             _pending.pop((session_id, request_id), None)
 
         decision = result["decision"]
         if decision == "always":
             _always_allow.setdefault(session_id, set()).add((tool_name, key))
-            return {"behavior": "allow", "updatedInput": tool_input}
+            return PermissionResultAllow(updated_input=tool_input)
         if decision == "allow":
-            return {"behavior": "allow", "updatedInput": tool_input}
-        return {
-            "behavior": "deny",
-            "message": result.get("message") or "User denied the request.",
-        }
+            return PermissionResultAllow(updated_input=tool_input)
+        return PermissionResultDeny(
+            message=result.get("message") or "User denied the request.")
 
     return can_use_tool

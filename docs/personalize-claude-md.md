@@ -2,17 +2,16 @@
 
 > [简体中文](personalize-claude-md_zh.md)
 
-Muse is **one** assistant — it understands your body, what you do, your
-money, the people you care about, your life, all at once. It doesn't
-switch personas by topic; it always answers with the full background
-in view.
+Muse is a single assistant — it understands the user's health, daily
+activities, finances, relationships, and life as a whole. It does not
+switch personas by topic; every response is informed by the full context.
 
-To make that work, Muse reads the `CLAUDE.md` at the root of your archive
-on every startup. This file is **your autobiographical brief** to Muse.
+To support this, Muse reads the `CLAUDE.md` at the root of the archive
+on every startup. This file is the user's autobiographical brief to Muse.
 
 **Important**: the template is neutral across life stages — students,
-employees, freelancers, full-time parents, retirees, founders — all fit.
-Delete sections that don't apply to you; don't force-fill.
+employees, freelancers, full-time parents, retirees, founders — all are
+accommodated. Delete sections that do not apply; do not force-fill.
 
 ---
 
@@ -20,22 +19,20 @@ Delete sections that don't apply to you; don't force-fill.
 
 ### Chat-driven intake — 👤 button (recommended)
 
-The fastest path inside muselab itself. Click the **👤** icon in the
-top bar. Muse opens a fresh session, seeds an empty CLAUDE.md from the
-template if you don't have one yet, then walks you through the nine
-sections one at a time, asking concrete questions and saving each answer
-via `Edit`. Skip any section by saying "skip" or "no for now". Sensitive
-sections (money / health) get a softer treatment — Muse asks
-qualitative orders-of-magnitude first, exact numbers only when you offer
-them.
+The fastest method within muselab. Click the **👤** icon in the top bar.
+Muse opens a fresh session, creates an empty `CLAUDE.md` from the template
+if one does not yet exist, then guides through each of the nine sections
+with concrete questions, saving each answer via `Edit`. Any section can be
+skipped by saying "skip" or "not now". Sensitive sections (money / health)
+are handled more gently — Muse asks for qualitative orders of magnitude
+first, with exact figures only if offered voluntarily.
 
-This is the path the welcome card on first chat load points you at —
+This is the path indicated by the welcome card on the first chat load —
 step 2 of the three-step orientation.
 
 ### Use the installer (alternative, less interactive)
 
-The first run of `scripts/install-{linux,macos,windows}` asks whether you
-want it to:
+The first run of `scripts/install-{linux,macos,windows}` offers to:
 
 1. Create 6 sub-directories under your archive (`health/` `work/` `money/`
    `people/` `notes/` `archives/`), each with its own README
@@ -50,8 +47,8 @@ want it to:
 3. Patch the answers into the corresponding fields in CLAUDE.md
 4. Tell you which originals to drop into which directory next
 
-Skipping intake is fine — just press Enter on every question. You can
-always finish the rest later via the 👤 chat flow.
+Skipping intake is acceptable — press Enter on every question to continue.
+The remaining sections can be completed at any time via the 👤 chat flow.
 
 ### Manual
 
@@ -100,28 +97,29 @@ suggestions.
 
 ### Muse is one assistant, not multiple personas
 
-Cross-domain decisions are where Muse earns its keep. Example:
-**parent just had a cardiac stent + your cash flow this year + whether
-you'll change jobs in the next few years → should you upgrade your
-parent's Hong Kong health insurance?** A persona model splits this into 3
-separate experts giving 3 disconnected pieces of advice; one assistant
-can give a single coherent answer that actually fits you.
+Cross-domain decisions are where Muse is most valuable. Example:
+**a parent recently underwent cardiac stent placement + the user's cash
+flow this year + the possibility of changing jobs in the coming years →
+should the parent's Hong Kong health insurance be upgraded?** A persona
+model splits this into three separate experts providing three disconnected
+answers; a unified assistant can give a single coherent response that
+accounts for all the relevant factors.
 
 ### Template is neutral
 
 All phrasing, directory names, and intake questions avoid presupposing
-your life stage:
+any particular life stage:
 
-- `work/`, not `career/` (works for students and retirees)
+- `work/`, not `career/` (applicable to students and retirees as well)
 - `money/`, not `investment/` (covers budgets, student loans, pensions, FIRE)
 - `people/`, not `family/` (also fits solo / unmarried / friend-only circles)
 - "What you do most of the week", not "What's your job?"
 
-### Behavioral promises are Muse's, not yours
+### Behavioral commitments belong to Muse, not the user
 
 The "health-related / money-related / study-or-work-related" rules in
-§8 are promises about **how Muse answers** (e.g. cite the guideline for
-health, don't diagnose), not requirements that you fill in every section.
+§8 are commitments about **how Muse responds** (e.g. cite guidelines for
+health topics, do not diagnose), not requirements to fill in every section.
 
 ---
 
@@ -139,13 +137,13 @@ health, don't diagnose), not requirements that you fill in every section.
 
 ## Privacy / security
 
-- Strongly recommend filesystem encryption on your muselab archive
-  (macOS FileVault / Linux LUKS / Windows BitLocker)
-- **Do not** sync the archive to OneDrive / Google Drive / Dropbox or
-  similar public clouds
+- Filesystem encryption is strongly recommended for the muselab archive
+  (macOS FileVault / Linux LUKS / Windows BitLocker).
+- Do not sync the archive to OneDrive / Google Drive / Dropbox or
+  similar public cloud services.
 - Information about other people can be redacted ("father" / "M" instead
-  of real names)
-- Passwords / national-ID / bank accounts belong in a dedicated password
-  manager, **not** in the archive
+  of real names).
+- Passwords / national ID numbers / bank accounts belong in a dedicated
+  password manager, not in the archive.
 - For remote backup, use [restic](https://restic.net) or
-  [borg](https://borgbackup.org) with end-to-end encryption
+  [borg](https://borgbackup.org) with end-to-end encryption.

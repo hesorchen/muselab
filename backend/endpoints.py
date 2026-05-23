@@ -31,18 +31,37 @@ class Provider:
 # at request time (via `_resolve_base_url`) so a Settings UI change to
 # `<PROVIDER>_BASE_URL` takes effect on the next stream() without a restart.
 _DEFAULT_BASE_URLS: dict[str, str] = {
-    "DEEPSEEK_API_KEY":  "https://api.deepseek.com/anthropic",
-    "ZHIPUAI_API_KEY":   "https://open.bigmodel.cn/api/anthropic",
+    "DEEPSEEK_API_KEY":      "https://api.deepseek.com/anthropic",
+    "ZHIPUAI_API_KEY":       "https://open.bigmodel.cn/api/anthropic",
     # ⚠ 务必用 minimaxi.com (中国主站)；minimax.io 是海外站，
     # 用同一把 key 测试时返回 401。
-    "MINIMAX_API_KEY":   "https://api.minimaxi.com/anthropic",
+    "MINIMAX_API_KEY":        "https://api.minimaxi.com/anthropic",
+    # Moonshot Kimi — re-added 2026-05-22 after the 2026-05-17 removal
+    # ("inconsistent endpoint behaviour"). K2.5 / K2.6 (Jan-Apr 2026) are
+    # new GA releases on a different code path than the version that was
+    # flaky; community reports (liteLLM, kimrel, OpenClaw docs) confirm
+    # the /anthropic endpoint stabilised. ⚠ Anthropic-compat layer maps
+    # request_temperature * 0.6 to real_temperature — irrelevant for SDK
+    # defaults but worth knowing if a downstream user tunes temperature.
+    "MOONSHOT_API_KEY":       "https://api.moonshot.ai/anthropic",
+    # Alibaba DashScope Qwen — official "Migrate Anthropic Workloads to
+    # Qwen" doc names this path. International (Singapore) endpoint by
+    # default because it's reachable globally (incl. mainland); domestic
+    # users can override to dashscope.aliyuncs.com if latency matters.
+    "DASHSCOPE_API_KEY":      "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+    # Xiaomi MiMo — V2.5-Pro public beta 2026-04-22; platform.xiaomimimo
+    # explicitly documents the /anthropic endpoint.
+    "XIAOMI_MIMO_API_KEY":    "https://api.xiaomimimo.com/anthropic",
 }
 # Map api-key env name → base-url override env name. Self-hosters can point
 # any provider at a proxy / regional mirror via these.
 _BASE_URL_ENV_BY_KEY: dict[str, str] = {
-    "DEEPSEEK_API_KEY":  "DEEPSEEK_BASE_URL",
-    "ZHIPUAI_API_KEY":   "ZHIPUAI_BASE_URL",
-    "MINIMAX_API_KEY":   "MINIMAX_BASE_URL",
+    "DEEPSEEK_API_KEY":     "DEEPSEEK_BASE_URL",
+    "ZHIPUAI_API_KEY":      "ZHIPUAI_BASE_URL",
+    "MINIMAX_API_KEY":      "MINIMAX_BASE_URL",
+    "MOONSHOT_API_KEY":     "MOONSHOT_BASE_URL",
+    "DASHSCOPE_API_KEY":    "DASHSCOPE_BASE_URL",
+    "XIAOMI_MIMO_API_KEY":  "XIAOMI_MIMO_BASE_URL",
 }
 
 
@@ -98,8 +117,59 @@ CATALOG: tuple[Provider, ...] = (
             ("minimax-m2.5",            "M2.5"),
         ),
     ),
-    # Kimi (Moonshot) removed 2026-05-17 — vendor's anthropic endpoint
-    # behavior was inconsistent in muselab testing; add back when verified.
+    # Moonshot Kimi — re-added 2026-05-22. Removed once on 2026-05-17 for
+    # "inconsistent endpoint behaviour"; the K2.5 / K2.6 releases land on
+    # an updated stack with stable Anthropic-compat per vendor docs +
+    # third-party adapters (liteLLM, kimrel, OpenClaw). Verify tool-use
+    # works for your account before relying on production usage.
+    Provider(
+        prefix="kimi-",
+        base_url=_DEFAULT_BASE_URLS["MOONSHOT_API_KEY"],
+        env_key="MOONSHOT_API_KEY",
+        display="Kimi",
+        models=(
+            ("kimi-k2.6",          "K2.6"),          # 2026-04 GA
+            ("kimi-k2.5",          "K2.5"),          # 2026-01
+            ("kimi-k2-thinking",   "K2 Thinking"),
+            ("kimi-k2",            "K2"),
+        ),
+    ),
+    # Alibaba DashScope Qwen — added 2026-05-22. Anthropic-compat path is
+    # /apps/anthropic (not /anthropic — different from DeepSeek / GLM /
+    # MiniMax convention). Prefix is the bare string "qwen" (no dash)
+    # because model ids alternate "qwen-plus" and "qwen3-max" — both
+    # forms must route to the same provider.
+    Provider(
+        prefix="qwen",
+        base_url=_DEFAULT_BASE_URLS["DASHSCOPE_API_KEY"],
+        env_key="DASHSCOPE_API_KEY",
+        display="Qwen",
+        models=(
+            ("qwen3-max",            "Qwen3 Max"),
+            ("qwen-plus",            "Qwen Plus"),
+            ("qwen3.5-flash",        "Qwen3.5 Flash"),
+            ("qwen3.5-coder-plus",   "Qwen3.5 Coder Plus"),
+        ),
+    ),
+    # Xiaomi MiMo — added 2026-05-22. V2.5-Pro public beta 2026-04-22.
+    # MIT-licensed weights + Anthropic-compatible API; endpoint format
+    # follows the DeepSeek convention exactly.
+    Provider(
+        prefix="mimo-",
+        base_url=_DEFAULT_BASE_URLS["XIAOMI_MIMO_API_KEY"],
+        env_key="XIAOMI_MIMO_API_KEY",
+        display="Xiaomi MiMo",
+        models=(
+            ("mimo-v2.5-pro",   "V2.5 Pro"),
+            ("mimo-v2-flash",   "V2 Flash"),
+        ),
+    ),
+    # Doubao (字节 Volcengine) deliberately NOT added — only
+    # `Doubao-Seed-Code` is documented as Claude-Code-native
+    # Anthropic-compat; the general Doubao endpoint
+    # (ark.cn-beijing.volces.com/api/v3) doesn't expose the standard
+    # /anthropic path. Revisit once Volcengine publishes a stable
+    # /anthropic gateway across model families.
 )
 
 
@@ -112,22 +182,50 @@ CLAUDE_LABELS: dict[str, str] = {
 }
 
 
+_CLAUDE_LABEL_RE = __import__("re").compile(
+    r"^claude-(opus|sonnet|haiku)-(\d+)[-.](\d+)", __import__("re").IGNORECASE)
+
+
 def label_for(model: str) -> str:
-    """Friendly label for any model id we know about; falls back to the id."""
+    """Friendly label for any model id we know about; falls back to a
+    derived label for unknown Claude variants, then to the raw id.
+
+    Why the derive step: cost-dashboard rows come from the JSONL transcript,
+    which may contain older / preview / region-specific Claude ids that
+    aren't in `CLAUDE_LABELS` (e.g. `claude-opus-4-6`, `claude-sonnet-3-7`).
+    Showing raw ids made the by_model table look broken next to nicely-
+    named neighbors. The regex extracts "Opus 4.6" / "Sonnet 3.7" /
+    "Haiku 4.5" from any `claude-{tier}-{X}-{Y}...` shape.
+    """
+    if not model:
+        return model
     if model in CLAUDE_LABELS:
         return CLAUDE_LABELS[model]
+    # Derive friendly Claude label from id pattern when not in the explicit
+    # map. Catches historical / future-proof Anthropic ids without code
+    # changes per release.
+    if model.lower().startswith("claude-"):
+        m = _CLAUDE_LABEL_RE.match(model)
+        if m:
+            kind = m.group(1).capitalize()
+            return f"{kind} {m.group(2)}.{m.group(3)}"
     p = lookup(model)
     if p is not None:
+        low = model.lower()
         for mid, lab in p.models:
-            if mid == model:
+            if mid.lower() == low:
                 return lab
     return model
 
 
 def lookup(model: str) -> Provider | None:
-    """Find the provider for a given model id (by longest matching prefix)."""
+    """Find the provider for a given model id (by longest matching prefix).
+    Case-insensitive: third-party vendors sometimes return mixed-case in
+    `usage.model` (e.g. MiniMax returns `MiniMax-M2.7`), and we want those
+    to route to the same provider as the lowercase catalog entry."""
+    low = (model or "").lower()
     for p in sorted(CATALOG, key=lambda x: -len(x.prefix)):
-        if model.startswith(p.prefix):
+        if low.startswith(p.prefix):
             return p
     return None
 

@@ -100,7 +100,13 @@ try {
 
 Write-Host
 Bold "6. Provider keys"
-foreach ($entry in @(@{k="DEEPSEEK_API_KEY";n="DeepSeek"}, @{k="ZHIPUAI_API_KEY";n="GLM"}, @{k="MINIMAX_API_KEY";n="MiniMax"})) {
+foreach ($entry in @(
+    @{k="DEEPSEEK_API_KEY";    n="DeepSeek"},
+    @{k="ZHIPUAI_API_KEY";     n="GLM"},
+    @{k="MINIMAX_API_KEY";     n="MiniMax"},
+    @{k="MOONSHOT_API_KEY";    n="Kimi"},
+    @{k="DASHSCOPE_API_KEY";   n="Qwen"},
+    @{k="XIAOMI_MIMO_API_KEY"; n="Xiaomi MiMo"})) {
   $val = if ($envText -match "$($entry.k)=(\S+)") { $matches[1] } else { "" }
   if ($val) { Ok "$($entry.n) key configured ($($val.Substring(0,4))...$($val.Substring($val.Length-4)))" }
   else { Note "$($entry.n) key not set (optional)" }

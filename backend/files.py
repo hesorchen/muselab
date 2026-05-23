@@ -375,8 +375,14 @@ def read_file(path: str) -> PlainTextResponse:
     # This is the path that picks up .tmpl, .conf.j2, .env.staging, etc.
     if target.stat().st_size > 0 and _looks_binary(target):
         raise HTTPException(status_code=415, detail="binary content — not previewable as text")
+    content = target.read_text(encoding="utf-8", errors="replace")
+    if len(content) > MAX_TEXT_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large to read as text ({len(content)} bytes > {MAX_TEXT_SIZE})",
+        )
     return PlainTextResponse(
-        target.read_text(encoding="utf-8", errors="replace"),
+        content,
         headers={
             "Content-Disposition": "inline",
             "X-Content-Type-Options": "nosniff",
@@ -434,11 +440,11 @@ def raw_file(path: str = Query(...)) -> FileResponse:
             "Content-Disposition": f"inline; {disp_filename}",
             "Content-Security-Policy": (
                 "default-src 'none'; "
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+                "script-src 'self' 'unsafe-inline' https:; "
                 "style-src 'self' 'unsafe-inline' https:; "
                 "img-src 'self' data: https:; "
                 "font-src https: data:; "
-                "connect-src https:; "
+                "connect-src 'self'; "
                 "base-uri 'none'; form-action 'none'"
             ),
         })
@@ -528,25 +534,31 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=403,
                              detail="sensitive filename blocked")
     dest = target_dir / safe_name
-    # Stream + enforce size cap. If the user posts a 10 GB file, we abort
-    # mid-write so the disk doesn't fill.
+    # Stream + enforce size cap. Write to a temporary file first, then
+    # atomically rename to dest so a crash or size-exceeded abort never
+    # leaves a partial file at the intended path.
+    import tempfile as _tempfile
+    import uuid as _uuid
+    tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
     written = 0
     try:
-        with dest.open("wb") as f:
+        with tmp_path.open("wb") as f:
             while chunk := await file.read(1024 * 1024):
                 written += len(chunk)
                 if written > MAX_UPLOAD_BYTES:
                     f.close()
-                    dest.unlink(missing_ok=True)
+                    tmp_path.unlink(missing_ok=True)
                     raise HTTPException(
                         status_code=413,
                         detail=f"upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB cap",
                     )
                 f.write(chunk)
+        tmp_path.rename(dest)
     except HTTPException:
+        tmp_path.unlink(missing_ok=True)
         raise
     except Exception:
-        dest.unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
         raise
     return {"ok": True, "path": str(dest.relative_to(ROOT)), "size": dest.stat().st_size}
 
@@ -636,6 +648,8 @@ def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
                 continue
             full = Path(dirpath) / fname
             try:
+                if _is_sensitive(Path(full)):
+                    continue
                 if full.stat().st_size > MAX_GREP_FILE_SIZE:
                     continue
                 with full.open("r", encoding="utf-8", errors="replace") as f:
