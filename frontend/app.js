@@ -6732,7 +6732,20 @@ function portal() {
       };
       const openAsst = () => {
         if (curBubble) return;
-        const bubble = { role: "assistant", text: "", html: "", cost: "", model: modelForBubble };
+        // Pre-declare every key the template might read so Alpine's
+        // Proxy tracks them from t=0. Adding a key post-push (e.g.
+        // m.elapsed in _markDone) doesn't reliably trigger x-show
+        // re-evaluation — same root cause as the AskUserQuestion bug.
+        // Keys touched by .turn-footer / .bubble: ts (completion stamp),
+        // elapsed (total seconds), cost, model, text, html. All start
+        // empty / null so x-show defaults match "not yet computed".
+        const bubble = {
+          role: "assistant",
+          text: "", html: "", cost: "",
+          model: modelForBubble,
+          ts: null,
+          elapsed: 0,
+        };
         streamState.messages.push(bubble);
         // CRITICAL: pull the reactive-wrapped object back out of the
         // array, not the raw `bubble` reference. Alpine 3 (and Vue 3
@@ -6917,15 +6930,22 @@ function portal() {
         if (this.currentId !== streamSid && !cancelled) {
           streamState.unread = true;
         }
-        // Stamp the tail of the just-finished turn with a completion
-        // timestamp. A "turn" = contiguous run of muse-side messages
-        // between two user messages; only the tail assistant TEXT
-        // bubble carries .ts so .turn-footer (HH:MM) renders under the
-        // actual reply, not a stray tool_result row that happened to
-        // close the turn. Walk backwards past tool_use / tool_result /
-        // thinking blocks until we hit an assistant text or hit the
-        // user message that started the turn.
+        // Stamp the tail of the just-finished turn with completion
+        // timestamp + total elapsed seconds. A "turn" = contiguous run
+        // of muse-side messages between two user messages; only the tail
+        // assistant TEXT bubble carries .ts / .elapsed so .turn-footer
+        // (HH:MM · 2m50s) renders under the actual reply, not a stray
+        // tool_result row that happened to close the turn. Walk backwards
+        // past tool_use / tool_result / thinking blocks until we hit an
+        // assistant text or hit the user message that started the turn.
+        //
+        // elapsed: use the FE-tracked streamElapsed (matches the value
+        // the user just watched tick up next to the dots). Backend's
+        // d.duration_ms could differ slightly (covers SDK round-trip
+        // only, not the local send→connect lag), and seeing the number
+        // jump after "done" lands would feel like a bug.
         const _now = Date.now();
+        const _elapsed = streamState.streamElapsed || 0;
         for (let k = streamState.messages.length - 1; k >= 0; k--) {
           const m = streamState.messages[k];
           if (m.role === "user") break;          // entered the previous turn
@@ -6933,6 +6953,7 @@ function portal() {
           // "reply" the user reads time off.
           if (m.role !== "assistant") continue;
           if (!m.ts) m.ts = _now;                // found the tail text bubble
+          if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
           break;                                  // stop after the first one (most recent)
         }
         if (this.currentId === streamSid) {

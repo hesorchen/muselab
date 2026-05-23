@@ -1784,6 +1784,14 @@
                 <span x-show="m.ts && !(streaming && i === messages.length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
+                <!-- Total elapsed kept after done so the user can
+                     reference back how long the turn took (esp. useful
+                     for long agentic runs). Stamped in _markDone next
+                     to .ts; only shown when both exist and m.elapsed
+                     >= 1s (sub-second replies don't need the noise). -->
+                <span x-show="m.elapsed && m.ts && !(streaming && i === messages.length - 1)"
+                      class="msg-elapsed"
+                      x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
               </div>
             </div>
           </template>

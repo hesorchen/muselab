@@ -4060,6 +4060,15 @@ html[data-theme="light"] .bash-meta.interrupted { color: #92400e; background: rg
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
 }
+/* "· 2m50s" total-elapsed pill stamped next to .msg-ts after the turn
+   finishes. Same mono / muted treatment as .msg-ts so they read as one
+   compact footer line "13:42 · 2m50s". The · separator is in the
+   x-text so spacing stays uniform whether or not elapsed is present. */
+.msg-elapsed {
+  font-size: 10px; color: var(--c-fg-3);
+  font-family: var(--font-mono);
+  letter-spacing: 0.2px;
+}
 
 .jump-bottom {
   position: absolute; bottom: 18px; right: 18px;

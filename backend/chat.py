@@ -1268,9 +1268,16 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         u = entry.get("uuid")
         if not u:
             continue
-        ts = annotations.get(u, {}).get("ts")
+        ann = annotations.get(u, {})
+        ts = ann.get("ts")
         if ts is not None and "ts" not in entry:
             entry["ts"] = ts
+        # Also fan elapsed_s out the same way — turn-footer's "13:42 ·
+        # 2m50s" should survive a session reload too. Stored as float
+        # seconds by chat.py (see _handle_result_message).
+        elapsed = ann.get("elapsed_s")
+        if elapsed is not None and "elapsed" not in entry:
+            entry["elapsed"] = elapsed
     return out
 
 
@@ -3503,10 +3510,19 @@ async def stream(
                 # JS Date.now() (the frontend writes the same ts onto
                 # in-flight messages in _markDone; loading from sidecar
                 # uses this one).
+                # elapsed_s = SDK-reported wall-clock for the turn (in
+                # seconds). Persisted so reloading a session keeps the
+                # "13:42 · 2m50s" footer (FE-side stamping only survives
+                # within the live session). None when SDK didn't fill
+                # duration_ms.
+                _msg_duration_ms = getattr(msg, "duration_ms", None)
+                _elapsed_s = (round(_msg_duration_ms / 1000, 1)
+                              if _msg_duration_ms else None)
                 sess.set_message_annotation(
                     session_id, new_asst_uuid,
                     cost=f"${cost:.4f}", model=model_to_use,
-                    ts=int(time.time() * 1000))
+                    ts=int(time.time() * 1000),
+                    elapsed_s=_elapsed_s)
             if new_user_uuid and (persisted_imgs or persisted_docs):
                 sess.set_message_annotation(
                     session_id, new_user_uuid,
