@@ -4070,15 +4070,29 @@ function portal() {
       // there directly. Switching is just "show that tab".
       this._activateTabState(this.currentId);
       this.savePrefs();
+      // Sync the model + effort dropdowns to THIS session's persisted
+      // values on every tab switch. Without this, the dropdowns are
+      // tied to root state (this.model / this.effort) which carries
+      // over from whatever the user last picked on the previous tab.
+      // Symptom (2026-05-23 user report): on session A (opus), open
+      // new session B + pick haiku → switch back to A → dropdown
+      // wrongly shows "haiku" even though A.model is still opus. The
+      // backend was fine; only the UI label drifted. Same fix applied
+      // to effort which has the same shape (per-session metadata).
+      const cur = this.sessions.find(s => s.id === this.currentId);
+      if (cur) {
+        if (cur.model) this.model = cur.model;
+        // effort: explicit assignment even when empty — switching from
+        // a high-effort tab to one with no override should clear the
+        // dropdown, not inherit the old value.
+        this.effort = cur.effort || "";
+      }
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
         await this.loadSession(this.currentId);
         st._loaded = true;
       } else {
         // Already loaded — just re-bind UI state. messages reference unchanged.
-        if (this.model) {
-          // Stay on the current root model; no auto-update needed.
-        }
         this.atBottom = true;
         this.scrollToBottom(true);
         this.$nextTick(() => this.highlightCode(".chat-body"));

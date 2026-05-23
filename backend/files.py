@@ -537,7 +537,6 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
     # Stream + enforce size cap. Write to a temporary file first, then
     # atomically rename to dest so a crash or size-exceeded abort never
     # leaves a partial file at the intended path.
-    import tempfile as _tempfile
     import uuid as _uuid
     tmp_path = dest.parent / f".~{dest.name}.{_uuid.uuid4().hex[:8]}.uploading"
     written = 0

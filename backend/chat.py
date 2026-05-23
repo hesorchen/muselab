@@ -2361,8 +2361,12 @@ def context_info() -> dict:
     anthropic_api = bool(os.environ.get("ANTHROPIC_API_KEY")
                           or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
     from . import endpoints as _ep
+    # Return human-readable display names ("DeepSeek", "智谱 GLM"…) not raw
+    # env keys ("DEEPSEEK_API_KEY"…) — the FE / tests treat this as a
+    # user-facing list. A prior refactor briefly emitted env_key; broke
+    # test_settings_put_reflects_in_context_info. Stay on display names.
     third_party_configured = [
-        p.env_key for p in _ep.CATALOG
+        p.display for p in _ep.CATALOG
         if os.environ.get(p.env_key)
     ]
     # Back-compat: keep claude_md_exists / lines / mtime fields for any
@@ -3115,7 +3119,8 @@ async def stream(
                 # image bytes are corrupt — the frontend shows a placeholder.
                 thumb_b64 = None
                 try:
-                    import io as _io, base64 as _b64
+                    import io as _io
+                    import base64 as _b64
                     from PIL import Image as _Img
                     raw_bytes = _b64.b64decode(entry["b64"])
                     with _Img.open(_io.BytesIO(raw_bytes)) as _img:

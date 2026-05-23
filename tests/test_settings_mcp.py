@@ -9,11 +9,23 @@ import pytest
 
 @pytest.fixture
 def temp_mcp(monkeypatch, tmp_path, app_module):
-    """Point MCP_CONFIG_PATH to a tmp file inside the test root."""
+    """Point MCP_CONFIG_PATH to a tmp file inside the test root.
+
+    Also isolates the new (2026-05-23) Claude Code MCP auto-detect path —
+    `_load_external_mcp_sources` scans `~/.claude.json` / `~/.claude/settings.json`
+    / `<ROOT>/.mcp.json`. Without isolation, a developer's real `~/.claude.json`
+    leaks inherited MCPs into tests (e.g. test_get_empty_returns_empty_list
+    expects `servers: []` but sees the host's gmail/whatever entries). Point
+    the scan paths into tmp_path so they're guaranteed absent.
+    """
     from backend import api_settings
     p = tmp_path / "mcp.json"
     monkeypatch.setattr(api_settings, "MCP_CONFIG_PATH", p)
     monkeypatch.setattr(api_settings, "MCP_EXAMPLE_PATH", tmp_path / "missing.json")
+    # Isolate Claude Code MCP auto-detect to tmp paths — must not read
+    # the developer's / CI runner's actual ~/.claude.json.
+    monkeypatch.setattr(api_settings, "_CLAUDE_USER_JSON", tmp_path / "claude.json")
+    monkeypatch.setattr(api_settings, "_CLAUDE_USER_SETTINGS", tmp_path / "claude-settings.json")
     return p
 
 

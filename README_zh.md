@@ -1,7 +1,7 @@
 # muselab
 
 > 自部署 Web UI，让 **Claude Agent SDK** 跟你自己的文件对话。
-> 桌面、平板、手机共享会话；Claude、DeepSeek、GLM、Kimi、Qwen 共用同一套 agent loop。
+> 电脑、平板、手机共享会话；Claude、DeepSeek、GLM、Kimi、Qwen 共用同一套 agent loop。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
