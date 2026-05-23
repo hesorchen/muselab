@@ -1,7 +1,7 @@
 # muselab
 
-> A self-hosted Web UI that talks to your files using the **Claude Agent SDK**.
-> Sessions sync across desktop, tablet, and phone; Claude, DeepSeek, GLM, Kimi, and Qwen all run on the same agent loop.
+> A self-hosted, multi-model AI workspace. Sessions sync across devices.
+> Your archive is the working set — Muse knows the full picture.
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -10,7 +10,8 @@
 [![中文](https://img.shields.io/badge/lang-中文-red)](README_zh.md)
 
 - 🧠 **Your archive is the working set.** `MUSELAB_ROOT` is a directory
-  you own — files there are first-class context, not RAG documents.
+  you own — files there are first-class context for Muse (muselab's
+  built-in AI assistant), not RAG documents.
 - 🤖 **Full agent loop on every model.** MCP / Skills / Subagents / plan
   mode work the same on Claude, DeepSeek, GLM, MiniMax, Kimi, Qwen,
   Xiaomi MiMo.

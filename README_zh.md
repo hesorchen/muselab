@@ -1,7 +1,7 @@
 # muselab
 
-> 自部署 Web UI，让 **Claude Agent SDK** 跟你自己的文件对话。
-> 电脑、平板、手机共享会话；Claude、DeepSeek、GLM、Kimi、Qwen 共用同一套 agent loop。
+> 自部署的多模型 AI 工作台，多端共享会话。
+> 私人档案是它的工作集，Muse 了解你的全貌。
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -9,7 +9,7 @@
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
-- 🧠 **归档即工作集**。`MUSELAB_ROOT` 指向用户自有目录——其中的文件是一等上下文，而非 RAG 召回对象。
+- 🧠 **归档即工作集**。`MUSELAB_ROOT` 指向用户自有目录——其中的文件是 Muse（muselab 内置的 AI 助手）的一等上下文，而非 RAG 召回对象。
 - 🤖 **所有模型共用同一套 agent loop**。MCP / Skills / Subagent / plan 模式在 Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo 上行为一致。
 - 💸 **复用 Claude Pro / Max 订阅**（OAuth），无按令牌计费。也可填入第三方 API key。
 - 🔄 **多端共享一台服务器**。手机 / 平板 / 桌面共用会话；归档数据始终保存在用户自己的主机上。

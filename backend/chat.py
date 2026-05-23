@@ -2492,6 +2492,20 @@ def mcp_status() -> dict:
         return {"configured": False, "servers": [], "error": str(e)}
 
 
+# Session ids whose most recent /interrupt has been called but the in-flight
+# stream's ResultMessage handler hasn't observed it yet. Consumed (set.discard)
+# the moment the handler runs, used to:
+#   (a) suppress the turn-done Web Push — user just cancelled, getting a "Muse
+#       已回复" buzz is noise, sometimes confusing ("did the reply come through
+#       after all?").
+#   (b) tag the SSE done event with `cancelled: true` so the frontend doesn't
+#       paint completion-success UI (turn footer ts stamp / scroll-to-bottom
+#       are still fine; what we hide is celebratory toasts / push).
+# Module-level set is fine for the single-user model muselab targets — no
+# cross-user race to worry about.
+_pending_interrupts: set[str] = set()
+
+
 @router.post("/interrupt", dependencies=[Depends(require_token_query)])
 async def interrupt(session_id: str) -> dict:
     """Stop the current turn via SDK control protocol. Keeps the client
@@ -2501,6 +2515,11 @@ async def interrupt(session_id: str) -> dict:
         targets = [(k, c) for k, c in _clients.items() if k[0] == session_id]
     if not targets:
         return {"ok": True, "interrupted": [], "note": "no live client"}
+    # Mark BEFORE calling SDK's interrupt — the handler races with us, and
+    # we'd rather flag too early (one extra "not really cancelled"
+    # suppression that no-ops) than too late (push fires for a turn the
+    # user just cancelled).
+    _pending_interrupts.add(session_id)
     interrupted: list[str] = []
     for k, c in targets:
         try:
@@ -3031,6 +3050,12 @@ async def stream(
             return EventSourceResponse(_busy_gen())
         broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
         _active_turns[session_id] = broadcast
+    # Defensive: clear any stale "user cancelled" flag carried over from
+    # a previous turn on this session. Normally consumed by the prior
+    # turn's ResultMessage handler, but if that handler never reached
+    # (early exception in pump_claude before ResultMessage arrived) the
+    # flag would persist and wrongly suppress the next turn's push.
+    _pending_interrupts.discard(session_id)
     # One-session-one-model: if the session already has a locked model,
     # that wins over whatever the frontend's dropdown happens to say. This
     # prevents the "I tried to switch but it didn't take" class of bugs and
@@ -3514,9 +3539,19 @@ async def stream(
                                turn_count=n_turns,
                                auto_rename_from=first_user_text or prompt)
             sess.update_model(session_id, model_to_use)
-            # Web Push on turn-done. Three gates, in order:
+            # Was this turn cancelled by an explicit /interrupt? The FE
+            # closes its EventSource immediately on stop-click, which
+            # zeroes live_subscribers below — without this flag, the
+            # "no live subscriber → fire push" path would buzz the user
+            # for a reply they just cancelled. Consume the flag (.discard
+            # always returns None — wrap with `in` test then discard).
+            # (2026-05-23 user report)
+            was_cancelled = session_id in _pending_interrupts
+            _pending_interrupts.discard(session_id)
+            # Web Push on turn-done. Four gates, in order:
             #   1. MUSELAB_NOTIFY_NORMAL toggle (env-level mute switch)
-            #   2. No live SSE subscriber on this turn — if the user is
+            #   2. Turn was NOT user-cancelled — see was_cancelled above.
+            #   3. No live SSE subscriber on this turn — if the user is
             #      actively connected to the broadcast (page open, watching),
             #      they don't need a push. Pushing anyway caused a "ghost
             #      notification" UX bug: user sent message B, message A's
@@ -3525,11 +3560,12 @@ async def stream(
             #      sent B and got a reply" and confused the visible A reply
             #      with B's pending one. Skipping when subscribers > 0
             #      cleanly removes the false positive.
-            #   3. Wrapped in try/except — push failure must never block
+            #   4. Wrapped in try/except — push failure must never block
             #      the stream's done event.
             # Body intentionally minimal: session name + "Muse 已回复". No
             # preview text — the actual reply is one tap away in chat.
-            if os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false":
+            if (not was_cancelled
+                    and os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false"):
                 live_subscribers = 0
                 try:
                     _bc = _active_turns.get(session_id)
@@ -3566,6 +3602,10 @@ async def stream(
                 "total_cost_usd": cost,
                 "model": model_to_use,
                 "stats": _stats,
+                # Flag so the FE can skip celebration UI (success toast /
+                # green-dot tab unread badge would be wrong for a user-
+                # cancelled turn — they clicked stop, they know).
+                "cancelled": was_cancelled,
                 # turn_usage: cumulative (ResultMessage.usage). FE should
                 # prefer session_usage.context_* for window display. Will be
                 # removed once FE is fully migrated.

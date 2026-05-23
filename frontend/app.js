@@ -6902,14 +6902,19 @@ function portal() {
       // Mark the stream done for the ORIGIN tab. If the user is on a
       // different tab, we still update tabState[streamSid] silently — they'll
       // see the final state when they switch back.
-      const _markDone = () => {
+      // `cancelled=true` is set when the done event carried a backend
+      // cancellation flag (user clicked stop). For those, suppress the
+      // green-dot unread indicator — the user knows they cancelled, an
+      // "attention!" dot would imply something new arrived.
+      const _markDone = (cancelled = false) => {
         streamState.streaming = false;
         streamState.es = null;
         // If the user is on a different tab when this turn lands, flag
         // unread so the tab strip can show a green dot. Doing it inside
         // _markDone covers every termination path (done / error /
         // cancelled / reconnect-give-up) — no scattered flagging logic.
-        if (this.currentId !== streamSid) {
+        // EXCEPT user-cancelled — they don't need a "ding, ready!" cue.
+        if (this.currentId !== streamSid && !cancelled) {
           streamState.unread = true;
         }
         // Stamp the tail of the just-finished turn with a completion
@@ -6989,7 +6994,14 @@ function portal() {
             { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact(streamSid) },
           );
         }
-        es.close(); _markDone(); _stopTimer();
+        // Pass the backend's `cancelled` flag through to _markDone so it
+        // can skip the green-dot unread cue for user-cancelled turns.
+        // The on-screen `done` handler runs only when the FE is still
+        // subscribed at completion time (typical when user did NOT click
+        // stop — stop closes the ES). The relevant case for this branch
+        // is page-reload-then-reconnect picking up a turn that finished
+        // after being cancelled before reload.
+        es.close(); _markDone(!!d.cancelled); _stopTimer();
         this.refreshSessions();
         if (this.currentId === streamSid) {
           this.$nextTick(() => this.highlightCode(".chat-body"));

@@ -38,19 +38,6 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("ZHIPUAI_API_KEY", raising=False)
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
-    # Tunable MUSELAB_* envs that the settings GET / PUT round-trip touches.
-    # Critical now (2026-05-23): api_settings.put_settings only writes a key
-    # when its requested value differs from `_current(env_key)`, and
-    # _current() falls back to a canonical default when the env is unset.
-    # If a prior test leaked these into os.environ they'd block legitimate
-    # writes in the next test ("env already that value, no need to write").
-    # Cleared upfront so every test starts from "no env set, default
-    # applies", same as a fresh process.
-    for k in ("MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
-               "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",
-               "MUSELAB_MAX_TURNS", "MUSELAB_NOTIFY_SCHEDULED",
-               "MUSELAB_NOTIFY_NORMAL"):
-        monkeypatch.delenv(k, raising=False)
 
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
@@ -68,8 +55,21 @@ def app_module(monkeypatch, temp_root, tmp_path):
 
     import backend.main as main_mod  # type: ignore[import]
 
+    # Re-delenv AFTER the import, because backend.settings calls
+    # `load_dotenv` at module import time and the dev's real .env (if
+    # present locally) repopulates the keys we just cleared. CI has no
+    # .env so this loop is a no-op there, but on a dev machine it's
+    # what keeps the suite hermetic. (2026-05-23 fix — found via the
+    # api_settings._changed() comparison being too lenient when env
+    # carries the test's chosen value from the host .env, e.g.
+    # MUSELAB_DEFAULT_MODEL=claude-opus-4-7 → test PUTs opus → "no
+    # change, skip write" → file assertion fails.)
     for k in ("DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY",
-              "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+              "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+              "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
+              "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",
+              "MUSELAB_MAX_TURNS", "MUSELAB_NOTIFY_SCHEDULED",
+              "MUSELAB_NOTIFY_NORMAL"):
         monkeypatch.delenv(k, raising=False)
 
     return main_mod
