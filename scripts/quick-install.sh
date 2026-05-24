@@ -36,20 +36,30 @@ err()  { printf "  \033[31m✗\033[0m %s\n" "$*" >&2; }
 
 # Ask helper that reads from /dev/tty even when our stdin is a pipe.
 # Returns the user's answer or the default if they hit Enter.
+# Honors MUSELAB_NONINTERACTIVE=1 — skips the prompt and returns the default.
+NONINT="${MUSELAB_NONINTERACTIVE:-0}"
 ask_tty() {
   local q="$1" def="${2:-}" ans
+  if [[ "$NONINT" == "1" ]]; then
+    echo "$def"
+    return
+  fi
   if [[ -t 0 ]] || [[ -c /dev/tty ]]; then
     read -rp "  $q ${def:+[$def]} " ans </dev/tty
   else
     err "interactive prompts need a terminal — this script is being run"
     err "  in a non-interactive shell with no /dev/tty. Try:"
     err "    git clone $REPO_URL && cd muselab && bash scripts/install-linux.sh"
+    err "  Or for unattended install:  MUSELAB_NONINTERACTIVE=1 …"
     exit 1
   fi
   echo "${ans:-$def}"
 }
 
 bold "muselab — one-line bootstrap"
+if [[ "$NONINT" == "1" ]]; then
+  echo "  Mode: non-interactive (all defaults, no prompts)"
+fi
 echo
 
 # ----- 1. Refuse root --------------------------------------------------------
@@ -142,7 +152,11 @@ DEST="${DEST/#\~/$HOME}"
 if [[ -d "$DEST" ]]; then
   if [[ -d "$DEST/.git" ]] && [[ -f "$DEST/scripts/install-linux.sh" ]]; then
     warn "$DEST already looks like a muselab checkout."
-    answer="$(ask_tty "Re-use it (skip clone)? y/N" "n")"
+    # In non-interactive mode, re-running should be idempotent → default "y".
+    # Interactive default stays "n" since the user might have meant a fresh dir.
+    DEFAULT_REUSE="n"
+    [[ "$NONINT" == "1" ]] && DEFAULT_REUSE="y"
+    answer="$(ask_tty "Re-use it (skip clone)? y/N" "$DEFAULT_REUSE")"
     case "$answer" in
       y|Y|yes) ok "Using existing checkout at $DEST" ;;
       *)       err "Aborted — point this script at a different dir, or"

@@ -19,10 +19,16 @@
 
 ## 安装
 
-**一行命令**（Linux + macOS + WSL2 通用）——安装 `uv`，克隆仓库至 `~/muselab`，再调用平台安装程序：
+**一行命令**（Linux + macOS + WSL2 通用）——安装 `uv`，克隆仓库至 `~/muselab`，自动装 Node LTS 与 Anthropic `claude` CLI，再调用平台安装程序。Python 依赖 / Node / claude CLI / 服务注册一次搞定：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+```
+
+**无人值守**——CI / Docker / 录 demo 用。全部取默认值（随机 token、端口 8765、`~/muselab-archive`），跳过所有交互：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | MUSELAB_NONINTERACTIVE=1 bash
 ```
 
 **手动安装**——逐步执行每条命令：
@@ -32,7 +38,7 @@ git clone https://github.com/hesorchen/muselab && cd muselab
 bash scripts/install-linux.sh    # 或 install-macos.sh / install-windows.ps1
 ```
 
-访问 `http://localhost:8765`，粘贴 `.env` 中的 token。
+访问 `http://localhost:8765`，粘贴 `.env` 中的 token。若安装器末尾提示「claude CLI 已装但未登录」，执行一次 `claude login` 即可激活 Anthropic 模型。
 
 前置准备、Docker、开发模式与各平台详细说明，参见 [快速入门](docs/quickstart_zh.md)。
 

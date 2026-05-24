@@ -11,7 +11,12 @@ function Bold($s) { Write-Host $s -ForegroundColor White }
 function Ok($s)   { Write-Host "  [+] $s" -ForegroundColor Green }
 function Warn($s) { Write-Host "  [!] $s" -ForegroundColor Yellow }
 function Err($s)  { Write-Host "  [x] $s" -ForegroundColor Red }
+
+# Non-interactive mode (CI / Docker / demo recording): set
+# $env:MUSELAB_NONINTERACTIVE=1 to take every default and skip every prompt.
+$NonInt = ($env:MUSELAB_NONINTERACTIVE -eq "1")
 function Ask($q, $def="") {
+  if ($NonInt) { return $def }
   $prompt = if ($def) { "  $q [$def]" } else { "  $q" }
   $a = Read-Host $prompt
   if ([string]::IsNullOrWhiteSpace($a)) { return $def } else { return $a }
@@ -19,6 +24,7 @@ function Ask($q, $def="") {
 
 Bold "muselab — Windows installer"
 Write-Host "  Repo: $Repo"
+if ($NonInt) { Write-Host "  Mode: non-interactive (all defaults, no prompts)" }
 Write-Host
 
 # ----- 1. Prerequisites ---------------------------------------------------
@@ -72,24 +78,75 @@ Ok "uv: $UvPath"
 # choose a non-default port. Keep the earlier prereq block focused on tools.
 
 $claude = Get-Command claude -ErrorAction SilentlyContinue
-if (-not $claude) {
-  Warn "claude CLI not found. Anthropic models won't work until you install it"
-  Warn "  and run 'claude login'. Non-Claude providers will still work via API keys."
-} else {
-  Ok "claude CLI: $($claude.Source)"
-}
+if ($claude) { Ok "claude CLI: $($claude.Source)" }
 
-# MCP runtimes — non-fatal warnings.
+# uvx ships with uv → almost always present once uv is installed
 if (Get-Command uvx -ErrorAction SilentlyContinue) {
   Ok "uvx present — uv-based MCP servers available"
 } else {
   Warn "uvx not found — uv-based MCP presets (fetch, git, time) won't run"
 }
-if (Get-Command npx -ErrorAction SilentlyContinue) {
-  Ok "npx present — npm-based MCP servers available"
-} else {
-  Warn "npx not found — npm-based MCP presets (memory, sequential-thinking, filesystem) won't run"
-  Warn "  install Node.js from https://nodejs.org"
+
+# Auto-install Node LTS + claude CLI when missing. Uses winget (built-in
+# on Win10 1809+/Win11) so no separate installer download. Skipping these
+# used to leave the install in a "running but Claude 401s + default MCP
+# presets silent-fail" state.
+$NeedClaudeLogin = $false
+$InstallNode    = -not (Get-Command node -ErrorAction SilentlyContinue)
+$InstallClaude  = -not $claude
+
+if ($InstallNode -or $InstallClaude) {
+  Write-Host
+  Bold "Optional auto-install / 可选自动安装"
+  if ($InstallNode)   { Write-Host "  - Node LTS (via winget OpenJS.NodeJS.LTS)" }
+  if ($InstallClaude) { Write-Host "  - Anthropic claude CLI (npm install -g)" }
+  Write-Host "  Why: powers default MCP presets + Claude Pro/Max subscription reuse."
+  Write-Host "  原因：默认 MCP 预设和复用 Claude Pro/Max 订阅都需要它们。"
+  $reply = Ask "Install now / 现在装? [Y/n]:" "Y"
+  if ($reply -match "^[Yy]") {
+    if ($InstallNode) {
+      $winget = Get-Command winget -ErrorAction SilentlyContinue
+      if ($winget) {
+        Bold "Installing Node LTS via winget…"
+        # --silent to skip UAC-after-UAC; --accept-* so it doesn't sit on prompts
+        winget install -e --id OpenJS.NodeJS.LTS --silent `
+          --accept-package-agreements --accept-source-agreements
+        # winget puts node on the User PATH but this session's PATH is stale —
+        # rebuild it from registry so the npm call below works without a reboot.
+        $env:Path = `
+          [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
+          [Environment]::GetEnvironmentVariable("Path","User")
+      } else {
+        Warn "winget not available — please install Node LTS manually from https://nodejs.org"
+        Warn "  Then re-run this installer."
+      }
+      $node = Get-Command node -ErrorAction SilentlyContinue
+      if ($node) {
+        $npm = Get-Command npm -ErrorAction SilentlyContinue
+        Ok ("node " + (& node --version) + " · npm " + (& npm --version))
+      } else {
+        Warn "Node install ran but binary not on PATH yet. Open a new PowerShell and re-run installer."
+      }
+    }
+
+    if ($InstallClaude -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+      Bold "Installing @anthropic-ai/claude-code via npm…"
+      npm install -g @anthropic-ai/claude-code
+      $claudeAfter = Get-Command claude -ErrorAction SilentlyContinue
+      if ($claudeAfter) {
+        Ok "claude CLI: $($claudeAfter.Source)"
+        $NeedClaudeLogin = $true
+      } else {
+        Warn "npm install ran but 'claude' not on PATH yet — check 'npm root -g'"
+      }
+    } elseif ($InstallClaude) {
+      Warn "skipped claude CLI install — no npm (Node install failed?)"
+    }
+  } else {
+    Warn "Skipped. Without Node+claude CLI: Anthropic models 401, default MCP presets disabled."
+    Warn "  To install later:  winget install -e --id OpenJS.NodeJS.LTS"
+    Warn "                     npm install -g @anthropic-ai/claude-code; claude login"
+  }
 }
 
 # ----- 2. Python deps -----------------------------------------------------
@@ -112,7 +169,8 @@ if (Test-Path $EnvPath) {
   Write-Host "  Press Enter to auto-generate a 64-char random token (recommended)."
   Write-Host "  直接回车 = 随机生成 64 位（推荐）；想自己设密码就直接输入（≥16 字符）。"
   while ($true) {
-    $TokenInput = Read-Host "  Token (Enter for random / 回车随机)"
+    if ($NonInt) { $TokenInput = "" }   # non-interactive → auto-generate
+    else        { $TokenInput = Read-Host "  Token (Enter for random / 回车随机)" }
     if ([string]::IsNullOrWhiteSpace($TokenInput)) {
       $bytes = New-Object 'System.Byte[]' 32
       [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
@@ -133,7 +191,8 @@ if (Test-Path $EnvPath) {
   Write-Host "  HTTP port = where the web UI listens. Default 8765 is usually free."
   Write-Host "  HTTP 端口 = Web UI 监听端口。默认 8765 通常没被占用。"
   while ($true) {
-    $PortInput = Read-Host "  Port / 端口 [8765]"
+    if ($NonInt) { $PortInput = "" }   # non-interactive → default port
+    else        { $PortInput = Read-Host "  Port / 端口 [8765]" }
     if ([string]::IsNullOrWhiteSpace($PortInput)) { $Port = 8765; break }
     $parsed = 0
     if ([int]::TryParse($PortInput, [ref]$parsed) -and $parsed -ge 1024 -and $parsed -le 65535) {
@@ -476,6 +535,14 @@ if ($tokenNow) {
   Write-Host "    再查: Select-String MUSELAB_TOKEN .env"
 }
 Write-Host
+if ($NeedClaudeLogin) {
+  Bold "[!] One more step / 还差一步"
+  Write-Host "  claude CLI is installed but not logged in. Run this once to enable Claude:"
+  Write-Host "  Anthropic 凭证还没登。跑下面这一行（一次性，浏览器 OAuth）："
+  Write-Host
+  Write-Host "    claude login" -ForegroundColor Cyan
+  Write-Host
+}
 Write-Host "  Useful commands / 常用命令:"
 Write-Host "    Get-ScheduledTask -TaskName Muselab    # check status / 查状态"
 Write-Host "    Start-ScheduledTask -TaskName Muselab  # start / 启动"

@@ -28,11 +28,20 @@
 
 ## Install
 
-**One-line (Linux + macOS + WSL2)** — installs `uv`, clones the repo into
-`~/muselab`, then runs the platform installer:
+**One-line (Linux + macOS + WSL2)** — installs `uv`, clones into `~/muselab`,
+auto-installs Node LTS + the Anthropic `claude` CLI, then runs the platform
+installer. End-to-end (Python deps + Node + claude CLI + service registration)
+in one shot:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+```
+
+**Unattended** — for CI / Docker / demo recording. Takes every default
+(random token, port 8765, `~/muselab-archive`) and skips every prompt:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | MUSELAB_NONINTERACTIVE=1 bash
 ```
 
 **Manual** — if you'd rather see every step:
@@ -42,7 +51,9 @@ git clone https://github.com/hesorchen/muselab && cd muselab
 bash scripts/install-linux.sh    # or install-macos.sh / install-windows.ps1
 ```
 
-Open `http://localhost:8765`, paste the token from `.env`.
+Open `http://localhost:8765`, paste the token from `.env`. If the installer
+reported "claude CLI is installed but not logged in", run `claude login`
+once to enable Anthropic models.
 
 For prerequisites, Docker, dev mode and per-OS detail, see
 [Quick start](docs/quickstart.md).

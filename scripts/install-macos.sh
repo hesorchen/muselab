@@ -10,10 +10,25 @@ bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
 err()  { printf "  \033[31m✗\033[0m %s\n" "$*" >&2; }
-ask()  { local q="$1" def="${2:-}" ans; read -rp "  $q ${def:+[$def]} " ans; echo "${ans:-$def}"; }
+
+# Non-interactive mode (CI / Docker / demo recording): export
+# MUSELAB_NONINTERACTIVE=1 to take every default and skip every prompt.
+NONINT="${MUSELAB_NONINTERACTIVE:-0}"
+ask() {
+  local q="$1" def="${2:-}" ans
+  if [[ "$NONINT" == "1" ]]; then
+    echo "$def"
+    return
+  fi
+  read -rp "  $q ${def:+[$def]} " ans
+  echo "${ans:-$def}"
+}
 
 bold "muselab — macOS installer"
 echo  "  Repo: $REPO"
+if [[ "$NONINT" == "1" ]]; then
+  echo  "  Mode: non-interactive (all defaults, no prompts)"
+fi
 echo
 
 # ----- 1. Prerequisites ---------------------------------------------------
@@ -48,27 +63,82 @@ fi
 # Port pick + conflict check now happen at the .env step after the user can
 # choose a non-default port.
 
-if ! command -v claude >/dev/null 2>&1; then
-  warn "claude CLI not found. Anthropic models won't work until you install it"
-  warn "  and run 'claude login'. Non-Claude providers will still work via API keys."
-else
+if command -v claude >/dev/null 2>&1; then
   ok "claude CLI: $(command -v claude)"
   if [[ ! -d "$HOME/.claude" ]]; then
     warn "  ~/.claude not found — run 'claude login' before installing for OAuth to work"
   fi
 fi
 
-# MCP runtimes — non-fatal but warn.
+# uvx ships with uv → almost always present once uv is installed
 if command -v uvx >/dev/null 2>&1; then
   ok "uvx present — uv-based MCP servers (fetch, git, time, …) available"
 else
   warn "uvx not found — uv-based MCP presets (fetch, git, time) won't run"
 fi
-if command -v npx >/dev/null 2>&1; then
-  ok "npx present — npm-based MCP servers (memory, sequential-thinking, …) available"
-else
-  warn "npx not found — npm-based MCP presets (memory, sequential-thinking, filesystem) won't run"
-  warn "  install: brew install node"
+
+# Auto-install Node LTS + claude CLI when missing. macOS prefers Homebrew
+# if present (most users have it for uv anyway); falls back to fnm so the
+# install never blocks on "you need to brew install X first".
+# Skipping these used to leave Muse in a "running but Claude 401s + default
+# MCP presets silent-fail" state — with this block the one-line install is
+# really end-to-end.
+NEED_CLAUDE_LOGIN=0
+INSTALL_NODE=0
+INSTALL_CLAUDE=0
+command -v node >/dev/null 2>&1   || INSTALL_NODE=1
+command -v claude >/dev/null 2>&1 || INSTALL_CLAUDE=1
+
+if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
+  echo
+  bold "Optional auto-install / 可选自动安装"
+  (( INSTALL_NODE   )) && echo "  - Node LTS (brew if present, else fnm — both user-scoped, no sudo)"
+  (( INSTALL_CLAUDE )) && echo "  - Anthropic claude CLI (npm install -g, ~10s)"
+  echo "  Why: powers the default MCP presets (memory / sequential-thinking /"
+  echo "  filesystem) + lets you reuse a Claude Pro / Max subscription."
+  echo "  原因：默认 MCP 预设和复用 Claude Pro/Max 订阅都需要它们。"
+  REPLY="$(ask 'Install now / 现在装? [Y/n]:' 'Y')"
+  if [[ "$REPLY" =~ ^[Yy] ]]; then
+    if (( INSTALL_NODE )); then
+      if command -v brew >/dev/null 2>&1; then
+        bold "Installing Node LTS via Homebrew…"
+        brew install node
+      else
+        bold "Installing fnm + Node LTS (no brew detected)…"
+        curl -fsSL https://fnm.vercel.app/install | bash
+        export PATH="$HOME/Library/Application Support/fnm:$HOME/.local/share/fnm:$PATH"
+        if command -v fnm >/dev/null 2>&1; then
+          eval "$(fnm env --shell bash)"
+          fnm install --lts
+          fnm default lts/latest 2>/dev/null || fnm default lts-latest 2>/dev/null || true
+          fnm use     lts/latest 2>/dev/null || fnm use     lts-latest 2>/dev/null || true
+          eval "$(fnm env --shell bash)"
+        fi
+      fi
+      if command -v node >/dev/null 2>&1; then
+        ok "node $(node --version) · npm $(npm --version)"
+      else
+        warn "Node install ran but binary not on PATH. Open a new shell and re-run installer."
+      fi
+    fi
+
+    if (( INSTALL_CLAUDE )) && command -v npm >/dev/null 2>&1; then
+      bold "Installing @anthropic-ai/claude-code via npm…"
+      npm install -g @anthropic-ai/claude-code
+      if command -v claude >/dev/null 2>&1; then
+        ok "claude CLI: $(command -v claude)"
+        NEED_CLAUDE_LOGIN=1
+      else
+        warn "npm install ran but 'claude' not on PATH yet — check 'npm root -g'"
+      fi
+    elif (( INSTALL_CLAUDE )); then
+      warn "skipped claude CLI install — no npm (Node install failed?)"
+    fi
+  else
+    warn "Skipped. Without Node+claude CLI: Anthropic models 401, default MCP presets disabled."
+    warn "  To install later:  brew install node  (or fnm install --lts)"
+    warn "                     npm install -g @anthropic-ai/claude-code && claude login"
+  fi
 fi
 
 # ----- 2. Python deps ----------------------------------------------------
@@ -89,7 +159,11 @@ else
   echo "  Press Enter to auto-generate a 64-char random token (recommended)."
   echo "  直接回车 = 随机生成 64 位（推荐）；想自己设密码就直接输入（≥16 字符）。"
   while true; do
-    read -r -p "  Token (Enter for random / 回车随机): " TOKEN_INPUT
+    if [[ "$NONINT" == "1" ]]; then
+      TOKEN_INPUT=""   # non-interactive → auto-generate
+    else
+      read -r -p "  Token (Enter for random / 回车随机): " TOKEN_INPUT
+    fi
     if [[ -z "$TOKEN_INPUT" ]]; then
       TOKEN="$(openssl rand -hex 32)"
       ok "auto-generated 64-char random token / 已生成 64 位随机口令"
@@ -108,7 +182,11 @@ else
   echo "  HTTP port = where the web UI listens. Default 8765 is usually free."
   echo "  HTTP 端口 = Web UI 监听端口。默认 8765 通常没被占用。"
   while true; do
-    read -r -p "  Port / 端口 [8765]: " PORT_INPUT
+    if [[ "$NONINT" == "1" ]]; then
+      PORT_INPUT=""   # non-interactive → default port
+    else
+      read -r -p "  Port / 端口 [8765]: " PORT_INPUT
+    fi
     if [[ -z "$PORT_INPUT" ]]; then PORT=8765; break; fi
     if [[ "$PORT_INPUT" =~ ^[0-9]+$ ]] && (( PORT_INPUT >= 1024 && PORT_INPUT <= 65535 )); then
       PORT="$PORT_INPUT"; break
@@ -388,6 +466,18 @@ if [[ -n "$TOKEN_NOW" ]]; then
   echo  "  Saved at / 也存在: $REPO/.env  →  grep MUSELAB_TOKEN .env"
 fi
 echo
+if (( NEED_CLAUDE_LOGIN )); then
+  bold "⚠  One more step / 还差一步"
+  echo  "  claude CLI is installed but not logged in. Run this once to enable Claude:"
+  echo  "  Anthropic 凭证还没登。跑下面这一行（一次性，浏览器 OAuth）："
+  echo
+  if [[ -t 1 ]]; then
+    printf  "    \033[1;36m%s\033[0m\n" "claude login"
+  else
+    printf  "    %s\n" "claude login"
+  fi
+  echo
+fi
 echo  "  Useful commands / 常用命令:"
 echo  "    launchctl list | grep muselab               # check loaded / 查状态"
 echo  "    launchctl kickstart -k gui/\$UID/com.muselab # restart / 重启"
