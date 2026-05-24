@@ -1256,7 +1256,7 @@ def _restart_hint() -> str:
 # and identity comes from `claude auth status --json`. The UI renders a
 # dedicated card next to the other providers.
 # ============================================================
-import shutil as _shutil
+import shutil as _shutil  # noqa: E402  — kept here to colocate with Claude-Auth helpers
 
 _CLAUDE_CRED = Path.home() / ".claude" / ".credentials.json"
 

@@ -1778,7 +1778,8 @@ def attachments_usage() -> dict:
     files = 0
     sessions_with_attach = 0
     for sid_dir in base.iterdir():
-        if not sid_dir.is_dir(): continue
+        if not sid_dir.is_dir():
+            continue
         has_any = False
         for f in sid_dir.iterdir():
             if f.is_file():
@@ -1788,7 +1789,8 @@ def attachments_usage() -> dict:
                     has_any = True
                 except OSError:
                     pass
-        if has_any: sessions_with_attach += 1
+        if has_any:
+            sessions_with_attach += 1
     return {
         "total_bytes": total,
         "file_count": files,
@@ -3578,7 +3580,6 @@ async def stream(
                 # to enlarge" showed a 160-px upscaled blur.
                 import io as _io
                 import base64 as _b64
-                from pathlib import Path as _Path
                 ext_map = {
                     "image/png": "png", "image/jpeg": "jpg",
                     "image/jpg": "jpg", "image/gif": "gif",
@@ -3611,8 +3612,10 @@ async def stream(
                 except Exception:
                     pass
                 _item: dict = {"mime": entry["mime"]}
-                if thumb_b64: _item["thumb"] = thumb_b64
-                if full_url: _item["url"] = full_url
+                if thumb_b64:
+                    _item["thumb"] = thumb_b64
+                if full_url:
+                    _item["url"] = full_url
                 persisted_imgs.append(_item)
                 # Stash to pending NOW so the attachment survives even if
                 # the stream gets cancelled / errored before the

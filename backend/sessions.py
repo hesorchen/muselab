@@ -540,8 +540,10 @@ def consume_one_pending_attachments(sid: str, msg_uuid: str) -> dict | None:
     first = pend[0]
     images = first.get("images") or []
     docs = first.get("docs") or []
-    if images: cur["images"] = images
-    if docs: cur["docs"] = docs
+    if images:
+        cur["images"] = images
+    if docs:
+        cur["docs"] = docs
     data["pending_attachments"] = pend[1:]
     _save_sidecar(sid, data)
     return first
