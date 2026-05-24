@@ -74,17 +74,6 @@ for sub in health work money people notes archives; do
     ok "created $sub/"
   fi
 done
-# Drop in concrete "_example-" template files so users see the shape of
-# a typical entry. Suffix (.en.md / .zh.md) stripped on destination so
-# user just sees _example-*.md.
-for ex in health/_example-checkup work/_example-project-log money/_example-budget notes/_example-weekly-review people/_example-person-card; do
-  src="scripts/templates/archive-skeleton/${ex}.${MUSE_LOCALE}.md"
-  dest="$ARCHIVE/${ex}.md"
-  if [[ -f "$src" && ! -f "$dest" ]]; then
-    cp "$src" "$dest"
-    ok "added ${ex}.md (example template)"
-  fi
-done
 
 echo
 if [[ "$MUSE_LOCALE" == "zh" ]]; then
