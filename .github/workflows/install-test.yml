@@ -50,7 +50,7 @@ jobs:
       MUSELAB_SKIP_SERVICE:   "1"
       MUSELAB_NO_BROWSER:     "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -103,7 +103,7 @@ jobs:
       MUSELAB_SKIP_SERVICE:   "1"
       MUSELAB_NO_BROWSER:     "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -149,7 +149,7 @@ jobs:
     name: docker (build + run + probe)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
