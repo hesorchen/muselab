@@ -398,54 +398,64 @@ fi
 PORT="$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
 PORT="${PORT:-8765}"
 
-bold "4/5  Installing LaunchAgent / 注册 LaunchAgent"
-AGENT_DIR="$HOME/Library/LaunchAgents"
-LOG_DIR="$HOME/Library/Logs/muselab"
-mkdir -p "$AGENT_DIR" "$LOG_DIR"
-
-PLIST="$AGENT_DIR/com.muselab.plist"
-
-# Build PATH that the agent will inherit — must include uv's dir and brew dirs so
-# subprocesses (claude CLI, node for MCP) can be found by absolute resolution.
-UV_DIR="$(dirname "$UV")"
-PATH_DIRS="$UV_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-
-sed -e "s|{{REPO_PATH}}|$REPO|g" \
-    -e "s|{{UV_PATH}}|$UV|g" \
-    -e "s|{{PATH_DIRS}}|$PATH_DIRS|g" \
-    -e "s|{{HOME_DIR}}|$HOME|g" \
-    scripts/templates/com.muselab.plist.tmpl > "$PLIST"
-ok "plist: $PLIST"
-
-# Reload — unload first in case an old version is loaded
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load -w "$PLIST"
-# Wait up to 15s for the agent to register
-WAITED=0
-while (( WAITED < 15 )); do
-  if launchctl list 2>/dev/null | grep -q com.muselab; then break; fi
-  sleep 1; WAITED=$((WAITED+1))
-done
-if launchctl list 2>/dev/null | grep -q com.muselab; then
-  ok "agent loaded (took ${WAITED}s)"
+# MUSELAB_SKIP_SERVICE=1 short-circuits steps 4+5. CI-only escape hatch
+# (GHA macOS runners can technically register LaunchAgents, but skipping
+# keeps the test focused on the installer logic itself). End users should
+# never set this.
+if [[ "${MUSELAB_SKIP_SERVICE:-0}" == "1" ]]; then
+  LOG_DIR="$HOME/Library/Logs/muselab"   # still referenced in final hints
+  warn "4/5+5/5 SKIPPED (MUSELAB_SKIP_SERVICE=1) — no LaunchAgent registered"
+  warn "  To run muselab manually: uv run python -m backend.main"
 else
-  err "agent failed to load in 15s — check $LOG_DIR/stderr.log"
-  exit 1
-fi
+  bold "4/5  Installing LaunchAgent / 注册 LaunchAgent"
+  AGENT_DIR="$HOME/Library/LaunchAgents"
+  LOG_DIR="$HOME/Library/Logs/muselab"
+  mkdir -p "$AGENT_DIR" "$LOG_DIR"
 
-# ----- 5. Sanity check ---------------------------------------------------
-bold "5/5  Sanity check / 启动自检"
-# Up to 30s for HTTP to come up (first-boot SDK init)
-WAITED=0
-while (( WAITED < 30 )); do
-  if curl -fs -o /dev/null -m 3 http://127.0.0.1:$PORT/ 2>/dev/null; then break; fi
-  sleep 1; WAITED=$((WAITED+1))
-done
-if curl -fs -o /dev/null -m 3 http://127.0.0.1:$PORT/ 2>/dev/null; then
-  ok "muselab responding at http://localhost:$PORT (took ${WAITED}s)"
-else
-  warn "didn't respond at http://localhost:$PORT in 30s — give it more time or tail logs:"
-  warn "  tail -f $LOG_DIR/stderr.log"
+  PLIST="$AGENT_DIR/com.muselab.plist"
+
+  # Build PATH that the agent will inherit — must include uv's dir and brew dirs so
+  # subprocesses (claude CLI, node for MCP) can be found by absolute resolution.
+  UV_DIR="$(dirname "$UV")"
+  PATH_DIRS="$UV_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+  sed -e "s|{{REPO_PATH}}|$REPO|g" \
+      -e "s|{{UV_PATH}}|$UV|g" \
+      -e "s|{{PATH_DIRS}}|$PATH_DIRS|g" \
+      -e "s|{{HOME_DIR}}|$HOME|g" \
+      scripts/templates/com.muselab.plist.tmpl > "$PLIST"
+  ok "plist: $PLIST"
+
+  # Reload — unload first in case an old version is loaded
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load -w "$PLIST"
+  # Wait up to 15s for the agent to register
+  WAITED=0
+  while (( WAITED < 15 )); do
+    if launchctl list 2>/dev/null | grep -q com.muselab; then break; fi
+    sleep 1; WAITED=$((WAITED+1))
+  done
+  if launchctl list 2>/dev/null | grep -q com.muselab; then
+    ok "agent loaded (took ${WAITED}s)"
+  else
+    err "agent failed to load in 15s — check $LOG_DIR/stderr.log"
+    exit 1
+  fi
+
+  # ----- 5. Sanity check ---------------------------------------------------
+  bold "5/5  Sanity check / 启动自检"
+  # Up to 30s for HTTP to come up (first-boot SDK init)
+  WAITED=0
+  while (( WAITED < 30 )); do
+    if curl -fs -o /dev/null -m 3 http://127.0.0.1:$PORT/ 2>/dev/null; then break; fi
+    sleep 1; WAITED=$((WAITED+1))
+  done
+  if curl -fs -o /dev/null -m 3 http://127.0.0.1:$PORT/ 2>/dev/null; then
+    ok "muselab responding at http://localhost:$PORT (took ${WAITED}s)"
+  else
+    warn "didn't respond at http://localhost:$PORT in 30s — give it more time or tail logs:"
+    warn "  tail -f $LOG_DIR/stderr.log"
+  fi
 fi
 
 echo

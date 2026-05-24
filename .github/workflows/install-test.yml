@@ -1,0 +1,292 @@
+# Cross-OS install-script regression. Runs the platform installers in
+# non-interactive mode on clean runners and verifies the backend actually
+# starts + answers /api/health. Catches issues that pytest can't — Node
+# auto-install failures, fnm/brew/winget path quirks, .env BOM bugs,
+# Docker image regressions, etc.
+#
+# `MUSELAB_SKIP_SERVICE=1` is set so we don't try to register systemd /
+# launchd / Task Scheduler on the runner (no logind session on Linux GHA,
+# no admin/UAC on Windows GHA). The test then launches the backend
+# manually and probes /api/health to confirm the install plumbing works.
+
+name: install-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/install-*'
+      - 'scripts/quick-install.sh'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/install-test.yml'
+  pull_request:
+    paths:
+      - 'scripts/install-*'
+      - 'scripts/quick-install.sh'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/install-test.yml'
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: 22.04 + 24.04 (both LTS releases users actually run). The runner
+  # comes with Node pre-installed, so the auto-install path skips — but uv
+  # and claude CLI are NOT pre-installed, exercising both fallbacks.
+  # ---------------------------------------------------------------------------
+  linux:
+    name: linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    env:
+      MUSELAB_NONINTERACTIVE: "1"
+      MUSELAB_SKIP_SERVICE:   "1"
+      MUSELAB_NO_BROWSER:     "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Run install-linux.sh
+        run: bash scripts/install-linux.sh
+
+      - name: Launch backend in background
+        run: |
+          set -a; source .env; set +a
+          nohup uv run python -m backend.main > backend.log 2>&1 &
+          echo $! > backend.pid
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8765/api/health; then echo " — up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::backend never answered /api/health"
+          cat backend.log || true
+          exit 1
+
+      - name: Stop backend
+        if: always()
+        run: kill "$(cat backend.pid)" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.os }}-logs
+          path: |
+            backend.log
+            .env
+
+  # ---------------------------------------------------------------------------
+  # macOS: 13 (Intel) + 14 (Apple Silicon). Runner has brew pre-installed
+  # AND Node, so the auto-install path takes the brew branch (or no-op).
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macos (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14]
+    env:
+      MUSELAB_NONINTERACTIVE: "1"
+      MUSELAB_SKIP_SERVICE:   "1"
+      MUSELAB_NO_BROWSER:     "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Run install-macos.sh
+        run: bash scripts/install-macos.sh
+
+      - name: Launch backend in background
+        run: |
+          set -a; source .env; set +a
+          nohup uv run python -m backend.main > backend.log 2>&1 &
+          echo $! > backend.pid
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8765/api/health; then echo " — up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::backend never answered /api/health"
+          cat backend.log || true
+          exit 1
+
+      - name: Stop backend
+        if: always()
+        run: kill "$(cat backend.pid)" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.os }}-logs
+          path: |
+            backend.log
+            .env
+
+  # ---------------------------------------------------------------------------
+  # Windows: Server 2022. Runner has Node pre-installed; the auto-install
+  # path skips. Critical regression target: .env BOM (PS 5.1 default).
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows
+    runs-on: windows-2022
+    env:
+      MUSELAB_NONINTERACTIVE: "1"
+      MUSELAB_SKIP_SERVICE:   "1"
+      MUSELAB_NO_BROWSER:     "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Run install-windows.ps1
+        shell: powershell    # NOT pwsh — we want to test the PS 5.1 path that
+        run: |               # ships with Windows by default (BOM behavior etc).
+          powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+
+      - name: Verify .env has no UTF-8 BOM
+        shell: pwsh
+        run: |
+          # The first 3 bytes must NOT be EF BB BF — if they are, python-dotenv
+          # would prepend "﻿" to MUSELAB_TOKEN and every login would 401.
+          $bytes = [System.IO.File]::ReadAllBytes(".env")
+          if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            Write-Error ".env starts with UTF-8 BOM — would break python-dotenv"
+            exit 1
+          }
+          Write-Host ".env has no BOM (first 3 bytes: $($bytes[0..2] -join ',') )"
+
+      - name: Launch backend in background
+        shell: pwsh
+        run: |
+          # Load .env into the session
+          Get-Content .env | ForEach-Object {
+            if ($_ -match "^([A-Z_]+)=(.+)$") {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+            }
+          }
+          $p = Start-Process -PassThru -NoNewWindow `
+            -FilePath "uv" -ArgumentList @("run","python","-m","backend.main") `
+            -RedirectStandardOutput "backend.log" -RedirectStandardError "backend.err.log"
+          $p.Id | Out-File backend.pid
+
+      - name: Wait for /api/health
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8765/api/health" -UseBasicParsing -TimeoutSec 3
+              Write-Host "backend up after ${i}s (status $($r.StatusCode))"
+              exit 0
+            } catch {
+              Start-Sleep -Seconds 1
+            }
+          }
+          Write-Host "::error::backend never answered /api/health"
+          if (Test-Path backend.log)     { Write-Host "--- backend.log ---";     Get-Content backend.log }
+          if (Test-Path backend.err.log) { Write-Host "--- backend.err.log ---"; Get-Content backend.err.log }
+          exit 1
+
+      - name: Stop backend
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path backend.pid) {
+            Stop-Process -Id (Get-Content backend.pid) -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-logs
+          path: |
+            backend.log
+            backend.err.log
+            .env
+
+  # ---------------------------------------------------------------------------
+  # Docker: build the image AND actually run it. Existing ci.yml docker
+  # job only builds — that misses runtime regressions (missing dep,
+  # bad CMD args, healthcheck broken). This job complements it.
+  # ---------------------------------------------------------------------------
+  docker-run:
+    name: docker (build + run + probe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (single-arch, cache-from gha)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true             # makes the image available to docker run
+          tags: muselab:itest
+          cache-from: type=gha
+
+      - name: Prepare archive + token
+        run: |
+          mkdir -p test-archive
+          echo "MUSELAB_TOKEN=$(openssl rand -hex 32)" > test.env
+
+      - name: Run container
+        run: |
+          docker run -d --name muselab-itest \
+            --env-file test.env \
+            -e MUSELAB_ROOT=/data \
+            -p 127.0.0.1:8765:8765 \
+            -v $PWD/test-archive:/data \
+            muselab:itest
+
+      - name: Wait for /api/health (up to 60s — first-boot includes uvicorn cold start)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:8765/api/health; then echo " — up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::container never answered /api/health"
+          docker logs muselab-itest || true
+          exit 1
+
+      - name: Verify HEALTHCHECK passing
+        run: |
+          # docker compose's healthcheck takes ~start_period (15s) before it's
+          # accurate. By now we've already waited 60s so it should be healthy.
+          status="$(docker inspect --format='{{.State.Health.Status}}' muselab-itest)"
+          echo "container health: $status"
+          if [[ "$status" != "healthy" ]]; then
+            echo "::error::expected healthy, got $status"
+            docker logs muselab-itest
+            exit 1
+          fi
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f muselab-itest 2>/dev/null || true
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs muselab-itest 2>&1 || true

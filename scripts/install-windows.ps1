@@ -439,10 +439,21 @@ MUSELAB_MODEL=claude-sonnet-4-6
 $envText = Get-Content $EnvPath -Raw -Encoding utf8
 $Port = if ($envText -match "MUSELAB_PORT=(\d+)") { [int]$matches[1] } else { 8765 }
 
-# ----- 4. Scheduled Task --------------------------------------------------
-Bold "4/5  Registering Scheduled Task / 注册开机自启计划任务 (runs at logon, S4U)"
-$TaskName  = "Muselab"
+# Log dir is referenced by both the Scheduled Task step and the final hint
+# message — define it before the skip-guard so the hint still works in CI.
 $LogDir    = Join-Path $env:LOCALAPPDATA "muselab\logs"
+$TaskName  = "Muselab"
+
+# ----- 4. Scheduled Task --------------------------------------------------
+# MUSELAB_SKIP_SERVICE=1 short-circuits steps 4+5. CI-only escape hatch —
+# Register-ScheduledTask with S4U LogonType requires admin (UAC), which
+# GHA windows runners can't supply non-interactively. End users should
+# never set this.
+if ($env:MUSELAB_SKIP_SERVICE -eq "1") {
+  Warn "4/5+5/5 SKIPPED (MUSELAB_SKIP_SERVICE=1) — no Scheduled Task registered"
+  Warn "  To run muselab manually: uv run python -m backend.main"
+} else {
+Bold "4/5  Registering Scheduled Task / 注册开机自启计划任务 (runs at logon, S4U)"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 # Wrap the uv command in a small launcher .cmd file so the Scheduled Task can
@@ -521,6 +532,7 @@ if (-not $ok) {
   Warn "didn't respond at http://localhost:$Port in 30s — give it more time or tail logs:"
   Warn "  Get-Content -Wait `"$LogDir\stderr.log`""
 }
+}  # end skip-guard
 
 Write-Host
 Bold "[OK] muselab installed / 安装完成"

@@ -408,38 +408,46 @@ PORT="$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -
 PORT="${PORT:-8765}"
 
 # ----- 4. systemd user service -------------------------------------------
-bold "4/5  Installing systemd --user service / 注册 systemd 用户服务"
-UNIT_DIR="$HOME/.config/systemd/user"
-mkdir -p "$UNIT_DIR"
-sed -e "s|{{REPO_PATH}}|$REPO|g" \
-    -e "s|{{UV_PATH}}|$UV|g" \
-    scripts/templates/muselab.service.tmpl > "$UNIT_DIR/muselab.service"
-ok "unit file: $UNIT_DIR/muselab.service"
-
-systemctl --user daemon-reload
-systemctl --user enable --now muselab.service
-# Wait up to 30s for the service to become active — first-boot SDK initialisation
-# on slow VPS can take 5-10s, and a flat sleep 1 was reporting false failures.
-WAITED=0
-while (( WAITED < 30 )); do
-  if systemctl --user is-active --quiet muselab.service; then break; fi
-  sleep 1; WAITED=$((WAITED+1))
-done
-if systemctl --user is-active --quiet muselab.service; then
-  ok "service is active (took ${WAITED}s)"
+# MUSELAB_SKIP_SERVICE=1 short-circuits steps 4+5. CI-only escape hatch:
+# GitHub Actions runners don't have a user-level logind session, so
+# `systemctl --user enable` would fail. End users should never set this.
+if [[ "${MUSELAB_SKIP_SERVICE:-0}" == "1" ]]; then
+  warn "4/5+5/5 SKIPPED (MUSELAB_SKIP_SERVICE=1) — no autostart registered"
+  warn "  To run muselab manually: uv run python -m backend.main"
 else
-  err "service didn't become active in 30s — check logs: journalctl --user -u muselab -n 80"
-  exit 1
-fi
+  bold "4/5  Installing systemd --user service / 注册 systemd 用户服务"
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  sed -e "s|{{REPO_PATH}}|$REPO|g" \
+      -e "s|{{UV_PATH}}|$UV|g" \
+      scripts/templates/muselab.service.tmpl > "$UNIT_DIR/muselab.service"
+  ok "unit file: $UNIT_DIR/muselab.service"
 
-# ----- 5. Linger (so service runs even when you're not logged in) --------
-bold "5/5  Enable user lingering / 启用用户级常驻 (so service survives logout / reboot)"
-if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
-  ok "linger already enabled for $USER"
-else
-  warn "linger NOT enabled — service will stop when you log out / reboot without login"
-  warn "  To enable (requires sudo):"
-  warn "    sudo loginctl enable-linger $USER"
+  systemctl --user daemon-reload
+  systemctl --user enable --now muselab.service
+  # Wait up to 30s for the service to become active — first-boot SDK initialisation
+  # on slow VPS can take 5-10s, and a flat sleep 1 was reporting false failures.
+  WAITED=0
+  while (( WAITED < 30 )); do
+    if systemctl --user is-active --quiet muselab.service; then break; fi
+    sleep 1; WAITED=$((WAITED+1))
+  done
+  if systemctl --user is-active --quiet muselab.service; then
+    ok "service is active (took ${WAITED}s)"
+  else
+    err "service didn't become active in 30s — check logs: journalctl --user -u muselab -n 80"
+    exit 1
+  fi
+
+  # ----- 5. Linger (so service runs even when you're not logged in) --------
+  bold "5/5  Enable user lingering / 启用用户级常驻 (so service survives logout / reboot)"
+  if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+    ok "linger already enabled for $USER"
+  else
+    warn "linger NOT enabled — service will stop when you log out / reboot without login"
+    warn "  To enable (requires sudo):"
+    warn "    sudo loginctl enable-linger $USER"
+  fi
 fi
 
 echo
