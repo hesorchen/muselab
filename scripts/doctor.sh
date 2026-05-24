@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # muselab doctor — re-runs the same checks the installer does, plus probes a
 # running instance. Use after install / after weird behaviour / before file
-# bug report. Works on Linux + macOS (Windows version: doctor.ps1).
+# bug report. Works on Linux + macOS + WSL2.
 set -uo pipefail   # NOT -e: keep going past failures to give full report
 
-# Bail out early on Windows — this script only knows systemd (Linux) and
-# launchd (macOS). On Windows (Git Bash / MSYS / Cygwin) it would silently
-# skip the service-status section and report nothing useful.
+# Bail out early on native Windows shells — this script only knows systemd
+# (Linux / WSL2) and launchd (macOS). Git Bash / MSYS / Cygwin on native
+# Windows would silently skip the service-status section.
 case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*|Windows_NT)
-    printf "\033[31m✗\033[0m This script is for Linux / macOS only.\n" >&2
-    printf "  On Windows, run instead:\n" >&2
-    printf "    powershell -ExecutionPolicy Bypass -File scripts\\doctor.ps1\n" >&2
+    printf "\033[31m✗\033[0m This script is for Linux / macOS / WSL2 only.\n" >&2
+    printf "  On Windows, install muselab inside WSL2 and run this script there.\n" >&2
+    printf "  See docs/quickstart.md (Windows via WSL2).\n" >&2
     exit 1
     ;;
 esac

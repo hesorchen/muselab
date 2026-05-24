@@ -27,8 +27,7 @@ services:
       # Set ARCHIVE_DIR in .env (defaults to ./data).
       - ${ARCHIVE_DIR:-./data}:/data
       # Reuse the host's claude CLI OAuth credentials.
-      # Linux/macOS default: ~/.claude
-      # Windows (Docker Desktop): set CLAUDE_HOME=C:\Users\YOU\.claude in .env
+      # Default: ~/.claude. Override CLAUDE_HOME in .env for non-standard locations.
       - ${CLAUDE_HOME:-${HOME}/.claude}:/home/muse/.claude
       # Persist chat sessions across container recreations.
       - ./sessions:/app/sessions

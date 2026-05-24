@@ -5,9 +5,8 @@ Covers:
     three states (CLI missing / CLI present but not logged in / logged in)
   - /api/settings/claude-auth/disconnect — moves credentials file to a
     timestamped .bak; idempotent when file already absent
-  - Cross-platform: shutil.which finds the CLI on both POSIX and Windows
-    (via PATHEXT) — we don't actually mock that, just assert the field is
-    a string-or-None.
+  - shutil.which finds the CLI on PATH — we don't actually mock that,
+    just assert the field is a string-or-None.
 """
 from __future__ import annotations
 import json

@@ -7,14 +7,15 @@ from __future__ import annotations
 
 
 # ============================================================================
-# Bug 1: UnicodeEncodeError on emoji in session messages (Windows GBK default).
+# Bug 1: UnicodeEncodeError on emoji in session messages when the system
+# default encoding wasn't UTF-8 (historically observed on non-UTF-8 locales).
 # Fix: every read_text/write_text in backend now passes encoding='utf-8'.
 # ============================================================================
 
 def test_session_persist_handles_emoji_and_cjk(client, auth):
     """Session save+load must round-trip emoji / rare CJK without crashing.
-    Before df3f567, write_text relied on the system codepage — Windows zh-CN
-    would crash with `UnicodeEncodeError: 'gbk' codec can't encode '\\U0001f604'`."""
+    Before df3f567, write_text relied on the system codepage — non-UTF-8
+    locales would crash with `UnicodeEncodeError: ... can't encode '\\U0001f604'`."""
     # Create session
     r = client.post("/api/chat/sessions",
                      headers={**auth, "Content-Type": "application/json"},

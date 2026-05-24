@@ -19,25 +19,38 @@
 ### 安装 `uv`
 
 ```bash
-# Linux / macOS
+# Linux / macOS / WSL2
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+### Windows 用户走 WSL2
+
+muselab 不支持 Windows 原生（systemd / launchd 是 Linux/macOS 的服务模型，
+Task Scheduler 走另一套；维持双轨成本过高）。Windows 用户的路径是 WSL2 —— 微软
+官方的 Linux 子系统，体验和 Linux 一致。一次性配置：
+
 ```powershell
-# Windows PowerShell — 干净的 Windows 系统需要三步一次性配置。
-# 每一步完成后必须关闭当前 PowerShell 窗口并重新打开，以使 PATH 更新生效。
-# Windows 进程启动时会快照 PATH，不重新打开则新安装的工具不可用。
-# 跳过重新打开步骤，下一步会报「无法将 'git' / 'uv' 识别为 cmdlet」。
-
-# (a) 放行 PowerShell 脚本（默认 Restricted 会拒绝 uv）
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# (b) 装 git（干净 Windows 不带）
-winget install --id Git.Git -e
-
-# (c) 装 uv
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+# PowerShell（管理员）
+wsl --install            # 装 WSL2 + 默认 Ubuntu
+# 重启电脑，按提示创建 WSL 内的 Linux 用户名 / 密码
 ```
+
+WSL2 默认不带 systemd，muselab 服务注册需要它。在 WSL 内：
+
+```bash
+sudo tee /etc/wsl.conf >/dev/null <<'EOF'
+[boot]
+systemd=true
+EOF
+```
+
+回到 Windows 端 PowerShell：
+
+```powershell
+wsl --shutdown           # 让 wsl.conf 生效
+```
+
+再次打开 WSL 终端，从下面的一行命令安装即可。
 
 ## 1. 一键安装
 
@@ -62,18 +75,11 @@ bash quick-install.sh
 ### 1b. 手动安装（逐步执行）
 
 ```bash
-# Linux / macOS
+# Linux / macOS / WSL2
 git clone https://github.com/hesorchen/muselab && cd muselab
 
 bash scripts/install-macos.sh    # macOS — 用户级 LaunchAgent
-bash scripts/install-linux.sh    # Linux — 用户级 systemd
-```
-
-```powershell
-# Windows — Task Scheduler。PowerShell 5.1 不支持 && — 分两行执行。
-git clone https://github.com/hesorchen/muselab
-cd muselab
-powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+bash scripts/install-linux.sh    # Linux / WSL2 — 用户级 systemd
 ```
 
 脚本执行流程：预检查 → `uv sync` → 生成 `.env`（含随机 token）→ 7 项问答写入 CLAUDE.md → 注册自启动 → 等待服务可用（最多 30 秒）。
@@ -96,8 +102,7 @@ ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
 ## 3. 验证
 
 ```bash
-bash scripts/doctor.sh        # Linux / macOS
-powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
+bash scripts/doctor.sh        # Linux / macOS / WSL2
 ```
 
 `doctor` 会逐层检查（uv / claude CLI / `.env` / 服务状态 / HTTP / token / 模型密钥），出现故障时给出具体建议。遇到异常时执行此命令进行诊断。
@@ -108,10 +113,10 @@ powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
 |----|---------------------|------------------------|
 | **macOS** | ✅ 自启 | n/a（Mac 重启必须登录）|
 | **Linux** | ✅ 自启 | ⚠️ 需一次性执行 `sudo loginctl enable-linger $USER` |
-| **Windows** | ✅ 自启 | n/a（Task Scheduler 触发器为 "At Logon"）|
+| **WSL2** | ✅ 自启（打开 WSL 终端即触发 systemd-user） | ⚠️ Windows 重启后需手动打开一次 WSL 终端，或参考 [WSL boot 配置](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) |
 
 各 OS 详细指南（验证 / 重启 / tail 日志 / 暴露 LAN / 卸载）：
-[macOS](install-macos_zh.md) · [Linux](install-linux_zh.md) · [Windows](install-windows_zh.md)。
+[macOS](install-macos_zh.md) · [Linux](install-linux_zh.md)。
 
 ## Docker 备选方案
 

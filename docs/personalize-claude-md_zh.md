@@ -20,7 +20,7 @@ Muse 是一个整体助理——同时理解用户的身体状况、日常事务
 
 ### 使用安装脚本（备选，交互性较弱）
 
-`scripts/install-{linux,macos,windows}` 首次运行时将询问是否：
+`scripts/install-{linux,macos}` 首次运行时将询问是否：
 
 1. 在 archive 下建好 6 个子目录（`health/` `work/` `money/` `people/`
    `notes/` `archives/`），每个带 README 说明
@@ -114,7 +114,7 @@ cp -r scripts/templates/archive-skeleton/* ~/muselab-archive/
 
 ## 隐私与安全
 
-- 强烈建议为 muselab 归档目录启用文件系统加密（macOS FileVault / Linux LUKS / Windows BitLocker）。
+- 强烈建议为 muselab 归档目录启用文件系统加密（macOS FileVault / Linux LUKS）。
 - 不要将归档目录同步至 OneDrive / Google Drive / Dropbox 等公共云存储。
 - 涉及他人的信息可进行脱敏处理（以"父亲"/"M"代替真实姓名）。
 - 密码、身份证号、银行账号请存入专用密码管理器，不要写入归档目录。

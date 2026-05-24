@@ -1240,10 +1240,6 @@ def _restart_hint() -> str:
     """Platform-specific command to restart muselab so the new SDK is loaded."""
     import platform
     sysname = platform.system()
-    if sysname == "Windows":
-        return ("Stop-ScheduledTask -TaskName Muselab; "
-                "Get-Process python,uv -EA SilentlyContinue | Stop-Process -Force; "
-                "Start-ScheduledTask -TaskName Muselab")
     if sysname == "Darwin":
         return "launchctl kickstart -k gui/$UID/com.muselab"
     return "systemctl --user restart muselab"
@@ -1262,9 +1258,7 @@ _CLAUDE_CRED = Path.home() / ".claude" / ".credentials.json"
 
 
 def _claude_cli_path() -> str | None:
-    """Cross-platform: find the `claude` executable. Returns None if absent.
-    On Windows, npm-installed CLIs often live as `claude.cmd` — shutil.which
-    handles both extensions when PATHEXT is set (default on Windows)."""
+    """Find the `claude` executable on PATH. Returns None if absent."""
     return _shutil.which("claude")
 
 
@@ -1284,9 +1278,7 @@ def _run_claude_auth_status(timeout: float = 5.0) -> dict:
             # "logged in via API key" state. The CLI itself reads
             # credentials.json directly so no env is needed.
             env={"PATH": os.environ.get("PATH", ""),
-                 "HOME": os.environ.get("HOME", str(Path.home())),
-                 "USERPROFILE": os.environ.get("USERPROFILE", str(Path.home())),
-                 "APPDATA": os.environ.get("APPDATA", "")},
+                 "HOME": os.environ.get("HOME", str(Path.home()))},
         )
     except subprocess.TimeoutExpired:
         return {"loggedIn": False, "reason": "cli-timeout"}

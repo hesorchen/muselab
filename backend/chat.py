@@ -545,8 +545,8 @@ async def _build_and_connect_client(
     # any session that's ever streamed errors with "already in use".
     # Detect JSONL existence by RECURSIVELY scanning the CLI's projects
     # root — SDK's _find_project_dir relies on path-hash matching that
-    # was unreliable on Windows in practice (user's CLI saw the JSONL
-    # but the SDK helper didn't). _find_session_jsonl walks BOTH default
+    # has been unreliable in some setups (user's CLI saw the JSONL but
+    # the SDK helper didn't). _find_session_jsonl walks BOTH default
     # and vendor roots so vendor sessions don't look "new" here — passing
     # `session_id=` for an existing JSONL makes the CLI exit with
     # "Session ID already in use", and the fallback at the bottom of

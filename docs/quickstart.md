@@ -23,24 +23,40 @@ to make the cause clear.
 ### Install `uv`
 
 ```bash
-# Linux / macOS
+# Linux / macOS / WSL2
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+### Windows via WSL2
+
+muselab does not support native Windows (systemd / launchd are the
+Linux/macOS service models; Task Scheduler is a different beast — maintaining
+both is too expensive). Windows users go through WSL2 — Microsoft's official
+Linux subsystem; the experience matches Linux. One-time setup:
+
 ```powershell
-# Windows PowerShell — a clean Windows installation requires three one-time setup steps.
-# CLOSE AND REOPEN POWERSHELL AFTER EACH STEP so that PATH changes take effect.
-# (Skipping the reopen causes the next step to fail with "'git' / 'uv' is not recognized")
-
-# (a) allow scripts to run (default policy is Restricted)
-Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# (b) install git (default Windows doesn't have it)
-winget install --id Git.Git -e
-
-# (c) install uv
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+# PowerShell (Administrator)
+wsl --install            # installs WSL2 + Ubuntu default
+# Reboot, then create your WSL Linux user when prompted
 ```
+
+WSL2 doesn't enable systemd by default, which muselab's service registration
+needs. Inside WSL:
+
+```bash
+sudo tee /etc/wsl.conf >/dev/null <<'EOF'
+[boot]
+systemd=true
+EOF
+```
+
+Back in Windows PowerShell:
+
+```powershell
+wsl --shutdown           # make wsl.conf take effect
+```
+
+Reopen the WSL terminal and run the one-line install below.
 
 ## 1. One-shot installer
 
@@ -66,18 +82,11 @@ bash quick-install.sh
 ### 1b. Manual install (step-by-step)
 
 ```bash
-# Linux / macOS
+# Linux / macOS / WSL2
 git clone https://github.com/hesorchen/muselab && cd muselab
 
 bash scripts/install-macos.sh    # macOS — user LaunchAgent
-bash scripts/install-linux.sh    # Linux — user systemd service
-```
-
-```powershell
-# Windows — Task Scheduler. PowerShell 5.1 doesn't support && — run as two lines.
-git clone https://github.com/hesorchen/muselab
-cd muselab
-powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+bash scripts/install-linux.sh    # Linux / WSL2 — user systemd service
 ```
 
 Script steps: pre-flight checks → `uv sync` → write `.env` with a random token →
@@ -101,8 +110,7 @@ Or use [Tailscale](https://tailscale.com) — same effect, no terminal.
 ## 3. Verify
 
 ```bash
-bash scripts/doctor.sh        # Linux / macOS
-powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
+bash scripts/doctor.sh        # Linux / macOS / WSL2
 ```
 
 `doctor` checks every layer (uv / claude CLI / `.env` / service / HTTP /
@@ -115,10 +123,10 @@ when something appears to be wrong.
 |----|---------------------|------------------------|
 | **macOS** | ✅ auto-starts | n/a (always log in on Mac) |
 | **Linux** | ✅ auto-starts | ⚠️ needs one-time `sudo loginctl enable-linger $USER` |
-| **Windows** | ✅ auto-starts | n/a (Task Scheduler is "At Logon") |
+| **WSL2** | ✅ auto-starts (opening any WSL terminal triggers systemd-user) | ⚠️ after a Windows reboot, open a WSL terminal once — or configure [WSL boot autostart](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) |
 
 Per-OS detail (verify / restart / tail logs / expose to LAN / uninstall):
-[macOS](install-macos.md) · [Linux](install-linux.md) · [Windows](install-windows.md).
+[macOS](install-macos.md) · [Linux](install-linux.md).
 
 ## Docker alternative
 

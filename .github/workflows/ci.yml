@@ -46,10 +46,9 @@ jobs:
         # Blocking now that the backend is clean — regressions fail CI
         # instead of accumulating silently.
         run: uv run ruff check backend/ tests/
-      - name: muselab lint (encoding / BOM / class collisions)
+      - name: muselab lint (encoding / class collisions)
         # Catches the bug classes we've shipped historically — Python file
-        # I/O without encoding, .ps1 files missing BOM, etc. See
-        # scripts/lint.sh for the rule list.
+        # I/O without encoding, etc. See scripts/lint.sh for the rule list.
         run: bash scripts/lint.sh
 
   # Builds the Dockerfile on every PR (smoke), and on push to main / tags it

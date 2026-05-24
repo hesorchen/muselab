@@ -4,9 +4,7 @@
 #
 # Checks:
 #   1. Python read_text / write_text without encoding=
-#   2. PowerShell .ps1 files missing UTF-8 BOM
-#   3. PowerShell Get-Content / Set-Content without -Encoding
-#   4. .thinking class collision (mascot vs message bubble)
+#   2. .thinking class collision (mascot vs message bubble)
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,49 +37,7 @@ else
 fi
 echo
 
-echo "== Check 2: PowerShell .ps1 files missing UTF-8 BOM =="
-no_bom=()
-for f in scripts/*.ps1; do
-  [[ -f "$f" ]] || continue
-  hdr=$(head -c 3 "$f" | xxd -p)
-  if [[ "$hdr" != "efbbbf" ]]; then
-    no_bom+=("$f")
-  fi
-done
-if (( ${#no_bom[@]} > 0 )); then
-  red "FAIL — .ps1 files missing UTF-8 BOM (zh-CN Windows reads as GBK):"
-  for f in "${no_bom[@]}"; do echo "  $f"; done
-  echo "  → Prepend 0xEF 0xBB 0xBF, e.g.:"
-  echo "  python3 -c \"import sys; [open(p,'wb').write(b'\\xef\\xbb\\xbf'+open(p,'rb').read()) for p in sys.argv[1:]]\" <file>"
-  fail=1
-else
-  green "OK — all .ps1 files have UTF-8 BOM."
-fi
-echo
-
-echo "== Check 3: PowerShell Get-Content/Set-Content without -Encoding =="
-# Allow them in: Set-Content of pure ASCII probes; Get-Content -Wait (tail) usage
-violations=$(
-  grep -nE '(Get|Set)-Content' scripts/*.ps1 2>/dev/null \
-    | grep -v -- '-Encoding' \
-    | grep -v -- '-Wait' \
-    | grep -v 'Set-Content -Path \$probe' \
-    | grep -v 'Set-Content -Path \$LauncherPath' \
-    | grep -v 'Set-Content -Path \$TmpReg' \
-    | grep -v 'Set-Content -Path \$TmpRm' \
-    || true
-)
-if [[ -n "$violations" ]]; then
-  red "FAIL — PowerShell file I/O without -Encoding:"
-  echo "$violations" | sed 's/^/  /'
-  echo "  → Add -Encoding UTF8 (read) or use [System.IO.File]::WriteAllText with no-BOM UTF8."
-  fail=1
-else
-  green "OK — all PowerShell file I/O specifies encoding."
-fi
-echo
-
-echo "== Check 4: .thinking class used outside message-bubble context =="
+echo "== Check 2: .thinking class used outside message-bubble context =="
 # Mascot used to bind {'thinking': streaming} on a generic header element,
 # which collided with .thinking bubble style. New mascot uses is-streaming.
 violations=$(grep -nE "'thinking'\s*:" frontend/*.html frontend/*.js 2>/dev/null || true)

@@ -26,6 +26,6 @@
 ## 重要提示
 
 - 这个目录里很可能包含**身份证号 / 学号 / 合同金额**等高敏信息
-- 强烈建议给整个 muselab archive 启用文件系统加密（macOS FileVault / Linux LUKS / Windows BitLocker）
+- 强烈建议给整个 muselab archive 启用文件系统加密（macOS FileVault / Linux LUKS）
 - 绝对不要 sync 到公共云（OneDrive / Google Drive 等）
 - 如果非要远程备份：用 [restic](https://restic.net) 或 [borg](https://borgbackup.org) + 端到端加密

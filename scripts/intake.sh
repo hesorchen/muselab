@@ -4,7 +4,7 @@
 #   - your first install skipped the intake (answered "n")
 #   - you want to refresh the profile after life changes
 #   - you cloned an existing .env from elsewhere but never set up CLAUDE.md
-# Linux + macOS. Windows: scripts\intake.ps1.
+# Linux + macOS + WSL2.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

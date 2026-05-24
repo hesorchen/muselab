@@ -5,6 +5,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Native Windows support dropped before 1.0.** Windows users now go
+  through WSL2 (Microsoft's official Linux subsystem). Removed scripts:
+  `install-windows.ps1`, `uninstall-windows.ps1`, `upgrade.ps1`,
+  `doctor.ps1`, `intake.ps1`. Removed docs:
+  `docs/install-windows.md` / `_zh.md`. CI no longer runs the
+  `windows-2022` install-test matrix. Rationale: maintaining Task
+  Scheduler + PowerShell encoding + ExecutionPolicy quirks on top of
+  systemd-user / launchd doubled platform-specific bug surface for a
+  small audience that overlaps almost entirely with WSL2 users.
+  Migration: install WSL2 + enable systemd (see
+  `docs/quickstart.md` → "Windows via WSL2"), then run the one-line
+  installer inside WSL.
+
 ### Added
 - **Four new bundled skills.** `skills/pptx` (PowerPoint creation via
   python-pptx / OOXML), `skills/csv-analyzer` (pandas + matplotlib data

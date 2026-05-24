@@ -30,7 +30,7 @@ See the original numbers in [2024-09 checkup PDF](archives/2024-09-checkup-clini
 - This directory very likely contains high-sensitivity info: ID numbers
   / student numbers / contract amounts
 - Strongly recommend filesystem-level encryption for the whole muselab
-  archive (macOS FileVault / Linux LUKS / Windows BitLocker)
+  archive (macOS FileVault / Linux LUKS)
 - **Do not** sync to public clouds (OneDrive / Google Drive / Dropbox)
 - For remote backup, use [restic](https://restic.net) or
   [borg](https://borgbackup.org) with end-to-end encryption

@@ -29,13 +29,16 @@
 ## Install
 
 **One-line (Linux + macOS + WSL2)** — installs `uv`, clones into `~/muselab`,
-auto-installs Node LTS + the Anthropic `claude` CLI, then runs the platform
-installer. End-to-end (Python deps + Node + claude CLI + service registration)
-in one shot:
+then runs the platform installer (which auto-installs Node LTS + the Anthropic
+`claude` CLI and registers the service):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
 ```
+
+> **Windows users:** install via WSL2 (see [Quick start](docs/quickstart.md#windows-via-wsl2)).
+> Native Windows is not a supported target — WSL2 is Microsoft's first-class
+> Linux toolchain on Windows and the experience is on par with Linux.
 
 **Unattended** — for CI / Docker / demo recording. Takes every default
 (random token, port 8765, `~/muselab-archive`) and skips every prompt:
@@ -48,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quic
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
-bash scripts/install-linux.sh    # or install-macos.sh / install-windows.ps1
+bash scripts/install-linux.sh    # or install-macos.sh
 ```
 
 Open `http://localhost:8765`, paste the token from `.env`. If the installer

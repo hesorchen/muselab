@@ -32,7 +32,7 @@ step 2 of the three-step orientation.
 
 ### Use the installer (alternative, less interactive)
 
-The first run of `scripts/install-{linux,macos,windows}` offers to:
+The first run of `scripts/install-{linux,macos}` offers to:
 
 1. Create 6 sub-directories under your archive (`health/` `work/` `money/`
    `people/` `notes/` `archives/`), each with its own README
@@ -138,7 +138,7 @@ health topics, do not diagnose), not requirements to fill in every section.
 ## Privacy / security
 
 - Filesystem encryption is strongly recommended for the muselab archive
-  (macOS FileVault / Linux LUKS / Windows BitLocker).
+  (macOS FileVault / Linux LUKS).
 - Do not sync the archive to OneDrive / Google Drive / Dropbox or
   similar public cloud services.
 - Information about other people can be redacted ("father" / "M" instead
