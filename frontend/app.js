@@ -553,6 +553,20 @@ function portal() {
     // Per-provider help hints rendered under the API-key input. Anthropic
     // gets the most because it has two valid paths (Pro OAuth or API key);
     // others are just a link to where to get the key.
+    // i18n for provider display labels — backend ships a single string
+    // (e.g. "百度千帆", "MiniMax (国际)") that's fine for zh users but
+    // shows Chinese text in the English UI. Map only the entries that
+    // contain CJK; everything else passes through unchanged.
+    PROVIDER_DISPLAY_I18N: {
+      "百度千帆":         { en: "Baidu Qianfan" },
+      "MiniMax (国际)":   { en: "MiniMax (International)" },
+      "Qwen (国际)":      { en: "Qwen (International)" },
+    },
+    localizeProviderDisplay(d) {
+      const m = this.PROVIDER_DISPLAY_I18N[d];
+      return (m && m[this.lang]) || d;
+    },
+
     PROVIDER_HELP: {
       ANTHROPIC_API_KEY: {
         url: "https://console.anthropic.com/settings/keys",

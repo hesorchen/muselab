@@ -2659,7 +2659,7 @@
                  state for a configured row is "switch + 已配置 + 测试 + 修改"
                  (no contradictory empty input next to a green badge). -->
             <div class="settings-row provider-row" x-data="{ editing: false }">
-              <label x-text="p.display + ' (' + p.env_key + ')'"></label>
+              <label x-text="localizeProviderDisplay(p.display) + ' (' + p.env_key + ')'"></label>
               <div class="settings-input-wrap">
                 <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
                   <input type="checkbox" :checked="!p.disabled"
