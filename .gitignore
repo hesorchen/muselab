@@ -1,0 +1,39 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.router-token
+.DS_Store
+sessions/
+sessions.bak-*/
+mcp.json
+data/
+# frontend/data/ ships tracked static JS modules (i18n alternatives, slash
+# commands, etc.); carve out from the generic data/ rule above.
+!frontend/data/
+!frontend/data/**
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.vscode/
+.idea/
+*.log
+node_modules/
+
+# Internal working docs — kept locally for the maintainer's own use but
+# NOT published in the open-source repo (decision 2026-05-22).
+# - TODO.md: 21KB roadmap + launch checklist + personal scheduling notes.
+#   Public roadmap lives in GitHub Issues / Discussions instead.
+# - docs/competitive-analysis.md: candid positioning + launch-strategy
+#   memo; reads as internal pitch deck if published, not user docs.
+TODO.md
+docs/competitive-analysis.md
+
+# Demo archives — local-only, never published
+demo/
+

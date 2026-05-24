@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "description": "HTTP fetch — let Muse read web pages (markdown-converted). Requires: uv"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"],
+      "description": "Filesystem access scoped to /data. Replace /data with your path. Requires: node"
+    },
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "description": "Long-term key-value memory across sessions. Requires: node"
+    },
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "/data"],
+      "description": "Git operations on a specific repo. Replace /data. Requires: uv"
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "description": "Structured multi-step reasoning. Useful for hard logic / planning. Requires: node"
+    },
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone=Asia/Shanghai"],
+      "description": "Current time with timezone — fixes the model's blind spot. Adjust timezone. Requires: uv"
+    }
+  }
+}

@@ -1,0 +1,299 @@
+"""File CRUD + search + hidden-toggle endpoints."""
+import io
+
+
+# ---- list / read ----
+
+def test_list_root(client, auth):
+    r = client.get("/api/files/list?path=", headers=auth)
+    assert r.status_code == 200
+    names = {e["name"] for e in r.json()["entries"]}
+    assert "README.md" in names
+    assert "notes" in names
+    assert ".secret" not in names   # hidden by default
+
+
+def test_list_show_hidden(client, auth):
+    r = client.get("/api/files/list?path=&show_hidden=true", headers=auth)
+    names = {e["name"] for e in r.json()["entries"]}
+    assert ".secret" in names
+    # .env is sensitive AND hidden — still listed (the block only fires on
+    # read/write of its content; listing is allowed so the UI can show it).
+    assert ".env" in names
+
+
+def test_list_subdir(client, auth):
+    r = client.get("/api/files/list?path=notes", headers=auth)
+    names = {e["name"] for e in r.json()["entries"]}
+    assert names == {"a.md", "b.txt", "deep"}
+
+
+def test_read_markdown(client, auth):
+    r = client.get("/api/files/read?path=README.md", headers=auth)
+    assert r.status_code == 200
+    assert "Hello" in r.text
+
+
+def test_read_inline_disposition(client, auth):
+    r = client.get("/api/files/read?path=README.md", headers=auth)
+    assert r.headers["content-disposition"] == "inline"
+
+
+def test_read_nonexistent(client, auth):
+    r = client.get("/api/files/read?path=nope.md", headers=auth)
+    assert r.status_code == 404
+
+
+# ---- write / delete / mkdir / rename ----
+
+def test_write_then_read(client, auth, temp_root):
+    r = client.put(
+        "/api/files/write",
+        headers=auth,
+        json={"path": "notes/new.md", "content": "fresh\n"},
+    )
+    assert r.status_code == 200
+    assert (temp_root / "notes" / "new.md").read_text() == "fresh\n"
+
+
+def test_mkdir(client, auth, temp_root):
+    r = client.post(
+        "/api/files/mkdir",
+        headers=auth,
+        json={"path": "fresh/sub"},
+    )
+    assert r.status_code == 200
+    assert (temp_root / "fresh" / "sub").is_dir()
+
+
+def test_rename(client, auth, temp_root):
+    r = client.post(
+        "/api/files/rename",
+        headers=auth,
+        json={"src": "notes/a.md", "dst": "notes/renamed.md"},
+    )
+    assert r.status_code == 200
+    assert (temp_root / "notes" / "renamed.md").exists()
+    assert not (temp_root / "notes" / "a.md").exists()
+
+
+def test_delete_file(client, auth, temp_root):
+    r = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=auth,
+        json={"path": "notes/b.txt"},
+    )
+    assert r.status_code == 200
+    assert not (temp_root / "notes" / "b.txt").exists()
+
+
+def test_delete_nonempty_dir_refused(client, auth):
+    r = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=auth,
+        json={"path": "notes"},
+    )
+    assert r.status_code == 400
+
+
+def test_upload(client, auth, temp_root):
+    r = client.post(
+        "/api/files/upload",
+        headers=auth,
+        data={"path": "notes"},
+        files={"file": ("up.md", io.BytesIO(b"uploaded body"), "text/markdown")},
+    )
+    assert r.status_code == 200
+    assert (temp_root / "notes" / "up.md").read_bytes() == b"uploaded body"
+
+
+# ---- search / grep ----
+
+def test_search_by_filename(client, auth):
+    r = client.get("/api/files/search?q=read", headers=auth)
+    names = [e["name"] for e in r.json()["entries"]]
+    assert "README.md" in names
+
+
+def test_grep_content(client, auth):
+    r = client.get("/api/files/grep?q=first paragraph", headers=auth)
+    hits = r.json()["hits"]
+    assert any(h["path"] == "README.md" for h in hits)
+
+
+def test_grep_skips_hidden_by_default(client, auth, temp_root):
+    (temp_root / ".secret").write_text("UNIQUE_GREP_TOKEN_xyz\n")
+    r = client.get("/api/files/grep?q=UNIQUE_GREP_TOKEN_xyz", headers=auth)
+    assert r.json()["hits"] == []
+
+
+# ---- raw / download ----
+
+def test_raw_image_inline(client, temp_root):
+    from .conftest import TEST_TOKEN
+    (temp_root / "x.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    r = client.get(f"/api/files/raw?path=x.png&token={TEST_TOKEN}")
+    assert r.status_code == 200
+    assert r.headers["content-disposition"].startswith("inline")
+
+
+# ---- new endpoints / edge cases ----
+
+def test_rename_endpoint(client, auth, temp_root):
+    r = client.post("/api/files/rename", headers=auth,
+                    json={"src": "README.md", "dst": "RENAMED.md"})
+    assert r.status_code == 200
+    assert (temp_root / "RENAMED.md").exists()
+    assert not (temp_root / "README.md").exists()
+
+
+def test_rename_to_existing_refused(client, auth):
+    r = client.post("/api/files/rename", headers=auth,
+                    json={"src": "README.md", "dst": "notes/a.md"})
+    assert r.status_code == 409
+
+
+def test_search_with_show_hidden(client, auth):
+    """show_hidden lets search/grep see .* files."""
+    r = client.get("/api/files/grep?q=hidden&show_hidden=true", headers=auth)
+    hits = r.json()["hits"]
+    assert any(".secret" in h["path"] for h in hits)
+
+
+def test_mkdir_nested(client, auth, temp_root):
+    r = client.post("/api/files/mkdir", headers=auth,
+                    json={"path": "a/b/c/d"})
+    assert r.status_code == 200
+    assert (temp_root / "a" / "b" / "c" / "d").is_dir()
+
+
+def test_list_truncated_flag(client, auth, temp_root):
+    """When list_dir hits MAX_LIST_ENTRIES, truncated=true."""
+    big = temp_root / "big"
+    big.mkdir()
+    for i in range(550):
+        (big / f"f{i:04d}.txt").write_text("x")
+    r = client.get("/api/files/list?path=big", headers=auth)
+    d = r.json()
+    assert d["truncated"] is True
+    assert len(d["entries"]) == 500   # MAX_LIST_ENTRIES
+
+
+def test_no_extension_text_file(client, auth, temp_root):
+    """Files like Dockerfile / Makefile (no ext) should be readable."""
+    (temp_root / "Dockerfile").write_text("FROM python:3.12\n")
+    r = client.get("/api/files/read?path=Dockerfile", headers=auth)
+    assert r.status_code == 200
+    assert "FROM python" in r.text
+
+
+def test_unknown_extension_allowed_when_text(client, auth, temp_root):
+    """Unknown extensions (.weird, .tmpl, .j2 …) preview as text if the content
+    is actually text. Whitelist→blacklist+sniff inversion."""
+    (temp_root / "x.weird").write_text("hi")
+    r = client.get("/api/files/read?path=x.weird", headers=auth)
+    assert r.status_code == 200
+    assert r.text == "hi"
+
+
+def test_known_binary_extension_rejected(client, auth, temp_root):
+    """Fast-path 415 for known-binary extensions before reading content."""
+    (temp_root / "blob.zip").write_bytes(b"PK\x03\x04not really a zip")
+    r = client.get("/api/files/read?path=blob.zip", headers=auth)
+    assert r.status_code == 415
+
+
+def test_binary_content_rejected_by_sniff(client, auth, temp_root):
+    """File with no known-binary extension but NUL bytes in content → 415."""
+    (temp_root / "weird.dat").write_bytes(b"some\x00binary\x00data")
+    r = client.get("/api/files/read?path=weird.dat", headers=auth)
+    assert r.status_code == 415
+
+
+def test_tmpl_file_previewable(client, auth, temp_root):
+    """Regression: .tmpl was blocked by the old whitelist; should preview now."""
+    (temp_root / "muselab.service.tmpl").write_text(
+        "[Unit]\nDescription={{NAME}}\n")
+    r = client.get("/api/files/read?path=muselab.service.tmpl", headers=auth)
+    assert r.status_code == 200
+    assert "{{NAME}}" in r.text
+
+
+def test_empty_file_previewable(client, auth, temp_root):
+    """Empty file is text by definition."""
+    (temp_root / "empty.foo").write_text("")
+    r = client.get("/api/files/read?path=empty.foo", headers=auth)
+    assert r.status_code == 200
+    assert r.text == ""
+
+
+def test_chinese_markdown_at_sniff_boundary_previewable(client, auth, temp_root):
+    """Regression: CJK markdown files exceeding the 4 KB sniff window were
+    wrongly tagged binary because the chunk boundary split a 3-byte UTF-8
+    char and plain decode() raised UnicodeDecodeError, then the fallback
+    high-bit ratio test rejected as binary (CJK is ~100% high-bit)."""
+    chinese = "今天天气真好，我去公园散步。" * 400   # ~10 KB of pure CJK
+    (temp_root / "cn.md").write_text(chinese, encoding="utf-8")
+    r = client.get("/api/files/read?path=cn.md", headers=auth)
+    assert r.status_code == 200
+    assert "今天天气真好" in r.text
+
+
+# ---- csv preview ----
+
+def test_csv_preview_basic(client, auth, temp_root):
+    """Comma-separated file: sniffed header + paginated rows."""
+    (temp_root / "small.csv").write_text(
+        "name,age,city\nAlice,30,Beijing\nBob,25,Shanghai\nCarol,40,Guangzhou\n",
+        encoding="utf-8",
+    )
+    r = client.get("/api/files/csv?path=small.csv", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["has_header"]
+    assert data["header"] == ["name", "age", "city"]
+    assert data["rows"][0] == ["Alice", "30", "Beijing"]
+    assert data["total_rows"] == 3
+    assert data["delimiter"] == ","
+
+
+def test_csv_preview_tsv(client, auth, temp_root):
+    """Tab-separated — Sniffer can mis-guess on tabby files; .tsv extension
+    forces the correct dialect."""
+    (temp_root / "t.tsv").write_text("a\tb\nv1\tv2\n", encoding="utf-8")
+    r = client.get("/api/files/csv?path=t.tsv", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["delimiter"] == "\t"
+    assert data["rows"][0] == ["v1", "v2"]
+
+
+def test_csv_preview_pagination(client, auth, temp_root):
+    """Page-window slicing: offset skips data rows; limit caps page size.
+
+    Uses an obvious numeric/string header column so csv.Sniffer reliably
+    detects has_header=True; the pagination math is then unambiguous
+    (offset N means skip N data rows after the header)."""
+    lines = ["id,name\n"] + [f"{i},row-{i}\n" for i in range(50)]
+    (temp_root / "big.csv").write_text("".join(lines), encoding="utf-8")
+    r = client.get("/api/files/csv?path=big.csv&offset=10&limit=5", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["offset"] == 10
+    assert data["limit"] == 5
+    assert len(data["rows"]) == 5
+    # Sniffer may or may not flag the header on small samples — accept both
+    # branches: with-header skips header before counting, without-header
+    # treats line 0 as data so offset=10 lands one row earlier.
+    first_id = int(data["rows"][0][0])
+    assert first_id in (9, 10)
+    assert int(data["rows"][4][0]) == first_id + 4
+    assert data["total_rows"] in (50, 51)
+
+
+def test_csv_preview_rejects_non_csv(client, auth):
+    """README.md is text but not CSV — endpoint rejects with 415."""
+    r = client.get("/api/files/csv?path=README.md", headers=auth)
+    assert r.status_code == 415

@@ -1,0 +1,4377 @@
+import os
+import threading
+import base64
+import json
+import asyncio
+import re
+import sys
+import tempfile
+import time
+import urllib.parse
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Response
+from sse_starlette.sse import EventSourceResponse
+from pydantic import BaseModel
+from claude_agent_sdk import (
+    ClaudeSDKClient, ClaudeAgentOptions,
+    AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
+    ToolUseBlock, ToolResultBlock, StreamEvent,
+    ClaudeSDKError,
+    get_session_messages,
+    delete_session as sdk_delete_session,
+    rename_session as sdk_rename_session,
+    tag_session as sdk_tag_session,
+    fork_session as sdk_fork_session,
+)
+from .auth import require_token_query, require_token
+from .settings import ROOT, MODEL, atomic_write_text, is_chinese_locale
+from . import sessions as sess
+from . import endpoints
+from .ask_user_question import (
+    build_server_for_session, register_session_queue,
+    unregister_session_queue, submit_answer,
+)
+from . import permission_request as perm
+
+# Lock serialises CLAUDE_CONFIG_DIR overrides so two concurrent
+# get_session_messages() calls for vendor sessions don't race on
+# the shared os.environ entry.
+_vendor_msg_lock = threading.Lock()
+
+
+def _cli_project_roots() -> list[Path]:
+    """Return the directories where Claude CLI writes session JSONLs:
+
+    1. ``~/.claude/projects`` — default root used by Claude (Pro OAuth /
+       Anthropic API key).
+    2. ``<tmp>/muselab-vendor-cli-config/projects`` — vendor-isolated
+       root used when muselab routes the CLI subprocess to a third-party
+       Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax / Kimi /
+       Qwen / MiMo).  See ``endpoints.env_override`` for the isolation
+       rationale.
+
+    Callers reading transcripts MUST walk both. Forgetting the vendor
+    root has caused real bugs across the codebase — vendor sessions
+    silently invisible to cost dashboard, context-meter rebuild, full-
+    text search, compact marker detection, and the JSONL existence
+    check in :func:`get_client` that picks ``session_id=`` vs
+    ``resume=`` when spawning the CLI (the wrong call → CLI exits with
+    "Session ID already in use"). The single-helper pattern makes
+    forgetting impossible.
+
+    Only existing roots are returned, so callers don't need a separate
+    ``.exists()`` guard before iterating.
+    """
+    candidates = [
+        Path.home() / ".claude" / "projects",
+        Path(tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects",
+    ]
+    return [r for r in candidates if r.exists()]
+
+
+def _find_session_jsonl(sid: str) -> Path | None:
+    """Locate the CLI JSONL for ``sid`` across both project roots.
+
+    A session lives in exactly one root (Pro/Claude vs vendor — they're
+    mutually exclusive per session), so the first match wins. Returns
+    ``None`` when the session has no on-disk transcript yet (truly new
+    session)."""
+    for projects_root in _cli_project_roots():
+        for hit in projects_root.glob(f"*/{sid}.jsonl"):
+            if hit.is_file():
+                return hit
+    return None
+
+
+def _get_session_msgs(sid: str, model: str = "") -> list:
+    """Wrapper around the SDK's get_session_messages() that temporarily sets
+    CLAUDE_CONFIG_DIR to the vendor-isolated temp dir when the session uses a
+    third-party model.
+
+    Without this, vendor-session JSONLs (written by the CLI subprocess into
+    /tmp/muselab-vendor-cli-config/projects/) are invisible to the parent
+    process, which defaults to ~/.claude/projects/.  The result is that
+    refreshing a DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo session shows
+    zero messages."""
+    if model and endpoints.is_third_party(model):
+        vendor_dir = str(endpoints._vendor_config_dir())
+        with _vendor_msg_lock:
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            try:
+                os.environ["CLAUDE_CONFIG_DIR"] = vendor_dir
+                return get_session_messages(sid, directory=str(ROOT))
+            finally:
+                if old is not None:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+                else:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    return get_session_messages(sid, directory=str(ROOT))
+
+
+router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _plain_preview(text: str, limit: int = 120) -> str:
+    """Convert markdown assistant reply to a short plain-text push body.
+    Skips table rows, code fences, heading markers and horizontal rules so
+    the notification banner shows readable prose instead of markdown noise."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    buf: list[str] = []
+    in_code = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if stripped.startswith("|"):          # table row / separator
+            continue
+        if set(stripped) <= {"-", "*", "_", " "} and len(stripped) > 2:
+            continue                           # horizontal rule
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+        cleaned = re.sub(r"[*_`]+", "", stripped)
+        if cleaned:
+            buf.append(cleaned)
+            if sum(len(s) for s in buf) >= limit:
+                break
+    result = " ".join(buf)
+    if len(result) > limit:
+        result = result[: limit - 1] + "…"
+    return result
+
+# Clients keyed by (session_id, model, effort). model + effort are part of
+# the key so that switching model OR reasoning-effort mid-session creates a
+# fresh client (which uses resume=session_id to inherit the conversation
+# history from disk). The effort dimension was added 2026-05-21 so per-tab
+# "research mode" doesn't leak into other tabs of the same session.
+_clients: dict[tuple[str, str, str], ClaudeSDKClient] = {}
+# Tracks the permission_mode currently active on each cached client. SDK
+# doesn't expose a getter, so we shadow what we asked for. Lets a cached
+# client whose mode no longer matches the request swap via
+# client.set_permission_mode() instead of needing a full rebuild.
+_client_permission: dict[tuple[str, str, str], str] = {}
+
+
+class TurnBroadcast:
+    """Fan-out for an in-flight assistant turn.
+
+    Why: the SSE event_gen used to be the sole consumer of SDK output
+    via merge_q; when the browser closed, the generator unwound and
+    cancelled pump_claude, killing the in-progress reply.
+
+    Now event_gen runs as a detached background task that PUBLISHES
+    every SSE event it would have yielded to this broadcast. The HTTP
+    endpoint is just a SUBSCRIBER — it replays the existing buffer +
+    streams new events. A reconnecting browser becomes a new subscriber
+    and gets the full reply via replay + live tail, with no extra logic
+    on the SDK side. Up to 30 min per turn (asyncio.wait_for at the
+    background-task level). Removed from `_active_turns` when finished.
+    """
+    def __init__(self, session_id: str, model: str = ""):
+        self.session_id = session_id
+        self.model = model
+        self.events: list[dict] = []
+        self.subscribers: set[asyncio.Queue] = set()
+        self.done = False
+        self.started_at = time.time()
+        # User-side context for this turn — populated when the SSE
+        # endpoint kicks off a new turn. Needed because SDK CLI only
+        # flushes the session JSONL at turn completion; mid-turn reloads
+        # would see an empty session unless we reconstruct the message
+        # list from broadcast state. The user message itself isn't in
+        # `events` (those are server→client SSE events; user prompt is
+        # a separate input channel) so we keep it on the broadcast.
+        self.user_text: str = ""
+        self.user_images: list[dict] = []
+        self.user_docs: list[dict] = []
+
+    def publish(self, event: dict) -> None:
+        self.events.append(event)
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+    def finish(self) -> None:
+        if self.done:
+            return
+        self.done = True
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(None)   # sentinel — subscribers stop yielding
+            except Exception:
+                pass
+        # Do NOT clear self.events here — late subscribers (reconnecting
+        # browsers) still need the replay buffer. The list is small and
+        # will be GC'd when the broadcast object itself is removed from
+        # _active_turns.
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self.subscribers.add(q)
+        # If the turn already finished, finish() has already iterated the
+        # subscriber set and fired the sentinel — but THIS queue wasn't
+        # in it yet. Without seeding the sentinel here, _subscribe_broadcast
+        # would hang on `await q.get()` until the HTTP read times out.
+        # Late subscribers (e.g. a browser reconnecting just after the
+        # turn closed) must still see the replay-then-terminate flow.
+        if self.done:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self.subscribers.discard(q)
+
+
+# In-flight turns by session id. Lookup target for reconnect.
+_active_turns: dict[str, TurnBroadcast] = {}
+# LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
+# muselab leaks memory as users open more sessions. New clients append to
+# the tail; on cache miss with len > cap, oldest gets disconnected.
+_client_lru: list[tuple[str, str, str]] = []   # (session_id, model, effort)
+_CLIENT_POOL_CAP = int(os.environ.get("MUSELAB_CLIENT_POOL_CAP", "3"))
+_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# In-flight turn persistence (survives muselab process restart)
+# ---------------------------------------------------------------------------
+# Why: `_active_turns` is in-memory only. If muselab restarts mid-turn
+# (systemd OOM-kill / manual restart / crash / `systemctl --user restart`),
+# the user's prompt is lost and they may not even realize the turn never
+# replied. We write a tiny sidecar JSON to disk per in-flight turn, delete
+# it on clean completion, and on process startup scan for orphans to tell
+# the frontend "you had N unfinished turns last session."
+#
+# Design choices:
+# - Sidecar lives under `sessions/active_turns/<sid>.json`, not `~/.muselab/`,
+#   because SESS_DIR already exists, is gitignored, and is the natural sibling
+#   for per-session state.
+# - We do NOT auto-resume. Auto-resume would burn tokens on conversations the
+#   user has already abandoned and bypass their "should I rephrase?" judgment.
+#   Frontend gets the list + sids and toasts the user — they decide.
+# - File presence == status "in_flight". Don't bother with a status field;
+#   deletion is the only terminal action.
+# - No periodic touch / last_event_ts. Adding background touch task per turn
+#   means N file writes per second across active turns — not worth the
+#   complexity for "stale by 30s vs 30min" UX granularity. `started_at` is
+#   enough to show "5 min ago" in the toast.
+
+_ACTIVE_TURN_DIR = sess.SESS_DIR / "active_turns"
+_ACTIVE_TURN_DIR.mkdir(exist_ok=True)
+
+
+def _active_turn_path(sid: str) -> Path:
+    return _ACTIVE_TURN_DIR / f"{sid}.json"
+
+
+def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
+    """Persist the in-flight turn so a restart can surface it to the UI.
+    Best-effort: a failure here must NOT abort the turn (we'd rather run
+    the user's prompt without a recovery breadcrumb than refuse to run)."""
+    try:
+        raw = bc.user_text or ""
+        first_line = raw.strip().splitlines()[0] if raw.strip() else ""
+        preview = first_line if len(first_line) <= 200 else first_line[:199] + "…"
+        atomic_write_text(
+            _active_turn_path(bc.session_id),
+            json.dumps({
+                "sid": bc.session_id,
+                "user_text": raw,
+                "user_text_preview": preview,
+                "model": bc.model,
+                "started_at": bc.started_at,
+            }, ensure_ascii=False),
+        )
+    except Exception as e:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[chat] failed to write active-turn sidecar sid={bc.session_id}: "
+            f"{type(e).__name__}: {e}\n")
+        _sys.stderr.flush()
+
+
+def _delete_active_turn_sidecar(sid: str) -> None:
+    """Called on clean turn termination (success / error / timeout). The
+    only case where we leave it on disk is when the process dies before
+    reaching this — exactly the case we want startup scan to catch."""
+    try:
+        p = _active_turn_path(sid)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _scan_interrupted_turns_at_startup() -> dict[str, dict]:
+    """Read all sidecars left over from a previous process. Runs once at
+    module import. Keeps the files on disk until the user dismisses each
+    one — that way two browsers can both see the notification, and a
+    second muselab restart still surfaces undismissed entries."""
+    out: dict[str, dict] = {}
+    if not _ACTIVE_TURN_DIR.exists():
+        return out
+    for p in _ACTIVE_TURN_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            sid = data.get("sid") or p.stem
+            out[sid] = data
+        except Exception as e:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[chat] skipping malformed active-turn sidecar {p.name}: "
+                f"{type(e).__name__}: {e}\n")
+    return out
+
+
+# Snapshot taken once at process startup. Endpoints serve from this dict;
+# starting a new turn for an sid here auto-dismisses (the new turn supersedes
+# the old in-flight). Don't re-scan disk on each request — once consumed by a
+# browser dismiss, the user has acknowledged.
+_interrupted_at_startup: dict[str, dict] = _scan_interrupted_turns_at_startup()
+
+
+# Global aggregate stats (across all sessions). cache_read / cache_creation
+# come from the Anthropic prompt cache — high cache_read ratio means subsequent
+# turns are much cheaper. Surfacing this in the UI lets the user see the value
+# of long sessions vs constantly opening new ones.
+_stats = {"total_cost_usd": 0.0, "total_messages": 0,
+          "total_input_tokens": 0, "total_output_tokens": 0,
+          "total_cache_read_tokens": 0, "total_cache_creation_tokens": 0}
+
+# Per-session current state — populated from the LATEST ResultMessage of each
+# session. The model's `input_tokens` on a turn ≈ current context window size,
+# so tracking the most-recent value gives a meaningful "context meter".
+_session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
+                                          #         cache_read_tokens,
+                                          #         cache_creation_tokens,
+                                          #         total_cost_usd, last_turn_at}
+
+# Per-model context windows. Used as the meter's denominator when a SDK
+# get_context_usage() truth isn't available (first turn of a session, or
+# any third-party model where CLI's tokenizer / window inference is
+# unreliable). Numbers verified 2026-05-18 from each vendor's docs:
+#   - Anthropic:   tygartmedia.com / anthropic.com (Opus/Sonnet 4.6+ default
+#                  to 1M on Pro/Max/Enterprise; Haiku 4.5 stays 200K)
+#   - DeepSeek V4: api-docs.deepseek.com (V4 series ships 1M native context)
+#   - Zhipu GLM:   glm-5.org / docs.z.ai (GLM-5 + GLM-4.7 both 200K context)
+#   - MiniMax:     platform.minimax.io (M2.5 / M2.7 both 204_800, cline #10007
+#                  PR fixed the prior 192K/245K misinformation)
+MODEL_CONTEXT_LIMITS = {
+    # Anthropic — 1M on Pro/Max plans (auto-upgrade, no flag needed). Haiku
+    # stayed at the older 200K since it's the speed/cost tier.
+    "claude-opus-4-7":            1_000_000,
+    "claude-sonnet-4-6":          1_000_000,
+    "claude-haiku-4-5-20251001":    200_000,
+    # DeepSeek V4 series — 1M native, all SKUs.
+    "deepseek-v4-pro":            1_000_000,
+    "deepseek-v4-flash":          1_000_000,
+    # DeepSeek V3 chat/reasoner SKUs — older 128K window kept.
+    "deepseek-chat":                128_000,
+    "deepseek-reasoner":            128_000,
+    # Zhipu GLM 5 series — 200K context, 128K output cap.
+    "glm-5":                        200_000,
+    "glm-5-air":                    200_000,
+    "glm-4.7":                      200_000,
+    "glm-4-plus":                   128_000,   # older 4-plus stayed 128K
+    # MiniMax — 204_800 exactly, per platform.minimax.io spec.
+    "minimax-m2.7":                 204_800,
+    "minimax-m2.7-highspeed":       204_800,
+    "minimax-m2.5":                 204_800,
+}
+DEFAULT_CONTEXT_LIMIT = 128_000
+
+# Soft budget. If set (via MUSELAB_BUDGET_USD env or PUT /api/settings),
+# usage endpoint flags overrun so the UI can color the cost badge red.
+def _is_real_user_prompt(sm: Any) -> bool:
+    """True if ``sm`` is a user message the human actually typed.
+
+    SDK 0.2.82's get_session_messages doesn't really filter tool-use
+    sidechain frames — every wrapped tool_result still comes back as
+    ``type="user"`` with ``parent_tool_use_id=None``, contrary to the
+    docstring. So we discriminate by content shape: real user prompts
+    contain text (string content, or a list with at least one non-
+    tool_result block); pure-tool_result frames are sidechain echoes
+    and don't count as a turn.
+
+    Without this filter a session with 45 prompts + heavy agent tool
+    use shows up as 300+ turns in the picker.
+    """
+    if sm is None or getattr(sm, "type", None) != "user":
+        return False
+    if getattr(sm, "parent_tool_use_id", None):
+        return False
+    msg = getattr(sm, "message", None)
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        # If any block is non-tool_result (text / image / etc.) → real prompt.
+        for b in content:
+            if isinstance(b, dict) and b.get("type") != "tool_result":
+                return True
+        return False
+    # Unknown shape — default to "real" so we don't under-count.
+    return True
+
+
+def _budget_usd() -> float:
+    try:
+        return float(os.environ.get("MUSELAB_BUDGET_USD", "0") or 0)
+    except ValueError:
+        return 0.0
+
+
+_MEMORY_DIR_PATH = (
+    f"~/.claude/projects/{str(ROOT).replace('/', '-')}/memory/"
+    if ROOT is not None
+    else "~/.claude/memory/"
+)
+
+SYSTEM_PROMPT = f"""\
+You are Muse, a personal assistant running inside muselab — a self-hosted AI
+workspace on the user's own machine. The user's files live at the archive root
+{ROOT} (path varies per install). You can browse and edit anything under that
+root via the available tools.
+
+# Who Muse is
+- One assistant, not split personalities. You hold the user's information
+  across whichever life dimensions they've put in the archive
+  (health / work / money / people / notes / …) and reason across them.
+- The user may have written a CLAUDE.md (at the archive root or in
+  ~/.claude/) describing who they are, what they care about, and how
+  they want you to respond. Treat it as ground truth about *them*.
+
+# Defaults
+- Be concise. Lead with the conclusion, then the supporting detail.
+- Reply in the same language as the user's last message.
+- Tables and bullet lists beat long paragraphs for comparing options.
+  Code blocks for code, with the language tag.
+- No "As an AI assistant…", no "I'd be happy to…", no apologizing for
+  things you didn't do. Skip the preamble, answer the question.
+
+# Tools
+- Read / Grep / Glob / Bash to explore the archive freely before
+  answering. Don't guess file contents — read them.
+- Edit / Write for changes. For non-trivial edits, show the diff intent
+  before touching the file.
+- `mcp__muselab__ask_user_question`: use this when you need the user to
+  pick from 2–4 mutually exclusive options. The UI renders clickable
+  buttons — faster than asking in plain text. NOT for open-ended
+  questions; for those, ask in plain text.
+
+# Memory (cross-conversation long-term memory)
+Claude Code keeps a file-based memory at `{_MEMORY_DIR_PATH}`.
+`MEMORY.md` in that dir is the index; its first 200 lines (or 25KB)
+load automatically at session start.
+
+When you learn something that should survive across conversations —
+a stable user preference, a personal fact, a behavior correction, an
+ongoing-project context — save a memory file via Write / Edit, then
+add a one-line entry to `MEMORY.md`.
+
+Naming conventions (mirror what's already there if the dir is
+non-empty):
+- `user_*.md` — identity, persistent facts about the user
+- `feedback_*.md` — behavior rules the user has corrected you on
+- `project_*.md` — context for an ongoing initiative
+- `reference_*.md` — pointers to authoritative files in the archive
+
+Don't memorize:
+- Trivial facts that change daily
+- Things already in archive files (just reference them with a
+  `reference_*.md` pointer)
+- Anything the user asked you NOT to remember
+
+When something changes, update the existing entry — don't duplicate.
+When in doubt, ask the user "should I remember this?" before writing.
+
+# When the user has a CLAUDE.md
+That document is the user's own rules for how you should behave around
+them. Follow it. If it conflicts with anything above, the user's
+CLAUDE.md wins — they wrote it on purpose.
+"""
+
+
+# Per-(sid, model, effort) creation lock. Coalesces parallel cache misses
+# on the same key (so we don't spawn two CLI subprocesses for one tab) while
+# leaving DIFFERENT keys free to build concurrently. Replaces the global
+# _lock-across-await pattern that froze every other request for 3-5 s while
+# one slow `client.connect()` ran.
+_creation_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+
+
+def _creation_lock_for(key: tuple[str, str, str]) -> asyncio.Lock:
+    return _creation_locks.setdefault(key, asyncio.Lock())
+
+
+async def _build_and_connect_client(
+    session_id: str, model: str, permission: str, effort: str,
+) -> ClaudeSDKClient:
+    """The slow path: build ClaudeAgentOptions, instantiate ClaudeSDKClient,
+    call .connect() with retry. NEVER holds _lock — multi-second CLI
+    subprocess spawn must not block sibling requests. Caller is responsible
+    for serialising concurrent misses on the same key via _creation_lock_for().
+    """
+    # Use session's custom system prompt if set, else fall back to muselab default.
+    sess_data = sess.get_session(session_id) or {}
+    custom_sp = (sess_data.get("system_prompt") or "").strip()
+    sp = f"{custom_sp}\n\n---\n\n{SYSTEM_PROMPT}" if custom_sp else SYSTEM_PROMPT
+    # New CLI rule: session_id + resume/continue conflict unless fork_session
+    # is set. So we use resume alone — it both loads existing state AND
+    # implies the session id. Falls back to session_id-only for new sessions.
+    # SDK default max_buffer_size is 1 MB. A single tool_use JSON message
+    # (Edit on a large file, or Read of a long file) can blow past that
+    # and kill the message reader silently — the chat then "hangs forever"
+    # because no more chunks arrive. Bump to 32 MB; configurable via env.
+    max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
+    # Critical SDK option distinction:
+    #   `session_id=X`  → force a NEW session to use UUID X (fails if
+    #                     CLI already has a JSONL for X)
+    #   `resume=X`      → resume an EXISTING session by UUID X
+    # If we always use `resume` for un-streamed sessions, CLI generates
+    # a fresh UUID and orphans ours. If we always use `session_id`,
+    # any session that's ever streamed errors with "already in use".
+    # Detect JSONL existence by RECURSIVELY scanning the CLI's projects
+    # root — SDK's _find_project_dir relies on path-hash matching that
+    # has been unreliable in some setups (user's CLI saw the JSONL but
+    # the SDK helper didn't). _find_session_jsonl walks BOTH default
+    # and vendor roots so vendor sessions don't look "new" here — passing
+    # `session_id=` for an existing JSONL makes the CLI exit with
+    # "Session ID already in use", and the fallback at the bottom of
+    # this function doesn't catch it (the CLI dies inside the SDK's
+    # background message reader, not during `client.connect()`).
+    jsonl_exists = False
+    try:
+        jsonl_exists = _find_session_jsonl(session_id) is not None
+    except Exception as e:
+        import sys as _sys
+        _sys.stderr.write(f"[muselab] jsonl_exists check failed for {session_id}: {e}\n")
+    # CLI stderr capture — without this, ProcessError just says
+    # "Check stderr output for details" with no actual details and
+    # we can't tell whether the CLI rejected --session-id, hit an
+    # auth error, or something else. Pipe every line into muselab's
+    # stderr.log so the next failure is debuggable.
+    import sys as _sys
+    def _cli_stderr(line: str) -> None:
+        _sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
+        _sys.stderr.flush()
+
+    opts_kwargs = dict(
+        cwd=str(ROOT),
+        model=endpoints.normalize_model_id(model),
+        permission_mode=permission,
+        system_prompt=sp,
+        max_buffer_size=max_buf,
+        stderr=_cli_stderr,
+        # Block harness-only tools the SDK exposes by default. AskUserQuestion
+        # is intentionally NOT blocked: we re-implement it via in-process MCP
+        # (mcp__muselab__ask_user_question) — see backend/ask_user_question.py.
+        # The system prompt tells the model to use that name. The built-in
+        # version is left enabled too as a fallback if the model forgets the
+        # MCP name; the frontend renders both shapes.
+        disallowed_tools=[
+            "ExitPlanMode",           # plan-mode handshake — no UI yet
+            "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
+            "CronCreate", "CronDelete", "CronList",
+            "EnterPlanMode", "EnterWorktree", "ExitWorktree",
+            "Monitor", "PushNotification", "RemoteTrigger",
+            "ShareOnboardingGuide",
+        ],
+        # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
+        # (cwd/CLAUDE.md → the user's archive), and local (.claude/
+        # within cwd). Also enables skill discovery from the same scopes.
+        setting_sources=["user", "project", "local"],
+        # Bind THIS session to muselab's chosen UUID — either as a new
+        # session (session_id=) or by resuming the existing one (resume=).
+        **({"resume": session_id} if jsonl_exists else {"session_id": session_id}),
+        # Token-level streaming: SDK emits StreamEvent for each delta
+        # the model produces (text / thinking). Without this, we only
+        # see full blocks at the end → user waits for the whole reply
+        # before seeing anything. With this, each token shows up.
+        include_partial_messages=True,
+    )
+    # Skills get attached to the system prompt as JSON tool defs.
+    # Claude handles a large skill catalog fine; third-party vendors
+    # (DeepSeek / GLM / MiniMax) often time out or 400 on the bigger
+    # payload. So default to skills only on Claude; opt-out via env.
+    is_third_party = endpoints.is_third_party(model)
+    skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in ("1", "true", "yes")
+    if not is_third_party and not skills_off:
+        opts_kwargs["skills"] = "all"
+    # Optional model params from env (UI-editable via /api/settings).
+    mt = int(os.environ.get("MUSELAB_MAX_TURNS", "0") or 0)
+    if mt > 0:
+        opts_kwargs["max_turns"] = mt
+    # For non-Claude models, point the SDK at the vendor's own
+    # Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax).
+    # This way the SDK's full agent loop (tools, MCP, skills, CLAUDE.md)
+    # works uniformly across providers — no router process needed.
+    # Claude models still go direct so Pro OAuth keeps working.
+    env_ovr = endpoints.env_override(model)
+    if env_ovr is not None:
+        opts_kwargs["env"] = env_ovr
+    else:
+        # No env_override == this is Claude (or unknown model). CLI needs
+        # ONE of: ~/.claude/.credentials.json (Pro OAuth), ANTHROPIC_API_KEY
+        # in env, or ANTHROPIC_AUTH_TOKEN. If none of those are present, CLI
+        # exits 1 with "Not logged in" BEFORE producing any stderr — leaving
+        # only a useless ProcessError. Pre-check and raise a clean message
+        # so the UI can surface "请先配置 Anthropic API key 或运行 claude login"
+        # instead of a generic stream-failure.
+        cred_file = Path.home() / ".claude" / ".credentials.json"
+        if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
+                and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            raise ClaudeSDKError(
+                f"Claude model '{model}' requires auth: either run "
+                f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
+                f"Settings. CLI would exit 1 silently otherwise."
+            )
+        # Capture CLI stderr so vendor 401 / network errors surface
+        # in /tmp/muselab-restart.log instead of vanishing silently.
+        def _stderr_logger(line: str) -> None:
+            sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
+            sys.stderr.flush()
+        opts_kwargs["stderr"] = _stderr_logger
+    # MCP servers: always register the in-process muselab server (for
+    # ask_user_question). Then merge in:
+    #   - muselab's own mcp.json (UI-managed)
+    #   - Claude Code's standard MCP config locations (~/.claude.json,
+    #     ~/.claude/settings.json, <archive>/.mcp.json) so any MCP the
+    #     user already added via `claude mcp add` "just works" without
+    #     re-entering — muselab is positioned as a Claude Code replacement.
+    # See backend/api_settings.py _load_mcp_merged for the merge rules.
+    mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
+    try:
+        from .api_settings import _load_mcp_merged
+        for name, spec in _load_mcp_merged().items():
+            if not isinstance(spec, dict):
+                continue
+            # Skip disabled servers (UI toggle OR override stub).
+            if spec.get("disabled"):
+                continue
+            # Strip muselab-local metadata keys before handing to SDK —
+            # `_source` / `_overridden_by_muselab` / `disabled` are
+            # display/control fields, not part of the MCP spec.
+            clean = {k: v for k, v in spec.items()
+                     if not k.startswith("_") and k != "disabled"}
+            # Defensive: external sources may have entries without
+            # `command` (e.g. broken Claude Code config). Skip rather
+            # than hand the SDK an unconnectable spec.
+            if "command" not in clean and "url" not in clean:
+                continue
+            mcp_dict[name] = clean
+    except Exception as e:
+        # Don't silently drop EVERY MCP server because one source had a
+        # parse error — log + carry on with the built-in. _load_mcp_merged
+        # already swallows per-file errors and stderr's them; this catch
+        # is for unexpected programmer errors only.
+        sys.stderr.write(
+            f"[chat] mcp merge failed for sid={session_id[:8]}: "
+            f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
+        sys.stderr.flush()
+    opts_kwargs["mcp_servers"] = mcp_dict
+    # Enable extended thinking for models whose provider endpoint handles
+    # the standard Anthropic thinking config. Some vendors (e.g. Qianfan)
+    # reject thinking because their max_completion_tokens cap (~12k) can't
+    # accommodate the thinking budget we normally pass (~4k) alongside the
+    # output max_tokens the SDK computes — the total exceeds their limit.
+    # For those providers we skip thinking entirely; the model still works
+    # but without visible reasoning blocks.
+    provider = endpoints.lookup(model)
+    supports_thinking = (provider is None) or provider.supports_thinking
+    if supports_thinking:
+        from claude_agent_sdk import ThinkingConfigEnabled
+        budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
+        opts_kwargs["thinking"] = ThinkingConfigEnabled(
+            type="enabled", budget_tokens=budget)
+    else:
+        from claude_agent_sdk import ThinkingConfigDisabled
+        opts_kwargs["thinking"] = ThinkingConfigDisabled(type="disabled")
+    # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
+    # picks an effort automatically; this override lets users force a
+    # deeper budget on specific tabs (e.g. xhigh for research). SDK
+    # rejects unknown strings, so guard the literal set.
+    _VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
+    if effort and effort in _VALID_EFFORT:
+        opts_kwargs["effort"] = effort
+    # Wire the SDK's can_use_tool callback UNCONDITIONALLY (2026-05-23).
+    # Two responsibilities:
+    #   1. Per-tool permission prompts (only when permission != bypass).
+    #   2. Routing built-in AskUserQuestion calls to muselab's UI — needed
+    #      ALWAYS, even on bypassPermissions. Without this, when the model
+    #      calls SDK's built-in `AskUserQuestion` (the shorter name —
+    #      models often forget the longer `mcp__muselab__ask_user_question`
+    #      MCP alias), the SDK's default tool handler tries to surface a
+    #      terminal-style prompt that obviously can't render in the web
+    #      UI → user sees "no options to pick" and is stuck waiting.
+    # The `bypass` flag tells the callback to auto-allow everything except
+    # AskUserQuestion, preserving the no-prompts UX while still surfacing
+    # the model's questions.
+    opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
+        session_id, bypass=(permission == "bypassPermissions"))
+    try:
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
+        await client.connect()
+        return client
+    except Exception as e:
+        # Two failure modes we recover from by swapping session_id ⇔ resume:
+        #   - tried `resume=` but CLI has no on-disk session for it
+        #     → swap to `session_id=` (create fresh tied to our UUID)
+        #   - tried `session_id=` but CLI reports "already in use"
+        #     (its internal lock leaked, or a JSONL appeared between
+        #     our glob check and the spawn) → swap to `resume=`
+        err_text = str(e).lower()
+        used_session_id = "session_id" in opts_kwargs
+        if used_session_id and "already in use" in err_text:
+            opts_kwargs.pop("session_id", None)
+            opts_kwargs["resume"] = session_id
+        else:
+            opts_kwargs.pop("resume", None)
+            opts_kwargs["session_id"] = session_id
+        # The fallback can ALSO hit "already in use" — retry with backoff.
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                client = ClaudeSDKClient(
+                    options=ClaudeAgentOptions(**opts_kwargs))
+                await client.connect()
+                if attempt > 0:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat] sid={session_id[:8]} connect retry "
+                        f"succeeded on attempt {attempt + 1}\n")
+                    _sys.stderr.flush()
+                return client
+            except Exception as e2:
+                last_err = e2
+                if "already in use" not in str(e2).lower():
+                    raise
+                # Backoff: 200ms, 400ms, 800ms, 1600ms (~3s total).
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat] sid={session_id[:8]} attempt {attempt + 1} "
+                    f"hit 'already in use', backing off "
+                    f"{200 * (2 ** attempt)}ms\n")
+                _sys.stderr.flush()
+                await asyncio.sleep(0.2 * (2 ** attempt))
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("unreachable")   # for type checker
+
+
+async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
+                     effort: str = "") -> ClaudeSDKClient:
+    """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
+    Switching model OR effort in the UI yields a fresh client; resume=session_id
+    loads the same on-disk conversation history into the new client.
+
+    Concurrency: _lock is only held across synchronous dict / LRU operations.
+    The slow `await client.connect()` runs OUTSIDE _lock under a per-key
+    creation lock — concurrent callers for different (sid, model, effort)
+    keys never block each other; concurrent callers for the SAME key
+    coalesce so we don't spawn two CLI subprocesses for one tab.
+
+    effort: "" (SDK adaptive) / "low" / "medium" / "high" / "xhigh" / "max".
+    Anything else is ignored — invalid values fall back to the SDK default."""
+    key = (session_id, model, effort)
+
+    # Fast path: cache hit. Lock just long enough to read + touch LRU.
+    async with _lock:
+        cached = _clients.get(key)
+        if cached is not None:
+            if key in _client_lru:
+                _client_lru.remove(key)
+            _client_lru.append(key)
+        cached_perm = _client_permission.get(key) if cached is not None else None
+
+    if cached is not None:
+        # set_permission_mode runs OUTSIDE _lock — it can take seconds and
+        # we never want sibling requests to wait on it. The cache key is
+        # (sid, model, effort), NOT permission, so swapping permission
+        # doesn't trigger a CLI subprocess rebuild.
+        if cached_perm != permission:
+            try:
+                await cached.set_permission_mode(permission)
+                _client_permission[key] = permission
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat] set_permission_mode {cached_perm}→{permission} "
+                    f"failed for {key}: {type(e).__name__}: {e}\n")
+                _sys.stderr.flush()
+        return cached
+
+    # Cache miss: build a new client OUTSIDE _lock. Per-key creation
+    # lock prevents two concurrent misses on the same key from spawning
+    # two CLI subprocesses (where one becomes orphaned).
+    async with _creation_lock_for(key):
+        # Re-check under the global lock — another coroutine may have
+        # already finished building while we waited for the creation lock.
+        async with _lock:
+            cached = _clients.get(key)
+            if cached is not None:
+                if key in _client_lru:
+                    _client_lru.remove(key)
+                _client_lru.append(key)
+                return cached
+
+        # Slow path — no awaits hold _lock.
+        client = await _build_and_connect_client(session_id, model, permission, effort)
+
+        # Commit + LRU eviction. Eviction's await disconnect() runs
+        # OUTSIDE _lock (the disconnect can take up to 5 s). Eviction
+        # also SKIPS any client whose session has an in-flight turn —
+        # dropping a live stream mid-flow looked like "Muse just stopped
+        # talking" to the user (no error event, just dead air).
+        to_disconnect: list[tuple[tuple[str, str, str], ClaudeSDKClient]] = []
+        async with _lock:
+            _clients[key] = client
+            _client_permission[key] = permission
+            _client_lru.append(key)
+            while len(_client_lru) > _CLIENT_POOL_CAP:
+                # Find the oldest evictable client: not ourselves, not
+                # currently streaming. If every cached client is live,
+                # leave the pool over its cap until the next eviction
+                # attempt — better than killing somebody's reply.
+                candidate_idx = None
+                for i, k in enumerate(_client_lru):
+                    if k == key:
+                        continue
+                    if k[0] in _active_turns and not _active_turns[k[0]].done:
+                        continue
+                    candidate_idx = i
+                    break
+                if candidate_idx is None:
+                    break
+                old_key = _client_lru.pop(candidate_idx)
+                old_client = _clients.pop(old_key, None)
+                _client_permission.pop(old_key, None)
+                if old_client is not None:
+                    to_disconnect.append((old_key, old_client))
+
+        for old_key, c in to_disconnect:
+            try:
+                await c.disconnect()
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[client-pool] evict {old_key} disconnect err: {e}\n")
+                _sys.stderr.flush()
+
+        return client
+
+
+async def disconnect_client(session_id: str) -> None:
+    """Disconnect every cached client for this session (across all models).
+    The disconnect() call can wait up to 5 s for the CLI subprocess to
+    exit; we pop dict entries under _lock but do the await OUTSIDE so
+    other requests aren't blocked for seconds at a time."""
+    to_disconnect: list[ClaudeSDKClient] = []
+    async with _lock:
+        keys = [k for k in _clients if k[0] == session_id]
+        for k in keys:
+            c = _clients.pop(k, None)
+            _client_permission.pop(k, None)
+            _creation_locks.pop(k, None)
+            if k in _client_lru:
+                _client_lru.remove(k)
+            if c is not None:
+                to_disconnect.append(c)
+    for c in to_disconnect:
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
+
+
+# ====== sessions REST ======
+
+class CreateReq(BaseModel):
+    name: str | None = None
+    model: str | None = None
+
+
+_last_orphan_gc_at = 0.0
+_ORPHAN_GC_INTERVAL_S = 3600   # at most hourly
+
+
+def _attachments_base() -> Path:
+    """Root dir for user-uploaded image originals.
+
+    Lives under the user's ARCHIVE ROOT (`MUSELAB_ROOT`), not inside the
+    muselab repo. Two reasons:
+      1. The repo's `sessions/` dir was already gitignored, but conceptually
+         user-data shouldn't sit in the install dir at all — uninstall /
+         reinstall / git clean should never touch the user's files.
+      2. archive root is where the user already keeps their docs; this
+         keeps "everything personal" in one place that's easy to back up.
+
+    Hidden (dot-prefixed) so it doesn't clutter the user's file browser
+    or archive UI tree.
+    """
+    return ROOT / ".muselab-attach"
+
+
+def _migrate_legacy_attachments() -> None:
+    """One-shot migration: sessions/attachments/* → ROOT/.muselab-attach/*.
+    Runs at module import. Idempotent — only moves dirs that don't yet
+    exist in the new location. Old location is removed when empty so a
+    second-pass migration is a no-op."""
+    import shutil as _shutil
+    old_base = sess.SESS_DIR / "attachments"
+    new_base = _attachments_base()
+    if not old_base.exists() or old_base == new_base:
+        return
+    try:
+        new_base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    moved = 0
+    for child in list(old_base.iterdir()):
+        if not child.is_dir():
+            continue
+        target = new_base / child.name
+        if target.exists():
+            continue  # already migrated; skip (don't clobber)
+        try:
+            _shutil.move(str(child), str(target))
+            moved += 1
+        except OSError:
+            pass
+    # Remove empty old base
+    try:
+        if not any(old_base.iterdir()):
+            old_base.rmdir()
+    except OSError:
+        pass
+    if moved:
+        import sys as _sys
+        _sys.stderr.write(f"[muselab] migrated {moved} attachment dirs to {new_base}\n")
+        _sys.stderr.flush()
+
+
+# Run migration once at import (cheap if no-op).
+try:
+    _migrate_legacy_attachments()
+except Exception:
+    pass
+
+@router.get("/sessions", dependencies=[Depends(require_token)])
+def list_sessions_api() -> dict:
+    sessions = sess.list_sessions()
+    # Truncate heavy fields for the list view — full content fetched per-session
+    for i, s in enumerate(sessions):
+        if s.get("system_prompt") and len(s["system_prompt"]) > 200:
+            s = dict(s)  # don't mutate cache
+            s["system_prompt"] = s["system_prompt"][:200] + "…"
+            sessions[i] = s
+    # Piggy-back orphan-attachments GC here — runs at most hourly. Cheaper
+    # than a cron, and naturally fires whenever the UI is in use.
+    global _last_orphan_gc_at
+    now = time.time()
+    if now - _last_orphan_gc_at > _ORPHAN_GC_INTERVAL_S:
+        _last_orphan_gc_at = now
+        try:
+            _gc_orphan_attachments()
+        except Exception:
+            pass
+    return {"sessions": sessions}
+
+
+@router.post("/sessions", dependencies=[Depends(require_token)])
+def create_session_api(req: CreateReq) -> dict:
+    meta = sess.create_session(name=req.name or "", model=req.model or MODEL)
+    # Auto-prune: delete any empty sessions left over from previous tabs /
+    # accidental new-session clicks. Skip the one we just created so it
+    # stays available for the user's first message.
+    sess.prune_empty_sessions(keep_ids=[meta["id"]])
+    return meta
+
+
+def _seed_claude_md_and_archive_skeleton() -> None:
+    """If CLAUDE.md / archive skeleton dirs are missing under ROOT, seed
+    them from the locale-aware template files in scripts/templates/.
+    Idempotent — every step skips if the target already exists. Called
+    by /sessions/organize (and historically by /sessions/profile-intake)
+    so the curator agent's first Read tool call has something to read on
+    a brand-new install.
+    """
+    import datetime as _dt
+    import shutil as _shutil
+
+    project_claude_md = ROOT / "CLAUDE.md"
+    is_zh = is_chinese_locale()
+    repo_root = Path(__file__).resolve().parent.parent
+
+    if not project_claude_md.exists():
+        tpl_name = "default-CLAUDE.md" if is_zh else "default-CLAUDE.en.md"
+        tpl_path = repo_root / "scripts" / "templates" / tpl_name
+        if tpl_path.exists():
+            content = tpl_path.read_text(encoding="utf-8")
+            content = content.replace(
+                "%DATE%", _dt.datetime.now().strftime("%Y-%m-%d"))
+            try:
+                project_claude_md.write_text(content, encoding="utf-8")
+            except OSError as e:
+                # Don't block session creation — agent will fail more
+                # informatively when it tries to Read a non-existent file.
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[organize] couldn't seed CLAUDE.md: {e}\n")
+                _sys.stderr.flush()
+
+    # Drop archive-skeleton subdirs so the user's first interaction has
+    # the right shape on disk. Skip ones that already exist. Mirrors
+    # what scripts/install-*.sh and intake.* do — README + concrete
+    # _example-*.md per supported subdir, so the chat-driven path
+    # produces the same starter skeleton as the installer path.
+    skel_root = repo_root / "scripts" / "templates" / "archive-skeleton"
+    readme_src = "README.md" if is_zh else "README.en.md"
+    example_suffix = ".zh.md" if is_zh else ".en.md"
+    examples_for_sub = {
+        "health":  "_example-checkup",
+        "work":    "_example-project-log",
+        "money":   "_example-budget",
+        "notes":   "_example-weekly-review",
+        "people":  "_example-person-card",
+        # archives/ intentionally has no example — it's a raw-source dir
+    }
+    for sub in ("health", "work", "money", "people", "notes", "archives"):
+        sd = ROOT / sub
+        if not sd.exists():
+            try:
+                sd.mkdir(parents=True, exist_ok=True)
+                src = skel_root / sub / readme_src
+                if src.exists():
+                    _shutil.copy(src, sd / "README.md")
+                ex_basename = examples_for_sub.get(sub)
+                if ex_basename:
+                    ex_src = skel_root / sub / (ex_basename + example_suffix)
+                    ex_dst = sd / (ex_basename + ".md")
+                    if ex_src.exists() and not ex_dst.exists():
+                        _shutil.copy(ex_src, ex_dst)
+            except OSError:
+                pass
+
+
+@router.post("/sessions/organize", dependencies=[Depends(require_token)])
+def create_organize_session_api(req: CreateReq | None = None) -> dict:
+    """Create a session preconfigured with the archive-curator system
+    prompt. The curator does BOTH archive tidying AND CLAUDE.md profile
+    completion (merged 2026-05-23 — used to be two separate buttons /
+    endpoints). If CLAUDE.md / archive subdirs are missing, they're
+    seeded from templates so the curator's first Read tool call has
+    something to work with.
+
+    Returns session metadata + an initial_message the frontend should
+    auto-send to kick off the workflow. See backend/prompts.py."""
+    from .prompts import CURATOR_SYSTEM_PROMPT, CURATOR_INITIAL_MESSAGE
+    import datetime as _dt
+    _seed_claude_md_and_archive_skeleton()
+    # Locale-aware default label so English users don't see "[整理档案]" in
+    # their tab strip. Mirrors install scripts.
+    _label = "[整理档案] " if is_chinese_locale() else "[Organize] "
+    name = (req.name if req else None) or (
+        _label + _dt.datetime.now().strftime("%m-%d %H:%M"))
+    model = (req.model if req else None) or MODEL
+    meta = sess.create_session(
+        name=name, model=model, system_prompt=CURATOR_SYSTEM_PROMPT)
+    return {**meta, "initial_message": CURATOR_INITIAL_MESSAGE}
+
+
+@router.post("/sessions/profile-intake", dependencies=[Depends(require_token)])
+def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
+    """DEPRECATED 2026-05-23 — kept for external API back-compat. The
+    profile-intake flow has been merged into /sessions/organize (single
+    button in the UI). New callers should hit /sessions/organize; this
+    endpoint now just forwards to it so any old saved bookmark / curl
+    script still works.
+
+    The old PROFILE_INTAKE_SYSTEM_PROMPT remains exported from
+    backend/prompts.py for anyone embedding muselab who wants the
+    narrower profile-only behavior."""
+    return create_organize_session_api(req)
+
+
+def _extract_searchable_text(content: Any) -> str:
+    """Extract plain text from a JSONL message.content field for search.
+    Handles both string content and list-of-blocks. Skips tool_use /
+    tool_result blocks because their inputs/outputs are usually noisy
+    JSON and not what users mean when they search."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            t = block.get("text")
+            if isinstance(t, str):
+                parts.append(t)
+        elif btype == "thinking":
+            t = block.get("thinking")
+            if isinstance(t, str):
+                parts.append(t)
+    return "\n".join(parts)
+
+
+def _make_snippet(text: str, idx: int, qlen: int, *,
+                   ctx: int = 60, max_len: int = 200) -> str:
+    """Build a search-result snippet centered on a match. Caller passes the
+    match position so we don't have to find() twice. Result is capped at
+    max_len chars with leading/trailing ellipses if truncated."""
+    start = max(0, idx - ctx)
+    end = min(len(text), idx + qlen + ctx)
+    snippet = text[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    # Collapse whitespace runs so multi-line transcripts render compactly
+    # in the search result list.
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+    if len(snippet) > max_len:
+        snippet = snippet[:max_len - 1] + "…"
+    return snippet
+
+
+@router.get("/search", dependencies=[Depends(require_token)])
+def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200),
+                         limit: int = Query(default=30, ge=1, le=100)) -> dict:
+    """Cross-session full-text search. Scans CLI JSONL files for user /
+    assistant text matching `q` (case-insensitive substring). Returns
+    hits sorted by timestamp desc. Each hit:
+        {sid, name, uuid, role, snippet, ts}
+    Implementation: line-by-line JSON parse of every JSONL under the
+    project's CLI directory. For ~200 sessions of typical size (< 1MB
+    each) this runs in <500ms — switch to SQLite FTS5 if it grows."""
+    query = q.strip()
+    if not query:
+        return {"hits": [], "total": 0}
+    qlower = query.lower()
+    if ROOT is None:
+        return {"hits": [], "total": 0}
+    cwd_key = str(ROOT).replace("/", "-")
+    # Walk per-cwd subdirs under each CLI project root — both default
+    # and vendor-isolated. Skipping vendor would silently hide every
+    # third-party session from search.
+    proj_dirs = [r / cwd_key for r in _cli_project_roots()
+                 if (r / cwd_key).exists()]
+    if not proj_dirs:
+        return {"hits": [], "total": 0}
+
+    name_map = {s["id"]: s.get("name", "") for s in sess.list_sessions()}
+
+    hits: list[dict] = []
+    PER_SESSION_CAP = 5   # avoid one chatty session swamping results
+    # Iterate JSONLs across both roots. A given sid only lives in one root
+    # at a time (vendor vs Claude is mutually exclusive per session), so
+    # PER_SESSION_CAP keyed by stem still applies cleanly.
+    jsonl_paths = [p for d in proj_dirs for p in d.glob("*.jsonl")]
+    for jsonl in jsonl_paths:
+        sid = jsonl.stem
+        per_sess = 0
+        try:
+            # utf-8-sig strips a leading BOM so JSONL writers that emit
+            # U+FEFF at the start (some CLI versions did, briefly) don't
+            # poison the "fast reject" qlower-in-line check at the start
+            # of every line — `"﻿{...}".lower()` would mismatch a
+            # qlower hitting the literal first chars.
+            with jsonl.open("r", encoding="utf-8-sig") as f:
+                for line in f:
+                    if qlower not in line.lower():
+                        continue   # fast reject before JSON parse
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if entry.get("type") not in ("user", "assistant"):
+                        continue
+                    msg = entry.get("message") or {}
+                    text = _extract_searchable_text(msg.get("content"))
+                    if not text:
+                        continue
+                    # CLI's slash-command wrapper round-trips as user
+                    # text — strip before matching so e.g. searching
+                    # "compact" doesn't surface every /compact invocation.
+                    text = _strip_cli_slash_wrapper(text) or text
+                    pos = text.lower().find(qlower)
+                    if pos < 0:
+                        continue
+                    hits.append({
+                        "sid": sid,
+                        "name": name_map.get(sid, ""),
+                        "uuid": entry.get("uuid", ""),
+                        "role": entry.get("type"),
+                        "snippet": _make_snippet(text, pos, len(query)),
+                        "ts": entry.get("timestamp", ""),
+                    })
+                    per_sess += 1
+                    if per_sess >= PER_SESSION_CAP:
+                        break
+        except OSError:
+            continue
+
+    hits.sort(key=lambda h: h["ts"], reverse=True)
+    return {"hits": hits[:limit], "total": len(hits)}
+
+
+# CLI wraps slash commands as pseudo-user messages with these tags so it can
+# round-trip through the conversation log. They're internal protocol detail
+# and should never reach the user's chat UI as a regular bubble.
+_CLI_SLASH_TAGS_RE = re.compile(
+    r"<(command-name|command-message|command-args|"
+    r"local-command-stdout|local-command-stderr)>.*?</\1>",
+    re.DOTALL,
+)
+
+
+def _strip_cli_slash_wrapper(text: str) -> str:
+    """Remove CLI slash-command protocol tags. Returns cleaned text (may be
+    empty — caller should skip rendering when empty)."""
+    if not text:
+        return text
+    return _CLI_SLASH_TAGS_RE.sub("", text).strip()
+
+
+def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
+                          compact_uuids: set[str] | None = None) -> list[dict]:
+    """Convert SDK SessionMessage list into muselab's flat UI message list.
+    Each SessionMessage may explode into multiple UI bubbles because the
+    frontend renders tool_use / tool_result / thinking blocks as separate
+    messages from the text bubble. Annotations (cost, model, images) attach
+    by message UUID to the primary text bubble. UUIDs in `compact_uuids`
+    get an `_is_compact_summary` flag so the UI can render a "📦 已压缩" pill."""
+    compact_uuids = compact_uuids or set()
+    out: list[dict] = []
+    # tool_use_id → tool_name lookup so the historic-load path attaches the
+    # same `tool_name` field that the live stream attaches. Keeps the FE's
+    # per-tool rich renderers (Bash terminal, Read with gutter, …) working
+    # after a page refresh / session reload.
+    tool_use_names: dict[str, str] = {}
+    for sm in sm_list:
+        ann = annotations.get(sm.uuid, {})
+        is_compact = sm.uuid in compact_uuids
+        msg = sm.message or {}
+        content = msg.get("content")
+
+        # Simple shape: content is a single string.
+        if isinstance(content, str):
+            text = _strip_cli_slash_wrapper(content)
+            # CLI's slash-command wrapper (<command-name>/compact</command-name>
+            # …) round-trips through the conversation log as a "user" turn;
+            # hide it from the UI rather than rendering a confusing bubble.
+            if not text:
+                continue
+            entry = {"role": sm.type, "text": text, "uuid": sm.uuid}
+            if is_compact:
+                entry["_is_compact_summary"] = True
+            entry.update(ann)   # cost / model / images / etc.
+            out.append(entry)
+            continue
+        if not isinstance(content, list):
+            continue
+
+        text_buf = ""
+        image_refs = []   # placeholder for inline image blocks (if any in JSONL)
+
+        def flush_text():
+            nonlocal text_buf, image_refs
+            # Strip CLI slash wrapper before deciding if there's anything to
+            # render. Pure-wrapper messages produce empty text + no images
+            # → drop the bubble entirely.
+            cleaned = _strip_cli_slash_wrapper(text_buf)
+            if not cleaned and not image_refs:
+                text_buf = ""
+                image_refs = []
+                return
+            entry = {"role": sm.type, "text": cleaned, "uuid": sm.uuid}
+            if is_compact:
+                entry["_is_compact_summary"] = True
+            if image_refs:
+                # CLI JSONL stores image source dicts; convert minimal info for UI.
+                # If sidecar has full base64 (uploaded via muselab), it wins
+                # — already merged via ann["images"].
+                entry.setdefault("images", image_refs)
+            entry.update(ann)
+            out.append(entry)
+            text_buf = ""
+            image_refs = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                text_buf += block.get("text", "")
+            elif bt == "thinking":
+                flush_text()
+                # Anthropic Opus 4.x extended-thinking blocks come back
+                # redacted in the final transcript — `thinking` is "" and
+                # only the `signature` survives. The plain-text content is
+                # ONLY visible live via thinking_delta events during streaming.
+                # Surface a placeholder so the UI doesn't show an empty
+                # block on reload — reads as "model thought here but the
+                # text isn't retained" rather than a broken render.
+                th_text = block.get("thinking", "") or ""
+                if not th_text.strip() and block.get("signature"):
+                    th_text = "[已加密推理 · 仅 streaming 期间可见明文]"
+                out.append({"role": "thinking", "text": th_text,
+                             "uuid": sm.uuid})
+            elif bt == "tool_use":
+                flush_text()
+                tu_name = block.get("name") or ""
+                tu_id = block.get("id") or ""
+                if tu_id:
+                    tool_use_names[tu_id] = tu_name
+                # Slim + cap the input the same way the live stream does so
+                # the FE gets a consistent shape across "fresh stream" and
+                # "reload from JSONL". Without this, reload-after-Edit lost
+                # the old_string/new_string fields and the diff renderer
+                # silently degraded to file-path-only.
+                raw_input = block.get("input") or {}
+                slim_input = {
+                    k: _slim_input_value(v)
+                    for k, v in raw_input.items()
+                    if k in {
+                        "file_path", "notebook_path", "path",
+                        "command", "pattern", "url", "query",
+                        "name", "skill", "subagent_type", "description", "todos",
+                        "old_string", "new_string", "edits", "content",
+                        "offset", "limit",
+                        "timeout", "run_in_background", "replace_all",
+                    }
+                }
+                tu = {
+                    "role": "tool_use",
+                    "uuid": sm.uuid,
+                    "id": tu_id,
+                    "name": tu_name,
+                    "input": slim_input,
+                    # Compact summary that the frontend usually shows in the bubble
+                    "summary": _summarize_tool_input(tu_name, raw_input),
+                }
+                if tu_name == "TodoWrite":
+                    tu["todos"] = raw_input.get("todos") or []
+                elif tu_name == "Task":
+                    tu["task"] = {
+                        "subagent_type": raw_input.get("subagent_type"),
+                        "description": raw_input.get("description"),
+                        "prompt": raw_input.get("prompt"),
+                    }
+                elif tu_name == "ExitPlanMode":
+                    tu["plan"] = raw_input.get("plan") or ""
+                out.append(tu)
+            elif bt == "tool_result":
+                flush_text()
+                tr_text = ""
+                tr_content = block.get("content")
+                if isinstance(tr_content, str):
+                    tr_text = tr_content
+                elif isinstance(tr_content, list):
+                    parts = []
+                    for p in tr_content:
+                        if isinstance(p, dict):
+                            parts.append(p.get("text", str(p)))
+                        else:
+                            parts.append(str(p))
+                    tr_text = "\n".join(parts)
+                tu_id = block.get("tool_use_id") or ""
+                tool_name = tool_use_names.get(tu_id, "")
+                entry = {
+                    "role": "tool_result", "uuid": sm.uuid,
+                    "id": tu_id,
+                    "preview": tr_text[:_TOOL_RESULT_PREVIEW_CAP],
+                    "truncated": len(tr_text) > _TOOL_RESULT_PREVIEW_CAP,
+                    "text": tr_text[:_TOOL_RESULT_TEXT_CAP],
+                    "text_truncated": len(tr_text) > _TOOL_RESULT_TEXT_CAP,
+                    "is_error": bool(block.get("is_error", False)),
+                }
+                if tool_name:
+                    entry["tool_name"] = tool_name
+                if tool_name == "Bash":
+                    bash = _parse_bash_result(tr_text)
+                    if bash:
+                        entry["bash"] = bash
+                out.append(entry)
+            elif bt == "image":
+                # Inline image block in user content — record a reference.
+                # Real base64 lives in the sidecar (annotations["images"]) for
+                # images the user uploaded via muselab's upload flow.
+                src = block.get("source") or {}
+                image_refs.append({"mime": src.get("media_type") or ""})
+            # Other block types (server_tool_use, etc.) — skip silently for now.
+        flush_text()
+    # Propagate the turn-completion ts (stored on the LAST sm.uuid of
+    # the turn via set_message_annotation in chat_stream's tail) onto
+    # EVERY ui entry that shares that uuid — thinking / tool_use /
+    # tool_result / assistant text. The frontend renders turn-footer
+    # under whichever entry is the turn tail; making sure all of them
+    # carry ts means whatever block ends up at the tail can display
+    # the time. Cheap O(N) — annotations is already a dict lookup.
+    for entry in out:
+        u = entry.get("uuid")
+        if not u:
+            continue
+        ann = annotations.get(u, {})
+        ts = ann.get("ts")
+        if ts is not None and "ts" not in entry:
+            entry["ts"] = ts
+        # Also fan elapsed_s out the same way — turn-footer's "13:42 ·
+        # 2m50s" should survive a session reload too. Stored as float
+        # seconds by chat.py (see _handle_result_message).
+        elapsed = ann.get("elapsed_s")
+        if elapsed is not None and "elapsed" not in entry:
+            entry["elapsed"] = elapsed
+        # User-msg image annotations (thumb + url for the lightbox)
+        # live in the sidecar — the inline `image_refs` extracted from
+        # the SDK content blocks only carry `mime`. Layer the sidecar's
+        # richer payload on top so the FE sees {mime, thumb, url} after
+        # a session reload, not just the bare mime.
+        ann_images = ann.get("images")
+        if ann_images and entry.get("role") == "user":
+            entry["images"] = ann_images
+        ann_docs = ann.get("docs")
+        if ann_docs and entry.get("role") == "user":
+            entry["docs"] = ann_docs
+    return out
+
+
+def _bind_pending_attachments(sid: str, messages: list[dict]) -> None:
+    """For every user message that has image refs (only mime, no thumb/url)
+    but no annotation yet, pop one entry off the sidecar's pending list
+    and bind it. Runs in-order so multi-image conversations stay aligned.
+
+    Called by GET /sessions/{sid} after _sdk_messages_to_ui. Modifies
+    messages in place."""
+    for entry in messages:
+        if entry.get("role") != "user":
+            continue
+        imgs = entry.get("images") or []
+        if not imgs:
+            continue
+        # Already has thumb / url for at least one — already bound, skip.
+        if any(im.get("thumb") or im.get("url") for im in imgs):
+            continue
+        uuid = entry.get("uuid")
+        if not uuid:
+            continue
+        bound = sess.consume_one_pending_attachments(sid, uuid)
+        if bound and bound.get("images"):
+            entry["images"] = bound["images"]
+        if bound and bound.get("docs"):
+            entry["docs"] = bound["docs"]
+
+
+def _summarize_tool_input(name: str | None, inp: dict) -> str:
+    """Same summarization used by _render_tool_use, factored to also work for
+    raw dict input (post-JSONL parse, no ToolUseBlock instance)."""
+    if not name:
+        return ""
+    if name in ("Read", "Edit", "Write"):
+        return inp.get("file_path", "")
+    if name == "Bash":
+        return (inp.get("command") or "")[:200]
+    if name in ("Glob", "Grep"):
+        return (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
+    if name == "WebFetch":
+        return inp.get("url", "")
+    if name == "WebSearch":
+        return inp.get("query", "")
+    if name == "TodoWrite":
+        return f"{len(inp.get('todos') or [])} todos"
+    return ""
+
+
+def _compact_summary_uuids(sid: str) -> set[str]:
+    """Scan raw CLI JSONL for entries with isCompactSummary:true and return
+    their UUIDs. SDK get_session_messages strips this flag, so to render a
+    "📦 已压缩" indicator we have to detect it ourselves at the JSONL level.
+
+    Glob-based JSONL lookup via _find_session_jsonl — covers both default
+    and vendor-isolated roots so vendor sessions keep their compact
+    markers too."""
+    try:
+        jsonl_path = _find_session_jsonl(sid)
+        if jsonl_path is None:
+            return set()
+        uuids: set[str] = set()
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"isCompactSummary":true' not in line and '"isCompactSummary": true' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if entry.get("isCompactSummary") and entry.get("uuid"):
+                    uuids.add(entry["uuid"])
+        return uuids
+    except Exception:
+        return set()
+
+
+@router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
+def get_session_api(sid: str) -> dict:
+    """Read session: metadata from muselab sidecar + transcript from CLI JSONL
+    via SDK. Merges per-message annotations (cost, model, images) into the
+    transcript so the UI gets one flat list of bubbles.
+
+    Mid-turn fallback: SDK CLI only writes the JSONL on turn completion,
+    so a reload while a reply is streaming would otherwise return an
+    empty list. When an active TurnBroadcast exists for `sid`, we
+    reconstruct the in-flight messages from its event buffer (user
+    prompt + every SSE event yielded so far) so the user sees the
+    partial reply instead of a blank session."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    model = meta.get("model", "")
+    try:
+        sdk_msgs = _get_session_msgs(sid, model)
+    except Exception:
+        sdk_msgs = []
+    annotations = sess.get_message_annotations(sid)
+    compact_uuids = _compact_summary_uuids(sid)
+    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    # Bind any unbound pending image/doc attachments (those persisted
+    # before the stream completed could write a uuid annotation) to the
+    # user messages that have inline image refs but no thumb/url yet.
+    _bind_pending_attachments(sid, messages)
+    # Mid-turn merge: SDK CLI writes the JSONL incrementally — the
+    # user prompt lands immediately when the turn starts, but the
+    # assistant reply (text/thinking/tool blocks) only commits when
+    # the whole turn finishes. So a reload during streaming sees the
+    # user msg but no reply. The active TurnBroadcast has the live
+    # event stream → reconstruct an in-progress view from it and
+    # splice it in place of the last (incomplete) user msg the SDK
+    # returned. When the turn finishes, the active broadcast is
+    # popped and this branch becomes inert; the SDK JSONL alone is
+    # the source of truth again.
+    # NOTE: deliberately NOT layering broadcast rebuild on top of the
+    # SDK transcript here. The frontend's _checkActiveTurn fires SSE
+    # reconnect when the backend says active=true, and the reconnect
+    # endpoint replays the broadcast buffer + streams live events.
+    # If we rebuilt the in-flight portion here too, the user would
+    # either:
+    #  a) see static partial content with no further streaming
+    #     (frontend skips reconnect because messages already ends in
+    #     assistant), or
+    #  b) see duplicated content (SDK partial + broadcast replay).
+    # Keeping this path SDK-only lets reconnect be the sole live-tail
+    # mechanism. The user briefly sees just the user msg, then SSE
+    # fills in everything via replay → live.
+    return {**meta, "messages": messages}
+
+
+def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
+    """Reconstruct a UI-shaped message list from an in-flight broadcast.
+    Lossy by design: this is shown only mid-turn while SDK JSONL is
+    empty. Once the turn finishes the regular SDK→UI path takes over
+    and we drop this view.
+
+    Events fold like the streaming-handler's openAsst/closeAsst dance:
+    consecutive 'text' deltas form one assistant bubble; thinking
+    deltas accumulate into one thinking message; tool_use / tool_result
+    push their own messages. Non-render events (done / error / etc.)
+    are ignored here — the UI's `done` handler only matters in live
+    streaming, not in a reload-rebuild."""
+    out: list[dict] = []
+    if bc.user_text or bc.user_images or bc.user_docs:
+        out.append({
+            "role": "user",
+            "text": bc.user_text,
+            "images": bc.user_images,
+            "docs": bc.user_docs,
+        })
+    cur_text_msg: dict | None = None
+    cur_thinking_msg: dict | None = None
+    for ev in bc.events:
+        kind = ev.get("event") or ""
+        data_str = ev.get("data") or "{}"
+        try:
+            data = json.loads(data_str)
+        except Exception:
+            continue
+        if kind == "text":
+            cur_thinking_msg = None
+            chunk = data.get("text", "")
+            if cur_text_msg is None:
+                cur_text_msg = {"role": "assistant", "text": chunk,
+                                  "model": bc.model}
+                out.append(cur_text_msg)
+            else:
+                cur_text_msg["text"] += chunk
+        elif kind == "thinking":
+            cur_text_msg = None
+            chunk = data.get("text", "")
+            if cur_thinking_msg is None:
+                cur_thinking_msg = {"role": "thinking", "text": chunk}
+                out.append(cur_thinking_msg)
+            else:
+                cur_thinking_msg["text"] += chunk
+        elif kind == "tool_use":
+            cur_text_msg = None
+            cur_thinking_msg = None
+            out.append({
+                "role": "tool_use",
+                "name": data.get("name"),
+                "summary": data.get("summary"),
+                "input": data.get("input"),
+                **({"todos": data["todos"]} if "todos" in data else {}),
+                **({"task": data["task"]} if "task" in data else {}),
+                **({"plan": data["plan"]} if "plan" in data else {}),
+            })
+        elif kind == "tool_result":
+            cur_text_msg = None
+            cur_thinking_msg = None
+            out.append({
+                "role": "tool_result",
+                "preview": data.get("preview"),
+                "truncated": data.get("truncated"),
+                "is_error": data.get("is_error"),
+            })
+        # ask_user_question / permission_request not reconstructed here —
+        # they're interactive blocks whose answer state lives in the
+        # ask/perm queues, not in the broadcast buffer.
+    return out
+
+
+@router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
+def export_session_markdown(sid: str) -> Response:
+    """Render the transcript as a single Markdown file the user can save.
+
+    Auth is via ?token=... rather than the header — file downloads from a
+    plain anchor don't carry custom headers."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    model = meta.get("model", "")
+    try:
+        sdk_msgs = _get_session_msgs(sid, model)
+    except Exception:
+        sdk_msgs = []
+    annotations = sess.get_message_annotations(sid)
+    compact_uuids = _compact_summary_uuids(sid)
+    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    # Bind any unbound pending image/doc attachments (those persisted
+    # before the stream completed could write a uuid annotation) to the
+    # user messages that have inline image refs but no thumb/url yet.
+    _bind_pending_attachments(sid, messages)
+
+    name = meta.get("name") or "session"
+    model = meta.get("model") or ""
+    created = meta.get("created_at")
+    created_str = (datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M")
+                    if created else "")
+    lines: list[str] = [f"# {name}", ""]
+    if created_str:
+        lines.append(f"*Created: {created_str}*  ")
+    if model:
+        lines.append(f"*Model: {model}*  ")
+    lines.append(f"*Messages: {len(messages)}*")
+    lines.append("")
+    for m in messages:
+        role = m.get("role")
+        text = (m.get("text") or "").strip()
+        if not text or role in ("tool_use", "tool_result"):
+            continue
+        if role == "user":
+            lines.append("---")
+            lines.append("")
+            lines.append("### 👤 User")
+        elif role == "assistant":
+            lines.append("### 🤖 Muse")
+        else:
+            lines.append(f"### {role}")
+        lines.append("")
+        lines.append(text)
+        lines.append("")
+
+    body = "\n".join(lines)
+    # Filenames in Content-Disposition can't safely include CJK / spaces in all
+    # browsers; fall back to a slug. RFC 5987 filename*=UTF-8 covers Unicode for
+    # modern browsers; the bare filename is an ASCII fallback for older ones.
+    safe_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "session"
+    safe_slug = safe_slug[:60]
+    encoded = urllib.parse.quote(name, safe="")
+    headers = {
+        "Content-Disposition":
+            f'attachment; filename="{safe_slug}.md"; '
+            f"filename*=UTF-8''{encoded}.md",
+    }
+    return Response(content=body, media_type="text/markdown; charset=utf-8",
+                    headers=headers)
+
+
+@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
+async def delete_session_api(sid: str) -> dict:
+    await disconnect_client(sid)
+    # SDK delete first (removes CLI JSONL); then muselab sidecar.
+    try:
+        sdk_delete_session(sid, directory=str(ROOT))
+    except (FileNotFoundError, ValueError):
+        pass   # JSONL never existed (session never streamed) — that's fine
+    if not sess.delete_session(sid):
+        raise HTTPException(404, "session not found")
+    # Sweep per-session attachments dir (uploaded image full-res originals
+    # persisted by upload-image → send pipeline). Without this, deleting
+    # a session would orphan its image files on disk forever.
+    import shutil as _shutil
+    attach_dir = _attachments_base() / sid
+    if attach_dir.exists():
+        try:
+            _shutil.rmtree(attach_dir, ignore_errors=True)
+        except OSError:
+            pass
+    return {"ok": True}
+
+
+# Orphan attachments sweep — defends against the case where a JSONL was
+# deleted out of band (manual rm, git restore, etc.) and left an
+# attachments/<sid>/ behind. Runs lazily off the existing session-list
+# endpoint so we don't need a separate cron. Bounded — only sweeps if
+# attachments dir actually has children.
+def _gc_orphan_attachments() -> None:
+    base = _attachments_base()
+    if not base.exists():
+        return
+    try:
+        known_sids = {s["id"] for s in sess.list_sessions() if s.get("id")}
+    except Exception:
+        return
+    import shutil as _shutil
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name not in known_sids:
+            try:
+                _shutil.rmtree(child, ignore_errors=True)
+            except OSError:
+                pass
+
+
+@router.get("/attachments-usage", dependencies=[Depends(require_token)])
+def attachments_usage() -> dict:
+    """Total bytes + file count under sessions/attachments. UI / settings
+    can render this so users know how much disk their uploaded images
+    have eaten, and can trigger a sweep."""
+    base = _attachments_base()
+    if not base.exists():
+        return {"total_bytes": 0, "file_count": 0, "session_count": 0}
+    total = 0
+    files = 0
+    sessions_with_attach = 0
+    for sid_dir in base.iterdir():
+        if not sid_dir.is_dir():
+            continue
+        has_any = False
+        for f in sid_dir.iterdir():
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                    files += 1
+                    has_any = True
+                except OSError:
+                    pass
+        if has_any:
+            sessions_with_attach += 1
+    return {
+        "total_bytes": total,
+        "file_count": files,
+        "session_count": sessions_with_attach,
+    }
+
+
+@router.post("/attachments-sweep", dependencies=[Depends(require_token)])
+def attachments_sweep() -> dict:
+    """Manually trigger the orphan-attachments sweep + return new usage."""
+    _gc_orphan_attachments()
+    return attachments_usage()
+
+
+class SessionPatchReq(BaseModel):
+    name: str | None = None
+    system_prompt: str | None = None
+    model: str | None = None
+    # SDK-native session tag — written to CLI JSONL so other tools (and
+    # manual `claude` CLI runs) see it. Pass empty string to clear.
+    tag: str | None = None
+    # Pin to top of the session picker. None = no change, True/False = set.
+    pinned: bool | None = None
+    # Reasoning effort knob — "" / "low" / "medium" / "high" / "xhigh" / "max".
+    # Empty string clears the override (SDK picks adaptive). Changing effort
+    # invalidates cached clients so the next turn rebuilds with the new value.
+    effort: str | None = None
+
+
+@router.patch("/sessions/{sid}", dependencies=[Depends(require_token)])
+async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
+    ok = False
+    if req.name is not None:
+        ok = sess.rename_session(sid, req.name) or ok
+        # Also propagate to CLI's JSONL so list_sessions() / manual claude
+        # CLI runs see the new title. Silent no-op if JSONL doesn't exist yet.
+        try:
+            sdk_rename_session(sid, req.name, directory=str(ROOT))
+        except (FileNotFoundError, ValueError):
+            pass
+    if req.tag is not None:
+        # Empty string → clear tag. SDK accepts None or str.
+        try:
+            sdk_tag_session(sid, req.tag or None, directory=str(ROOT))
+            ok = True
+        except (FileNotFoundError, ValueError) as e:
+            # JSONL doesn't exist yet → tag has nowhere to live until first
+            # query. Surface as a 409 so the FE can wait for first turn.
+            raise HTTPException(409, f"cannot tag session before first turn: {e}")
+    if req.pinned is not None:
+        # Pin is muselab-local (not stored in CLI JSONL). Always idempotent.
+        # set_pin runs the load-mutate-save sequence under _INDEX_LOCK.
+        sess.set_pin(sid, req.pinned)
+        ok = True
+    if req.system_prompt is not None:
+        ok = sess.update_system_prompt(sid, req.system_prompt) or ok
+        # System prompt change invalidates cached SDK clients for this session.
+        await disconnect_client(sid)
+    if req.effort is not None:
+        # Validate against SDK literal set; empty string is a deliberate
+        # "clear override" signal so the user can revert to adaptive.
+        valid = {"", "low", "medium", "high", "xhigh", "max"}
+        if req.effort not in valid:
+            raise HTTPException(400, f"invalid effort: {req.effort}")
+        sess.update_effort(sid, req.effort)
+        # Effort is baked into ClaudeAgentOptions at construction time, so a
+        # change requires rebuilding the client. The next stream() call will
+        # pick up the new value via sess.get_session().
+        await disconnect_client(sid)
+        ok = True
+    if req.model is not None:
+        # Model switch is allowed any time — including mid-session. The next
+        # turn will use the new model (frontend captures `streamingModel`
+        # per-request so old bubbles keep their original model badge).
+        # Caveats (frontend warns about cross-vendor):
+        #   - cross-vendor switches can hit thinking-signature errors on the
+        #     next reply if the prior turn had thinking blocks
+        #   - prompt cache resets when model changes (first turn slower)
+        # If a turn is still streaming for this session, interrupt it
+        # first. Otherwise the old CLI subprocess is still actively
+        # writing to the session JSONL and disconnect_client below would
+        # race with that — leading to "Session ID already in use" on the
+        # next stream's CLI spawn (eg. GLM → MiniMax mid-reply).
+        bc = _active_turns.get(sid)
+        if bc is not None and not bc.done:
+            async with _lock:
+                live_clients = [c for k, c in _clients.items() if k[0] == sid]
+            for c in live_clients:
+                try:
+                    await c.interrupt()
+                except Exception as _e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat] interrupt before model swap failed for "
+                        f"{sid}: {type(_e).__name__}: {_e}\n")
+        sess.update_model(sid, req.model)
+        # SDK-native swap if same provider — `client.set_model()` reuses the
+        # CLI subprocess (and its loaded CLAUDE.md / MCP / system prompt).
+        # Cross-provider switch (e.g. Claude → DeepSeek) needs full rebuild
+        # because env_override / base_url differ.
+        async with _lock:
+            live = [(k, c) for k, c in _clients.items() if k[0] == sid]
+        pa = endpoints.lookup(req.model)
+        same_provider = (
+            len(live) == 1
+            and ((pa is None and endpoints.lookup(live[0][0][1]) is None)
+                 or (pa is not None
+                     and endpoints.lookup(live[0][0][1]) is not None
+                     and endpoints.lookup(live[0][0][1]).prefix == pa.prefix)))
+        if same_provider:
+            (old_key, client) = live[0]
+            try:
+                await client.set_model(endpoints.normalize_model_id(req.model))
+                # Re-validate under _lock — between the snapshot above
+                # and now, another request could have evicted / replaced
+                # _clients[old_key] (eviction from a parallel get_client,
+                # an interrupt, or even a competing model swap). Without
+                # this check we'd silently pop whatever's there now and
+                # leak the original client OR clobber a fresh handle the
+                # next turn just created.
+                snapshot_still_valid = False
+                async with _lock:
+                    if _clients.get(old_key) is client:
+                        snapshot_still_valid = True
+                        _clients.pop(old_key, None)
+                        perm = _client_permission.pop(old_key, "bypassPermissions")
+                        if old_key in _client_lru:
+                            _client_lru.remove(old_key)
+                        # Preserve the effort dimension when remapping under
+                        # the new model — set_model() keeps the SDK options
+                        # object, which still has the prior effort baked in.
+                        new_key = (sid, req.model, old_key[2])
+                        _clients[new_key] = client
+                        _client_permission[new_key] = perm
+                        _client_lru.append(new_key)
+                if not snapshot_still_valid:
+                    # Our client is orphaned now (the cache entry was
+                    # replaced under us). Disconnect it so the CLI
+                    # subprocess goes away; next turn will rebuild.
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat] set_model {old_key[1]}→{req.model} raced "
+                        f"with cache mutation; disconnecting orphan\n")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat] set_model {old_key[1]}→{req.model} failed: "
+                    f"{type(e).__name__}: {e}; rebuilding on next turn\n")
+                await disconnect_client(sid)
+        else:
+            # Cross-provider, or no/multiple live clients — disconnect; the
+            # next send() rebuilds with the new model.
+            await disconnect_client(sid)
+        ok = True
+    if not ok:
+        raise HTTPException(404, "session not found or no changes")
+    return {"ok": True}
+
+
+# ====== usage / reset ======
+
+@router.get("/usage", dependencies=[Depends(require_token)])
+def usage() -> dict:
+    cr = _stats.get("total_cache_read_tokens", 0)
+    in_t = _stats.get("total_input_tokens", 0)
+    cache_pct = round(cr / (cr + in_t) * 100, 1) if (cr + in_t) > 0 else 0
+    return {**_stats, "model_default": MODEL,
+            "active_sessions": list(_clients.keys()),
+            "cache_hit_pct": cache_pct,
+            "budget_usd": _budget_usd(),
+            "budget_used_pct": (
+                round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
+                if _budget_usd() > 0 else 0
+            )}
+
+
+def _session_usage_from_jsonl(sid: str) -> dict | None:
+    """Rebuild a session_usage snapshot from the CLI JSONL transcript.
+
+    Why this exists: `_session_usage` is in-memory and clears on every
+    muselab restart. After restart, switching to an existing session
+    used to show an empty context meter until the user sent a new
+    message — a confusing "did my conversation vanish?" UX even though
+    the transcript was still there. Now we lazily rebuild from disk on
+    miss.
+
+    What we extract:
+      - last assistant turn's `message.usage` → input / output / cache
+        tokens (gives the "current context window" estimate the meter
+        cares about)
+      - sum of cost annotations from the muselab sidecar → cumulative
+        total_cost_usd
+
+    Returns None when no JSONL exists (truly new session) so the
+    caller can fall through to a zero-shaped default. The walk is
+    O(n_lines) per session and only fires on a cache miss; subsequent
+    polls hit `_session_usage` again.
+    """
+    if ROOT is None:
+        return None
+    jsonl_path = _find_session_jsonl(sid)
+    if jsonl_path is None:
+        return None
+    last_usage: dict[str, int] = {}
+    last_ts: float = 0.0
+    last_model: str = ""
+    try:
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = entry.get("message") or {}
+                u = msg.get("usage") or {}
+                if not isinstance(u, dict) or not u:
+                    continue
+                last_usage = u
+                last_model = msg.get("model") or last_model
+                ts = entry.get("timestamp") or ""
+                if ts:
+                    try:
+                        import datetime as _dt
+                        dt_utc = _dt.datetime.fromisoformat(
+                            ts.replace("Z", "+00:00"))
+                        last_ts = dt_utc.timestamp()
+                    except ValueError:
+                        pass
+    except OSError:
+        return None
+    if not last_usage:
+        return None
+    # Cumulative cost — sum sidecar annotations. Cheaper than reparsing
+    # JSONL costs, and Anthropic is the only vendor that puts USD in
+    # message.usage anyway.
+    total_cost = 0.0
+    try:
+        from . import sessions as _sess
+        anns = _sess.get_message_annotations(sid)
+        for ann in anns.values():
+            if isinstance(ann, dict):
+                total_cost += _parse_cost(ann.get("cost"))
+    except Exception:
+        pass
+    in_t = int(last_usage.get("input_tokens", 0) or 0)
+    out_t = int(last_usage.get("output_tokens", 0) or 0)
+    cr_t = int(last_usage.get("cache_read_input_tokens", 0)
+                or last_usage.get("cache_read_tokens", 0) or 0)
+    cc_t = int(last_usage.get("cache_creation_input_tokens", 0)
+                or last_usage.get("cache_creation_tokens", 0) or 0)
+    ctx_used = in_t + cr_t + cc_t
+    limit = MODEL_CONTEXT_LIMITS.get(last_model, 0)
+    pct = round(ctx_used / limit * 100, 1) if limit else 0.0
+    return {
+        "input_tokens": in_t, "output_tokens": out_t,
+        "cache_read_tokens": cr_t, "cache_creation_tokens": cc_t,
+        "total_cost_usd": total_cost, "last_turn_at": last_ts,
+        "context_used": ctx_used, "context_used_pct": pct,
+        "context_limit": limit,
+    }
+
+
+@router.get("/usage/{session_id}", dependencies=[Depends(require_token)])
+def session_usage(session_id: str, model: str = "") -> dict:
+    """Per-session context meter — what fraction of the model's window we're at.
+
+    Note: this is the cheap path — reads cached per-turn usage values.
+    On cache miss (e.g. fresh process restart, session not yet streamed
+    in this lifetime), lazily rebuilds the snapshot from the CLI JSONL
+    so the meter doesn't show empty for already-running conversations.
+    For a true breakdown (per CLAUDE.md file, per MCP tool, per skill),
+    use /context-breakdown/{session_id} which invokes
+    ClaudeSDKClient.get_context_usage() against the live session."""
+    u = _session_usage.get(session_id)
+    if u is None:
+        rebuilt = _session_usage_from_jsonl(session_id)
+        if rebuilt is not None:
+            # Populate the cache so subsequent polls don't re-walk JSONL.
+            _session_usage[session_id] = rebuilt
+            u = rebuilt
+        else:
+            u = {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
+            }
+    m = model or MODEL
+    # Take the MAX of (stored sess_u value, hardcoded table). This way when
+    # MODEL_CONTEXT_LIMITS gets bumped (e.g. Opus 200K → 1M), an existing
+    # session that stored the old 200K still picks up the new ceiling on the
+    # next /usage poll — no need to wait for the user to send a new message.
+    # SDK truth (from ResultMessage handler) overrides on next stream done.
+    stored = int(u.get("context_limit", 0) or 0)
+    hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
+    limit = max(stored, hardcoded)
+    # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
+    # handler. Fall back to the legacy estimate only if no turn has completed
+    # yet (in which case `context_used` is 0 anyway → 0% display, correct).
+    if u.get("context_used"):
+        ctx_used = int(u["context_used"])
+        # Recompute pct against possibly-bumped limit so it doesn't show stale
+        # high percentage (e.g. 14.2% if computed against 200K but limit is 1M).
+        ctx_pct = round(ctx_used / limit * 100, 1) if limit else 0.0
+    else:
+        # Conservative fallback: per-turn input only (not summed with cache,
+        # because cache_read/cache_creation in SDK usage are cumulative and
+        # would inflate the meter — see ResultMessage handler comment).
+        ctx_used = int(u.get("input_tokens", 0) or 0)
+        ctx_pct = round(ctx_used / limit * 100, 1) if limit else 0
+    return {
+        **u,
+        "model": m,
+        "context_limit": limit,
+        "context_used": ctx_used,
+        "context_used_pct": ctx_pct,
+    }
+
+
+def _parse_cost(raw: Any) -> float:
+    """Sidecar stores cost as the formatted string we showed in the UI
+    (e.g. '$0.1993'). Parse back to a float for aggregation. Returns 0.0
+    for missing / unparseable values."""
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lstrip("$").replace(",", "")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _empty_bucket() -> dict:
+    """Per-time-bucket aggregator shape. Used by cost_dashboard to add
+    up arbitrary turn slices. Cost comes from sidecar (vendor knows
+    pricing); tokens come from JSONL (universal across all vendors)."""
+    return {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_tokens": 0, "cache_creation_tokens": 0,
+             "cost": 0.0, "turns": 0}
+
+
+def _vendor_label_for(model_id: str) -> str:
+    """Pretty vendor name for the cost-dashboard `by_vendor` rollup.
+    Claude lives outside CATALOG (we serve OAuth Pro/Max directly, not via
+    a third-party endpoint) so map it explicitly; third-parties fall through
+    to their CATALOG `display` field; truly unknown ids land in 'Unknown'."""
+    if not model_id:
+        return "Unknown"
+    low = model_id.lower()
+    if low.startswith("claude-"):
+        return "Claude"
+    p = endpoints.lookup(model_id)
+    if p is not None:
+        return p.display
+    return "Unknown"
+
+
+def _cost_reported_for(model_id: str) -> bool:
+    """True when this vendor actually reports USD cost in muselab sidecar
+    (= the FE can trust the $-figure). Currently only the Claude path
+    (Anthropic Pro/Max OAuth or direct API key) populates ResultMessage's
+    `total_cost_usd`; DeepSeek / GLM / MiniMax always come through as 0 and
+    we don't want the dashboard pretending they're free. FE uses this to
+    show a 'cost not tracked — vendor doesn't report USD' footnote."""
+    return (model_id or "").lower().startswith("claude-")
+
+
+def _add_bucket(dst: dict, src: dict) -> None:
+    for k, v in src.items():
+        if k in dst:
+            dst[k] += v
+
+
+@router.get("/cost-dashboard", dependencies=[Depends(require_token)])
+def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
+                    tz_offset_minutes: int = Query(default=0, ge=-1440, le=1440)
+                    ) -> dict:
+    """Aggregate per-turn usage across all sessions, bucketed by local date
+    and by model. JSONL is the truth for **token counts and model** (CLI
+    writes `message.usage` per turn for every vendor — Anthropic, GLM,
+    MiniMax, DeepSeek). Sidecar adds **cost in USD** where available
+    (only Anthropic + a few others report it; third-party vendors
+    typically report 0). All vendors get full token visibility.
+
+    `tz_offset_minutes` lets the browser ask for buckets in its local
+    timezone (e.g. Beijing = +480). Server stays UTC internally.
+
+    Returns:
+      {
+        "window_days": int,
+        "today" / "last_7d" / "last_30d" / "all_time": {
+            input_tokens, output_tokens, cache_read_tokens,
+            cache_creation_tokens, cost, turns
+        },
+        "by_day":   [{date, ...same fields}, ...]   # densified to `days`
+        "by_model": [{model, ...same fields}, ...]  # all time
+      }
+    """
+    import datetime as _dt
+    from collections import defaultdict
+
+    # 1) Sidecar costs by (sid, uuid) — optional overlay, may be sparse
+    # or empty for third-party vendors. Walk it once so the JSONL scan
+    # can do a cheap dict lookup per turn.
+    cost_by_uuid: dict[str, dict[str, float]] = {}
+    for sidecar in sess.SESS_DIR.glob("*.sidecar.json"):
+        sid = sidecar.name.split(".sidecar.json")[0]
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        msgs = data.get("messages") or {}
+        per_sess: dict[str, float] = {}
+        for uuid_key, ann in msgs.items():
+            if not isinstance(ann, dict):
+                continue
+            cost_val = _parse_cost(ann.get("cost"))
+            if cost_val > 0:
+                per_sess[uuid_key] = cost_val
+        if per_sess:
+            cost_by_uuid[sid] = per_sess
+
+    # 2) Walk JSONL — the universal token source. Every vendor writes
+    # message.usage on assistant turns in Anthropic-compatible shape
+    # (CLI normalizes OpenAI-compatible vendors transparently).
+    tz = _dt.timezone(_dt.timedelta(minutes=tz_offset_minutes))
+    now = _dt.datetime.now(tz)
+    today_str = now.date().isoformat()
+    cutoff_day = (now.date() - _dt.timedelta(days=days - 1)).isoformat()
+    cutoff_7d  = (now.date() - _dt.timedelta(days=6)).isoformat()
+
+    all_total   = _empty_bucket()
+    today_total = _empty_bucket()
+    last_7d     = _empty_bucket()
+    last_30d    = _empty_bucket()
+    by_day:   dict[str, dict] = defaultdict(_empty_bucket)
+    by_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_vendor: dict[str, dict] = defaultdict(_empty_bucket)
+
+    # Discover all JSONLs for muselab-tracked sessions. SDK CLI keys
+    # the projects dir by the cwd that ran the session, so a single
+    # logical archive (one ROOT) can have JSONL spread across multiple
+    # `<projects-root>/<encoded-cwd>/` dirs if ROOT (or working dir)
+    # changed over time. We track every JSONL whose session id matches
+    # something muselab knows about (sidecar OR sess.list_sessions()) —
+    # this catches early sessions on prior cwds without picking up
+    # totally unrelated projects.
+    project_roots = _cli_project_roots()
+    if not project_roots:
+        return _empty_dashboard_response(days, tz_offset_minutes, now)
+
+    known_sids: set[str] = set()
+    for sidecar in sess.SESS_DIR.glob("*.sidecar.json"):
+        known_sids.add(sidecar.name.split(".sidecar.json")[0])
+    try:
+        for s in sess.list_sessions():
+            sid = s.get("id")
+            if sid:
+                known_sids.add(sid)
+    except Exception:
+        pass
+
+    jsonl_paths: list[Path] = []
+    for projects_root in project_roots:
+        try:
+            for proj_sub in projects_root.iterdir():
+                if not proj_sub.is_dir():
+                    continue
+                for jsonl in proj_sub.glob("*.jsonl"):
+                    if jsonl.stem in known_sids:
+                        jsonl_paths.append(jsonl)
+        except OSError:
+            continue
+
+    for jsonl in jsonl_paths:
+        sid = jsonl.stem
+        sid_costs = cost_by_uuid.get(sid, {})
+        try:
+            with jsonl.open("r", encoding="utf-8") as f:
+                for line in f:
+                    # Cheap reject: only assistant turns carry usage.
+                    if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    msg = entry.get("message") or {}
+                    usage = msg.get("usage") or {}
+                    if not isinstance(usage, dict):
+                        continue
+                    in_t  = int(usage.get("input_tokens", 0) or 0)
+                    out_t = int(usage.get("output_tokens", 0) or 0)
+                    cr_t  = int(usage.get("cache_read_input_tokens", 0)
+                                  or usage.get("cache_read_tokens", 0) or 0)
+                    cc_t  = int(usage.get("cache_creation_input_tokens", 0)
+                                  or usage.get("cache_creation_tokens", 0) or 0)
+                    # Skip empty-usage entries (e.g. CLI-internal markers).
+                    if in_t == 0 and out_t == 0 and cr_t == 0 and cc_t == 0:
+                        continue
+                    # A single "turn" = one user prompt + its assistant
+                    # response chain. Inside that chain there can be many
+                    # intermediate assistant lines for tool_use loops —
+                    # those have stop_reason="tool_use". Only count the
+                    # final completion (stop_reason="end_turn", "max_tokens",
+                    # or sometimes None for legacy/streamed lines).
+                    stop_reason = msg.get("stop_reason")
+                    is_final = stop_reason in (None, "end_turn",
+                                                  "max_tokens", "stop_sequence")
+                    ts = entry.get("timestamp") or ""
+                    if not ts:
+                        continue
+                    try:
+                        dt_utc = _dt.datetime.fromisoformat(
+                            ts.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    day_str = dt_utc.astimezone(tz).date().isoformat()
+                    model_name = msg.get("model") or "unknown"
+                    uuid_key = entry.get("uuid") or ""
+                    cost_val = sid_costs.get(uuid_key, 0.0)
+
+                    turn = {
+                        "input_tokens": in_t,
+                        "output_tokens": out_t,
+                        "cache_read_tokens": cr_t,
+                        "cache_creation_tokens": cc_t,
+                        "cost": cost_val,
+                        # Every assistant line contributes tokens (each
+                        # tool-use loop iteration costs real compute), but
+                        # only the final completion counts as a "turn"
+                        # from the user's perspective.
+                        "turns": 1 if is_final else 0,
+                    }
+                    _add_bucket(all_total, turn)
+                    _add_bucket(by_model[model_name], turn)
+                    # Roll up to vendor too — same data, vendor granularity.
+                    # "Claude" for Anthropic, vendor display for third-parties
+                    # (DeepSeek / GLM / MiniMax), "Unknown" for stray model
+                    # ids we can't map (rare; CLI / vendor wrapper artifacts).
+                    vendor = _vendor_label_for(model_name)
+                    _add_bucket(by_vendor[vendor], turn)
+                    if day_str >= cutoff_day:
+                        _add_bucket(by_day[day_str], turn)
+                        _add_bucket(last_30d, turn)
+                    if day_str >= cutoff_7d:
+                        _add_bucket(last_7d, turn)
+                    if day_str == today_str:
+                        _add_bucket(today_total, turn)
+        except OSError:
+            continue
+
+    # Densify by_day so quiet days still get a zero bar.
+    dense_days: list[dict] = []
+    for i in range(days):
+        d = (now.date() - _dt.timedelta(days=days - 1 - i)).isoformat()
+        bucket = by_day.get(d, _empty_bucket())
+        dense_days.append({"date": d, **_round_bucket(bucket)})
+
+    by_model_list = sorted(
+        [
+            {
+                "model": k,
+                # Friendly label (e.g. "Sonnet 4.6" instead of
+                # "claude-sonnet-4-6") so the FE can show readable names
+                # without re-implementing the mapping.
+                "label": endpoints.label_for(k),
+                "vendor": _vendor_label_for(k),
+                # FE uses this to decorate rows whose cost is "untracked,
+                # not free" with a footnote instead of pretending the
+                # vendor was free.
+                "cost_reported": _cost_reported_for(k),
+                **_round_bucket(v),
+            }
+            for k, v in by_model.items()
+        ],
+        key=lambda x: (x["input_tokens"] + x["output_tokens"]
+                        + x["cache_read_tokens"] + x["cache_creation_tokens"]),
+        reverse=True)
+
+    by_vendor_list = sorted(
+        [
+            {
+                "vendor": k,
+                # Same "we report USD" flag at vendor granularity. A vendor
+                # is cost-reported when at least one of its model ids is —
+                # currently equivalent to "vendor == 'Claude'".
+                "cost_reported": k == "Claude",
+                **_round_bucket(v),
+            }
+            for k, v in by_vendor.items()
+        ],
+        key=lambda x: (x["input_tokens"] + x["output_tokens"]
+                        + x["cache_read_tokens"] + x["cache_creation_tokens"]),
+        reverse=True)
+
+    return {
+        "window_days": days,
+        "tz_offset_minutes": tz_offset_minutes,
+        "today":    _round_bucket(today_total),
+        "last_7d":  _round_bucket(last_7d),
+        "last_30d": _round_bucket(last_30d),
+        "all_time": _round_bucket(all_total),
+        "by_day":   dense_days,
+        "by_model": by_model_list,
+        "by_vendor": by_vendor_list,
+    }
+
+
+def _round_bucket(b: dict) -> dict:
+    return {**b, "cost": round(b["cost"], 4)}
+
+
+def _empty_dashboard_response(days: int, tz_offset_minutes: int, now) -> dict:
+    """Helper for the no-JSONL case — returns the same shape with all
+    zeros + a densified by_day list so the frontend's chart doesn't
+    crash on missing keys."""
+    import datetime as _dt
+    dense = [{"date": (now.date() - _dt.timedelta(days=days - 1 - i)).isoformat(),
+                **_round_bucket(_empty_bucket())} for i in range(days)]
+    return {
+        "window_days": days,
+        "tz_offset_minutes": tz_offset_minutes,
+        "today":    _round_bucket(_empty_bucket()),
+        "last_7d":  _round_bucket(_empty_bucket()),
+        "last_30d": _round_bucket(_empty_bucket()),
+        "all_time": _round_bucket(_empty_bucket()),
+        "by_day":   dense,
+        "by_model": [],
+        "by_vendor": [],
+    }
+
+
+@router.get("/context-breakdown/{session_id}", dependencies=[Depends(require_token)])
+async def context_breakdown(session_id: str, model: str = "") -> dict:
+    """Detailed context breakdown via SDK — answers "where did my 100K go?".
+    Calls ClaudeSDKClient.get_context_usage() which returns the same data
+    the CLI's /context command shows: tokens per category (memory files,
+    MCP tools, agents, system tools, system prompt sections), with
+    per-file and per-tool breakdowns.
+
+    Returns 404 if the session doesn't have a live SDK client yet — that
+    happens for newly-created sessions that haven't run a turn."""
+    s = sess.get_session(session_id)
+    if s is None:
+        raise HTTPException(404, "session not found")
+    m = (model or s.get("model") or MODEL).strip()
+    # The context-breakdown call is read-only and effort-independent — find
+    # ANY live client for this (sid, model) pair regardless of effort key.
+    matched = [k for k in _clients if k[0] == session_id and k[1] == m]
+    if not matched:
+        # No live client → can't ask CLI for breakdown. Surface this rather
+        # than returning fake data; frontend can fall back to /usage.
+        raise HTTPException(409, "no live client for this session — send a message first")
+    key = matched[0]
+    client = _clients.get(key)
+    if client is None:
+        raise HTTPException(409, "no live client for this session — send a message first")
+    try:
+        breakdown = await client.get_context_usage()
+        # Pass through the SDK's response shape directly. Frontend can pick
+        # whichever fields it wants to render.
+        return dict(breakdown)
+    except Exception as e:
+        # Log the raw exception to stderr (it can contain CLI subprocess
+        # stderr lines that mention ~/.claude/.credentials.json paths or
+        # vendor URLs / 401 echoes carrying API-key prefixes); return a
+        # generic message to the client.
+        sys.stderr.write(f"[chat] get_context_usage failed for sid={session_id[:8]}: "
+                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "context-usage probe failed") from None
+
+
+@router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
+async def native_compact_session_api(sid: str) -> dict:
+    """Compact a session using the CLI's native /compact slash command via SDK.
+    Lossless — CLI writes compact_boundary + isCompactSummary into the session
+    JSONL. Subsequent get_session_messages() returns the summary in place of
+    pre-compaction history, so the UI automatically reflects the compacted
+    state on next loadSession — no muselab-side marker needed.
+
+    Session ID stays the same; tool_use history is preserved in the summary."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    model = (meta.get("model") or "").strip() or MODEL
+    client = await get_client(sid, model, "bypassPermissions")
+    try:
+        await client.query("/compact")
+        async for _ in client.receive_response():
+            pass
+    except Exception as e:
+        sys.stderr.write(f"[chat] native /compact failed for sid={sid[:8]}: "
+                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "native /compact failed — see server log") from None
+    # Refresh message_count + turn_count so the sidebar reflects the
+    # compacted size. turn_count uses the real-prompt filter — see the
+    # comment on _is_real_user_prompt for why bare `type == "user"` over-
+    # counts by 5-10× in tool-heavy sessions.
+    try:
+        new_msgs = _get_session_msgs(sid, model)
+        n_turns = sum(1 for sm in new_msgs if _is_real_user_prompt(sm))
+        sess.bump_session(sid, message_count=len(new_msgs),
+                           turn_count=n_turns)
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+class ForkReq(BaseModel):
+    # Inclusive — fork copies the transcript up to and including this
+    # message UUID. To branch BEFORE a user message (e.g. for an edit-and-
+    # retry), pass the UUID of the previous assistant message.
+    # Omit / null = no truncation, copy the full transcript.
+    up_to_message_id: str | None = None
+    title: str | None = None
+
+
+@router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
+def fork_session_api(sid: str, req: ForkReq) -> dict:
+    """Branch a session at an arbitrary message UUID. SDK copies the JSONL
+    transcript up to that point into a fresh session file with new UUIDs;
+    muselab mirrors the new sid into index.json so it surfaces in the
+    picker immediately. Use case: user edits one of their messages — UI
+    forks at the previous assistant message, then resends the new text."""
+    src_meta = sess.get_session_meta(sid)
+    if src_meta is None:
+        raise HTTPException(404, "session not found")
+    try:
+        result = sdk_fork_session(
+            sid,
+            directory=str(ROOT),
+            up_to_message_id=req.up_to_message_id,
+            title=req.title,
+        )
+    except FileNotFoundError:
+        raise HTTPException(404, "source transcript not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        sys.stderr.write(f"[chat] fork session failed for sid={sid[:8]}: "
+                          f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        raise HTTPException(500, "fork failed — see server log") from None
+    new_sid = result.session_id
+    new_name = req.title or ((src_meta.get("name") or "会话") + " (分支)")
+    sess.register_session(
+        new_sid,
+        name=new_name,
+        model=src_meta.get("model") or MODEL,
+        system_prompt=src_meta.get("system_prompt") or "",
+        auto_named=False,
+    )
+    return {"session_id": new_sid, "name": new_name}
+
+
+class BudgetReq(BaseModel):
+    budget_usd: float       # 0 = disabled
+
+
+def _claude_md_filled_ratio(path: Path) -> tuple[int, float]:
+    """Heuristic: how much of a CLAUDE.md is actually filled vs. template.
+
+    Returns (filled_content_lines, fill_ratio_0_to_1).
+
+    The install script seeds CLAUDE.md with a 100+ line bilingual template
+    full of section headers and empty placeholders ("Name:", "Birth year:",
+    bullet labels with nothing after the colon). Just checking `lines > 0`
+    is a lie — that's "file exists", not "user actually told Muse anything."
+
+    We count a line as "filled" only if it carries user content:
+      - skip blank lines, pure markdown punctuation (---, ===, |...|)
+      - skip pure headers (#, ##, ###)
+      - skip comment lines (<!-- ... -->)
+      - skip lines that are just a label with no value
+        (e.g. "Name:" or "- 配偶 / 关系：" with nothing after the colon)
+      - skip the leading blockquote intro paragraph (> ...) used by the
+        default template's preamble — informational, not user content
+      - skip lines under a "delete-if-not-applicable" instruction that
+        still match the template's bullet labels exactly (best-effort
+        heuristic: anything that contains BOTH "(" and ":" but ends in
+        ":" is probably an unfilled prompt line)
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (0, 0.0)
+    lines = raw.splitlines()
+    filled = 0
+    total_content = 0  # lines that COULD be content (excludes pure structure)
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        # Pure structure / decoration — never counts as content
+        if s.startswith("#"):              # headers
+            continue
+        if s.startswith("---") or s.startswith("==="):
+            continue
+        if s.startswith("<!--") and s.endswith("-->"):
+            continue
+        if s.startswith("> "):             # block-quote preamble in template
+            continue
+        if s.startswith("|") and s.endswith("|"):  # markdown table rows
+            # Tables can be content OR template (e.g. "| Date | What |"). We
+            # treat them as content only if a non-header cell has > 2 chars.
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if any(len(c) > 2 and c not in ("---", ":---", "---:") for c in cells):
+                total_content += 1
+                filled += 1
+            continue
+        total_content += 1
+        # "Label:" with nothing meaningful after → unfilled prompt
+        # Examples seeded by template:
+        #   "- Name / how you'd like Muse to address you:"
+        #   "- Birth year (an age range is fine):"
+        #   "姓名 / 你希望 Muse 如何称呼你："
+        # If the line ends in ":" or "：", or has only label-colon-whitespace,
+        # it's an unfilled prompt.
+        if s.endswith(":") or s.endswith("："):
+            continue
+        # Lines like "- 居住：" (bullet + label + colon at end)
+        if s.endswith(":)") or s.endswith("：)"):
+            continue
+        # "(e.g. ...)" placeholder example lines — template hints, not user
+        # content. Heuristic: starts with "(" or "（".
+        if s.startswith("(") or s.startswith("（"):
+            continue
+        # Anything left is user-supplied content
+        filled += 1
+    ratio = (filled / total_content) if total_content > 0 else 0.0
+    return (filled, ratio)
+
+
+def _scan_claude_md_source(scope: str, path: Path) -> dict | None:
+    """Build a source descriptor for one CLAUDE.md path, or None if absent."""
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        total_lines = sum(1 for _ in path.open(encoding="utf-8", errors="replace"))
+        filled_lines, ratio = _claude_md_filled_ratio(path)
+        return {
+            "scope": scope,
+            "path": str(path),
+            "lines": total_lines,
+            "filled_lines": filled_lines,
+            "fill_ratio": round(ratio, 3),
+            "meaningfully_filled": filled_lines >= 6,  # arbitrary but useful threshold
+            "mtime": path.stat().st_mtime,
+        }
+    except OSError:
+        return None
+
+
+@router.get("/context-info", dependencies=[Depends(require_token)])
+def context_info() -> dict:
+    """Information about what Muse can see — used by the UI's onboarding
+    hints (does the user have a CLAUDE.md? archive empty? skills loaded?
+    has any working auth?). All paths relative to ROOT for safety.
+
+    SDK options pass `setting_sources=["user", "project", "local"]`, so
+    "Muse knows you" if any of these CLAUDE.md sources exist:
+      - project scope: ROOT/CLAUDE.md  (the user's autobiographical brief)
+      - project local override: ROOT/CLAUDE.local.md  (gitignored personal)
+      - project dot scope: ROOT/.claude/CLAUDE.md  (rarer, but SDK loads it)
+      - user scope: ~/.claude/CLAUDE.md  (cross-archive global)
+      - per-subdir: ROOT/{subdir}/CLAUDE.md  (e.g. health/CLAUDE.md to
+        scope rules to one domain; the SDK loads these lazily when Muse
+        Reads inside the dir)
+
+    We also distinguish "file exists" from "file actually has user content"
+    via a filled-ratio heuristic — the install script seeds a long bilingual
+    template, so plain `lines > 0` would falsely report "yes, Muse knows
+    you" right after install.
+    """
+    # Project-scope candidates at archive root
+    candidates: list[tuple[str, Path]] = [
+        ("project",       ROOT / "CLAUDE.md"),
+        ("project_local", ROOT / "CLAUDE.local.md"),
+        ("project_dot",   ROOT / ".claude" / "CLAUDE.md"),
+        ("user",          Path.home() / ".claude" / "CLAUDE.md"),
+    ]
+    # Per-subdirectory CLAUDE.md (one level deep, skip hidden / archives)
+    try:
+        for sub in sorted(ROOT.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name.startswith(".") or sub.name == "archives":
+                continue
+            candidates.append((f"subdir:{sub.name}", sub / "CLAUDE.md"))
+    except OSError:
+        pass
+
+    sources: list[dict] = []
+    for scope, path in candidates:
+        s = _scan_claude_md_source(scope, path)
+        if s is not None:
+            sources.append(s)
+
+    # Detect "do we have ANY working auth?" — needed so the chat-empty card
+    # can warn "you have no provider set up; configure one before chatting".
+    # Three valid Anthropic-side auth sources:
+    #   1. Pro/Max OAuth (~/.claude/.credentials.json)
+    #   2. ANTHROPIC_API_KEY  → x-api-key header
+    #   3. ANTHROPIC_AUTH_TOKEN → Authorization: Bearer (OAuth/enterprise)
+    # has_any_provider previously only checked #1 + third-party vendors,
+    # so users who configured ANTHROPIC_API_KEY in Settings got a stuck
+    # "no provider configured" warning (observed after clear-localStorage).
+    claude_oauth = (Path.home() / ".claude" / ".credentials.json").exists()
+    anthropic_api = bool(os.environ.get("ANTHROPIC_API_KEY")
+                          or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    from . import endpoints as _ep
+    # Return human-readable display names ("DeepSeek", "智谱 GLM"…) not raw
+    # env keys ("DEEPSEEK_API_KEY"…) — the FE / tests treat this as a
+    # user-facing list. A prior refactor briefly emitted env_key; broke
+    # test_settings_put_reflects_in_context_info. Stay on display names.
+    third_party_configured = [
+        p.display for p in _ep.CATALOG
+        if os.environ.get(p.env_key)
+    ]
+    # Back-compat: keep claude_md_exists / lines / mtime fields for any
+    # consumer that hasn't migrated to the new claude_md_sources list.
+    # Reflect "ANY source present" + union total lines + latest mtime so
+    # the existing UI keeps working without changes.
+    total_lines = sum(s["lines"] for s in sources)
+    latest_mtime = max((s["mtime"] for s in sources), default=0.0)
+    # NEW: distinguish "file present" from "user actually filled it".
+    # Onboarding logic needs this: a freshly-installed CLAUDE.md is a
+    # 100+ line template with zero user content — UI should still treat
+    # the profile as empty and prompt the user to fill it out.
+    meaningfully_filled = any(s["meaningfully_filled"] for s in sources)
+    info: dict = {
+        "archive_root": str(ROOT),
+        "claude_md_exists": len(sources) > 0,
+        "claude_md_lines": total_lines,
+        "claude_md_mtime": latest_mtime,
+        "claude_md_sources": sources,
+        "claude_md_meaningfully_filled": meaningfully_filled,
+        "archive_empty": True,
+        "subdir_present": {},
+        "has_claude_oauth": claude_oauth,
+        "has_anthropic_api": anthropic_api,
+        "third_party_configured": third_party_configured,
+        "has_any_provider": (
+            claude_oauth or anthropic_api or len(third_party_configured) > 0
+        ),
+    }
+    # Subdirs the install scripts create — used to nudge "drop a doc into X"
+    for sub in ("health", "work", "money", "people", "notes", "archives"):
+        d = ROOT / sub
+        present = d.exists() and d.is_dir()
+        info["subdir_present"][sub] = present
+        if present:
+            # Count any file other than the README to decide "empty"
+            try:
+                non_readme = [p for p in d.iterdir()
+                              if p.is_file() and p.name.lower() != "readme.md"]
+                if non_readme:
+                    info["archive_empty"] = False
+            except OSError:
+                pass
+    # If the root itself has user docs (not a subdir-only setup), also count
+    if info["archive_empty"]:
+        try:
+            for p in ROOT.iterdir():
+                if p.is_file() and p.name not in ("CLAUDE.md",):
+                    info["archive_empty"] = False
+                    break
+        except OSError:
+            pass
+    return info
+
+
+@router.get("/probe/{model}", dependencies=[Depends(require_token)])
+async def probe_provider(model: str) -> dict:
+    """Hit the vendor's anthropic-compat endpoint with the configured key and
+    return what the vendor said. Lets the user self-diagnose 401 / wrong-host
+    / wrong-key issues WITHOUT pasting keys into chat. Always returns 200 on
+    our side — the body carries vendor's status, headers, and partial body."""
+    import httpx
+    p = endpoints.lookup(model)
+    if p is None:
+        return {"ok": False, "reason": f"unknown model: {model}"}
+    key = os.environ.get(p.env_key, "")
+    if not key:
+        return {"ok": False, "reason": f"{p.env_key} not configured (Settings → Provider API Keys)"}
+    # Use the live-resolved base URL (env override > catalog default) so a
+    # proxy / on-prem URL probe doesn't silently hit the public endpoint.
+    base = endpoints._resolve_base_url(p.env_key, p) or p.base_url
+    url = base.rstrip("/") + "/v1/messages"
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    # Strip internal prefixes like "qwen-intl:" before sending to the API.
+    api_model = endpoints.normalize_model_id(model)
+    body = {"model": api_model, "max_tokens": 16,
+             "messages": [{"role": "user", "content": "ping"}]}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=body, headers=headers)
+        snippet = r.text[:500]
+        return {
+            "ok": r.status_code == 200,
+            "vendor": p.display, "model": model, "url": url,
+            "status": r.status_code,
+            "key_hint": f"{key[:4]}…{key[-4:]}" if len(key) > 12 else "***",
+            "vendor_response_excerpt": snippet,
+        }
+    except Exception as e:
+        return {"ok": False, "reason": f"transport error: {type(e).__name__}: {e}",
+                 "url": url}
+
+
+@router.put("/budget", dependencies=[Depends(require_token)])
+async def set_budget(req: BudgetReq) -> dict:
+    """Set the soft budget cap. Stored in env (process-lifetime only — for a
+    persistent cap, edit MUSELAB_BUDGET_USD in .env via /api/settings)."""
+    if req.budget_usd < 0:
+        raise HTTPException(400, "budget must be >= 0")
+    os.environ["MUSELAB_BUDGET_USD"] = str(req.budget_usd)
+    return {"ok": True, "budget_usd": req.budget_usd}
+
+
+@router.get("/mcp", dependencies=[Depends(require_token)])
+def mcp_status() -> dict:
+    """Return configured MCP servers (merged view: muselab's mcp.json +
+    Claude Code's standard config locations) for UI display. Source field
+    tells the caller where each entry came from. `configured: True` if at
+    least one server resolved from anywhere."""
+    try:
+        from .api_settings import _load_mcp_merged
+        merged = _load_mcp_merged()
+        return {
+            "configured": bool(merged),
+            "servers": [
+                {
+                    "name": name,
+                    "command": s.get("command", ""),
+                    "args": s.get("args", []),
+                    "source": s.get("_source", "muselab"),
+                    "disabled": bool(s.get("disabled", False)),
+                }
+                for name, s in merged.items()
+            ],
+        }
+    except Exception as e:
+        return {"configured": False, "servers": [], "error": str(e)}
+
+
+# Session ids whose most recent /interrupt has been called but the in-flight
+# stream's ResultMessage handler hasn't observed it yet. Consumed (set.discard)
+# the moment the handler runs, used to:
+#   (a) suppress the turn-done Web Push — user just cancelled, getting a "Muse
+#       已回复" buzz is noise, sometimes confusing ("did the reply come through
+#       after all?").
+#   (b) tag the SSE done event with `cancelled: true` so the frontend doesn't
+#       paint completion-success UI (turn footer ts stamp / scroll-to-bottom
+#       are still fine; what we hide is celebratory toasts / push).
+# Module-level set is fine for the single-user model muselab targets — no
+# cross-user race to worry about.
+_pending_interrupts: set[str] = set()
+
+
+@router.post("/interrupt", dependencies=[Depends(require_token_query)])
+async def interrupt(session_id: str) -> dict:
+    """Stop the current turn via SDK control protocol. Keeps the client
+    connected so the next message continues the same conversation without
+    re-spawning the CLI / re-loading CLAUDE.md / re-initializing MCP."""
+    async with _lock:
+        targets = [(k, c) for k, c in _clients.items() if k[0] == session_id]
+    if not targets:
+        return {"ok": True, "interrupted": [], "note": "no live client"}
+    # Mark BEFORE calling SDK's interrupt — the handler races with us, and
+    # we'd rather flag too early (one extra "not really cancelled"
+    # suppression that no-ops) than too late (push fires for a turn the
+    # user just cancelled).
+    _pending_interrupts.add(session_id)
+    interrupted: list[str] = []
+    for k, c in targets:
+        try:
+            await c.interrupt()
+            interrupted.append(f"{k[0]}@{k[1]}")
+        except Exception as e:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[chat-interrupt] {k} failed: {type(e).__name__}: {e}\n")
+    return {"ok": True, "interrupted": interrupted}
+
+
+@router.post("/reset", dependencies=[Depends(require_token_query)])
+async def reset(session_id: str | None = None) -> dict:
+    if session_id:
+        await disconnect_client(session_id)
+        return {"ok": True, "reset": [session_id]}
+    async with _lock:
+        keys = list(_clients.keys())
+        for k in keys:
+            c = _clients.pop(k, None)
+            if c is not None:
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
+    return {"ok": True, "reset": [f"{s}@{m}" for s, m in keys]}
+
+
+# ====== streaming ======
+
+# Per-field cap so a single tool_use payload stays bounded even when Write
+# pastes a 500KB file. 100KB covers >99% of real Edit / Write inputs while
+# capping the worst case at "still fits in one SSE frame, fits in the browser
+# buffer". Truncation is marked inline so the FE can show "…and 90KB more"
+# instead of silently rendering a partial diff.
+_MAX_INPUT_FIELD_LEN = 100_000
+
+
+def _slim_input_value(v: Any) -> Any:
+    """Cap a single tool-input field so a runaway Write doesn't blow the
+    SSE buffer. Strings get truncated with a marker; large lists/dicts are
+    rejected entirely and replaced by a placeholder (the FE wasn't going to
+    render them meaningfully anyway)."""
+    if isinstance(v, str) and len(v) > _MAX_INPUT_FIELD_LEN:
+        return (v[:_MAX_INPUT_FIELD_LEN]
+                + f"\n…[truncated, {len(v) - _MAX_INPUT_FIELD_LEN} chars more]")
+    if isinstance(v, (list, dict)):
+        try:
+            dumped = json.dumps(v, ensure_ascii=False)
+            if len(dumped) > _MAX_INPUT_FIELD_LEN:
+                return (f"[truncated structured field, "
+                        f"{len(dumped)} chars total]")
+        except (TypeError, ValueError):
+            pass
+    return v
+
+
+def _render_tool_use(block: ToolUseBlock) -> dict:
+    inp = block.input or {}
+    name = block.name
+    if name in ("Read", "Edit", "Write"):
+        summary = inp.get("file_path", "")
+    elif name == "Bash":
+        summary = (inp.get("command") or "")[:200]
+    elif name in ("Glob", "Grep"):
+        summary = (inp.get("pattern") or "") + (f"  in {inp.get('path','')}" if inp.get("path") else "")
+    elif name == "WebFetch":
+        summary = inp.get("url", "")
+    elif name == "WebSearch":
+        summary = inp.get("query", "")
+    elif name == "TodoWrite":
+        items = inp.get("todos") or []
+        summary = f"{len(items)} todos"
+    elif name == "Task":
+        sub = inp.get("subagent_type") or "agent"
+        desc = inp.get("description") or ""
+        summary = f"[{sub}] {desc}"[:240]
+    elif name == "ExitPlanMode":
+        summary = (inp.get("plan") or "")[:240]
+    elif name == "Skill":
+        summary = inp.get("name") or inp.get("skill") or ""
+    else:
+        summary = json.dumps(inp, ensure_ascii=False)[:200]
+
+    # Slim input — drop bulky fields the FE doesn't use, cap retained fields
+    # at _MAX_INPUT_FIELD_LEN. FE uses these for:
+    #   - file_path → clickable chip + preview auto-refresh on Edit
+    #   - old_string / new_string / edits / content → diff rendering for
+    #     Edit / MultiEdit / Write (previously the FE had no way to show
+    #     "what Muse actually changed" beyond a file_path chip)
+    #   - offset / limit → "lines N–M of …" label on Read
+    #   - command → Bash terminal-style block
+    _SLIM_INPUT_FIELDS = {
+        "file_path", "notebook_path", "path",
+        "command", "pattern", "url", "query",
+        "name", "skill", "subagent_type", "description", "todos",
+        # Diff-rendering inputs (Edit / MultiEdit / Write).
+        "old_string", "new_string", "edits", "content",
+        # Read pagination — surfaces as "lines N–M" label.
+        "offset", "limit",
+        # Bash extras — `description` already in the set; also pass
+        # `timeout` / `run_in_background` if present so the FE can show a
+        # spinner state for long-running commands.
+        "timeout", "run_in_background",
+        # MultiEdit/Edit "fix on miss" flag (Claude sometimes sends it).
+        "replace_all",
+        # Task* family — needed by the FE task-log-line renderer
+        # (subject + #id + status). Without these the live stream sent
+        # contentless "+ Created" / "✓ Done" lines.
+        "subject", "activeForm",
+        "taskId", "task_id", "status",
+        "addBlocks", "addBlockedBy",
+    }
+    slim_input = {k: _slim_input_value(v)
+                  for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
+    out: dict = {"name": name, "summary": summary, "id": block.id,
+                  "input": slim_input}
+    # Pass full structured payloads through for tools that have dedicated UIs.
+    if name == "TodoWrite":
+        out["todos"] = inp.get("todos") or []
+    elif name == "Task":
+        out["task"] = {
+            "subagent_type": inp.get("subagent_type"),
+            "description": inp.get("description"),
+            "prompt": inp.get("prompt"),
+        }
+    elif name == "ExitPlanMode":
+        out["plan"] = inp.get("plan") or ""
+    return out
+
+
+# tool_result raw text cap. preview stays small (cheap default render);
+# `text` carries the full body up to this cap (drives the "expand" button).
+# 50 KB ≈ a long Bash stack trace or a 500-line Read window — bigger than
+# that and the FE's <pre> render starts to feel sluggish anyway.
+_TOOL_RESULT_PREVIEW_CAP = 500
+_TOOL_RESULT_TEXT_CAP = 50_000
+
+
+# Bash output format from claude-code's CLI: stdout / stderr / exit_code are
+# wrapped in pseudo-XML tags so we can split them apart for terminal-style
+# rendering. Falls through gracefully when the tags aren't present (vendor
+# wrappers / mocked runs); the FE then just renders the raw body.
+_BASH_TAG_RE = re.compile(
+    r"<(stdout|stderr|exit_code|interrupted|description)>"
+    r"(.*?)</\1>",
+    re.DOTALL,
+)
+
+
+def _classify_stream_error(err: Any) -> dict:
+    """Tag a stream-error message with a kind + CTA hint + retryable flag so
+    the FE can render a useful action button instead of just a red toast.
+
+    Real-world breakdown (seen on the user's machine):
+      - vendor 401 / "invalid api key" / "Not logged in"  → kind=auth, retry=N
+      - "429" / "rate limit" / "quota exceeded"           → kind=quota, retry=Y
+      - "Connection refused" / "timeout" / "ECONNRESET"   → kind=network, retry=Y
+      - "Session ID already in use"                        → kind=session, retry=Y
+      - "thinking signature"                               → kind=cross_vendor, retry=Y
+      - everything else                                    → kind=unknown, retry=Y
+
+    `cta`: optional opaque key the FE maps to a button label + handler
+    (e.g. "open_settings", "switch_model", "retry"). FE falls back to a
+    plain "Retry" button when None.
+    """
+    msg = str(err) if err is not None else ""
+    low = msg.lower()
+    kind = "unknown"
+    cta: str | None = "retry"
+    retryable = True
+    if any(t in low for t in (
+        "401", "invalid api key", "invalid_api_key",
+        "not logged in", "requires auth", "no api key",
+        "anthropic_api_key", "authentication",
+    )):
+        kind = "auth"
+        cta = "open_settings"
+        retryable = False
+    elif any(t in low for t in (
+        "429", "rate limit", "rate_limit", "quota", "too many requests",
+        "overloaded",
+    )):
+        kind = "quota"
+        cta = "switch_model"
+    elif any(t in low for t in (
+        "connection refused", "timeout", "timed out",
+        "econnreset", "econnrefused", "enotfound", "network", "dns",
+    )):
+        kind = "network"
+        cta = "retry"
+    elif "thinking" in low and "signature" in low:
+        # Cross-vendor switch left a Claude thinking-signature in history;
+        # next turn from a non-Claude vendor fails validation. UX: tell the
+        # user to clear / compact / fork.
+        kind = "cross_vendor"
+        cta = "compact_or_fork"
+    elif "session" in low and ("already in use" in low or "already_in_use" in low):
+        kind = "session"
+        cta = "retry"
+    elif "processerror" in low or "claudesdkerror" in low:
+        kind = "sdk"
+        cta = "retry"
+    return {"kind": kind, "retryable": retryable, "cta": cta}
+
+
+def _error_event(err: Any) -> dict:
+    """Bundle a stream-error message with its classification into an SSE
+    `error` event payload — single call site so the FE always sees the
+    same shape regardless of which yield-error branch fired."""
+    msg = str(err) if err is not None else ""
+    return {"event": "error",
+            "data": json.dumps({"error": msg, **_classify_stream_error(msg)})}
+
+
+def _parse_bash_result(text: str) -> dict | None:
+    """Return {stdout, stderr, exit_code, interrupted, description} when
+    `text` carries CLI's wrapped Bash output. None when the body isn't in
+    that shape (still falls through to plain-text rendering on the FE)."""
+    if not text or "<" not in text:
+        return None
+    matches = list(_BASH_TAG_RE.finditer(text))
+    if not matches:
+        return None
+    parts: dict[str, Any] = {}
+    for m in matches:
+        tag, body = m.group(1), m.group(2)
+        if tag == "exit_code":
+            try:
+                parts["exit_code"] = int(body.strip())
+            except ValueError:
+                pass
+        elif tag == "interrupted":
+            parts["interrupted"] = body.strip().lower() in ("true", "1", "yes")
+        else:
+            parts[tag] = body
+    return parts or None
+
+
+def _render_tool_result(block: ToolResultBlock,
+                        *, tool_name: str = "") -> dict:
+    text = ""
+    if isinstance(block.content, str):
+        text = block.content
+    elif isinstance(block.content, list):
+        parts = []
+        for p in block.content:
+            if isinstance(p, dict):
+                parts.append(p.get("text", str(p)))
+            else:
+                parts.append(str(p))
+        text = "\n".join(parts)
+    out: dict = {
+        "id": getattr(block, "tool_use_id", None),
+        "preview": text[:_TOOL_RESULT_PREVIEW_CAP],
+        "truncated": len(text) > _TOOL_RESULT_PREVIEW_CAP,
+        # Full body up to _TOOL_RESULT_TEXT_CAP — drives the FE's "expand"
+        # affordance and per-tool rich render (Bash terminal, Read with
+        # gutter, WebFetch markdown card). When the underlying SDK text was
+        # bigger than the cap, `text_truncated` tells the FE so it can show
+        # "… 50KB more cut" instead of pretending this is the full output.
+        "text": text[:_TOOL_RESULT_TEXT_CAP],
+        "text_truncated": len(text) > _TOOL_RESULT_TEXT_CAP,
+        "is_error": bool(getattr(block, "is_error", False)),
+    }
+    if tool_name:
+        out["tool_name"] = tool_name
+    # Bash gets structured-output extraction so the FE can render stdout /
+    # stderr / exit-code with different styling. Only emit when the parse
+    # actually succeeded — empty objects would mislead.
+    if tool_name == "Bash":
+        bash = _parse_bash_result(text)
+        if bash:
+            out["bash"] = bash
+    return out
+
+
+# ====== attachment upload (images + documents) ======
+#
+# Multipart upload returns an attachment_id. Stream endpoint reads it (with
+# TTL) and attaches as the right SDK block type:
+#   - images (png/jpeg/gif/webp) → ImageBlock with base64 data
+#   - PDFs → DocumentBlock with base64 data (Claude supports PDFs natively)
+#   - text-ish docs (md / txt / csv / json / source code) → inline-text prefix
+#     in the prompt so any model can consume them. Stored as utf-8 text.
+# Stored in-memory; on restart pending uploads are lost (fine — re-attach).
+
+_image_store: dict[str, dict] = {}     # id -> {kind, mime, b64|text, name, ts}
+_IMAGE_TTL_S = 600
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
+_IMAGE_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_PDF_MIME = {"application/pdf"}
+# text-ish formats we'll inline. Browsers send vague mimes — we also gate by
+# extension below as a fallback.
+_TEXT_MIME = {
+    "text/plain", "text/markdown", "text/csv", "text/html", "text/css",
+    "text/xml", "text/javascript", "text/typescript",
+    "text/x-python", "text/x-yaml", "text/x-toml", "text/x-shellscript",
+    "application/json", "application/xml", "application/yaml",
+    "application/x-yaml", "application/toml",
+}
+_TEXT_EXTS = {
+    ".md", ".markdown", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml",
+    ".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx",
+    ".html", ".htm", ".css", ".scss", ".xml", ".log", ".ini", ".conf", ".cfg",
+    ".env.example", ".rs", ".go", ".java", ".c", ".h", ".cpp", ".hpp",
+    ".rb", ".php", ".swift", ".kt", ".sql", ".dockerfile", ".gitignore",
+}
+# Spreadsheets — we pre-process these to CSV-style text via openpyxl so
+# the model sees the data inline. Same "ends as `text` kind to the
+# frontend" contract — frontend's _classifyFile maps these to "text"
+# too so the chip is consistent.
+_XLSX_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+_TEXT_MAX_BYTES = 200 * 1024            # inline at most 200 KB as text
+# Caps for xlsx inlining — same shape as the /api/files/xlsx preview
+# endpoint, kept smaller because we're shoving this into the prompt
+# context, not just rendering a table.
+_XLSX_ATTACH_MAX_SHEETS = 5
+_XLSX_ATTACH_MAX_ROWS = 200
+_XLSX_ATTACH_MAX_COLS = 30
+_XLSX_ATTACH_CELL_MAX_CHARS = 200
+
+
+def _gc_images() -> None:
+    """Drop entries older than TTL."""
+    cutoff = time.time() - _IMAGE_TTL_S
+    for k in list(_image_store.keys()):
+        if _image_store[k]["ts"] < cutoff:
+            del _image_store[k]
+
+
+def _classify_attachment(mime: str, name: str) -> str:
+    """Return one of: 'image' / 'pdf' / 'text' / 'xlsx' / '' (unsupported)."""
+    mime = (mime or "").lower()
+    if mime in _IMAGE_MIME:
+        return "image"
+    if mime in _PDF_MIME:
+        return "pdf"
+    if mime in _TEXT_MIME:
+        return "text"
+    # Fall back to extension check (browsers often send empty / octet-stream).
+    lower = name.lower()
+    for ext in _TEXT_EXTS:
+        if lower.endswith(ext):
+            return "text"
+    if lower.endswith(".pdf"):
+        return "pdf"
+    for ext in _XLSX_EXTS:
+        if lower.endswith(ext):
+            return "xlsx"
+    return ""
+
+
+def _xlsx_to_text(body: bytes, name: str) -> str:
+    """Read xlsx bytes and dump each sheet as `[Sheet: name]\\n<csv>` blocks.
+    Capped by _XLSX_ATTACH_MAX_* so a 100k-row spreadsheet doesn't blow
+    the prompt. Truncation is signaled inline so the model knows."""
+    import openpyxl
+    from io import BytesIO
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(body), read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(
+            422, f"failed to parse xlsx '{name}': {type(e).__name__}: {e}",
+        )
+
+    parts: list[str] = [f"# Spreadsheet: {name}"]
+    sheets_total = len(wb.sheetnames)
+    sheets_truncated = sheets_total > _XLSX_ATTACH_MAX_SHEETS
+    try:
+        for sheet_name in wb.sheetnames[:_XLSX_ATTACH_MAX_SHEETS]:
+            ws = wb[sheet_name]
+            parts.append("")
+            parts.append(f"## Sheet: {sheet_name}")
+            rows_emitted = 0
+            cols_truncated = False
+            rows_truncated = False
+            for r_idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if r_idx >= _XLSX_ATTACH_MAX_ROWS:
+                    rows_truncated = True
+                    break
+                cells: list[str] = []
+                for c_idx, val in enumerate(row):
+                    if c_idx >= _XLSX_ATTACH_MAX_COLS:
+                        cols_truncated = True
+                        break
+                    if val is None:
+                        cells.append("")
+                    else:
+                        s = str(val)
+                        if len(s) > _XLSX_ATTACH_CELL_MAX_CHARS:
+                            s = s[:_XLSX_ATTACH_CELL_MAX_CHARS] + "…"
+                        # CSV-light: only quote/escape if a separator or
+                        # quote actually appears (cheap heuristic — the
+                        # model parses prose, not strict RFC 4180).
+                        if "," in s or '"' in s or "\n" in s:
+                            s = '"' + s.replace('"', '""') + '"'
+                        cells.append(s)
+                parts.append(",".join(cells))
+                rows_emitted += 1
+            if rows_truncated:
+                parts.append(f"… (rows truncated at {_XLSX_ATTACH_MAX_ROWS})")
+            if cols_truncated:
+                parts.append(f"… (cols truncated at {_XLSX_ATTACH_MAX_COLS})")
+            if rows_emitted == 0:
+                parts.append("(empty sheet)")
+    finally:
+        wb.close()
+
+    if sheets_truncated:
+        parts.append("")
+        parts.append(f"… (sheets truncated at {_XLSX_ATTACH_MAX_SHEETS} "
+                     f"of {sheets_total})")
+
+    return "\n".join(parts)
+
+
+@router.get("/attachments/{session_id}/{filename}",
+            dependencies=[Depends(require_token_query)])
+def get_attachment(session_id: str, filename: str):
+    """Serve the FULL-RES original of a user-uploaded image saved at
+    send-time. Lightbox uses this; the in-stream bubble keeps using the
+    160-px thumbnail (small + fast). require_token_query lets the
+    browser issue plain `<img src=...?token=...>` requests without
+    needing to inject auth headers per element.
+
+    Path traversal guard: filename must be a single basename (no slashes,
+    no parent-dir refs) and session_id must be a valid uuid-ish string.
+    """
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
+        raise HTTPException(400, "bad session_id")
+    if "/" in filename or ".." in filename or "\\" in filename:
+        raise HTTPException(400, "bad filename")
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}", filename):
+        raise HTTPException(400, "bad filename format")
+    path = _attachments_base() / session_id / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "attachment not found")
+    # Resolve + verify still inside the attachments dir (extra defense)
+    base = (_attachments_base()).resolve()
+    real = path.resolve()
+    try:
+        real.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, "bad path")
+    # MIME from extension
+    ext = filename.rsplit(".", 1)[-1].lower()
+    mime = {
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path, media_type=mime,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
+
+
+@router.post("/upload-image", dependencies=[Depends(require_token)])
+async def upload_image(file: UploadFile = File(...)) -> dict:
+    """Legacy endpoint name; now handles images + PDF + text-ish docs + xlsx."""
+    import sys as _sys
+    _t0 = time.perf_counter()
+    _gc_images()
+    mime = (file.content_type or "").lower()
+    name = file.filename or "upload"
+    kind = _classify_attachment(mime, name)
+    if not kind:
+        raise HTTPException(
+            400,
+            f"unsupported file type: {mime or 'unknown'} ({name}). "
+            f"Accepted: images (png/jpg/gif/webp), PDF, text-based docs "
+            f"(md/txt/csv/json/yaml/source code), or Excel (xlsx/xlsm).",
+        )
+    _t_read_start = time.perf_counter()
+    body = await file.read()
+    _t_read_end = time.perf_counter()
+    if len(body) > _IMAGE_MAX_BYTES:
+        raise HTTPException(413, f"file too large: {len(body)} bytes. "
+                                  f"Max {_IMAGE_MAX_BYTES} bytes (~10MB)")
+    aid = uuid.uuid4().hex
+    entry: dict = {"kind": kind, "mime": mime, "name": name, "ts": time.time()}
+    if kind == "text":
+        if len(body) > _TEXT_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"text file too large: {len(body)} bytes. Max "
+                f"{_TEXT_MAX_BYTES} (~200 KB). Trim it or send as PDF.",
+            )
+        try:
+            entry["text"] = body.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(400, "text file is not valid UTF-8 — "
+                                      "convert to UTF-8 or send as PDF") from None
+    elif kind == "xlsx":
+        # Convert to text up front; downstream chat code only inlines
+        # entries whose kind is "text", so flip it before storing.
+        entry["text"] = _xlsx_to_text(body, name)
+        entry["kind"] = "text"
+        if len(entry["text"].encode("utf-8")) > _TEXT_MAX_BYTES * 2:
+            # Higher cap for converted spreadsheets — the per-cell + row
+            # ceilings already bound output size, this is just a hard
+            # safety rail. 400 KB ≈ 10k rows of 8 short cols.
+            raise HTTPException(
+                413,
+                "spreadsheet too large after conversion. Reduce rows / "
+                "cols and re-upload, or send a CSV of just the slice "
+                "you need.",
+            )
+    else:
+        entry["b64"] = base64.b64encode(body).decode("ascii")
+    _image_store[aid] = entry
+    # Diagnostic timing — logs to journalctl so we can cross-reference
+    # against the frontend's console.log when uploads feel slow. Splits
+    # into "read body" (multipart parse + transfer-out-of-uvicorn) vs
+    # "total" (incl. base64 / dict insert) so we know where the time
+    # actually went on the server side.
+    _t_end = time.perf_counter()
+    _safe_name = Path(file.filename or "upload").name
+    _sys.stderr.write(
+        f"[upload] kind={kind} mime={mime} bytes={len(body)} "
+        f"name={_safe_name!r} read_ms={(_t_read_end - _t_read_start)*1000:.0f} "
+        f"total_ms={(_t_end - _t0)*1000:.0f}\n")
+    _sys.stderr.flush()
+    # Tell the FE the on-disk extension we'll use when persisting this
+    # image at send-time. FE assembles the lightbox URL from
+    # (currentId, aid, ext) immediately and stores it on the user
+    # message — that way the URL survives even if the user reloads
+    # before the stream-completion annotation hook fires.
+    _EXT_MAP = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+                "image/gif": "gif", "image/webp": "webp"}
+    ext = _EXT_MAP.get(mime, "")
+    return {"id": aid, "mime": mime, "bytes": len(body),
+             "kind": entry["kind"], "name": name,
+             "attach_ext": ext}
+
+
+@router.get("/stream", dependencies=[Depends(require_token_query)])
+async def stream(
+    prompt: str = Query(default=""),
+    token: str = Query(...),
+    session_id: str = Query(...),
+    model: str = Query(default=""),
+    permission: str = Query(default="bypassPermissions"),
+    image_ids: str = Query(default=""),
+):
+    # RECONNECT MODE: empty prompt + NO attached images + an active
+    # in-flight turn on this session = subscribe to the existing
+    # TurnBroadcast for replay + live tail. Frontend uses this after
+    # loadSession discovers that `/sessions/{sid}/active` is true.
+    # No new query is sent to the SDK.
+    #
+    # IMPORTANT: image-only turns (text empty + image_ids set) are a
+    # LEGITIMATE new turn — "look at this picture" with no caption.
+    # Previously we lumped them into reconnect mode and returned
+    # "no active turn", confusing the user (just dropped an image,
+    # got a generic error toast).
+    is_image_only = (not prompt.strip()) and bool((image_ids or "").strip())
+    if not prompt.strip() and not is_image_only:
+        existing = _active_turns.get(session_id)
+        if existing is None:
+            async def _no_active_gen():
+                yield _error_event("no active turn")
+            return EventSourceResponse(_no_active_gen())
+        return EventSourceResponse(
+            _subscribe_broadcast(existing),
+            headers={
+                "Content-Encoding": "identity",
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    # Image-only path: inject a neutral placeholder prompt so the SDK
+    # gets non-empty text alongside the attachment. "(image)" is short
+    # and language-neutral; Muse handles "what's in this image?" fine
+    # from just the attachment + this hint.
+    if is_image_only:
+        prompt = "(image)"
+
+    # NEW-TURN MODE: refuse if there's already an unfinished turn on
+    # this session — otherwise the second turn would overwrite the
+    # broadcast and the user would lose visibility into the first.
+    # Frontend should either reconnect (empty prompt) or wait.
+    #
+    # The check + reservation MUST happen atomically under _lock — two
+    # near-simultaneous SSE requests on the same sid could otherwise both
+    # pass the "busy?" check (neither sees the other's broadcast yet),
+    # both build their own broadcast, and the later one overwrites
+    # `_active_turns[sid]` — making the first turn's reply silently vanish
+    # from the UI. Reserve a placeholder broadcast under the lock; we'll
+    # fill its `user_text` / images / etc. below once we've parsed them.
+    async with _lock:
+        if session_id in _active_turns and not _active_turns[session_id].done:
+            async def _busy_gen():
+                yield _error_event("previous turn still running")
+            return EventSourceResponse(_busy_gen())
+        broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+        _active_turns[session_id] = broadcast
+    # Defensive: clear any stale "user cancelled" flag carried over from
+    # a previous turn on this session. Normally consumed by the prior
+    # turn's ResultMessage handler, but if that handler never reached
+    # (early exception in pump_claude before ResultMessage arrived) the
+    # flag would persist and wrongly suppress the next turn's push.
+    _pending_interrupts.discard(session_id)
+    # One-session-one-model: if the session already has a locked model,
+    # that wins over whatever the frontend's dropdown happens to say. This
+    # prevents the "I tried to switch but it didn't take" class of bugs and
+    # avoids cross-vendor thinking-signature corruption.
+    s = sess.get_session(session_id) or {}
+    locked = (s.get("model") or "").strip()
+    if locked:
+        model_to_use = locked
+    else:
+        # Virgin session — frontend's choice gets persisted on first send.
+        model_to_use = model or MODEL
+        sess.update_model(session_id, model_to_use)
+
+    # Effort is per-session; read from metadata (settable via PATCH). Empty
+    # string = SDK adaptive default, which is what the existing behavior was.
+    effort_to_use = (s.get("effort") or "").strip()
+    # Wrap get_client so SDK / auth pre-check errors surface as SSE error
+    # events instead of bubbling up as a 500 (which the frontend can only
+    # render as the generic "stream connection failed" toast). Also: release
+    # the reservation we made at the top of NEW-TURN MODE, otherwise this
+    # session's slot stays "busy" forever and subsequent sends get rejected.
+    try:
+        client = await asyncio.wait_for(
+            get_client(session_id, model_to_use, permission, effort=effort_to_use),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise HTTPException(504, "Client connection timed out — CLI process may be hung")
+    except asyncio.CancelledError:
+        # FastAPI cancels the handler when the client disconnects mid-
+        # await (browser tab closed, request aborted). Without this the
+        # reservation we made above stays in _active_turns forever and
+        # every subsequent send on this sid is rejected as "previous
+        # turn still running." CancelledError is a BaseException, NOT
+        # an Exception, so the broader handler below would miss it.
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise
+    except Exception as e:
+        err_msg = str(e) or f"{type(e).__name__}"
+        # Free the reservation so the user can fix their config (e.g. add an
+        # API key) and immediately retry without waiting for any timeout.
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        async def _early_err_gen():
+            yield _error_event(err_msg)
+        return EventSourceResponse(_early_err_gen())
+
+    # Pull attachments from the in-memory store; build content blocks for the
+    # SDK. Consume them — same attachment won't be re-sent on retry.
+    img_blocks: list[dict] = []
+    pdf_blocks: list[dict] = []
+    text_attachments: list[tuple[str, str]] = []   # (name, content)
+    persisted_imgs: list[dict] = []
+    persisted_docs: list[dict] = []
+    if image_ids:
+        # Sweep expired entries before consuming. Previously _gc_images
+        # only ran on upload, so a user who never uploaded again would
+        # leak their old attachments in memory past TTL. Reads check too.
+        _gc_images()
+        for aid in [x.strip() for x in image_ids.split(",") if x.strip()]:
+            entry = _image_store.pop(aid, None)
+            if entry is None:
+                continue   # expired or unknown — silently skip
+            kind = entry.get("kind", "image")
+            if kind == "image":
+                img_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": entry["mime"],
+                        "data": entry["b64"],
+                    },
+                })
+                # Persist FULL-RES original to disk so a future lightbox
+                # open after reload still sees the real image, not a 160-px
+                # thumbnail blown up. Path: sessions/attachments/<sid>/<aid>.<ext>
+                # JSONL message keeps {thumb, url, mime} — thumb for the
+                # in-stream chat bubble (small, fast), url for lightbox
+                # full-res. Previously only thumb was kept, hence "click
+                # to enlarge" showed a 160-px upscaled blur.
+                import io as _io
+                import base64 as _b64
+                ext_map = {
+                    "image/png": "png", "image/jpeg": "jpg",
+                    "image/jpg": "jpg", "image/gif": "gif",
+                    "image/webp": "webp",
+                }
+                ext = ext_map.get(entry["mime"], "bin")
+                attach_dir = _attachments_base() / session_id
+                full_url = None
+                try:
+                    attach_dir.mkdir(parents=True, exist_ok=True)
+                    attach_path = attach_dir / f"{aid}.{ext}"
+                    attach_path.write_bytes(_b64.b64decode(entry["b64"]))
+                    full_url = f"/api/chat/attachments/{session_id}/{aid}.{ext}"
+                except Exception as _e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[attach] persist failed sid={session_id} aid={aid} "
+                        f"path={attach_dir} err={type(_e).__name__}: {_e}\n")
+                    _sys.stderr.flush()
+                # Thumb for in-stream bubble (≤ 160 px, JPEG 60%).
+                thumb_b64 = None
+                try:
+                    from PIL import Image as _Img
+                    raw_bytes = _b64.b64decode(entry["b64"])
+                    with _Img.open(_io.BytesIO(raw_bytes)) as _img:
+                        _img.thumbnail((160, 160))
+                        buf = _io.BytesIO()
+                        _img.convert("RGB").save(buf, "JPEG", quality=60)
+                        thumb_b64 = _b64.b64encode(buf.getvalue()).decode()
+                except Exception:
+                    pass
+                _item: dict = {"mime": entry["mime"]}
+                if thumb_b64:
+                    _item["thumb"] = thumb_b64
+                if full_url:
+                    _item["url"] = full_url
+                persisted_imgs.append(_item)
+                # Stash to pending NOW so the attachment survives even if
+                # the stream gets cancelled / errored before the
+                # set_message_annotation(uuid) hook at stream-completion
+                # gets to fire. GET /sessions/{sid} will bind it to the
+                # next user message that has image refs but no annotation.
+                try:
+                    sess.append_pending_attachments(session_id, images=[_item])
+                except Exception:
+                    pass
+            elif kind == "pdf":
+                pdf_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": entry["b64"],
+                    },
+                })
+                persisted_docs.append({"name": entry.get("name", "doc.pdf"),
+                                        "kind": "pdf"})
+            elif kind == "text":
+                text_attachments.append((entry.get("name", "file.txt"),
+                                          entry["text"]))
+                persisted_docs.append({"name": entry.get("name", "file.txt"),
+                                        "kind": "text"})
+
+    # Prepend inline text attachments to the prompt (any model can consume).
+    if text_attachments:
+        parts = [prompt] if prompt else []
+        for name, body in text_attachments:
+            parts.append(f"\n\n--- Attached file: {name} ---\n```\n{body}\n```\n--- end {name} ---")
+        prompt = "\n".join(parts).lstrip()
+
+    # New architecture: CLI's JSONL is the transcript source-of-truth. We no
+    # longer accumulate `persisted` into a parallel local store. Instead, after
+    # the stream completes we ask SDK for the latest message UUIDs and write
+    # per-message annotations (cost / model / images) keyed by those UUIDs.
+    assistant_acc = ""
+    # Mirror of frontend's per-bubble `acc`. Reset on tool_use (FE
+    # closeAsst). Lets us tail-emit any TextBlock suffix the SDK didn't
+    # send as text_delta — see TextBlock branch below for context.
+    streamed_in_bubble = ""
+    # tool_use_id → tool_name lookup populated as we forward ToolUseBlock
+    # events. When the matching ToolResultBlock arrives, we attach the
+    # name so the FE can pick a per-tool rich renderer (Bash terminal,
+    # Read with line gutter, etc.) without re-scanning its own message
+    # list. Cleared per turn (lives in event_gen closure).
+    tool_use_names: dict[str, str] = {}
+
+    async def event_gen():
+        nonlocal assistant_acc, streamed_in_bubble
+        # Subscribe to the session's side-channel queue. The MCP ask_user_question
+        # handler publishes here; we merge those events into the SSE stream so the
+        # UI can render the question UI while the SDK tool handler is await-ing.
+        side_q = register_session_queue(session_id)
+        perm_q = perm.register_session_queue(session_id)
+        merge_q: asyncio.Queue = asyncio.Queue()
+        SENTINEL_DONE = object()
+
+        async def pump_claude():
+            """Pull from claude SDK response stream into the merge queue."""
+            try:
+                # Multimodal path when binary blocks (image/pdf) are present.
+                # Text-only attachments were already inlined into `prompt`.
+                binary_blocks = [*img_blocks, *pdf_blocks]
+                if binary_blocks:
+                    text_block = {"type": "text", "text": prompt}
+                    content = [*binary_blocks, text_block]
+
+                    async def gen():
+                        yield {
+                            "type": "user",
+                            "message": {"role": "user", "content": content},
+                        }
+                    await client.query(gen())
+                else:
+                    await client.query(prompt)
+                async for msg in client.receive_response():
+                    await merge_q.put(("claude", msg))
+                    if isinstance(msg, ResultMessage):
+                        break
+            except Exception as e:
+                # Log the full exception type + message + traceback for diagnosis.
+                # SDK transport errors / vendor 401s land here. Without this we
+                # silently die and the user just sees "卡着，无法对话".
+                import traceback
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chat-stream] sid={session_id} model={model_to_use} "
+                    f"exc={type(e).__name__}: {e}\n{traceback.format_exc()}\n")
+                _sys.stderr.flush()
+                await merge_q.put(("error", e))
+            finally:
+                await merge_q.put(("done", SENTINEL_DONE))
+
+        async def pump_side_q(src_q):
+            """Pull from a side channel (MCP tool / permission) into merge queue."""
+            try:
+                while True:
+                    evt = await src_q.get()
+                    await merge_q.put(("side", evt))
+            except asyncio.CancelledError:
+                pass
+
+        # ====== message-type-specific handlers ======
+        # Three nested async generators, one per SDK message type. They share
+        # closure state (assistant_acc + streamed_in_bubble via nonlocal,
+        # other locals read-only). Keeps the main loop a ~15-line dispatch
+        # instead of a 200-line elif chain.
+
+        async def _handle_stream_event(msg):
+            """Token-by-token deltas → tiny text / thinking events. Fast
+            feedback path; the AssistantMessage handler suppresses re-emit."""
+            nonlocal assistant_acc, streamed_in_bubble
+            ev = msg.event or {}
+            if ev.get("type") != "content_block_delta":
+                return
+            delta = ev.get("delta") or {}
+            dt = delta.get("type")
+            if dt == "text_delta":
+                chunk = delta.get("text", "")
+                if chunk:
+                    assistant_acc += chunk
+                    streamed_in_bubble += chunk
+                    yield {"event": "text", "data": json.dumps({"text": chunk})}
+            elif dt == "thinking_delta":
+                chunk = delta.get("thinking", "")
+                if chunk:
+                    yield {"event": "thinking", "data": json.dumps({"text": chunk})}
+
+        async def _handle_assistant_message(msg):
+            """Per-turn AssistantMessage:
+              1. Snapshot per-turn usage (msg.usage is raw Anthropic per-call
+                 dict; populate sess_u truthfully for the context meter).
+              2. Accumulate per-turn tokens into the global _stats (truth
+                 for `/api/chat/usage`). ResultMessage.usage is cumulative
+                 per session and would double-count, so we do it here.
+              3. Iterate content blocks — tail-emit TextBlock suffix the
+                 stream may have skipped; forward tool_use / tool_result.
+            """
+            nonlocal assistant_acc, streamed_in_bubble
+            a_usage = getattr(msg, "usage", None) or {}
+            if a_usage:
+                in_t = int(a_usage.get("input_tokens", 0) or 0)
+                cr_t = int(a_usage.get("cache_read_input_tokens", 0) or 0)
+                cc_t = int(a_usage.get("cache_creation_input_tokens", 0) or 0)
+                out_t = int(a_usage.get("output_tokens", 0) or 0)
+                ctx_used = in_t + cr_t + cc_t
+                # Per-turn accumulation into the global stats. We do this
+                # here (not in ResultMessage) because ResultMessage.usage
+                # is the cumulative-per-session value and would inflate
+                # _stats quadratically on long sessions.
+                _stats["total_input_tokens"]           += in_t
+                _stats["total_output_tokens"]          += out_t
+                _stats["total_cache_read_tokens"]      += cr_t
+                _stats["total_cache_creation_tokens"]  += cc_t
+                sess_u = _session_usage.setdefault(session_id, {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                    "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                    "context_used": 0, "context_used_pct": 0.0,
+                    "context_limit": 0,
+                })
+                # Prefer the SDK-authoritative limit set by a prior turn's
+                # ResultMessage handler (real maxTokens, may be 1M). Fallback
+                # to the hardcoded estimate on the very first turn before
+                # any get_context_usage() has run.
+                limit = sess_u.get("context_limit") or MODEL_CONTEXT_LIMITS.get(
+                    model_to_use, DEFAULT_CONTEXT_LIMIT)
+                sess_u["input_tokens"] = in_t
+                sess_u["cache_read_tokens"] = cr_t
+                sess_u["cache_creation_tokens"] = cc_t
+                sess_u["output_tokens"] = out_t
+                sess_u["context_used"] = ctx_used
+                sess_u["context_used_pct"] = (
+                    round(ctx_used / limit * 100, 1) if limit else 0.0)
+                # Only write context_limit when it's still 0 (first turn).
+                # Otherwise keep the SDK-authoritative value the prior turn's
+                # ResultMessage handler wrote.
+                if not sess_u.get("context_limit"):
+                    sess_u["context_limit"] = limit
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    # Defensive tail-emit (see message_parser.py:279-290 — SDK
+                    # forwards CLI stream events 1:1 in theory, but FE was
+                    # observed truncating mid-word "CSS 变量切" 2026-05-18).
+                    # Diagnostic log only fires when diff > 0 (no spam).
+                    full = (getattr(block, "text", "") or "")
+                    if full and full != streamed_in_bubble:
+                        tail = (full[len(streamed_in_bubble):]
+                                 if full.startswith(streamed_in_bubble)
+                                 else full)
+                        if tail:
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f"[chat-stream] sid={session_id} "
+                                f"TextBlock tail-emit: streamed="
+                                f"{len(streamed_in_bubble)} chars, "
+                                f"block.text={len(full)} chars, "
+                                f"emitting tail={len(tail)} chars "
+                                f"(prefix_match="
+                                f"{full.startswith(streamed_in_bubble)})\n")
+                            _sys.stderr.flush()
+                            assistant_acc += tail
+                            streamed_in_bubble += tail
+                            yield {"event": "text",
+                                   "data": json.dumps({"text": tail})}
+                elif isinstance(block, ThinkingBlock):
+                    # Already streamed via thinking_delta events.
+                    pass
+                elif isinstance(block, ToolUseBlock):
+                    if block.id:
+                        tool_use_names[block.id] = block.name or ""
+                    yield {"event": "tool_use",
+                           "data": json.dumps(_render_tool_use(block))}
+                    # FE closeAsst()'s the bubble on tool_use; reset mirror.
+                    streamed_in_bubble = ""
+                elif isinstance(block, ToolResultBlock):
+                    tu_id = getattr(block, "tool_use_id", "") or ""
+                    tname = tool_use_names.get(tu_id, "")
+                    yield {"event": "tool_result",
+                           "data": json.dumps(
+                               _render_tool_result(block, tool_name=tname))}
+
+        async def _handle_user_message(msg):
+            """SDK emits a `UserMessage` after every tool the agent ran —
+            its `content` list carries `ToolResultBlock`s. Without this
+            handler the result of every Read/Bash/Edit/etc. was silently
+            dropped on the floor (the FE only ever saw the `tool_use`
+            half of the round trip). 2026-05-22 audit fix.
+
+            tool_use_id matches the prior ToolUseBlock; we look up its
+            name from `tool_use_names` so the FE renderer (Bash terminal,
+            Read gutter, …) can pick the right per-tool view."""
+            content = getattr(msg, "content", None)
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, ToolResultBlock):
+                        tu_id = getattr(block, "tool_use_id", "") or ""
+                        tname = tool_use_names.get(tu_id, "")
+                        yield {"event": "tool_result",
+                               "data": json.dumps(
+                                   _render_tool_result(block, tool_name=tname))}
+
+        async def _handle_result_message(msg):
+            """ResultMessage = turn complete. Update cumulative cost / stats,
+            write per-message sidecar annotations, bump session metadata, then
+            yield the consolidated 'done' SSE event the FE awaits."""
+            cost = getattr(msg, "total_cost_usd", None) or 0.0
+            u = getattr(msg, "usage", {}) or {}
+            # ResultMessage.usage is CUMULATIVE per session. Per-turn
+            # token accumulation into _stats happens in
+            # _handle_assistant_message; here we only record the
+            # cumulative numbers for the SSE "done" payload (FE reads
+            # them as a snapshot). Cost is per-turn (not cumulative),
+            # so it's safe to += into _stats.
+            in_t = int(u.get("input_tokens", 0) or 0)
+            out_t = int(u.get("output_tokens", 0) or 0)
+            cr_t = int(u.get("cache_read_input_tokens", 0)
+                        or u.get("cache_read_tokens", 0) or 0)
+            cc_t = int(u.get("cache_creation_input_tokens", 0)
+                        or u.get("cache_creation_tokens", 0) or 0)
+            _stats["total_cost_usd"] += cost
+            _stats["total_messages"] += 1
+            sess_u = _session_usage.setdefault(session_id, {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0,
+                "context_limit": 0,
+            })
+            sess_u["total_cost_usd"] += cost
+            sess_u["last_turn_at"] = time.time()
+
+            # Pull authoritative max-window from SDK so the meter reflects the
+            # ACTUAL effective limit (which may be 1M for Pro/Max subscribers,
+            # not the hardcoded 200K in MODEL_CONTEXT_LIMITS). One control
+            # round-trip per turn — small price for accurate denominator.
+            #
+            # Third-party caveat: CLI's get_context_usage uses Claude's
+            # tokenizer + doesn't know DeepSeek/GLM/MiniMax context windows,
+            # so for those vendors we trust our hardcoded MODEL_CONTEXT_LIMITS
+            # table instead. It's not perfect either but at least matches the
+            # vendor's documented window. AssistantMessage.usage already
+            # populated context_used / pct against that limit a few lines up.
+            if endpoints.is_third_party(model_to_use):
+                # Re-anchor context_limit to muselab's table in case a prior
+                # turn (under a different model) left a Claude-style 1M
+                # value behind.
+                sess_u["context_limit"] = MODEL_CONTEXT_LIMITS.get(
+                    model_to_use, DEFAULT_CONTEXT_LIMIT)
+                # Recompute pct against the corrected limit.
+                if sess_u["context_limit"]:
+                    sess_u["context_used_pct"] = round(
+                        sess_u.get("context_used", 0)
+                        / sess_u["context_limit"] * 100, 1)
+            else:
+                try:
+                    cu = await client.get_context_usage()
+                    real_max = int(cu.get("maxTokens") or 0)
+                    real_total = int(cu.get("totalTokens") or 0)
+                    if real_max:
+                        sess_u["context_limit"] = real_max
+                    if real_total:
+                        sess_u["context_used"] = real_total
+                    if real_max and real_total:
+                        sess_u["context_used_pct"] = round(
+                            real_total / real_max * 100, 1)
+                except Exception as _e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[chat-stream] get_context_usage skipped for "
+                        f"sid={session_id}: {type(_e).__name__}\n")
+
+            # Sidecar annotations: pull latest transcript from SDK to find
+            # new user/assistant UUIDs, then write cost / model / images /
+            # docs against those rows in muselab's per-session sidecar.
+            try:
+                all_msgs = _get_session_msgs(session_id, model)
+            except Exception:
+                all_msgs = []
+            new_asst_uuid = None
+            new_user_uuid = None
+            for sm in reversed(all_msgs):
+                if sm.type == "assistant" and not new_asst_uuid:
+                    new_asst_uuid = sm.uuid
+                elif sm.type == "user" and not new_user_uuid:
+                    if persisted_imgs:
+                        # When images were sent, match the user message that
+                        # actually contains image blocks — not just any last
+                        # user message. Without this, if the user sends more
+                        # messages while the stream is running, reversed()
+                        # finds a later (non-image) user UUID and the image
+                        # annotation ends up on the wrong message.
+                        content = (sm.message or {}).get("content") or []
+                        has_img_block = isinstance(content, list) and any(
+                            isinstance(b, dict) and b.get("type") == "image"
+                            for b in content
+                        )
+                        if has_img_block:
+                            new_user_uuid = sm.uuid
+                    else:
+                        new_user_uuid = sm.uuid
+                if new_asst_uuid and new_user_uuid:
+                    break
+            if new_asst_uuid and assistant_acc:
+                # ts (ms epoch) stamps the turn's completion time. The
+                # frontend's turn-footer (.turn-footer in index.html)
+                # reads it via fmtHM() → "HH:MM" under the last muse
+                # block of the turn. Stored at ms granularity to match
+                # JS Date.now() (the frontend writes the same ts onto
+                # in-flight messages in _markDone; loading from sidecar
+                # uses this one).
+                # elapsed_s = SDK-reported wall-clock for the turn (in
+                # seconds). Persisted so reloading a session keeps the
+                # "13:42 · 2m50s" footer (FE-side stamping only survives
+                # within the live session). None when SDK didn't fill
+                # duration_ms.
+                _msg_duration_ms = getattr(msg, "duration_ms", None)
+                _elapsed_s = (round(_msg_duration_ms / 1000, 1)
+                              if _msg_duration_ms else None)
+                sess.set_message_annotation(
+                    session_id, new_asst_uuid,
+                    cost=f"${cost:.4f}", model=model_to_use,
+                    ts=int(time.time() * 1000),
+                    elapsed_s=_elapsed_s)
+            if new_user_uuid and (persisted_imgs or persisted_docs):
+                sess.set_message_annotation(
+                    session_id, new_user_uuid,
+                    images=persisted_imgs or None,
+                    docs=persisted_docs or None)
+            # message_count = total transcript size; auto-rename from first
+            # user message text if session is still auto-named.
+            first_user_text = ""
+            for sm in all_msgs:
+                if sm.type == "user":
+                    c = (sm.message or {}).get("content")
+                    if isinstance(c, str):
+                        first_user_text = c
+                    elif isinstance(c, list):
+                        for b in c:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                first_user_text = b.get("text", "")
+                                break
+                    break
+            # turn_count = real user prompts only. SDK's get_session_messages
+            # claims to filter tool-use sidechain (parent_tool_use_id always
+            # None) but actually returns *every* user-typed frame, including
+            # the implicit ones that wrap tool_result blocks after an agent
+            # tool call. We detect those by content shape: if every content
+            # block is a tool_result, the frame is a sidechain echo, not a
+            # real user message. Without this filter, a session with 45 real
+            # prompts but heavy agent tool use shows up as 300+ turns.
+            n_turns = sum(1 for sm in all_msgs if _is_real_user_prompt(sm))
+            sess.bump_session(session_id, message_count=len(all_msgs),
+                               turn_count=n_turns,
+                               auto_rename_from=first_user_text or prompt)
+            sess.update_model(session_id, model_to_use)
+            # Was this turn cancelled by an explicit /interrupt? The FE
+            # closes its EventSource immediately on stop-click, which
+            # zeroes live_subscribers below — without this flag, the
+            # "no live subscriber → fire push" path would buzz the user
+            # for a reply they just cancelled. Consume the flag (.discard
+            # always returns None — wrap with `in` test then discard).
+            # (2026-05-23 user report)
+            was_cancelled = session_id in _pending_interrupts
+            _pending_interrupts.discard(session_id)
+            # Web Push on turn-done. Four gates, in order:
+            #   1. MUSELAB_NOTIFY_NORMAL toggle (env-level mute switch)
+            #   2. Turn was NOT user-cancelled — see was_cancelled above.
+            #   3. No device has heartbeated /api/presence recently — i.e.
+            #      the user is NOT actively at any screen. See below.
+            #   4. Wrapped in try/except — push failure must never block
+            #      the stream's done event.
+            #
+            # History of the gating logic:
+            #   - v1: gated on "no live SSE subscriber" → broke multi-device
+            #     (desktop SSE alive ⇒ phone push suppressed too).
+            #   - v2: removed server-side gate, moved decision to sw.js
+            #     visibility check → fixed phone backgrounded case, but
+            #     phone STILL rang while user was on desktop because each
+            #     SW only sees its own device's clients.
+            #   - v3 (now): server-side presence heartbeat. Frontend POSTs
+            #     /api/presence every ~15s while visible; if any device
+            #     reported in within GRACE_SECONDS, skip the fan-out
+            #     entirely. The sw.js visibility check stays as
+            #     defense-in-depth for the case where heartbeat data is
+            #     stale (network blip, browser killed the timer, etc.).
+            #
+            # Body intentionally minimal: session name + "Muse 已回复". No
+            # preview text — the actual reply is one tap away in chat.
+            if (not was_cancelled
+                    and os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false"):
+                from . import presence as _presence
+                if _presence.recently_active():
+                    # User is at one of their devices — they'll see the
+                    # reply in-app. Skip the push fan-out entirely.
+                    pass
+                else:
+                    try:
+                        from . import push as _push
+                        sname = ""
+                        try:
+                            for s in sess.list_sessions():
+                                if s.get("id") == session_id:
+                                    sname = s.get("name", "")
+                                    break
+                        except Exception:
+                            pass
+                        _body = _plain_preview(assistant_acc) or "Muse 已回复"
+                        _push.send_to_all(
+                            title=sname or "muselab",
+                            body=_body,
+                            url=f"/?session={session_id}",
+                            tag=f"turn-{session_id}",
+                        )
+                    except Exception as e:
+                        import sys as _sys
+                        _sys.stderr.write(f"[chat] turn push failed: {e}\n")
+            # Strip unverifiable thinking-block signatures so this session
+            # stays resumable via `claude --resume` (and the official
+            # Anthropic API). Third-party vendors (DeepSeek / GLM /
+            # MiniMax / Kimi / Qwen / Baidu / Xiaomi MiMo) don't sign
+            # their thinking output; Anthropic's resume API would 400 on
+            # any of those blocks. We clean opportunistically every turn
+            # — idempotent on already-clean files, so the cost is just
+            # one stat + a parse of the small jsonl. See
+            # backend/jsonl_cleanup.py for the full rationale + the
+            # scripts/fix-thinking-signatures.py CLI for retroactive
+            # cleanup of pre-existing sessions.
+            try:
+                from . import jsonl_cleanup as _jc
+                _jc.clean_session(session_id)
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(f"[chat] jsonl cleanup failed: {e}\n")
+            yield {"event": "done", "data": json.dumps({
+                "duration_ms": getattr(msg, "duration_ms", None),
+                "total_cost_usd": cost,
+                "model": model_to_use,
+                "stats": _stats,
+                # Flag so the FE can skip celebration UI (success toast /
+                # green-dot tab unread badge would be wrong for a user-
+                # cancelled turn — they clicked stop, they know).
+                "cancelled": was_cancelled,
+                # turn_usage: cumulative (ResultMessage.usage). FE should
+                # prefer session_usage.context_* for window display. Will be
+                # removed once FE is fully migrated.
+                "turn_usage": {
+                    "input_tokens": in_t,
+                    "output_tokens": out_t,
+                    "cache_read_tokens": cr_t,
+                    "cache_creation_tokens": cc_t,
+                },
+                "session_usage": _session_usage[session_id],
+                "budget_usd": _budget_usd(),
+                "budget_used_pct": (
+                    round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
+                    if _budget_usd() > 0 else 0
+                ),
+            })}
+
+        # event_gen is now driven by a detached background task (see
+        # stream endpoint below), so the SSE generator doesn't cancel
+        # these workers when the browser disconnects — they complete
+        # naturally. 30-minute hard cap is applied to the outer
+        # task, not here.
+        claude_task = asyncio.create_task(pump_claude())
+        side_task = asyncio.create_task(pump_side_q(side_q))
+        perm_task = asyncio.create_task(pump_side_q(perm_q))
+
+        try:
+            while True:
+                kind, payload = await merge_q.get()
+                if kind == "side":
+                    # Already shaped as {"event": "...", "data": "..."} — pass through.
+                    yield payload
+                    continue
+                if kind == "error":
+                    yield _error_event(payload)
+                    break
+                if kind == "done":
+                    break
+                # kind == "claude" — dispatch by SDK message type to the
+                # per-type helper async generators defined above. Each
+                # helper yields zero-or-more SSE events; we forward them.
+                msg = payload
+                if isinstance(msg, StreamEvent):
+                    async for ev in _handle_stream_event(msg):
+                        yield ev
+                elif isinstance(msg, AssistantMessage):
+                    async for ev in _handle_assistant_message(msg):
+                        yield ev
+                elif isinstance(msg, UserMessage):
+                    # SDK emits a UserMessage after every tool the agent
+                    # invoked — its content carries the ToolResultBlocks.
+                    # Without this dispatch, every Read/Bash/Edit result
+                    # was silently dropped on the floor; the FE only saw
+                    # the tool_use half of the round trip.
+                    async for ev in _handle_user_message(msg):
+                        yield ev
+                elif isinstance(msg, ResultMessage):
+                    async for ev in _handle_result_message(msg):
+                        yield ev
+        except asyncio.CancelledError:
+            yield {"event": "cancelled", "data": "{}"}
+            raise
+        finally:
+            # event_gen runs as part of a detached background task now;
+            # cleanup here runs after the task finishes naturally (or
+            # the 30-min outer timeout fires and cancels us).
+            side_task.cancel()
+            perm_task.cancel()
+            claude_task.cancel()
+            unregister_session_queue(session_id)
+            perm.unregister_session_queue(session_id)
+
+    # Background-completion + reconnect-streaming design:
+    #
+    # Old: `event_gen()` was the SSE response generator directly.
+    # Browser disconnect cancelled the generator, which cancelled
+    # pump_claude, which cut off the SDK reply mid-stream.
+    #
+    # New: event_gen() runs as a DETACHED background task that publishes
+    # every event it would have yielded into a per-session TurnBroadcast.
+    # The HTTP response is just a subscriber that replays the buffer +
+    # streams new events. A user closing their browser doesn't affect
+    # the background task — it runs to completion (or 30-min timeout).
+    # A second SSE request to the same session (reconnect) becomes
+    # another subscriber and sees the full reply via replay + live tail.
+    BG_TIMEOUT_S = 1800   # 30 minutes — see PR thread for rationale
+
+    # `broadcast` was already reserved under _lock at the top of NEW-TURN
+    # MODE to close the check+insert race. Fill its remaining fields now
+    # that we've parsed prompt + attachments + resolved the actual model.
+    broadcast.model = model_to_use
+    broadcast.user_text = prompt
+    broadcast.user_images = list(persisted_imgs)
+    broadcast.user_docs = list(persisted_docs)
+    # Persist an in-flight breadcrumb so a process crash / restart can
+    # surface this turn to the user on next boot. Auto-dismiss any
+    # stale entry for this sid — starting a new turn supersedes whatever
+    # the previous process left behind.
+    _write_active_turn_sidecar(broadcast)
+    _interrupted_at_startup.pop(session_id, None)
+
+    async def _pump_gen_to_broadcast():
+        try:
+            async with asyncio.timeout(BG_TIMEOUT_S):
+                async for ev in event_gen():
+                    broadcast.publish(ev)
+        except asyncio.TimeoutError:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[chat] turn exceeded {BG_TIMEOUT_S}s (30min), aborting "
+                f"sid={session_id}\n")
+            _sys.stderr.flush()
+            broadcast.publish(_error_event("turn exceeded 30min"))
+        except Exception as e:
+            import sys as _sys
+            import traceback as _tb
+            _sys.stderr.write(
+                f"[chat] background turn crashed sid={session_id} "
+                f"exc={type(e).__name__}: {e}\n{_tb.format_exc()}\n")
+            _sys.stderr.flush()
+            broadcast.publish(_error_event(f"{type(e).__name__}: {e}"))
+        finally:
+            broadcast.finish()
+            _active_turns.pop(session_id, None)
+            # Turn reached a terminal state (success / error / timeout) inside
+            # this process — drop the persistence breadcrumb so startup scan
+            # doesn't surface it as "interrupted." Only an actual process death
+            # (OOM kill / SIGKILL / power loss) leaves the sidecar on disk.
+            _delete_active_turn_sidecar(session_id)
+
+    asyncio.create_task(_pump_gen_to_broadcast())
+
+    return EventSourceResponse(
+        _subscribe_broadcast(broadcast),
+        headers={
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _subscribe_broadcast(broadcast: TurnBroadcast):
+    """Yields buffered events first (replay), then live events as they
+    publish, terminating on the broadcast's finish sentinel. A late
+    subscriber (reconnecting browser) gets the complete history plus
+    everything that arrives after.
+
+    Atomicity note: `broadcast.subscribe()` adds the queue and
+    `len(...)` snapshots the buffer length in one synchronous block
+    (no `await` between them). asyncio is single-threaded and won't
+    preempt — publishes that happen before subscribe are entirely in
+    the buffer, publishes after go into BOTH the buffer and the queue.
+    Slicing the buffer up to `snap_len` gives us exactly the "before"
+    set, and the queue gives us exactly the "after" set, with no
+    duplication and no missed events."""
+    q = broadcast.subscribe()
+    snap_len = len(broadcast.events)
+    try:
+        # Replay the buffered prefix (events published BEFORE we
+        # subscribed — they're not in our queue).
+        for i in range(snap_len):
+            try:
+                chunk = broadcast.events[i]
+            except IndexError:
+                break  # events 被意外清空，停止 replay
+            yield chunk
+        # If the turn already finished before we subscribed, the queue
+        # holds nothing but the None sentinel.
+        while True:
+            ev = await q.get()
+            if ev is None:
+                break
+            yield ev
+    finally:
+        broadcast.unsubscribe(q)
+
+
+@router.get("/sessions/{sid}/active", dependencies=[Depends(require_token)])
+def session_active_status(sid: str) -> dict:
+    """Tell the frontend whether `sid` has an in-progress background
+    turn. Used on session load to decide between "render JSONL history"
+    and "open a reconnect SSE stream to follow the live tail."""
+    b = _active_turns.get(sid)
+    if not b:
+        return {"active": False}
+    return {
+        "active": True,
+        "model": b.model,
+        "started_at": b.started_at,
+        "events_so_far": len(b.events),
+    }
+
+
+# ====== interrupted turns (process-crash recovery) ======
+
+@router.get("/interrupted-turns", dependencies=[Depends(require_token)])
+def list_interrupted_turns() -> dict:
+    """Returns turns that were in-flight when the previous muselab process
+    died. Empty list on clean restart. Frontend reads this once per session
+    boot and toasts the user — does NOT auto-resume (user decides whether
+    the conversation is worth retrying)."""
+    items = []
+    for sid, data in _interrupted_at_startup.items():
+        items.append({
+            "sid": sid,
+            "preview": data.get("user_text_preview") or "",
+            "model": data.get("model") or "",
+            "started_at": data.get("started_at") or 0,
+        })
+    # Most recent first — usually what the user remembers best
+    items.sort(key=lambda x: x["started_at"], reverse=True)
+    return {"turns": items}
+
+
+@router.post("/interrupted-turns/{sid}/dismiss",
+             dependencies=[Depends(require_token)])
+def dismiss_interrupted_turn(sid: str) -> dict:
+    """User clicked 'dismiss' (or opened the session and saw the history).
+    Removes the in-memory entry AND deletes the disk sidecar so future
+    restarts don't keep nagging about the same turn."""
+    _interrupted_at_startup.pop(sid, None)
+    _delete_active_turn_sidecar(sid)
+    return {"ok": True}
+
+
+# ====== ask_user_question answer endpoint ======
+
+class AnswerReq(BaseModel):
+    answers: dict[str, Any]  # question_text -> chosen label (str) or labels (list[str])
+
+
+@router.post("/answer/{session_id}/{question_id}",
+              dependencies=[Depends(require_token)])
+async def submit_answer_api(session_id: str, question_id: str, req: AnswerReq) -> dict:
+    """Frontend POSTs the user's button click here. Resolves the Future the
+    ask_user_question tool handler is await-ing; the tool then returns a
+    text result and the model continues."""
+    if not submit_answer(session_id, question_id, req.answers):
+        raise HTTPException(404, "no pending question with that id "
+                                  "(may have timed out or been answered already)")
+    return {"ok": True}
+
+
+# ====== permission request decision endpoint ======
+
+class PermissionDecisionReq(BaseModel):
+    decision: str           # "allow" | "deny" | "always"
+    message: str | None = None
+
+
+@router.post("/permission/{session_id}/{request_id}",
+              dependencies=[Depends(require_token)])
+async def submit_permission_decision_api(
+    session_id: str, request_id: str, req: PermissionDecisionReq
+) -> dict:
+    """Frontend POSTs Allow / Deny / Always-allow click here."""
+    if not perm.submit_decision(session_id, request_id, req.decision, req.message):
+        raise HTTPException(404, "no pending permission request with that id "
+                                  "(may have timed out or been answered already)")
+    return {"ok": True}
+
+
+
+
+@router.get("/providers", dependencies=[Depends(require_token)])
+def providers_list() -> dict:
+    """Available model groups based on which provider API keys are configured."""
+    groups = endpoints.available_groups()
+    # Flatten to the {group, label, model} shape the frontend expects.
+    flat = [{"group": g["group"], "label": i["label"], "model": i["model"]}
+            for g in groups for i in g["items"]]
+    return {"models": flat}
