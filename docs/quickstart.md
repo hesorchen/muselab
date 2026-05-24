@@ -126,13 +126,21 @@ Per-OS detail (verify / restart / tail logs / expose to LAN / uninstall):
 
 ```bash
 docker run -d --name muselab \
-  -p 8765:8765 \
+  -p 127.0.0.1:8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
   -v $HOME/muselab-archive:/data \
   -e MUSELAB_ROOT=/data \
   -v $HOME/.claude:/home/muse/.claude \
   ghcr.io/hesorchen/muselab:latest
 ```
+
+> **Bind address.** The example above pins the port to `127.0.0.1` so the
+> service is only reachable from the host. Plain `-p 8765:8765` binds
+> `0.0.0.0` (all interfaces) — on a public VPS that leaves the portal
+> reachable from the internet with only the token as a barrier. To expose
+> it on a LAN (e.g. for phone access), use `-p 0.0.0.0:8765:8765` *and*
+> put a firewall / reverse proxy in front. The bundled `docker-compose.yml`
+> defaults to `127.0.0.1`; override with `MUSELAB_BIND=0.0.0.0` in `.env`.
 
 The container runs as a non-root `muse` user (uid 1000) with home directory
 `/home/muse/.claude`. Bind-mount the host's `~/.claude` to that path to reuse

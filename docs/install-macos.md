@@ -105,3 +105,5 @@ the log dir are **not** touched. Delete the repo to remove fully.
 | Anthropic models 401 | `~/.claude` missing or stale — `claude login` again |
 | `claude` not found by agent | The plist sets a hardcoded `PATH` including `/opt/homebrew/bin` and `/usr/local/bin`. If your `claude` is elsewhere, edit `EnvironmentVariables/PATH` in the plist and `launchctl unload && load -w` it. |
 | Plist installed but no autostart at login | Check `launchctl print gui/$UID/com.muselab` — look for `state = running` |
+| Gatekeeper blocks `uv` / `node` / `python` ("cannot be opened because the developer cannot be verified") | First-run binaries downloaded by `curl \| sh` carry the `com.apple.quarantine` xattr. Strip it: `xattr -dr com.apple.quarantine ~/.local/bin /opt/homebrew/bin` (or wherever the blocked binary lives — `which uv` to confirm). |
+| Apple Silicon + Intel Homebrew path mismatch | The plist's hardcoded `/opt/homebrew/bin` is for Apple Silicon. On Intel Macs your Homebrew lives at `/usr/local/bin` — already in the path, so it should work, but verify with `which claude` and confirm the plist's `PATH` includes its directory. |

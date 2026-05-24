@@ -488,6 +488,54 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     _save_sidecar(sid, data)
 
 
+def append_pending_attachments(sid: str, images: list[dict] | None = None,
+                                docs: list[dict] | None = None) -> None:
+    """Stash image/doc attachments before we know the user-message UUID.
+
+    The SDK writes the user-message JSONL record asynchronously, so at
+    image-upload time we don't yet have a uuid to set_message_annotation
+    on. Previously we waited until stream-completion to find the matching
+    user uuid and write the annotation then — but if the stream gets
+    cancelled / errored / the user reloads, that write never happens and
+    the attachment metadata (thumb + url) is lost.
+
+    Pending entries are bound to user uuids by consume_one_pending_attachments
+    when GET /sessions/{sid} encounters a user message with inline image
+    refs but no annotation. FIFO match."""
+    if not images and not docs:
+        return
+    data = _load_sidecar(sid)
+    pend = data.setdefault("pending_attachments", [])
+    pend.append({
+        "ts": int(__import__("time").time() * 1000),
+        "images": images or [],
+        "docs": docs or [],
+    })
+    _save_sidecar(sid, data)
+
+
+def consume_one_pending_attachments(sid: str, msg_uuid: str) -> dict | None:
+    """Pop the oldest pending bundle and bind it to `msg_uuid` as a
+    normal annotation. Returns the bundle (or None if no pending /
+    already bound). Idempotent."""
+    data = _load_sidecar(sid)
+    msgs = data.setdefault("messages", {})
+    cur = msgs.setdefault(msg_uuid, {})
+    if cur.get("images") or cur.get("docs"):
+        return None  # already bound elsewhere
+    pend = data.get("pending_attachments") or []
+    if not pend:
+        return None
+    first = pend[0]
+    images = first.get("images") or []
+    docs = first.get("docs") or []
+    if images: cur["images"] = images
+    if docs: cur["docs"] = docs
+    data["pending_attachments"] = pend[1:]
+    _save_sidecar(sid, data)
+    return first
+
+
 # ============================================================================
 # Activity bumping — called after every stream turn
 # ============================================================================

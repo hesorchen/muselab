@@ -903,6 +903,71 @@ class CreateReq(BaseModel):
     model: str | None = None
 
 
+_last_orphan_gc_at = 0.0
+_ORPHAN_GC_INTERVAL_S = 3600   # at most hourly
+
+
+def _attachments_base() -> Path:
+    """Root dir for user-uploaded image originals.
+
+    Lives under the user's ARCHIVE ROOT (`MUSELAB_ROOT`), not inside the
+    muselab repo. Two reasons:
+      1. The repo's `sessions/` dir was already gitignored, but conceptually
+         user-data shouldn't sit in the install dir at all — uninstall /
+         reinstall / git clean should never touch the user's files.
+      2. archive root is where the user already keeps their docs; this
+         keeps "everything personal" in one place that's easy to back up.
+
+    Hidden (dot-prefixed) so it doesn't clutter the user's file browser
+    or archive UI tree.
+    """
+    return ROOT / ".muselab-attach"
+
+
+def _migrate_legacy_attachments() -> None:
+    """One-shot migration: sessions/attachments/* → ROOT/.muselab-attach/*.
+    Runs at module import. Idempotent — only moves dirs that don't yet
+    exist in the new location. Old location is removed when empty so a
+    second-pass migration is a no-op."""
+    import shutil as _shutil
+    old_base = sess.SESS_DIR / "attachments"
+    new_base = _attachments_base()
+    if not old_base.exists() or old_base == new_base:
+        return
+    try:
+        new_base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    moved = 0
+    for child in list(old_base.iterdir()):
+        if not child.is_dir():
+            continue
+        target = new_base / child.name
+        if target.exists():
+            continue  # already migrated; skip (don't clobber)
+        try:
+            _shutil.move(str(child), str(target))
+            moved += 1
+        except OSError:
+            pass
+    # Remove empty old base
+    try:
+        if not any(old_base.iterdir()):
+            old_base.rmdir()
+    except OSError:
+        pass
+    if moved:
+        import sys as _sys
+        _sys.stderr.write(f"[muselab] migrated {moved} attachment dirs to {new_base}\n")
+        _sys.stderr.flush()
+
+
+# Run migration once at import (cheap if no-op).
+try:
+    _migrate_legacy_attachments()
+except Exception:
+    pass
+
 @router.get("/sessions", dependencies=[Depends(require_token)])
 def list_sessions_api() -> dict:
     sessions = sess.list_sessions()
@@ -912,6 +977,16 @@ def list_sessions_api() -> dict:
             s = dict(s)  # don't mutate cache
             s["system_prompt"] = s["system_prompt"][:200] + "…"
             sessions[i] = s
+    # Piggy-back orphan-attachments GC here — runs at most hourly. Cheaper
+    # than a cron, and naturally fires whenever the UI is in use.
+    global _last_orphan_gc_at
+    now = time.time()
+    if now - _last_orphan_gc_at > _ORPHAN_GC_INTERVAL_S:
+        _last_orphan_gc_at = now
+        try:
+            _gc_orphan_attachments()
+        except Exception:
+            pass
     return {"sessions": sessions}
 
 
@@ -1363,7 +1438,44 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         elapsed = ann.get("elapsed_s")
         if elapsed is not None and "elapsed" not in entry:
             entry["elapsed"] = elapsed
+        # User-msg image annotations (thumb + url for the lightbox)
+        # live in the sidecar — the inline `image_refs` extracted from
+        # the SDK content blocks only carry `mime`. Layer the sidecar's
+        # richer payload on top so the FE sees {mime, thumb, url} after
+        # a session reload, not just the bare mime.
+        ann_images = ann.get("images")
+        if ann_images and entry.get("role") == "user":
+            entry["images"] = ann_images
+        ann_docs = ann.get("docs")
+        if ann_docs and entry.get("role") == "user":
+            entry["docs"] = ann_docs
     return out
+
+
+def _bind_pending_attachments(sid: str, messages: list[dict]) -> None:
+    """For every user message that has image refs (only mime, no thumb/url)
+    but no annotation yet, pop one entry off the sidecar's pending list
+    and bind it. Runs in-order so multi-image conversations stay aligned.
+
+    Called by GET /sessions/{sid} after _sdk_messages_to_ui. Modifies
+    messages in place."""
+    for entry in messages:
+        if entry.get("role") != "user":
+            continue
+        imgs = entry.get("images") or []
+        if not imgs:
+            continue
+        # Already has thumb / url for at least one — already bound, skip.
+        if any(im.get("thumb") or im.get("url") for im in imgs):
+            continue
+        uuid = entry.get("uuid")
+        if not uuid:
+            continue
+        bound = sess.consume_one_pending_attachments(sid, uuid)
+        if bound and bound.get("images"):
+            entry["images"] = bound["images"]
+        if bound and bound.get("docs"):
+            entry["docs"] = bound["docs"]
 
 
 def _summarize_tool_input(name: str | None, inp: dict) -> str:
@@ -1437,6 +1549,10 @@ def get_session_api(sid: str) -> dict:
     annotations = sess.get_message_annotations(sid)
     compact_uuids = _compact_summary_uuids(sid)
     messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    # Bind any unbound pending image/doc attachments (those persisted
+    # before the stream completed could write a uuid annotation) to the
+    # user messages that have inline image refs but no thumb/url yet.
+    _bind_pending_attachments(sid, messages)
     # Mid-turn merge: SDK CLI writes the JSONL incrementally — the
     # user prompt lands immediately when the turn starts, but the
     # assistant reply (text/thinking/tool blocks) only commits when
@@ -1553,6 +1669,10 @@ def export_session_markdown(sid: str) -> Response:
     annotations = sess.get_message_annotations(sid)
     compact_uuids = _compact_summary_uuids(sid)
     messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    # Bind any unbound pending image/doc attachments (those persisted
+    # before the stream completed could write a uuid annotation) to the
+    # user messages that have inline image refs but no thumb/url yet.
+    _bind_pending_attachments(sid, messages)
 
     name = meta.get("name") or "session"
     model = meta.get("model") or ""
@@ -1609,7 +1729,78 @@ async def delete_session_api(sid: str) -> dict:
         pass   # JSONL never existed (session never streamed) — that's fine
     if not sess.delete_session(sid):
         raise HTTPException(404, "session not found")
+    # Sweep per-session attachments dir (uploaded image full-res originals
+    # persisted by upload-image → send pipeline). Without this, deleting
+    # a session would orphan its image files on disk forever.
+    import shutil as _shutil
+    attach_dir = _attachments_base() / sid
+    if attach_dir.exists():
+        try:
+            _shutil.rmtree(attach_dir, ignore_errors=True)
+        except OSError:
+            pass
     return {"ok": True}
+
+
+# Orphan attachments sweep — defends against the case where a JSONL was
+# deleted out of band (manual rm, git restore, etc.) and left an
+# attachments/<sid>/ behind. Runs lazily off the existing session-list
+# endpoint so we don't need a separate cron. Bounded — only sweeps if
+# attachments dir actually has children.
+def _gc_orphan_attachments() -> None:
+    base = _attachments_base()
+    if not base.exists():
+        return
+    try:
+        known_sids = {s["id"] for s in sess.list_sessions() if s.get("id")}
+    except Exception:
+        return
+    import shutil as _shutil
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name not in known_sids:
+            try:
+                _shutil.rmtree(child, ignore_errors=True)
+            except OSError:
+                pass
+
+
+@router.get("/attachments-usage", dependencies=[Depends(require_token)])
+def attachments_usage() -> dict:
+    """Total bytes + file count under sessions/attachments. UI / settings
+    can render this so users know how much disk their uploaded images
+    have eaten, and can trigger a sweep."""
+    base = _attachments_base()
+    if not base.exists():
+        return {"total_bytes": 0, "file_count": 0, "session_count": 0}
+    total = 0
+    files = 0
+    sessions_with_attach = 0
+    for sid_dir in base.iterdir():
+        if not sid_dir.is_dir(): continue
+        has_any = False
+        for f in sid_dir.iterdir():
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                    files += 1
+                    has_any = True
+                except OSError:
+                    pass
+        if has_any: sessions_with_attach += 1
+    return {
+        "total_bytes": total,
+        "file_count": files,
+        "session_count": sessions_with_attach,
+    }
+
+
+@router.post("/attachments-sweep", dependencies=[Depends(require_token)])
+def attachments_sweep() -> dict:
+    """Manually trigger the orphan-attachments sweep + return new usage."""
+    _gc_orphan_attachments()
+    return attachments_usage()
 
 
 class SessionPatchReq(BaseModel):
@@ -2796,6 +2987,12 @@ def _render_tool_use(block: ToolUseBlock) -> dict:
         "timeout", "run_in_background",
         # MultiEdit/Edit "fix on miss" flag (Claude sometimes sends it).
         "replace_all",
+        # Task* family — needed by the FE task-log-line renderer
+        # (subject + #id + status). Without these the live stream sent
+        # contentless "+ Created" / "✓ Done" lines.
+        "subject", "activeForm",
+        "taskId", "task_id", "status",
+        "addBlocks", "addBlockedBy",
     }
     slim_input = {k: _slim_input_value(v)
                   for k, v in inp.items() if k in _SLIM_INPUT_FIELDS}
@@ -3102,6 +3299,48 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
     return "\n".join(parts)
 
 
+@router.get("/attachments/{session_id}/{filename}",
+            dependencies=[Depends(require_token_query)])
+def get_attachment(session_id: str, filename: str):
+    """Serve the FULL-RES original of a user-uploaded image saved at
+    send-time. Lightbox uses this; the in-stream bubble keeps using the
+    160-px thumbnail (small + fast). require_token_query lets the
+    browser issue plain `<img src=...?token=...>` requests without
+    needing to inject auth headers per element.
+
+    Path traversal guard: filename must be a single basename (no slashes,
+    no parent-dir refs) and session_id must be a valid uuid-ish string.
+    """
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]{6,80}", session_id):
+        raise HTTPException(400, "bad session_id")
+    if "/" in filename or ".." in filename or "\\" in filename:
+        raise HTTPException(400, "bad filename")
+    if not _re.fullmatch(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}", filename):
+        raise HTTPException(400, "bad filename format")
+    path = _attachments_base() / session_id / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "attachment not found")
+    # Resolve + verify still inside the attachments dir (extra defense)
+    base = (_attachments_base()).resolve()
+    real = path.resolve()
+    try:
+        real.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, "bad path")
+    # MIME from extension
+    ext = filename.rsplit(".", 1)[-1].lower()
+    mime = {
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path, media_type=mime,
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
+
+
 @router.post("/upload-image", dependencies=[Depends(require_token)])
 async def upload_image(file: UploadFile = File(...)) -> dict:
     """Legacy endpoint name; now handles images + PDF + text-ish docs + xlsx."""
@@ -3168,8 +3407,17 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
         f"name={_safe_name!r} read_ms={(_t_read_end - _t_read_start)*1000:.0f} "
         f"total_ms={(_t_end - _t0)*1000:.0f}\n")
     _sys.stderr.flush()
+    # Tell the FE the on-disk extension we'll use when persisting this
+    # image at send-time. FE assembles the lightbox URL from
+    # (currentId, aid, ext) immediately and stores it on the user
+    # message — that way the URL survives even if the user reloads
+    # before the stream-completion annotation hook fires.
+    _EXT_MAP = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+                "image/gif": "gif", "image/webp": "webp"}
+    ext = _EXT_MAP.get(mime, "")
     return {"id": aid, "mime": mime, "bytes": len(body),
-             "kind": entry["kind"], "name": name}
+             "kind": entry["kind"], "name": name,
+             "attach_ext": ext}
 
 
 @router.get("/stream", dependencies=[Depends(require_token_query)])
@@ -3321,14 +3569,38 @@ async def stream(
                         "data": entry["b64"],
                     },
                 })
-                # Store a small thumbnail (≤ 160 px, JPEG 60 %) in the
-                # sidecar so reloaded sessions can still show the image.
-                # Falls back gracefully if Pillow is not installed or the
-                # image bytes are corrupt — the frontend shows a placeholder.
+                # Persist FULL-RES original to disk so a future lightbox
+                # open after reload still sees the real image, not a 160-px
+                # thumbnail blown up. Path: sessions/attachments/<sid>/<aid>.<ext>
+                # JSONL message keeps {thumb, url, mime} — thumb for the
+                # in-stream chat bubble (small, fast), url for lightbox
+                # full-res. Previously only thumb was kept, hence "click
+                # to enlarge" showed a 160-px upscaled blur.
+                import io as _io
+                import base64 as _b64
+                from pathlib import Path as _Path
+                ext_map = {
+                    "image/png": "png", "image/jpeg": "jpg",
+                    "image/jpg": "jpg", "image/gif": "gif",
+                    "image/webp": "webp",
+                }
+                ext = ext_map.get(entry["mime"], "bin")
+                attach_dir = _attachments_base() / session_id
+                full_url = None
+                try:
+                    attach_dir.mkdir(parents=True, exist_ok=True)
+                    attach_path = attach_dir / f"{aid}.{ext}"
+                    attach_path.write_bytes(_b64.b64decode(entry["b64"]))
+                    full_url = f"/api/chat/attachments/{session_id}/{aid}.{ext}"
+                except Exception as _e:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[attach] persist failed sid={session_id} aid={aid} "
+                        f"path={attach_dir} err={type(_e).__name__}: {_e}\n")
+                    _sys.stderr.flush()
+                # Thumb for in-stream bubble (≤ 160 px, JPEG 60%).
                 thumb_b64 = None
                 try:
-                    import io as _io
-                    import base64 as _b64
                     from PIL import Image as _Img
                     raw_bytes = _b64.b64decode(entry["b64"])
                     with _Img.open(_io.BytesIO(raw_bytes)) as _img:
@@ -3339,9 +3611,18 @@ async def stream(
                 except Exception:
                     pass
                 _item: dict = {"mime": entry["mime"]}
-                if thumb_b64:
-                    _item["thumb"] = thumb_b64
+                if thumb_b64: _item["thumb"] = thumb_b64
+                if full_url: _item["url"] = full_url
                 persisted_imgs.append(_item)
+                # Stash to pending NOW so the attachment survives even if
+                # the stream gets cancelled / errored before the
+                # set_message_annotation(uuid) hook at stream-completion
+                # gets to fire. GET /sessions/{sid} will bind it to the
+                # next user message that has image refs but no annotation.
+                try:
+                    sess.append_pending_attachments(session_id, images=[_item])
+                except Exception:
+                    pass
             elif kind == "pdf":
                 pdf_blocks.append({
                     "type": "document",

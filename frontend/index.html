@@ -1279,11 +1279,20 @@
                                  and triggers a real network request that fails (was firing
                                  [muse-capture] resource-load-failed errors in console). -->
                             <span class="user-msg-img-wrap">
-                              <template x-if="im.preview || im.thumb">
+                              <template x-if="im.preview || im.thumb || im.url">
+                                <!-- in-bubble thumbnail prefers preview (live blob URL,
+                                     freshest) > thumb (base64 thumbnail in JSONL); only
+                                     falls back to full url if neither is available.
+                                     Lightbox click PREFERS url (full-res original
+                                     served from disk) > preview > thumb — that's the
+                                     fix for "click to enlarge shows blurry upscale". -->
                                 <img class="user-msg-img"
-                                     :src="im.preview || 'data:image/jpeg;base64,' + im.thumb"
+                                     :src="im.preview || (im.thumb ? 'data:image/jpeg;base64,' + im.thumb : (im.url ? im.url + '?token=' + encodeURIComponent(token) : ''))"
                                      :alt="im.name || 'image'"
-                                     @click="openLightbox(im.preview || 'data:image/jpeg;base64,' + im.thumb, im.name)"
+                                     @click="openLightbox(
+                                        im.url ? im.url + '?token=' + encodeURIComponent(token)
+                                          : (im.preview || 'data:image/jpeg;base64,' + im.thumb),
+                                        im.name)"
                                      :title="lang==='zh'?'点击放大':'Click to enlarge'"
                                      @error="$el.style.display='none'; $el.nextElementSibling && ($el.nextElementSibling.style.display='inline-flex')" />
                               </template>

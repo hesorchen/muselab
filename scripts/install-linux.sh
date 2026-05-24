@@ -375,7 +375,14 @@ echo
 TOKEN_NOW="$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
 if [[ -n "$TOKEN_NOW" ]]; then
   echo  "  Login token / 登录口令（复制贴进浏览器登录框）:"
-  printf  "    \033[1;36m%s\033[0m\n" "$TOKEN_NOW"
+  # Only emit ANSI color when stdout is a TTY — otherwise the user piping
+  # to a file / tee / CI log would copy the literal escape codes into the
+  # browser as part of the token.
+  if [[ -t 1 ]]; then
+    printf  "    \033[1;36m%s\033[0m\n" "$TOKEN_NOW"
+  else
+    printf  "    %s\n" "$TOKEN_NOW"
+  fi
   echo  "  Saved at / 也存在: $REPO/.env  →  grep MUSELAB_TOKEN .env"
 fi
 echo

@@ -119,13 +119,15 @@ powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1   # Windows
 
 ```bash
 docker run -d --name muselab \
-  -p 8765:8765 \
+  -p 127.0.0.1:8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
   -v $HOME/muselab-archive:/data \
   -e MUSELAB_ROOT=/data \
   -v $HOME/.claude:/home/muse/.claude \
   ghcr.io/hesorchen/muselab:latest
 ```
+
+> **绑定地址说明：** 上面示例显式绑定 `127.0.0.1`，服务只在本机可达。直接写 `-p 8765:8765` 会绑到 `0.0.0.0`（所有网卡）——在公网 VPS 上等于把服务挂到互联网上，只靠 token 一道防线。若需 LAN 内访问（如手机连本机），改成 `-p 0.0.0.0:8765:8765`，并务必在前面加防火墙或反向代理。仓库自带的 `docker-compose.yml` 默认绑 `127.0.0.1`，要放开在 `.env` 设 `MUSELAB_BIND=0.0.0.0`。
 
 容器以非 root 用户 `muse`（uid 1000）运行，主目录为 `/home/muse/.claude`。将宿主机的 `~/.claude` 挂载至该路径，即可复用 `claude login` 获取的 OAuth 凭据。
 

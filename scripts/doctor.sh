@@ -4,6 +4,18 @@
 # bug report. Works on Linux + macOS (Windows version: doctor.ps1).
 set -uo pipefail   # NOT -e: keep going past failures to give full report
 
+# Bail out early on Windows — this script only knows systemd (Linux) and
+# launchd (macOS). On Windows (Git Bash / MSYS / Cygwin) it would silently
+# skip the service-status section and report nothing useful.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    printf "\033[31m✗\033[0m This script is for Linux / macOS only.\n" >&2
+    printf "  On Windows, run instead:\n" >&2
+    printf "    powershell -ExecutionPolicy Bypass -File scripts\\doctor.ps1\n" >&2
+    exit 1
+    ;;
+esac
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 

@@ -7046,3 +7046,46 @@ html[data-theme="eyecare"] .tool-error-hint {
   border-left-color: #aa503c;
 }
 .tool-error-hint-text { color: var(--c-fg-1); }
+
+/* Tighten Task* family rendering — make the chain of log lines truly
+   compact instead of inheriting per-message vertical margins. */
+.msg:has(.task-log-line) {
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.task-log-line {
+  padding: 4px 14px;
+  font-size: 12.5px;
+  line-height: 1.35;
+  margin-left: 38px;
+}
+/* Adjacent task-log msgs fuse seamlessly — drop internal borders so
+   the run reads as one panel. The :first-of-run / :last-of-run
+   selectors round the top/bottom of the cluster. */
+.msg:has(.task-log-line) + .msg:has(.task-log-line) .task-log-line {
+  border-top: none;
+}
+
+/* Strong override — chat-body uses `gap: var(--sp-2)` between every .msg,
+   which makes a chain of task-log-lines look airy with big white bands
+   between them. Negative margin-top on consecutive .msg .task-log-line
+   pulls them together so they read as a single panel.
+   The :has() selector requires Chrome 105+ / Safari 15.4+ / Firefox 121+
+   — covers all current Chromium-derived browsers (98%+ users). */
+.msg:has(> .task-log-line) {
+  /* Cancel the chat-body gap above */
+  margin-top: calc(var(--sp-2) * -0.5) !important;
+  margin-bottom: 0 !important;
+}
+.msg:has(> .task-log-line) + .msg:has(> .task-log-line) {
+  margin-top: calc(var(--sp-2) * -1) !important;
+}
+/* Tighter padding inside */
+.task-log-line {
+  padding: 5px 14px !important;
+  font-size: 12.5px;
+  line-height: 1.35;
+  margin: 0 0 0 38px !important;
+}

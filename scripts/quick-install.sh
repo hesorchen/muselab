@@ -70,14 +70,28 @@ case "$(uname -s)" in
 esac
 ok "OS: $OS"
 
-# WSL note (informational, doesn't change behaviour) — install-linux.sh
-# requires systemd, which WSL2 only has when /etc/wsl.conf has
-# `[boot]\nsystemd=true` set + a `wsl --shutdown` afterwards.
+# WSL needs systemd for the install-linux.sh service-registration step.
+# WSL2 only has systemd when /etc/wsl.conf has `[boot]\nsystemd=true` set
+# and the distro has been restarted with `wsl --shutdown` (from PowerShell).
+# Fail fast here instead of letting the user wait through 5 minutes of dep
+# installs only to crash on `systemctl --user enable`.
 if [[ "$OS" == "linux" ]] && grep -qi "microsoft" /proc/version 2>/dev/null; then
-  warn "WSL detected — install-linux.sh needs systemd-user."
-  warn "  If install fails with 'systemctl not connected', enable systemd:"
-  warn "    sudo tee /etc/wsl.conf >/dev/null <<<\$'[boot]\\nsystemd=true'"
-  warn "    then  wsl --shutdown  (from PowerShell) and re-enter WSL."
+  if ! systemctl --user is-system-running >/dev/null 2>&1; then
+    # is-system-running prints "offline"/"running"/etc — exit 0 means the
+    # user instance is reachable. Non-zero = no systemd-user → bail.
+    err "WSL detected without systemd-user enabled — install would fail at service registration."
+    err ""
+    err "Fix (one-time, ~30 seconds):"
+    err "  1) Inside WSL:"
+    err "       sudo tee /etc/wsl.conf >/dev/null <<<\$'[boot]\\nsystemd=true'"
+    err "  2) From PowerShell on the Windows host:"
+    err "       wsl --shutdown"
+    err "  3) Re-open WSL, then re-run this installer."
+    err ""
+    err "(systemd is needed so the muselab service can survive logout / reboot.)"
+    exit 1
+  fi
+  ok "WSL detected — systemd-user is up, proceeding"
 fi
 
 # ----- 3. Check git + curl (curl piped this script, so it must exist) -------

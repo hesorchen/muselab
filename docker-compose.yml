@@ -7,7 +7,12 @@ services:
     container_name: muselab
     restart: unless-stopped
     ports:
-      - "${MUSELAB_PORT:-8765}:8765"
+      # Bind to loopback by default — Docker's short syntax otherwise exposes
+      # the port on 0.0.0.0 (all interfaces), which on a public VPS leaves the
+      # service reachable from the internet with only the token as a barrier.
+      # To open it up (e.g. for phone access on the LAN), set MUSELAB_BIND=0.0.0.0
+      # in .env AND put a reverse proxy / firewall in front. See docs/quickstart.
+      - "${MUSELAB_BIND:-127.0.0.1}:${MUSELAB_PORT:-8765}:8765"
     env_file:
       - .env
     environment:
@@ -39,12 +44,15 @@ services:
     pids_limit: 4096
     healthcheck:
       # Use the dedicated /api/health endpoint — cheaper than rendering the
-      # full index.html on every probe (every 30s × 24h = 2880 renders/day).
+      # full index.html on every probe (every 30s × 24h = 2880 probes/day).
+      # `curl` ships with the image and avoids the ~150ms Python startup cost.
       test:
         - CMD
-        - python
-        - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3).status==200 else 1)"
+        - curl
+        - -fsS
+        - --max-time
+        - "3"
+        - http://127.0.0.1:8765/api/health
       interval: 30s
       timeout: 5s
       retries: 3

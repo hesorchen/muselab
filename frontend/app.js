@@ -1825,6 +1825,11 @@ function portal() {
         }
         const d = await r.json();
         entry.id = d.id; entry.uploading = false;
+        // Stash the on-disk extension the server will use when persisting
+        // this image at send-time. Used to construct the lightbox URL
+        // upfront so the full-res original is accessible even if the
+        // user reloads before the stream-completion annotation hook fires.
+        if (d.attach_ext) entry.attach_ext = d.attach_ext;
         // Server's classification wins for kind label.
         if (d.kind && entry.kind) entry.kind = d.kind;
         // === Diagnostic timing report ===
@@ -3535,6 +3540,12 @@ function portal() {
     // for users who actually want to see content; preserves the
     // default-collapsed behavior for users who don't touch anything.
     // Reset on each new session (loadSession clears via _ensureTabState).
+    // 2026-05-24: Smart-collapse memory (per-kind expansion preference)
+    // removed. Made every same-kind tool-result toggle in lockstep when
+    // the user just wanted to peek at ONE specific Bash output — wildly
+    // unintuitive. Each tool_result now toggles independently. Kept the
+    // property name for back-compat with any localStorage that referenced
+    // it, but it's no longer read or written.
     _kindExpansionPrefs: {},
     _msgKey(i, m) {
       if (!m) return "";
@@ -3544,12 +3555,6 @@ function portal() {
       if (!m) return true;
       const k = this._msgKey(i, m);
       if (k in this._expandedMsgs) return this._expandedMsgs[k];
-      // Smart-collapse: if the user has shown a preference for this kind
-      // of tool in this session, honor it.
-      const kind = this.toolResultKind(m);
-      if (kind && kind in this._kindExpansionPrefs) {
-        return this._kindExpansionPrefs[kind];
-      }
       // Explicit caller hint (e.g. diff strip wants to be open by default)
       // overrides the default-collapsed behavior. Caller still respects
       // user's explicit toggle (the _expandedMsgs check above).
@@ -3566,13 +3571,6 @@ function portal() {
       const newState = !cur;
       // Spread-assign so Alpine sees the replacement and re-evaluates.
       this._expandedMsgs = { ...this._expandedMsgs, [k]: newState };
-      // Smart-collapse: record the user's preference for this kind so
-      // future tools of the same kind inherit it. Only do this for
-      // tool_result messages (kind is well-defined there).
-      const kind = this.toolResultKind(m);
-      if (kind && m.role === "tool_result") {
-        this._kindExpansionPrefs = { ...this._kindExpansionPrefs, [kind]: newState };
-      }
     },
     toolResultClass(i, m) {
       let cls = "tool-result";
@@ -3872,6 +3870,49 @@ function portal() {
     },
     // Render-time data for a Task* tool_use bubble. Returns null when the
     // call should be hidden entirely (pure queries like TaskList).
+    // Build a {taskId: subject} lookup so TaskUpdate (which only carries
+    // taskId + status) can show the same subject the original TaskCreate
+    // declared. TaskCreate doesn't see its own taskId — that's assigned
+    // by the runtime and returned in the tool_result text like
+    // "Task #15 created successfully: <subject>". We scan messages in
+    // order, matching each TaskCreate tool_use to its tool_result by
+    // tool_use_id, then parse the "#N" out of the result text.
+    // Cached by message-array length (cheap invalidation).
+    _taskSubjectMapForMessages() {
+      const msgs = this.messages || [];
+      const cached = this._cachedTaskSubjectMap;
+      if (cached && cached.length === msgs.length) return cached.map;
+      const map = {};
+      const pendingCreate = {};  // tool_use_id → subject
+      for (const m of msgs) {
+        if (!m) continue;
+        if (m.role === "tool_use" && m.name === "TaskCreate") {
+          const subj = (m.input && m.input.subject) || "";
+          if (m.id) pendingCreate[m.id] = subj;
+        } else if (m.role === "tool_use" && m.name === "TaskUpdate") {
+          // Subsequent TaskUpdate may carry an updated subject — refresh
+          const inp = m.input || {};
+          const tid = inp.taskId || inp.task_id;
+          if (tid && inp.subject) map[String(tid)] = inp.subject;
+        } else if (m.role === "tool_result") {
+          // Backend serializes tool_result's tool_use_id into `m.id`
+          // (the same `id` field that tool_use uses, intentionally
+          // matched as a pair). Older code expected m.tool_use_id /
+          // m.tool_id, which never matched — every TaskCreate's
+          // subject was silently dropped from the map.
+          const tuId = m.tool_use_id || m.tool_id || m.id;
+          if (tuId && pendingCreate[tuId] !== undefined) {
+            // Parse "Task #N created successfully" out of result text
+            const txt = m.text || m.preview || "";
+            const match = txt.match(/Task\s+#(\d+)/i);
+            if (match) map[match[1]] = pendingCreate[tuId];
+            delete pendingCreate[tuId];
+          }
+        }
+      }
+      this._cachedTaskSubjectMap = { length: msgs.length, map };
+      return map;
+    },
     taskLogLine(m) {
       if (!m || !m.name) return null;
       const inp = m.input || {};
@@ -7588,7 +7629,18 @@ function portal() {
       if (!isReconnect) {
         sendState.messages.push({
           role: "user", text,
-          images: readyImages.map(im => ({ preview: im.preview })),
+          images: readyImages.map(im => ({
+            preview: im.preview,
+            // Pre-compute the URL the backend will serve once it
+            // persists the full-res original (it does so the moment
+            // the SSE stream consumes the upload's aid). This makes
+            // the lightbox work even if the user reloads before the
+            // stream-completion annotation hook fires.
+            url: (im.id && im.attach_ext && sendSid)
+              ? `/api/chat/attachments/${sendSid}/${im.id}.${im.attach_ext}`
+              : undefined,
+            mime: im.mime,
+          })),
           docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
         });
       } else {

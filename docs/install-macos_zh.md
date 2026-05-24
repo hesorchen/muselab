@@ -104,3 +104,5 @@ bash scripts/uninstall-macos.sh
 | Anthropic 模型 401 | `~/.claude` 缺失或过期——再 `claude login` 一次 |
 | agent 找不到 `claude` | plist 内 `PATH` 硬编码了 `/opt/homebrew/bin` 和 `/usr/local/bin`。如果你的 `claude` 在别处，编辑 plist 的 `EnvironmentVariables/PATH`，然后 `launchctl unload && load -w` |
 | plist 已安装但登录后不自启 | `launchctl print gui/$UID/com.muselab`，查 `state = running` |
+| Gatekeeper 拦截 `uv` / `node` / `python`（提示「无法打开，因为无法验证开发者」）| `curl \| sh` 下载的二进制默认带 `com.apple.quarantine` 扩展属性。清除：`xattr -dr com.apple.quarantine ~/.local/bin /opt/homebrew/bin`（或用 `which uv` 定位实际路径再清）。 |
+| Apple Silicon 与 Intel Mac 路径不一致 | plist 内 `/opt/homebrew/bin` 是 Apple Silicon 路径。Intel Mac 上 Homebrew 在 `/usr/local/bin`，plist 已包含，应可工作；遇问题先 `which claude` 确认 plist 的 `PATH` 包含其目录。 |

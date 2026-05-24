@@ -65,10 +65,10 @@ USER muse
 
 EXPOSE 8765
 
-# Probe the dedicated /api/health endpoint — way cheaper than rendering the
-# full HTML page on every 30s probe (~2880 page renders / day otherwise).
+# Probe the dedicated /api/health endpoint. Using `curl` (already installed
+# for the Node.js setup above) over `python -c …` shaves the ~150ms Python
+# interpreter startup off every probe (every 30s × 24h = 2880 probes/day).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3).status==200 else 1)" \
-        || exit 1
+    CMD curl -fsS --max-time 3 http://127.0.0.1:8765/api/health >/dev/null || exit 1
 
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8765"]
