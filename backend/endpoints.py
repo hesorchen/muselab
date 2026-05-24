@@ -30,6 +30,15 @@ class Provider:
     # or where thinking budget pushes max_tokens past the vendor's output limit
     # (e.g. Qianfan 12288 cap). Defaults to True at the call site.
     supports_thinking: bool = True
+    # Vendor's hard cap on max output tokens, if it's lower than what the
+    # claude CLI's default would send. None = let the CLI pick its default
+    # (typically 32k+ on real Anthropic). For vendors that 400 the request
+    # when max_tokens exceeds their cap (e.g. Qianfan refuses anything
+    # over 12288), pin this and we'll export CLAUDE_CODE_MAX_OUTPUT_TOKENS
+    # in the SDK's env dict so the CLI subprocess never sends a value over
+    # the cap. Symptom this prevents:
+    #     API Error: 400 — max_completion_tokens range is [1, 12288]
+    max_output_tokens: int | None = None
 
 
 # Default base URLs per provider — used when no env override is set. Resolved
@@ -239,6 +248,9 @@ CATALOG: tuple[Provider, ...] = (
         env_key="QIANFAN_API_KEY",
         display="百度千帆",
         supports_thinking=False,
+        # Qianfan rejects max_completion_tokens > 12288 with HTTP 400.
+        # The CLI's default sits around 32-64k, so we have to pin this.
+        max_output_tokens=12288,
         models=(
             ("ernie-4.5-turbo-20260402",  "ERNIE 4.5 Turbo"),
             ("ernie-4.5-turbo-128k",      "ERNIE 4.5 Turbo 128K"),
@@ -383,6 +395,13 @@ def env_override(model: str) -> dict[str, str] | None:
         # Point CLI at an empty config dir so it can't load saved Pro OAuth.
         "CLAUDE_CONFIG_DIR": str(isolated_cfg),
     })
+    # Cap output tokens for vendors whose ceiling is below the CLI's
+    # default. Without this, Qianfan returns 400 "max_completion_tokens
+    # range is [1, 12288]" on every call. CLAUDE_CODE_MAX_OUTPUT_TOKENS
+    # is the documented env knob the CLI honours for its outgoing
+    # max_tokens parameter.
+    if p.max_output_tokens is not None:
+        merged["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(p.max_output_tokens)
     return merged
 
 
