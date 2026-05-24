@@ -2654,21 +2654,34 @@
 
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
           <template x-for="(p, idx) in settings.providers" :key="idx">
-            <div class="settings-row provider-row">
+            <!-- editing: local UI flag — only show the input box when the user
+                 explicitly clicks 修改 on a configured provider, so the steady
+                 state for a configured row is "switch + 已配置 + 测试 + 修改"
+                 (no contradictory empty input next to a green badge). -->
+            <div class="settings-row provider-row" x-data="{ editing: false }">
               <label x-text="p.display + ' (' + p.env_key + ')'"></label>
               <div class="settings-input-wrap">
-                <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '已关闭' : 'Disabled') : (lang==='zh' ? '已开启' : 'Enabled')">
+                <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
                   <input type="checkbox" :checked="!p.disabled"
                          @change="toggleProvider(p.probe_model, !$event.target.checked)" />
                   <span class="switch-slider"></span>
                 </label>
-                <input type="password" class="settings-input"
-                       :placeholder="p.configured ? p.masked : t('set.key_unset')"
+                <!-- Input only appears when (a) provider isn't configured yet,
+                     or (b) the user clicked 修改 to update an existing key. -->
+                <input x-show="!p.configured || editing"
+                       type="password" class="settings-input"
+                       :placeholder="editing ? t('set.key_edit_placeholder') : t('set.key_unset')"
                        x-model="settings.draftKeys[p.env_key]" />
-                <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
+                <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
                 <button x-show="p.configured" class="btn-ghost sm"
                         @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
                         x-text="t('set.probe')"></button>
+                <button x-show="p.configured && !editing" class="btn-ghost sm"
+                        @click="editing = true"
+                        x-text="t('set.key_edit')"></button>
+                <button x-show="p.configured && editing" class="btn-ghost sm"
+                        @click="editing = false; settings.draftKeys[p.env_key] = ''"
+                        x-text="t('set.key_cancel')"></button>
               </div>
               <!-- Per-provider help text + console link -->
               <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
