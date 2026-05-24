@@ -3954,57 +3954,67 @@ function portal() {
       if (!m || !m.name) return null;
       const inp = m.input || {};
       const status = inp.status || "";
-      const taskId = inp.taskId || inp.task_id || "";
+      const taskId = String(inp.taskId || inp.task_id || "");
       const subject = inp.subject || "";
       const desc = inp.description || "";
-      // Pull what the message-payload knows about the task subject when
-      // TaskUpdate doesn't include it (subjects are stable after Create).
+      // For TaskUpdate / TaskStop, look up the original subject so the
+      // log line reads "✓ 完成 #2 Fix #2: Windows .env 去 BOM" instead
+      // of the bare "✓ 完成 #2".
+      const subjectFromMap = taskId
+        ? (this._taskSubjectMapForMessages()[taskId] || "")
+        : "";
+
+      // Verbs include "任务" / "task" so the line is self-explanatory
+      // even when the subject lookup fails (compacted history etc).
+      // "✗ 删除 #2" alone reads cryptic; "✗ 删除任务 #2" is obvious.
+      //
+      // `#N` is the SDK-assigned task ID — useful as a fallback handle
+      // when the subject is missing, but noise when the subject is
+      // already shown. Show #N only when we have no subject to display.
+      const refFallback = (subj) => (subj ? "" : (taskId ? "#" + taskId : ""));
       switch (m.name) {
         case "TaskCreate":
+          // TaskCreate has no taskId yet (assigned by runtime, returned
+          // in the tool_result text). ref always empty here.
           return {
-            verb: this.lang === "zh" ? "新建" : "Created",
+            verb: this.lang === "zh" ? "新建任务" : "Created task",
             icon: "+", colorClass: "task-created",
             ref: "", subject, detail: desc,
           };
         case "TaskUpdate":
           if (status === "completed") {
-            return { verb: this.lang === "zh" ? "完成" : "Done",
+            return { verb: this.lang === "zh" ? "完成任务" : "Completed task",
                      icon: "✓", colorClass: "task-done",
-                     ref: "#" + taskId, subject: "", detail: "" };
+                     ref: refFallback(subjectFromMap), subject: subjectFromMap, detail: "" };
           }
           if (status === "in_progress") {
-            return { verb: this.lang === "zh" ? "开始" : "Started",
+            return { verb: this.lang === "zh" ? "开始任务" : "Started task",
                      icon: "→", colorClass: "task-started",
-                     ref: "#" + taskId, subject: "", detail: "" };
+                     ref: refFallback(subjectFromMap), subject: subjectFromMap, detail: "" };
           }
           if (status === "deleted") {
-            return { verb: this.lang === "zh" ? "删除" : "Deleted",
+            return { verb: this.lang === "zh" ? "删除任务" : "Deleted task",
                      icon: "✗", colorClass: "task-deleted",
-                     ref: "#" + taskId, subject: "", detail: "" };
+                     ref: refFallback(subjectFromMap), subject: subjectFromMap, detail: "" };
           }
           if (status === "pending") {
-            return { verb: this.lang === "zh" ? "重置" : "Reset",
+            return { verb: this.lang === "zh" ? "重置任务" : "Reset task",
                      icon: "○", colorClass: "task-pending",
-                     ref: "#" + taskId, subject: "", detail: "" };
+                     ref: refFallback(subjectFromMap), subject: subjectFromMap, detail: "" };
           }
-          // Non-status update (rename / addBlockedBy / metadata):
-          // only show if there's something user-visible to surface
-          // (taskId + at least subject or activeForm). Otherwise this
-          // is pure metadata churn — hide.
           if (!taskId && !inp.subject && !inp.activeForm) return null;
-          if (!taskId) return null;  // "更新 #" with no ID is meaningless
-          // If the only change is internal metadata (no subject / no
-          // visible label change), also hide.
+          if (!taskId) return null;
           if (!inp.subject && !inp.activeForm && !inp.description) return null;
-          return { verb: this.lang === "zh" ? "更新" : "Updated",
-                   icon: "·", colorClass: "task-updated",
-                   ref: "#" + taskId,
-                   subject: inp.subject || inp.activeForm || "",
-                   detail: "" };
+          {
+            const subj = inp.subject || inp.activeForm || subjectFromMap;
+            return { verb: this.lang === "zh" ? "更新任务" : "Updated task",
+                     icon: "·", colorClass: "task-updated",
+                     ref: refFallback(subj), subject: subj, detail: "" };
+          }
         case "TaskStop":
-          return { verb: this.lang === "zh" ? "停止" : "Stopped",
+          return { verb: this.lang === "zh" ? "停止任务" : "Stopped task",
                    icon: "✗", colorClass: "task-deleted",
-                   ref: "#" + taskId, subject: "", detail: "" };
+                   ref: refFallback(subjectFromMap), subject: subjectFromMap, detail: "" };
         case "TaskList":
         case "TaskGet":
         case "TaskOutput":
