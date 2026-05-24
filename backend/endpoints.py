@@ -251,15 +251,21 @@ CATALOG: tuple[Provider, ...] = (
         # Qianfan rejects max_completion_tokens > 12288 with HTTP 400.
         # The CLI's default sits around 32-64k, so we have to pin this.
         max_output_tokens=12288,
+        # Model list audited 2026-05-24 by direct probe against
+        # qianfan.baidubce.com/anthropic. ernie-5.0 added (flagship,
+        # ships with thinking output). ernie-x1.1-preview added (new
+        # reasoning preview). deepseek-v3.1 / deepseek-r1 removed —
+        # Qianfan no longer serves them on the Anthropic-compat path
+        # (returns invalid_model).
         models=(
+            ("ernie-5.0",                 "ERNIE 5.0"),
             ("ernie-4.5-turbo-20260402",  "ERNIE 4.5 Turbo"),
             ("ernie-4.5-turbo-128k",      "ERNIE 4.5 Turbo 128K"),
             ("ernie-4.0-turbo-128k",      "ERNIE 4.0 Turbo"),
             ("ernie-4.0-8k",              "ERNIE 4.0"),
+            ("ernie-x1.1-preview",        "ERNIE X1.1 推理 (preview)"),
             ("ernie-x1-turbo-32k",        "ERNIE X1 推理"),
             ("deepseek-v3.2",             "DeepSeek V3.2 (千帆)"),
-            ("deepseek-v3.1",             "DeepSeek V3.1 (千帆)"),
-            ("deepseek-r1",               "DeepSeek R1 (千帆)"),
         ),
     ),
     # Doubao (字节 Volcengine) deliberately NOT added — only
