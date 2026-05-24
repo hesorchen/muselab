@@ -5569,6 +5569,40 @@ function portal() {
 
     // Toggle a provider's visibility in the model picker. probeModel uniquely
     // identifies each provider (e.g. "qwen3.6-plus" vs "qwen-intl:qwen3.6-plus").
+    // Save a single provider's key without going through the bottom-bar
+    // Save (which writes every draft at once). Lets the Settings UI offer
+    // an inline "保存" button next to the input — same one-key edit
+    // gesture the user expects from any modern settings page. The bottom
+    // bar still works for batch saves.
+    async saveProviderKey(envKey) {
+      const v = (this.settings.draftKeys[envKey] || "").trim();
+      if (!v) {
+        this.toast(this.lang === "zh" ? "请先输入 key" : "Enter a key first", "warn", 2000);
+        return false;
+      }
+      try {
+        const r = await fetch("/api/settings", {
+          method: "PUT",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ provider_keys: { [envKey]: v } }),
+        });
+        if (!r.ok) throw new Error("status " + r.status);
+        // Optimistic local refresh: mark this provider configured + clear
+        // the draft so the row collapses back to "已配置" view next render.
+        const p = this.settings.providers.find(x => x.env_key === envKey);
+        if (p) p.configured = true;
+        this.settings.draftKeys[envKey] = "";
+        this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
+        // Refresh providers + model list so any newly-enabled model
+        // appears in the chat dropdown immediately.
+        await this._fetchModels();
+        return true;
+      } catch (e) {
+        this.toast(this.lang === "zh" ? "保存失败：" + e.message : "Save failed: " + e.message, "error", 4000);
+        return false;
+      }
+    },
+
     async toggleProvider(probeModel, disabled) {
       const r = await fetch("/api/settings", {
         method: "PUT",

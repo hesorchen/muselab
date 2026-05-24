@@ -2590,7 +2590,10 @@
 
         <div class="settings-section" data-page="lang"
              x-show="isWideScreen || settings.activePage === 'lang'">
-          <div class="settings-section-title" x-text="t('set.sec.lang')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.lang')"></span>
+            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+          </div>
           <div class="settings-row">
             <label x-text="t('set.label.lang')"></label>
             <div class="lang-picker">
@@ -2602,7 +2605,10 @@
 
         <div class="settings-section" data-page="provider"
              x-show="isWideScreen || settings.activePage === 'provider'">
-          <div class="settings-section-title" x-text="t('set.sec.provider')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.provider')"></span>
+            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+          </div>
 
           <!-- Claude Auth — first-class OAuth provider, no API key field.
                Distinct UX from the generic provider rows: shows identity
@@ -2673,15 +2679,21 @@
                        :placeholder="editing ? t('set.key_edit_placeholder') : t('set.key_unset')"
                        x-model="settings.draftKeys[p.env_key]" />
                 <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
-                <button x-show="p.configured" class="btn-ghost sm"
+                <!-- Edit-mode actions: 保存 (primary, only if input has content) + 取消 -->
+                <button x-show="!p.configured || editing" class="btn-primary sm"
+                        :disabled="!(settings.draftKeys[p.env_key] || '').trim()"
+                        @click="(async () => { if (await saveProviderKey(p.env_key)) editing = false })()"
+                        x-text="t('btn.save')"></button>
+                <button x-show="p.configured && editing" class="btn-ghost sm"
+                        @click="editing = false; settings.draftKeys[p.env_key] = ''"
+                        x-text="t('set.key_cancel')"></button>
+                <!-- Read-mode actions: 测试 + 修改 -->
+                <button x-show="p.configured && !editing" class="btn-ghost sm"
                         @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
                         x-text="t('set.probe')"></button>
                 <button x-show="p.configured && !editing" class="btn-ghost sm"
                         @click="editing = true"
                         x-text="t('set.key_edit')"></button>
-                <button x-show="p.configured && editing" class="btn-ghost sm"
-                        @click="editing = false; settings.draftKeys[p.env_key] = ''"
-                        x-text="t('set.key_cancel')"></button>
               </div>
               <!-- Per-provider help text + console link -->
               <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
@@ -2706,7 +2718,10 @@
 
         <div class="settings-section" data-page="appearance"
              x-show="isWideScreen || settings.activePage === 'appearance'">
-          <div class="settings-section-title" x-text="t('set.sec.appearance')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.appearance')"></span>
+            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+          </div>
           <div class="settings-row">
             <label x-text="t('set.label.accent')"></label>
             <div class="accent-picker">
@@ -2730,8 +2745,8 @@
             <span x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
             <button class="btn-ghost sm" @click="loadVersions()"
                     :disabled="settings.versionsLoading"
-                    style="margin-left: 8px;"
                     x-text="settings.versionsLoading ? (lang==='zh' ? '检查中…' : 'Checking…') : (lang==='zh' ? '检查更新' : 'Check')"></button>
+            <span class="settings-save-mode reload" x-text="t('set.mode.reload')"></span>
           </div>
           <template x-if="settings.versions">
             <div>
@@ -2824,7 +2839,7 @@
                   <div x-show="settings.upgradeResult.needs_restart" class="restart-hint">
                     <div x-text="lang==='zh' ? '需要重启服务以加载新版 SDK：' : 'Restart service to load new SDK:'"></div>
                     <div class="restart-actions">
-                      <button class="btn-primary btn-sm"
+                      <button class="btn-ghost sm"
                               :disabled="settings.restarting"
                               @click="restartService()"
                               x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '一键重启' : 'Restart now')">
@@ -2850,7 +2865,7 @@
           <!-- Standalone restart button — useful any time, not just after upgrade -->
           <div class="settings-row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--c-border)">
             <label x-text="lang==='zh' ? '重启服务' : 'Restart service'"></label>
-            <button class="btn-ghost btn-sm"
+            <button class="btn-ghost sm"
                     :disabled="settings.restarting"
                     @click="restartService()"
                     x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '重启' : 'Restart')">
@@ -2874,7 +2889,6 @@
             <span x-text="t('set.sec.cost')"></span>
             <button class="btn-ghost sm" @click="loadCostDashboard(true)"
                     :disabled="cost.loading"
-                    style="margin-left: 8px;"
                     x-text="cost.loading ? t('set.cost.loading') : t('set.cost.refresh')"></button>
           </div>
           <template x-if="!cost.data && !cost.loading">
@@ -2978,7 +2992,10 @@
 
         <div class="settings-section" data-page="defaults"
              x-show="isWideScreen || settings.activePage === 'defaults'">
-          <div class="settings-section-title" x-text="t('set.sec.defaults')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.defaults')"></span>
+            <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
+          </div>
           <div class="settings-row">
             <label x-text="t('set.label.default_model')"></label>
             <select x-model="settings.draftDefaults.model" class="settings-input">
@@ -3005,7 +3022,10 @@
 
         <div class="settings-section" data-page="model_params"
              x-show="isWideScreen || settings.activePage === 'model_params'">
-          <div class="settings-section-title" x-text="t('set.sec.model_params')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.model_params')"></span>
+            <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
+          </div>
           <div class="settings-row">
             <label x-text="t('set.label.thinking_budget')"></label>
             <input type="number" min="1024" max="32000" step="1024"
@@ -3024,8 +3044,15 @@
              "muselab closed, still notify" case via a service worker. -->
         <div class="settings-section" data-page="notification"
              x-show="isWideScreen || settings.activePage === 'notification'">
-          <div class="settings-section-title"
-               x-text="lang==='zh' ? '通知' : 'Notifications'"></div>
+          <div class="settings-section-title">
+            <span x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
+            <!-- Mixed mode: 本设备 toggles are live (localStorage); 服务端开关
+                 (notify_normal / notify_scheduled) need Save. Tag the
+                 section "batch" since the server-side toggles are the
+                 ones with delayed effect — local ones flip instantly
+                 anyway, so users won't be confused by the badge. -->
+            <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
+          </div>
 
           <!-- Per-device (localStorage) — controls how THIS browser/device
                reacts when push arrives. -->
@@ -3089,7 +3116,10 @@
 
         <div class="settings-section" data-page="skills"
              x-show="isWideScreen || settings.activePage === 'skills'">
-          <div class="settings-section-title" x-text="t('set.sec.skills')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.skills')"></span>
+            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+          </div>
           <!-- Auto-detection notice: tells the user muselab automatically
                pulled in skills from their Claude Code setup. No setup
                needed — the SDK already loaded them. -->
@@ -3131,7 +3161,10 @@
 
         <div class="settings-section" data-page="mcp"
              x-show="isWideScreen || settings.activePage === 'mcp'">
-          <div class="settings-section-title" x-text="t('set.sec.mcp')"></div>
+          <div class="settings-section-title">
+            <span x-text="t('set.sec.mcp')"></span>
+            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+          </div>
           <div class="settings-hint" x-text="t('set.mcp.hint')"></div>
 
           <div x-show="!settings.mcpServers.length && !settings.mcpExamples.length"

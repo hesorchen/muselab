@@ -4690,6 +4690,27 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); color: var(--c-fg-3);
   margin: -8px 0 var(--sp-3); line-height: 1.5;
 }
+/* Save-mode badge in section title — tells the user upfront whether
+   changes in this section take effect immediately, need the bottom
+   "Save" button, or require a service restart. Without these badges
+   users were unsure whether toggling something had any effect — esp.
+   in the notifications section where some toggles auto-save and some
+   don't. Always sits to the right of the section title, never wraps. */
+.settings-section-title {
+  display: flex; align-items: center; gap: 8px;
+}
+.settings-save-mode {
+  margin-left: auto;
+  font-size: 10.5px; font-weight: var(--fw-regular);
+  letter-spacing: 0; text-transform: none;
+  padding: 1px 7px; border-radius: 9px;
+  border: 1px solid var(--c-border-strong);
+  color: var(--c-fg-3); background: var(--c-bg-1);
+  white-space: nowrap;
+}
+.settings-save-mode.live   { color: #2c8a4f; border-color: rgba(44,138,79,0.30); background: rgba(44,138,79,0.08); }
+.settings-save-mode.batch  { color: var(--c-fg-2); }
+.settings-save-mode.reload { color: #b25e1d; border-color: rgba(178,94,29,0.35); background: rgba(178,94,29,0.08); }
 /* Subdivider within a settings-section (e.g. "本设备" / "服务端开关"
    inside the notification section). Lighter than the section title. */
 .settings-subtitle {
