@@ -150,17 +150,17 @@ def test_cost_dashboard_discovers_vendor_config_dir_jsonl(
     client, auth, app_module, temp_root, tmp_path, monkeypatch, request,
 ):
     """Third-party providers (DeepSeek / GLM / MiniMax) run the CLI with
-    CLAUDE_CONFIG_DIR=/tmp/muselab-vendor-cli-config so Pro OAuth never
+    CLAUDE_CONFIG_DIR pointed at a per-uid temp dir so Pro OAuth never
     leaks out. The CLI then writes its JSONL to
     <CLAUDE_CONFIG_DIR>/projects/, NOT ~/.claude/projects/. Dashboard
     must scan both roots — otherwise GLM/MiniMax token usage is invisible
     even though we already build the env_for_model isolation path."""
-    import tempfile
     from backend import sessions as sess_mod
+    from backend import endpoints as endpoints_mod
 
-    # Build a fake vendor projects dir like the real CLI would.
-    vendor_root = (Path(tempfile.gettempdir())
-                    / "muselab-vendor-cli-config" / "projects")
+    # Build a fake vendor projects dir under whatever path the production
+    # code resolves to (per-uid temp dir; see endpoints._vendor_config_dir).
+    vendor_root = endpoints_mod._vendor_config_dir() / "projects"
     proj = vendor_root / str(temp_root).replace("/", "-")
     proj.mkdir(parents=True, exist_ok=True)
 
