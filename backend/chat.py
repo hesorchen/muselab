@@ -4073,6 +4073,23 @@ async def stream(
                     except Exception as e:
                         import sys as _sys
                         _sys.stderr.write(f"[chat] turn push failed: {e}\n")
+            # Strip unverifiable thinking-block signatures so this session
+            # stays resumable via `claude --resume` (and the official
+            # Anthropic API). Third-party vendors (DeepSeek / GLM /
+            # MiniMax / Kimi / Qwen / Baidu / Xiaomi MiMo) don't sign
+            # their thinking output; Anthropic's resume API would 400 on
+            # any of those blocks. We clean opportunistically every turn
+            # — idempotent on already-clean files, so the cost is just
+            # one stat + a parse of the small jsonl. See
+            # backend/jsonl_cleanup.py for the full rationale + the
+            # scripts/fix-thinking-signatures.py CLI for retroactive
+            # cleanup of pre-existing sessions.
+            try:
+                from . import jsonl_cleanup as _jc
+                _jc.clean_session(session_id)
+            except Exception as e:
+                import sys as _sys
+                _sys.stderr.write(f"[chat] jsonl cleanup failed: {e}\n")
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,
