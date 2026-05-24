@@ -7974,7 +7974,16 @@ function portal() {
       es.addEventListener("tool_use", ev => {
         closeAsst();
         const d = JSON.parse(ev.data);
-        const msg = { role: "tool_use", name: d.name, summary: d.summary, input: d.input };
+        // `id` is the SDK's toolu_xxx tool_use_id. Critical for
+        // _taskSubjectMapForMessages — it pairs each TaskCreate
+        // tool_use with the tool_result that carries the assigned
+        // task number. Dropping it here caused live TaskUpdate(#N)
+        // lines to render with no subject in the same turn that
+        // created the task (the historic-load path was fine because
+        // backend/chat.py:1361 included id; the live stream path
+        // just forgot to copy it across).
+        const msg = { role: "tool_use", name: d.name, id: d.id,
+                       summary: d.summary, input: d.input };
         if (d.todos != null) msg.todos = d.todos;
         if (d.task != null) msg.task = d.task;
         if (d.plan != null) msg.plan = d.plan;
