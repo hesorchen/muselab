@@ -24,6 +24,16 @@ ask() {
   echo "${ans:-$def}"
 }
 
+# When invoked via `curl ... | bash` (the one-line install), our stdin is
+# the pipe — and every interactive `read` would immediately EOF, causing
+# `set -e` to silently abort the script after just printing the prompt.
+# Detect that case and reattach stdin to the controlling terminal. The
+# `[[ ! -t 0 ]]` guard makes this a no-op when the script is run directly
+# (e.g. `bash scripts/install-macos.sh`), so no behavior change there.
+if [[ "$NONINT" != "1" ]] && [[ ! -t 0 ]] && [[ -c /dev/tty ]]; then
+  exec </dev/tty
+fi
+
 # Locale for files written to disk (CLAUDE.md template + archive READMEs).
 # Defaults to zh if the shell locale is Chinese, en otherwise. Override
 # explicitly with MUSELAB_LOCALE=zh|en. The installer's prompts/output
