@@ -24,8 +24,24 @@ ask() {
   echo "${ans:-$def}"
 }
 
+# Locale for files written to disk (CLAUDE.md template + archive READMEs).
+# Defaults to zh if the shell locale is Chinese, en otherwise. Override
+# explicitly with MUSELAB_LOCALE=zh|en before running — useful on VPS where
+# the system default is en_US.UTF-8 but the user wants Chinese archive
+# content. NOTE: this only affects files written to disk. The installer's
+# own prompts/output are always bilingual.
+MUSE_LOCALE="${MUSELAB_LOCALE:-}"
+if [[ -z "$MUSE_LOCALE" ]]; then
+  if [[ "${LANG:-}${LC_ALL:-}${LC_MESSAGES:-}" == *zh* ]]; then
+    MUSE_LOCALE=zh
+  else
+    MUSE_LOCALE=en
+  fi
+fi
+
 bold "muselab — Linux installer"
 echo  "  Repo: $REPO"
+echo  "  Archive content language / 档案内容语言: $MUSE_LOCALE  (override: MUSELAB_LOCALE=zh|en)"
 if [[ "$NONINT" == "1" ]]; then
   echo  "  Mode: non-interactive (all defaults, no prompts)"
 fi
@@ -42,10 +58,29 @@ if [[ $EUID -eq 0 ]]; then
   exit 1
 fi
 
+# uv discovery — uv's official installer drops the binary into
+# ~/.local/bin, which isn't on PATH for fresh shells on many distros
+# (Debian/Ubuntu add it via ~/.profile only on login shells, etc.). Before
+# failing, transparently retry with the standard install dirs appended.
+if ! command -v uv >/dev/null 2>&1; then
+  EXTRA_PATHS=(
+    "$HOME/.local/bin"            # astral.sh/uv/install.sh default
+    "$HOME/.cargo/bin"            # legacy cargo install path
+    "/usr/local/bin"              # manual install
+  )
+  for p in "${EXTRA_PATHS[@]}"; do
+    if [[ -x "$p/uv" ]]; then
+      export PATH="$p:$PATH"
+      warn "uv found at $p/uv but wasn't on PATH — added it for this run"
+      warn "  (permanent fix: add 'export PATH=\"$p:\$PATH\"' to ~/.bashrc or ~/.zshrc)"
+      break
+    fi
+  done
+fi
 if ! command -v uv >/dev/null 2>&1; then
   err "uv not found. Install it first:"
   echo "      curl -LsSf https://astral.sh/uv/install.sh | sh"
-  echo "      Then re-source your shell or open a new terminal."
+  echo "      Then open a new shell (or 'source ~/.bashrc') and re-run this script."
   exit 1
 fi
 UV="$(command -v uv)"
@@ -236,7 +271,8 @@ else
 
   echo
   echo "  Archive dir = where Muse can read/write (NEVER point at \$HOME or /)"
-  ARCHIVE="$(ask 'Archive dir (absolute path):' "$HOME/muselab-archive")"
+  echo "  Archive 目录 = Muse 可读写的目录（绝对不要指向 \$HOME 或 /）"
+  ARCHIVE="$(ask 'Archive dir / Archive 目录 (absolute path):' "$HOME/muselab-archive")"
   ARCHIVE="${ARCHIVE/#\~/$HOME}"
   if ! mkdir -p "$ARCHIVE" 2>/dev/null; then
     err "cannot create $ARCHIVE (permission denied?). Pick a path under your home."
@@ -264,31 +300,21 @@ EOF
   # First-time setup: drop a CLAUDE.md template + subdirectory skeleton, and
   # walk the user through a short intake to populate the holistic profile.
   if [[ ! -f "$ARCHIVE/CLAUDE.md" ]]; then
-    # Locale detection — Chinese template if user's shell locale is zh,
-    # English template otherwise. $LANG / $LC_ALL / $LC_MESSAGES checked.
-    if [[ "${LANG:-}${LC_ALL:-}${LC_MESSAGES:-}" == *zh* ]]; then
-      MUSE_LOCALE=zh
+    # MUSE_LOCALE was decided at the top of the script (env override or
+    # shell-locale guess). Map it to template paths.
+    if [[ "$MUSE_LOCALE" == "zh" ]]; then
       MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.md"
       MUSE_README_SRC="README.md"
     else
-      MUSE_LOCALE=en
       MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.en.md"
       MUSE_README_SRC="README.en.md"
     fi
     echo
-    if [[ "$MUSE_LOCALE" == "zh" ]]; then
-      echo "  Muse 是一个同时管你健康 / 职业 / 投资 / 家庭 / 生活的助手。"
-      echo "  它需要先认识你（基本档案）+ 知道去哪里查你的真实材料。"
-      echo "  下面是 2 分钟的入门问题，任意一题可以直接回车跳过。"
-      INTAKE_PROMPT='现在生成档案目录骨架 + CLAUDE.md？ [Y/n]:'
-    else
-      echo "  Muse is one assistant that helps you across health / work /"
-      echo "  money / people / life — simultaneously. To do that well, it"
-      echo "  needs your basic profile and somewhere to find your real documents."
-      echo "  This is a 2-minute intake; you can skip any question (press Enter)."
-      INTAKE_PROMPT='Set up archive skeleton + CLAUDE.md now? [Y/n]:'
-    fi
-    REPLY="$(ask "$INTAKE_PROMPT" 'Y')"
+    echo "  Muse is one assistant — health / work / money / people / life all at once."
+    echo "  Muse 是一个同时管你健康 / 工作 / 财务 / 关心的人 / 生活的助手。"
+    echo "  Below is a 2-minute intake; press Enter to skip any question."
+    echo "  下面 2 分钟入门问答，任意一题直接回车即跳过。"
+    REPLY="$(ask 'Set up archive skeleton + CLAUDE.md / 现在生成档案目录骨架 + CLAUDE.md? [Y/n]:' 'Y')"
     if [[ "$REPLY" =~ ^[Yy] ]]; then
       # 1) Copy subdirectory skeleton (each with a README explaining what to
       #    put there). User gets clean "README.md" regardless of locale.
@@ -315,29 +341,17 @@ EOF
       # All questions are open-ended so they fit students / employees / freelancers /
       # parents / retirees alike. Press Enter to skip any.
       echo
-      if [[ "$MUSE_LOCALE" == "zh" ]]; then
-        echo "  --- 入门问答（任意题回车跳过）---"
-        INTAKE_NAME="$(ask 'Muse 该怎么称呼你？' '')"
-        INTAKE_BIRTH="$(ask '出生年份（或大致年龄段）:' '')"
-        INTAKE_CITY="$(ask '你现在住在哪？' '')"
-        echo "  这一周你的主要时间花在哪？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
-        INTAKE_DOING="$(ask '' '')"
-        echo "  用一句话描述你当下的人生阶段"
-        INTAKE_STAGE="$(ask '' '')"
-        INTAKE_GOAL="$(ask '这一年最想做成的一件事:' '')"
-        INTAKE_HEALTH="$(ask '当前最关心的健康问题（无则填 none）:' '')"
-      else
-        echo "  --- Quick intake (press Enter to skip any) ---"
-        INTAKE_NAME="$(ask 'How should Muse address you?' '')"
-        INTAKE_BIRTH="$(ask 'Birth year (or age range):' '')"
-        INTAKE_CITY="$(ask 'Where do you live?' '')"
-        echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
-        INTAKE_DOING="$(ask '' '')"
-        echo "  One sentence about your life stage right now"
-        INTAKE_STAGE="$(ask '' '')"
-        INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
-        INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
-      fi
+      echo "  --- Quick intake / 入门问答 (Enter to skip / 回车跳过) ---"
+      INTAKE_NAME="$(ask 'How should Muse address you? / Muse 该怎么称呼你？' '')"
+      INTAKE_BIRTH="$(ask 'Birth year or age range / 出生年份（或大致年龄段）:' '')"
+      INTAKE_CITY="$(ask 'Where do you live? / 你现在住在哪？' '')"
+      echo "  What occupies most of your week? / 这一周你的主要时间花在哪？"
+      echo "    (study / job / freelance / care / retirement / … —— 学业 / 工作 / 自由职业 / 照护 / 退休 / 其他)"
+      INTAKE_DOING="$(ask '' '')"
+      echo "  One sentence about your life stage right now / 用一句话描述你当下的人生阶段"
+      INTAKE_STAGE="$(ask '' '')"
+      INTAKE_GOAL="$(ask 'One main goal for this year / 这一年最想做成的一件事:' '')"
+      INTAKE_HEALTH="$(ask 'Top health concern (or "none") / 当前最关心的健康问题（无则填 none）:' '')"
 
       # 3) Write CLAUDE.md with the intake values prefilled.
       sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
@@ -377,27 +391,20 @@ EOF
           "$ARCHIVE/CLAUDE.md"
       fi
 
-      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (intake answers prefilled)"
+      ok "CLAUDE.md → $ARCHIVE/CLAUDE.md (intake answers prefilled / 入门答案已写入)"
       echo
-      if [[ "$MUSE_LOCALE" == "zh" ]]; then
-        echo "  接下来放点真实材料（按你的人生阶段选）:"
-        echo "    • 健康:  体检 / 补剂 / 训练记录       → $ARCHIVE/health/"
-        echo "    • 工作:  简历 / 作品集 / 学业材料     → $ARCHIVE/work/"
-        echo "    • 财务:  预算 / 持仓 / 学贷 / 保单    → $ARCHIVE/money/"
-        echo "    • 人:    关心的人的资料               → $ARCHIVE/people/"
-        echo "    • 编辑 $ARCHIVE/CLAUDE.md 把剩下的空字段填完"
-        echo "  每个子目录里都有 README.md 说明放什么。"
-        echo "  下次 chat 时 Muse 会自动看到这些 — 不用重启服务。"
-      else
-        echo "  Next steps (what fits depends on your life stage):"
-        echo "    • Health:  checkups / supplements / training logs → $ARCHIVE/health/"
-        echo "    • Work:    resume / portfolio / study material    → $ARCHIVE/work/"
-        echo "    • Money:   budget / holdings / loans / insurance  → $ARCHIVE/money/"
-        echo "    • People:  profiles of people you care about      → $ARCHIVE/people/"
-        echo "    • Open $ARCHIVE/CLAUDE.md and fill any blank fields"
-        echo "  Each subdir has a README.md explaining what to put there."
-        echo "  Muse picks all of this up on your next chat — no restart needed."
-      fi
+      echo "  Next steps — drop real files into these directories:"
+      echo "  接下来：把真实材料放进对应目录:"
+      echo "    • Health 健康:  checkups / supplements / training       → $ARCHIVE/health/"
+      echo "    • Work 工作:    resume / portfolio / study material      → $ARCHIVE/work/"
+      echo "    • Money 财务:   budget / holdings / loans / insurance    → $ARCHIVE/money/"
+      echo "    • People 人:    profiles of people you care about        → $ARCHIVE/people/"
+      echo "  Edit $ARCHIVE/CLAUDE.md to fill any remaining blank fields."
+      echo "  编辑 $ARCHIVE/CLAUDE.md 把剩下的空字段填完。"
+      echo "  Each subdir has a README.md explaining what to put there."
+      echo "  每个子目录里都有 README.md 说明放什么。"
+      echo "  Muse picks all of this up on your next chat — no restart needed."
+      echo "  下次对话时 Muse 自动看到这些 —— 不用重启服务。"
     fi
   fi
 fi
