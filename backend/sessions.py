@@ -380,7 +380,18 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
     """Delete all sessions with message_count == 0 that are not pinned.
     `keep_ids` — session IDs to skip regardless (e.g. the one just created).
     Returns the list of deleted session IDs. Safe to call concurrently;
-    the index is patched under _INDEX_LOCK in one shot."""
+    the index is patched under _INDEX_LOCK in one shot.
+
+    Disabled by default since 2026-05-24 — the magic disappearance of
+    sessions the user hadn't explicitly deleted was surprising and made
+    "did I lose work?" anxiety more common than "thanks for cleaning up".
+    Opt in by exporting MUSELAB_PRUNE_EMPTY_SESSIONS=true if you want
+    the old behaviour back (still subject to all the same safety gates:
+    only sessions < 2h old, never-renamed, no pins, no messages).
+    """
+    import os as _os
+    if _os.environ.get("MUSELAB_PRUNE_EMPTY_SESSIONS", "false").lower() != "true":
+        return []
     import time as _time
     from claude_agent_sdk import delete_session as sdk_delete_session
     keep = set(keep_ids)
