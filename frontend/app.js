@@ -7836,6 +7836,25 @@ function portal() {
       streamState.streamingModel = this.model;
       this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
       streamState.streamElapsed = 0; this.streamElapsed = 0;
+      // Start the wall-clock NOW, at submit-time — not later in es.onopen.
+      // The previous setup waited for the SSE handshake (which can take
+      // 1-3s on slow networks / cold backends) before the counter began
+      // ticking, so users saw "thinking · 0s" frozen for the first few
+      // seconds and then jump. Setting it here AND not clobbering it on
+      // reconnect (see es.onopen below) also fixes the "timer suddenly
+      // resets to 0" bug — every SSE reconnect used to fire onopen which
+      // overwrote _streamStartedAt with now.
+      streamState._streamStartedAt = Date.now();
+      this._streamStartedAt = streamState._streamStartedAt;
+      // Tick immediately so the footer shows 0.0s right after submit
+      // (without waiting for the first 200ms interval tick).
+      if (streamState._streamTimer) clearInterval(streamState._streamTimer);
+      streamState._streamTimer = setInterval(() => {
+        const elapsed = (Date.now() - streamState._streamStartedAt) / 1000;
+        streamState.streamElapsed = elapsed;
+        if (this.currentId === streamSid) this.streamElapsed = elapsed;
+      }, 200);
+      this._streamTimer = streamState._streamTimer;
       this.atBottom = true;
       this.scrollToBottom(true);
 
@@ -7848,25 +7867,14 @@ function portal() {
         + "&token=" + encodeURIComponent(this.token);
       const es = new EventSource(url);
       streamState.es = es; this.es = es;
-      // Reset auto-reconnect counter on every fresh stream open. Survives
-      // across `send({reconnect:true})` chains because we reset to 0 only
-      // when the connection actually succeeds (es.onopen below) — failed
-      // reconnects keep the counter ticking so we give up after N tries
-      // instead of looping forever on a dead backend.
-      // Tick elapsed time so user sees "thinking · 3.2s" when first token is slow.
-      // Timer starts here (on open) so it only runs once the connection is
-      // established — avoids counting pre-connect time as "thinking time".
+      // Reset auto-reconnect counter on each successful SSE open. NOTE
+      // — we deliberately do NOT (re)start the elapsed-time counter
+      // here. Timer + _streamStartedAt are set above at submit time so
+      // (a) the footer shows "0.0s" immediately instead of waiting
+      // through the SSE handshake, and (b) mid-stream reconnects don't
+      // visibly reset the displayed elapsed back to zero.
       es.onopen = () => {
         streamState._reconnectAttempts = 0;
-        streamState._streamStartedAt = Date.now();
-        this._streamStartedAt = streamState._streamStartedAt;
-        if (streamState._streamTimer) clearInterval(streamState._streamTimer);
-        streamState._streamTimer = setInterval(() => {
-          const elapsed = (Date.now() - streamState._streamStartedAt) / 1000;
-          streamState.streamElapsed = elapsed;
-          if (this.currentId === streamSid) this.streamElapsed = elapsed;
-        }, 200);
-        this._streamTimer = streamState._streamTimer;
       };
 
       // Active assistant bubble pointer. Text events open / extend it; tool /
