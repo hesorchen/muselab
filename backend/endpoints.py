@@ -81,17 +81,26 @@ _BASE_URL_ENV_BY_KEY: dict[str, str] = {
 }
 
 
-_VENDOR_CONFIG_DIR = Path(tempfile.gettempdir()) / "muselab-vendor-cli-config"
+# Per-OS-user path so multiple muselab installs on the same host (e.g. a
+# real user + a `muselab` test user) don't collide. Earlier this was a
+# single shared `/tmp/muselab-vendor-cli-config`, so whichever user
+# created it first locked the others out with PermissionError on Read,
+# which then surfaced as a 504 on the chat SSE stream.
+_VENDOR_CONFIG_DIR = (
+    Path(tempfile.gettempdir())
+    / f"muselab-vendor-cli-config-{os.getuid()}"
+)
 
 
 def _vendor_config_dir() -> Path:
     """Returns the isolated config dir used by third-party providers. Shared
-    across all three-party sessions — it has no .credentials.json, so the CLI
-    subprocess cannot fall back to Pro OAuth and send the wrong token to vendor.
+    across all three-party sessions FOR THE CURRENT OS USER — it has no
+    .credentials.json, so the CLI subprocess cannot fall back to Pro OAuth
+    and send the wrong token to vendor.
 
     chat.py also reads from here when loading session messages for vendor
     sessions."""
-    _VENDOR_CONFIG_DIR.mkdir(exist_ok=True)
+    _VENDOR_CONFIG_DIR.mkdir(exist_ok=True, mode=0o700)
     return _VENDOR_CONFIG_DIR
 
 
