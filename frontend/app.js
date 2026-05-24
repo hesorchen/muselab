@@ -5658,6 +5658,15 @@ function portal() {
 
     async restartService() {
       if (this.settings.restarting) return;
+      // Confirm before restarting — a stray tap on a phone would otherwise
+      // drop every active chat session for ~10s with no recourse. Native
+      // confirm() is intentional: this is a destructive action and the
+      // OS-level dialog forces deliberate user attention better than an
+      // in-app modal that may blend into the settings drawer chrome.
+      const msg = this.lang === "zh"
+        ? "重启 muselab 服务？所有正在跑的对话会中断约 10 秒。"
+        : "Restart muselab? All running chats will pause for ~10 seconds.";
+      if (!window.confirm(msg)) return;
       this.settings.restarting = true;
       try {
         // Fire the restart request — the server responds before it restarts

@@ -5045,6 +5045,16 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .accent-custom::-webkit-color-swatch-wrapper { padding: 2px; }
 .accent-custom::-webkit-color-swatch { border: 0; border-radius: 4px; }
 
+/* Mobile: shrink swatches + custom picker so all 6 presets + 1 custom
+   fit on a single row inside the settings drawer's right column. iOS
+   Safari otherwise renders <input type="color"> as a wide button that
+   forces wrap to a second row, leaving 5+1+1 stacked awkwardly. */
+@media (max-width: 480px) {
+  .accent-picker { gap: 6px; }
+  .accent-swatch { width: 22px; height: 22px; }
+  .accent-custom { width: 24px; height: 24px; }
+}
+
 /* 语言切换：两个胶囊按钮 */
 .lang-picker {
   display: inline-flex; gap: 0;
