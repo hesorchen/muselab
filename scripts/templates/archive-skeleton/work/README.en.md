@@ -1,7 +1,7 @@
 # work/
 
-What you're doing — coursework, employment, freelance, founding, caregiving,
-retirement activities.
+Active work artifacts — coursework, employment, freelance, founding,
+caregiving, retirement activities.
 
 ## What goes here
 

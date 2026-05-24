@@ -10,7 +10,7 @@ long-term conditions.
 - Exercise / training logs
 - Sleep / heart rate / steps exports
 - Doctor visit records, allergies, chronic conditions
-- Health of people you care about — sub-folders per person
+- Health of family members — sub-folders per person
 
 ## Muse's constraints here
 

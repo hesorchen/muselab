@@ -1,7 +1,7 @@
 # people/
 
-People you care about — partner, parents, kids, housemates, long-term
-friends, mentors, pets.
+Notes about people in this archive owner's life — partner, parents, kids,
+housemates, long-term friends, mentors, pets.
 
 ## What goes here
 

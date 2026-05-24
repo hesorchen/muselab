@@ -13,4 +13,4 @@ in the other directories.
 ## Muse's behavior here
 
 - Full-text search + topic linking: surfaces related earlier notes when X comes up
-- Doesn't impose categories — works with whatever organization you already use
+- Doesn't impose categories — follows whatever organization is already in place
