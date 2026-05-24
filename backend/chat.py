@@ -990,9 +990,44 @@ def list_sessions_api() -> dict:
     return {"sessions": sessions}
 
 
+def _resolve_default_model(requested: str = "") -> str:
+    """Pick a model id for a new session. Three-tier fallback:
+      1. `requested` (what the caller sent) — used ONLY if its provider
+         is actually configured. Otherwise we silently swap; honoring an
+         unusable preference would 401 on the first send.
+      2. `MUSELAB_MODEL` env (settings.MODEL) — same availability check.
+      3. First model from the first available_groups() entry — covers
+         "user configured only DEEPSEEK_API_KEY" cases on fresh installs.
+
+    Returns `MODEL` (likely claude-sonnet-4-6) only as last resort when
+    no provider at all is configured — UI surfaces the no-provider
+    onboarding card before any chat would actually fire.
+    """
+    groups = endpoints.available_groups()
+    available = {item["model"] for g in groups for item in g.get("items", [])}
+
+    # 1. Caller-requested model, if its provider is wired.
+    if requested and requested in available:
+        return requested
+
+    # 2. Env-pinned default, if its provider is wired.
+    explicit = (MODEL or "").strip()
+    if explicit and explicit in available:
+        return explicit
+
+    # 3. First actually-available model.
+    if groups and groups[0].get("items"):
+        return groups[0]["items"][0]["model"]
+
+    # 4. Nothing configured — fall back to the constant. UI handles this
+    # via the no-provider onboarding card.
+    return MODEL
+
+
 @router.post("/sessions", dependencies=[Depends(require_token)])
 def create_session_api(req: CreateReq) -> dict:
-    meta = sess.create_session(name=req.name or "", model=req.model or MODEL)
+    meta = sess.create_session(name=req.name or "",
+                               model=_resolve_default_model(req.model))
     # Auto-prune: delete any empty sessions left over from previous tabs /
     # accidental new-session clicks. Skip the one we just created so it
     # stays available for the user's first message.
