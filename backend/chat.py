@@ -47,11 +47,11 @@ def _cli_project_roots() -> list[Path]:
 
     1. ``~/.claude/projects`` — default root used by Claude (Pro OAuth /
        Anthropic API key).
-    2. ``<tmp>/muselab-vendor-cli-config/projects`` — vendor-isolated
+    2. ``<tmp>/muselab-vendor-cli-config-<uid>/projects`` — vendor-isolated
        root used when muselab routes the CLI subprocess to a third-party
        Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax / Kimi /
        Qwen / MiMo).  See ``endpoints.env_override`` for the isolation
-       rationale.
+       rationale. Path is per-OS-user to avoid multi-user collision.
 
     Callers reading transcripts MUST walk both. Forgetting the vendor
     root has caused real bugs across the codebase — vendor sessions
@@ -67,7 +67,7 @@ def _cli_project_roots() -> list[Path]:
     """
     candidates = [
         Path.home() / ".claude" / "projects",
-        Path(tempfile.gettempdir()) / "muselab-vendor-cli-config" / "projects",
+        endpoints._vendor_config_dir() / "projects",
     ]
     return [r for r in candidates if r.exists()]
 
@@ -92,8 +92,8 @@ def _get_session_msgs(sid: str, model: str = "") -> list:
     third-party model.
 
     Without this, vendor-session JSONLs (written by the CLI subprocess into
-    /tmp/muselab-vendor-cli-config/projects/) are invisible to the parent
-    process, which defaults to ~/.claude/projects/.  The result is that
+    the per-uid vendor config dir's projects/ subdir) are invisible to the
+    parent process, which defaults to ~/.claude/projects/. The result is that
     refreshing a DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo session shows
     zero messages."""
     if model and endpoints.is_third_party(model):
