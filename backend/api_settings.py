@@ -1309,7 +1309,7 @@ def _read_credentials_expiry() -> int | None:
     if not _CLAUDE_CRED.exists():
         return None
     try:
-        data = json.loads(_CLAUDE_CRED.read_text())
+        data = json.loads(_CLAUDE_CRED.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     return data.get("claudeAiOauth", {}).get("expiresAt")
