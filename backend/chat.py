@@ -4021,55 +4021,48 @@ async def stream(
             # (2026-05-23 user report)
             was_cancelled = session_id in _pending_interrupts
             _pending_interrupts.discard(session_id)
-            # Web Push on turn-done. Four gates, in order:
+            # Web Push on turn-done. Three gates, in order:
             #   1. MUSELAB_NOTIFY_NORMAL toggle (env-level mute switch)
             #   2. Turn was NOT user-cancelled — see was_cancelled above.
-            #   3. No live SSE subscriber on this turn — if the user is
-            #      actively connected to the broadcast (page open, watching),
-            #      they don't need a push. Pushing anyway caused a "ghost
-            #      notification" UX bug: user sent message B, message A's
-            #      turn finished just after, push fired for A while B's
-            #      SSE was already open — user perceived the push as "you
-            #      sent B and got a reply" and confused the visible A reply
-            #      with B's pending one. Skipping when subscribers > 0
-            #      cleanly removes the false positive.
-            #   4. Wrapped in try/except — push failure must never block
+            #   3. Wrapped in try/except — push failure must never block
             #      the stream's done event.
+            #
+            # We used to also gate on "no live SSE subscriber" to avoid a
+            # "ghost notification" (user sends B while A's turn ends, push
+            # for A confuses them about B). But that rule fired the suppress
+            # for *every* device on the account — if the user had a desktop
+            # tab open watching, their phone (which had no live SSE because
+            # iOS Safari kills backgrounded EventSource) got no push either.
+            # The fix lives on the *client* side now: the service worker's
+            # `push` handler runs `clients.matchAll()`, sees whether any
+            # window on THAT device is currently visible, and swallows the
+            # notification locally if so. Result: desktop foreground swallows
+            # its own push; phone backgrounded still rings. See sw.js.
+            #
             # Body intentionally minimal: session name + "Muse 已回复". No
             # preview text — the actual reply is one tap away in chat.
             if (not was_cancelled
                     and os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false"):
-                live_subscribers = 0
                 try:
-                    _bc = _active_turns.get(session_id)
-                    if _bc is not None:
-                        live_subscribers = len(_bc.subscribers)
-                except Exception:
-                    pass
-                if live_subscribers > 0:
-                    # User is watching live — no push.
-                    pass
-                else:
+                    from . import push as _push
+                    sname = ""
                     try:
-                        from . import push as _push
-                        sname = ""
-                        try:
-                            for s in sess.list_sessions():
-                                if s.get("id") == session_id:
-                                    sname = s.get("name", "")
-                                    break
-                        except Exception:
-                            pass
-                        _body = _plain_preview(assistant_acc) or "Muse 已回复"
-                        _push.send_to_all(
-                            title=sname or "muselab",
-                            body=_body,
-                            url="/",
-                            tag=f"turn-{session_id}",
-                        )
-                    except Exception as e:
-                        import sys as _sys
-                        _sys.stderr.write(f"[chat] turn push failed: {e}\n")
+                        for s in sess.list_sessions():
+                            if s.get("id") == session_id:
+                                sname = s.get("name", "")
+                                break
+                    except Exception:
+                        pass
+                    _body = _plain_preview(assistant_acc) or "Muse 已回复"
+                    _push.send_to_all(
+                        title=sname or "muselab",
+                        body=_body,
+                        url=f"/?session={session_id}",
+                        tag=f"turn-{session_id}",
+                    )
+                except Exception as e:
+                    import sys as _sys
+                    _sys.stderr.write(f"[chat] turn push failed: {e}\n")
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,

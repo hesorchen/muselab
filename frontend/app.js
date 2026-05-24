@@ -3877,13 +3877,40 @@ function portal() {
     // "Task #15 created successfully: <subject>". We scan messages in
     // order, matching each TaskCreate tool_use to its tool_result by
     // tool_use_id, then parse the "#N" out of the result text.
-    // Cached by message-array length (cheap invalidation).
+    //
+    // We also persist observed subjects to localStorage keyed per chat
+    // session — so when the conversation context gets compacted (Claude
+    // drops old messages from its rolling window to save tokens), later
+    // TaskUpdate(delete #2) renderings can still resolve "#2 → Fix #2:
+    // Windows .env 去 BOM" from the persistent map. Without this, long
+    // chats render naked "✗ 删除 #2" with no subject — confusing.
+    _taskSubjStorageKey() {
+      return "muselab.taskSubjects." + (this.currentId || "_default");
+    },
+    _loadStoredTaskSubjects() {
+      try {
+        const raw = localStorage.getItem(this._taskSubjStorageKey());
+        return raw ? JSON.parse(raw) : {};
+      } catch (_) { return {}; }
+    },
+    _storeTaskSubjects(map) {
+      try {
+        localStorage.setItem(this._taskSubjStorageKey(), JSON.stringify(map));
+      } catch (_) { /* quota / private mode — best-effort, ignore */ }
+    },
     _taskSubjectMapForMessages() {
       const msgs = this.messages || [];
+      // Cache key includes session id — switching tabs/sessions must
+      // invalidate even when message count happens to match.
+      const cacheKey = (this.currentId || "_") + ":" + msgs.length;
       const cached = this._cachedTaskSubjectMap;
-      if (cached && cached.length === msgs.length) return cached.map;
-      const map = {};
+      if (cached && cached.key === cacheKey) return cached.map;
+
+      // Start from the persistent per-session map — entries observed in
+      // previous turns survive context compaction this way.
+      const map = Object.assign({}, this._loadStoredTaskSubjects());
       const pendingCreate = {};  // tool_use_id → subject
+      let dirty = false;
       for (const m of msgs) {
         if (!m) continue;
         if (m.role === "tool_use" && m.name === "TaskCreate") {
@@ -3893,7 +3920,10 @@ function portal() {
           // Subsequent TaskUpdate may carry an updated subject — refresh
           const inp = m.input || {};
           const tid = inp.taskId || inp.task_id;
-          if (tid && inp.subject) map[String(tid)] = inp.subject;
+          if (tid && inp.subject && map[String(tid)] !== inp.subject) {
+            map[String(tid)] = inp.subject;
+            dirty = true;
+          }
         } else if (m.role === "tool_result") {
           // Backend serializes tool_result's tool_use_id into `m.id`
           // (the same `id` field that tool_use uses, intentionally
@@ -3905,12 +3935,19 @@ function portal() {
             // Parse "Task #N created successfully" out of result text
             const txt = m.text || m.preview || "";
             const match = txt.match(/Task\s+#(\d+)/i);
-            if (match) map[match[1]] = pendingCreate[tuId];
+            if (match) {
+              const tid = match[1];
+              if (map[tid] !== pendingCreate[tuId]) {
+                map[tid] = pendingCreate[tuId];
+                dirty = true;
+              }
+            }
             delete pendingCreate[tuId];
           }
         }
       }
-      this._cachedTaskSubjectMap = { length: msgs.length, map };
+      if (dirty) this._storeTaskSubjects(map);
+      this._cachedTaskSubjectMap = { key: cacheKey, map };
       return map;
     },
     taskLogLine(m) {

@@ -33,7 +33,31 @@ self.addEventListener("push", (event) => {
     badge: "/static/assets/icon-512.png",
     data: { url },
   };
-  event.waitUntil(self.registration.showNotification(title, opts));
+
+  // Per-device suppression: if any muselab window on *this device* is
+  // currently visible (Page Visibility = "visible" — i.e. the user has
+  // the app in foreground), they don't need a notification — they'll
+  // see the reply land in-app. Each device's SW only sees its own
+  // clients, so this is correctly per-device: desktop foreground
+  // swallows desktop's push while phone backgrounded still rings.
+  //
+  // Backend used to do this check via SSE-subscriber count, which broke
+  // multi-device (desktop SSE alive => phone push suppressed too).
+  // Moving the decision client-side fixes that.
+  event.waitUntil((async () => {
+    try {
+      const clients = await self.clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      const anyVisible = clients.some(c => c.visibilityState === "visible");
+      if (anyVisible) return;   // foreground client will render the reply
+    } catch (_) {
+      // matchAll failure (rare) — fall through and show, so we err on
+      // the side of NOT silently dropping notifications.
+    }
+    return self.registration.showNotification(title, opts);
+  })());
 });
 
 self.addEventListener("notificationclick", (event) => {
