@@ -33,6 +33,14 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.setenv("MUSELAB_TOKEN", TEST_TOKEN)
     monkeypatch.setenv("MUSELAB_ROOT", str(temp_root))
     monkeypatch.setenv("MUSELAB_PORT", "9999")
+    # Critical: redirect ENV_PATH to a throwaway file so PUT /api/settings
+    # tests don't clobber the developer's real ~/muselab/.env. Without
+    # this, test_regressions.py was silently overwriting DEEPSEEK_API_KEY
+    # on every run (the placeholder "sk-test-key-12345" landed in
+    # production .env, breaking real chat against DeepSeek). 2026-05-24.
+    test_env_path = tmp_path / "test.env"
+    test_env_path.write_text(f"MUSELAB_TOKEN={TEST_TOKEN}\nMUSELAB_ROOT={temp_root}\n")
+    monkeypatch.setenv("MUSELAB_ENV_PATH", str(test_env_path))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)

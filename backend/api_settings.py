@@ -27,7 +27,17 @@ MCP_EXAMPLE_PATH = Path(__file__).resolve().parent.parent / "mcp.json.example"
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+# Path to the .env file we read/write at runtime. Defaults to the repo
+# root's `.env`. The MUSELAB_ENV_PATH override is critical for test
+# isolation — without it, tests/test_regressions.py calling
+# PUT /api/settings would clobber the developer's real .env (every CI
+# run silently overwrote the DEEPSEEK_API_KEY with "sk-test-key-12345"
+# until 2026-05-24 when this guard was added). Production setups
+# never need to set the env var; it's a test-only escape hatch.
+ENV_PATH = Path(os.environ.get(
+    "MUSELAB_ENV_PATH",
+    str(Path(__file__).resolve().parent.parent / ".env"),
+))
 
 # Providers exposed in the settings UI. Derived from endpoints.CATALOG so a
 # new entry there automatically surfaces in Settings — no parallel list to
@@ -250,8 +260,16 @@ def put_settings(req: SettingsIn) -> dict:
                 continue
             if v == "_delete_":
                 updates[env_name] = None  # type: ignore[assignment]
-            else:
-                updates[env_name] = v
+                continue
+            # Defence: refuse to save a string that looks like our own
+            # mask (contains "•"). Without this, a bug in the FE that
+            # accidentally piped p.masked into draftKeys[…] would
+            # silently turn the user's real key into a string of
+            # bullets — unrecoverable without a backup. The mask uses
+            # U+2022 BULLET; legitimate API keys never contain it.
+            if "•" in v:
+                continue
+            updates[env_name] = v
 
     # Per-field "did it actually change?" gate. The frontend sends every
     # draftDefaults / draftParams field on every save (it doesn't track
