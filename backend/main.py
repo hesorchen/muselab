@@ -356,6 +356,18 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.post("/api/presence", dependencies=[Depends(require_token)])
+def presence_heartbeat() -> dict:
+    """Frontend pings this every ~15s while the page is `visible`. We
+    record a single shared "last_seen" timestamp and use it in
+    chat.py's turn-done push gate to skip pushes when any device is
+    actively at the screen. See backend/presence.py for the rationale."""
+    from . import presence as _presence
+    _presence.mark_seen()
+    age = _presence.last_seen_age()
+    return {"ok": True, "last_seen_age_sec": age, "grace_sec": _presence.GRACE_SECONDS}
+
+
 # Per-IP rate limiter for /api/log/client-error. The endpoint is
 # intentionally unauthenticated (errors fire before auth is established),
 # which means a misbehaving page or a hostile client could flood

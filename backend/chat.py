@@ -4021,48 +4021,58 @@ async def stream(
             # (2026-05-23 user report)
             was_cancelled = session_id in _pending_interrupts
             _pending_interrupts.discard(session_id)
-            # Web Push on turn-done. Three gates, in order:
+            # Web Push on turn-done. Four gates, in order:
             #   1. MUSELAB_NOTIFY_NORMAL toggle (env-level mute switch)
             #   2. Turn was NOT user-cancelled — see was_cancelled above.
-            #   3. Wrapped in try/except — push failure must never block
+            #   3. No device has heartbeated /api/presence recently — i.e.
+            #      the user is NOT actively at any screen. See below.
+            #   4. Wrapped in try/except — push failure must never block
             #      the stream's done event.
             #
-            # We used to also gate on "no live SSE subscriber" to avoid a
-            # "ghost notification" (user sends B while A's turn ends, push
-            # for A confuses them about B). But that rule fired the suppress
-            # for *every* device on the account — if the user had a desktop
-            # tab open watching, their phone (which had no live SSE because
-            # iOS Safari kills backgrounded EventSource) got no push either.
-            # The fix lives on the *client* side now: the service worker's
-            # `push` handler runs `clients.matchAll()`, sees whether any
-            # window on THAT device is currently visible, and swallows the
-            # notification locally if so. Result: desktop foreground swallows
-            # its own push; phone backgrounded still rings. See sw.js.
+            # History of the gating logic:
+            #   - v1: gated on "no live SSE subscriber" → broke multi-device
+            #     (desktop SSE alive ⇒ phone push suppressed too).
+            #   - v2: removed server-side gate, moved decision to sw.js
+            #     visibility check → fixed phone backgrounded case, but
+            #     phone STILL rang while user was on desktop because each
+            #     SW only sees its own device's clients.
+            #   - v3 (now): server-side presence heartbeat. Frontend POSTs
+            #     /api/presence every ~15s while visible; if any device
+            #     reported in within GRACE_SECONDS, skip the fan-out
+            #     entirely. The sw.js visibility check stays as
+            #     defense-in-depth for the case where heartbeat data is
+            #     stale (network blip, browser killed the timer, etc.).
             #
             # Body intentionally minimal: session name + "Muse 已回复". No
             # preview text — the actual reply is one tap away in chat.
             if (not was_cancelled
                     and os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false"):
-                try:
-                    from . import push as _push
-                    sname = ""
+                from . import presence as _presence
+                if _presence.recently_active():
+                    # User is at one of their devices — they'll see the
+                    # reply in-app. Skip the push fan-out entirely.
+                    pass
+                else:
                     try:
-                        for s in sess.list_sessions():
-                            if s.get("id") == session_id:
-                                sname = s.get("name", "")
-                                break
-                    except Exception:
-                        pass
-                    _body = _plain_preview(assistant_acc) or "Muse 已回复"
-                    _push.send_to_all(
-                        title=sname or "muselab",
-                        body=_body,
-                        url=f"/?session={session_id}",
-                        tag=f"turn-{session_id}",
-                    )
-                except Exception as e:
-                    import sys as _sys
-                    _sys.stderr.write(f"[chat] turn push failed: {e}\n")
+                        from . import push as _push
+                        sname = ""
+                        try:
+                            for s in sess.list_sessions():
+                                if s.get("id") == session_id:
+                                    sname = s.get("name", "")
+                                    break
+                        except Exception:
+                            pass
+                        _body = _plain_preview(assistant_acc) or "Muse 已回复"
+                        _push.send_to_all(
+                            title=sname or "muselab",
+                            body=_body,
+                            url=f"/?session={session_id}",
+                            tag=f"turn-{session_id}",
+                        )
+                    except Exception as e:
+                        import sys as _sys
+                        _sys.stderr.write(f"[chat] turn push failed: {e}\n")
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,

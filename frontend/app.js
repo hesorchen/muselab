@@ -1195,6 +1195,7 @@ function portal() {
         // Will retry via heartbeat
       }
       this._startHeartbeat();
+      this._startPresence();
     },
 
     _markReady() {
@@ -1272,6 +1273,36 @@ function portal() {
     _startHeartbeat() {
       if (this._connHeartbeat) clearInterval(this._connHeartbeat);
       this._connHeartbeat = setInterval(() => this._pingHealth(), 10_000);
+    },
+
+    // Presence heartbeat — tells the backend "this device is at the
+    // screen right now" so the chat turn-done push gate (see
+    // backend/presence.py + chat.py) doesn't fan a notification out to
+    // the user's phone while they're using their laptop. Sent every
+    // 15s WHILE the page is visible; stops as soon as the tab is
+    // minimized / switched away. Also fires immediately on every
+    // visibility-change to "visible" (so coming back into focus
+    // re-arms the suppression before the next push could fire).
+    _startPresence() {
+      const ping = () => {
+        if (typeof document === "undefined") return;
+        if (document.visibilityState !== "visible") return;
+        try {
+          fetch("/api/presence", { method: "POST", headers: this.hdr() })
+            .catch(() => {});   // silent — presence is best-effort
+        } catch (_) { /* ignore */ }
+      };
+      // Fire once on init so we don't wait up to 15s for the first ping.
+      ping();
+      if (this._presenceTimer) clearInterval(this._presenceTimer);
+      this._presenceTimer = setInterval(ping, 15_000);
+      // Tab returning to foreground → ping immediately. Without this, a
+      // user who just opened the laptop after a 5-minute lunch break
+      // might still get a phone push for a turn that finishes in the
+      // first 15s of being back.
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") ping();
+      });
     },
     async _pingHealth() {
       try {
