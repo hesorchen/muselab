@@ -291,7 +291,10 @@ MUSELAB_TOKEN=$TOKEN
 MUSELAB_ROOT=$ARCHIVE
 MUSELAB_HOST=127.0.0.1
 MUSELAB_PORT=$PORT
-MUSELAB_MODEL=claude-sonnet-4-6
+# MUSELAB_MODEL intentionally NOT set here — the frontend picks the first
+# configured provider on first load. Set this only if you have a strong
+# preference AND have configured the matching provider (e.g.
+# MUSELAB_MODEL=deepseek-v4-pro after setting DEEPSEEK_API_KEY).
 EOF
   chmod 600 .env
   ok ".env created (mode 600)"

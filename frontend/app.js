@@ -2770,6 +2770,7 @@ function portal() {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
           this.availableModels = (await r.json()).models || [];
+          this._ensureValidModel();
           this._rebindModelSelect();
         }
       } catch {}
@@ -5653,9 +5654,44 @@ function portal() {
     async _fetchModels() {
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r.ok) this.availableModels = (await r.json()).models || [];
+        if (r.ok) {
+          this.availableModels = (await r.json()).models || [];
+          this._ensureValidModel();
+        }
       } catch (e) {
         // Silently skip — the dropdown can be refreshed next time it opens.
+      }
+    },
+    // Ensure `this.model` references a model whose provider is currently
+    // configured. Without this, a fresh install (.env's MUSELAB_MODEL
+    // default = claude-sonnet-4-6) plus a user who only configured e.g.
+    // DEEPSEEK_API_KEY would send chats as Claude and hit 401 on every
+    // turn — the dropdown shows the wrong model on first load.
+    _ensureValidModel() {
+      // No providers configured at all → leave model empty so the dropdown
+      // shows the placeholder and the no-provider onboarding card surfaces.
+      if (!this.availableModels || this.availableModels.length === 0) {
+        if (this.model) {
+          this.model = "";
+          this.savePrefs();
+        }
+        return;
+      }
+      // Current model is in the available list → nothing to do.
+      if (this.availableModels.find(m => m.model === this.model)) return;
+      // Current model isn't available → fall back to the first one. Toast
+      // only when the user previously had a real selection (avoids a
+      // confusing first-load toast on an empty-default install).
+      const oldModel = this.model;
+      this.model = this.availableModels[0].model;
+      this.savePrefs();
+      if (oldModel) {
+        const newLabel = this.availableModels[0].label || this.model;
+        this.toast(
+          this.lang === "zh"
+            ? `已切到 ${newLabel}（${oldModel} 对应的 provider 未配置）`
+            : `Switched to ${newLabel} (${oldModel}'s provider not configured)`,
+          "info", 3500);
       }
     },
 
