@@ -64,6 +64,12 @@ def test_is_third_party(monkeypatch):
 
 def test_available_groups_only_lists_configured(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {
+        # ANTHROPIC_API_KEY makes has_anthropic_auth() True without
+        # needing a ~/.claude/.credentials.json on disk — required so
+        # this test passes on CI runners (developer machines have the
+        # credentials file from `claude login` and historically hid
+        # the gap).
+        "ANTHROPIC_API_KEY": "x",
         "DEEPSEEK_API_KEY": "x",
         "ZHIPUAI_API_KEY": None,
         "MINIMAX_API_KEY": None,
@@ -172,6 +178,11 @@ def test_all_catalog_providers_have_valid_fields(monkeypatch):
 
 
 def test_available_groups_claude_always_first(monkeypatch):
-    ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "x"})
+    # ANTHROPIC_API_KEY so Claude shows up on CI (see comment in
+    # test_available_groups_only_lists_configured).
+    ep = _reload_endpoints(monkeypatch, {
+        "ANTHROPIC_API_KEY": "x",
+        "DEEPSEEK_API_KEY": "x",
+    })
     groups = ep.available_groups()
     assert groups[0]["group"] == "Claude"
