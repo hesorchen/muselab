@@ -26,6 +26,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)" />
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#f5f0e0" />
 
 <link rel="stylesheet" href="/static/styles.css" />
 <link id="hljs-theme" rel="stylesheet" href="/static/vendor/highlight-theme.css" />
@@ -179,6 +180,7 @@
   <symbol id="i-file-search" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="14 2 14 8 20 8"/><circle cx="11" cy="14" r="2"/><path d="m13 16 2 2"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+  <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M11 20A7 7 0 0 1 9.8 6.9C15.5 4.9 17 3.5 19 2c1 5 4 9.5-1 14a7 7 0 0 1-7 4z"/><path d="M2 22c1.3-1.7 3.3-2.6 5-3"/></symbol>
   <symbol id="i-chevron-left" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
   <symbol id="i-maximize" viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></symbol>
   <symbol id="i-minimize" viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></symbol>
@@ -275,9 +277,11 @@
           <svg><use href="#i-eye"/></svg>
         </button>
         <button @click="reloadTree()" class="icon-btn" :title="t('btn.refresh')"><svg><use href="#i-refresh"/></svg></button>
-        <button @click="toggleTheme()" class="icon-btn" :title="theme==='light' ? t('btn.theme_dark') : t('btn.theme_light')">
+        <button @click="toggleTheme()" class="icon-btn"
+                :title="theme==='light' ? t('btn.theme_dark') : theme==='dark' ? t('btn.theme_eyecare') : t('btn.theme_light')">
           <svg x-show="theme==='light'"><use href="#i-moon"/></svg>
-          <svg x-show="theme!=='light'"><use href="#i-sun"/></svg>
+          <svg x-show="theme==='dark'"><use href="#i-leaf"/></svg>
+          <svg x-show="theme==='eyecare'"><use href="#i-sun"/></svg>
         </button>
         <input type="file" x-ref="upload" style="display:none" @change="upload($event)" />
       </header>
@@ -575,9 +579,12 @@
         <iframe x-show="!editing && previewMode==='html'"
                 :src="previewMode==='html' ? rawUrl(selected) : 'about:blank'"
                 class="frame" sandbox="allow-scripts"></iframe>
-        <img x-show="!editing && previewMode==='img'"
-             :src="previewMode==='img' ? rawUrl(selected) : ''"
-             class="preview-img" />
+        <!-- Use template x-if (not x-show) so the <img> isn't even in the DOM
+             when not active — :src="" would otherwise resolve to the page URL
+             and fire a spurious resource-load-failed error in console. -->
+        <template x-if="!editing && previewMode==='img' && selected">
+          <img :src="rawUrl(selected)" class="preview-img" />
+        </template>
         <iframe x-show="!editing && previewMode==='pdf'"
                 :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
                 class="frame"></iframe>
@@ -1112,34 +1119,8 @@
               · <span x-text="t('chat.runs_on')"></span> <span x-text="currentModelLabel()"></span>
             </div>
 
-            <!-- Welcome card — shown only for users who haven't finished
-                 setup yet (no provider OR no CLAUDE.md). Frames the
-                 setup-warn cards below with "what muselab is + 3 next
-                 actions". Dismissed via localStorage flag
-                 `muselab.welcomeDismissed`. Once setup is complete the
-                 welcome card retires permanently and the "Try asking
-                 Muse" suggestions card takes its slot on every new
-                 chat — see showWelcomeCard() in app.js. -->
-            <template x-if="showWelcomeCard()">
-              <div class="onboard-card welcome">
-                <button class="welcome-dismiss" @click="dismissWelcome()"
-                        :title="lang==='zh' ? '关闭' : 'Dismiss'"
-                        aria-label="dismiss welcome">×</button>
-                <div class="onboard-card-title" x-text="t('onboard.welcome_title')"></div>
-                <div class="onboard-card-body" x-html="t('onboard.welcome_body')"></div>
-                <ol class="welcome-steps">
-                  <li><span x-html="t('onboard.welcome_step1')"></span></li>
-                  <li><span x-html="t('onboard.welcome_step2')"></span></li>
-                  <li><span x-html="t('onboard.welcome_step3')"></span></li>
-                </ol>
-              </div>
-            </template>
-
-            <!-- Onboarding cards — only one shows at a time, in priority order:
-                 1. no provider auth → "Set up a model before chatting"
-                 2. no CLAUDE.md     → "Muse doesn't know you yet"
-                 3. archive empty    → "Drop your first document"
-                 4. all set          → suggested first questions / skill chips -->
+            <!-- Provider warn — first-priority blocker. Stays visible until
+                 the user enables at least one provider in Settings. -->
             <template x-if="contextInfo._fetched && !contextInfo.has_any_provider">
               <div class="onboard-card warn">
                 <div class="onboard-card-title" x-text="t('onboard.no_provider_title')"></div>
@@ -1147,19 +1128,32 @@
                 <button class="btn-primary" @click="openSettings()" x-text="t('onboard.no_provider_cta')"></button>
               </div>
             </template>
-            <template x-if="contextInfo._fetched && contextInfo.has_any_provider && !contextInfo.claude_md_exists">
-              <div class="onboard-card warn">
-                <div class="onboard-card-title" x-text="t('onboard.no_claude_md_title')"></div>
-                <div class="onboard-card-body" x-text="t('onboard.no_claude_md_body')"></div>
-                <!-- 2026-05-23: 改走 startOrganize() —— 整理档案 workflow 现在
-                     也覆盖 CLAUDE.md profile 补全（curator prompt 3b），
-                     startProfileIntake 已弃用。 -->
-                <button class="btn-primary" @click="startOrganize()" x-text="t('onboard.no_claude_md_cta')"></button>
+
+            <!-- ★ Muse opener — UI-only first bubble, state-aware (see
+                 museOpener() in app.js). Doesn't go into session history,
+                 doesn't cost tokens. Hides the moment the user starts
+                 typing so it never competes with their own first message. -->
+            <template x-if="contextInfo._fetched && contextInfo.has_any_provider && museOpener() && !input">
+              <div class="muse-opener" x-transition.opacity.duration.300ms>
+                <span class="muse-mascot sm">
+                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                </span>
+                <div class="muse-opener-bubble">
+                  <div class="muse-opener-text" x-text="museOpener()"></div>
+                  <template x-if="museOpenerAction()">
+                    <button class="muse-opener-action" @click="museOpenerAction().handler()"
+                            x-text="museOpenerAction().label"></button>
+                  </template>
+                </div>
               </div>
             </template>
-            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && contextInfo.archive_empty">
-              <div class="onboard-card">
-                <div class="onboard-card-title" x-text="t('onboard.empty_archive_title')"></div>
+
+            <!-- Archive subdir hints — kept as informational chips, only
+                 when the user has a profile but no docs yet. Distinct from
+                 the Muse opener (which is conversational); these are a
+                 visual map of "where to drop your stuff". -->
+            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_meaningfully_filled && contextInfo.archive_empty">
+              <div class="onboard-card calm onboard-subdirs-card">
                 <div class="onboard-card-body" x-text="t('onboard.empty_archive_body')"></div>
                 <div class="onboard-subdirs">
                   <template x-for="sub in onboardingSubdirs()" :key="sub.name">
@@ -1171,39 +1165,37 @@
                 </div>
               </div>
             </template>
-            <!-- "Try asking Muse" suggestions — shown on every new chat
-                 once setup is complete. welcome card is mutually
-                 exclusive (it only renders pre-setup), so no extra guard
-                 needed against double-stacking. User feedback 2026-05-22:
-                 configured users want the prompt suggestions, not the
-                 welcome intro, on every fresh session. -->
-            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_exists && !contextInfo.archive_empty">
-              <div class="onboard-card calm">
-                <div class="onboard-card-head">
-                  <div class="onboard-card-title" x-text="t('onboard.ready_title')"></div>
-                  <button class="onboard-shuffle"
-                          @click="shuffleInspirePrompts()"
-                          :title="lang==='zh' ? '换一批' : 'Shuffle'"
-                          aria-label="Shuffle">
-                    <svg viewBox="0 0 24 24"
-                         fill="none" stroke="currentColor" stroke-width="2"
-                         stroke-linecap="round" stroke-linejoin="round">
-                      <polyline points="23 4 23 10 17 10"/>
-                      <polyline points="1 20 1 14 7 14"/>
-                      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-                    </svg>
-                  </button>
+
+            <!-- ★ Nine Muses 3×3 grid — visible whenever a provider is
+                 configured, regardless of archive state. Each cell is a
+                 conversation entry point: click → switch mascot + prefill
+                 her invite line into the chat input. -->
+            <template x-if="contextInfo._fetched && contextInfo.has_any_provider">
+              <div class="muse-grid-wrap" x-show="!input"
+                   x-transition.opacity.duration.300ms>
+                <div class="muse-grid-divider">
+                  <span x-text="t('muse_opener.divider')"></span>
                 </div>
-                <div class="onboard-suggestions">
-                  <template x-for="(q, i) in onboardingPrompts()" :key="i + '|' + q">
-                    <button class="onboard-suggestion" @click="useSuggestedPrompt(q)" x-text="q"></button>
+                <div class="muse-grid">
+                  <template x-for="(m, i) in MASCOTS" :key="m.id">
+                    <button class="muse-cell" :class="{'active': mascotIdx === i}"
+                            @click="pickMascotAndAsk(i)"
+                            :title="lang==='zh' ? m.zhName + '・' + m.domain.zh : m.greek + ' · ' + m.domain.en">
+                      <span class="muse-cell-icon">
+                        <svg viewBox="0 0 24 24"><use :href="'#m-' + m.id"/></svg>
+                      </span>
+                      <span class="muse-cell-name"
+                            x-text="lang==='zh' ? m.zhName : m.greek"></span>
+                      <span class="muse-cell-domain"
+                            x-text="lang==='zh' ? m.domain.zh : m.domain.en"></span>
+                      <span class="muse-cell-invite"
+                            x-text="lang==='zh' ? m.invite.zh : m.invite.en"></span>
+                    </button>
                   </template>
                 </div>
-                <!-- Skill triggers — surface what the loaded skills can do.
-                     Header tells the total count (incl. auto-detected Claude
-                     Code skills), chips show only the 7 hand-crafted examples.
-                     "See all" link opens the drawer for the full picker. -->
-                <template x-if="settings.skills.length">
+                <!-- Skill chips — kept as a thin row below the grid for
+                     users with loaded skills. Hidden when no skills. -->
+                <template x-if="settings.skills && settings.skills.length">
                   <div class="onboard-skills">
                     <div class="onboard-skills-label">
                       <span x-text="t('onboard.skill_hint_count', { n: settings.skills.length })"></span>
@@ -1230,6 +1222,27 @@
               <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
               <div class="brand-tip"><span class="kbd">?</span><span x-text="t('chat.empty_tip4')"></span></div>
             </div>
+          </div>
+          <!-- (The dedicated conv-outline-wrap I added here in eafb7ad has
+               been removed in favor of the project's pre-existing
+               msg-outline-modal — that's the floating round button users
+               actually click. outlineMessages() now reads the same
+               _backendOutline cache to stay accurate on lazy-loaded
+               sessions.) -->
+
+          <!-- Lazy-loaded history controls — sits above the message loop.
+               Only shown when loadSession() deferred older messages because
+               history exceeds INITIAL_LOAD. Clicking pages back in batches
+               (LOAD_MORE_BATCH = 50) while preserving scroll position. -->
+          <div x-show="hasMoreHistory() || historyTruncated()"
+               class="load-earlier-wrap">
+            <button x-show="hasMoreHistory()"
+                    class="load-earlier-btn"
+                    @click="loadEarlierMessages()"
+                    x-text="t('history.load_earlier', { n: earlierMessageCount() })"></button>
+            <div x-show="historyTruncated() && !hasMoreHistory()"
+                 class="load-earlier-truncated-note"
+                 x-text="t('history.truncated_note')"></div>
           </div>
           <!-- Per-message rendering — Alpine 3's reactivity worked
                reliably on this flat messages x-for. The "group into
@@ -1260,15 +1273,23 @@
                         <div class="user-msg-imgs">
                           <template x-for="(im, ii) in (m.images || [])" :key="'i'+ii">
                             <!-- Single root element required by x-for.
-                                 imgSrc(): blob URL (live) → base64 thumb (reload) → '' (placeholder via onerror) -->
+                                 imgSrc(): blob URL (live) → base64 thumb (reload) → placeholder.
+                                 IMPORTANT: render the <img> ONLY when we have a real source.
+                                 With :src="" the browser resolves it to the current page URL
+                                 and triggers a real network request that fails (was firing
+                                 [muse-capture] resource-load-failed errors in console). -->
                             <span class="user-msg-img-wrap">
-                              <img class="user-msg-img"
-                                   :src="im.preview || (im.thumb ? 'data:image/jpeg;base64,' + im.thumb : '')"
-                                   :alt="im.name || 'image'"
-                                   @click="(im.preview || im.thumb) && openLightbox(im.preview || 'data:image/jpeg;base64,' + im.thumb, im.name)"
-                                   :title="lang==='zh'?'点击放大':'Click to enlarge'"
-                                   @error="$el.style.display='none'; $el.nextElementSibling.style.display='inline-flex'" />
-                              <span class="user-msg-img-placeholder" style="display:none" :title="im.mime || 'image'">
+                              <template x-if="im.preview || im.thumb">
+                                <img class="user-msg-img"
+                                     :src="im.preview || 'data:image/jpeg;base64,' + im.thumb"
+                                     :alt="im.name || 'image'"
+                                     @click="openLightbox(im.preview || 'data:image/jpeg;base64,' + im.thumb, im.name)"
+                                     :title="lang==='zh'?'点击放大':'Click to enlarge'"
+                                     @error="$el.style.display='none'; $el.nextElementSibling && ($el.nextElementSibling.style.display='inline-flex')" />
+                              </template>
+                              <span class="user-msg-img-placeholder"
+                                    :style="(im.preview || im.thumb) ? 'display:none' : 'display:inline-flex'"
+                                    :title="im.mime || 'image'">
                                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
                               </span>
                             </span>
@@ -1477,8 +1498,24 @@
                 </div>
               </template>
 
+              <!-- Task* family (TaskCreate / TaskUpdate / TaskStop) —
+                   collapsed to single log line. Pure queries (TaskList /
+                   TaskGet / TaskOutput) are hidden entirely. Adjacent task
+                   lines visually fuse into a "plan panel" via CSS sibling
+                   selectors (see .task-log-line + .task-log-line). -->
+              <template x-if="m.role === 'tool_use' && isTaskTool(m) && shouldRenderTaskLine(m)">
+                <div class="task-log-line" :class="taskLogLine(m).colorClass">
+                  <span class="task-log-icon" x-text="taskLogLine(m).icon"></span>
+                  <span class="task-log-verb" x-text="taskLogLine(m).verb"></span>
+                  <span class="task-log-ref" x-show="taskLogLine(m).ref"
+                        x-text="taskLogLine(m).ref"></span>
+                  <span class="task-log-subject" x-show="taskLogLine(m).subject"
+                        x-text="taskLogLine(m).subject"></span>
+                </div>
+              </template>
+
               <!-- default tool bubble -->
-              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'ExitPlanMode'">
+              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
                         :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
@@ -1487,49 +1524,101 @@
                   </span>
                   <div class="tool"
                        :class="{ 'tool-mcp': m.name && m.name.startsWith('mcp__'), 'tool-skill': m.name === 'Skill' }">
-                    <span class="tool-name">
-                      <span x-show="m.name && m.name.startsWith('mcp__')" class="tool-prefix-icon"><svg><use href="#i-plug"/></svg></span>
-                      <span x-show="m.name === 'Skill'" class="tool-prefix-icon"><svg><use href="#i-puzzle"/></svg></span>
-                      <span x-text="renderToolName(m.name)"></span>
-                    </span>
+                    <!-- MCP enhanced: emoji per known server + server · tool layout -->
+                    <template x-if="m.name && m.name.startsWith('mcp__') && mcpServerInfo(m.name)">
+                      <span class="tool-name">
+                        <span class="tool-prefix-icon mcp-emoji"
+                              x-text="mcpServerInfo(m.name).icon"></span>
+                        <span class="mcp-server-label"
+                              x-text="mcpServerInfo(m.name).serverLabel"></span>
+                        <span class="mcp-sep">·</span>
+                        <span class="mcp-tool-label"
+                              x-text="mcpServerInfo(m.name).toolLabel"></span>
+                      </span>
+                    </template>
+                    <!-- Non-MCP: original simple label -->
+                    <template x-if="!(m.name && m.name.startsWith('mcp__'))">
+                      <span class="tool-name">
+                        <span x-show="m.name === 'Skill'" class="tool-prefix-icon"><svg><use href="#i-puzzle"/></svg></span>
+                        <span x-text="renderToolName(m.name)"></span>
+                      </span>
+                    </template>
                     <template x-if="toolFilePath(m)">
                       <a class="tool-arg file-link" href="#"
                          :data-path="toolFilePath(m)"
                          :title="toolFilePath(m)"
                          x-text="toolFilePath(m)"></a>
                     </template>
-                    <template x-if="!toolFilePath(m)">
+                    <!-- Edit / Write / MultiEdit: +X / -Y badge showing
+                         change magnitude at a glance without expanding diff. -->
+                    <template x-if="['Edit','MultiEdit','Write'].includes(m.name) && editDiffStats(m)">
+                      <span class="diff-badge"
+                            :title="lang==='zh' ? '本次改动行数(+插入 / −删除)' : 'lines changed (+insert / −delete)'">
+                        <span class="diff-badge-plus" x-show="editDiffStats(m).plus > 0"
+                              x-text="'+' + editDiffStats(m).plus"></span>
+                        <span class="diff-badge-minus" x-show="editDiffStats(m).minus > 0"
+                              x-text="'−' + editDiffStats(m).minus"></span>
+                      </span>
+                    </template>
+                    <!-- MCP input preview: compact key:val · key:val list -->
+                    <template x-if="!toolFilePath(m) && m.name && m.name.startsWith('mcp__') && mcpInputPreview(m)">
+                      <span class="tool-arg mcp-input-preview" x-text="mcpInputPreview(m)"></span>
+                    </template>
+                    <template x-if="!toolFilePath(m) && !(m.name && m.name.startsWith('mcp__'))">
                       <span class="tool-arg" x-text="m.summary"></span>
                     </template>
                   </div>
                 </div>
-                <!-- Diff strip under Edit / MultiEdit / Write so the user
-                     can see WHAT changed without opening the file. Collapsed
-                     by default to keep the message stream scannable. -->
-                <template x-if="['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
-                  <div class="diff-strip">
-                    <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
-                      <span class="thinking-chevron">
-                        <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
-                        </svg>
-                      </span>
-                      <span class="diff-strip-label" x-text="lang==='zh' ? 'diff 预览' : 'diff preview'"></span>
-                    </div>
-                    <div x-show="isMsgExpanded(i, m)" class="diff-body">
-                      <template x-for="(op, oi) in editDiffOps(m)" :key="oi">
-                        <div :class="'diff-line diff-' + op.op">
-                          <span class="diff-sign" x-text="op.op === 'ins' ? '+' : op.op === 'del' ? '−' : op.op === 'sep' ? '⋯' : ' '"></span>
-                          <span class="diff-text" x-text="op.text"></span>
-                        </div>
-                      </template>
-                    </div>
-                  </div>
-                </template>
               </template>
 
-              <!-- tool_result -->
-              <template x-if="m.role === 'tool_result'">
+              <!-- Diff strip under Edit / MultiEdit / Write — code-review
+                   style with red/green row backgrounds, default expanded
+                   so users see the actual change immediately. Header is
+                   still clickable to collapse for users who want a
+                   scannable stream.
+                   IMPORTANT: this template is a SIBLING of the "default tool
+                   bubble" template above (not a child) because Alpine
+                   <template x-if> only renders its first root element —
+                   nesting two roots in one x-if silently drops the second.
+                   The role guard here recovers what the parent x-if used to
+                   filter for. -->
+              <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
+                <div class="diff-strip diff-strip-cr">
+                  <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
+                    <span class="thinking-chevron">
+                      <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
+                        <path :d="isMsgExpanded(i, m, isLatestEditTool(i, m)) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                      </svg>
+                    </span>
+                    <span class="diff-strip-label" x-text="lang==='zh' ? '改动预览' : 'diff'"></span>
+                    <template x-if="editDiffStats(m)">
+                      <span class="diff-strip-stats">
+                        <span x-show="editDiffStats(m).plus > 0"
+                              class="diff-strip-plus" x-text="'+' + editDiffStats(m).plus"></span>
+                        <span x-show="editDiffStats(m).minus > 0"
+                              class="diff-strip-minus" x-text="'−' + editDiffStats(m).minus"></span>
+                      </span>
+                    </template>
+                  </div>
+                  <div x-show="isMsgExpanded(i, m, isLatestEditTool(i, m))" class="diff-body diff-body-cr">
+                    <template x-for="(op, oi) in editDiffOps(m)" :key="oi">
+                      <div :class="'diff-line diff-' + op.op">
+                        <span class="diff-sign" x-text="op.op === 'ins' ? '+' : op.op === 'del' ? '−' : op.op === 'sep' ? '⋯' : ' '"></span>
+                        <span class="diff-text" x-text="op.text"></span>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+
+              <!-- tool_result — suppressed for:
+                   - Task*       (log line above already shows state change)
+                   - Edit / Write / MultiEdit on success (diff strip shows
+                     the change; "File has been updated successfully" is
+                     pure noise to the user).
+                   Failures (is_error) always render so the user sees
+                   what broke + the errorFixHint banner. -->
+              <template x-if="m.role === 'tool_result' && !shouldHideToolResult(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
                         :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
@@ -1546,8 +1635,18 @@
                         </svg>
                       </span>
                       <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
-                            x-text="toolResultSummary(m)"></span>
+                            x-text="toolResultSummary(m, i)"></span>
                     </div>
+                    <!-- Error hint banner — shown for failed tool calls when
+                         we can detect a common pattern + give a fix. Only
+                         visible when the user explicitly expands the result;
+                         collapsed state should stay quiet. -->
+                    <template x-if="m.is_error && errorFixHint(m) && isMsgExpanded(i, m)">
+                      <div class="tool-error-hint">
+                        <span class="tool-error-hint-icon">💡</span>
+                        <span class="tool-error-hint-text" x-text="errorFixHint(m)"></span>
+                      </div>
+                    </template>
                     <!-- expanded body: per-tool renderer takes precedence,
                          falls back to plain text for unknown tool types -->
                     <template x-if="isMsgExpanded(i, m)">
@@ -1584,19 +1683,84 @@
                             </template>
                           </div>
                         </template>
-                        <!-- WebFetch / WebSearch: render result body as markdown card -->
+                        <!-- WebFetch / WebSearch: card w/ source badge on top -->
                         <template x-if="toolResultKind(m) === 'web'">
                           <div class="web-card">
+                            <template x-if="findToolUseFor(m, i) && webSourceUrl(findToolUseFor(m, i))">
+                              <div class="web-source">
+                                <span class="web-source-icon"
+                                      x-text="webIsUrl(webSourceUrl(findToolUseFor(m, i))) ? '🔗' : '🔍'"></span>
+                                <template x-if="webIsUrl(webSourceUrl(findToolUseFor(m, i)))">
+                                  <a class="web-source-link"
+                                     :href="webSourceUrl(findToolUseFor(m, i))"
+                                     target="_blank" rel="noopener"
+                                     x-text="webSourceDomain(webSourceUrl(findToolUseFor(m, i)))"></a>
+                                </template>
+                                <template x-if="!webIsUrl(webSourceUrl(findToolUseFor(m, i)))">
+                                  <span class="web-source-query"
+                                        x-text="webSourceUrl(findToolUseFor(m, i))"></span>
+                                </template>
+                              </div>
+                            </template>
                             <div class="web-card-body" x-html="mdRender(toolResultBodyText(m))"></div>
                           </div>
                         </template>
-                        <!-- Glob / Grep: each match on its own line, monospace -->
+                        <!-- Glob / Grep: parsed hits with clickable file paths -->
                         <template x-if="toolResultKind(m) === 'search'">
-                          <pre class="search-hits" x-text="toolResultBodyText(m)"></pre>
+                          <div class="search-hits-list">
+                            <template x-for="(hit, hi) in parseSearchHits(toolResultBodyText(m)).slice(0, 100)" :key="hi">
+                              <div class="search-hit">
+                                <template x-if="hit.path">
+                                  <a class="search-hit-path file-link" href="#"
+                                     :data-path="hit.path"
+                                     :title="hit.path"
+                                     x-text="hit.path"></a>
+                                </template>
+                                <template x-if="hit.lineno !== null">
+                                  <span class="search-hit-lineno" x-text="':' + hit.lineno"></span>
+                                </template>
+                                <template x-if="hit.content">
+                                  <span class="search-hit-content" x-text="hit.content"></span>
+                                </template>
+                                <template x-if="!hit.path && !hit.content">
+                                  <span class="search-hit-raw" x-text="hit.raw"></span>
+                                </template>
+                              </div>
+                            </template>
+                            <template x-if="parseSearchHits(toolResultBodyText(m)).length > 100">
+                              <div class="search-hit-truncated"
+                                   x-text="(lang==='zh' ? '… 还有 ' : '… ') + (parseSearchHits(toolResultBodyText(m)).length - 100) + (lang==='zh' ? ' 项匹配未显示' : ' more matches not shown')"></div>
+                            </template>
+                          </div>
                         </template>
-                        <!-- MCP tool: pretty-printed JSON if it parses, else text -->
+                        <!-- MCP tool: smart render based on detected result shape.
+                             - Array of objects → bullet list of compact JSON
+                             - Object → pretty-printed JSON block
+                             - Plain text → markdown-rendered card (a lot of
+                               MCP servers return human prose, not data) -->
                         <template x-if="toolResultKind(m) === 'mcp'">
-                          <pre class="mcp-result" x-text="toolResultBodyText(m)"></pre>
+                          <div class="mcp-result-wrap">
+                            <template x-if="mcpResultFormatted(m).kind === 'array'">
+                              <ul class="mcp-result-list">
+                                <template x-for="(item, idx) in mcpResultFormatted(m).value.slice(0, 50)" :key="idx">
+                                  <li class="mcp-result-item">
+                                    <span class="mcp-result-idx" x-text="'#' + (idx + 1)"></span>
+                                    <pre class="mcp-result-item-body" x-text="typeof item === 'string' ? item : JSON.stringify(item, null, 2)"></pre>
+                                  </li>
+                                </template>
+                                <template x-if="mcpResultFormatted(m).value.length > 50">
+                                  <li class="mcp-result-truncated"
+                                      x-text="(lang==='zh' ? '… 还有 ' : '… ') + (mcpResultFormatted(m).value.length - 50) + (lang==='zh' ? ' 条结果未显示' : ' more results not shown')"></li>
+                                </template>
+                              </ul>
+                            </template>
+                            <template x-if="mcpResultFormatted(m).kind === 'object'">
+                              <pre class="mcp-result mcp-result-json" x-text="mcpResultFormatted(m).value"></pre>
+                            </template>
+                            <template x-if="mcpResultFormatted(m).kind === 'text'">
+                              <div class="mcp-result-text" x-html="mdRender(mcpResultFormatted(m).value)"></div>
+                            </template>
+                          </div>
                         </template>
                         <!-- Fallback: plain text body -->
                         <template x-if="!toolResultKind(m)">
@@ -1875,7 +2039,10 @@
                        x-show="(q.pendingImages && q.pendingImages.length)
                                 || (q.pendingDocs && q.pendingDocs.length)">
                     <template x-for="(img, ii) in (q.pendingImages || [])" :key="'qi-'+ii">
-                      <img class="queued-img" :src="img.preview" alt="" />
+                      <!-- guard against empty src → browser would resolve to current
+                           URL and fire a spurious resource-load-failed error -->
+                      <img class="queued-img" :src="img.preview || 'data:image/gif;base64,R0lGODlhAQABAAAAACw='"
+                           alt="" :style="img.preview ? '' : 'opacity:0.3'" />
                     </template>
                     <template x-for="(doc, di) in (q.pendingDocs || [])" :key="'qd-'+di">
                       <span class="queued-doc-chip">
@@ -1988,7 +2155,9 @@
         <div class="img-attachments" x-show="pendingImages.length || pendingDocs.length">
           <template x-for="(img, i) in pendingImages" :key="img.id || ('i'+i)">
             <div class="img-chip" :class="{ uploading: img.uploading, error: img.error }">
-              <img :src="img.preview" alt="" />
+              <!-- empty :src would resolve to page URL and fail (see queued-img guard) -->
+              <img :src="img.preview || 'data:image/gif;base64,R0lGODlhAQABAAAAACw='"
+                   alt="" :style="img.preview ? '' : 'opacity:0.3'" />
               <button class="img-chip-x icon-btn sm"
                       @click="removePendingImage(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
@@ -2254,8 +2423,12 @@
        x-transition.opacity
        @click="lightbox.show = false"
        @keydown.escape.window="lightbox.show = false">
-    <img :src="lightbox.src" class="lightbox-img"
-         @click.stop="lightbox.show = false" :alt="lightbox.alt || (lang==='zh' ? '图片预览' : 'Image preview')" />
+    <!-- x-if so the <img> is only in the DOM when actually shown — prevents
+         the same empty-src resource-load-failed warning the preview pane had. -->
+    <template x-if="lightbox.show && lightbox.src">
+      <img :src="lightbox.src" class="lightbox-img"
+           @click.stop="lightbox.show = false" :alt="lightbox.alt || (lang==='zh' ? '图片预览' : 'Image preview')" />
+    </template>
     <button class="lightbox-close"
             :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'"
             :aria-label="lang==='zh' ? '关闭（Esc）' : 'Close (Esc)'"
@@ -2421,17 +2594,71 @@
         <div class="settings-section" data-page="provider"
              x-show="isWideScreen || settings.activePage === 'provider'">
           <div class="settings-section-title" x-text="t('set.sec.provider')"></div>
+
+          <!-- Claude Auth — first-class OAuth provider, no API key field.
+               Distinct UX from the generic provider rows: shows identity
+               (email/plan/expiry) when connected, Connect button when not. -->
+          <div class="claude-auth-card">
+            <div class="claude-auth-head">
+              <div class="claude-auth-title-wrap">
+                <div class="claude-auth-title" x-text="t('claude_auth.title')"></div>
+                <div class="claude-auth-subtitle" x-text="t('claude_auth.subtitle')"></div>
+              </div>
+              <span x-show="claudeAuth.logged_in" class="settings-badge ok"
+                    x-text="t('claude_auth.status_connected')"></span>
+              <span x-show="claudeAuth.loaded && !claudeAuth.logged_in" class="settings-badge"
+                    x-text="t('claude_auth.status_disconnected')"></span>
+            </div>
+
+            <!-- Connected: identity panel + action buttons -->
+            <div x-show="claudeAuth.logged_in" class="claude-auth-connected">
+              <div class="claude-auth-field">
+                <span class="claude-auth-label" x-text="t('claude_auth.email_label')"></span>
+                <span class="claude-auth-value" x-text="claudeAuth.email || '—'"></span>
+              </div>
+              <div class="claude-auth-field">
+                <span class="claude-auth-label" x-text="t('claude_auth.plan_label')"></span>
+                <span class="claude-auth-value" x-text="claudeAuthPlanLabel()"></span>
+              </div>
+              <div class="claude-auth-field">
+                <span class="claude-auth-label" x-text="t('claude_auth.expires_label')"></span>
+                <span class="claude-auth-value" x-text="claudeAuthExpiresHuman()"></span>
+              </div>
+              <div class="claude-auth-actions">
+                <button class="btn-ghost sm" @click="reauthClaude()"
+                        x-text="t('claude_auth.reauth_btn')"></button>
+                <button class="btn-ghost sm danger" @click="disconnectClaudeAuth()"
+                        x-text="t('claude_auth.disconnect_btn')"></button>
+              </div>
+            </div>
+
+            <!-- Not connected: Connect button + CLI install hint if missing -->
+            <div x-show="claudeAuth.loaded && !claudeAuth.logged_in" class="claude-auth-disconnected">
+              <div x-show="!claudeAuth.cli_installed" class="claude-auth-cli-warn">
+                <span x-text="t('claude_auth.cli_missing')"></span>
+                <code x-text="t('claude_auth.cli_install_cmd')"></code>
+              </div>
+              <button class="btn-primary" @click="openClaudeAuthModal()"
+                      x-text="t('claude_auth.connect_btn')"></button>
+            </div>
+          </div>
+
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
-          <template x-for="p in settings.providers" :key="p.env_key">
+          <template x-for="(p, idx) in settings.providers" :key="idx">
             <div class="settings-row provider-row">
               <label x-text="p.display + ' (' + p.env_key + ')'"></label>
               <div class="settings-input-wrap">
+                <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '已关闭' : 'Disabled') : (lang==='zh' ? '已开启' : 'Enabled')">
+                  <input type="checkbox" :checked="!p.disabled"
+                         @change="toggleProvider(p.probe_model, !$event.target.checked)" />
+                  <span class="switch-slider"></span>
+                </label>
                 <input type="password" class="settings-input"
                        :placeholder="p.configured ? p.masked : t('set.key_unset')"
                        x-model="settings.draftKeys[p.env_key]" />
                 <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
                 <button x-show="p.configured" class="btn-ghost sm"
-                        @click="probeProvider(p.env_key)" :title="t('set.probe_tip')"
+                        @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
                         x-text="t('set.probe')"></button>
               </div>
               <!-- Per-provider help text + console link -->
@@ -2443,13 +2670,13 @@
                    x-text="lang==='zh' ? '打开控制台 ↗' : 'Open console ↗'"></a>
               </div>
               <!-- Inline result of last test, persisted until next test -->
-              <div x-show="settings.probeResults[p.env_key]"
+              <div x-show="settings.probeResults[p.probe_model]"
                    class="probe-result"
-                   :class="{ ok: settings.probeResults[p.env_key]?.ok,
-                              err: !settings.probeResults[p.env_key]?.ok }">
-                <svg class="probe-result-icon ok" x-show="settings.probeResults[p.env_key]?.ok"><use href="#i-check-circle"/></svg>
-                <svg class="probe-result-icon err" x-show="!settings.probeResults[p.env_key]?.ok"><use href="#i-alert-circle"/></svg>
-                <span x-text="settings.probeResults[p.env_key]?.text"></span>
+                   :class="{ ok: settings.probeResults[p.probe_model]?.ok,
+                              err: !settings.probeResults[p.probe_model]?.ok }">
+                <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
+                <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
+                <span x-text="settings.probeResults[p.probe_model]?.text"></span>
               </div>
             </div>
           </template>
@@ -3149,6 +3376,56 @@
   </div>
 
   <!-- ============ Modal ============ -->
+  <!-- Claude Auth Connect modal — instructions + polling.
+       Stays open until /status reports logged_in === true, then auto-closes. -->
+  <div class="modal-backdrop" x-show="claudeAuthModal.open"
+       @click.self="closeClaudeAuthModal()"
+       x-transition.opacity.duration.120ms>
+    <div class="modal claude-auth-modal" @keydown.escape.window="closeClaudeAuthModal()"
+         role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <span class="modal-title" x-text="t('claude_auth.modal_title')"></span>
+        <button class="modal-close" @click="closeClaudeAuthModal()"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <!-- Step 1: CLI install command -->
+        <div class="claude-auth-step">
+          <div class="claude-auth-step-text" x-text="t('claude_auth.modal_step1')"></div>
+          <div class="claude-auth-cmd-row">
+            <code class="claude-auth-cmd" x-text="t('claude_auth.cli_install_cmd')"></code>
+            <button class="btn-ghost sm" @click="copyClaudeAuthCmd('install')"
+                    x-text="claudeAuthModal.copyToast === 'install' ? t('claude_auth.copied') : '📋'"></button>
+          </div>
+        </div>
+        <!-- Step 2: claude login -->
+        <div class="claude-auth-step">
+          <div class="claude-auth-step-text" x-text="t('claude_auth.modal_step2')"></div>
+          <div class="claude-auth-cmd-row">
+            <code class="claude-auth-cmd">claude login</code>
+            <button class="btn-ghost sm" @click="copyClaudeAuthCmd('login')"
+                    x-text="claudeAuthModal.copyToast === 'login' ? t('claude_auth.copied') : '📋'"></button>
+          </div>
+        </div>
+        <!-- Step 3: browser auth -->
+        <div class="claude-auth-step">
+          <div class="claude-auth-step-text" x-text="t('claude_auth.modal_step3')"></div>
+        </div>
+        <!-- Polling indicator -->
+        <div class="claude-auth-waiting" x-show="claudeAuthModal.polling">
+          <span class="spinner-sm"></span>
+          <span x-text="t('claude_auth.modal_waiting')"></span>
+        </div>
+        <!-- Docker hint -->
+        <div class="claude-auth-tip" x-text="t('claude_auth.modal_docker_tip')"></div>
+      </div>
+      <div class="modal-foot">
+        <button @click="closeClaudeAuthModal()" class="btn-ghost"
+                x-text="t('claude_auth.modal_close')"></button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-backdrop confirm-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
     <div class="modal confirm-modal" @keydown.escape.window="modal.cancel && modal.cancel()"
          role="alertdialog" aria-modal="true">

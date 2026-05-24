@@ -154,6 +154,47 @@ html[data-theme="light"] {
   --c-thinking-fg: #3a52a0;
 }
 
+/* =========================================================================
+   Eyecare theme — warm paper, reduced blue light
+   ========================================================================= */
+html[data-theme="eyecare"] {
+  --c-bg-0: #f5f0e0;
+  --c-bg-1: #efe9d6;
+  --c-bg-2: #e8e2cd;
+  --c-bg-3: #ddd5be;
+  --c-bg-4: #ccc4ab;
+  --c-bg-5: #b5ad96;
+
+  --c-fg-0: #3d3526;
+  --c-fg-1: #4a4233;
+  --c-fg-2: #6b6050;
+  --c-fg-3: #8c8070;
+  --c-fg-4: #a3988a;
+
+  --c-border: #e0d8c4;
+  --c-border-strong: #d0c8b4;
+
+  --c-accent: #5a8f6a;
+  --c-accent-hover: #4a7d5a;
+  --c-accent-soft: rgba(90, 143, 106, 0.10);
+  --c-accent-fg: #3a5a30;
+
+  --c-success: #4a8f4a;
+  --c-warn: #b08030;
+  --c-danger: #c05050;
+  --c-danger-hover: #a04040;
+  --c-danger-soft: rgba(192, 80, 80, 0.08);
+
+  --c-user-bg: #e0ecd8;
+  --c-user-fg: #3a5a30;
+  --c-assistant-bg: #efe9d6;
+  --c-tool-bg: #f0e8d0;
+  --c-tool-fg: #8a6a38;
+  --c-thinking-bg: #e8e8d8;
+  --c-thinking-fg: #5a6a4a;
+}
+
+
 html, body {
   margin: 0; height: 100%; overflow: hidden;
   background: var(--c-bg-0); color: var(--c-fg-1);
@@ -1636,6 +1677,7 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 /* Override CM5 default light theme to match our bg in light mode */
 html[data-theme="light"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
+html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 
 .markdown {
   padding: var(--sp-6) var(--sp-8);
@@ -2887,6 +2929,9 @@ pre.has-copy-btn .code-copy-btn.copied {
 html[data-theme="light"] .bash-meta.ok          { color: #166534; background: rgba(22, 101, 52, 0.08); }
 html[data-theme="light"] .bash-meta.err         { color: #991b1b; background: rgba(153, 27, 27, 0.08); }
 html[data-theme="light"] .bash-meta.interrupted { color: #92400e; background: rgba(146, 64, 14, 0.08); }
+html[data-theme="eyecare"] .bash-meta.ok          { color: #3a6a3a; background: rgba(58, 106, 58, 0.08); }
+html[data-theme="eyecare"] .bash-meta.err         { color: #883030; background: rgba(136, 48, 48, 0.08); }
+html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: rgba(122, 90, 32, 0.08); }
 /* SVG icon inside .bash-meta.interrupted (used to be the ⚠ emoji prefix) */
 .bash-meta-icon {
   width: 1em; height: 1em;
@@ -6034,3 +6079,970 @@ html[data-theme="light"] .bash-meta.interrupted { color: #92400e; background: rg
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ============================================================
+   Claude Auth — first-class OAuth provider card in Settings.
+   Styled to feel "different from API-key rows" — bigger, with
+   identity panel when connected, single CTA when not.
+   ============================================================ */
+.claude-auth-card {
+  background: var(--bg-soft, #f6f7f9);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+.claude-auth-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.claude-auth-title-wrap { flex: 1; min-width: 0; }
+.claude-auth-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg, #111);
+}
+.claude-auth-subtitle {
+  font-size: 12.5px;
+  color: var(--fg-soft, #6b7280);
+  margin-top: 3px;
+  line-height: 1.45;
+}
+.claude-auth-connected {
+  margin-top: 4px;
+}
+.claude-auth-field {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  font-size: 13px;
+}
+.claude-auth-label {
+  flex: 0 0 90px;
+  color: var(--fg-soft, #6b7280);
+}
+.claude-auth-value {
+  color: var(--fg, #111);
+  font-weight: 500;
+  word-break: break-all;
+}
+.claude-auth-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border, #e5e7eb);
+}
+.claude-auth-disconnected {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.claude-auth-cli-warn {
+  font-size: 12.5px;
+  color: var(--warn, #c97a00);
+  background: rgba(217, 119, 6, 0.08);
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.claude-auth-cli-warn code {
+  display: inline-block;
+  margin-top: 4px;
+  font-family: monospace;
+  font-size: 12px;
+  background: rgba(0,0,0,0.05);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* Connect modal */
+.claude-auth-modal { max-width: 540px; }
+.claude-auth-step {
+  margin-bottom: 14px;
+}
+.claude-auth-step-text {
+  font-size: 13.5px;
+  color: var(--fg, #111);
+  margin-bottom: 6px;
+}
+.claude-auth-cmd-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.claude-auth-cmd {
+  flex: 1;
+  font-family: monospace;
+  font-size: 13px;
+  background: var(--bg-code, #0f172a);
+  color: #e2e8f0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  word-break: break-all;
+}
+.claude-auth-waiting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--fg-soft, #6b7280);
+}
+.claude-auth-tip {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--fg-soft, #6b7280);
+  line-height: 1.5;
+  font-style: italic;
+}
+.spinner-sm {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(59, 130, 246, 0.3);
+  border-top-color: rgba(59, 130, 246, 0.9);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.btn-ghost.danger {
+  color: var(--danger, #c0392b);
+}
+.btn-ghost.danger:hover {
+  background: rgba(192, 57, 43, 0.08);
+}
+
+/* ============================================================
+   Muse opener — UI-only "Muse said" bubble at chat empty state.
+   ============================================================ */
+.muse-opener {
+  display: flex;
+  gap: 10px;
+  margin: 14px 0 18px;
+  max-width: 620px;
+  align-self: center;
+  width: 100%;
+}
+.muse-opener > .muse-mascot.sm {
+  flex: 0 0 28px;
+  margin-top: 4px;
+}
+.muse-opener-bubble {
+  flex: 1;
+  background: var(--bg-soft, #f6f7f9);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 14px;
+  border-top-left-radius: 4px;
+  padding: 12px 16px;
+}
+.muse-opener-text {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--fg, #1f2937);
+}
+.muse-opener-action {
+  margin-top: 10px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.muse-opener-action:hover { opacity: 0.85; }
+
+/* ============================================================
+   Nine Muses 3×3 grid — conversation entry matrix.
+   ============================================================ */
+.muse-grid-wrap {
+  max-width: 760px;
+  width: 100%;
+  align-self: center;
+  margin: 8px 0 16px;
+}
+.muse-grid-divider {
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--fg-soft, #6b7280);
+  margin-bottom: 14px;
+  position: relative;
+}
+.muse-grid-divider::before,
+.muse-grid-divider::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 25%;
+  height: 1px;
+  background: var(--border, #e5e7eb);
+}
+.muse-grid-divider::before { left: 8%; }
+.muse-grid-divider::after  { right: 8%; }
+.muse-grid-divider span {
+  display: inline-block;
+  padding: 0 14px;
+  background: var(--bg, #fff);
+  position: relative;
+  z-index: 1;
+}
+.muse-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.muse-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  padding: 14px 14px 12px;
+  background: var(--bg, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+  min-height: 120px;
+}
+.muse-cell:hover {
+  border-color: var(--accent, #3b82f6);
+  background: var(--bg-soft, #f6f7f9);
+  transform: translateY(-1px);
+}
+.muse-cell.active {
+  border-color: var(--accent, #3b82f6);
+  background: rgba(59, 130, 246, 0.05);
+}
+.muse-cell-icon {
+  width: 22px;
+  height: 22px;
+  margin-bottom: 4px;
+  color: var(--accent, #3b82f6);
+  flex-shrink: 0;
+}
+.muse-cell-icon svg { width: 100%; height: 100%; }
+.muse-cell-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg, #1f2937);
+}
+.muse-cell-domain {
+  font-size: 11.5px;
+  color: var(--fg-soft, #6b7280);
+  margin-bottom: 4px;
+}
+.muse-cell-invite {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-soft, #6b7280);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Mobile: collapse 3×3 to a single column scrollable list. */
+@media (max-width: 720px) {
+  .muse-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .muse-cell {
+    min-height: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+  }
+  .muse-cell-icon { margin-bottom: 0; }
+  .muse-cell-name { flex-shrink: 0; }
+  .muse-cell-domain { display: none; }
+  .muse-cell-invite { -webkit-line-clamp: 2; }
+}
+
+/* ============================================================
+   Lazy-loaded history — "Load earlier messages" button at top
+   of chat scroll. Sticky-ish, low-key, doesn't compete with the
+   current conversation but discoverable when needed.
+   ============================================================ */
+.load-earlier-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  margin-bottom: 8px;
+}
+.load-earlier-btn {
+  font-size: 12.5px;
+  color: var(--fg-soft, #6b7280);
+  background: var(--bg-soft, #f6f7f9);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 16px;
+  padding: 6px 16px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+.load-earlier-btn:hover {
+  background: var(--bg, #fff);
+  border-color: var(--accent, #3b82f6);
+  color: var(--accent, #3b82f6);
+}
+.load-earlier-truncated-note {
+  font-size: 11.5px;
+  color: var(--fg-soft, #6b7280);
+  font-style: italic;
+  text-align: center;
+  max-width: 480px;
+  line-height: 1.5;
+}
+
+/* ============================================================
+   Task* family — compact log-line rendering. Adjacent task lines
+   fuse into a single "plan panel" via sibling selectors:
+     - first line gets top border + radius
+     - last line gets bottom border + radius
+     - middles have no border to merge visually
+   ============================================================ */
+.task-log-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  margin: 0 0 0 38px;  /* indent under assistant avatar column */
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--fg-soft, #6b7280);
+  background: var(--bg-soft, #f6f7f9);
+  border: 1px solid var(--border, #e5e7eb);
+  border-top: none;
+  border-bottom: none;
+}
+/* First in a run of task-log-lines */
+.msg:not(:has(+ .msg .task-log-line)) .task-log-line,
+.task-log-line:first-child,
+.msg:not(:has(.task-log-line)) + .msg .task-log-line {
+  border-top: 1px solid var(--border, #e5e7eb);
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+  margin-top: 8px;
+}
+/* Last in a run */
+.msg:has(.task-log-line):not(:has(+ .msg .task-log-line)) .task-log-line {
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  margin-bottom: 8px;
+}
+/* Always show borders on isolated single line (fallback for browsers w/o :has) */
+@supports not selector(:has(*)) {
+  .task-log-line {
+    border-top: 1px solid var(--border, #e5e7eb);
+    border-bottom: 1px solid var(--border, #e5e7eb);
+    border-radius: 8px;
+    margin-top: 4px;
+    margin-bottom: 4px;
+  }
+}
+.task-log-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-weight: 700;
+  font-size: 13px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.task-log-verb {
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.task-log-ref {
+  font-family: monospace;
+  font-size: 11.5px;
+  color: var(--fg-soft, #6b7280);
+  background: rgba(0,0,0,0.04);
+  padding: 1px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.task-log-subject {
+  color: var(--fg, #111);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Status-specific colors */
+.task-log-line.task-created .task-log-icon { background: #dbeafe; color: #1e40af; }
+.task-log-line.task-started .task-log-icon { background: #fef3c7; color: #92400e; }
+.task-log-line.task-done    .task-log-icon { background: #d1fae5; color: #065f46; }
+.task-log-line.task-deleted .task-log-icon { background: #e5e7eb; color: #6b7280; }
+.task-log-line.task-pending .task-log-icon { background: #f3f4f6; color: #6b7280; }
+.task-log-line.task-updated .task-log-icon { background: #ede9fe; color: #5b21b6; }
+
+/* ============================================================
+   MCP tool enhancements — emoji per server + structured result.
+   ============================================================ */
+.mcp-emoji {
+  font-size: 14px;
+  line-height: 1;
+  margin-right: 2px;
+}
+.mcp-server-label {
+  font-weight: 600;
+  color: var(--fg, #1f2937);
+}
+.mcp-sep {
+  color: var(--fg-soft, #6b7280);
+  margin: 0 2px;
+}
+.mcp-tool-label {
+  color: var(--fg-soft, #6b7280);
+  font-family: monospace;
+  font-size: 12px;
+}
+.mcp-input-preview {
+  font-family: monospace;
+  font-size: 11.5px;
+  color: var(--fg-soft, #6b7280);
+  background: rgba(0,0,0,0.03);
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-left: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 360px;
+  display: inline-block;
+}
+.mcp-result-wrap {
+  font-size: 13px;
+}
+.mcp-result-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mcp-result-item {
+  display: flex;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-soft, #f6f7f9);
+  border-left: 3px solid var(--accent, #3b82f6);
+  border-radius: 4px;
+}
+.mcp-result-idx {
+  font-size: 11px;
+  color: var(--fg-soft, #6b7280);
+  font-family: monospace;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+.mcp-result-item-body {
+  flex: 1;
+  margin: 0;
+  font-family: monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: transparent;
+}
+.mcp-result-truncated {
+  text-align: center;
+  font-style: italic;
+  color: var(--fg-soft, #6b7280);
+  font-size: 12px;
+  padding: 6px;
+}
+.mcp-result-json {
+  font-family: monospace;
+  font-size: 12px;
+  background: var(--bg-soft, #f6f7f9);
+  padding: 10px 12px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.mcp-result-text {
+  line-height: 1.6;
+}
+.mcp-result-text p:first-child { margin-top: 0; }
+.mcp-result-text p:last-child  { margin-bottom: 0; }
+
+/* ============================================================
+   Edit / Write / MultiEdit — +X/−Y diff badge in tool bubble.
+   ============================================================ */
+.diff-badge {
+  display: inline-flex;
+  gap: 5px;
+  margin-left: 8px;
+  font-family: monospace;
+  font-size: 11.5px;
+  font-weight: 600;
+  align-items: center;
+  cursor: help;
+}
+.diff-badge-plus {
+  color: #16a34a;
+  background: rgba(22, 163, 74, 0.1);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.diff-badge-minus {
+  color: #dc2626;
+  background: rgba(220, 38, 38, 0.1);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* ============================================================
+   Grep / Glob — clickable search hits replacing raw <pre>.
+   ============================================================ */
+.search-hits-list {
+  display: flex;
+  flex-direction: column;
+  font-family: monospace;
+  font-size: 12.5px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+.search-hit {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.search-hit:hover {
+  background: var(--bg-soft, #f6f7f9);
+}
+.search-hit-path {
+  color: var(--accent, #3b82f6);
+  text-decoration: none;
+  flex-shrink: 0;
+  font-weight: 500;
+}
+.search-hit-path:hover { text-decoration: underline; }
+.search-hit-lineno {
+  color: var(--fg-soft, #6b7280);
+  flex-shrink: 0;
+}
+.search-hit-content {
+  color: var(--fg, #1f2937);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.search-hit-truncated {
+  text-align: center;
+  font-style: italic;
+  color: var(--fg-soft, #6b7280);
+  padding: 8px;
+  font-size: 11.5px;
+}
+.search-hit-raw {
+  color: var(--fg-soft, #6b7280);
+  white-space: pre-wrap;
+}
+
+/* ============================================================
+   WebFetch / WebSearch — source URL badge above markdown body.
+   ============================================================ */
+.web-source {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg-soft, #f6f7f9);
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  font-size: 12.5px;
+}
+.web-source-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.web-source-link {
+  color: var(--accent, #3b82f6);
+  text-decoration: none;
+  font-family: monospace;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.web-source-link:hover { text-decoration: underline; }
+.web-source-query {
+  font-style: italic;
+  color: var(--fg-soft, #6b7280);
+  font-size: 12px;
+}
+
+/* ============================================================
+   Tool error hint — actionable "💡 try X" banner on failed calls.
+   Always visible regardless of result expansion state.
+   ============================================================ */
+.tool-error-hint {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 6px 0;
+  padding: 8px 12px;
+  background: rgba(220, 38, 38, 0.06);
+  border: 1px solid rgba(220, 38, 38, 0.18);
+  border-left: 3px solid #dc2626;
+  border-radius: 4px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.tool-error-hint-icon {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+.tool-error-hint-text {
+  color: var(--fg, #1f2937);
+  flex: 1;
+}
+
+/* ============================================================
+   Edit / Write — code-review-style diff strip.
+   Default expanded; +/− rows get full-bleed green/red backgrounds.
+   ============================================================ */
+.diff-strip-cr {
+  margin: 8px 0 8px 38px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg, #fff);
+}
+.diff-strip-cr .diff-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-soft, #f6f7f9);
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--fg-soft, #6b7280);
+}
+.diff-strip-cr .diff-strip-label {
+  font-weight: 500;
+  flex: 0 0 auto;
+}
+.diff-strip-stats {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  font-family: monospace;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.diff-strip-plus  { color: #16a34a; }
+.diff-strip-minus { color: #dc2626; }
+.diff-body-cr {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-height: 540px;
+  overflow-y: auto;
+}
+.diff-body-cr .diff-line {
+  display: flex;
+  align-items: flex-start;
+  padding: 0 12px;
+  white-space: pre;
+}
+.diff-body-cr .diff-line.diff-ins {
+  background: rgba(22, 163, 74, 0.12);
+  border-left: 3px solid #16a34a;
+  padding-left: 9px;
+}
+.diff-body-cr .diff-line.diff-del {
+  background: rgba(220, 38, 38, 0.10);
+  border-left: 3px solid #dc2626;
+  padding-left: 9px;
+}
+.diff-body-cr .diff-line.diff-ctx {
+  background: transparent;
+  border-left: 3px solid transparent;
+  padding-left: 9px;
+  color: var(--fg-soft, #6b7280);
+}
+.diff-body-cr .diff-line.diff-sep {
+  background: var(--bg-soft, #f6f7f9);
+  border-top: 1px dashed var(--border, #e5e7eb);
+  border-bottom: 1px dashed var(--border, #e5e7eb);
+  color: var(--fg-soft, #6b7280);
+  font-style: italic;
+  padding: 2px 12px;
+  margin: 2px 0;
+}
+.diff-body-cr .diff-sign {
+  flex: 0 0 14px;
+  font-weight: 700;
+  user-select: none;
+  text-align: center;
+  margin-right: 6px;
+}
+.diff-body-cr .diff-line.diff-ins .diff-sign { color: #16a34a; }
+.diff-body-cr .diff-line.diff-del .diff-sign { color: #dc2626; }
+.diff-body-cr .diff-text {
+  flex: 1;
+  word-break: break-all;
+}
+
+/* ============================================================
+   Theme-aware overrides for the chat-renderer additions
+   (commit a9421dc / 664304a / eafb7ad). The original CSS used
+   hard-coded greens/reds + var(--bg-soft, #f6f7f9) fallbacks
+   that don't exist as project tokens — so light/eyecare themes
+   ended up with broken diff-strip backgrounds.
+   ============================================================ */
+
+/* ---- Diff strip (Edit/Write/MultiEdit) ---- */
+.diff-strip-cr {
+  background: var(--c-bg-1);
+  border-color: var(--c-border);
+}
+.diff-strip-cr .diff-strip-head {
+  background: var(--c-bg-2);
+  border-bottom-color: var(--c-border);
+  color: var(--c-fg-3);
+}
+.diff-body-cr .diff-line.diff-ctx {
+  color: var(--c-fg-3);
+}
+.diff-body-cr .diff-line.diff-sep {
+  background: var(--c-bg-2);
+  border-color: var(--c-border);
+  color: var(--c-fg-3);
+}
+
+/* Dark theme (default) — slightly stronger contrast on add/del backgrounds */
+.diff-body-cr .diff-line.diff-ins {
+  background: rgba(34, 197, 94, 0.18);
+  border-left-color: #22c55e;
+}
+.diff-body-cr .diff-line.diff-del {
+  background: rgba(239, 68, 68, 0.16);
+  border-left-color: #ef4444;
+}
+.diff-body-cr .diff-line.diff-ins .diff-sign,
+.diff-strip-plus { color: #22c55e; }
+.diff-body-cr .diff-line.diff-del .diff-sign,
+.diff-strip-minus { color: #ef4444; }
+
+/* Light theme — desaturated, paper-friendly */
+html[data-theme="light"] .diff-body-cr .diff-line.diff-ins {
+  background: rgba(22, 163, 74, 0.10);
+  border-left-color: #16a34a;
+}
+html[data-theme="light"] .diff-body-cr .diff-line.diff-del {
+  background: rgba(220, 38, 38, 0.08);
+  border-left-color: #dc2626;
+}
+html[data-theme="light"] .diff-body-cr .diff-line.diff-ins .diff-sign,
+html[data-theme="light"] .diff-strip-plus { color: #16a34a; }
+html[data-theme="light"] .diff-body-cr .diff-line.diff-del .diff-sign,
+html[data-theme="light"] .diff-strip-minus { color: #dc2626; }
+
+/* Eyecare — warm muted, less saturation, no pure red/green */
+html[data-theme="eyecare"] .diff-body-cr .diff-line.diff-ins {
+  background: rgba(94, 138, 86, 0.14);
+  border-left-color: #5e8a56;
+}
+html[data-theme="eyecare"] .diff-body-cr .diff-line.diff-del {
+  background: rgba(170, 80, 60, 0.12);
+  border-left-color: #aa503c;
+}
+html[data-theme="eyecare"] .diff-body-cr .diff-line.diff-ins .diff-sign,
+html[data-theme="eyecare"] .diff-strip-plus { color: #5e8a56; }
+html[data-theme="eyecare"] .diff-body-cr .diff-line.diff-del .diff-sign,
+html[data-theme="eyecare"] .diff-strip-minus { color: #aa503c; }
+
+/* ---- Diff badge on tool bubble ---- */
+.diff-badge-plus  { color: #22c55e; background: rgba(34, 197, 94, 0.14); }
+.diff-badge-minus { color: #ef4444; background: rgba(239, 68, 68, 0.12); }
+html[data-theme="light"] .diff-badge-plus  { color: #16a34a; background: rgba(22, 163, 74, 0.10); }
+html[data-theme="light"] .diff-badge-minus { color: #dc2626; background: rgba(220, 38, 38, 0.08); }
+html[data-theme="eyecare"] .diff-badge-plus  { color: #5e8a56; background: rgba(94, 138, 86, 0.12); }
+html[data-theme="eyecare"] .diff-badge-minus { color: #aa503c; background: rgba(170, 80, 60, 0.10); }
+
+/* ---- Task log lines (plan panel) ---- */
+.task-log-line {
+  background: var(--c-bg-1);
+  border-color: var(--c-border);
+  color: var(--c-fg-2);
+}
+.task-log-ref { background: var(--c-bg-3); color: var(--c-fg-2); }
+.task-log-subject { color: var(--c-fg-1); }
+/* Status chip backgrounds — keep semantic across themes but
+   theme-tuned saturation */
+.task-log-line.task-created .task-log-icon {
+  background: rgba(59, 130, 246, 0.20); color: #60a5fa;
+}
+.task-log-line.task-started .task-log-icon {
+  background: rgba(217, 119, 6, 0.20); color: #fbbf24;
+}
+.task-log-line.task-done .task-log-icon {
+  background: rgba(22, 163, 74, 0.22); color: #34d399;
+}
+.task-log-line.task-deleted .task-log-icon,
+.task-log-line.task-pending .task-log-icon {
+  background: var(--c-bg-3); color: var(--c-fg-3);
+}
+.task-log-line.task-updated .task-log-icon {
+  background: rgba(139, 92, 246, 0.20); color: #a78bfa;
+}
+html[data-theme="light"] .task-log-line.task-created .task-log-icon { background: #dbeafe; color: #1e40af; }
+html[data-theme="light"] .task-log-line.task-started .task-log-icon { background: #fef3c7; color: #92400e; }
+html[data-theme="light"] .task-log-line.task-done    .task-log-icon { background: #d1fae5; color: #065f46; }
+html[data-theme="light"] .task-log-line.task-updated .task-log-icon { background: #ede9fe; color: #5b21b6; }
+html[data-theme="eyecare"] .task-log-line.task-created .task-log-icon { background: #d6dfe8; color: #2d4860; }
+html[data-theme="eyecare"] .task-log-line.task-started .task-log-icon { background: #ede4cd; color: #7a5a20; }
+html[data-theme="eyecare"] .task-log-line.task-done    .task-log-icon { background: #d4e2cf; color: #3a6a3a; }
+html[data-theme="eyecare"] .task-log-line.task-updated .task-log-icon { background: #ddd6e8; color: #5b3a6b; }
+
+/* ---- Load earlier button ---- */
+.load-earlier-btn {
+  color: var(--c-fg-3); background: var(--c-bg-1);
+  border-color: var(--c-border);
+}
+.load-earlier-btn:hover {
+  background: var(--c-bg-0); border-color: var(--c-accent);
+  color: var(--c-accent);
+}
+.load-earlier-truncated-note { color: var(--c-fg-3); }
+
+/* ---- Muse opener bubble ---- */
+.muse-opener-bubble {
+  background: var(--c-bg-1);
+  border-color: var(--c-border);
+}
+.muse-opener-text { color: var(--c-fg-1); }
+.muse-opener-action { background: var(--c-accent); }
+.muse-opener-action:hover { background: var(--c-accent-hover); }
+
+/* ---- Nine-muses grid ---- */
+.muse-grid-divider { color: var(--c-fg-3); }
+.muse-grid-divider::before, .muse-grid-divider::after { background: var(--c-border); }
+.muse-grid-divider span { background: var(--c-bg-0); }
+.muse-cell {
+  background: var(--c-bg-1);
+  border-color: var(--c-border);
+}
+.muse-cell:hover {
+  border-color: var(--c-accent);
+  background: var(--c-bg-2);
+}
+.muse-cell.active {
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+.muse-cell-icon { color: var(--c-accent); }
+.muse-cell-name { color: var(--c-fg-1); }
+.muse-cell-domain, .muse-cell-invite { color: var(--c-fg-3); }
+
+/* ---- Claude Auth card ---- */
+.claude-auth-card {
+  background: var(--c-bg-1);
+  border-color: var(--c-border);
+}
+.claude-auth-title { color: var(--c-fg-1); }
+.claude-auth-subtitle { color: var(--c-fg-3); }
+.claude-auth-label { color: var(--c-fg-3); }
+.claude-auth-value { color: var(--c-fg-1); }
+.claude-auth-actions { border-top-color: var(--c-border); }
+.claude-auth-cmd { background: var(--c-bg-3); color: var(--c-fg-1); }
+html[data-theme="light"] .claude-auth-cmd,
+html[data-theme="eyecare"] .claude-auth-cmd {
+  background: var(--c-bg-4); color: var(--c-fg-0);
+}
+.claude-auth-waiting {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+  color: var(--c-fg-2);
+}
+.claude-auth-tip { color: var(--c-fg-3); }
+.claude-auth-cli-warn {
+  color: var(--c-warn);
+  background: rgba(217, 119, 6, 0.10);
+  border-color: rgba(217, 119, 6, 0.30);
+}
+
+/* ---- MCP enhanced bubble ---- */
+.mcp-server-label { color: var(--c-fg-1); }
+.mcp-tool-label   { color: var(--c-fg-3); }
+.mcp-sep          { color: var(--c-fg-3); }
+.mcp-input-preview {
+  color: var(--c-fg-3);
+  background: var(--c-bg-2);
+}
+.mcp-result-item {
+  background: var(--c-bg-1);
+  border-left-color: var(--c-accent);
+}
+.mcp-result-idx { color: var(--c-fg-3); }
+.mcp-result-truncated { color: var(--c-fg-3); }
+.mcp-result-json {
+  background: var(--c-bg-2);
+  color: var(--c-fg-1);
+}
+
+/* ---- Search hits ---- */
+.search-hits-list { color: var(--c-fg-1); }
+.search-hit { border-bottom-color: var(--c-border); }
+.search-hit:hover { background: var(--c-bg-1); }
+.search-hit-path { color: var(--c-accent); }
+.search-hit-lineno, .search-hit-truncated, .search-hit-raw { color: var(--c-fg-3); }
+.search-hit-content { color: var(--c-fg-1); }
+
+/* ---- Web source badge ---- */
+.web-source {
+  background: var(--c-bg-1);
+  border-bottom-color: var(--c-border);
+  color: var(--c-fg-2);
+}
+.web-source-link { color: var(--c-accent); }
+.web-source-query { color: var(--c-fg-3); }
+
+/* ---- Tool error hint banner ---- */
+.tool-error-hint {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.22);
+  border-left-color: #ef4444;
+  color: var(--c-fg-1);
+}
+html[data-theme="light"] .tool-error-hint {
+  background: rgba(220, 38, 38, 0.05);
+  border-color: rgba(220, 38, 38, 0.18);
+  border-left-color: #dc2626;
+}
+html[data-theme="eyecare"] .tool-error-hint {
+  background: rgba(170, 80, 60, 0.06);
+  border-color: rgba(170, 80, 60, 0.22);
+  border-left-color: #aa503c;
+}
+.tool-error-hint-text { color: var(--c-fg-1); }

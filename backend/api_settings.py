@@ -33,13 +33,14 @@ ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 # new entry there automatically surfaces in Settings — no parallel list to
 # keep in sync. Anthropic is added explicitly (Claude isn't in CATALOG —
 # it routes through `claude login` OAuth, not a third-party adapter).
-def _build_provider_keys() -> list[tuple[str, str]]:
+def _build_provider_keys() -> list[tuple[str, str, str]]:
     # Anthropic first — recommended primary provider. Empty here is fine if
     # the user authenticates via `claude login` Pro/Max OAuth instead.
-    out: list[tuple[str, str]] = [("ANTHROPIC_API_KEY", "Anthropic (Claude API)")]
+    out: list[tuple[str, str, str]] = [("ANTHROPIC_API_KEY", "Anthropic (Claude API)", "claude-sonnet-4-6")]
     from . import endpoints as _ep
     for p in _ep.CATALOG:
-        out.append((p.env_key, p.display))
+        probe_model = p.models[0][0]  # first model ID in the provider's model list
+        out.append((p.env_key, p.display, probe_model))
     return out
 
 
@@ -92,6 +93,10 @@ class SettingsIn(BaseModel):
     # chat.py's per-turn done push.
     notify_scheduled: bool | None = None
     notify_normal: bool | None = None
+    # Per-provider visibility toggle — dict of {probe_model: true/false}.
+    # true = disable (hide from model picker). Sent as a partial diff: only
+    # the toggled provider appears in the dict, not all providers.
+    provider_disabled: dict[str, bool] | None = None
 
 
 def _write_env(updates: dict[str, str]) -> None:
@@ -175,14 +180,18 @@ def _current(env_key: str) -> str:
 @router.get("", dependencies=[Depends(require_token)])
 def get_settings() -> dict:
     """Return current settings with API keys masked."""
+    raw_disabled = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
+    disabled_models = set(raw_disabled.split(",")) if raw_disabled else set()
     providers: list[dict] = []
-    for key, display in PROVIDER_KEYS:
+    for key, display, probe_model in PROVIDER_KEYS:
         v = os.environ.get(key, "")
         providers.append({
             "env_key": key,
             "display": display,
             "configured": bool(v),
             "masked": _mask(v),
+            "probe_model": probe_model,
+            "disabled": probe_model in disabled_models,
         })
     return {
         "providers": providers,
@@ -233,7 +242,7 @@ def put_settings(req: SettingsIn) -> dict:
     # keeps a credential-stealing route from existing on principle —
     # otherwise a future XSS could PUT `PATH=/tmp/evil` here).
     if req.provider_keys is not None:
-        allowed_envs = {k for k, _ in PROVIDER_KEYS}
+        allowed_envs = {k for k, _, _ in PROVIDER_KEYS}
         for env_name, v in req.provider_keys.items():
             if env_name not in allowed_envs:
                 continue   # silently drop typo'd / disallowed envs
@@ -296,6 +305,24 @@ def put_settings(req: SettingsIn) -> dict:
         new_v = "true" if req.notify_normal else "false"
         if _changed("MUSELAB_NOTIFY_NORMAL", new_v):
             updates["MUSELAB_NOTIFY_NORMAL"] = new_v
+    if req.provider_disabled is not None:
+        raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
+        disabled_models = set(raw.split(",")) if raw else set()
+        changed = False
+        for model_id, disable in req.provider_disabled.items():
+            if disable:
+                if model_id not in disabled_models:
+                    disabled_models.add(model_id)
+                    changed = True
+            else:
+                if model_id in disabled_models:
+                    disabled_models.discard(model_id)
+                    changed = True
+        if changed:
+            if disabled_models:
+                updates["MUSELAB_DISABLED_PROVIDERS"] = ",".join(sorted(disabled_models))
+            else:
+                updates["MUSELAB_DISABLED_PROVIDERS"] = None  # type: ignore[assignment]  # remove key
 
     _write_env(updates)
     # The `chat.py` module captured `MODEL` at import time; if we just touched
@@ -1202,3 +1229,126 @@ def _restart_hint() -> str:
     if sysname == "Darwin":
         return "launchctl kickstart -k gui/$UID/com.muselab"
     return "systemctl --user restart muselab"
+
+
+# ============================================================
+# Claude Auth — Pro/Max OAuth as a first-class settings provider.
+# Treated separately from PROVIDER_KEYS because it isn't an API key —
+# auth lives in ~/.claude/.credentials.json (written by `claude login`)
+# and identity comes from `claude auth status --json`. The UI renders a
+# dedicated card next to the other providers.
+# ============================================================
+import shutil as _shutil
+
+_CLAUDE_CRED = Path.home() / ".claude" / ".credentials.json"
+
+
+def _claude_cli_path() -> str | None:
+    """Cross-platform: find the `claude` executable. Returns None if absent.
+    On Windows, npm-installed CLIs often live as `claude.cmd` — shutil.which
+    handles both extensions when PATHEXT is set (default on Windows)."""
+    return _shutil.which("claude")
+
+
+def _run_claude_auth_status(timeout: float = 5.0) -> dict:
+    """Invoke `claude auth status --json` and return parsed dict.
+    Returns {"loggedIn": False, "reason": ...} on any failure so the UI
+    always gets a deterministic shape — never crashes the endpoint."""
+    cli = _claude_cli_path()
+    if not cli:
+        return {"loggedIn": False, "reason": "cli-not-installed"}
+    try:
+        proc = subprocess.run(
+            [cli, "auth", "status", "--json"],
+            capture_output=True, text=True, timeout=timeout,
+            # Don't inherit the parent env's ANTHROPIC_* — those would
+            # mask the OAuth check and make this report a confusing
+            # "logged in via API key" state. The CLI itself reads
+            # credentials.json directly so no env is needed.
+            env={"PATH": os.environ.get("PATH", ""),
+                 "HOME": os.environ.get("HOME", str(Path.home())),
+                 "USERPROFILE": os.environ.get("USERPROFILE", str(Path.home())),
+                 "APPDATA": os.environ.get("APPDATA", "")},
+        )
+    except subprocess.TimeoutExpired:
+        return {"loggedIn": False, "reason": "cli-timeout"}
+    except Exception as e:
+        return {"loggedIn": False, "reason": f"cli-error: {type(e).__name__}"}
+    if proc.returncode != 0:
+        return {"loggedIn": False, "reason": "not-logged-in",
+                "stderr": (proc.stderr or "").strip()[:300]}
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"loggedIn": False, "reason": "cli-bad-json",
+                "stdout": (proc.stdout or "")[:300]}
+    return data
+
+
+def _read_credentials_expiry() -> int | None:
+    """Read OAuth token expiry timestamp (ms since epoch) from credentials.json.
+    Returns None if file missing / unreadable / field absent."""
+    if not _CLAUDE_CRED.exists():
+        return None
+    try:
+        data = json.loads(_CLAUDE_CRED.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get("claudeAiOauth", {}).get("expiresAt")
+
+
+@router.get("/claude-auth/status", dependencies=[Depends(require_token)])
+def claude_auth_status() -> dict:
+    """Report whether the user is signed in to Claude via Pro/Max OAuth,
+    and surface identity (email / org / plan) when available.
+
+    Shape returned to the UI:
+      {
+        "cli_installed": bool,
+        "cli_path": str | null,
+        "credentials_file_present": bool,
+        "logged_in": bool,
+        "email": str | null,
+        "org_name": str | null,
+        "subscription_type": str | null,   # "max" / "pro" / "free" / null
+        "expires_at": int | null,          # ms-since-epoch, OAuth token
+        "reason": str | null,              # diagnostic when !logged_in
+      }
+    """
+    cli = _claude_cli_path()
+    status = _run_claude_auth_status() if cli else {
+        "loggedIn": False, "reason": "cli-not-installed"
+    }
+    return {
+        "cli_installed": cli is not None,
+        "cli_path": cli,
+        "credentials_file_present": _CLAUDE_CRED.exists(),
+        "logged_in": bool(status.get("loggedIn", False)),
+        "email": status.get("email"),
+        "org_name": status.get("orgName"),
+        "subscription_type": status.get("subscriptionType"),
+        "expires_at": _read_credentials_expiry(),
+        "reason": status.get("reason"),
+    }
+
+
+@router.post("/claude-auth/disconnect", dependencies=[Depends(require_token)])
+def claude_auth_disconnect() -> dict:
+    """Disconnect Claude Auth by moving credentials.json to a .bak sibling.
+    Reversible — the user can rename it back if they regret. We DON'T call
+    `claude logout` because that wipes the file outright; the .bak move
+    matches the user's explicit preference for a reversible disconnect."""
+    if not _CLAUDE_CRED.exists():
+        return {"ok": True, "already_disconnected": True}
+    # Time-stamped backup so repeated connect/disconnect cycles don't clobber
+    # an earlier backup. ".bak" without suffix would be lost on the second
+    # disconnect when the user reconnects + disconnects again.
+    import datetime as _dt
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = _CLAUDE_CRED.with_suffix(f".json.{stamp}.bak")
+    try:
+        _CLAUDE_CRED.rename(bak)
+    except OSError as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Could not move credentials file: {e}") from e
+    return {"ok": True, "backup_path": str(bak)}

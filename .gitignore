@@ -33,3 +33,7 @@ node_modules/
 #   memo; reads as internal pitch deck if published, not user docs.
 TODO.md
 docs/competitive-analysis.md
+
+# Demo archives — local-only, never published
+demo/
+

@@ -25,6 +25,11 @@ class Provider:
     env_key: str         # name of env var holding the API key
     display: str         # human-readable group name
     models: tuple[tuple[str, str], ...]   # ((model_id, short_label), ...)
+    # Whether this vendor's Anthropic-compat endpoint handles the standard
+    # Anthropic thinking config. Set False for endpoints that reject thinking
+    # or where thinking budget pushes max_tokens past the vendor's output limit
+    # (e.g. Qianfan 12288 cap). Defaults to True at the call site.
+    supports_thinking: bool = True
 
 
 # Default base URLs per provider — used when no env override is set. Resolved
@@ -43,7 +48,7 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     # the /anthropic endpoint stabilised. ⚠ Anthropic-compat layer maps
     # request_temperature * 0.6 to real_temperature — irrelevant for SDK
     # defaults but worth knowing if a downstream user tunes temperature.
-    "MOONSHOT_API_KEY":       "https://api.moonshot.ai/anthropic",
+    "MOONSHOT_API_KEY":       "https://api.moonshot.cn/anthropic",
     # Alibaba DashScope Qwen — official "Migrate Anthropic Workloads to
     # Qwen" doc names this path. International (Singapore) endpoint by
     # default because it's reachable globally (incl. mainland); domestic
@@ -52,6 +57,7 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     # Xiaomi MiMo — V2.5-Pro public beta 2026-04-22; platform.xiaomimimo
     # explicitly documents the /anthropic endpoint.
     "XIAOMI_MIMO_API_KEY":    "https://api.xiaomimimo.com/anthropic",
+    "QIANFAN_API_KEY":        "https://qianfan.baidubce.com/anthropic",
 }
 # Map api-key env name → base-url override env name. Self-hosters can point
 # any provider at a proxy / regional mirror via these.
@@ -62,6 +68,7 @@ _BASE_URL_ENV_BY_KEY: dict[str, str] = {
     "MOONSHOT_API_KEY":     "MOONSHOT_BASE_URL",
     "DASHSCOPE_API_KEY":    "DASHSCOPE_BASE_URL",
     "XIAOMI_MIMO_API_KEY":  "XIAOMI_MIMO_BASE_URL",
+    "QIANFAN_API_KEY":      "QIANFAN_BASE_URL",
 }
 
 
@@ -79,13 +86,19 @@ def _vendor_config_dir() -> Path:
     return _VENDOR_CONFIG_DIR
 
 
-def _resolve_base_url(env_key: str) -> str:
-    """Look up the current base URL for a provider: env override > default."""
+def _resolve_base_url(env_key: str, provider: Provider | None = None) -> str:
+    """Look up the current base URL for a provider: env override > provider's
+    own base_url (from CATALOG) > per-key default. The provider fallback is
+    critical for families that share one API key but need different endpoints
+    (e.g. Qwen domestic vs international — both use DASHSCOPE_API_KEY but
+    route to different hosts)."""
     override_env = _BASE_URL_ENV_BY_KEY.get(env_key, "")
     if override_env:
         v = os.environ.get(override_env, "").strip()
         if v:
             return v.rstrip("/")
+    if provider is not None:
+        return provider.base_url.rstrip("/")
     return _DEFAULT_BASE_URLS.get(env_key, "").rstrip("/")
 
 
@@ -104,8 +117,6 @@ CATALOG: tuple[Provider, ...] = (
         models=(
             ("deepseek-v4-pro",    "V4 Pro"),
             ("deepseek-v4-flash",  "V4 Flash"),
-            ("deepseek-chat",      "Chat"),
-            ("deepseek-reasoner",  "Reasoner (R1)"),
         ),
     ),
     Provider(
@@ -114,10 +125,11 @@ CATALOG: tuple[Provider, ...] = (
         env_key="ZHIPUAI_API_KEY",
         display="智谱 GLM",
         models=(
-            ("glm-5",       "GLM 5"),
-            ("glm-5-air",   "GLM 5 Air"),
-            ("glm-4.7",     "GLM 4.7"),
-            ("glm-4-plus",  "GLM 4 Plus"),
+            ("glm-5.1",      "GLM 5.1"),
+            ("glm-5",        "GLM 5"),
+            ("glm-5-air",    "GLM 5 Air"),
+            ("glm-4.7",      "GLM 4.7"),
+            ("glm-4-plus",   "GLM 4 Plus"),
         ),
     ),
     Provider(
@@ -129,6 +141,25 @@ CATALOG: tuple[Provider, ...] = (
             ("minimax-m2.7",            "M2.7"),
             ("minimax-m2.7-highspeed",  "M2.7 Highspeed"),
             ("minimax-m2.5",            "M2.5"),
+            ("minimax-m2.5-highspeed",  "M2.5 Highspeed"),
+            ("minimax-m2.1",            "M2.1"),
+            ("minimax-m2.1-highspeed",  "M2.1 Highspeed"),
+        ),
+    ),
+    # MiniMax 国际站 — 海外用户延迟更低。⚠ 注意：国际站需要单独的 API key，
+    # 中国站的 key 在国际站会返回 401。
+    Provider(
+        prefix="minimax-intl:",
+        base_url="https://api.minimax.io/anthropic",
+        env_key="MINIMAX_INTL_API_KEY",
+        display="MiniMax (国际)",
+        models=(
+            ("minimax-intl:minimax-m2.7",            "M2.7"),
+            ("minimax-intl:minimax-m2.7-highspeed",  "M2.7 Highspeed"),
+            ("minimax-intl:minimax-m2.5",            "M2.5"),
+            ("minimax-intl:minimax-m2.5-highspeed",  "M2.5 Highspeed"),
+            ("minimax-intl:minimax-m2.1",            "M2.1"),
+            ("minimax-intl:minimax-m2.1-highspeed",  "M2.1 Highspeed"),
         ),
     ),
     # Moonshot Kimi — re-added 2026-05-22. Removed once on 2026-05-17 for
@@ -138,7 +169,7 @@ CATALOG: tuple[Provider, ...] = (
     # works for your account before relying on production usage.
     Provider(
         prefix="kimi-",
-        base_url=_DEFAULT_BASE_URLS["MOONSHOT_API_KEY"],
+        base_url="https://api.moonshot.cn/anthropic",
         env_key="MOONSHOT_API_KEY",
         display="Kimi",
         models=(
@@ -148,21 +179,37 @@ CATALOG: tuple[Provider, ...] = (
             ("kimi-k2",            "K2"),
         ),
     ),
-    # Alibaba DashScope Qwen — added 2026-05-22. Anthropic-compat path is
-    # /apps/anthropic (not /anthropic — different from DeepSeek / GLM /
-    # MiniMax convention). Prefix is the bare string "qwen" (no dash)
-    # because model ids alternate "qwen-plus" and "qwen3-max" — both
-    # forms must route to the same provider.
+    # Alibaba DashScope Qwen — 国内站（默认）。Anthropic-compat path is
+    # /apps/anthropic (not /anthropic). Prefix is the bare string "qwen"
+    # (no dash) because model ids alternate "qwen-plus" and "qwen3-max".
+    # 同一把 API key 可用于国内站和国际站，国际用户可选国际站降低延迟。
     Provider(
         prefix="qwen",
-        base_url=_DEFAULT_BASE_URLS["DASHSCOPE_API_KEY"],
+        base_url="https://dashscope.aliyuncs.com/apps/anthropic",
         env_key="DASHSCOPE_API_KEY",
         display="Qwen",
         models=(
-            ("qwen3-max",            "Qwen3 Max"),
-            ("qwen-plus",            "Qwen Plus"),
-            ("qwen3.5-flash",        "Qwen3.5 Flash"),
-            ("qwen3.5-coder-plus",   "Qwen3.5 Coder Plus"),
+            ("qwen3.6-plus",          "Qwen3.6 Plus"),
+            ("qwen3-max",             "Qwen3 Max"),
+            ("qwen3.5-plus",          "Qwen3.5 Plus"),
+            ("qwen3.5-flash",         "Qwen3.5 Flash"),
+            ("qwen3.5-coder-plus",    "Qwen3.5 Coder Plus"),
+            ("qwen-plus",             "Qwen Plus"),
+        ),
+    ),
+    # Qwen 国际站 — 新加坡节点，国际用户延迟更低。与国内站共用同一把 API key。
+    Provider(
+        prefix="qwen-intl:",
+        base_url="https://dashscope-intl.aliyuncs.com/apps/anthropic",
+        env_key="DASHSCOPE_API_KEY",
+        display="Qwen (国际)",
+        models=(
+            ("qwen-intl:qwen3.6-plus",          "Qwen3.6 Plus"),
+            ("qwen-intl:qwen3-max",             "Qwen3 Max"),
+            ("qwen-intl:qwen3.5-plus",          "Qwen3.5 Plus"),
+            ("qwen-intl:qwen3.5-flash",         "Qwen3.5 Flash"),
+            ("qwen-intl:qwen3.5-coder-plus",    "Qwen3.5 Coder Plus"),
+            ("qwen-intl:qwen-plus",             "Qwen Plus"),
         ),
     ),
     # Xiaomi MiMo — added 2026-05-22. V2.5-Pro public beta 2026-04-22.
@@ -175,7 +222,32 @@ CATALOG: tuple[Provider, ...] = (
         display="Xiaomi MiMo",
         models=(
             ("mimo-v2.5-pro",   "V2.5 Pro"),
+            ("mimo-v2.5",       "V2.5"),
             ("mimo-v2-flash",   "V2 Flash"),
+        ),
+    ),
+    # Baidu Qianfan — Anthropic-compat endpoint confirmed 2026-05-23.
+    # ⚠ Auth uses IAM access token (bce-v3/ALTAK-xxx/xxx), not a plain
+    # sk-xxx key. Qianfan is a model aggregator: in addition to ERNIE
+    # models, it also hosts third-party models (DeepSeek / Kimi / GLM /
+    # MiniMax / Qwen) behind the same endpoint. Model availability may
+    # vary by account — check console.bce.baidu.com/qianfan for your
+    # region's current model list.
+    Provider(
+        prefix="ernie-",
+        base_url=_DEFAULT_BASE_URLS["QIANFAN_API_KEY"],
+        env_key="QIANFAN_API_KEY",
+        display="百度千帆",
+        supports_thinking=False,
+        models=(
+            ("ernie-4.5-turbo-20260402",  "ERNIE 4.5 Turbo"),
+            ("ernie-4.5-turbo-128k",      "ERNIE 4.5 Turbo 128K"),
+            ("ernie-4.0-turbo-128k",      "ERNIE 4.0 Turbo"),
+            ("ernie-4.0-8k",              "ERNIE 4.0"),
+            ("ernie-x1-turbo-32k",        "ERNIE X1 推理"),
+            ("deepseek-v3.2",             "DeepSeek V3.2 (千帆)"),
+            ("deepseek-v3.1",             "DeepSeek V3.1 (千帆)"),
+            ("deepseek-r1",               "DeepSeek R1 (千帆)"),
         ),
     ),
     # Doubao (字节 Volcengine) deliberately NOT added — only
@@ -249,6 +321,16 @@ def is_third_party(model: str) -> bool:
     return lookup(model) is not None
 
 
+def normalize_model_id(model: str) -> str:
+    """Strip internal prefixes from model id before sending to the API.
+    For example, 'qwen-intl:qwen3-max' becomes 'qwen3-max'."""
+    if model.startswith("qwen-intl:"):
+        return model[len("qwen-intl:"):]
+    if model.startswith("minimax-intl:"):
+        return model[len("minimax-intl:"):]
+    return model
+
+
 def env_override(model: str) -> dict[str, str] | None:
     """Build the env dict to pass to ClaudeAgentOptions(env=...) so the SDK
     routes to the vendor's Anthropic-compatible endpoint. Returns None if no
@@ -289,7 +371,7 @@ def env_override(model: str) -> dict[str, str] | None:
     # Resolve base URL at call time so a Settings-UI override (or .env tweak
     # via `<VENDOR>_BASE_URL`) takes effect on the very next stream() — no
     # process restart needed. Falls back to the catalog default.
-    base_url = _resolve_base_url(p.env_key) or p.base_url
+    base_url = _resolve_base_url(p.env_key, p)
     merged = dict(os.environ)
     merged.update({
         "ANTHROPIC_BASE_URL": base_url,
@@ -319,9 +401,11 @@ def has_anthropic_auth() -> bool:
 
 def available_groups() -> list[dict]:
     """Catalog filtered to providers whose API key (or OAuth, for Claude) is
-    configured. Each item has `label` (short pretty name) + `model` (full id
-    used as dropdown value). Returns [] if nothing is configured — UI should
-    treat that as 'no model, open Settings'."""
+    configured AND not disabled in Settings. Each item has `label` (short
+    pretty name) + `model` (full id used as dropdown value). Returns [] if
+    nothing is configured — UI should treat that as 'no model, open Settings'."""
+    raw_disabled = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
+    disabled_models = set(raw_disabled.split(",")) if raw_disabled else set()
     groups: list[dict] = []
     if has_anthropic_auth():
         groups.append({
@@ -336,6 +420,12 @@ def available_groups() -> list[dict]:
         })
     for p in CATALOG:
         if not os.environ.get(p.env_key):
+            continue
+        # Skip provider if its first model is in the disabled list. We use the
+        # first model ID as the provider's stable identifier — it uniquely
+        # identifies each provider row (including Qwen domestic vs international
+        # which share DASHSCOPE_API_KEY but have different first models).
+        if p.models[0][0] in disabled_models:
             continue
         groups.append({
             "group": p.display,

@@ -77,18 +77,28 @@ def test_available_groups_only_lists_configured(monkeypatch):
 
 
 @pytest.mark.parametrize("model,expected_host", [
-    ("deepseek-v4-pro",      "api.deepseek.com"),
-    ("glm-5",                "bigmodel.cn"),
-    ("minimax-m2.7",         "minimaxi.com"),
+    ("deepseek-v4-pro",         "api.deepseek.com"),
+    ("glm-5",                   "bigmodel.cn"),
+    ("minimax-m2.7",            "minimaxi.com"),
     # Re-added / new providers (2026-05-22) — keep the regression matrix
     # honest: a future endpoint URL typo would route a vendor's traffic to
     # the wrong host and we'd only catch it via "all my Kimi turns fail".
-    ("kimi-k2.6",            "api.moonshot.ai"),
-    ("kimi-k2-thinking",     "api.moonshot.ai"),
-    ("qwen3-max",            "dashscope-intl.aliyuncs.com"),
-    ("qwen-plus",            "dashscope-intl.aliyuncs.com"),  # mixed naming
-    ("qwen3.5-flash",        "dashscope-intl.aliyuncs.com"),
-    ("mimo-v2.5-pro",        "api.xiaomimimo.com"),
+    # NOTE: Kimi moved to api.moonshot.cn (was .ai) per Moonshot's 2026-05
+    # endpoint consolidation. Qwen domestic dashscope.aliyuncs.com is the
+    # default; international users explicitly opt in via "qwen-intl:" prefix.
+    ("kimi-k2.6",               "api.moonshot.cn"),
+    ("kimi-k2-thinking",        "api.moonshot.cn"),
+    ("qwen3-max",               "dashscope.aliyuncs.com"),
+    ("qwen-plus",               "dashscope.aliyuncs.com"),
+    ("qwen3.5-flash",           "dashscope.aliyuncs.com"),
+    ("qwen-intl:qwen3-max",     "dashscope-intl.aliyuncs.com"),
+    ("mimo-v2.5-pro",           "api.xiaomimimo.com"),
+    # Baidu Qianfan — aggregator hosting ERNIE + cross-vendor models
+    ("ernie-4.5-turbo-128k",    "qianfan.baidubce.com"),
+    # NOTE: "deepseek-v3.2" via Qianfan is documented in Qianfan's catalog
+    # but lookup() matches by prefix → DeepSeek's own provider wins (the
+    # "deepseek-" prefix entry registers first). Users wanting Qianfan-
+    # hosted DeepSeek must call Qianfan directly. Not in the routing matrix.
 ])
 def test_all_providers_route_to_correct_host(monkeypatch, model, expected_host):
     """Each catalog entry's base_url contains the expected vendor domain."""
@@ -139,6 +149,10 @@ def test_all_catalog_providers_have_valid_fields(monkeypatch):
     model id starts with its provider's prefix — is checked below regardless.
     """
     ep = _reload_endpoints(monkeypatch, {})
+    # Aggregator providers host cross-vendor model IDs (e.g. Qianfan exposes
+    # `deepseek-v3.2` alongside its native `ernie-*` line). For them the
+    # prefix names the primary brand only, not the model-ID convention.
+    AGGREGATOR_ENV_KEYS = {"QIANFAN_API_KEY"}
     for p in ep.CATALOG:
         assert p.prefix, "prefix must be non-empty"
         assert p.prefix == p.prefix.lower(), f"prefix should be lowercase: {p.prefix}"
@@ -146,6 +160,12 @@ def test_all_catalog_providers_have_valid_fields(monkeypatch):
         assert "anthropic" in p.base_url, "base_url should hit /anthropic endpoint"
         assert p.env_key.endswith("_API_KEY"), f"env_key convention: {p.env_key}"
         assert len(p.models) > 0, f"provider {p.prefix} has no models listed"
+        if p.env_key in AGGREGATOR_ENV_KEYS:
+            # Aggregator: just check labels are non-empty; model IDs can be any
+            # vendor's native form.
+            for _mid, label in p.models:
+                assert label, "label must be non-empty"
+            continue
         for mid, label in p.models:
             assert mid.startswith(p.prefix), f"model {mid} doesn't match prefix {p.prefix}"
             assert label, "label must be non-empty"

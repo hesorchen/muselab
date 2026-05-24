@@ -38,6 +38,10 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("ZHIPUAI_API_KEY", raising=False)
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("XIAOMI_MIMO_API_KEY", raising=False)
+    monkeypatch.delenv("QIANFAN_API_KEY", raising=False)
 
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
@@ -65,6 +69,8 @@ def app_module(monkeypatch, temp_root, tmp_path):
     # MUSELAB_DEFAULT_MODEL=claude-opus-4-7 → test PUTs opus → "no
     # change, skip write" → file assertion fails.)
     for k in ("DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY",
+              "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY", "XIAOMI_MIMO_API_KEY",
+              "QIANFAN_API_KEY",
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
               "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
               "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",

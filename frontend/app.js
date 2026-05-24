@@ -402,16 +402,39 @@ function portal() {
     // ===== Muse mascot =====
     // 九缪斯（Nine Muses of Greek mythology）。视觉仍是抽象几何，名字承载典故：
     // 每个缪斯对应一种艺术 / 学科，几何形象选有意义关联的（如 Urania 天文 → orbit 行星）。
+    // Each muse carries a neutral "invite" prompt — a one-line conversation
+    // opener that matches her thematic domain. Clicking a muse in the chat-
+    // empty grid switches the mascot AND prefills the chat input with her
+    // invite line (user can edit / send). Designed to be domain-flavored
+    // but everyday-usable — not theatrical, not generic.
     MASCOTS: [
-      { id: "hex",      greek: "Calliope",    zhName: "卡利俄佩",       domain: { zh: "史诗", en: "Epic poetry" } },
-      { id: "bars",     greek: "Clio",        zhName: "克利俄",         domain: { zh: "历史", en: "History" } },
-      { id: "lens",     greek: "Erato",       zhName: "厄拉托",         domain: { zh: "情诗", en: "Love poetry" } },
-      { id: "wave",     greek: "Euterpe",     zhName: "欧忒耳佩",       domain: { zh: "音乐", en: "Music" } },
-      { id: "crescent", greek: "Melpomene",   zhName: "墨尔波墨涅",     domain: { zh: "悲剧", en: "Tragedy" } },
-      { id: "halo",     greek: "Polyhymnia",  zhName: "波吕许谟尼亚",   domain: { zh: "圣诗", en: "Sacred hymns" } },
-      { id: "trio",     greek: "Terpsichore", zhName: "忒耳普西科瑞",   domain: { zh: "舞蹈", en: "Dance" } },
-      { id: "spark",    greek: "Thalia",      zhName: "塔利亚",         domain: { zh: "喜剧", en: "Comedy" } },
-      { id: "orbit",    greek: "Urania",      zhName: "乌拉尼亚",       domain: { zh: "天文", en: "Astronomy" } },
+      { id: "hex",      greek: "Calliope",    zhName: "卡利俄佩",       domain: { zh: "史诗", en: "Epic poetry" },
+        invite: { zh: "讲讲你的大故事——这一年你最在意的三件事是什么?",
+                  en: "Tell me the big story — what are the 3 things you care most about this year?" } },
+      { id: "bars",     greek: "Clio",        zhName: "克利俄",         domain: { zh: "历史", en: "History" },
+        invite: { zh: "整理一下你的时间线——过去半年最关键的变化是什么?",
+                  en: "Walk me through your timeline — what changed most in the last six months?" } },
+      { id: "lens",     greek: "Erato",       zhName: "厄拉托",         domain: { zh: "情诗", en: "Love poetry" },
+        invite: { zh: "聊聊你在乎的人——最近谁需要你多一点注意?",
+                  en: "Tell me about who matters to you — who needs your attention right now?" } },
+      { id: "wave",     greek: "Euterpe",     zhName: "欧忒耳佩",       domain: { zh: "音乐", en: "Music" },
+        invite: { zh: "讲讲你的节奏——最近哪件日常的小事做得最顺?",
+                  en: "Talk about your rhythm — what daily thing has been clicking lately?" } },
+      { id: "crescent", greek: "Melpomene",   zhName: "墨尔波墨涅",     domain: { zh: "悲剧", en: "Tragedy" },
+        invite: { zh: "聊聊最近的烦恼——什么事让你睡不踏实?",
+                  en: "Tell me what's weighing on you — what's been keeping you up?" } },
+      { id: "halo",     greek: "Polyhymnia",  zhName: "波吕许谟尼亚",   domain: { zh: "圣诗", en: "Sacred hymns" },
+        invite: { zh: "聊聊你的信念——什么事让你觉得「必须做」?",
+                  en: "Talk about what you believe in — what feels non-negotiable to you?" } },
+      { id: "trio",     greek: "Terpsichore", zhName: "忒耳普西科瑞",   domain: { zh: "舞蹈", en: "Dance" },
+        invite: { zh: "讲讲你的身体——最近的状态怎么样?",
+                  en: "Tell me about your body — how are you feeling lately?" } },
+      { id: "spark",    greek: "Thalia",      zhName: "塔利亚",         domain: { zh: "喜剧", en: "Comedy" },
+        invite: { zh: "来点轻松的——最近有什么有意思的事?",
+                  en: "Lighten things up — what's something fun that happened recently?" } },
+      { id: "orbit",    greek: "Urania",      zhName: "乌拉尼亚",       domain: { zh: "天文", en: "Astronomy" },
+        invite: { zh: "聊聊你的好奇心——什么大问题最近一直在想?",
+                  en: "Talk about what you're curious about — what big question is on your mind?" } },
     ],
     mascotIdx: 0,
     mascotGreet: false,
@@ -533,8 +556,8 @@ function portal() {
     PROVIDER_HELP: {
       ANTHROPIC_API_KEY: {
         url: "https://console.anthropic.com/settings/keys",
-        zh: "两种路径：(1) Pro/Max 订阅 → 终端跑 `claude login`（免费配额，无需在此填）；(2) API 按量付费 → 去 console.anthropic.com 拿 key 填这里。两个都配 → CLI 自动用 Pro，不会重复扣费。",
-        en: "Two paths: (1) Pro/Max subscription → run `claude login` in terminal (free quota, leave this blank); (2) pay-per-use API → grab a key from console.anthropic.com and paste it here. With both configured, CLI prefers Pro automatically — you won't double-bill.",
+        zh: "API 按量付费。去 console.anthropic.com 拿 key 填这里。Pro/Max 订阅请用上面的 Claude Auth 卡片。两个都配 → CLI 自动用 Pro,不会重复扣费。",
+        en: "Pay-per-use API. Get a key at console.anthropic.com and paste it here. For Pro/Max subscription, use the Claude Auth card above. With both configured, CLI prefers Pro automatically — no double-billing.",
       },
       DEEPSEEK_API_KEY: {
         url: "https://platform.deepseek.com/api_keys",
@@ -566,9 +589,41 @@ function portal() {
         zh: "去 platform.xiaomimimo.com 申请 MiMo API 内测资格并创建 key。",
         en: "Apply for MiMo API beta access and create a key at platform.xiaomimimo.com.",
       },
+      QIANFAN_API_KEY: {
+        url: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application/v2",
+        zh: "去百度智能云千帆控制台创建应用，获取 API key（ERNIE 系列走此 key）。注意需要 IAM 鉴权，非普通 sk-xxx 格式。",
+        en: "Create an app in Baidu Qianfan console to get an API key (for ERNIE models). Note: IAM auth, not plain sk-xxx format.",
+      },
     },
 
     _pendingExpanded: null,
+
+    // ===== Claude Auth (Pro/Max OAuth) — standalone provider =====
+    // Treated as its own card in Settings — separate from PROVIDER_HELP /
+    // settings.providers because it has no API key field. Auth lives in
+    // ~/.claude/.credentials.json (written by `claude login`), identity
+    // comes from `claude auth status --json` — both exposed via
+    // /api/settings/claude-auth/{status,disconnect}.
+    claudeAuth: {
+      loaded: false,           // first /status fetch completed
+      cli_installed: false,
+      cli_path: null,
+      credentials_file_present: false,
+      logged_in: false,
+      email: null,
+      org_name: null,
+      subscription_type: null,  // "max" / "pro" / "free" / null
+      expires_at: null,         // ms-since-epoch
+      reason: null,
+    },
+    // Connect modal state — managed independently from generic confirm()
+    // because it has its own polling lifecycle (every 3 sec until logged_in).
+    claudeAuthModal: {
+      open: false,
+      polling: false,
+      pollHandle: null,
+      copyToast: null,        // which command got copied ("install" | "login")
+    },
 
     // ===== init =====
     onGlobalKeyDown(ev) {
@@ -1349,7 +1404,7 @@ function portal() {
 
     initTheme() {
       const saved = localStorage.getItem("muselab_theme");
-      if (saved === "light" || saved === "dark") {
+      if (saved === "light" || saved === "dark" || saved === "eyecare") {
         this.theme = saved;
       } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
         this.theme = "light";
@@ -1377,18 +1432,27 @@ function portal() {
       document.documentElement.setAttribute("data-theme", this.theme);
       const link = document.getElementById("hljs-theme");
       if (link) {
+        // Eyecare reuses the dark hljs theme — its softer contrast fits
+        // the warm paper background better than the high-contrast light theme.
         link.href = this.theme === "light"
           ? "/static/vendor/highlight-theme-light.css"
           : "/static/vendor/highlight-theme.css";
+      }
+      // CodeMirror: use default (light) theme for both light and eyecare
+      // since material-darker is too harsh on warm backgrounds.
+      if (window.__muselab_cm) {
+        window.__muselab_cm.setOption("theme",
+          this.theme === "dark" ? "material-darker" : "default");
       }
     },
     applyAccent() {
       // 主色 + 派生色（hover / soft 半透明 / 文字色用浅化 mix 实现）
       const r = document.documentElement.style;
+      const isLight = this.theme === "light" || this.theme === "eyecare";
       r.setProperty("--c-accent", this.accent);
-      r.setProperty("--c-accent-hover", this._shade(this.accent, this.theme === "light" ? -15 : 12));
-      r.setProperty("--c-accent-soft", this._withAlpha(this.accent, this.theme === "light" ? 0.10 : 0.14));
-      r.setProperty("--c-accent-fg", this.theme === "light"
+      r.setProperty("--c-accent-hover", this._shade(this.accent, isLight ? -15 : 12));
+      r.setProperty("--c-accent-soft", this._withAlpha(this.accent, isLight ? 0.10 : 0.14));
+      r.setProperty("--c-accent-fg", isLight
         ? this._shade(this.accent, -25)
         : this._shade(this.accent, 25));
     },
@@ -1518,11 +1582,13 @@ function portal() {
       this._mascotT = setTimeout(() => { this.mascotGreet = false; }, 900);
     },
     toggleTheme() {
-      this.theme = this.theme === "light" ? "dark" : "light";
+      // Cycle: light → dark → eyecare → light
+      const order = ["light", "dark", "eyecare"];
+      const idx = order.indexOf(this.theme);
+      this.theme = order[(idx + 1) % order.length];
       this.applyTheme();
       this.applyAccent();   // 派生色对深浅敏感，重算
       localStorage.setItem("muselab_theme", this.theme);
-      if (window.__muselab_cm) window.__muselab_cm.setOption("theme", this.theme === "light" ? "default" : "material-darker");
     },
 
     // 色彩小工具
@@ -1851,6 +1917,32 @@ function portal() {
     // (skipping the auto-injected compact summaries) — they're what the
     // user remembers asking, so they make the best jump targets.
     outlineMessages() {
+      // Touch reactivity ping so the modal re-renders when backend fetch
+      // completes (same mechanism conversationOutline uses).
+      const _ = this.outlineVersion;
+      // Fire off a background backend fetch so the list reflects the
+      // FULL session, not just the lazy-loaded visible window. This was
+      // the source of "outline shows only 2 user messages on a 45-user
+      // session" — the original filter walked this.messages which only
+      // contains the recent slice after the long-history performance
+      // optimization (commit 664304a).
+      const sid = this.currentId;
+      if (sid) this.refreshOutlineFromBackend(sid);
+      // Primary: backend-sourced list, shaped to look like message
+      // objects so the modal template (which calls outlineText(m) and
+      // _scrollToUserMsg(m.uuid)) keeps working unchanged.
+      const st = sid && this.tabState && this.tabState[sid];
+      const backendList = st && st._backendOutline;
+      if (Array.isArray(backendList) && backendList.length > 0) {
+        return backendList.map(c => ({
+          uuid: c.uuid,
+          text: c.preview,         // outlineText reads .text first
+          role: "user",
+          ts: c.ts || null,
+          _fromBackend: true,
+        }));
+      }
+      // Fallback: live filter on the visible window (original behavior).
       return (this.messages || []).filter(
         m => m && m.role === "user" && !m._is_compact_summary);
     },
@@ -1861,13 +1953,54 @@ function portal() {
       const uuid = m && m.uuid;
       if (!uuid) return;
       if (this._isMobileLayout()) this.mobileTab = "chat";
-      this.$nextTick(() => {
+      const tryScroll = () => {
         const el = document.querySelector(
           `.msg[data-uuid="${CSS.escape(uuid)}"]`);
-        if (!el) return;
+        if (!el) return false;
         el.scrollIntoView({ behavior: "smooth", block: "center" });
         el.classList.add("msg-highlight");
         setTimeout(() => el.classList.remove("msg-highlight"), 2400);
+        return true;
+      };
+      this.$nextTick(() => {
+        if (tryScroll()) return;
+        // Target not in DOM — it lives in the lazy stash. Find it there
+        // and pull everything from that index forward into visible
+        // messages, then retry scroll. Mirrors jumpToOutlineItem's
+        // backend branch but for the modal outline path.
+        const sid = this.currentId;
+        const st = sid && this.tabState && this.tabState[sid];
+        const earlier = st && st._earlierMessages;
+        if (!Array.isArray(earlier) || earlier.length === 0) return;
+        const idx = earlier.findIndex(em => em && em.uuid === uuid);
+        if (idx < 0) {
+          // Not in lazy stash either — hard reload as last resort.
+          (async () => {
+            await this.loadSession(sid);
+            this.$nextTick(() => tryScroll());
+          })();
+          return;
+        }
+        const batch = earlier.splice(idx);
+        batch.forEach(em => {
+          if (em.role === "assistant" && em.text && !em.html) {
+            em.html = this.mdRender(em.text);
+          }
+        });
+        const oldScrollEl = this.$refs.chatBody;
+        const oldScrollHeight = oldScrollEl ? oldScrollEl.scrollHeight : 0;
+        const oldScrollTop = oldScrollEl ? oldScrollEl.scrollTop : 0;
+        st.messages.unshift(...batch);
+        this.messages = st.messages;
+        st._hasMoreHistory = (st._earlierMessages || []).length > 0;
+        this.$nextTick(() => {
+          if (oldScrollEl) {
+            const newScrollHeight = oldScrollEl.scrollHeight;
+            oldScrollEl.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
+          }
+          this.highlightCode(".chat-body");
+          setTimeout(tryScroll, 50);
+        });
       });
     },
     // Short preview text for an outline row — first line, trimmed.
@@ -2018,6 +2151,99 @@ function portal() {
         return name.slice(5).split("__").join(" · ");
       }
       return name;
+    },
+
+    // ===== MCP tool enrichment =====
+    // Known MCP servers get a recognizable emoji icon + short label so
+    // the user can quickly scan "ah, that's a Gmail call" vs "that's a
+    // memory write" vs "that's a custom muselab tool" — instead of every
+    // mcp__* call looking the same. Unknown servers fall back to the
+    // generic plug icon.
+    MCP_SERVER_ICONS: {
+      // Google ecosystem
+      "Gmail":                "📧",  "gmail":                "📧",
+      "Google_Calendar":      "📅",  "google_calendar":      "📅",
+      "Google_Drive":         "💾",  "google_drive":         "💾",
+      "Google_Docs":          "📄",
+      // Dev / collaboration
+      "github":               "🐙",  "GitHub":               "🐙",
+      "git":                  "⎇",
+      "linear":               "📋",
+      "slack":                "💬",
+      "notion":               "📝",
+      // Cognitive / data
+      "memory":               "🧠",
+      "sequential-thinking":  "🤔",
+      "filesystem":           "📁",
+      "time":                 "⏰",
+      "fetch":                "🌐",
+      // muselab-internal
+      "muselab":              "🎭",
+    },
+    // Parse mcp__<server>__<tool> into a UI-friendly descriptor.
+    // Server names sometimes carry an OAuth-provider prefix like
+    // "claude_ai_Gmail" — we strip the known prefix to find the icon.
+    mcpServerInfo(toolName) {
+      if (!toolName || !toolName.startsWith("mcp__")) return null;
+      const rest = toolName.slice(5);
+      const parts = rest.split("__");
+      let rawServer = parts[0] || "";
+      const tool = parts.slice(1).join(" · ");
+      // Strip OAuth provider prefix if present ("claude_ai_Gmail" → "Gmail")
+      let cleanServer = rawServer;
+      const OAUTH_PREFIXES = ["claude_ai_", "claude_ai__"];
+      for (const p of OAUTH_PREFIXES) {
+        if (cleanServer.startsWith(p)) {
+          cleanServer = cleanServer.slice(p.length);
+          break;
+        }
+      }
+      const icon = this.MCP_SERVER_ICONS[cleanServer] || "🔌";
+      return {
+        rawServer,
+        serverLabel: cleanServer.replace(/_/g, " "),
+        toolLabel: tool,
+        icon,
+      };
+    },
+    // Pretty-print MCP tool input for the bubble — compact, with smart
+    // truncation. Long values (>60 chars) get an ellipsis.
+    mcpInputPreview(m) {
+      const inp = m && m.input;
+      if (!inp || typeof inp !== "object") return "";
+      const pairs = [];
+      for (const [k, v] of Object.entries(inp)) {
+        let val;
+        if (v === null || v === undefined) val = "—";
+        else if (typeof v === "string") {
+          val = v.length > 60 ? v.slice(0, 57) + "…" : v;
+        }
+        else if (typeof v === "boolean" || typeof v === "number") val = String(v);
+        else if (Array.isArray(v)) val = `[${v.length} items]`;
+        else val = "{...}";
+        pairs.push(`${k}: ${val}`);
+      }
+      return pairs.slice(0, 3).join(" · ")
+              + (pairs.length > 3 ? ` · +${pairs.length - 3} more` : "");
+    },
+    // Try to render MCP tool result intelligently. JSON gets pretty-printed,
+    // arrays become bullet lists, plain text passes through. Falls back to
+    // raw text on parse failure (always safe — never throws).
+    mcpResultFormatted(m) {
+      const text = (m && (m.text || m.preview)) || "";
+      if (!text) return { kind: "empty", value: "" };
+      const trimmed = text.trim();
+      // Try JSON first
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            return { kind: "array", value: parsed };
+          }
+          return { kind: "object", value: JSON.stringify(parsed, null, 2) };
+        } catch (e) { /* fall through to text */ }
+      }
+      return { kind: "text", value: text };
     },
 
     mdRender(text) {
@@ -2732,6 +2958,18 @@ function portal() {
         // True while an async _fetchTabUsage request is in flight for this
         // session — prevents concurrent duplicate fetches from piling up.
         _usageFetching: false,
+        // Lazy-load stash: older messages from this session that haven't
+        // been rendered yet. Populated by loadSession() when history
+        // exceeds INITIAL_LOAD; drained in batches by loadEarlierMessages.
+        // mdRender on these is deferred — they hold raw text only.
+        _earlierMessages: [],
+        // True iff _earlierMessages is non-empty — drives the "Load earlier"
+        // button visibility.
+        _hasMoreHistory: false,
+        // True iff the absolute MAX_TOTAL cap kicked in during loadSession
+        // (sessions with thousands of messages). Shows a hint that not
+        // every message is reachable from the UI, full history is in JSONL.
+        _truncatedFromTop: false,
       };
     },
     _ensureTabState(id) {
@@ -3291,14 +3529,31 @@ function portal() {
     // but Alpine v3 doesn't deep-wrap array elements — direct property set
     // didn't trigger re-render. Top-level prop + spread-assign does.
     _expandedMsgs: {},
+    // Smart-collapse memory: once the user manually expands or collapses a
+    // tool of kind X in this session, subsequent same-kind tools default
+    // to that state. Reduces "expand 5 Read results in a row" friction
+    // for users who actually want to see content; preserves the
+    // default-collapsed behavior for users who don't touch anything.
+    // Reset on each new session (loadSession clears via _ensureTabState).
+    _kindExpansionPrefs: {},
     _msgKey(i, m) {
       if (!m) return "";
       return m.uuid || m._k || ("m-" + i);
     },
-    isMsgExpanded(i, m) {
+    isMsgExpanded(i, m, defaultOpen) {
       if (!m) return true;
       const k = this._msgKey(i, m);
       if (k in this._expandedMsgs) return this._expandedMsgs[k];
+      // Smart-collapse: if the user has shown a preference for this kind
+      // of tool in this session, honor it.
+      const kind = this.toolResultKind(m);
+      if (kind && kind in this._kindExpansionPrefs) {
+        return this._kindExpansionPrefs[kind];
+      }
+      // Explicit caller hint (e.g. diff strip wants to be open by default)
+      // overrides the default-collapsed behavior. Caller still respects
+      // user's explicit toggle (the _expandedMsgs check above).
+      if (defaultOpen) return true;
       // Default: only the actively-streaming last block is expanded.
       const msgs = this.messages || [];
       return !!this.streaming && i === msgs.length - 1;
@@ -3308,8 +3563,16 @@ function portal() {
       const idx = (i ?? (this.messages || []).indexOf(m));
       const k = this._msgKey(idx, m);
       const cur = this.isMsgExpanded(idx, m);
+      const newState = !cur;
       // Spread-assign so Alpine sees the replacement and re-evaluates.
-      this._expandedMsgs = { ...this._expandedMsgs, [k]: !cur };
+      this._expandedMsgs = { ...this._expandedMsgs, [k]: newState };
+      // Smart-collapse: record the user's preference for this kind so
+      // future tools of the same kind inherit it. Only do this for
+      // tool_result messages (kind is well-defined there).
+      const kind = this.toolResultKind(m);
+      if (kind && m.role === "tool_result") {
+        this._kindExpansionPrefs = { ...this._kindExpansionPrefs, [kind]: newState };
+      }
     },
     toolResultClass(i, m) {
       let cls = "tool-result";
@@ -3321,7 +3584,7 @@ function portal() {
       if (kind) cls += " kind-" + kind;
       return cls;
     },
-    toolResultSummary(m) {
+    toolResultSummary(m, i) {
       const text = (m && (m.text || m.preview)) || "";
       const lines = text.split("\n").length;
       const kind = this.toolResultKind(m);
@@ -3335,20 +3598,348 @@ function portal() {
           : (this.lang === "zh" ? `✗ 退出码 ${ec}` : `✗ exit ${ec}`);
         return `${tag} · ${lines}${suffix}`;
       }
+      // Read / Edit / Write: bring the filename forward into the summary
+      // by peeking at the immediately-preceding tool_use. With this the
+      // user can see what was read even when the result is collapsed.
+      if ((kind === "read" || kind === "search") && i !== undefined && i > 0) {
+        const prev = this.messages[i - 1];
+        if (prev && prev.role === "tool_use") {
+          const path = this.toolFilePath(prev);
+          if (path) {
+            const fname = path.split("/").pop();
+            return `${fname} · ${lines}${suffix}`;
+          }
+          // Grep / Glob: show the pattern
+          if (prev.name === "Grep" || prev.name === "Glob") {
+            const pat = (prev.input && (prev.input.pattern || prev.input.path)) || "";
+            const matchSuffix = this.lang === "zh" ? " 项匹配" : " matches";
+            if (pat) return `"${pat}" · ${lines}${matchSuffix}`;
+          }
+        }
+      }
       return lines + suffix;
     },
+
+    // Parse ripgrep / grep output into clickable rows.
+    // ripgrep formats hits as `path:lineno:content` or `path:content` (without
+    // -n). We split conservatively — anything we can't parse falls back to
+    // the original text line so users still see the unstructured result.
+    parseSearchHits(text) {
+      if (!text) return [];
+      const lines = text.split("\n");
+      const out = [];
+      for (const ln of lines) {
+        if (!ln.trim()) continue;
+        // Try path:lineno:content
+        const m = ln.match(/^([^:]+):(\d+):(.*)$/);
+        if (m) {
+          out.push({ path: m[1], lineno: parseInt(m[2], 10), content: m[3], raw: ln });
+          continue;
+        }
+        // Try path (Glob output is just paths)
+        if (!ln.includes(":") || ln.match(/^[^\s:]+$/)) {
+          out.push({ path: ln.trim(), lineno: null, content: "", raw: ln });
+          continue;
+        }
+        out.push({ path: "", lineno: null, content: ln, raw: ln });
+      }
+      return out;
+    },
+    // WebFetch / WebSearch source url (from the input). Falls back to "" so
+    // the template can hide the badge cleanly when not available.
+    webSourceUrl(toolUseMessage) {
+      const inp = toolUseMessage && toolUseMessage.input;
+      if (!inp) return "";
+      return inp.url || inp.query || "";
+    },
+    webSourceDomain(url) {
+      if (!url) return "";
+      // For URLs: extract hostname. For queries: just return as-is (with
+      // 🔍 prefix in the template).
+      if (/^https?:\/\//.test(url)) {
+        try { return new URL(url).hostname; }
+        catch (e) { return url; }
+      }
+      return url;
+    },
+    webIsUrl(url) {
+      return /^https?:\/\//.test(url || "");
+    },
+    // Subagent task card data (Task tool with subagent_type field).
+    subagentCardInfo(m) {
+      if (!m || m.name !== "Task") return null;
+      const inp = m.input || {};
+      return {
+        subagentType: inp.subagent_type || "general-purpose",
+        description: inp.description || "",
+        prompt: inp.prompt || "",
+        // Background mode shows distinct visual since the result may
+        // not arrive in this turn.
+        background: !!inp.run_in_background,
+        isolation: inp.isolation || "",
+      };
+    },
+    // Skill card data — name + description + trigger summary.
+    skillCardInfo(m) {
+      if (!m || m.name !== "Skill") return null;
+      const inp = m.input || {};
+      return {
+        skill: inp.skill || "",
+        args: inp.args || "",
+      };
+    },
+
+    // Hint generator for failed tool calls. Pattern-matches the error
+    // text against common failure modes and returns an actionable fix.
+    // Returns null for unrecognized errors — the renderer falls back to
+    // the raw error body. Localized to current lang.
+    errorFixHint(m) {
+      if (!m || !m.is_error) return null;
+      const txt = ((m.text || m.preview || "") + "").toLowerCase();
+      const zh = this.lang === "zh";
+      // Edit failure: old_string not unique / not found
+      if (txt.includes("old_string") &&
+          (txt.includes("not found") || txt.includes("could not find"))) {
+        return zh
+          ? "提示:旧字符串没匹配上。文件可能被改过 — 试试先 Read 一次再 Edit,或给 old_string 加更多上下文让它唯一。"
+          : "Hint: old_string didn't match. The file may have changed between Read and Edit — try Read again, or extend old_string with more context to make it unique.";
+      }
+      if (txt.includes("old_string") && txt.includes("not unique")) {
+        return zh
+          ? "提示:旧字符串在文件里出现多次。给 old_string 加更多前后行让它唯一,或者用 replace_all=true。"
+          : "Hint: old_string is not unique in the file. Add surrounding lines to disambiguate, or set replace_all=true.";
+      }
+      // File system failures
+      if (txt.includes("no such file") || txt.includes("does not exist")) {
+        return zh
+          ? "提示:路径不存在。检查拼写,或者确认你跑在正确的工作目录。"
+          : "Hint: path doesn't exist. Check the spelling, or confirm the current working directory.";
+      }
+      if (txt.includes("permission denied") || txt.includes("eacces")) {
+        return zh
+          ? "提示:权限不足。可能需要 chmod / sudo,或者文件被另一个进程占用。"
+          : "Hint: permission denied. Try chmod, or check if another process has the file locked.";
+      }
+      // Timeout / hung
+      if (txt.includes("timed out") || txt.includes("timeout")) {
+        return zh
+          ? "提示:超时。缩小命令范围(更窄的 grep / 更小的 head_limit),或显式传 timeout 参数。"
+          : "Hint: timed out. Narrow the scope (tighter grep / smaller head_limit) or pass an explicit timeout.";
+      }
+      // JSON / parse failures
+      if (txt.includes("json") && (txt.includes("decode") || txt.includes("parse"))) {
+        return zh
+          ? "提示:JSON 解析失败。检查工具返回是否为有效 JSON;也可能 server 报错时把 stderr 混进了 stdout。"
+          : "Hint: JSON parse error. The tool may have returned non-JSON, or mixed stderr into stdout.";
+      }
+      // Network
+      if (txt.includes("connection refused") || txt.includes("network") ||
+          txt.includes("dns") || txt.includes("getaddrinfo")) {
+        return zh
+          ? "提示:网络问题。检查代理 / VPN / 目标服务是否在跑。"
+          : "Hint: network problem. Check your proxy / VPN / whether the target service is up.";
+      }
+      // Auth
+      if (txt.includes("401") || txt.includes("unauthorized") ||
+          txt.includes("invalid api key") || txt.includes("authentication")) {
+        return zh
+          ? "提示:认证失败。检查 Settings 里对应 provider 的 API key,或 Claude Auth 是否仍然有效。"
+          : "Hint: auth failed. Check the provider's API key in Settings, or whether Claude Auth is still valid.";
+      }
+      // Rate limit
+      if (txt.includes("rate limit") || txt.includes("429") || txt.includes("too many requests")) {
+        return zh
+          ? "提示:触发限流。等几分钟再试,或换 provider。"
+          : "Hint: rate limited. Wait a few minutes, or switch to another provider.";
+      }
+      return null;
+    },
+
+    // Find the matching tool_use for a given tool_result by walking
+    // backwards through messages and matching tool_use_id. Used by the
+    // diff-badge renderer to count +/- on Edit/Write/MultiEdit.
+    findToolUseFor(toolResult, fromIdx) {
+      if (!toolResult || fromIdx === undefined || fromIdx === null) return null;
+      const id = toolResult.tool_use_id || toolResult.tool_id;
+      if (!id) {
+        // Fallback: walk backwards looking for the nearest tool_use
+        for (let j = fromIdx - 1; j >= Math.max(0, fromIdx - 3); j--) {
+          const c = this.messages[j];
+          if (c && c.role === "tool_use") return c;
+        }
+        return null;
+      }
+      for (let j = fromIdx - 1; j >= 0; j--) {
+        const c = this.messages[j];
+        if (c && c.role === "tool_use" &&
+            (c.id === id || c.tool_use_id === id)) return c;
+      }
+      return null;
+    },
+    // Declarative tool → renderer-kind registry. Replaces the original
+    // switch so third-party plugins / MCP servers can register a renderer
+    // kind without modifying core code:
+    //
+    //   window.muselabApp.registerToolRenderer('mcp__github__pr', 'web');
+    //
+    // The set of supported kinds is bounded by the templates baked into
+    // index.html (bash / read / web / search / mcp / task). Picking an
+    // unknown kind just falls back to the plain-text renderer — degrades
+    // gracefully.
+    TOOL_RENDERERS: {
+      "Bash":     "bash",
+      "Read":     "read",
+      "WebFetch": "web",
+      "WebSearch": "web",
+      "Glob":     "search",
+      "Grep":     "search",
+    },
+    // Tool-name pattern → kind. Order matters; first match wins. Used
+    // for prefix-based matches (Task*, mcp__*) so the table stays compact.
+    TOOL_RENDERER_PATTERNS: [
+      { test: (n) => n.startsWith("Task"), kind: "task" },
+      { test: (n) => n.startsWith("mcp__"), kind: "mcp" },
+    ],
     toolResultKind(m) {
-      // Map tool_name → renderer key. Drives both CSS class and the
-      // Alpine template that fires inside the expanded body.
       if (!m) return "";
       const name = m.tool_name || "";
-      if (name === "Bash") return "bash";
-      if (name === "Read") return "read";
-      if (name === "WebFetch") return "web";
-      if (name === "WebSearch") return "web";
-      if (name === "Glob" || name === "Grep") return "search";
-      if (name && name.startsWith("mcp__")) return "mcp";
+      if (this.TOOL_RENDERERS[name]) return this.TOOL_RENDERERS[name];
+      for (const p of this.TOOL_RENDERER_PATTERNS) {
+        if (p.test(name)) return p.kind;
+      }
       return "";
+    },
+    // Whether this tool_result should be hidden entirely. Used to suppress
+    // noise: Edit/Write/MultiEdit's "File has been updated successfully"
+    // adds zero info beyond what the diff strip already shows; Task*'s
+    // "Task #N created successfully" similarly. Failed cases (is_error
+    // true) are NEVER hidden — the user needs to see what broke + the
+    // errorFixHint banner attached to the same result.
+    shouldHideToolResult(m) {
+      if (!m) return false;
+      if (m.is_error) return false;  // never hide failures
+      const kind = this.toolResultKind(m);
+      if (kind === "task") return true;
+      const name = m.tool_name || "";
+      if (["Edit", "Write", "MultiEdit"].includes(name)) return true;
+      return false;
+    },
+
+    // True iff this Edit/Write/MultiEdit tool_use is Muse's CURRENT
+    // action — i.e., there's no later tool call of ANY kind after it.
+    // (Previous logic only checked for later Edit/Write, but a Bash or
+    // Read after the Edit still means the Edit is "done and moved past"
+    // — its diff should fold to keep the scroll history clean. Only the
+    // truly latest action gets the auto-expanded diff.)
+    // User-explicit toggles (via toggleMsgExpanded) still override.
+    isLatestEditTool(i, m) {
+      if (!m || !["Edit", "Write", "MultiEdit"].includes(m.name)) return false;
+      const msgs = this.messages || [];
+      for (let j = i + 1; j < msgs.length; j++) {
+        const c = msgs[j];
+        // Any later tool_use or tool_result means this Edit is no longer
+        // Muse's most recent action — fold its diff.
+        if (c && (c.role === "tool_use" || c.role === "tool_result")) {
+          return false;
+        }
+      }
+      return true;
+    },
+
+    // Public hook for plugins / extensions. Adds an entry to the registry
+    // at runtime — subsequent toolResultKind() calls see it. Returns true
+    // if registration succeeded (the kind is one of the known templates),
+    // false otherwise so the caller knows their kind won't render.
+    registerToolRenderer(name, kind) {
+      const KNOWN_KINDS = new Set(["bash", "read", "web", "search", "mcp", "task"]);
+      if (!name || !kind) return false;
+      this.TOOL_RENDERERS[name] = kind;
+      return KNOWN_KINDS.has(kind);
+    },
+
+    // ===== Task* tool family — compact log-line rendering =====
+    // The TaskCreate / TaskUpdate / TaskList / TaskGet / TaskOutput /
+    // TaskStop tools are Muse's internal planning scratchpad. Dumping
+    // the raw JSON of each call buries the actual conversation.
+    // Instead we render each *meaningful* call as a single-line log
+    // entry (icon + verb + #id + subject + state) and hide pure-read
+    // calls (TaskList / TaskGet / TaskOutput) that don't change anything.
+    // Adjacent task lines get visually fused into a "plan panel" via CSS.
+    TASK_TOOL_NAMES: ["TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+                       "TaskOutput", "TaskStop"],
+    isTaskTool(m) {
+      return !!(m && m.name && this.TASK_TOOL_NAMES.includes(m.name));
+    },
+    // Render-time data for a Task* tool_use bubble. Returns null when the
+    // call should be hidden entirely (pure queries like TaskList).
+    taskLogLine(m) {
+      if (!m || !m.name) return null;
+      const inp = m.input || {};
+      const status = inp.status || "";
+      const taskId = inp.taskId || inp.task_id || "";
+      const subject = inp.subject || "";
+      const desc = inp.description || "";
+      // Pull what the message-payload knows about the task subject when
+      // TaskUpdate doesn't include it (subjects are stable after Create).
+      switch (m.name) {
+        case "TaskCreate":
+          return {
+            verb: this.lang === "zh" ? "新建" : "Created",
+            icon: "+", colorClass: "task-created",
+            ref: "", subject, detail: desc,
+          };
+        case "TaskUpdate":
+          if (status === "completed") {
+            return { verb: this.lang === "zh" ? "完成" : "Done",
+                     icon: "✓", colorClass: "task-done",
+                     ref: "#" + taskId, subject: "", detail: "" };
+          }
+          if (status === "in_progress") {
+            return { verb: this.lang === "zh" ? "开始" : "Started",
+                     icon: "→", colorClass: "task-started",
+                     ref: "#" + taskId, subject: "", detail: "" };
+          }
+          if (status === "deleted") {
+            return { verb: this.lang === "zh" ? "删除" : "Deleted",
+                     icon: "✗", colorClass: "task-deleted",
+                     ref: "#" + taskId, subject: "", detail: "" };
+          }
+          if (status === "pending") {
+            return { verb: this.lang === "zh" ? "重置" : "Reset",
+                     icon: "○", colorClass: "task-pending",
+                     ref: "#" + taskId, subject: "", detail: "" };
+          }
+          // Non-status update (rename / addBlockedBy / metadata):
+          // only show if there's something user-visible to surface
+          // (taskId + at least subject or activeForm). Otherwise this
+          // is pure metadata churn — hide.
+          if (!taskId && !inp.subject && !inp.activeForm) return null;
+          if (!taskId) return null;  // "更新 #" with no ID is meaningless
+          // If the only change is internal metadata (no subject / no
+          // visible label change), also hide.
+          if (!inp.subject && !inp.activeForm && !inp.description) return null;
+          return { verb: this.lang === "zh" ? "更新" : "Updated",
+                   icon: "·", colorClass: "task-updated",
+                   ref: "#" + taskId,
+                   subject: inp.subject || inp.activeForm || "",
+                   detail: "" };
+        case "TaskStop":
+          return { verb: this.lang === "zh" ? "停止" : "Stopped",
+                   icon: "✗", colorClass: "task-deleted",
+                   ref: "#" + taskId, subject: "", detail: "" };
+        case "TaskList":
+        case "TaskGet":
+        case "TaskOutput":
+          // Pure queries — Muse asking itself about state. Hidden.
+          return null;
+        default:
+          return null;
+      }
+    },
+    // Whether this Task tool_use should be visible at all. Used by Alpine
+    // x-if to skip the whole bubble for pure queries.
+    shouldRenderTaskLine(m) {
+      return this.taskLogLine(m) !== null;
     },
     toolResultBodyText(m) {
       // Full body for the expanded view (or the truncation-marker tail).
@@ -3444,6 +4035,21 @@ function portal() {
       while (i < m) { ops.push({ op: "del", text: a[i++] }); }
       while (j < n) { ops.push({ op: "ins", text: b[j++] }); }
       return ops;
+    },
+    // +X / -Y badge data for an Edit / Write / MultiEdit tool_use bubble.
+    // Counts the LCS ops we already compute for the diff strip — same
+    // truth as the visible diff, no parallel logic to drift.
+    editDiffStats(m) {
+      if (!m) return null;
+      const ops = this.editDiffOps(m);
+      if (!ops || !ops.length) return null;
+      let plus = 0, minus = 0;
+      for (const op of ops) {
+        if (op.op === "ins") plus++;
+        else if (op.op === "del") minus++;
+      }
+      if (plus === 0 && minus === 0) return null;
+      return { plus, minus };
     },
     editDiffOps(m) {
       // Returns ops for an Edit / Write / MultiEdit tool_use. MultiEdit's
@@ -4166,41 +4772,123 @@ function portal() {
             }
           }
         });
-        const next = (s.messages || []).map((m, i) => {
-          const out = { ...m, _k: sid + "-" + i };
-          if (m.role === "assistant" && m.text) out.html = this.mdRender(m.text);
+        // Build message envelopes WITHOUT running mdRender — the heavy
+        // markdown→HTML pass is the dominant cost for long sessions, so we
+        // defer it until the message is actually about to be shown.
+        const buildEnvelope = (m, idx) => {
+          const out = { ...m, _k: sid + "-" + idx };
           // Restore blob preview URLs on user messages with images
           if (m.role === "user" && m.images && m.images.length) {
             const key = (m.text || "") + ":" + m.images.length;
             const saved = _blobPreviews.get(key);
             if (saved) {
-              out.images = m.images.map((im, idx) => ({
+              out.images = m.images.map((im, i) => ({
                 ...im,
-                preview: (saved[idx] && saved[idx].startsWith("blob:"))
-                           ? saved[idx] : (im.preview || null),
+                preview: (saved[i] && saved[i].startsWith("blob:"))
+                           ? saved[i] : (im.preview || null),
               }));
             }
           }
           return out;
-        });
+        };
+        const all = (s.messages || []).map(buildEnvelope);
+        // Lazy-load thresholds — only render the tail of the conversation on
+        // first paint; older messages stay in a "to-render" stash and get
+        // mdRender'd on demand when the user clicks "Load earlier".
+        // Rationale: a long indie-coding session can rack up hundreds of
+        // assistant messages, each potentially with a 200-line code block.
+        // mdRender + Alpine x-for over all of them locks up the main thread
+        // for several seconds on initial load. Rendering only the recent
+        // 30 keeps switch-to-session snappy; "Load earlier" lets the user
+        // page back in batches of 50 as needed.
+        const INITIAL_LOAD = 30;
+        const renderMarkdown = (m) => {
+          if (m.role === "assistant" && m.text && !m.html) {
+            m.html = this.mdRender(m.text);
+          }
+        };
+        // Split into earlier (deferred) vs visible (rendered now).
+        //
+        // Naive `slice(-INITIAL_LOAD)` breaks badly when the tail of the
+        // conversation is tool-call heavy: one turn can easily have 20+
+        // tool_use/tool_result/task-update messages, so the last 30 may
+        // contain zero user/assistant TEXT — the user opens the session
+        // and sees only Task-update bubbles with no actual conversation.
+        //
+        // Smarter strategy: rewind from the end until we've included AT
+        // LEAST the last two user messages (so there's at least one full
+        // back-and-forth visible), capped at INITIAL_LOAD * 5 so a
+        // pathological 500-tool-call turn doesn't render everything.
+        const pickVisibleStart = (msgs) => {
+          if (msgs.length <= INITIAL_LOAD) return 0;
+          // Default tail position
+          let start = msgs.length - INITIAL_LOAD;
+          // Walk backwards collecting user-message indices
+          const userIdx = [];
+          for (let j = msgs.length - 1; j >= 0; j--) {
+            if (msgs[j] && msgs[j].role === "user") {
+              userIdx.push(j);
+              if (userIdx.length >= 2) break;
+            }
+          }
+          // Anchor on the 2nd-most-recent user msg if we found one
+          if (userIdx.length >= 2) start = Math.min(start, userIdx[1]);
+          else if (userIdx.length === 1) start = Math.min(start, userIdx[0]);
+          // Safety cap so a single huge turn doesn't render hundreds
+          const HARD_CAP = INITIAL_LOAD * 5;
+          if (msgs.length - start > HARD_CAP) start = msgs.length - HARD_CAP;
+          return Math.max(0, start);
+        };
+        const startIdx = pickVisibleStart(all);
+        const visible = all.slice(startIdx);
+        const earlier = all.slice(0, startIdx);
+        visible.forEach(renderMarkdown);
         // Mutate in place — preserves the Array reference Alpine is watching.
         st.messages.length = 0;
-        st.messages.push(...next);
-        // Cap displayed messages at 300 to keep Alpine x-for performant.
-        // Older messages are preserved in the JSONL transcript; user can
-        // reload to see the full history (TODO: virtual scroll).
-        const MAX_DISPLAY = 300;
-        if (st.messages.length > MAX_DISPLAY) {
-          st.messages = st.messages.slice(-MAX_DISPLAY);
-          // Insert a synthetic system note at the top so the user knows
-          st.messages.unshift({
-            role: "system_note",
-            id: "truncation-note",
-            _k: sid + "-truncation-note",
-            text: this.lang === "zh"
-              ? `（仅显示最近 ${MAX_DISPLAY} 条消息，完整历史保存在 JSONL 文件中）`
-              : `(Showing last ${MAX_DISPLAY} messages — full history is in the JSONL transcript)`,
-          });
+        st.messages.push(...visible);
+        // Stash older messages on the per-tab state; the "Load earlier"
+        // button reads from here.
+        st._earlierMessages = earlier;
+        st._hasMoreHistory = earlier.length > 0;
+        // Build a COMPLETE outline cache from the full `all` array (not the
+        // lazy-split visible/earlier subsets). Previously conversationOutline
+        // walked _earlierMessages + messages, but Alpine reactivity edge cases
+        // were making _earlierMessages appear empty to the outline call site
+        // even when populated — users saw outlines with only 2 entries on
+        // sessions that actually had 39+ user prompts. Pre-computing here,
+        // once, sidesteps that entirely.
+        const _summ = (m) => {
+          const raw = ((m && m.text) || "").trim();
+          if (!raw) return "(empty)";
+          const oneLine = raw.split("\n").find(l => {
+            const s = l.trim();
+            return s && !s.startsWith(">");
+          }) || raw.split("\n")[0] || raw;
+          const cleaned = oneLine.replace(/^#+\s*/, "").trim();
+          return cleaned.length > 80 ? cleaned.slice(0, 77) + "…" : cleaned;
+        };
+        st._fullUserOutline = [];
+        for (let oi = 0; oi < all.length; oi++) {
+          const m = all[oi];
+          if (m && m.role === "user") {
+            st._fullUserOutline.push({
+              preview: _summ(m),
+              uuid: m.uuid || null,
+              origIdx: oi,          // absolute position in `all`
+              splitBoundary: startIdx,
+            });
+          }
+        }
+        // Absolute cap: if even the deferred stash is enormous (e.g. 2000+
+        // messages), truncate from the front so we don't keep arbitrarily
+        // large arrays in memory. Full history is always in the JSONL file.
+        const MAX_TOTAL = 2000;
+        if (st._earlierMessages.length + st.messages.length > MAX_TOTAL) {
+          const overflow = (st._earlierMessages.length + st.messages.length) - MAX_TOTAL;
+          st._earlierMessages = st._earlierMessages.slice(overflow);
+          st._truncatedFromTop = true;
+        } else {
+          st._truncatedFromTop = false;
         }
         if (isCurrent) {
           this.messages = st.messages;
@@ -4225,6 +4913,122 @@ function portal() {
         if (isCurrent) this.messagesLoading = false;
       }
     },
+
+    // ===== Lazy-loaded history controls =====
+    // Pop the next batch of older messages off the per-tab stash, mdRender
+    // them on demand, prepend to messages[]. Critical: preserve scroll
+    // position so the user's current viewport doesn't jump when older
+    // content unfolds above.
+    LOAD_MORE_BATCH: 50,
+    // Reactivity ping: bumped whenever refreshOutlineFromBackend writes
+    // new data. outlineMessages() reads it so Alpine knows to re-render
+    // the msg-outline-modal when async fetch completes. Without this,
+    // the first paint sees an empty backend cache and Alpine never
+    // re-checks it after fetch returns.
+    outlineVersion: 0,
+
+    // Build a navigable outline of the CURRENT session: every user
+    // message becomes a clickable jump target. Spans both the visible
+    // messages (already rendered) AND the deferred _earlierMessages
+    // stash, so the user can scan the entire conversation arc and
+    // jump to any point — even into history we haven't rendered yet.
+    // Trigger a background fetch of session-level outline if we don't
+    // have one yet or it's stale (>30s). Stores result on tabState so
+    // outlineMessages() reads it synchronously. Idempotent.
+    async refreshOutlineFromBackend(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return;
+      const st = this._ensureTabState(sid);
+      const now = Date.now();
+      if (st._outlineFetchedAt && (now - st._outlineFetchedAt) < 30000) return;
+      if (st._outlineFetching) return;
+      st._outlineFetching = true;
+      try {
+        const r = await fetch("/api/chat/sessions/" + sid, { headers: this.hdr() });
+        if (!r.ok) return;
+        const data = await r.json();
+        const users = (data.messages || []).filter(m => m && m.role === "user");
+        const fresh = users.map(m => {
+          const raw = ((m.text || "") + "").trim();
+          let preview = "(empty)";
+          if (raw) {
+            const oneLine = raw.split("\n").find(l => {
+              const s = l.trim();
+              return s && !s.startsWith(">");
+            }) || raw.split("\n")[0] || raw;
+            const cleaned = oneLine.replace(/^#+\s*/, "").trim();
+            preview = cleaned.length > 80 ? cleaned.slice(0, 77) + "…" : cleaned;
+          }
+          return { preview, uuid: m.uuid || null };
+        });
+        st._backendOutline = fresh;
+        st._outlineFetchedAt = now;
+        // Bump the reactivity ping so outlineMessages() re-runs and
+        // the Alpine template re-renders with the freshly-fetched list.
+        // Nested mutations on tabState[sid]._backendOutline alone do NOT
+        // trigger Alpine's dependency graph (Proxy doesn't see deep
+        // writes through a getter chain).
+        this.outlineVersion++;
+      } catch (_) {
+        // swallow — fallback path keeps outline working
+      } finally {
+        st._outlineFetching = false;
+      }
+    },
+
+    loadEarlierMessages(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return;
+      const st = this._ensureTabState(sid);
+      if (!st._earlierMessages || !st._earlierMessages.length) return;
+      // Take from the END of the earlier stash (those are the messages
+      // immediately preceding what's currently shown — "closest in time").
+      const batch = st._earlierMessages.splice(-this.LOAD_MORE_BATCH);
+      // Now do the deferred mdRender pass on this batch only.
+      batch.forEach(m => {
+        if (m.role === "assistant" && m.text && !m.html) {
+          m.html = this.mdRender(m.text);
+        }
+      });
+      const isCurrent = sid === this.currentId;
+      // Capture scroll geometry BEFORE the DOM grows so we can restore the
+      // user's visible-content offset after Alpine re-renders.
+      const scrollEl = isCurrent ? this.$refs.chatBody : null;
+      const oldScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
+      const oldScrollTop = scrollEl ? scrollEl.scrollTop : 0;
+      st.messages.unshift(...batch);
+      if (isCurrent) this.messages = st.messages;
+      st._hasMoreHistory = st._earlierMessages.length > 0;
+      // Restore scroll position so the message the user was looking at
+      // stays in place. Without this the viewport snaps to the new top.
+      if (scrollEl) {
+        this.$nextTick(() => {
+          const newScrollHeight = scrollEl.scrollHeight;
+          scrollEl.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
+          // Re-run code highlighting on the newly prepended content.
+          this.highlightCode(".chat-body");
+        });
+      }
+    },
+    hasMoreHistory(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return false;
+      const st = this.tabState[sid];
+      return !!(st && st._hasMoreHistory);
+    },
+    earlierMessageCount(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return 0;
+      const st = this.tabState[sid];
+      return st && st._earlierMessages ? st._earlierMessages.length : 0;
+    },
+    historyTruncated(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return false;
+      const st = this.tabState[sid];
+      return !!(st && st._truncatedFromTop);
+    },
+
     async renameSession() {
       const cur = this.sessions.find(x => x.id === this.currentId);
       if (!cur) return;
@@ -4288,6 +5092,163 @@ function portal() {
       this.refreshMcpList();
       this.refreshSkillList();
       this.loadCostDashboard();
+      this.loadClaudeAuthStatus();
+    },
+
+    // ===== Claude Auth methods =====
+    async loadClaudeAuthStatus() {
+      try {
+        const r = await fetch("/api/settings/claude-auth/status", { headers: this.hdr() });
+        if (!r.ok) return;  // 401 / 500 — silent; UI shows "未连接"
+        const d = await r.json();
+        this.claudeAuth = { ...this.claudeAuth, ...d, loaded: true };
+      } catch (e) { /* network — silent */ }
+    },
+    openClaudeAuthModal() {
+      this.claudeAuthModal.open = true;
+      this.claudeAuthModal.copyToast = null;
+      // Refresh status once before polling kicks in.
+      this.loadClaudeAuthStatus();
+      this.startClaudeAuthPoll();
+    },
+    closeClaudeAuthModal() {
+      this.claudeAuthModal.open = false;
+      this.stopClaudeAuthPoll();
+    },
+    startClaudeAuthPoll() {
+      if (this.claudeAuthModal.pollHandle) return;
+      this.claudeAuthModal.polling = true;
+      this.claudeAuthModal.pollHandle = setInterval(async () => {
+        await this.loadClaudeAuthStatus();
+        if (this.claudeAuth.logged_in) {
+          this.stopClaudeAuthPoll();
+          this.closeClaudeAuthModal();
+          this.toast(this.t("claude_auth.connect_success"), "success");
+        }
+      }, 3000);
+    },
+    stopClaudeAuthPoll() {
+      if (this.claudeAuthModal.pollHandle) {
+        clearInterval(this.claudeAuthModal.pollHandle);
+        this.claudeAuthModal.pollHandle = null;
+      }
+      this.claudeAuthModal.polling = false;
+    },
+    async copyClaudeAuthCmd(which) {
+      // which = "install" | "login"
+      const cmd = which === "install"
+        ? this.t("claude_auth.cli_install_cmd")
+        : "claude login";
+      try {
+        await navigator.clipboard.writeText(cmd);
+        this.claudeAuthModal.copyToast = which;
+        setTimeout(() => {
+          if (this.claudeAuthModal.copyToast === which) this.claudeAuthModal.copyToast = null;
+        }, 1500);
+      } catch (e) {
+        this.toast("clipboard write failed", "error");
+      }
+    },
+    async disconnectClaudeAuth() {
+      const ok = await this.confirm({
+        title: this.t("claude_auth.disconnect_confirm_title"),
+        body:  this.t("claude_auth.disconnect_confirm_body"),
+        confirmText: this.t("claude_auth.disconnect_btn"),
+        kind: "warning",
+      });
+      if (!ok) return;
+      try {
+        const r = await fetch("/api/settings/claude-auth/disconnect",
+                              { method: "POST", headers: this.hdr() });
+        if (!r.ok) {
+          this.toast(this.lang === "zh" ? "断开失败" : "Disconnect failed", "error");
+          return;
+        }
+        const d = await r.json();
+        this.toast(this.t("claude_auth.disconnect_done") + " " + (d.backup_path || ""), "success", 4000);
+        await this.loadClaudeAuthStatus();
+      } catch (e) {
+        this.toast(e.message || "error", "error");
+      }
+    },
+    async reauthClaude() {
+      // Reuse Connect modal — `claude login` overwrites existing creds.
+      this.openClaudeAuthModal();
+    },
+    claudeAuthExpiresHuman() {
+      if (!this.claudeAuth.expires_at) return "—";
+      const d = new Date(this.claudeAuth.expires_at);
+      return d.toLocaleDateString(this.lang === "zh" ? "zh-CN" : "en-US",
+              { year: "numeric", month: "short", day: "numeric" });
+    },
+    // ===== Muse main-chat empty-state opener + muse grid =====
+    // museOpener() picks a state-aware first line for Muse to render as
+    // a UI-only "Muse said" bubble at the top of a fresh chat. It's NOT a
+    // real LLM call — it's a fixed template per archive state, chosen from
+    // the new contextInfo fields (claude_md_meaningfully_filled + subdir
+    // counts). Hidden the moment the user starts typing so it doesn't
+    // distract from their own first message.
+    museOpener() {
+      const ci = this.contextInfo;
+      if (!ci || !ci._fetched) return "";
+      if (!ci.has_any_provider) return "";  // provider-warn card handles this state
+      // Count filled subdirs (excludes "archives" which is purely cold storage)
+      const subs = ci.subdir_present || {};
+      const subdir_count = Object.entries(subs).filter(
+        ([k, v]) => v && k !== "archives"
+      ).length;
+      // Files at archive root counted by archive_empty toggling false even
+      // when no subdir has content (root-level docs)
+      const has_root_files = !ci.archive_empty;
+      const profile_filled = !!ci.claude_md_meaningfully_filled;
+
+      // State 4: archive rich — ≥4 subdirs with content
+      if (subdir_count >= 4) return this.t("muse_opener.rich");
+      // State 3: some files — at least 1 subdir or root-level docs
+      if (subdir_count >= 1 || (has_root_files && profile_filled)) {
+        // Count total non-readme files across all subdirs (rough est.)
+        // archive_empty was the only sub-count we get; use subdir count as proxy
+        const n = subdir_count > 0 ? subdir_count : 1;
+        return this.t("muse_opener.some_files", { n });
+      }
+      // State 2: only profile filled, no archive files
+      if (profile_filled) return this.t("muse_opener.profile_only");
+      // State 1: nothing filled — even if CLAUDE.md *file* exists (template)
+      return this.t("muse_opener.empty");
+    },
+    museOpenerAction() {
+      // State 1 + 2 get an action button to open / fill CLAUDE.md inline.
+      const ci = this.contextInfo;
+      if (!ci || !ci._fetched || !ci.has_any_provider) return null;
+      const subs = ci.subdir_present || {};
+      const subdir_count = Object.values(subs).filter(Boolean).length;
+      if (subdir_count >= 1 || !ci.archive_empty) return null;  // states 3/4
+      return {
+        label: this.t("muse_opener.action_open_profile"),
+        // Reuse the existing /organize workflow — it walks CLAUDE.md gaps too
+        handler: () => this.startOrganize(),
+      };
+    },
+    // Click any muse in the grid → switch mascot + prefill her invite into
+    // the chat input. User can edit before sending (or just hit Enter).
+    pickMascotAndAsk(idx) {
+      const m = this.MASCOTS[idx];
+      if (!m) return;
+      this.mascotIdx = idx;
+      try { localStorage.setItem("muselab_mascot_idx", String(idx)); } catch {}
+      this.mascotGreet = true;
+      setTimeout(() => { this.mascotGreet = false; }, 900);
+      const invite = m.invite ? (m.invite[this.lang] || m.invite.zh) : "";
+      this.useSuggestedPrompt(invite);
+    },
+
+    claudeAuthPlanLabel() {
+      const s = this.claudeAuth.subscription_type;
+      if (!s) return "—";
+      if (s === "max") return "Max";
+      if (s === "pro") return "Pro";
+      if (s === "free") return "Free";
+      return s;
     },
     async loadCostDashboard(force = false) {
       if (this.cost.loading) return;
@@ -4431,25 +5392,19 @@ function portal() {
     // Provider key self-test — hits the vendor's anthropic-compatible endpoint
     // with the configured key and reports back. Useful when user gets 401 and
     // doesn't want to paste keys to debug.
-    async probeProvider(envKey) {
-      // Pick a representative model id for this env key.
-      const ENV_TO_MODEL = {
-        DEEPSEEK_API_KEY:    "deepseek-v4-flash",
-        ZHIPUAI_API_KEY:     "glm-4.7",
-        MINIMAX_API_KEY:     "minimax-m2.7",
-        MOONSHOT_API_KEY:    "kimi-k2.6",
-        DASHSCOPE_API_KEY:   "qwen-plus",
-        XIAOMI_MIMO_API_KEY: "mimo-v2.5-pro",
-      };
-      const m = ENV_TO_MODEL[envKey];
-      if (!m) return;
-      this.settings.probeResults[envKey] = { ok: null, text: this.t("set.probe_running") };
+    async probeProvider(envKey, probeModel) {
+      // probeModel is the first model in this provider's catalog (e.g. "qwen3-max"
+      // for Qwen domestic, "qwen-intl:qwen3-max" for Qwen international). Using it
+      // as the result key ensures two providers that share one env key (DASHSCOPE_API_KEY)
+      // get independent probe results.
+      if (!probeModel) return;
+      this.settings.probeResults[probeModel] = { ok: null, text: this.t("set.probe_running") };
       try {
-        const r = await fetch(`/api/chat/probe/${encodeURIComponent(m)}`,
+        const r = await fetch(`/api/chat/probe/${encodeURIComponent(probeModel)}`,
                                  { headers: this.hdr() });
         const d = await r.json();
         if (d.ok) {
-          this.settings.probeResults[envKey] = {
+          this.settings.probeResults[probeModel] = {
             ok: true,
             text: `${this.t("set.probe_ok")} · ${d.key_hint}`,
           };
@@ -4467,15 +5422,44 @@ function portal() {
           if (d.status === 401) hint = " · " + this.t("set.probe_hint_401");
           else if (d.status === 403) hint = " · " + this.t("set.probe_hint_403");
           else if (d.status === 429) hint = " · " + this.t("set.probe_hint_429");
-          this.settings.probeResults[envKey] = {
+          this.settings.probeResults[probeModel] = {
             ok: false,
             text: `${status}: ${detail || "—"}${hint}`,
           };
         }
       } catch (e) {
-        this.settings.probeResults[envKey] = {
+        this.settings.probeResults[probeModel] = {
           ok: false, text: this.t("set.probe_failed") + ": " + e.message,
         };
+      }
+    },
+
+    // Toggle a provider's visibility in the model picker. probeModel uniquely
+    // identifies each provider (e.g. "qwen3.6-plus" vs "qwen-intl:qwen3.6-plus").
+    async toggleProvider(probeModel, disabled) {
+      const r = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ provider_disabled: { [probeModel]: disabled } }),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        // Update local state so the toggle reflects immediately.
+        const p = this.settings.providers.find(x => x.probe_model === probeModel);
+        if (p) p.disabled = disabled;
+        // Refresh the model list so the picker drops the hidden provider.
+        await this._fetchModels();
+      }
+    },
+
+    // Refresh the available model list from backend — called when provider
+    // visibility changes so the model picker dropdown stays in sync.
+    async _fetchModels() {
+      try {
+        const r = await fetch("/api/chat/providers", { headers: this.hdr() });
+        if (r.ok) this.availableModels = (await r.json()).models || [];
+      } catch (e) {
+        // Silently skip — the dropdown can be refreshed next time it opens.
       }
     },
 
@@ -6147,34 +7131,12 @@ function portal() {
     // 第 3 步 3b 节）。后端 /sessions/profile-intake 端点保留向后兼容，
     // 现在 forward 到 /sessions/organize.
 
-    // Welcome card — shown until user dismisses it (then never again on
-    // this device). Suppressed while session is loading to avoid a flicker
-    // between the skeleton and the real cards.
-    showWelcomeCard() {
-      if (this._welcomeDismissed) return false;
-      if (this.messagesLoading) return false;
-      // Only on the empty-chat screen — once the user has sent a turn,
-      // they've clearly oriented themselves and the welcome card is noise.
-      if (this.messages && this.messages.length) return false;
-      // Once the user has crossed the setup finish line (provider auth
-      // + CLAUDE.md), the suggestions card is more useful than the
-      // "what is muselab" intro. The welcome card stays for users
-      // who still need to finish onboarding (it sits ABOVE the
-      // setup-warn cards to frame the steps they're about to take).
-      // User feedback 2026-05-22: configured users were seeing welcome
-      // every new session and missing the prompt suggestions.
-      if (this.contextInfo
-          && this.contextInfo.has_any_provider
-          && this.contextInfo.claude_md_exists) {
-        return false;
-      }
-      return true;
-    },
-    dismissWelcome() {
-      this._welcomeDismissed = true;
-      try { localStorage.setItem("muselab_welcome_dismissed", "1"); }
-      catch (e) { /* private mode / quota / no-op */ }
-    },
+    // 2026-05-24: showWelcomeCard / dismissWelcome removed.
+    // The pre-setup "what is muselab + 3 steps" card was replaced by the
+    // Muse opener bubble + nine-muses grid (always-visible conversation
+    // entry points). _welcomeDismissed key is still read at init for
+    // back-compat but no longer drives any UI — safe to leave the
+    // localStorage entry in place for existing installs.
 
     // Pretty-print a USD amount for the cost badge.
     //   0          → "$0"

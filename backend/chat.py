@@ -570,7 +570,7 @@ async def _build_and_connect_client(
 
     opts_kwargs = dict(
         cwd=str(ROOT),
-        model=model,
+        model=endpoints.normalize_model_id(model),
         permission_mode=permission,
         system_prompt=sp,
         max_buffer_size=max_buf,
@@ -682,20 +682,23 @@ async def _build_and_connect_client(
             f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
         sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
-    # Always enable extended thinking. Without an explicit config the
-    # model uses adaptive thinking and silently pauses mid-reply for
-    # invisible reasoning — user perceives "few chars + stall + dump".
-    # With ThinkingConfigEnabled the reasoning is streamed visibly via
-    # thinking_delta events, which the FE renders as a collapsible
-    # block. (Old `show_thinking` toggle removed 2026-05-20 — was
-    # always-on for years; nobody passes it any more.)
-    from claude_agent_sdk import ThinkingConfigEnabled
-    budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
-    # ThinkingConfigEnabled is a TypedDict — instantiating without
-    # `type` produces a dict missing that key, and the SDK then raises
-    # KeyError('type') in subprocess_cli.py:376. Set it explicitly.
-    opts_kwargs["thinking"] = ThinkingConfigEnabled(
-        type="enabled", budget_tokens=budget)
+    # Enable extended thinking for models whose provider endpoint handles
+    # the standard Anthropic thinking config. Some vendors (e.g. Qianfan)
+    # reject thinking because their max_completion_tokens cap (~12k) can't
+    # accommodate the thinking budget we normally pass (~4k) alongside the
+    # output max_tokens the SDK computes — the total exceeds their limit.
+    # For those providers we skip thinking entirely; the model still works
+    # but without visible reasoning blocks.
+    provider = endpoints.lookup(model)
+    supports_thinking = (provider is None) or provider.supports_thinking
+    if supports_thinking:
+        from claude_agent_sdk import ThinkingConfigEnabled
+        budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
+        opts_kwargs["thinking"] = ThinkingConfigEnabled(
+            type="enabled", budget_tokens=budget)
+    else:
+        from claude_agent_sdk import ThinkingConfigDisabled
+        opts_kwargs["thinking"] = ThinkingConfigDisabled(type="disabled")
     # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
     # picks an effort automatically; this override lets users force a
     # deeper budget on specific tabs (e.g. xhigh for research). SDK
@@ -1707,7 +1710,7 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         if same_provider:
             (old_key, client) = live[0]
             try:
-                await client.set_model(req.model)
+                await client.set_model(endpoints.normalize_model_id(req.model))
                 # Re-validate under _lock — between the snapshot above
                 # and now, another request could have evicted / replaced
                 # _clients[old_key] (eviction from a parallel get_client,
@@ -2367,6 +2370,100 @@ class BudgetReq(BaseModel):
     budget_usd: float       # 0 = disabled
 
 
+def _claude_md_filled_ratio(path: Path) -> tuple[int, float]:
+    """Heuristic: how much of a CLAUDE.md is actually filled vs. template.
+
+    Returns (filled_content_lines, fill_ratio_0_to_1).
+
+    The install script seeds CLAUDE.md with a 100+ line bilingual template
+    full of section headers and empty placeholders ("Name:", "Birth year:",
+    bullet labels with nothing after the colon). Just checking `lines > 0`
+    is a lie — that's "file exists", not "user actually told Muse anything."
+
+    We count a line as "filled" only if it carries user content:
+      - skip blank lines, pure markdown punctuation (---, ===, |...|)
+      - skip pure headers (#, ##, ###)
+      - skip comment lines (<!-- ... -->)
+      - skip lines that are just a label with no value
+        (e.g. "Name:" or "- 配偶 / 关系：" with nothing after the colon)
+      - skip the leading blockquote intro paragraph (> ...) used by the
+        default template's preamble — informational, not user content
+      - skip lines under a "delete-if-not-applicable" instruction that
+        still match the template's bullet labels exactly (best-effort
+        heuristic: anything that contains BOTH "(" and ":" but ends in
+        ":" is probably an unfilled prompt line)
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (0, 0.0)
+    lines = raw.splitlines()
+    filled = 0
+    total_content = 0  # lines that COULD be content (excludes pure structure)
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        # Pure structure / decoration — never counts as content
+        if s.startswith("#"):              # headers
+            continue
+        if s.startswith("---") or s.startswith("==="):
+            continue
+        if s.startswith("<!--") and s.endswith("-->"):
+            continue
+        if s.startswith("> "):             # block-quote preamble in template
+            continue
+        if s.startswith("|") and s.endswith("|"):  # markdown table rows
+            # Tables can be content OR template (e.g. "| Date | What |"). We
+            # treat them as content only if a non-header cell has > 2 chars.
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if any(len(c) > 2 and c not in ("---", ":---", "---:") for c in cells):
+                total_content += 1
+                filled += 1
+            continue
+        total_content += 1
+        # "Label:" with nothing meaningful after → unfilled prompt
+        # Examples seeded by template:
+        #   "- Name / how you'd like Muse to address you:"
+        #   "- Birth year (an age range is fine):"
+        #   "姓名 / 你希望 Muse 如何称呼你："
+        # If the line ends in ":" or "：", or has only label-colon-whitespace,
+        # it's an unfilled prompt.
+        if s.endswith(":") or s.endswith("："):
+            continue
+        # Lines like "- 居住：" (bullet + label + colon at end)
+        if s.endswith(":)") or s.endswith("：)"):
+            continue
+        # "(e.g. ...)" placeholder example lines — template hints, not user
+        # content. Heuristic: starts with "(" or "（".
+        if s.startswith("(") or s.startswith("（"):
+            continue
+        # Anything left is user-supplied content
+        filled += 1
+    ratio = (filled / total_content) if total_content > 0 else 0.0
+    return (filled, ratio)
+
+
+def _scan_claude_md_source(scope: str, path: Path) -> dict | None:
+    """Build a source descriptor for one CLAUDE.md path, or None if absent."""
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        total_lines = sum(1 for _ in path.open(encoding="utf-8", errors="replace"))
+        filled_lines, ratio = _claude_md_filled_ratio(path)
+        return {
+            "scope": scope,
+            "path": str(path),
+            "lines": total_lines,
+            "filled_lines": filled_lines,
+            "fill_ratio": round(ratio, 3),
+            "meaningfully_filled": filled_lines >= 6,  # arbitrary but useful threshold
+            "mtime": path.stat().st_mtime,
+        }
+    except OSError:
+        return None
+
+
 @router.get("/context-info", dependencies=[Depends(require_token)])
 def context_info() -> dict:
     """Information about what Muse can see — used by the UI's onboarding
@@ -2374,34 +2471,43 @@ def context_info() -> dict:
     has any working auth?). All paths relative to ROOT for safety.
 
     SDK options pass `setting_sources=["user", "project", "local"]`, so
-    "Muse knows you" if EITHER the project-scope CLAUDE.md (ROOT/CLAUDE.md)
-    OR the user-scope global one (~/.claude/CLAUDE.md) exists. We track
-    both and surface the union — UI hides the "Muse doesn't know you yet"
-    nag whenever any source is present."""
-    project_claude_md = ROOT / "CLAUDE.md"
-    user_claude_md = Path.home() / ".claude" / "CLAUDE.md"
+    "Muse knows you" if any of these CLAUDE.md sources exist:
+      - project scope: ROOT/CLAUDE.md  (the user's autobiographical brief)
+      - project local override: ROOT/CLAUDE.local.md  (gitignored personal)
+      - project dot scope: ROOT/.claude/CLAUDE.md  (rarer, but SDK loads it)
+      - user scope: ~/.claude/CLAUDE.md  (cross-archive global)
+      - per-subdir: ROOT/{subdir}/CLAUDE.md  (e.g. health/CLAUDE.md to
+        scope rules to one domain; the SDK loads these lazily when Muse
+        Reads inside the dir)
+
+    We also distinguish "file exists" from "file actually has user content"
+    via a filled-ratio heuristic — the install script seeds a long bilingual
+    template, so plain `lines > 0` would falsely report "yes, Muse knows
+    you" right after install.
+    """
+    # Project-scope candidates at archive root
+    candidates: list[tuple[str, Path]] = [
+        ("project",       ROOT / "CLAUDE.md"),
+        ("project_local", ROOT / "CLAUDE.local.md"),
+        ("project_dot",   ROOT / ".claude" / "CLAUDE.md"),
+        ("user",          Path.home() / ".claude" / "CLAUDE.md"),
+    ]
+    # Per-subdirectory CLAUDE.md (one level deep, skip hidden / archives)
+    try:
+        for sub in sorted(ROOT.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name.startswith(".") or sub.name == "archives":
+                continue
+            candidates.append((f"subdir:{sub.name}", sub / "CLAUDE.md"))
+    except OSError:
+        pass
 
     sources: list[dict] = []
-    if project_claude_md.exists():
-        try:
-            sources.append({
-                "scope": "project",
-                "path": str(project_claude_md),
-                "lines": sum(1 for _ in project_claude_md.open(encoding="utf-8", errors="replace")),
-                "mtime": project_claude_md.stat().st_mtime,
-            })
-        except OSError:
-            pass
-    if user_claude_md.exists():
-        try:
-            sources.append({
-                "scope": "user",
-                "path": str(user_claude_md),
-                "lines": sum(1 for _ in user_claude_md.open(encoding="utf-8", errors="replace")),
-                "mtime": user_claude_md.stat().st_mtime,
-            })
-        except OSError:
-            pass
+    for scope, path in candidates:
+        s = _scan_claude_md_source(scope, path)
+        if s is not None:
+            sources.append(s)
 
     # Detect "do we have ANY working auth?" — needed so the chat-empty card
     # can warn "you have no provider set up; configure one before chatting".
@@ -2430,12 +2536,18 @@ def context_info() -> dict:
     # the existing UI keeps working without changes.
     total_lines = sum(s["lines"] for s in sources)
     latest_mtime = max((s["mtime"] for s in sources), default=0.0)
+    # NEW: distinguish "file present" from "user actually filled it".
+    # Onboarding logic needs this: a freshly-installed CLAUDE.md is a
+    # 100+ line template with zero user content — UI should still treat
+    # the profile as empty and prompt the user to fill it out.
+    meaningfully_filled = any(s["meaningfully_filled"] for s in sources)
     info: dict = {
         "archive_root": str(ROOT),
         "claude_md_exists": len(sources) > 0,
         "claude_md_lines": total_lines,
         "claude_md_mtime": latest_mtime,
         "claude_md_sources": sources,
+        "claude_md_meaningfully_filled": meaningfully_filled,
         "archive_empty": True,
         "subdir_present": {},
         "has_claude_oauth": claude_oauth,
@@ -2486,14 +2598,16 @@ async def probe_provider(model: str) -> dict:
         return {"ok": False, "reason": f"{p.env_key} not configured (Settings → Provider API Keys)"}
     # Use the live-resolved base URL (env override > catalog default) so a
     # proxy / on-prem URL probe doesn't silently hit the public endpoint.
-    base = endpoints._resolve_base_url(p.env_key) or p.base_url
+    base = endpoints._resolve_base_url(p.env_key, p) or p.base_url
     url = base.rstrip("/") + "/v1/messages"
     headers = {
         "x-api-key": key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    body = {"model": model, "max_tokens": 16,
+    # Strip internal prefixes like "qwen-intl:" before sending to the API.
+    api_model = endpoints.normalize_model_id(model)
+    body = {"model": api_model, "max_tokens": 16,
              "messages": [{"role": "user", "content": "ping"}]}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -3067,11 +3181,19 @@ async def stream(
     permission: str = Query(default="bypassPermissions"),
     image_ids: str = Query(default=""),
 ):
-    # RECONNECT MODE: empty prompt + an active in-flight turn on this
-    # session = subscribe to the existing TurnBroadcast for replay +
-    # live tail. Frontend uses this after loadSession discovers that
-    # `/sessions/{sid}/active` is true. No new query is sent to the SDK.
-    if not prompt.strip():
+    # RECONNECT MODE: empty prompt + NO attached images + an active
+    # in-flight turn on this session = subscribe to the existing
+    # TurnBroadcast for replay + live tail. Frontend uses this after
+    # loadSession discovers that `/sessions/{sid}/active` is true.
+    # No new query is sent to the SDK.
+    #
+    # IMPORTANT: image-only turns (text empty + image_ids set) are a
+    # LEGITIMATE new turn — "look at this picture" with no caption.
+    # Previously we lumped them into reconnect mode and returned
+    # "no active turn", confusing the user (just dropped an image,
+    # got a generic error toast).
+    is_image_only = (not prompt.strip()) and bool((image_ids or "").strip())
+    if not prompt.strip() and not is_image_only:
         existing = _active_turns.get(session_id)
         if existing is None:
             async def _no_active_gen():
@@ -3085,6 +3207,12 @@ async def stream(
                 "X-Accel-Buffering": "no",
             },
         )
+    # Image-only path: inject a neutral placeholder prompt so the SDK
+    # gets non-empty text alongside the attachment. "(image)" is short
+    # and language-neutral; Muse handles "what's in this image?" fine
+    # from just the attachment + this hint.
+    if is_image_only:
+        prompt = "(image)"
 
     # NEW-TURN MODE: refuse if there's already an unfinished turn on
     # this session — otherwise the second turn would overwrite the
