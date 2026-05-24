@@ -4556,7 +4556,7 @@ function portal() {
       this.previewDragHover = false;
       this.osFileDragging = false;
       this._dragCounter = 0;
-      const files = (ev.dataTransfer && ev.dataTransfer.files) || [];
+      const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
       // Always upload to the archive root (MUSELAB_ROOT), regardless of
       // which file is currently open in the preview pane. Earlier this
@@ -4566,8 +4566,57 @@ function portal() {
       // wanted to triage drops from the top level first. Root is the
       // predictable target — the user can always move files later from
       // the file tree.
-      for (const f of files) {
-        try { await this.uploadFileTo("", f); } catch {}
+      //
+      // Multi-file drop: upload in parallel and refresh the tree ONCE
+      // at the end. The previous `for ... await uploadFileTo` was
+      // sequential AND ran reloadTree() per file, so a 5-file drop
+      // serialized 5 uploads + 5 tree refetches — slow enough that
+      // users reported "looks like only one got uploaded" because
+      // they hadn't waited for the others to finish.
+      const results = await Promise.allSettled(
+        files.map(f => this._uploadFileQuiet("", f))
+      );
+      const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
+      const failed = results.length - ok;
+      this.reloadTree();
+      if (failed && !ok) {
+        this.toast(this.lang === "zh"
+          ? `${failed} 个文件上传失败`
+          : `${failed} file(s) failed to upload`, "error", 3500);
+      } else if (failed) {
+        this.toast(this.lang === "zh"
+          ? `已上传 ${ok} 个，${failed} 个失败`
+          : `Uploaded ${ok}, ${failed} failed`, "warn", 3500);
+      } else if (ok === 1) {
+        this.toast(this.lang === "zh"
+          ? `已上传 ${files[0].name}`
+          : `Uploaded ${files[0].name}`, "success", 2200);
+      } else {
+        this.toast(this.lang === "zh"
+          ? `已上传 ${ok} 个文件`
+          : `Uploaded ${ok} files`, "success", 2200);
+      }
+    },
+    // Single-file upload without tree reload / toast — used by parallel
+    // drop handlers (onPreviewDrop, tree-onDrop multi-file) so the caller
+    // can batch the side effects. Returns true on success, false on error.
+    async _uploadFileQuiet(dirPath, file) {
+      const fd = new FormData();
+      fd.append("path", dirPath);
+      fd.append("file", file);
+      try {
+        const r = await fetch("/api/files/upload", {
+          method: "POST", headers: this.hdr(), body: fd,
+        });
+        if (!r.ok) {
+          console.warn("[upload]", file.name, "failed:", r.status);
+          return false;
+        }
+        delete this.childCache[dirPath];
+        return true;
+      } catch (e) {
+        console.warn("[upload]", file.name, "error:", e);
+        return false;
       }
     },
     onPreviewTabDragStart(ev, path) {
@@ -6679,10 +6728,35 @@ function portal() {
       }
 
       // OS file upload — dropping onto a file uploads into that file's
-      // parent dir (same dir-resolution as internal moves).
-      const files = ev.dataTransfer?.files || [];
+      // parent dir (same dir-resolution as internal moves). Same
+      // parallel-upload + batched-refresh pattern as onPreviewDrop so
+      // a multi-file drop onto a tree node doesn't serialize.
+      const files = Array.from(ev.dataTransfer?.files || []);
       if (!files.length) return;
-      for (const f of files) await this.uploadFileTo(targetDir, f);
+      const results = await Promise.allSettled(
+        files.map(f => this._uploadFileQuiet(targetDir, f))
+      );
+      const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
+      const failed = results.length - ok;
+      this.reloadTree();
+      const intoLabel = targetDir ? `/${targetDir}` : "/";
+      if (failed && !ok) {
+        this.toast(this.lang === "zh"
+          ? `${failed} 个文件上传失败`
+          : `${failed} file(s) failed`, "error", 3500);
+      } else if (failed) {
+        this.toast(this.lang === "zh"
+          ? `已上传 ${ok} 个到 ${intoLabel}，${failed} 个失败`
+          : `Uploaded ${ok} to ${intoLabel}, ${failed} failed`, "warn", 3500);
+      } else if (ok === 1) {
+        this.toast(this.lang === "zh"
+          ? `已上传 ${files[0].name} 到 ${intoLabel}`
+          : `Uploaded ${files[0].name} to ${intoLabel}`, "success", 2200);
+      } else {
+        this.toast(this.lang === "zh"
+          ? `已上传 ${ok} 个文件到 ${intoLabel}`
+          : `Uploaded ${ok} files to ${intoLabel}`, "success", 2200);
+      }
     },
     async moveTreeItem(srcPath, targetDir) {
       if (!srcPath) return;
