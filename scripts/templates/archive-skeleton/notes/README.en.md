@@ -1,24 +1,16 @@
-# notes/ — miscellaneous
+# notes/
+
+Miscellaneous notes — study, ideas, journals, anything that doesn't belong
+in the other directories.
 
 ## What goes here
 
-- **Study notes**: books / courses / paper summaries
-- **Ideas / inspirations**: jot as you have them, by topic or by date —
-  whichever
-- **Life records**: weekly / monthly / yearly reviews
-- **Everything else that doesn't belong in the other directories**
+- Study notes (books / courses / paper summaries)
+- Ideas and inspirations (by topic or by date)
+- Life logs (weekly / monthly / annual reviews)
+- Anything that's not health / work / money / people
 
-## What Muse can do with this
+## Muse's behavior here
 
-- Full-text search + association: when you mention X in chat, Muse can
-  tell you "you wrote something similar two months ago in this note"
-- Weekly / monthly / yearly retrospectives: Muse pulls out themes from
-  your notes
-- Turning scattered ideas into actionable tasks
-
-## Getting started
-
-Pick the 3-5 topics you're most interested in or think about most often
-right now, and start a subdirectory or one md file for each. Don't try
-to design the perfect taxonomy on day one — three months in, the right
-shape will become obvious and you can reorganize then.
+- Full-text search + topic linking: surfaces related earlier notes when X comes up
+- Doesn't impose categories — works with whatever organization you already use

@@ -1,36 +1,32 @@
-# archives/ — original-file vault
+# archives/
+
+Original files — long-term references that don't need regular updates.
 
 ## What goes here
 
-**Original files** that don't need daily updating but should be kept
-long-term:
-
-- Diplomas / credential verifications / transcripts
-- Birth certificate / national ID scans (**encrypted**)
-- Old checkup PDFs (the originals referenced from `health/`)
+- Diplomas / transcripts / degree verifications
+- Birth certificates / ID scans (**encrypted**)
+- Historical checkup PDFs (originals already cited from `health/`)
 - Old resumes / offer letters
-- Important contracts / agreements
-- Old employment certificates / leaving certificates
-- Family archives / metadata for old photos
+- Important contracts, agreements, separation letters
+- Family archives, photo metadata
 
-## How this relates to other directories
+## Relationship to other directories
 
-`archives/` is the **vault** — read-only, rarely opened.
-The other directories (`health/`, `work/`, …) are the **workbench** —
-updated often, read by Muse often.
-
-When the workbench references an original, use a markdown link:
+`archives/` is the **filing cabinet** (read-only, rarely opened). The other
+directories (`health/` / `work/` / ...) are the **working surface** (updated
+often, Muse reads often). Workspace files reference originals via markdown link:
 
 ```markdown
-See the original numbers in [2024-09 checkup PDF](archives/2024-09-checkup-clinic.pdf)
+See [2024-09 checkup original](archives/2024-09-checkup-xiehe.pdf) for details.
 ```
 
-## Important notes
+## Notes
 
-- This directory very likely contains high-sensitivity info: ID numbers
-  / student numbers / contract amounts
+- This directory likely contains highly sensitive info (national IDs,
+  student IDs, contract amounts)
 - Strongly recommend filesystem-level encryption for the whole muselab
   archive (macOS FileVault / Linux LUKS)
-- **Do not** sync to public clouds (OneDrive / Google Drive / Dropbox)
-- For remote backup, use [restic](https://restic.net) or
+- Do NOT sync to public clouds (OneDrive / Google Drive / Dropbox)
+- For remote backup: use [restic](https://restic.net) or
   [borg](https://borgbackup.org) with end-to-end encryption

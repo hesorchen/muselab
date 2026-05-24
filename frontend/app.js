@@ -6176,6 +6176,17 @@ function portal() {
       // don't have to hunt for it. `block/inline: "nearest"` is a no-op if
       // the item is already visible, so this is cheap on the common path.
       this.$nextTick(() => this._scrollPreviewSelectedIntoView());
+      // Clear the previous file's preview data and surface a loading
+      // indicator. Without this, switching from a 10MB markdown file to
+      // a small csv would briefly show the old markdown while the new
+      // fetch is in flight — users read it as "click didn't register".
+      // Each mode branch below overrides previewMode with the real type
+      // once the content is ready.
+      this.rawText = "";
+      this.renderedMd = "";
+      this.xlsxSheets = [];
+      this.csvData = null;
+      this.previewMode = "loading";
       const name = n.name || n.path.split("/").pop();
       const ext = name.split(".").pop().toLowerCase();
       if (["md", "markdown"].includes(ext)) {

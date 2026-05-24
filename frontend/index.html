@@ -573,6 +573,14 @@
             <span class="seg" :class="cmStatus.dirty ? 'dirty' : ''" x-text="cmStatus.dirty ? (lang==='zh' ? '● 未保存' : '● Unsaved') : (lang==='zh' ? '○ 已保存' : '○ Saved')"></span>
           </div>
         </div>
+        <!-- Loading state — shown briefly between selecting a new file and the
+             fetch completing. Without this, fast clicks across tabs left the
+             previous file's content visible while the new one loaded. -->
+        <div x-show="!editing && previewMode==='loading'" class="preview-loading">
+          <span class="spinner-lg"></span>
+          <span class="preview-loading-text"
+                x-text="lang==='zh' ? '加载中…' : 'Loading…'"></span>
+        </div>
         <div x-show="!editing && previewMode==='md'" class="markdown" x-html="renderedMd"></div>
         <pre x-show="!editing && previewMode==='text'" class="text"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
         <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，

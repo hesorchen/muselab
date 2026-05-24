@@ -62,19 +62,26 @@ cp -r scripts/templates/archive-skeleton/* ~/muselab-archive/
 
 ---
 
-## The 9 sections of the template
+## The 6 sections of the template
+
+CLAUDE.md is a deliberately bare skeleton — it's loaded into Muse's
+context on every conversation, so it carries no filling instructions or
+option lists, only fields.
 
 | Section | What to put |
 |---------|-------------|
-| **1. Who I am** | Name / age / city / language / household |
-| **2. What I do most of the week** | One-line life stage + status by role (student / employed / self-employed / caregiving / retired / …) |
-| **3. Money** | Income source / scale / main concerns (no stage gating) |
-| **4. Body** | General health / checkups / medications / concerns |
-| **5. People I care about** | Not just family — partner / parents / friends / anyone important |
-| **6. What's on my mind** | Current worries / things you're doing / things you want to do |
-| **7. What's in the archive** | Index of the 6 sub-directories + current key materials |
-| **8. How Muse collaborates with me** | Behavioral promises (neutral; apply to everyone) |
-| **9. What I maintain myself** | Which section to update when life changes |
+| **1. Who I am** | Name / birth year / lives in / languages / household |
+| **2. What I'm mainly doing** | Life stage (one line) / main activity / how long / goal this year / big decision this year |
+| **3. Money** | Income source / asset-liability scale / current focus / risk tolerance |
+| **4. Body** | General / last checkup / medications / exercise / top concern / sleep |
+| **5. People I care about** | Key relationships / who needs attention now / recent events |
+| **6. What's on my mind** | Biggest worry / active projects / things to start |
+
+The archive subdirectories (`health/` / `work/` / `money/` / `people/` /
+`notes/` / `archives/`) are reached via Muse's Read tool on demand — no
+index needed in CLAUDE.md. Each subdir's `README.md` describes what
+belongs there and the constraints Muse follows in that domain (no
+diagnosis in health, no price predictions in money, etc.).
 
 ---
 
@@ -116,11 +123,13 @@ any particular life stage:
 - `people/`, not `family/` (also fits solo / unmarried / friend-only circles)
 - "What you do most of the week", not "What's your job?"
 
-### Behavioral commitments belong to Muse, not the user
+### Behavioral commitments live with each subdirectory, not in CLAUDE.md
 
-The "health-related / money-related / study-or-work-related" rules in
-§8 are commitments about **how Muse responds** (e.g. cite guidelines for
-health topics, do not diagnose), not requirements to fill in every section.
+Domain-specific constraints (health: cite guidelines, no diagnosis; money:
+no price predictions; etc.) live in each subdirectory's `README.md`
+(e.g. `health/README.md`, `money/README.md`). Muse reads those when it
+enters the corresponding directory. CLAUDE.md itself stays a bare-bones
+fact sheet about you.
 
 ---
 
