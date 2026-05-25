@@ -1,4 +1,7 @@
 import os
+import json
+import secrets
+import shutil
 import time
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
@@ -8,6 +11,136 @@ from .auth import require_token, require_token_query
 from .settings import ROOT, atomic_write_text
 
 router = APIRouter(prefix="/api/files", tags=["files"])
+
+# ============================================================
+# Trash / dustbin — soft delete moves to <ROOT>/.muselab-dustbin/ instead
+# of unlink. Restore + permanent-purge are separate endpoints. The dir is
+# always excluded from file tree listings, search, and grep (it has its
+# own dedicated UI surface in the frontend).
+#
+# Layout per deletion:
+#   <ROOT>/.muselab-dustbin/<trash_id>.json   ← manifest (original path,
+#                                                deletion time, kind, size)
+#   <ROOT>/.muselab-dustbin/<trash_id>        ← payload (file OR dir, the
+#                                                inode rename'd in place)
+# trash_id = "<unix_ts>_<8-hex>" — sortable, collision-resistant, opaque
+# to the client.
+# ============================================================
+TRASH_DIR_NAME = ".muselab-dustbin"
+
+
+def _trash_dir() -> Path:
+    return ROOT / TRASH_DIR_NAME
+
+
+def _ensure_trash_dir() -> Path:
+    d = _trash_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _gen_trash_id() -> str:
+    return f"{int(time.time())}_{secrets.token_hex(4)}"
+
+
+def _dir_size(p: Path) -> int:
+    """Sum of file sizes (best-effort; OSError on individual files skipped)."""
+    total = 0
+    try:
+        for sub in p.rglob("*"):
+            try:
+                if sub.is_file():
+                    total += sub.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def _move_to_trash(target: Path) -> dict:
+    """Move `target` into the trash, write a manifest, return it.
+    Caller is responsible for ensuring `target` exists + is inside ROOT.
+    Same-filesystem rename, so atomic + cheap regardless of payload size."""
+    trash = _ensure_trash_dir()
+    tid = _gen_trash_id()
+    payload = trash / tid
+    original_rel = str(target.relative_to(ROOT))
+    target.rename(payload)
+    is_dir = payload.is_dir()
+    try:
+        size = _dir_size(payload) if is_dir else payload.stat().st_size
+    except OSError:
+        size = 0
+    manifest = {
+        "trash_id": tid,
+        "original_path": original_rel,
+        "original_name": target.name,
+        "deleted_at": time.time(),
+        "kind": "dir" if is_dir else "file",
+        "size": size,
+    }
+    (trash / f"{tid}.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _read_manifest(tid: str) -> dict | None:
+    mf = _trash_dir() / f"{tid}.json"
+    if not mf.exists():
+        return None
+    try:
+        return json.loads(mf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _list_trash() -> list[dict]:
+    """Manifests of every in-trash item, newest first. Orphans (manifest
+    without payload, or vice versa) are skipped — they'd be confusing
+    to surface and the user can't usefully act on them anyway."""
+    d = _trash_dir()
+    if not d.exists():
+        return []
+    items: list[dict] = []
+    try:
+        for mf in d.glob("*.json"):
+            try:
+                data = json.loads(mf.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            tid = data.get("trash_id")
+            if not tid:
+                continue
+            payload = d / tid
+            if not payload.exists():
+                continue
+            items.append(data)
+    except OSError:
+        return []
+    items.sort(key=lambda x: x.get("deleted_at", 0), reverse=True)
+    return items
+
+
+def _purge_one(tid: str) -> None:
+    """Permanently delete one trash item (manifest + payload).
+    Silent no-op if neither exists."""
+    d = _trash_dir()
+    payload = d / tid
+    if payload.exists():
+        if payload.is_dir():
+            shutil.rmtree(payload, ignore_errors=True)
+        else:
+            try:
+                payload.unlink()
+            except OSError:
+                pass
+    mf = d / f"{tid}.json"
+    if mf.exists():
+        try:
+            mf.unlink()
+        except OSError:
+            pass
 
 # Filenames without extensions that are commonly text (Dockerfile, Makefile, etc.).
 # Compared case-insensitively against the full name.
@@ -153,7 +286,14 @@ def list_dir(path: str = "", show_hidden: bool = False) -> dict:
         raise HTTPException(status_code=400, detail="not a directory")
     entries: list[dict] = []
     truncated = False
+    # Trash dir is always hidden from the file tree (even when
+    # show_hidden=true) — it has its own dedicated UI surface; mixing it
+    # back into the tree would surface deleted files in a confusing
+    # context. Only relevant at the root level since trash dir lives there.
+    is_root_listing = (target == ROOT)
     for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        if is_root_listing and child.name == TRASH_DIR_NAME:
+            continue
         if not show_hidden and child.name.startswith("."):
             continue
         if len(entries) >= MAX_LIST_ENTRIES:
@@ -567,18 +707,106 @@ class DeleteReq(BaseModel):
 
 
 @router.delete("/delete", dependencies=[Depends(require_token)])
-def delete(req: DeleteReq) -> dict:
+def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
+    """Soft delete by default: move into <ROOT>/.muselab-dustbin/. The
+    previous "must be empty for dirs" guard is dropped because the
+    operation is now reversible — Restore moves the payload back to its
+    original path. Set ?permanent=true for hard delete (skips trash).
+
+    Refuses to delete the trash dir itself or anything inside it via this
+    route — those operations have dedicated /trash/* endpoints with a
+    different mental model."""
     target = safe_resolve(req.path)
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
-    if target.is_dir():
-        # require empty dir for safety
-        if any(target.iterdir()):
-            raise HTTPException(status_code=400, detail="dir not empty")
-        target.rmdir()
-    else:
-        target.unlink()
+    trash_root = _trash_dir()
+    if target == trash_root or trash_root in target.parents:
+        raise HTTPException(
+            status_code=400,
+            detail="cannot delete trash via /delete — use /trash/purge or /trash/empty",
+        )
+    if permanent:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"ok": True, "permanent": True}
+    manifest = _move_to_trash(target)
+    return {"ok": True, "permanent": False,
+            "trash_id": manifest["trash_id"], "manifest": manifest}
+
+
+# ============================================================
+# Trash management endpoints
+# ============================================================
+@router.get("/trash/list", dependencies=[Depends(require_token)])
+def trash_list() -> dict:
+    """All trash items, newest first. Each item: trash_id, original_path,
+    original_name, deleted_at (unix sec, float), kind ('file'|'dir'), size."""
+    return {"items": _list_trash()}
+
+
+class TrashIdReq(BaseModel):
+    trash_id: str
+
+
+@router.post("/trash/restore", dependencies=[Depends(require_token)])
+def trash_restore(req: TrashIdReq) -> dict:
+    """Move the payload back to its original path. Fails 409 if that path
+    is now occupied — user has to rename / clear it before restoring.
+    Manifest is removed on success."""
+    data = _read_manifest(req.trash_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="trash item not found")
+    payload = _trash_dir() / req.trash_id
+    if not payload.exists():
+        raise HTTPException(status_code=404, detail="trash payload missing")
+    orig_rel = data.get("original_path") or ""
+    if not orig_rel:
+        raise HTTPException(status_code=500, detail="manifest missing original_path")
+    # Reuse safe_resolve so the same anti-traversal + sensitive-name guards
+    # apply to restoration as to any other write. allow_sensitive=True
+    # because the user already had this file in-place before deletion;
+    # blocking restore would leave their data stranded in trash.
+    orig = safe_resolve(orig_rel, allow_sensitive=True)
+    if orig.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="original path is occupied; rename or clear it first",
+        )
+    orig.parent.mkdir(parents=True, exist_ok=True)
+    payload.rename(orig)
+    mf = _trash_dir() / f"{req.trash_id}.json"
+    if mf.exists():
+        try:
+            mf.unlink()
+        except OSError:
+            pass
+    return {"ok": True, "restored_path": orig_rel}
+
+
+@router.delete("/trash/purge", dependencies=[Depends(require_token)])
+def trash_purge(req: TrashIdReq) -> dict:
+    """Permanently delete one trash item. Irreversible."""
+    d = _trash_dir()
+    if not (d / f"{req.trash_id}.json").exists() and not (d / req.trash_id).exists():
+        raise HTTPException(status_code=404, detail="trash item not found")
+    _purge_one(req.trash_id)
     return {"ok": True}
+
+
+@router.delete("/trash/empty", dependencies=[Depends(require_token)])
+def trash_empty() -> dict:
+    """Permanently delete every trash item. Irreversible."""
+    d = _trash_dir()
+    if not d.exists():
+        return {"ok": True, "purged": 0}
+    count = 0
+    for mf in list(d.glob("*.json")):
+        tid = mf.stem
+        _purge_one(tid)
+        count += 1
+    return {"ok": True, "purged": count}
 
 
 class MkdirReq(BaseModel):
@@ -611,7 +839,12 @@ def rename(req: RenameReq) -> dict:
 
 
 SEARCH_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                 ".cache", ".pytest_cache", ".mypy_cache", "dist", "build"}
+                 ".cache", ".pytest_cache", ".mypy_cache", "dist", "build",
+                 # Trash always excluded from search/grep regardless of
+                 # show_hidden — otherwise a search for "foo" surfaces every
+                 # version of foo.md the user has ever deleted, which the
+                 # trash UI is purpose-built to present separately.
+                 TRASH_DIR_NAME}
 
 GREP_EXTS = {".md", ".markdown", ".txt", ".html", ".htm", ".json", ".yaml", ".yml",
              ".py", ".js", ".ts", ".css", ".sh", ".toml", ".ini", ".csv", ".sql",

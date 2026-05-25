@@ -402,39 +402,62 @@ function portal() {
     // ===== Muse mascot =====
     // 九缪斯（Nine Muses of Greek mythology）。视觉仍是抽象几何，名字承载典故：
     // 每个缪斯对应一种艺术 / 学科，几何形象选有意义关联的（如 Urania 天文 → orbit 行星）。
-    // Each muse carries a neutral "invite" prompt — a one-line conversation
-    // opener that matches her thematic domain. Clicking a muse in the chat-
-    // empty grid switches the mascot AND prefills the chat input with her
-    // invite line (user can edit / send). Designed to be domain-flavored
-    // but everyday-usable — not theatrical, not generic.
+    //
+    // Each muse has TWO conversation-opener strings, deliberately split
+    // by perspective (the previous single-string design conflated them
+    // and produced grammatically wrong fills — "聊聊你的..." in the
+    // user's input box reads as the user asking Muse to talk about
+    // herself):
+    //   - invite:  Muse → user (card preview). "讲讲你的..." / "聊聊你..."
+    //   - prompt:  user → Muse (prefilled into chat input on click).
+    //              "我想聊聊..." — first-person, statement (not question)
+    //              so user can hit Enter immediately or tweak before sending.
     MASCOTS: [
       { id: "hex",      greek: "Calliope",    zhName: "卡利俄佩",       domain: { zh: "史诗", en: "Epic poetry" },
         invite: { zh: "讲讲你的大故事——这一年你最在意的三件事是什么?",
-                  en: "Tell me the big story — what are the 3 things you care most about this year?" } },
+                  en: "Tell me the big story — what are the 3 things you care most about this year?" },
+        prompt: { zh: "我想和你聊聊这一年我最在意的三件事",
+                  en: "I want to talk through the 3 things I care most about this year" } },
       { id: "bars",     greek: "Clio",        zhName: "克利俄",         domain: { zh: "历史", en: "History" },
         invite: { zh: "整理一下你的时间线——过去半年最关键的变化是什么?",
-                  en: "Walk me through your timeline — what changed most in the last six months?" } },
+                  en: "Walk me through your timeline — what changed most in the last six months?" },
+        prompt: { zh: "帮我整理一下过去半年最关键的变化",
+                  en: "Help me walk through what changed most in the last six months" } },
       { id: "lens",     greek: "Erato",       zhName: "厄拉托",         domain: { zh: "情诗", en: "Love poetry" },
         invite: { zh: "聊聊你在乎的人——最近谁需要你多一点注意?",
-                  en: "Tell me about who matters to you — who needs your attention right now?" } },
+                  en: "Tell me about who matters to you — who needs your attention right now?" },
+        prompt: { zh: "想聊聊我在乎的人——感觉最近有谁需要我多一点注意",
+                  en: "I want to talk about people who matter to me — someone might need more attention from me right now" } },
       { id: "wave",     greek: "Euterpe",     zhName: "欧忒耳佩",       domain: { zh: "音乐", en: "Music" },
         invite: { zh: "讲讲你的节奏——最近哪件日常的小事做得最顺?",
-                  en: "Talk about your rhythm — what daily thing has been clicking lately?" } },
+                  en: "Talk about your rhythm — what daily thing has been clicking lately?" },
+        prompt: { zh: "想聊聊我最近的节奏——哪件日常小事做得最顺",
+                  en: "Let me talk about my rhythm lately — a daily thing that's been clicking" } },
       { id: "crescent", greek: "Melpomene",   zhName: "墨尔波墨涅",     domain: { zh: "悲剧", en: "Tragedy" },
         invite: { zh: "聊聊最近的烦恼——什么事让你睡不踏实?",
-                  en: "Tell me what's weighing on you — what's been keeping you up?" } },
+                  en: "Tell me what's weighing on you — what's been keeping you up?" },
+        prompt: { zh: "想聊聊最近的烦恼——有件事让我睡不踏实",
+                  en: "Want to talk about what's been weighing on me — something's keeping me up" } },
       { id: "halo",     greek: "Polyhymnia",  zhName: "波吕许谟尼亚",   domain: { zh: "圣诗", en: "Sacred hymns" },
         invite: { zh: "聊聊你的信念——什么事让你觉得「必须做」?",
-                  en: "Talk about what you believe in — what feels non-negotiable to you?" } },
+                  en: "Talk about what you believe in — what feels non-negotiable to you?" },
+        prompt: { zh: "想聊聊我的信念——有件事让我觉得「必须做」",
+                  en: "Want to talk about what I believe in — something feels non-negotiable to me" } },
       { id: "trio",     greek: "Terpsichore", zhName: "忒耳普西科瑞",   domain: { zh: "舞蹈", en: "Dance" },
         invite: { zh: "讲讲你的身体——最近的状态怎么样?",
-                  en: "Tell me about your body — how are you feeling lately?" } },
+                  en: "Tell me about your body — how are you feeling lately?" },
+        prompt: { zh: "想聊聊我最近身体的状态",
+                  en: "Want to talk about how my body's been feeling lately" } },
       { id: "spark",    greek: "Thalia",      zhName: "塔利亚",         domain: { zh: "喜剧", en: "Comedy" },
         invite: { zh: "来点轻松的——最近有什么有意思的事?",
-                  en: "Lighten things up — what's something fun that happened recently?" } },
+                  en: "Lighten things up — what's something fun that happened recently?" },
+        prompt: { zh: "来点轻松的——最近有件有意思的事想跟你说",
+                  en: "Let's lighten things up — something fun happened recently I want to share" } },
       { id: "orbit",    greek: "Urania",      zhName: "乌拉尼亚",       domain: { zh: "天文", en: "Astronomy" },
         invite: { zh: "聊聊你的好奇心——什么大问题最近一直在想?",
-                  en: "Talk about what you're curious about — what big question is on your mind?" } },
+                  en: "Talk about what you're curious about — what big question is on your mind?" },
+        prompt: { zh: "想聊聊我最近的好奇心——有个大问题一直在脑子里",
+                  en: "Want to talk about something I'm curious about — a big question that's been on my mind" } },
     ],
     mascotIdx: 0,
     mascotGreet: false,
@@ -444,6 +467,32 @@ function portal() {
     leftWidth: 280,
     rightWidth: 440,
     showHidden: false,
+    // ===== Trash =====
+    // Files /delete moves into <ROOT>/.muselab-dustbin/ instead of unlink
+    // (see backend/files.py). The trash UI lives as a docked icon at the
+    // bottom of the files pane; click → modal with restore / purge actions.
+    // `count` is mirrored from the trash list whenever the modal opens OR
+    // an item is deleted (used to badge the trash icon).
+    trash: {
+      modalOpen: false,
+      loading: false,
+      items: [],
+      count: 0,
+    },
+    // Toggled by onTrashDragOver/onTrashDragLeave to drive the red-highlight
+    // animation on the trash button. Stays out of the trash{} sub-object
+    // so it can be touched in dragover handlers (60+ events/sec while
+    // dragging) without thrashing the nested reactive proxy.
+    dragOverTrash: false,
+    // ===== Code Artifacts =====
+    // Both Mermaid and HTML artifacts are always on. The HTML path
+    // mounts AI-supplied markup in a sandboxed iframe WITHOUT
+    // allow-same-origin — the iframe has a null origin and cannot
+    // touch muselab's DOM, cookies, token, or localStorage. See the
+    // sandbox config in _toggleHtmlIframe for the exact attrs and
+    // docs/research-code-artifacts-2026-05.md for the threat model.
+    _mermaidLoadPromise: null,
+    _artifactClickBound: false,
     // Desktop-only "fullscreen" for one pane — "preview" or "chat" (or ""
     // = normal 3-column). Triggered by the maximize button in each pane's
     // header; hides files / the other pane / both resizers via CSS so the
@@ -783,6 +832,12 @@ function portal() {
       this.initLang();
       this.initMascot();
       this.configureMarked();
+      this._initArtifacts();
+      // NOTE: loadTrash() does NOT run here — init() executes before the
+      // user has supplied a token (token gating happens in _bootApp /
+      // login). Calling it here produced a 401 spam in the network tab.
+      // Trash is loaded in _bootApp (saved-token boot) + login() (first
+      // login), and lazily on openTrashModal as a backstop.
       this._initMobileKeyboardWatch();
       // PTR (pull-to-refresh) helper exposed for x-init use on scroll
       // containers. Mobile only — no-op on devices without touch.
@@ -1162,6 +1217,10 @@ function portal() {
       this.loadRoot();
       this.initSessions();
       this.fetchStats();
+      // Trash badge state — light fetch (just count), gated by token
+      // which is already verified at this point. Fire-and-forget;
+      // failures degrade silently to "no badge styling".
+      this.loadTrash();
       // Surface any in-flight turns that were cut short by a previous
       // process death (OOM kill / power loss / manual restart mid-stream).
       // Fire-and-forget — purely informational, doesn't block boot. Backend
@@ -1589,6 +1648,17 @@ function portal() {
       const id = this.mascot().id;
       // 重新声明每个 mascot 的 SVG body —— defs 在 document 里通过 <use> 引用，但 favicon
       // data URL 是独立文档，必须把图形内嵌。集中在这里维护成 lookup。
+      //
+      // FAVICON-SPECIFIC SIMPLIFICATIONS:
+      //   - orbit (Urania): drop the satellite small-circle. At 16px in
+      //     a browser tab, the filled dot at (18.5, 6) reads as an
+      //     unread-notification badge, which is a false signal. The
+      //     in-page mascot (rendered larger via the SVG <defs>) still
+      //     uses the satellite — only the favicon variant is stripped.
+      //   - trio (Thalia): keep all three dots; at 16px they still read
+      //     as a triangle of dots, not a badge.
+      //   - spark (Erato): keep — center dot is on a cross so reads as
+      //     a hub, not a notification.
       const SHAPES = {
         hex:      '<path d="M12 3 L20 7.5 L20 16.5 L12 21 L4 16.5 L4 7.5 Z"/>',
         bars:     '<line x1="4" y1="7" x2="20" y2="7"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="17" x2="14" y2="17"/>',
@@ -1598,7 +1668,10 @@ function portal() {
         halo:     '<circle cx="12" cy="14" r="5"/><path d="M5 8 A 7 4 0 0 1 19 8"/>',
         trio:     '<circle cx="12" cy="6" r="2" fill="currentColor"/><circle cx="6" cy="17" r="2" fill="currentColor"/><circle cx="18" cy="17" r="2" fill="currentColor"/>',
         spark:    '<line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/><circle cx="12" cy="12" r="2" fill="currentColor"/>',
-        orbit:    '<circle cx="11" cy="13" r="5"/><circle cx="18.5" cy="6" r="1.6" fill="currentColor"/>',
+        // orbit favicon: just the planet circle, centered. The satellite
+        // dot is kept in the in-page mascot defs (see #m-orbit in
+        // index.html) so the brand mark still has it where size allows.
+        orbit:    '<circle cx="12" cy="12" r="7"/>',
       };
       const color = this.accent || "#6093ff";
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="color:${color}">${SHAPES[id] || SHAPES.orbit}</svg>`;
@@ -2490,6 +2563,7 @@ function portal() {
         await this.loadRoot();
         await this.initSessions();
         this.fetchStats();
+        this.loadTrash();
         // Restore the preview file the user was looking at before refresh.
         // openFile is idempotent on tabs[] (won't duplicate); if the file
         // no longer exists we silently no-op (no toast — refresh restoration).
@@ -5310,11 +5384,36 @@ function portal() {
     // ===== Claude Auth methods =====
     async loadClaudeAuthStatus() {
       try {
-        const r = await fetch("/api/settings/claude-auth/status", { headers: this.hdr() });
-        if (!r.ok) return;  // 401 / 500 — silent; UI shows "未连接"
+        const r = await fetch("/api/settings/claude-auth/status", {
+          headers: this.hdr(),
+          // Bypass HTTP cache so a stale "未连接" verdict cached after an
+          // earlier failed probe doesn't outlive a `claude login` the user
+          // ran later in the terminal. Forces the backend to re-invoke the
+          // CLI every call.
+          cache: "no-store",
+        });
+        if (!r.ok) {
+          // Surface the failure instead of silently keeping the old state.
+          // Without this, a transient 500 / 401 made the UI stick on a
+          // wrong "未连接" verdict forever (until next openSettings).
+          this.claudeAuth = {
+            ...this.claudeAuth,
+            loaded: true,
+            logged_in: false,
+            reason: `http-${r.status}`,
+          };
+          return;
+        }
         const d = await r.json();
         this.claudeAuth = { ...this.claudeAuth, ...d, loaded: true };
-      } catch (e) { /* network — silent */ }
+      } catch (e) {
+        this.claudeAuth = {
+          ...this.claudeAuth,
+          loaded: true,
+          logged_in: false,
+          reason: `network: ${e && e.message ? e.message : 'unknown'}`,
+        };
+      }
     },
     openClaudeAuthModal() {
       this.claudeAuthModal.open = true;
@@ -5441,8 +5540,14 @@ function portal() {
         handler: () => this.startOrganize(),
       };
     },
-    // Click any muse in the grid → switch mascot + prefill her invite into
-    // the chat input. User can edit before sending (or just hit Enter).
+    // Click any muse in the grid → switch mascot + prefill the chat input.
+    // CRITICAL: prefill uses `m.prompt` (user-voice, "我想聊聊...") NOT
+    // `m.invite` (Muse-voice, "聊聊你..."). The card preview displays
+    // invite so it reads naturally as Muse asking; the input box gets
+    // the first-person rewrite so the grammar / perspective is correct
+    // when the user hits Enter. Falls back to invite if a muse hasn't
+    // been given a prompt yet (forward-compat safety, all 9 currently
+    // have one).
     pickMascotAndAsk(idx) {
       const m = this.MASCOTS[idx];
       if (!m) return;
@@ -5450,8 +5555,9 @@ function portal() {
       try { localStorage.setItem("muselab_mascot_idx", String(idx)); } catch {}
       this.mascotGreet = true;
       setTimeout(() => { this.mascotGreet = false; }, 900);
-      const invite = m.invite ? (m.invite[this.lang] || m.invite.zh) : "";
-      this.useSuggestedPrompt(invite);
+      const src = m.prompt || m.invite || null;
+      const text = src ? (src[this.lang] || src.zh) : "";
+      this.useSuggestedPrompt(text);
     },
 
     claudeAuthPlanLabel() {
@@ -6009,6 +6115,90 @@ function portal() {
       this.childCache = {};
       this.loadRoot();
     },
+    // In-place removal of a node (and its descendants, if a dir) from the
+    // visible flat-list. Avoids the full reloadTree() that delete used to
+    // trigger — which clears the entire childCache and re-fetches every
+    // expanded directory from disk, flickering the whole tree on every
+    // single-file delete. Now: one splice, one cache key drop, done.
+    //
+    // Used by doDelete + drag-to-trash + (future) any other "this exact
+    // path went away" event. Restore still uses _refreshParentInTree
+    // because we don't have the new node's metadata client-side.
+    _removeNodeFromTree(path) {
+      if (!path) return;
+      const idx = this.visible.findIndex(n => n.path === path);
+      if (idx < 0) return;
+      const node = this.visible[idx];
+      // If it's a directory, swallow all rendered descendants too
+      // (depth > node.depth runs contiguously below the parent in the
+      // flat list, same shape collapse() relies on).
+      let end = idx + 1;
+      if (node.is_dir) {
+        while (end < this.visible.length
+                && this.visible[end].depth > node.depth) end++;
+      }
+      this.visible.splice(idx, end - idx);
+      // Clean up expanded set: the node itself + any of its descendants
+      // that were expanded. New Set() reassignment forces Alpine to
+      // notice (Set mutation in place doesn't trigger reactivity).
+      if (this.expanded.has(path)) this.expanded.delete(path);
+      for (const p of Array.from(this.expanded)) {
+        if (p.startsWith(path + "/")) this.expanded.delete(p);
+      }
+      this.expanded = new Set(this.expanded);
+      // Invalidate the parent dir's cache so a manual collapse+expand
+      // (or a future restore-into-this-parent) refetches truth from
+      // disk. Both showHidden=true|false variants since we don't know
+      // which one the user is currently viewing.
+      const parent = path.split("/").slice(0, -1).join("/");
+      delete this.childCache[`${parent}:true`];
+      delete this.childCache[`${parent}:false`];
+    },
+    // After restore, the parent dir's contents include a new node we
+    // don't have client-side. Cheapest correct behavior: invalidate
+    // parent cache + refetch + splice in place. If the parent isn't
+    // currently expanded (or restored to root and root isn't loaded),
+    // we fall back to reloadTree — rare in practice but covers the
+    // edge case without bespoke logic.
+    async _refreshParentInTree(restoredPath) {
+      if (!restoredPath) { this.reloadTree(); return; }
+      const parent = restoredPath.split("/").slice(0, -1).join("/");
+      delete this.childCache[`${parent}:true`];
+      delete this.childCache[`${parent}:false`];
+      if (!parent) {
+        // Root-level restore: re-merge root children, preserving expanded subtrees.
+        this.reloadTree();
+        return;
+      }
+      if (!this.expanded.has(parent)) {
+        // Parent is collapsed → nothing visible changes; expanding later
+        // will refetch fresh.
+        return;
+      }
+      const parentIdx = this.visible.findIndex(n => n.path === parent);
+      if (parentIdx < 0) { this.reloadTree(); return; }
+      const parentNode = this.visible[parentIdx];
+      // Snapshot inner-expanded subtrees so we can restore them after
+      // re-rendering the parent's children.
+      const innerExpanded = Array.from(this.expanded)
+        .filter(p => p !== parent && p.startsWith(parent + "/"));
+      // Splice out parent's current rendered subtree.
+      let end = parentIdx + 1;
+      while (end < this.visible.length
+              && this.visible[end].depth > parentNode.depth) end++;
+      this.visible.splice(parentIdx + 1, end - parentIdx - 1);
+      for (const p of innerExpanded) this.expanded.delete(p);
+      const children = await this.fetchChildren(parent);
+      const items = children.map(c => ({ ...c, depth: parentNode.depth + 1 }));
+      this.visible.splice(parentIdx + 1, 0, ...items);
+      // Re-expand previously-open inner subtrees in shortest-path-first
+      // order so each expand() can find its parent already rendered.
+      for (const p of innerExpanded.sort((a, b) => a.length - b.length)) {
+        const node = this.visible.find(n => n.path === p);
+        if (node && node.is_dir) await this.expand(node);
+      }
+      this.expanded = new Set(this.expanded);
+    },
     async fetchChildren(path) {
       const cacheKey = `${path}:${this.showHidden}`;
       if (this.childCache[cacheKey]) return this.childCache[cacheKey];
@@ -6183,13 +6373,17 @@ function portal() {
     },
     async doDelete(n) {
       const zh = this.lang === "zh";
+      // Soft-delete now: backend moves the target into <ROOT>/.muselab-dustbin/
+      // and returns a trash_id. Confirm copy says "move to trash" rather
+      // than "permanently delete"; the prior "(only empty dirs)" caveat
+      // is dropped because non-empty dir rename is just as cheap.
       const ok = await this.confirm({
-        title: zh ? "删除" : "Delete",
+        title: zh ? "移到垃圾桶" : "Move to trash",
         body: zh
-          ? (`删除 ${n.name}？` + (n.is_dir ? "（仅可删除空目录）" : ""))
-          : (`Delete ${n.name}?` + (n.is_dir ? " (only empty dirs)" : "")),
-        danger: true,
-        okText: zh ? "删除" : "Delete",
+          ? `把 ${n.name} 移到垃圾桶？可以从左下角垃圾桶恢复。`
+          : `Move ${n.name} to trash? You can restore it from the trash icon at the bottom of the files pane.`,
+        danger: false,
+        okText: zh ? "移到垃圾桶" : "Move to trash",
       });
       if (!ok) return;
       const r = await fetch("/api/files/delete", {
@@ -6197,15 +6391,213 @@ function portal() {
         headers: { ...this.hdr(), "Content-Type": "application/json" },
         body: JSON.stringify({ path: n.path }),
       });
-      if (r.ok) {
-        // 同步 tabs：删了的文件如果在 tabs 也清掉
-        this.tabs = this.tabs.filter(t => t.path !== n.path);
-        if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
-        const parent = n.path.split("/").slice(0, -1).join("/");
-        delete this.childCache[parent];
-        this.reloadTree();
-        this.toast(this.t("toast.deleted"), "success");
-      } else this.errToast("delete", await r.text());
+      if (!r.ok) {
+        this.errToast("delete", await r.text());
+        return;
+      }
+      let data = {};
+      try { data = await r.json(); } catch (_) {}
+      // 同步 tabs：删了的文件如果在 tabs 也清掉
+      this.tabs = this.tabs.filter(t => t.path !== n.path);
+      if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
+      // In-place tree removal: no full reload, no flicker. Helper also
+      // invalidates the parent's childCache so a future re-expand fetches
+      // fresh truth from disk.
+      this._removeNodeFromTree(n.path);
+      // Bump trash count for the badge without a round-trip.
+      this.trash.count += 1;
+      // Toast with an Undo action — clicking calls /trash/restore with
+      // the just-issued trash_id. 6s window matches the user expectation
+      // that "I just hit Delete" stays undoable for a moment. The 4th
+      // arg of toast() takes a `{label, onClick}` action — see
+      // runToastAction + the toast template button.
+      const tid = data.trash_id;
+      const baseMsg = zh ? `已移到垃圾桶：${n.name}` : `Moved to trash: ${n.name}`;
+      if (tid) {
+        this.toast(baseMsg, "success", 6000, {
+          label: zh ? "撤销" : "Undo",
+          onClick: () => this.restoreTrash(tid),
+        });
+      } else {
+        this.toast(baseMsg, "success", 3500);
+      }
+    },
+
+    // ============================================================
+    // Trash UI methods
+    // ============================================================
+    async loadTrash() {
+      // Skip before user has authenticated — otherwise the request 401s
+      // and pollutes the network panel on every fresh page load. Caller
+      // paths that fire pre-auth (any future ones) just silently no-op
+      // until login/_bootApp re-invokes us.
+      if (!this.token) return;
+      this.trash.loading = true;
+      try {
+        const r = await fetch("/api/files/trash/list", { headers: this.hdr() });
+        if (!r.ok) {
+          this.errToast("trash list", await r.text());
+          return;
+        }
+        const d = await r.json();
+        this.trash.items = d.items || [];
+        this.trash.count = this.trash.items.length;
+      } catch (e) {
+        this.toast(String(e.message || e), "error");
+      } finally {
+        this.trash.loading = false;
+      }
+    },
+    openTrashModal() {
+      this.trash.modalOpen = true;
+      this.loadTrash();
+    },
+    closeTrashModal() {
+      this.trash.modalOpen = false;
+    },
+    async restoreTrash(tid) {
+      const r = await fetch("/api/files/trash/restore", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ trash_id: tid }),
+      });
+      if (!r.ok) {
+        // 409 = original path occupied; surface backend detail verbatim
+        let detail = "";
+        try { detail = (await r.json()).detail || ""; } catch (_) {}
+        const zh = this.lang === "zh";
+        this.toast(detail || (zh ? "恢复失败" : "Restore failed"), "error", 4500);
+        return;
+      }
+      const d = await r.json();
+      this.trash.items = this.trash.items.filter(it => it.trash_id !== tid);
+      this.trash.count = Math.max(0, this.trash.count - 1);
+      // Targeted refresh: re-fetch ONLY the parent dir's children + splice
+      // them back into the tree, preserving every other expanded subtree.
+      // Falls back to reloadTree internally for the root / unloaded-parent
+      // edge cases.
+      const restored = d.restored_path || "";
+      await this._refreshParentInTree(restored);
+      const zh = this.lang === "zh";
+      this.toast(zh ? `已恢复：${restored}` : `Restored: ${restored}`, "success", 2500);
+    },
+    async purgeTrash(tid) {
+      const zh = this.lang === "zh";
+      const ok = await this.confirm({
+        title: zh ? "彻底删除" : "Permanently delete",
+        body: zh ? "这一项将被永久删除，无法恢复。继续？"
+                   : "This item will be permanently deleted. Continue?",
+        danger: true,
+        okText: zh ? "彻底删除" : "Delete forever",
+      });
+      if (!ok) return;
+      const r = await fetch("/api/files/trash/purge", {
+        method: "DELETE",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ trash_id: tid }),
+      });
+      if (!r.ok) {
+        this.errToast("trash purge", await r.text());
+        return;
+      }
+      this.trash.items = this.trash.items.filter(it => it.trash_id !== tid);
+      this.trash.count = Math.max(0, this.trash.count - 1);
+      this.toast(zh ? "已彻底删除" : "Permanently deleted", "success", 2000);
+    },
+    async emptyTrash() {
+      const zh = this.lang === "zh";
+      if (!this.trash.items.length) return;
+      const ok = await this.confirm({
+        title: zh ? "清空垃圾桶" : "Empty trash",
+        body: zh ? `${this.trash.items.length} 项将被永久删除，无法恢复。继续？`
+                   : `${this.trash.items.length} item(s) will be permanently deleted. Continue?`,
+        danger: true,
+        okText: zh ? "清空" : "Empty",
+      });
+      if (!ok) return;
+      const r = await fetch("/api/files/trash/empty", {
+        method: "DELETE",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+      });
+      if (!r.ok) {
+        this.errToast("trash empty", await r.text());
+        return;
+      }
+      this.trash.items = [];
+      this.trash.count = 0;
+      this.toast(zh ? "垃圾桶已清空" : "Trash emptied", "success", 2000);
+    },
+    onTrashDragOver(ev) {
+      // Only accept drops that came from inside the file tree (our custom
+      // MIME). OS file drops onto the trash icon are meaningless — they'd
+      // upload a file just to immediately trash it.
+      const types = Array.from(ev.dataTransfer?.types || []);
+      if (!types.includes(this._DRAG_MIME_INTERNAL)) {
+        ev.dataTransfer.dropEffect = "none";
+        return;
+      }
+      ev.dataTransfer.dropEffect = "move";
+      this.dragOverTrash = true;
+    },
+    async onTrashDrop(ev) {
+      this.dragOverTrash = false;
+      const types = Array.from(ev.dataTransfer?.types || []);
+      if (!types.includes(this._DRAG_MIME_INTERNAL)) return;
+      const path = ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL)
+                    || this._dragSrcPath || "";
+      this._dragSrcPath = null;
+      if (!path) return;
+      // Drag-to-trash skips the confirm modal — the drag itself is the
+      // commitment, matching Finder / Files behavior. The Undo toast
+      // covers accidental drops (6s window). We DO still want the same
+      // tab-cleanup and tree-refresh side effects as doDelete(), so
+      // hand off to a shared helper.
+      await this._sendToTrash(path);
+    },
+    async _sendToTrash(path) {
+      const name = path.split("/").pop() || path;
+      const r = await fetch("/api/files/delete", {
+        method: "DELETE",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (!r.ok) {
+        this.errToast("delete", await r.text());
+        return;
+      }
+      let data = {};
+      try { data = await r.json(); } catch (_) {}
+      this.tabs = this.tabs.filter(t => t.path !== path);
+      if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
+      // In-place removal — see _removeNodeFromTree for rationale.
+      this._removeNodeFromTree(path);
+      this.trash.count += 1;
+      const tid = data.trash_id;
+      const zh = this.lang === "zh";
+      const baseMsg = zh ? `已移到垃圾桶：${name}` : `Moved to trash: ${name}`;
+      if (tid) {
+        this.toast(baseMsg, "success", 6000, {
+          label: zh ? "撤销" : "Undo",
+          onClick: () => this.restoreTrash(tid),
+        });
+      } else {
+        this.toast(baseMsg, "success", 3500);
+      }
+    },
+    trashItemTime(it) {
+      // Format unix sec → local short time, e.g. "05-25 16:42" / "May 25 4:42 PM"
+      const ts = it.deleted_at || 0;
+      if (!ts) return "—";
+      const d = new Date(ts * 1000);
+      const zh = this.lang === "zh";
+      return d.toLocaleString(zh ? "zh-CN" : "en-US",
+        { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    },
+    trashItemSize(it) {
+      const n = it.size || 0;
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+      return (n / 1024 / 1024).toFixed(1) + " MB";
     },
     async openFile(n) {
       // multi-tab：第一次打开就推进 tabs；已存在则切换
@@ -6376,19 +6768,46 @@ function portal() {
       await this.revealInTree(path);
     },
     async revealInTree(path) {
-      // Expand every ancestor directory so the file's row exists in `visible`,
-      // then scroll its <li> into view. Skips no-op when the file is already
-      // visible (`scrollIntoView({block:"nearest"})` won't scroll if visible).
+      // Make the file's row visible in the tree pane and flash it so the
+      // user can see the locate operation actually happened.
+      //
+      // Failure modes this guards against (all previously made the feature
+      // feel "broken"):
+      //   1. Mobile — user is on mobileTab="preview", so even after the
+      //      tree expands they see no change. Switch to "files" first.
+      //   2. searchMode — filelist-wrap has x-show="!searchMode", so the
+      //      <li> exists in DOM but is hidden inside a display:none parent.
+      //      Clear searchMode so the tree is actually visible.
+      //   3. Already in viewport — block:"nearest" + smooth scroll does
+      //      nothing visibly. Use block:"center" + a temporary CSS pulse
+      //      class so the user always sees feedback.
+      //   4. Non-active tab — when the user right-clicks a non-current
+      //      preview tab, `selected !== path`, so the row has no `sel`
+      //      class. The pulse class handles that too.
       if (!path) return;
+      if (this.searchMode) this.clearSearch();
+      if (this._isMobileLayout()) this.mobileTab = "files";
       const parts = path.split("/");
       parts.pop();   // drop the filename, keep only directory chain
       const dirPath = parts.join("/");
       if (dirPath) await this.expandPath(dirPath);
-      this.$nextTick(() => {
-        const el = document.querySelector(
-          `.filelist li[data-path="${(window.CSS && CSS.escape) ? CSS.escape(path) : path}"]`);
-        if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      });
+      // Two nextTicks: first to let the mobileTab/searchMode toggles flush
+      // and the filelist-wrap become visible, second to let any final
+      // splice from expandPath render before we query.
+      this.$nextTick(() => this.$nextTick(() => {
+        const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
+        const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
+        if (!el) return;
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        // Pulse highlight — independent of `sel` class so it fires even
+        // when this isn't the active tab. Restart by removing+adding so
+        // rapid re-reveals still trigger the animation.
+        el.classList.remove("reveal-pulse");
+        // Force reflow so the next add restarts the animation.
+        void el.offsetWidth;
+        el.classList.add("reveal-pulse");
+        setTimeout(() => el.classList.remove("reveal-pulse"), 1600);
+      }));
     },
     closeTab(path) {
       const idx = this.tabs.findIndex(t => t.path === path);
@@ -6570,6 +6989,257 @@ function portal() {
         // Attach copy button to every <pre> wrapping a code block — only once.
         this._attachCopyBtn(el);
       });
+      // After hljs finishes, scan for Artifact-eligible code blocks (mermaid
+      // diagrams, HTML previews). Limited to chat messages and markdown
+      // previews — file previews (.text) are raw read-only views where
+      // auto-rendering embedded HTML / running Mermaid would be unexpected.
+      // Fire-and-forget — mermaid.render is async but UI doesn't need to wait.
+      if (root === ".chat-body" || root === ".markdown") {
+        this._renderArtifacts(root).catch(e =>
+          console.warn("[muselab] artifacts render failed:", e));
+      }
+    },
+
+    // ============================================================
+    // Code Artifacts — inline render of mermaid diagrams + (opt-in)
+    // sandboxed HTML preview. Designed to keep muselab's "no build,
+    // no external CDN" constraint: mermaid is vendored locally
+    // (frontend/vendor/mermaid.min.js, ~3.3 MB) and lazy-loaded only
+    // when the first mermaid block appears. HTML artifacts use a
+    // sandboxed iframe (no allow-same-origin; the AI-supplied markup
+    // CANNOT access muselab's DOM, cookies, or token).
+    //
+    // Phase 1 scope (see docs/research-code-artifacts-2026-05.md):
+    //   - Mermaid: always on; replaces the <pre><code> with SVG
+    //   - HTML: opt-in via Settings → Appearance (default OFF). Wraps
+    //     the <pre><code> with a toolbar; "Run" mounts a sandboxed iframe
+    //   - React/JSX: NOT in scope; needs Sucrase/esbuild-wasm (~1-3 MB
+    //     of transpiler) which violates the no-build constraint
+    // ============================================================
+    _initArtifacts() {
+      // Single document-level click delegation for all artifact toolbar
+      // buttons. Dynamic content inserted by _renderArtifacts doesn't get
+      // Alpine-initialized, so plain DOM events are the path of least
+      // resistance. Idempotent guard against init() double-fire (same
+      // pattern as other listener attachments above).
+      if (this._artifactClickBound) return;
+      this._artifactClickBound = true;
+      document.addEventListener("click", (ev) => {
+        const btn = ev.target.closest && ev.target.closest(".artifact-btn");
+        if (!btn) return;
+        const wrap = btn.closest(".artifact-wrap");
+        if (!wrap) return;
+        this._onArtifactBtn(wrap, btn.dataset.action || "");
+      });
+    },
+
+    // Lazy-loads vendored mermaid.min.js (~3.3 MB) and initializes it
+    // with strict securityLevel. Returns a Promise that resolves once
+    // window.mermaid is ready. Subsequent calls reuse the cached promise.
+    async _loadMermaid() {
+      if (window.mermaid) return window.mermaid;
+      if (this._mermaidLoadPromise) return this._mermaidLoadPromise;
+      this._mermaidLoadPromise = new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "/static/vendor/mermaid.min.js";
+        s.onload = () => {
+          try {
+            // securityLevel: "strict" disables foreign HTML in labels,
+            // click-event handlers, and arbitrary script injection inside
+            // diagrams. theme=null lets us inherit CSS variables via our
+            // own stylesheet rather than mermaid's baked-in themes.
+            window.mermaid.initialize({
+              startOnLoad: false,
+              securityLevel: "strict",
+              theme: this.theme === "dark" ? "dark" : "default",
+            });
+            resolve(window.mermaid);
+          } catch (e) { reject(e); }
+        };
+        s.onerror = () => reject(new Error("mermaid load failed"));
+        document.head.appendChild(s);
+      });
+      return this._mermaidLoadPromise;
+    },
+
+    async _renderArtifacts(rootSelector) {
+      const pres = document.querySelectorAll(rootSelector + " pre > code");
+      for (const codeEl of pres) {
+        const pre = codeEl.parentElement;
+        // Skip <pre> nested INSIDE an existing artifact's source viewer
+        // (we clone the original pre into .artifact-source for the
+        // "view source" toggle — without this guard, re-runs would
+        // double-wrap the clone). closest() returns null when no
+        // ancestor matches, so this is safe even for top-level pres.
+        if (pre.closest(".artifact-wrap")) continue;
+        const m = (codeEl.className || "").match(/language-([\w+-]+)/);
+        if (!m) continue;
+        const lang = m[1].toLowerCase();
+        if (lang === "mermaid") {
+          // Streaming-safe: mid-stream the source is often incomplete
+          // (closing ``` not yet arrived), so mermaid throws. We retry
+          // on subsequent renders by hashing the current text — if it
+          // matches the last failed attempt, skip; otherwise try again.
+          // On success, _renderMermaidBlock replaces <pre> entirely.
+          const src = codeEl.textContent || "";
+          if (pre.dataset.artifactSrc === src) continue;  // unchanged failure
+          await this._renderMermaidBlock(pre, codeEl, src);
+        } else if (lang === "html" || lang === "htmlpreview") {
+          if (pre.dataset.artifact === "1") continue;  // HTML is one-shot wrap
+          pre.dataset.artifact = "1";
+          this._renderHtmlBlock(pre, codeEl);
+        }
+      }
+    },
+
+    async _renderMermaidBlock(pre, codeEl, src) {
+      // textContent rather than innerText so we don't get hljs's syntax
+      // span structure — mermaid needs the raw source. Caller passes src
+      // so we hash the same text we're rendering (the dataset.artifactSrc
+      // check happens on the same value).
+      try {
+        const mm = await this._loadMermaid();
+        const id = "mermaid-" + Math.random().toString(36).slice(2, 10);
+        const { svg } = await mm.render(id, src);
+        const wrap = document.createElement("div");
+        wrap.className = "artifact-wrap artifact-mermaid";
+        wrap.innerHTML = `
+          <div class="artifact-toolbar">
+            <span class="artifact-label">Mermaid</span>
+            <button class="artifact-btn" data-action="toggle-source"
+                    title="${this.lang === 'zh' ? '查看源码' : 'View source'}">
+              &lt;/&gt;
+            </button>
+            <button class="artifact-btn" data-action="copy"
+                    title="${this.lang === 'zh' ? '复制源码' : 'Copy source'}">
+              ${this.lang === 'zh' ? '复制' : 'Copy'}
+            </button>
+          </div>
+          <div class="artifact-render">${svg}</div>
+          <div class="artifact-source" hidden></div>
+        `;
+        // Move the original highlighted <pre> into the source toggle so
+        // "View source" still shows hljs colors.
+        const srcSlot = wrap.querySelector(".artifact-source");
+        const clonePre = pre.cloneNode(true);
+        clonePre.removeAttribute("data-artifact");
+        clonePre.removeAttribute("data-artifact-src");
+        srcSlot.appendChild(clonePre);
+        pre.replaceWith(wrap);
+      } catch (e) {
+        // Mid-stream partial blocks fail constantly (unclosed graph
+        // syntax). Cache this source text so we don't re-render on every
+        // chunk — _renderArtifacts checks dataset.artifactSrc and retries
+        // only when the text changes. Keep the original code block
+        // visible so the user can read the source while it grows.
+        pre.dataset.artifactSrc = src;
+        // Replace prior error chip (if any) instead of stacking.
+        let note = pre.nextElementSibling;
+        if (!note || !note.classList || !note.classList.contains("artifact-error")) {
+          note = document.createElement("div");
+          note.className = "artifact-error";
+          pre.after(note);
+        }
+        note.textContent = (this.lang === "zh" ? "Mermaid 渲染失败：" : "Mermaid render failed: ")
+                            + (e && e.message ? e.message : String(e)).slice(0, 200);
+      }
+    },
+
+    _renderHtmlBlock(pre, codeEl) {
+      const src = codeEl.textContent || "";
+      const wrap = document.createElement("div");
+      wrap.className = "artifact-wrap artifact-html";
+      const runLabel  = this.lang === "zh" ? "运行" : "Run";
+      const stopLabel = this.lang === "zh" ? "停止" : "Stop";
+      const copyLabel = this.lang === "zh" ? "复制" : "Copy";
+      wrap.innerHTML = `
+        <div class="artifact-toolbar">
+          <span class="artifact-label">HTML</span>
+          <button class="artifact-btn primary" data-action="run-html" data-label-run="${runLabel}" data-label-stop="${stopLabel}">${runLabel}</button>
+          <button class="artifact-btn" data-action="copy" title="${copyLabel}">${copyLabel}</button>
+        </div>
+        <div class="artifact-source"></div>
+        <div class="artifact-render" hidden></div>
+      `;
+      // Keep the original (hljs-highlighted) <pre> visible by default so
+      // the user can read what the AI proposed BEFORE running it.
+      const srcSlot = wrap.querySelector(".artifact-source");
+      const clonePre = pre.cloneNode(true);
+      clonePre.removeAttribute("data-artifact");
+      srcSlot.appendChild(clonePre);
+      // Stash raw source on the wrapper so Run can read it without
+      // re-walking the cloned hljs spans.
+      wrap.dataset.htmlSource = src;
+      pre.replaceWith(wrap);
+    },
+
+    _onArtifactBtn(wrap, action) {
+      if (action === "toggle-source") {
+        const ren = wrap.querySelector(".artifact-render");
+        const src = wrap.querySelector(".artifact-source");
+        const showingSource = !src.hasAttribute("hidden");
+        if (showingSource) {
+          src.setAttribute("hidden", "");
+          if (ren) ren.removeAttribute("hidden");
+        } else {
+          src.removeAttribute("hidden");
+          if (ren) ren.setAttribute("hidden", "");
+        }
+      } else if (action === "copy") {
+        // Copy the original source. For HTML artifacts the raw source lives
+        // on dataset; for Mermaid we re-read from the hidden source <pre>.
+        const raw = wrap.dataset.htmlSource
+                    || (wrap.querySelector(".artifact-source code")?.textContent ?? "");
+        try {
+          navigator.clipboard.writeText(raw);
+          this.toast && this.toast(this.lang === "zh" ? "已复制" : "Copied",
+                                    "success", 1200);
+        } catch (e) {
+          this.toast && this.toast("Clipboard error", "error");
+        }
+      } else if (action === "run-html") {
+        this._toggleHtmlIframe(wrap);
+      }
+    },
+
+    _toggleHtmlIframe(wrap) {
+      const btn = wrap.querySelector('[data-action="run-html"]');
+      const ren = wrap.querySelector(".artifact-render");
+      const src = wrap.querySelector(".artifact-source");
+      const running = !ren.hasAttribute("hidden");
+      if (running) {
+        // Tear down: blank the iframe content so any timers / fetches in
+        // the AI-supplied HTML stop, then hide the render panel.
+        ren.innerHTML = "";
+        ren.setAttribute("hidden", "");
+        src.removeAttribute("hidden");
+        if (btn) btn.textContent = btn.dataset.labelRun || "Run";
+        btn.classList.add("primary");
+        return;
+      }
+      // Mount: build a fresh sandboxed iframe. CRITICAL security notes:
+      //   - sandbox WITHOUT allow-same-origin → iframe gets a null origin,
+      //     cannot read parent DOM, cookies, or localStorage. Any
+      //     <script>parent.alert()</script> attack is blocked.
+      //   - NO allow-top-navigation → AI-supplied HTML can't redirect
+      //     the whole window.
+      //   - srcdoc (not src) → no external network resource by URL; only
+      //     what the AI literally wrote in the block.
+      //   - allow-popups-to-escape-sandbox lets target=_blank links open
+      //     in a real tab (which IS sandbox-free) — convenient for demos.
+      const html = wrap.dataset.htmlSource || "";
+      const iframe = document.createElement("iframe");
+      iframe.className = "artifact-iframe";
+      iframe.setAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms");
+      iframe.srcdoc = html;
+      ren.innerHTML = "";
+      ren.appendChild(iframe);
+      ren.removeAttribute("hidden");
+      src.setAttribute("hidden", "");
+      if (btn) {
+        btn.textContent = btn.dataset.labelStop || "Stop";
+        btn.classList.remove("primary");
+      }
     },
 
     // Wraps a fenced-code-block <code> with a hover-revealed copy button on
@@ -7713,13 +8383,17 @@ function portal() {
       // 那时不应该当成"发送"，让 IME 自己处理。
       if (ev.isComposing || ev.keyCode === 229) return;
       if (this.mentionShow) { this.pickMention(); return; }
-      if (ev.shiftKey) { this.input += "\n"; return; }
-      // Mobile / touch screens: Enter inserts a newline; send is via the
-      // button only. Desktop users get the keyboard-first flow.
+      // Newline-at-cursor for: Shift+Enter, Ctrl+Enter, Meta+Enter, and
+      // touch devices (where bare Enter is a newline because send is via
+      // the on-screen button). Inserting at selectionStart/End preserves
+      // mid-paragraph editing — previously `input += "\n"` always tacked
+      // the newline onto the end, which made it impossible to split a
+      // paragraph at the caret.
       const isTouch = (window.matchMedia
                         && window.matchMedia("(pointer: coarse)").matches)
                       || window.innerWidth < 768;
-      if (isTouch) {
+      const wantNewline = ev.shiftKey || ev.ctrlKey || ev.metaKey || isTouch;
+      if (wantNewline) {
         const ta = this.$refs.chatInput;
         if (ta) {
           const s = ta.selectionStart, e = ta.selectionEnd;
@@ -7741,34 +8415,32 @@ function portal() {
     onChatScroll() {
       const el = this.$refs.chatBody;
       if (!el) return;
-      // 150px = "near bottom" sticky threshold. Bigger than the obvious
-      // ~80px because on mobile the keyboard pushes things, the pending
-      // bubble appears mid-turn (+~60px), the queue badge inflates (+~20px),
-      // and tool_result expand/collapse can shift layout — all of those
-      // briefly pop the user above an 80px threshold even though they
-      // visually didn't scroll. With 150 we keep "stick to bottom" intent
-      // through layout jitter.
-      this.atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 150;
+      // Strict "at bottom": 2px tolerance only — just enough to absorb
+      // sub-pixel geometry (browser zoom / high-DPI displays can report
+      // distance as 0.4–1.x even when visually at bottom; pure ==0 would
+      // mis-classify and never re-engage auto-follow). Any user-driven
+      // scroll-up of even a few pixels immediately disables mid-stream
+      // auto-follow until they scroll all the way back down.
+      // Layout jitter (pending bubble grows, queue badge inflates, etc.)
+      // doesn't fire scroll events — only scrollTop changes do — so this
+      // tight threshold is safe against false negatives from those.
+      this.atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
     },
     scrollToBottom(force) {
       const el = this.$refs.chatBody;
       if (!el) return;
-      // Sample "are we near the bottom right now" SYNCHRONOUSLY off the
-      // DOM, before scheduling the post-Alpine-flush scroll. We used to
-      // rely solely on `this.atBottom`, but that flag only updates on
-      // scroll events — so if the pending bubble / keyboard / queue badge
-      // pushed the viewport down without firing a scroll, the flag was
-      // stale `true` (correct) OR stale `false` (the bug the user hit:
-      // Muse streams new text, atBottom is somehow already false, no
-      // scroll). Sampling now → decide → flush → scroll keeps the decision
-      // anchored in real-time geometry instead of an event-driven cache.
-      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-      const wasNearBottom = distance < 150;
+      // Strict semantics: when not forced, respect the user's atBottom
+      // intent exclusively. Don't re-sample geometry — the prior
+      // "sample-then-decide" approach used a 150px window that meant
+      // every new chunk during streaming could re-engage auto-follow
+      // even after the user had scrolled up to read history (each
+      // chunk's small height kept distance briefly under 150). With
+      // this guard, once the user is meaningfully scrolled up the
+      // viewport stays put until they manually scroll back to the bottom.
+      if (!force && !this.atBottom) return;
       this.$nextTick(() => {
-        if (force || wasNearBottom) {
-          el.scrollTop = el.scrollHeight;
-          this.atBottom = true;
-        }
+        el.scrollTop = el.scrollHeight;
+        this.atBottom = true;
       });
     },
 

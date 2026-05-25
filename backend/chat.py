@@ -5,7 +5,6 @@ import json
 import asyncio
 import re
 import sys
-import tempfile
 import time
 import urllib.parse
 import uuid
@@ -70,6 +69,23 @@ def _cli_project_roots() -> list[Path]:
         endpoints._vendor_config_dir() / "projects",
     ]
     return [r for r in candidates if r.exists()]
+
+
+def _cli_encode_cwd(path: str) -> str:
+    """Mirror Claude CLI's projects-dir encoding: every non-alphanumeric
+    character becomes ``-``.
+
+    Examples::
+
+        /home/chenxiaosen              → -home-chenxiaosen
+        /home/chenxiaosen/claude_space → -home-chenxiaosen-claude-space
+
+    Note: a naive ``str.replace("/", "-")`` only handles slashes and
+    breaks for paths containing ``_`` or ``.`` — the CLI replaces those
+    too. The cost dashboard, transcript search, and tests all share this
+    helper so the encoding stays in lockstep.
+    """
+    return "".join(c if c.isalnum() else "-" for c in path)
 
 
 def _find_session_jsonl(sid: str) -> Path | None:
@@ -1201,7 +1217,7 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
     qlower = query.lower()
     if ROOT is None:
         return {"hits": [], "total": 0}
-    cwd_key = str(ROOT).replace("/", "-")
+    cwd_key = _cli_encode_cwd(str(ROOT))
     # Walk per-cwd subdirs under each CLI project root — both default
     # and vendor-isolated. Skipping vendor would silently hide every
     # third-party session from search.
@@ -2278,25 +2294,29 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     # Discover all JSONLs for muselab-tracked sessions. SDK CLI keys
     # the projects dir by the cwd that ran the session, so a single
     # logical archive (one ROOT) can have JSONL spread across multiple
-    # `<projects-root>/<encoded-cwd>/` dirs if ROOT (or working dir)
-    # changed over time. We track every JSONL whose session id matches
-    # something muselab knows about (sidecar OR sess.list_sessions()) —
-    # this catches early sessions on prior cwds without picking up
-    # totally unrelated projects.
+    # `<projects-root>/<encoded-cwd>/` dirs:
+    #   - The current MUSELAB_ROOT's encoded form
+    #   - Any subdir of MUSELAB_ROOT (the CLI was launched with cwd set
+    #     to a child path — happens when ROOT was historically deeper,
+    #     or when a subagent ran with a narrower cwd)
+    # Earlier versions filtered by `jsonl.stem in known_sids` (sidecar
+    # OR sess.list_sessions()), but `sess.list_sessions(directory=ROOT)`
+    # only sees the CURRENT ROOT's encoded-cwd dir, so JSONLs written
+    # when MUSELAB_ROOT was different (e.g. user moved ROOT up from
+    # /home/user/archive → /home/user) became invisible — their models
+    # disappeared from by_model even though the JSONL was still on disk.
+    # We now scope by encoded-path-prefix instead: a JSONL counts iff its
+    # containing dir name equals encoded(ROOT) or starts with
+    # `encoded(ROOT) + "-"`. This catches all historical sub-cwds without
+    # picking up totally unrelated projects (e.g. /opt/foo, /tmp/bar,
+    # an old macOS path /Users/x/... — they don't share the prefix).
     project_roots = _cli_project_roots()
     if not project_roots:
         return _empty_dashboard_response(days, tz_offset_minutes, now)
 
-    known_sids: set[str] = set()
-    for sidecar in sess.SESS_DIR.glob("*.sidecar.json"):
-        known_sids.add(sidecar.name.split(".sidecar.json")[0])
-    try:
-        for s in sess.list_sessions():
-            sid = s.get("id")
-            if sid:
-                known_sids.add(sid)
-    except Exception:
-        pass
+    # ROOT is guaranteed non-None here (settings.py asserts at startup).
+    root_encoded = _cli_encode_cwd(str(ROOT))
+    root_prefix = root_encoded + "-"
 
     jsonl_paths: list[Path] = []
     for projects_root in project_roots:
@@ -2304,9 +2324,11 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
             for proj_sub in projects_root.iterdir():
                 if not proj_sub.is_dir():
                     continue
+                name = proj_sub.name
+                if name != root_encoded and not name.startswith(root_prefix):
+                    continue
                 for jsonl in proj_sub.glob("*.jsonl"):
-                    if jsonl.stem in known_sids:
-                        jsonl_paths.append(jsonl)
+                    jsonl_paths.append(jsonl)
         except OSError:
             continue
 

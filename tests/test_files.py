@@ -88,14 +88,37 @@ def test_delete_file(client, auth, temp_root):
     assert not (temp_root / "notes" / "b.txt").exists()
 
 
-def test_delete_nonempty_dir_refused(client, auth):
+def test_delete_nonempty_dir_moves_to_trash(client, auth, temp_root):
+    # Trash semantics (2026-05-25): /delete on a non-empty dir is no longer
+    # refused — it does a soft-delete by moving the whole subtree to
+    # `<ROOT>/.muselab-dustbin/`. Only `permanent=true` actually rmtrees.
+    assert (temp_root / "notes").exists()
     r = client.request(
         "DELETE",
         "/api/files/delete",
         headers=auth,
         json={"path": "notes"},
     )
-    assert r.status_code == 400
+    assert r.status_code == 200, r.text
+    assert not (temp_root / "notes").exists()
+    dustbin = temp_root / ".muselab-dustbin"
+    assert dustbin.is_dir()
+    assert any(dustbin.iterdir()), "trash dir should hold the moved subtree"
+
+
+def test_delete_nonempty_dir_permanent_still_works(client, auth, temp_root):
+    # Sanity: permanent=true bypasses trash entirely (used by the
+    # trash-purge / empty-trash flows).
+    assert (temp_root / "notes").exists()
+    r = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": "notes"},
+    )
+    assert r.status_code == 200, r.text
+    assert not (temp_root / "notes").exists()
+    assert not (temp_root / ".muselab-dustbin" / "notes").exists()
 
 
 def test_upload(client, auth, temp_root):

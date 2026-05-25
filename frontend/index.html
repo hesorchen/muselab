@@ -425,6 +425,25 @@
         <div class="hint-row" x-show="!searchHits.length && !grepHits.length && !searching" x-text="t('files.empty_search')"></div>
         <div class="hint-row" x-show="searching" x-text="t('files.searching')"></div>
       </div>
+      <!-- Trash footer: docked at the bottom of the files pane.
+           - Click → open trash modal
+           - Drag a file-tree node onto it → move that file to trash
+             (no confirm — the drag IS the intent; Undo toast covers
+             accidental drops, same UX as Finder / Files apps).
+           - dragOverTrash state drives a red-highlight + scale-up
+             animation so the user sees they've hit a valid target.
+           Badge shows count when > 0. -->
+      <footer class="files-foot"
+              @dragover.prevent="onTrashDragOver($event)"
+              @dragleave.prevent="dragOverTrash = false"
+              @drop.prevent="onTrashDrop($event)">
+        <button class="files-foot-trash"
+                :class="{ 'drag-over': dragOverTrash, 'has-items': trash.count > 0 }"
+                @click="openTrashModal()"
+                :title="lang==='zh' ? '垃圾桶 · 点击查看，拖文件进来删除' : 'Trash · click to view, drag files here to delete'">
+          <span class="icon"><svg><use href="#i-trash"/></svg></span>
+        </button>
+      </footer>
     </aside>
 
     <!-- resizer between files and preview -->
@@ -1225,8 +1244,8 @@
               </div>
             </template>
 
-            <div class="brand-tips">
-              <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span></div>
+            <div class="brand-tips" x-show="input" x-transition.opacity.duration.200ms>
+              <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span> <span x-text="t('chat.empty_tip1b')"></span></div>
               <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
               <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
               <div class="brand-tip"><span class="kbd">?</span><span x-text="t('chat.empty_tip4')"></span></div>
@@ -2628,6 +2647,11 @@
                 <div class="claude-auth-title" x-text="t('claude_auth.title')"></div>
                 <div class="claude-auth-subtitle" x-text="t('claude_auth.subtitle')"></div>
               </div>
+              <!-- In-flight: backend hasn't responded yet. Without this,
+                   the head row stays empty during the fetch and visually
+                   matches "未连接" — users assume the worst. -->
+              <span x-show="!claudeAuth.loaded" class="settings-badge"
+                    x-text="lang==='zh' ? '检测中…' : 'Checking…'"></span>
               <span x-show="claudeAuth.logged_in" class="settings-badge ok"
                     x-text="t('claude_auth.status_connected')"></span>
               <span x-show="claudeAuth.loaded && !claudeAuth.logged_in" class="settings-badge"
@@ -2662,8 +2686,20 @@
                 <span x-text="t('claude_auth.cli_missing')"></span>
                 <code x-text="t('claude_auth.cli_install_cmd')"></code>
               </div>
-              <button class="btn-primary" @click="openClaudeAuthModal()"
-                      x-text="t('claude_auth.connect_btn')"></button>
+              <!-- Surface `reason` so the user can self-debug a wrong
+                   "未连接" verdict (e.g. cli-timeout, not-logged-in,
+                   cli-bad-json). Hidden when reason is null. -->
+              <div x-show="claudeAuth.reason" class="claude-auth-reason"
+                   style="font-size:12px;color:var(--fg-soft,#6b7280);">
+                <span x-text="lang==='zh' ? '探测原因：' : 'Probe reason: '"></span>
+                <code x-text="claudeAuth.reason"></code>
+              </div>
+              <div class="claude-auth-actions" style="border-top:none;padding-top:0;">
+                <button class="btn-primary" @click="openClaudeAuthModal()"
+                        x-text="t('claude_auth.connect_btn')"></button>
+                <button class="btn-ghost sm" @click="loadClaudeAuthStatus()"
+                        x-text="lang==='zh' ? '重新检测' : 'Recheck'"></button>
+              </div>
             </div>
           </div>
 
@@ -3296,7 +3332,11 @@
             </tr>
             <tr>
               <td><span class="kbd">Shift</span><span class="kbd">Enter</span></td>
-              <td x-text="lang==='zh' ? '输入框换行' : 'Newline in input'"></td>
+              <td x-text="lang==='zh' ? '输入框换行（光标处插入）' : 'Newline at caret'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">Ctrl</span><span class="kbd">Enter</span> / <span class="kbd">⌘</span><span class="kbd">Enter</span></td>
+              <td x-text="lang==='zh' ? '输入框换行（光标处插入）' : 'Newline at caret'"></td>
             </tr>
             <tr>
               <td><span class="kbd">@</span></td>
@@ -3506,6 +3546,72 @@
       <div class="modal-foot">
         <button @click="modal.cancel && modal.cancel()" class="btn-ghost" x-text="modal.cancelText || '取消'"></button>
         <button @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || '确认'"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================
+       Trash modal — list of soft-deleted files/dirs with restore +
+       permanent-purge per item, plus "Empty all". Opens from the
+       trash icon at the bottom of the files pane. Loads /trash/list
+       on each open so the view is always fresh.
+       ============================================================ -->
+  <div class="modal-backdrop" x-show="trash.modalOpen"
+       @click.self="closeTrashModal()"
+       x-transition.opacity.duration.120ms>
+    <div class="modal trash-modal" @keydown.escape.window="closeTrashModal()"
+         role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <span class="modal-title">
+          <span class="icon" style="display:inline-flex;width:18px;height:18px;vertical-align:-3px;"><svg><use href="#i-trash"/></svg></span>
+          <span x-text="lang==='zh' ? '垃圾桶' : 'Trash'"></span>
+          <span class="modal-title-count" x-show="trash.items.length > 0"
+                x-text="'(' + trash.items.length + ')'"></span>
+        </span>
+        <button class="modal-close" @click="closeTrashModal()"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <template x-if="trash.loading">
+          <div class="hint-row" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+        </template>
+        <template x-if="!trash.loading && !trash.items.length">
+          <div class="hint-row" x-text="lang==='zh' ? '垃圾桶是空的' : 'Trash is empty'"></div>
+        </template>
+        <template x-if="!trash.loading && trash.items.length">
+          <div class="trash-list">
+            <template x-for="it in trash.items" :key="it.trash_id">
+              <div class="trash-row">
+                <span class="trash-kind-icon">
+                  <svg><use :href="it.kind === 'dir' ? '#i-folder' : '#i-file'"/></svg>
+                </span>
+                <div class="trash-meta">
+                  <div class="trash-name" x-text="it.original_name"></div>
+                  <div class="trash-sub">
+                    <span class="trash-path" x-text="it.original_path"></span>
+                    <span class="trash-sep">·</span>
+                    <span x-text="trashItemTime(it)"></span>
+                    <span class="trash-sep">·</span>
+                    <span x-text="trashItemSize(it)"></span>
+                  </div>
+                </div>
+                <div class="trash-actions">
+                  <button class="btn-ghost sm" @click="restoreTrash(it.trash_id)"
+                          x-text="lang==='zh' ? '恢复' : 'Restore'"></button>
+                  <button class="btn-ghost sm danger" @click="purgeTrash(it.trash_id)"
+                          x-text="lang==='zh' ? '彻底删除' : 'Delete'"></button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+      <div class="modal-foot">
+        <button @click="closeTrashModal()" class="btn-ghost"
+                x-text="lang==='zh' ? '关闭' : 'Close'"></button>
+        <button @click="emptyTrash()" class="btn-danger"
+                :disabled="!trash.items.length"
+                x-text="lang==='zh' ? '清空垃圾桶' : 'Empty trash'"></button>
       </div>
     </div>
   </div>

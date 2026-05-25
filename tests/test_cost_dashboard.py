@@ -14,7 +14,14 @@ import pytest
 
 
 def _projects_dir_for(root: Path) -> Path:
-    return Path.home() / ".claude" / "projects" / str(root).replace("/", "-")
+    # Must match Claude CLI's actual encoding (non-alnum → "-"). A naive
+    # `str(root).replace("/", "-")` worked by coincidence as long as test
+    # paths had no underscores — once pytest's `tmp_path` contained one
+    # (e.g. `test_cost_dashboard_aggregates0`), the staged dir name didn't
+    # match what production code (`backend.chat._cli_encode_cwd`) looks
+    # for. Share the encoder so they stay in lockstep.
+    from backend.chat import _cli_encode_cwd
+    return Path.home() / ".claude" / "projects" / _cli_encode_cwd(str(root))
 
 
 @pytest.fixture()
@@ -160,8 +167,9 @@ def test_cost_dashboard_discovers_vendor_config_dir_jsonl(
 
     # Build a fake vendor projects dir under whatever path the production
     # code resolves to (per-uid temp dir; see endpoints._vendor_config_dir).
+    from backend.chat import _cli_encode_cwd
     vendor_root = endpoints_mod._vendor_config_dir() / "projects"
-    proj = vendor_root / str(temp_root).replace("/", "-")
+    proj = vendor_root / _cli_encode_cwd(str(temp_root))
     proj.mkdir(parents=True, exist_ok=True)
 
     sid = str(uuid.uuid4())

@@ -1262,7 +1262,7 @@ def _claude_cli_path() -> str | None:
     return _shutil.which("claude")
 
 
-def _run_claude_auth_status(timeout: float = 5.0) -> dict:
+def _run_claude_auth_status(timeout: float = 8.0) -> dict:
     """Invoke `claude auth status --json` and return parsed dict.
     Returns {"loggedIn": False, "reason": ...} on any failure so the UI
     always gets a deterministic shape — never crashes the endpoint."""

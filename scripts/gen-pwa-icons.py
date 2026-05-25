@@ -28,19 +28,22 @@ OUT = REPO / "frontend" / "assets"
 
 # Design space is 200×200 (matches icon.svg viewBox); all geometry below
 # is in those units and scaled per target size.
+#
+# Brand mark: pure "M" zigzag (Candidate F, user-selected 2026-05-25).
+# Five vertices, 4 stroke segments, rounded line-caps + joins.
 ACCENT = (0x60, 0x93, 0xFF)
 WHITE = (255, 255, 255)
 
-# Standard ("any" purpose) variant — rounded corners, M with bottom-right dot
+# Standard ("any" purpose) variant — rounded corners
 ROUNDED_RADIUS = 44.0
-M_PTS = [(55.0, 140.0), (55.0, 60.0), (100.0, 110.0), (145.0, 60.0), (145.0, 140.0)]
-M_STROKE = 18.0
-DOT = (155.0, 148.0, 9.0)
+# M vertices (left-bottom, left-top, middle-bottom-of-V, right-top, right-bottom)
+M_PTS = [(56.0, 144.0), (56.0, 56.0), (100.0, 100.0), (144.0, 56.0), (144.0, 144.0)]
+M_STROKE = 20.0
 
-# Maskable variant — square, M shrunk into 80% safe zone
-MASK_PTS = [(70.0, 132.0), (70.0, 68.0), (100.0, 104.0), (130.0, 68.0), (130.0, 132.0)]
-MASK_STROKE = 14.0
-MASK_DOT = (138.0, 138.0, 7.0)
+# Maskable variant — square, M inset to 80% safe zone (40..160)
+MASK_RADIUS = 0.0
+MASK_PTS = [(60.0, 140.0), (60.0, 60.0), (100.0, 100.0), (140.0, 60.0), (140.0, 140.0)]
+MASK_STROKE = 16.0
 
 AA = 4  # 4x4 super-sampling — clean edges on small (32, 180) sizes
 
@@ -67,6 +70,9 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
 
 def dist_seg(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    """Min distance from point P to segment AB. Used to check whether a
+    pixel lies within stroke/2 of one of the M's line segments — gives
+    rounded line-caps and joins for free."""
     dx = bx - ax
     dy = by - ay
     L2 = dx * dx + dy * dy
@@ -93,12 +99,15 @@ def rounded_inside(px: float, py: float, radius: float) -> bool:
 
 def render(size: int, *, maskable: bool) -> bytes:
     """Render an RGBA image. Coordinates are computed in 200-unit design
-    space then mapped to `size` pixels with AA×AA super-sampling."""
+    space then mapped to `size` pixels with AA×AA super-sampling.
+
+    Foreground = "M" zigzag drawn as 4 line segments; pixel is on the
+    stroke iff its distance to any segment <= stroke/2. Rounded line
+    caps + joins are inherent to the SDF check."""
     s = size / 200.0  # pixels per design unit
     pts = MASK_PTS if maskable else M_PTS
     stroke = MASK_STROKE if maskable else M_STROKE
-    dot_cx, dot_cy, dot_r = MASK_DOT if maskable else DOT
-    radius = 0.0 if maskable else ROUNDED_RADIUS
+    radius = MASK_RADIUS if maskable else ROUNDED_RADIUS
     half_stroke = stroke / 2.0
 
     pixels = bytearray(size * size * 4)
@@ -127,7 +136,7 @@ def render(size: int, *, maskable: bool) -> bytes:
                         continue
                     shape_hits += 1
 
-                    # 2) foreground = M strokes or dot
+                    # 2) foreground = on any of the 4 M segments
                     on_fg = False
                     for k in range(4):
                         ax, ay = pts[k]
@@ -135,9 +144,6 @@ def render(size: int, *, maskable: bool) -> bytes:
                         if dist_seg(px_des, py_des, ax, ay, bx, by) <= half_stroke:
                             on_fg = True
                             break
-                    if not on_fg:
-                        if math.hypot(px_des - dot_cx, py_des - dot_cy) <= dot_r:
-                            on_fg = True
                     if on_fg:
                         fg_hits += 1
 

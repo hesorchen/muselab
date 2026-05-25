@@ -14,7 +14,10 @@ import pytest
 
 
 def _projects_dir_for(root: Path) -> Path:
-    return Path.home() / ".claude" / "projects" / str(root).replace("/", "-")
+    # Use the shared encoder — see backend.chat._cli_encode_cwd for why a
+    # naive `str(root).replace("/", "-")` breaks on paths containing `_`.
+    from backend.chat import _cli_encode_cwd
+    return Path.home() / ".claude" / "projects" / _cli_encode_cwd(str(root))
 
 
 def _write_jsonl(path: Path, entries: list[dict]) -> None:

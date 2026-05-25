@@ -1,11 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="muselab">
   <!-- Maskable variant: fill the whole square so the platform's safe-zone
        mask (Android adaptive icons, iOS standalone splash) doesn't crop
-       into the logo. The 'M' is intentionally inset 20% on each side so
-       it stays inside the standard 80% safe zone. -->
+       into the logo. "M" is inset 20% on each side (extents 60..140) so
+       it stays inside the standard 80% safe zone (40..160). -->
   <rect width="200" height="200" fill="#6093ff"/>
-  <path d="M70 132 L70 68 L100 104 L130 68 L130 132"
-        stroke="#ffffff" stroke-width="14"
-        stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-  <circle cx="138" cy="138" r="7" fill="#ffffff"/>
+  <path d="M 60 140 L 60 60 L 100 100 L 140 60 L 140 140"
+        fill="none" stroke="#ffffff" stroke-width="16"
+        stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
