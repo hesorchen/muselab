@@ -1418,6 +1418,13 @@ body.kb-open .mobile-tab-bar { display: none; }
 .filelist li.reveal-pulse {
   animation: reveal-pulse-bg 1.6s ease-out;
 }
+/* Respect reduced-motion preferences — show a single static highlight
+   for the same 1.6s window instead of animating the gradient transition. */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes reveal-pulse-bg {
+    0%, 100% { background: var(--c-accent-soft); box-shadow: inset 3px 0 0 var(--c-accent); }
+  }
+}
 .filelist .caret { width: 14px; color: var(--c-fg-3); }
 .filelist .caret svg { width: 11px; height: 11px; }
 .filelist .icon { color: var(--c-fg-2); transition: color var(--t-fast); }
