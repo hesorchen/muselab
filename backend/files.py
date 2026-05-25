@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import secrets
 import shutil
 import time
@@ -8,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Q
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
-from .settings import ROOT, atomic_write_text
+from .settings import ROOT, atomic_write_text, env_int
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -39,8 +40,25 @@ def _ensure_trash_dir() -> Path:
     return d
 
 
+_TRASH_ID_RE = re.compile(r"^\d{1,20}_[0-9a-f]{8}$")
+
+
 def _gen_trash_id() -> str:
     return f"{int(time.time())}_{secrets.token_hex(4)}"
+
+
+def _valid_trash_id(tid: str) -> bool:
+    """trash_id format check — `^\\d+_[0-9a-f]{8}$` (matches _gen_trash_id).
+
+    Defense in depth: the trash_id flows from the user back through
+    /trash/restore + /trash/purge endpoints, where it's used to build
+    paths under <ROOT>/.muselab-dustbin/. Without validation, a payload
+    like ``"../../etc/passwd"`` would resolve outside the trash dir and
+    trash_purge would rmtree arbitrary directories. The auth token is
+    the primary defense, but a strict format check costs nothing and
+    blocks the exploit class entirely.
+    """
+    return bool(tid) and bool(_TRASH_ID_RE.fullmatch(tid))
 
 
 def _dir_size(p: Path) -> int:
@@ -80,8 +98,12 @@ def _move_to_trash(target: Path) -> dict:
         "kind": "dir" if is_dir else "file",
         "size": size,
     }
-    (trash / f"{tid}.json").write_text(
-        json.dumps(manifest), encoding="utf-8")
+    # Atomic write: a half-written manifest from a crash mid-rename
+    # would orphan the payload (manifest parses as invalid JSON → item
+    # filtered out of /trash/list → user permanently loses access to
+    # their soft-deleted file). atomic_write_text uses tempfile + rename
+    # so readers always see either the old or the new full content.
+    atomic_write_text(trash / f"{tid}.json", json.dumps(manifest))
     return manifest
 
 
@@ -120,6 +142,45 @@ def _list_trash() -> list[dict]:
         return []
     items.sort(key=lambda x: x.get("deleted_at", 0), reverse=True)
     return items
+
+
+# Auto-expire trash items older than this many days. Tunable via env so
+# users on tiny SSDs can be more aggressive; 0 = never auto-purge.
+# Default 30 days mirrors macOS Finder / GNOME's "permanently delete after
+# 30 days" behaviour — long enough for "wait, I needed that", short enough
+# that the dustbin doesn't silently eat the disk.
+#
+# env_int handles non-numeric input (typo / "30 days" / etc.) by falling
+# back to the default + logging to stderr — a config mistake leaves the
+# feature disabled with a clear reason instead of bricking backend import.
+_TRASH_TTL_DAYS = env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0)
+
+
+def auto_purge_expired_trash() -> int:
+    """Purge trash items whose `deleted_at` is older than _TRASH_TTL_DAYS.
+    Returns the count purged. Called once at startup (see backend/main.py)
+    and ignores any per-item errors so a single corrupt manifest can't
+    block the cleanup of healthy entries. Returns 0 when disabled."""
+    if _TRASH_TTL_DAYS <= 0:
+        return 0
+    d = _trash_dir()
+    if not d.exists():
+        return 0
+    cutoff = time.time() - (_TRASH_TTL_DAYS * 86400)
+    purged = 0
+    for mf in list(d.glob("*.json")):
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (data.get("deleted_at") or 0) >= cutoff:
+            continue
+        tid = data.get("trash_id")
+        if not tid or not _valid_trash_id(tid):
+            continue
+        _purge_one(tid)
+        purged += 1
+    return purged
 
 
 def _purge_one(tid: str) -> None:
@@ -648,7 +709,7 @@ def write_file(req: WriteReq) -> dict:
 
 
 # Default 100 MB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
-MAX_UPLOAD_BYTES = int(os.environ.get("MUSELAB_MAX_UPLOAD_MB", "100")) * 1024 * 1024
+MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 100, min_value=1) * 1024 * 1024
 # Filename extensions that are likely to be hostile or pointless to host in
 # a personal archive. Block at upload (cleaner than after-the-fact cleanup).
 UPLOAD_BLOCKED_SUFFIX = {
@@ -742,8 +803,18 @@ def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
 @router.get("/trash/list", dependencies=[Depends(require_token)])
 def trash_list() -> dict:
     """All trash items, newest first. Each item: trash_id, original_path,
-    original_name, deleted_at (unix sec, float), kind ('file'|'dir'), size."""
-    return {"items": _list_trash()}
+    original_name, deleted_at (unix sec, float), kind ('file'|'dir'), size.
+
+    Top-level keys also include ``total_size`` (sum of all item sizes,
+    bytes) and ``ttl_days`` (auto-purge horizon — 0 means disabled) so
+    the UI can surface "Trash · 142 MB · auto-purged after 30 days"
+    without a separate roundtrip."""
+    items = _list_trash()
+    return {
+        "items": items,
+        "total_size": sum(int(i.get("size") or 0) for i in items),
+        "ttl_days": _TRASH_TTL_DAYS,
+    }
 
 
 class TrashIdReq(BaseModel):
@@ -755,6 +826,8 @@ def trash_restore(req: TrashIdReq) -> dict:
     """Move the payload back to its original path. Fails 409 if that path
     is now occupied — user has to rename / clear it before restoring.
     Manifest is removed on success."""
+    if not _valid_trash_id(req.trash_id):
+        raise HTTPException(status_code=400, detail="invalid trash_id")
     data = _read_manifest(req.trash_id)
     if not data:
         raise HTTPException(status_code=404, detail="trash item not found")
@@ -788,6 +861,8 @@ def trash_restore(req: TrashIdReq) -> dict:
 @router.delete("/trash/purge", dependencies=[Depends(require_token)])
 def trash_purge(req: TrashIdReq) -> dict:
     """Permanently delete one trash item. Irreversible."""
+    if not _valid_trash_id(req.trash_id):
+        raise HTTPException(status_code=400, detail="invalid trash_id")
     d = _trash_dir()
     if not (d / f"{req.trash_id}.json").exists() and not (d / req.trash_id).exists():
         raise HTTPException(status_code=404, detail="trash item not found")

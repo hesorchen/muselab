@@ -499,6 +499,18 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     _save_sidecar(sid, data)
 
 
+# Hard cap on pending_attachments to prevent unbounded sidecar growth.
+# Without this, "upload image → cancel/refresh before send" silently
+# accretes entries forever (consume only fires when a real user message
+# matches). 50 is far more than any reasonable in-flight burst — a
+# single message typically queues 1-3 attachments.
+_PENDING_ATTACH_CAP = 50
+# Entries older than this are pruned on every append. Counterpart to
+# the cap: if the user uploads infrequently, the cap may not trigger
+# but stale entries from weeks-old crashed sessions still go away.
+_PENDING_ATTACH_TTL_MS = 24 * 60 * 60 * 1000   # 24 hours
+
+
 def append_pending_attachments(sid: str, images: list[dict] | None = None,
                                 docs: list[dict] | None = None) -> None:
     """Stash image/doc attachments before we know the user-message UUID.
@@ -512,16 +524,31 @@ def append_pending_attachments(sid: str, images: list[dict] | None = None,
 
     Pending entries are bound to user uuids by consume_one_pending_attachments
     when GET /sessions/{sid} encounters a user message with inline image
-    refs but no annotation. FIFO match."""
+    refs but no annotation. FIFO match.
+
+    Garbage collection: every append also drops entries older than
+    _PENDING_ATTACH_TTL_MS, then truncates to _PENDING_ATTACH_CAP. Without
+    this, "upload then cancel" silently bloats the sidecar JSON across
+    months of usage."""
     if not images and not docs:
         return
+    now_ms = int(__import__("time").time() * 1000)
     data = _load_sidecar(sid)
     pend = data.setdefault("pending_attachments", [])
+    # GC stale entries first (age them out by ts).
+    cutoff = now_ms - _PENDING_ATTACH_TTL_MS
+    if pend and any((p.get("ts") or 0) < cutoff for p in pend):
+        pend = [p for p in pend if (p.get("ts") or 0) >= cutoff]
+        data["pending_attachments"] = pend
     pend.append({
-        "ts": int(__import__("time").time() * 1000),
+        "ts": now_ms,
         "images": images or [],
         "docs": docs or [],
     })
+    # Hard cap — drop oldest (FIFO) so the freshest are kept for the
+    # next consume call.
+    if len(pend) > _PENDING_ATTACH_CAP:
+        del pend[: len(pend) - _PENDING_ATTACH_CAP]
     _save_sidecar(sid, data)
 
 

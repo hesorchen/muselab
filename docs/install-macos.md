@@ -18,7 +18,8 @@ no `sudo`, autostarts on login, restarts on crash.
   claude login
   ```
   This stores OAuth in `~/.claude/` which the agent reuses. Non-Claude providers
-  (DeepSeek / GLM / MiniMax) only need API keys via Settings UI.
+  (DeepSeek / GLM / MiniMax / Kimi / Qwen / Xiaomi MiMo / Baidu ERNIE) only need
+  API keys via Settings UI.
 
 ## Install
 

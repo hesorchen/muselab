@@ -1,8 +1,53 @@
 import os
 import shutil
+import sys
 import warnings
 from pathlib import Path
 from dotenv import load_dotenv
+
+
+def env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    """Read ``name`` from env as an int, falling back to ``default`` on
+    missing / empty / non-numeric input. Optional ``min_value`` clamps
+    the result (e.g. negatives → 0 for "days to keep" semantics).
+
+    Naive ``int(os.environ.get(...))`` patterns crash the whole backend
+    when the env var holds a typo (``MAX_TURNS=80 turns``,
+    ``CLIENT_POOL_CAP=3.5``). Three of the four module-level uses of
+    this pattern (MAX_UPLOAD_BYTES, CLIENT_POOL_CAP, TRASH_TTL_DAYS)
+    would refuse to even import the backend on a bad value — turning a
+    config typo into "the server won't start, and the log just says
+    ``ValueError: invalid literal for int()``" with no hint at the
+    culprit env var. This helper makes the fallback explicit + logs
+    the offending value to stderr so the operator can fix it.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        v = default
+    else:
+        try:
+            v = int(raw)
+        except ValueError:
+            print(f"[muselab] {name}={raw!r} is not an integer; "
+                  f"falling back to {default}", file=sys.stderr, flush=True)
+            v = default
+    if min_value is not None and v < min_value:
+        v = min_value
+    return v
+
+
+def env_float(name: str, default: float) -> float:
+    """Sibling to env_int for float-valued knobs (e.g. MUSELAB_BUDGET_USD).
+    Same fallback behaviour."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[muselab] {name}={raw!r} is not a number; "
+              f"falling back to {default}", file=sys.stderr, flush=True)
+        return default
 
 
 def locate_executable(name: str) -> str | None:
@@ -143,7 +188,16 @@ def _env(new_name: str, old_name: str = "", default: str = "") -> str:
 _root_str = _env("MUSELAB_ROOT", "PORTAL_ROOT")
 ROOT = Path(_root_str).resolve() if _root_str else None
 TOKEN = _env("MUSELAB_TOKEN", "PORTAL_TOKEN")
-PORT = int(_env("MUSELAB_PORT", "PORTAL_PORT", "8765"))
+_port_raw = _env("MUSELAB_PORT", "PORTAL_PORT", "8765")
+try:
+    PORT = int(_port_raw)
+except ValueError:
+    # Non-numeric MUSELAB_PORT would crash backend import. Better to
+    # fall back to the standard 8765 with a clear stderr warning than
+    # to refuse startup with a cryptic stack trace.
+    print(f"[muselab] MUSELAB_PORT={_port_raw!r} is not an integer; "
+          f"falling back to 8765", file=sys.stderr, flush=True)
+    PORT = 8765
 # Default to localhost-only. The one-shot installer scripts target single-user
 # desktops, so binding to LAN by default would be a footgun. Override to "0.0.0.0"
 # in .env for LAN/VPS/Docker scenarios.

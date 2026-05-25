@@ -121,6 +121,94 @@ def test_delete_nonempty_dir_permanent_still_works(client, auth, temp_root):
     assert not (temp_root / ".muselab-dustbin" / "notes").exists()
 
 
+def test_trash_purge_rejects_path_traversal_in_trash_id(client, auth, temp_root):
+    # Without trash_id validation, `"../../tmp/x"` would resolve outside
+    # the dustbin and trash_purge would happily rmtree() arbitrary dirs.
+    # `_valid_trash_id` blocks any payload that isn't `\\d+_[0-9a-f]{8}$`.
+    for evil in ["../../tmp/x", "../etc", "/etc/passwd", "abc.json", "x/y", ""]:
+        r = client.request(
+            "DELETE",
+            "/api/files/trash/purge",
+            headers=auth,
+            json={"trash_id": evil},
+        )
+        assert r.status_code == 400, f"bad trash_id should 400: {evil!r}, got {r.status_code}"
+
+
+def test_trash_restore_rejects_path_traversal_in_trash_id(client, auth):
+    for evil in ["../../tmp/x", "../etc", "/etc/passwd", "abc.json", "x/y", ""]:
+        r = client.post(
+            "/api/files/trash/restore",
+            headers=auth,
+            json={"trash_id": evil},
+        )
+        assert r.status_code == 400, f"bad trash_id should 400: {evil!r}, got {r.status_code}"
+
+
+def test_trash_purge_accepts_valid_trash_id_format(client, auth):
+    # Well-formed id that doesn't exist → 404 (not 400). Confirms the
+    # validator allows real ids through.
+    r = client.request(
+        "DELETE",
+        "/api/files/trash/purge",
+        headers=auth,
+        json={"trash_id": "1234567890_deadbeef"},
+    )
+    assert r.status_code == 404
+
+
+def test_env_int_handles_bad_input(monkeypatch):
+    # Module-level `int(os.environ.get(...))` patterns crash backend
+    # startup on typos. env_int must fall back to the default + log
+    # instead. Verified against MUSELAB_TRASH_TTL_DAYS as a stand-in
+    # for the 5+ call sites that share the helper.
+    from backend.settings import env_int
+    monkeypatch.setenv("MUSELAB_TRASH_TTL_DAYS", "abc")
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 30
+    monkeypatch.setenv("MUSELAB_TRASH_TTL_DAYS", "30 days")
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 30
+    monkeypatch.setenv("MUSELAB_TRASH_TTL_DAYS", "")
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 30
+    monkeypatch.delenv("MUSELAB_TRASH_TTL_DAYS", raising=False)
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 30
+    # Valid values pass through.
+    monkeypatch.setenv("MUSELAB_TRASH_TTL_DAYS", "7")
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 7
+    monkeypatch.setenv("MUSELAB_TRASH_TTL_DAYS", "0")
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 0
+    # Negatives → clamped to min_value (disabled, in TTL semantics).
+    monkeypatch.setenv("MUSELAB_TRASH_TTL_DAYS", "-5")
+    assert env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0) == 0
+
+
+def test_env_float_handles_bad_input(monkeypatch):
+    from backend.settings import env_float
+    monkeypatch.setenv("MUSELAB_BUDGET_USD", "abc")
+    assert env_float("MUSELAB_BUDGET_USD", 0.0) == 0.0
+    monkeypatch.setenv("MUSELAB_BUDGET_USD", "20.5")
+    assert env_float("MUSELAB_BUDGET_USD", 0.0) == 20.5
+    monkeypatch.setenv("MUSELAB_BUDGET_USD", "")
+    assert env_float("MUSELAB_BUDGET_USD", 7.5) == 7.5
+
+
+def test_trash_list_returns_total_size_and_ttl(client, auth, temp_root):
+    # After dropping one file into trash, list endpoint should report
+    # both total_size and ttl_days top-level — used by the frontend to
+    # render "Trash · 142 KB · auto-purged after 30 days".
+    # Seed: create + soft-delete a file.
+    (temp_root / "notes" / "trash_me.md").write_text(
+        "x" * 1234, encoding="utf-8")
+    r = client.request("DELETE", "/api/files/delete", headers=auth,
+                       json={"path": "notes/trash_me.md"})
+    assert r.status_code == 200
+    r = client.get("/api/files/trash/list", headers=auth)
+    assert r.status_code == 200
+    data = r.json()
+    assert "items" in data and "total_size" in data and "ttl_days" in data
+    assert data["total_size"] >= 1234, data
+    assert isinstance(data["ttl_days"], int)
+
+
 def test_upload(client, auth, temp_root):
     r = client.post(
         "/api/files/upload",

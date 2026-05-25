@@ -824,7 +824,7 @@ function portal() {
       ]) {
         const v = localStorage.getItem(oldK);
         if (v != null && localStorage.getItem(newK) == null) {
-          localStorage.setItem(newK, v);
+          this._setLS(newK, v);
         }
         localStorage.removeItem(oldK);
       }
@@ -1236,7 +1236,7 @@ function portal() {
               ? "Tip：⌘K 命令面板 · / 斜杠命令 · @ 引用文件 · ↑ 回滚上一条"
               : "Tip: ⌘K command palette · / slash commands · @ to reference files · ↑ to recall last message",
             "info", 7000);
-          localStorage.setItem("muselab_seen_help", "1");
+          this._setLS("muselab_seen_help", "1");
         }, 1500);
       }
       // Same preview-file restore that login() does — covers the
@@ -1562,7 +1562,7 @@ function portal() {
     },
     setAccent(color) {
       this.accent = color;
-      localStorage.setItem("muselab_accent", color);
+      this._setLS("muselab_accent", color);
       this.applyAccent();
       if (this.MASCOTS) this.applyFavicon();  // favicon 跟主题色同步
     },
@@ -1577,7 +1577,7 @@ function portal() {
     setLang(lang) {
       if (lang !== "zh" && lang !== "en") return;
       this.lang = lang;
-      localStorage.setItem("muselab_lang", lang);
+      this._setLS("muselab_lang", lang);
       document.documentElement.lang = lang;
       this.toast(this.t("toast.lang_switched"), "success", 1500);
     },
@@ -1706,7 +1706,7 @@ function portal() {
       this.theme = order[(idx + 1) % order.length];
       this.applyTheme();
       this.applyAccent();   // 派生色对深浅敏感，重算
-      localStorage.setItem("muselab_theme", this.theme);
+      this._setLS("muselab_theme", this.theme);
     },
 
     // 色彩小工具
@@ -1802,9 +1802,15 @@ function portal() {
         };
         img.onerror = () => {
           URL.revokeObjectURL(objUrl);
-          // Fallback: return original as blob URL (will work for the
-          // current session even if it won't survive page reload).
-          resolve(URL.createObjectURL(file));
+          // Decode failed (corrupt file, unsupported format, ...).
+          // The previous fallback created ANOTHER blob URL via
+          // createObjectURL and returned it — but if the browser
+          // couldn't decode the file the first time, the new blob URL
+          // wouldn't render either, AND it was never revoked (the
+          // closeChatTab sweep was removed when previews moved to data
+          // URLs in 2026-04). Return empty string instead so callers
+          // show a generic "image" placeholder.
+          resolve("");
         };
         img.src = objUrl;
       });
@@ -2557,7 +2563,7 @@ function portal() {
       try {
         const r = await fetch("/api/files/list?path=", { headers: this.hdr() });
         if (!r.ok) throw new Error("token 错误");
-        localStorage.setItem("muselab_token", this.token);
+        this._setLS("muselab_token", this.token);
         this.authed = true;
         this.loadPrefs();
         await this.loadRoot();
@@ -2647,6 +2653,57 @@ function portal() {
     // ===== toast =====
     // `action` is optional: { label: "撤销", onClick: () => {...} } — renders
     // a button inside the toast. Clicking it runs onClick and dismisses.
+    // ===== localStorage wrapper =====
+    // Browsers cap localStorage at ~5–10 MB per origin and throw
+    // QuotaExceededError on setItem. Hot writers (savePrefs runs on
+    // every tab open/close/scroll/expand) used to call setItem directly,
+    // so any user accumulating enough sessions+prefs+queue would hit the
+    // cap and the next pref save would crash the call site mid-stack.
+    // Centralize the writes here so:
+    //   1. Quota / private-mode / disabled-storage throws never escape.
+    //   2. Failure surfaces ONCE per session as a non-blocking toast,
+    //      not every keystroke (Date.now-based rate limit).
+    //   3. All call sites read the same JSON-stringify discipline (caller
+    //      passes pre-stringified value — we do NOT auto-stringify so
+    //      bare strings like the token don't get double-quoted).
+    // Returns true on success, false on failure.
+    _lsLastWarnAt: 0,
+    _setLS(key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch (e) {
+        // Quota errors come back with different `name`s across browsers
+        // ("QuotaExceededError" / "NS_ERROR_DOM_QUOTA_REACHED" / code 22
+        // / 1014). Detection isn't critical — every failure is treated
+        // the same way.
+        if (Date.now() - this._lsLastWarnAt > 60_000) {
+          this._lsLastWarnAt = Date.now();
+          // Best-effort toast; if `toast` itself isn't ready (very early
+          // boot), swallow silently — the next save attempt warns.
+          try {
+            const msg = this.lang === "zh"
+              ? "本地存储已满，部分偏好可能不会保存。建议清理对话历史或导出/重置。"
+              : "Local storage is full — some preferences may not persist. Consider clearing chat history or resetting.";
+            this.toast?.(msg, "warn", 6000);
+          } catch {}
+        }
+        return false;
+      }
+    },
+    // Symmetrical getter — also tolerates JSON.parse failures so a
+    // corrupt key (manual edit, partial write from a quota throw)
+    // doesn't crash boot. Returns `fallback` on any error.
+    _getLSJson(key, fallback = null) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw == null) return fallback;
+        return JSON.parse(raw);
+      } catch {
+        return fallback;
+      }
+    },
+
     // Convenience: bilingual error toast for common "<verb> failed: <body>"
     // patterns. Call sites used to inline `this.toast("保存失败：" + …, "error")`
     // which gave English users a Chinese-only message. Pass the verb key
@@ -2752,7 +2809,7 @@ function portal() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
-      localStorage.setItem("muselab_prefs", JSON.stringify({
+      this._setLS("muselab_prefs", JSON.stringify({
         schema: 2,          // bump when prefs format changes incompatibly
         model: this.model, permission: this.permission,
         currentId: this.currentId,
@@ -6763,16 +6820,33 @@ function portal() {
     async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
 
     async switchTab(path) {
-      // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容
+      // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容。
+      // Pass mode:"background" so we expand/scroll the tree quietly —
+      // the user clicked a preview tab, they want to STAY in preview
+      // (especially on mobile, where revealInTree's default mode would
+      // bounce them to the files pane). The pulse animation also
+      // doesn't fire here because there's no "I'm looking for this
+      // file in the tree" user intent — they were already on it.
       await this.openFile({ path, name: path.split("/").pop() });
-      await this.revealInTree(path);
+      await this.revealInTree(path, { mode: "background" });
     },
-    async revealInTree(path) {
+    async revealInTree(path, opts = {}) {
       // Make the file's row visible in the tree pane and flash it so the
       // user can see the locate operation actually happened.
       //
-      // Failure modes this guards against (all previously made the feature
-      // feel "broken"):
+      // Two modes:
+      //   - "interactive" (default): user explicitly asked to locate
+      //     this file (context menu "在文件树定位"). Switch mobileTab to
+      //     "files" so they see the result, clear searchMode (the tree
+      //     is hidden under x-show otherwise), and pulse the row.
+      //   - "background": caller wants the side-effect of expanding
+      //     ancestors + scrolling, but the user is currently doing
+      //     something else (e.g. switching preview tabs). Do NOT
+      //     hijack mobileTab, do NOT clear search, do NOT pulse —
+      //     just quietly position the row so it's already correct
+      //     when the user later switches to the files pane.
+      //
+      // Failure modes the interactive mode guards against:
       //   1. Mobile — user is on mobileTab="preview", so even after the
       //      tree expands they see no change. Switch to "files" first.
       //   2. searchMode — filelist-wrap has x-show="!searchMode", so the
@@ -6785,8 +6859,11 @@ function portal() {
       //      preview tab, `selected !== path`, so the row has no `sel`
       //      class. The pulse class handles that too.
       if (!path) return;
-      if (this.searchMode) this.clearSearch();
-      if (this._isMobileLayout()) this.mobileTab = "files";
+      const interactive = opts.mode !== "background";
+      if (interactive) {
+        if (this.searchMode) this.clearSearch();
+        if (this._isMobileLayout()) this.mobileTab = "files";
+      }
       const parts = path.split("/");
       parts.pop();   // drop the filename, keep only directory chain
       const dirPath = parts.join("/");
@@ -6798,7 +6875,13 @@ function portal() {
         const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
         const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
         if (!el) return;
-        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        // Background mode: nearest (no animation if already on-screen)
+        // keeps the operation invisible. Interactive: center it.
+        el.scrollIntoView({
+          block: interactive ? "center" : "nearest",
+          behavior: "smooth",
+        });
+        if (!interactive) return;
         // Pulse highlight — independent of `sel` class so it fires even
         // when this isn't the active tab. Restart by removing+adding so
         // rapid re-reveals still trigger the animation.
@@ -7039,6 +7122,14 @@ function portal() {
     async _loadMermaid() {
       if (window.mermaid) return window.mermaid;
       if (this._mermaidLoadPromise) return this._mermaidLoadPromise;
+      // Clear the cached promise on failure so a later block (or a retry
+      // when the user scrolls back into view) can re-attempt. Otherwise
+      // one transient 4xx/5xx on the static asset would permanently
+      // disable mermaid for the session.
+      const clearOnFail = (err) => {
+        this._mermaidLoadPromise = null;
+        return Promise.reject(err);
+      };
       this._mermaidLoadPromise = new Promise((resolve, reject) => {
         const s = document.createElement("script");
         s.src = "/static/vendor/mermaid.min.js";
@@ -7058,7 +7149,7 @@ function portal() {
         };
         s.onerror = () => reject(new Error("mermaid load failed"));
         document.head.appendChild(s);
-      });
+      }).catch(clearOnFail);
       return this._mermaidLoadPromise;
     },
 
@@ -8637,11 +8728,11 @@ function portal() {
             : `${erroredImages.length + erroredDocs.length} attachment(s) failed and were skipped`,
             "warn", 4000);
         }
-        // Do NOT revoke blob preview URLs here — they have already been
-        // referenced by the optimistic user bubble (images: readyImages.map…
-        // at send time). Revoking now breaks the <img> that just appeared.
-        // Blob URLs are revoked when the chat tab is closed (closeChatTab)
-        // which sweeps sendState.messages for blob: preview references.
+        // Note (2026-04): previews are now data URIs from canvas.toDataURL
+        // (see _imageToThumbDataURL), not blob: URLs — they're safe to
+        // hold across reloads with no revoke needed. The only path that
+        // creates a blob URL is the img.onerror fallback, which now
+        // returns "" rather than leaking — so no sweep here is needed.
         this.pendingImages = [];
         this.pendingDocs = [];
         this.input = "";

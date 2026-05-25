@@ -10,7 +10,7 @@
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
 - 🧠 **归档即工作集**。`MUSELAB_ROOT` 指向用户自有目录——其中的文件是 Muse（muselab 内置的 AI 助手）的一等上下文。
-- 🤖 **所有模型共用同一套 agent loop**。MCP / Skills / Subagent / plan 模式在 Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo 上行为一致。
+- 🤖 **所有模型共用同一套 agent loop**。MCP / Skills / Subagent / plan 模式在 Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo、百度 ERNIE 上行为一致。
 - 💸 **复用 Claude Pro / Max 订阅**（OAuth），无按令牌计费。也可填入第三方 API key。
 - 🔄 **多端共享一台服务器**。手机 / 平板 / 桌面共用会话；归档数据始终保存在用户自己的主机上。
 - 🛠 **无构建步骤**。原生 HTML + Alpine.js + CSS，以静态文件形式直接提供——修改文件后刷新浏览器即可生效。

@@ -96,6 +96,22 @@ async def _lifespan(app: FastAPI):
     except Exception as _e:
         sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
         sys.stderr.flush()
+    # Purge trash items older than MUSELAB_TRASH_TTL_DAYS (default 30).
+    # Without this the dustbin grows monotonically — soft-delete of large
+    # subtrees over months eventually fills the disk. Mirrors macOS Finder
+    # / GNOME behaviour. Disable with MUSELAB_TRASH_TTL_DAYS=0.
+    try:
+        from . import files as _files_mod
+        purged = _files_mod.auto_purge_expired_trash()
+        if purged:
+            sys.stderr.write(
+                f"[muselab] auto-purged {purged} expired trash item(s) "
+                f"(> {_files_mod._TRASH_TTL_DAYS}d old)\n")
+            sys.stderr.flush()
+    except Exception as _e:
+        sys.stderr.write(
+            f"[muselab] trash auto-purge failed (non-fatal): {_e}\n")
+        sys.stderr.flush()
     # Fire-and-forget: rewrite turn_count for any session whose value was
     # written by the old algorithm (which counted every type="user" SDK
     # frame — including tool_result sidechain echoes — so values were

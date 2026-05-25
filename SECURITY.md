@@ -28,6 +28,37 @@ execution within `MUSELAB_ROOT`**. Operate accordingly:
 - Default response headers: `X-Content-Type-Options: nosniff` (no MIME sniffing of file previews) · `Referrer-Policy: same-origin` (tokens in query strings do not leak via cross-origin `Referer`) · `X-Frame-Options: SAMEORIGIN` (external sites cannot iframe the UI)
 - `noindex, nofollow, noarchive` meta tags and `/robots.txt` — accidental public exposure will not result in crawling
 
+## Reverse-proxy logging caveat
+
+The streaming chat endpoint uses Server-Sent Events (`EventSource`), which the
+browser spec forbids from sending custom headers. The auth token therefore
+travels as a query string parameter (`?token=…`) on that one endpoint only.
+muselab's own access log strips it before writing (`_TokenFilter` in
+`backend/main.py`), but a reverse proxy in front of muselab will record the
+raw URL by default. **If you put muselab behind nginx / Caddy / a CDN,
+configure access logs to strip or mask the `token` query parameter.**
+Examples:
+
+```nginx
+# nginx: redact token= in the access log
+log_format muselab_safe '$remote_addr - $remote_user [$time_local] '
+                        '"$request_method $uri?<redacted> $server_protocol" '
+                        '$status $body_bytes_sent';
+access_log /var/log/nginx/muselab.log muselab_safe;
+```
+
+```caddy
+# Caddy: drop the query string from access logs
+log {
+    output file /var/log/caddy/muselab.log
+    format filter {
+        request>uri query {
+            delete token
+        }
+    }
+}
+```
+
 ## What muselab does NOT defend against
 
 - A compromised `MUSELAB_TOKEN` — full access is granted by design

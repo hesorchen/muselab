@@ -26,7 +26,7 @@ from claude_agent_sdk import (
     fork_session as sdk_fork_session,
 )
 from .auth import require_token_query, require_token
-from .settings import ROOT, MODEL, atomic_write_text, is_chinese_locale
+from .settings import ROOT, MODEL, atomic_write_text, env_float, env_int, is_chinese_locale
 from . import sessions as sess
 from . import endpoints
 from .ask_user_question import (
@@ -256,7 +256,7 @@ _active_turns: dict[str, TurnBroadcast] = {}
 # muselab leaks memory as users open more sessions. New clients append to
 # the tail; on cache miss with len > cap, oldest gets disconnected.
 _client_lru: list[tuple[str, str, str]] = []   # (session_id, model, effort)
-_CLIENT_POOL_CAP = int(os.environ.get("MUSELAB_CLIENT_POOL_CAP", "3"))
+_CLIENT_POOL_CAP = env_int("MUSELAB_CLIENT_POOL_CAP", 3, min_value=1)
 _lock = asyncio.Lock()
 
 
@@ -443,14 +443,11 @@ def _is_real_user_prompt(sm: Any) -> bool:
 
 
 def _budget_usd() -> float:
-    try:
-        return float(os.environ.get("MUSELAB_BUDGET_USD", "0") or 0)
-    except ValueError:
-        return 0.0
+    return env_float("MUSELAB_BUDGET_USD", 0.0)
 
 
 _MEMORY_DIR_PATH = (
-    f"~/.claude/projects/{str(ROOT).replace('/', '-')}/memory/"
+    f"~/.claude/projects/{_cli_encode_cwd(str(ROOT))}/memory/"
     if ROOT is not None
     else "~/.claude/memory/"
 )
@@ -551,7 +548,7 @@ async def _build_and_connect_client(
     # (Edit on a large file, or Read of a long file) can blow past that
     # and kill the message reader silently — the chat then "hangs forever"
     # because no more chunks arrive. Bump to 32 MB; configurable via env.
-    max_buf = int(os.environ.get("MUSELAB_MAX_BUFFER_SIZE", str(32 * 1024 * 1024)))
+    max_buf = env_int("MUSELAB_MAX_BUFFER_SIZE", 32 * 1024 * 1024, min_value=1024)
     # Critical SDK option distinction:
     #   `session_id=X`  → force a NEW session to use UUID X (fails if
     #                     CLI already has a JSONL for X)
@@ -627,7 +624,7 @@ async def _build_and_connect_client(
     if not is_third_party and not skills_off:
         opts_kwargs["skills"] = "all"
     # Optional model params from env (UI-editable via /api/settings).
-    mt = int(os.environ.get("MUSELAB_MAX_TURNS", "0") or 0)
+    mt = env_int("MUSELAB_MAX_TURNS", 0, min_value=0)
     if mt > 0:
         opts_kwargs["max_turns"] = mt
     # For non-Claude models, point the SDK at the vendor's own
@@ -709,7 +706,7 @@ async def _build_and_connect_client(
     supports_thinking = (provider is None) or provider.supports_thinking
     if supports_thinking:
         from claude_agent_sdk import ThinkingConfigEnabled
-        budget = int(os.environ.get("MUSELAB_THINKING_BUDGET", "4000") or 4000)
+        budget = env_int("MUSELAB_THINKING_BUDGET", 4000, min_value=0)
         opts_kwargs["thinking"] = ThinkingConfigEnabled(
             type="enabled", budget_tokens=budget)
     else:
@@ -3303,8 +3300,13 @@ def _xlsx_to_text(body: bytes, name: str) -> str:
     try:
         wb = openpyxl.load_workbook(BytesIO(body), read_only=True, data_only=True)
     except Exception as e:
+        # Don't echo the openpyxl exception message verbatim — it can
+        # leak internal library paths / partial cell contents / version
+        # info. Log the detail for debugging, return a generic message.
+        print(f"[muselab] xlsx parse failed for {name!r}: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
         raise HTTPException(
-            422, f"failed to parse xlsx '{name}': {type(e).__name__}: {e}",
+            422, "failed to parse spreadsheet (file may be corrupt or unsupported)"
         )
 
     parts: list[str] = [f"# Spreadsheet: {name}"]

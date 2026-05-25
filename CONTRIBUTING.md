@@ -22,7 +22,7 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
 - **New providers** that have an Anthropic-compatible Messages endpoint
   (a single `CATALOG` entry in `backend/endpoints.py`, see [docs/add-provider.md](docs/add-provider.md))
 - **MCP / skill presets** under `mcp.json.example` / `skills/`
-- **UI translations** (see the `STRINGS` table in `frontend/app.js`)
+- **UI translations** (see the `zh` / `en` key tables in `frontend/i18n/index.js`)
 - **Documentation improvements** — clearer install instructions, personalization guidance, or FAQ entries
 - **Visual / UX polish** — please open an issue first describing the problem
 

@@ -16,8 +16,7 @@
   ```bash
   claude login
   ```
-  非 Claude provider（DeepSeek / GLM / MiniMax）只需 API key——稍后在
-  Settings UI 内填即可。
+  非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度 ERNIE）只需 API key——稍后在 Settings UI 内填即可，无需 CLI。
 
 ## 安装
 

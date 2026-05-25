@@ -14,7 +14,7 @@
   built-in AI assistant).
 - 🤖 **Full agent loop on every model.** MCP / Skills / Subagents / plan
   mode work the same on Claude, DeepSeek, GLM, MiniMax, Kimi, Qwen,
-  Xiaomi MiMo.
+  Xiaomi MiMo, Baidu ERNIE.
 - 💸 **Reuse your Claude Pro / Max subscription** via OAuth — no
   per-token billing. Or bring a vendor API key.
 - 🔄 **Multi-device, one server.** Phone / tablet / desktop share

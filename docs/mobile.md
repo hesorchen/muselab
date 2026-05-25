@@ -18,7 +18,8 @@ like a native application.
 
 ## Install on iPhone
 
-Chrome → ⋮ menu → **Share** → **Add to Home Screen** → Add.
+Open the page in **Safari** (iOS Chrome doesn't expose this menu) →
+**Share** sheet → **Add to Home Screen** → Add.
 
 On Android Chrome, the address bar shows an "Install" prompt directly.
 
