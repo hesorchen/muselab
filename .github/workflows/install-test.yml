@@ -166,6 +166,13 @@ jobs:
       - name: Prepare archive + token
         run: |
           mkdir -p test-archive
+          # Container runs as `muse` (uid 1000); the runner creates the
+          # bind-mount source as a different uid. Without this chown, the
+          # backend's push subsystem hits PermissionError trying to mkdir
+          # <ROOT>/.muselab/ for VAPID key storage. (Push gracefully
+          # degrades — but other features that mkdir under ROOT would
+          # have the same problem, so fix it at the mount layer.)
+          sudo chown -R 1000:1000 test-archive
           echo "MUSELAB_TOKEN=$(openssl rand -hex 32)" > test.env
 
       - name: Run container
@@ -189,15 +196,29 @@ jobs:
 
       - name: Verify HEALTHCHECK passing
         run: |
-          # docker compose's healthcheck takes ~start_period (15s) before it's
-          # accurate. By now we've already waited 60s so it should be healthy.
-          status="$(docker inspect --format='{{.State.Health.Status}}' muselab-itest)"
-          echo "container health: $status"
-          if [[ "$status" != "healthy" ]]; then
-            echo "::error::expected healthy, got $status"
-            docker logs muselab-itest
-            exit 1
-          fi
+          # The Dockerfile's HEALTHCHECK is start_period=15s + interval=30s,
+          # so the FIRST scheduled probe doesn't run until ~45s into the
+          # container's life and Docker reports "starting" the whole time
+          # before that — even though /api/health is already answering.
+          # Poll docker inspect for up to 90 more seconds so the test passes
+          # as soon as the first real probe completes, instead of failing
+          # because we asked too early.
+          for i in $(seq 1 90); do
+            status="$(docker inspect --format='{{.State.Health.Status}}' muselab-itest)"
+            if [[ "$status" == "healthy" ]]; then
+              echo "container health: healthy (after ${i}s of polling)"
+              exit 0
+            fi
+            if [[ "$status" == "unhealthy" ]]; then
+              echo "::error::container reported unhealthy"
+              docker logs muselab-itest
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::healthcheck never transitioned to healthy (last status: $status)"
+          docker logs muselab-itest
+          exit 1
 
       - name: Stop container
         if: always()
