@@ -30,8 +30,6 @@
 
 <link rel="stylesheet" href="/static/styles.css" />
 <link id="hljs-theme" rel="stylesheet" href="/static/vendor/highlight-theme.css" />
-<link rel="stylesheet" href="/static/vendor/cm/codemirror.min.css" />
-<link rel="stylesheet" href="/static/vendor/cm/theme/material-darker.min.css" />
 <script defer src="/static/vendor/highlight.min.js"></script>
 <!-- 额外语言（common bundle 没的） -->
 <script defer src="/static/vendor/hljs-langs/dockerfile.min.js"></script>
@@ -47,30 +45,13 @@
 <script defer src="/static/app.js"></script>
 <script defer src="/static/vendor/marked.min.js"></script>
 <script defer src="/static/vendor/purify.min.js"></script>
-<!-- KaTeX (math rendering for markdown $...$ and $$...$$) -->
-<link rel="stylesheet" href="/static/vendor/katex/katex.min.css" />
-<script defer src="/static/vendor/katex/katex.min.js"></script>
-<script defer src="/static/vendor/katex/auto-render.min.js"></script>
-<!-- CodeMirror 5 (core + modes + addons, all vendored) -->
-<script defer src="/static/vendor/cm/codemirror.min.js"></script>
-<!-- addons first (some modes depend on them) -->
-<script defer src="/static/vendor/cm/addon/mode/simple.min.js"></script>
-<script defer src="/static/vendor/cm/addon/edit/closebrackets.min.js"></script>
-<script defer src="/static/vendor/cm/addon/edit/matchbrackets.min.js"></script>
-<script defer src="/static/vendor/cm/mode/meta.min.js"></script>
-<!-- base modes first; markdown / htmlmixed depend on these -->
-<script defer src="/static/vendor/cm/mode/xml/xml.min.js"></script>
-<script defer src="/static/vendor/cm/mode/javascript/javascript.min.js"></script>
-<script defer src="/static/vendor/cm/mode/css/css.min.js"></script>
-<script defer src="/static/vendor/cm/mode/clike/clike.min.js"></script>
-<!-- composite / standalone modes -->
-<script defer src="/static/vendor/cm/mode/htmlmixed/htmlmixed.min.js"></script>
-<script defer src="/static/vendor/cm/mode/markdown/markdown.min.js"></script>
-<script defer src="/static/vendor/cm/mode/python/python.min.js"></script>
-<script defer src="/static/vendor/cm/mode/yaml/yaml.min.js"></script>
-<script defer src="/static/vendor/cm/mode/shell/shell.min.js"></script>
-<script defer src="/static/vendor/cm/mode/go/go.min.js"></script>
-<script defer src="/static/vendor/cm/mode/rust/rust.min.js"></script>
+<!-- KaTeX (math rendering for $...$ / $$...$$) and CodeMirror (preview-pane
+     edit mode) are NOT preloaded here — both together account for ~870 KB
+     of cold-start payload that only the math-using or edit-mode-using
+     minority of users actually needs. They're lazy-loaded via
+     `_loadKatex()` / `_loadCodemirror()` in app.js on first use, mirroring
+     the existing pattern for Mermaid (~3.2 MB lazy-loaded on first
+     mermaid block render). -->
 <!-- Production: minified Alpine. The dev build (alpine.dev.js) ships
      more verbose error messages + heavier source size; only swap back
      when actively chasing an Alpine-internal bug. (The TEMP comment

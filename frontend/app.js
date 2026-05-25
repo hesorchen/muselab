@@ -1374,10 +1374,21 @@ function portal() {
       // might still get a phone push for a turn that finishes in the
       // first 15s of being back.
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") ping();
+        if (document.visibilityState !== "visible") return;
+        ping();                  // presence: re-arm push suppression
+        this._pingHealth();      // health: refresh conn state immediately
       });
     },
     async _pingHealth() {
+      // Skip when tab is hidden — heartbeat purpose is "show user we're
+      // connected", which is meaningless if the user isn't looking. Mobile
+      // PWA in background used to fire 8.6k fetches/day (10s × 24h)
+      // draining battery + radio for no UI benefit. Coming back to
+      // foreground triggers an immediate ping below via the
+      // visibilitychange handler, so there's no "unknown for up to 10s"
+      // gap on return.
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return;
       try {
         const r = await fetch("/api/meta", { headers: this.hdr() });
         if (!r.ok) throw new Error("status " + r.status);
@@ -1431,7 +1442,15 @@ function portal() {
       };
       return map[ext] || "text/plain";
     },
-    mountCM() {
+    async mountCM() {
+      // CodeMirror is lazy-loaded — kick off the fetch (no-op if already
+      // present) and only proceed once the global is exposed. Without this
+      // wait, every first edit-mode entry per session would silently fall
+      // through and the textarea fallback would render.
+      if (!window.CodeMirror) {
+        try { await this._loadCodemirror(); }
+        catch (e) { console.warn("[muselab] CodeMirror lazy load failed:", e); return; }
+      }
       this.$nextTick(() => {
         if (!window.CodeMirror) { console.warn("[muselab] CodeMirror not loaded"); return; }
         const host = this.$refs.cmHost;
@@ -2418,8 +2437,23 @@ function portal() {
       }
       // Math: render $...$ / $$...$$ via KaTeX auto-render. KaTeX runs after
       // DOMPurify (its output is trusted vendor HTML, no need to re-sanitize).
+      // KaTeX is lazy-loaded — kick off the load if not yet present so the
+      // NEXT mdRender call has math (this render falls through with plain
+      // delimiters). Cheap heuristic: only trigger if the input looks like
+      // it contains math, avoiding the network cost for pure-prose messages.
       const tmp = document.createElement("div");
       tmp.innerHTML = safe;
+      const looksLikeMath = /\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(text);
+      if (!window.renderMathInElement && looksLikeMath) {
+        this._loadKatex().then(() => {
+          // Reactive re-render: bump a counter that downstream renderedMd
+          // computations depend on so Alpine re-walks affected bindings.
+          // Cheaper than re-running mdRender on every static message — only
+          // future renders pick up KaTeX support; existing rendered HTML
+          // stays unchanged (worst case: math shows as raw $...$ in older
+          // bubbles until the user reloads, which is acceptable).
+        }).catch((e) => console.warn("[muselab] katex lazy load failed:", e));
+      }
       if (window.renderMathInElement && window.katex) {
         try {
           window.renderMathInElement(tmp, {
@@ -7048,8 +7082,14 @@ function portal() {
     highlightCode(root) {
       if (!window.hljs) { console.warn("[muselab] hljs not loaded"); return; }
       document.querySelectorAll(root + " code").forEach(el => {
-        // hljs.highlightElement refuses to re-highlight already-highlighted
-        // elements. So always go through highlight() directly and replace HTML.
+        // Dedup: every stream chunk re-runs flushRender → highlightCode,
+        // and without this guard we'd re-highlight every code block in
+        // the chat on every chunk. Long conversations × streaming =
+        // hundreds of redundant hljs runs per second. The `data-hl="1"`
+        // sentinel is cleared by the preview-reload paths (3 sites)
+        // when their underlying content changes, so cache invalidation
+        // is still correct.
+        if (el.dataset.hl === "1") return;
         const text = el.textContent;
         // Skip expensive syntax highlighting for large files. hljs JavaScript /
         // TypeScript parsers can block the main thread for several seconds on
@@ -7057,6 +7097,7 @@ function portal() {
         // generous cap — most human-authored source files are well under 50 KB.
         if (text.length > 150000) {
           el.classList.add("hljs");
+          el.dataset.hl = "1";
           this._attachCopyBtn(el);
           return;
         }
@@ -7068,6 +7109,7 @@ function portal() {
             : window.hljs.highlightAuto(text);
           el.innerHTML = r.value;
           el.classList.add("hljs");
+          el.dataset.hl = "1";
         } catch (e) { console.warn("[muselab] highlight failed:", e); }
         // Attach copy button to every <pre> wrapping a code block — only once.
         this._attachCopyBtn(el);
@@ -7119,6 +7161,96 @@ function portal() {
     // Lazy-loads vendored mermaid.min.js (~3.3 MB) and initializes it
     // with strict securityLevel. Returns a Promise that resolves once
     // window.mermaid is ready. Subsequent calls reuse the cached promise.
+    // Generic lazy-loader for vendor assets. Inserts <script>/<link> tags
+    // on demand, caches the in-flight promise so concurrent callers fold
+    // into one request, clears the cache on failure so a transient 4xx/5xx
+    // doesn't permanently disable the feature.
+    //
+    // `srcs`: list of asset URLs (.js or .css — auto-detected by extension).
+    // `key`: storage slot on `this` for the cached promise.
+    // `ready`: predicate that returns true once the global is exposed
+    //   (e.g. () => window.CodeMirror). Used both as a fast path on
+    //   already-loaded scripts and to resolve the promise.
+    _loadAssets(key, srcs, ready) {
+      if (ready()) return Promise.resolve();
+      if (this[key]) return this[key];
+      const clearOnFail = (err) => { this[key] = null; return Promise.reject(err); };
+      const loadOne = (src) => new Promise((resolve, reject) => {
+        // Already in the DOM (e.g. from a previous lazy-load attempt)? Wait
+        // for ready(); don't re-inject the tag.
+        const sel = src.endsWith(".css")
+          ? `link[href="${src}"]`
+          : `script[src="${src}"]`;
+        if (document.querySelector(sel)) {
+          // Poll briefly for ready in case the in-flight load wasn't ours.
+          const t0 = Date.now();
+          (function wait() {
+            if (ready()) return resolve();
+            if (Date.now() - t0 > 5000) return reject(new Error("ready() timeout for " + src));
+            setTimeout(wait, 50);
+          })();
+          return;
+        }
+        if (src.endsWith(".css")) {
+          const l = document.createElement("link");
+          l.rel = "stylesheet"; l.href = src;
+          l.onload = resolve; l.onerror = () => reject(new Error("load failed: " + src));
+          document.head.appendChild(l);
+        } else {
+          const s = document.createElement("script");
+          s.src = src;
+          s.onload = resolve; s.onerror = () => reject(new Error("load failed: " + src));
+          document.head.appendChild(s);
+        }
+      });
+      // Sequential load so dependency order is preserved (modes need
+      // CodeMirror core loaded first, etc).
+      this[key] = srcs.reduce(
+        (p, src) => p.then(() => loadOne(src)),
+        Promise.resolve(),
+      ).then(() => {
+        if (!ready()) throw new Error("loaded but ready() still false for " + key);
+      }).catch(clearOnFail);
+      return this[key];
+    },
+
+    // KaTeX is ~562 KB (with fonts) of math rendering — only fires when a
+    // message body contains $...$, $$...$$, \(...\), or \[...\] delimiters.
+    // Many users never see math, so loading at startup wastes their bandwidth.
+    async _loadKatex() {
+      return this._loadAssets("_katexLoadPromise", [
+        "/static/vendor/katex/katex.min.css",
+        "/static/vendor/katex/katex.min.js",
+        "/static/vendor/katex/auto-render.min.js",
+      ], () => window.katex && window.renderMathInElement);
+    },
+
+    // CodeMirror is ~308 KB (core + 11 modes + 3 addons) — only fires when
+    // the user opens edit mode on a file preview. Most read-only browsing
+    // never needs it.
+    async _loadCodemirror() {
+      return this._loadAssets("_cmLoadPromise", [
+        "/static/vendor/cm/codemirror.min.css",
+        "/static/vendor/cm/theme/material-darker.min.css",
+        "/static/vendor/cm/codemirror.min.js",
+        "/static/vendor/cm/addon/mode/simple.min.js",
+        "/static/vendor/cm/addon/edit/closebrackets.min.js",
+        "/static/vendor/cm/addon/edit/matchbrackets.min.js",
+        "/static/vendor/cm/mode/meta.min.js",
+        "/static/vendor/cm/mode/xml/xml.min.js",
+        "/static/vendor/cm/mode/javascript/javascript.min.js",
+        "/static/vendor/cm/mode/css/css.min.js",
+        "/static/vendor/cm/mode/clike/clike.min.js",
+        "/static/vendor/cm/mode/htmlmixed/htmlmixed.min.js",
+        "/static/vendor/cm/mode/markdown/markdown.min.js",
+        "/static/vendor/cm/mode/python/python.min.js",
+        "/static/vendor/cm/mode/yaml/yaml.min.js",
+        "/static/vendor/cm/mode/shell/shell.min.js",
+        "/static/vendor/cm/mode/go/go.min.js",
+        "/static/vendor/cm/mode/rust/rust.min.js",
+      ], () => window.CodeMirror);
+    },
+
     async _loadMermaid() {
       if (window.mermaid) return window.mermaid;
       if (this._mermaidLoadPromise) return this._mermaidLoadPromise;
