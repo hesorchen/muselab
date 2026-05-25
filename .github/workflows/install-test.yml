@@ -94,6 +94,13 @@ jobs:
   macos:
     name: macos (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # macos-13 (Intel) routinely queues for 20+ hours on the free GHA
+    # runner pool — but we don't want to drop Intel coverage entirely.
+    # Flag the Intel matrix entry as best-effort: it tries to run when
+    # capacity is available, but its failure / 24-hour timeout doesn't
+    # cascade into an install-test workflow failure. macos-14 (Apple
+    # Silicon) is the required signal.
+    continue-on-error: ${{ matrix.os == 'macos-13' }}
     strategy:
       fail-fast: false
       matrix:
