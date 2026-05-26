@@ -102,6 +102,61 @@ def test_status_endpoint_parses_logged_in_state(client, monkeypatch):
     assert d["reason"] is None
 
 
+def test_status_endpoint_overrides_logged_in_when_token_expired(client, monkeypatch, tmp_path):
+    """`claude auth status` only checks credentials.json existence — it does
+    NOT validate token freshness. If expiresAt is in the past, we must override
+    logged_in=False with reason='token-expired', otherwise the UI confidently
+    shows "已连接" while every actual chat 401s.
+
+    Regression for the bug where users saw "已连接" in settings but still had
+    to run `claude login` in a shell."""
+    import subprocess as _sp
+    import backend.api_settings as mod
+    monkeypatch.setattr(mod, "_claude_cli_path", lambda: "/usr/bin/claude")
+    # CLI reports loggedIn=True (because creds file exists)
+    def fake_run(*args, **kwargs):
+        return _sp.CompletedProcess(args=args[0], returncode=0,
+                                     stdout=json.dumps({
+                                         "loggedIn": True,
+                                         "email": "test@example.com",
+                                         "subscriptionType": "max",
+                                     }), stderr="")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    # But credentials.json says the token expired 1 hour ago
+    cred = tmp_path / ".credentials.json"
+    expired_ms = int((time.time() - 3600) * 1000)
+    cred.write_text(json.dumps({
+        "claudeAiOauth": {"accessToken": "stale", "expiresAt": expired_ms}
+    }))
+    monkeypatch.setattr(mod, "_CLAUDE_CRED", cred)
+    r = client.get("/api/settings/claude-auth/status", headers=_hdr())
+    d = r.json()
+    assert d["logged_in"] is False, "expired token must override loggedIn=True"
+    assert d["reason"] == "token-expired"
+    assert d["expires_at"] == expired_ms  # still surfaced for display
+
+
+def test_status_endpoint_keeps_logged_in_when_token_fresh(client, monkeypatch, tmp_path):
+    """Sanity counterpart: when expiresAt is in the future, logged_in stays True."""
+    import subprocess as _sp
+    import backend.api_settings as mod
+    monkeypatch.setattr(mod, "_claude_cli_path", lambda: "/usr/bin/claude")
+    def fake_run(*args, **kwargs):
+        return _sp.CompletedProcess(args=args[0], returncode=0,
+                                     stdout=json.dumps({"loggedIn": True}), stderr="")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    cred = tmp_path / ".credentials.json"
+    future_ms = int((time.time() + 3600) * 1000)
+    cred.write_text(json.dumps({
+        "claudeAiOauth": {"accessToken": "fresh", "expiresAt": future_ms}
+    }))
+    monkeypatch.setattr(mod, "_CLAUDE_CRED", cred)
+    r = client.get("/api/settings/claude-auth/status", headers=_hdr())
+    d = r.json()
+    assert d["logged_in"] is True
+    assert d["reason"] is None
+
+
 def test_status_endpoint_handles_cli_timeout(client, monkeypatch):
     """If `claude auth status` hangs, we shouldn't 500 — return a clean
     deterministic 'cli-timeout' reason."""

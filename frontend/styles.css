@@ -2260,6 +2260,39 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 }
 .msg { display: flex; flex-direction: column; position: relative; animation: msg-in var(--t-base); }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+/* Collapse empty message wrappers. Every msg is rendered as
+   <div class="msg role"> regardless of whether any inner <template x-if>
+   actually matched — when none did (successful Edit/Write/MultiEdit
+   tool_results suppressed by shouldHideToolResult, TaskList/TaskGet/
+   TaskOutput tool_uses skipped by shouldRenderTaskLine) the wrapper is
+   visually empty but still participates in `.chat-body`'s `gap: var(--sp-2)`
+   between siblings, leaving a visible band of whitespace below the
+   preceding bubble. `:has(> :not(template))` matches wrappers that have
+   at least one rendered (non-template-placeholder) direct child; negate
+   it to catch the all-templates-falsy case. Requires :has support
+   (Chrome 105+, Safari 15.4+, Firefox 121+) — already a baseline
+   elsewhere in this stylesheet. */
+.msg:not(:has(> :not(template))) { display: none; }
+/* Bubble-internal first/last block: kill the outer markdown margin
+   so the bubble's own padding (8px 11px) is the only top/bottom inset.
+   Without this, a leading `<p>` adds ~12px (margin: 0.7em 0 from
+   `.markdown p` below) on top of the 8px bubble padding, and the same
+   on the bottom — making every assistant text bubble feel airy AND
+   making the gap below a folded diff strip look like a giant blank
+   band (~36px) rather than a clean break. This rule scopes the reset
+   to inside `.bubble` only, so the preview-pane `.markdown` (which
+   has its own outer padding and benefits from leading p margin) is
+   untouched. The `> *` direct-child selector dodges nested first
+   children (e.g. tables, blockquotes), which need their margins. */
+.bubble > :first-child { margin-top: 0; }
+.bubble > :last-child { margin-bottom: 0; }
+/* When the code-review diff strip is collapsed (Alpine x-show writes
+   `style="display: none;"` on `.diff-body`), kill the strip's bottom
+   margin so the next bubble sits flush. Expanded keeps the 8px
+   breathing room defined on `.diff-strip-cr`. The `[style*="none"]`
+   substring match tolerates Alpine's exact whitespace (`display: none;`
+   vs `display:none`) and any future format tweak. */
+.diff-strip-cr:has(> .diff-body[style*="none"]) { margin-bottom: 0; }
 /* user side hugs the right; muse side hugs the left. Both with the
    SAME max-row-width — true wechat mirror layout. */
 .msg.user { align-items: flex-end; }

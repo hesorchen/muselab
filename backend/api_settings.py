@@ -1195,16 +1195,38 @@ def get_ui_state() -> dict:
     return _read_ui_state()
 
 
+class PreviewTabIn(BaseModel):
+    path: str
+    name: str | None = None
+
+
 class UIStateIn(BaseModel):
     last_session_id: str | None = None
+    # Tab strip — the list of chat session IDs currently open across all
+    # devices. Synced so opening a session on one device makes it appear on
+    # the others' tab strip too. `currentId` (which tab is active) is
+    # intentionally NOT synced — each device keeps its own focus.
+    open_tab_ids: list[str] | None = None
+    # File preview tab strip — same semantics as open_tab_ids but for the
+    # file viewer panel. Only path + name are persisted; content is fetched
+    # lazily on first switch.
+    preview_tabs: list[PreviewTabIn] | None = None
 
 
 @router.put("/ui-state", dependencies=[Depends(require_token)])
 def put_ui_state(req: UIStateIn) -> dict:
-    """Persist UI state fields. Only provided (non-None) fields are updated."""
+    """Persist UI state fields. Only provided (non-None) fields are updated.
+
+    None means "leave alone" — empty list ([]) is a meaningful value (the
+    user closed all tabs) and IS persisted.
+    """
     state = _read_ui_state()
     if req.last_session_id is not None:
         state["last_session_id"] = req.last_session_id
+    if req.open_tab_ids is not None:
+        state["open_tab_ids"] = list(req.open_tab_ids)
+    if req.preview_tabs is not None:
+        state["preview_tabs"] = [t.model_dump() for t in req.preview_tabs]
     _write_ui_state(state)
     return state
 
@@ -1329,16 +1351,30 @@ def claude_auth_status() -> dict:
     status = _run_claude_auth_status() if cli else {
         "loggedIn": False, "reason": "cli-not-installed"
     }
+    expires_at = _read_credentials_expiry()
+    logged_in = bool(status.get("loggedIn", False))
+    reason = status.get("reason")
+    # `claude auth status` reports loggedIn=True as long as credentials.json
+    # exists — it does NOT validate that the OAuth access_token is still
+    # fresh. Symptom: a long-idle session shows "已连接" in the UI but every
+    # actual chat fails because the token expired and the user has to run
+    # `claude login` again in a shell. Cross-check expiresAt here so we
+    # surface "token-expired" up front instead of confidently lying.
+    if logged_in and expires_at:
+        import time as _time
+        if expires_at < int(_time.time() * 1000):
+            logged_in = False
+            reason = "token-expired"
     return {
         "cli_installed": cli is not None,
         "cli_path": cli,
         "credentials_file_present": _CLAUDE_CRED.exists(),
-        "logged_in": bool(status.get("loggedIn", False)),
+        "logged_in": logged_in,
         "email": status.get("email"),
         "org_name": status.get("orgName"),
         "subscription_type": status.get("subscriptionType"),
-        "expires_at": _read_credentials_expiry(),
-        "reason": status.get("reason"),
+        "expires_at": expires_at,
+        "reason": reason,
     }
 
 

@@ -833,6 +833,7 @@ function portal() {
       this.initMascot();
       this.configureMarked();
       this._initArtifacts();
+      this._initStreamSelectionGuard();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
       // login). Calling it here produced a 401 spam in the network tab.
@@ -849,15 +850,11 @@ function portal() {
       this.$watch("currentId", (tid) => {
         if (!tid) return;
         this.$nextTick(() => this._scrollTabIntoView(tid));
-        // Persist last active session to server so other devices can
-        // resume where this one left off. Debounced 1 s to avoid a PUT
-        // on every rapid tab switch (e.g. keyboard Ctrl+1..9).
-        clearTimeout(this._saveLastSessionTimer);
-        this._saveLastSessionTimer = setTimeout(() => {
-          this.api("/api/settings/ui-state", {
-            method: "PUT", json: { last_session_id: tid },
-          }).catch(() => {});
-        }, 1000);
+        // Persist the current tab to server so other devices follow.
+        // Goes through the same debounced ui-state push that openTabIds /
+        // previewTabs use (last_session_id carries currentId) — keeps
+        // payload coherent and avoids two PUT races overwriting each other.
+        this._pushUIStateSoon();
       });
       // Leaving preview tab on mobile cancels immersive mode so the next
       // tab is rendered with its bars visible. Also persists the choice so
@@ -1373,10 +1370,19 @@ function portal() {
       // user who just opened the laptop after a 5-minute lunch break
       // might still get a phone push for a turn that finishes in the
       // first 15s of being back.
-      document.addEventListener("visibilitychange", () => {
+      document.addEventListener("visibilitychange", async () => {
         if (document.visibilityState !== "visible") return;
         ping();                  // presence: re-arm push suppression
         this._pingHealth();      // health: refresh conn state immediately
+        // Cross-device tab sync — refresh sessions first (in case another
+        // device created/deleted sessions while this tab was hidden), then
+        // flush any pending local push so the GET sees our latest writes
+        // BEFORE pulling, then merge remote state into the tab strip.
+        try {
+          await this.refreshSessions();
+          await this._flushUIStatePush();
+          await this._pullUIStateAndMerge();
+        } catch (_) {}
       });
     },
     async _pingHealth() {
@@ -1392,6 +1398,37 @@ function portal() {
       try {
         const r = await fetch("/api/meta", { headers: this.hdr() });
         if (!r.ok) throw new Error("status " + r.status);
+        // Stale-JS detector. Mobile Safari frequently resumes a
+        // backgrounded PWA tab without re-fetching HTML, so the page
+        // keeps running last week's app.js against today's API. When
+        // /api/meta.asset_version is newer than the version baked into
+        // OUR HTML at boot (via <meta name="muselab-asset-version">),
+        // hard-reload to pick up the new bundle. Guarded so we only
+        // reload once per session — bailing out cleanly if the user
+        // is mid-stream or the meta tag is missing (old HTML still
+        // cached, no placeholder).
+        try {
+          const meta = await r.clone().json();
+          const remoteVer = meta && meta.asset_version;
+          if (remoteVer && !this._appVersionReloadFired) {
+            const localVer = (document.querySelector(
+              'meta[name="muselab-asset-version"]') || {}).content || "";
+            // localVer === "" → fresh deploy whose HTML still uses the
+            // un-substituted placeholder is impossible (backend always
+            // replaces). Treat "" or the literal placeholder as "unknown,
+            // skip" rather than infinite-reload.
+            const knownLocal = localVer
+              && localVer !== "__MUSELAB_ASSET_VERSION__";
+            if (knownLocal && localVer !== String(remoteVer)
+                && !this.streaming) {
+              this._appVersionReloadFired = true;
+              console.info("[muselab] asset version changed",
+                           localVer, "→", remoteVer, "— reloading");
+              location.reload();
+              return;
+            }
+          }
+        } catch (_) { /* meta parse failed — non-fatal, skip check */ }
         // Healthy
         if (this.connState === "reconnecting") {
           this.connState = "reconnected";
@@ -2863,7 +2900,135 @@ function portal() {
         // user on the preview tab even if they were chatting before.
         mobileTab: this.mobileTab,
       }));
+      // Fire-and-forget cross-device sync. Debounced inside.
+      this._pushUIStateSoon();
     },
+    // Cross-device sync of the tab strip, preview tab strip, AND currentId
+    // via /api/settings/ui-state. Debounced because savePrefs() fires on
+    // every tab open/close/reorder/preview-select — un-debounced we'd PUT
+    // 5+ times for a single drag-reorder gesture. 300ms is short enough
+    // that a tab change on device A shows up on device B as soon as B's
+    // visibilitychange GET runs, but long enough to collapse bursts.
+    //
+    // currentId rides as last_session_id (the existing field — it always
+    // meant "most recently active session ID"; we now treat it as the
+    // cross-device authoritative current tab, not just a new-device boot
+    // fallback). $watch("currentId") routes through this same path so
+    // tab switches sync without a separate PUT race.
+    _uiStatePayload() {
+      return {
+        last_session_id: this.currentId || null,
+        open_tab_ids: Array.isArray(this.openTabIds) ? this.openTabIds : [],
+        preview_tabs: (this.tabs || []).map(t => ({
+          path: t.path, name: t.name || "",
+        })),
+      };
+    },
+    _pushUIStateSoon() {
+      if (!this.token) return;                          // pre-login: no-op
+      if (this._uiStatePushTimer) clearTimeout(this._uiStatePushTimer);
+      this._uiStatePushTimer = setTimeout(() => {
+        this._uiStatePushTimer = null;
+        this._uiStatePushInflight = this.api("/api/settings/ui-state", {
+          method: "PUT", json: this._uiStatePayload(),
+        }).catch(() => {}).finally(() => { this._uiStatePushInflight = null; });
+      }, 300);
+    },
+    // Force any pending PUT to flush + complete BEFORE the next GET so
+    // visibilitychange doesn't pull stale remote state that overwrites
+    // local changes we haven't pushed yet.
+    async _flushUIStatePush() {
+      if (this._uiStatePushTimer) {
+        clearTimeout(this._uiStatePushTimer);
+        this._uiStatePushTimer = null;
+        try {
+          await this.api("/api/settings/ui-state", {
+            method: "PUT", json: this._uiStatePayload(),
+          });
+        } catch (_) {}
+      }
+      if (this._uiStatePushInflight) {
+        try { await this._uiStatePushInflight; } catch (_) {}
+      }
+    },
+    // Pull remote ui-state and merge into local openTabIds, preview tabs,
+    // and currentId. Merge rules:
+    //   - remote field undefined / not present → leave local alone (avoids
+    //     wiping local state on a fresh install where remote has no record
+    //     of these fields yet).
+    //   - remote field is an array (incl. empty) → REPLACE local. Empty is
+    //     a meaningful "user closed everything elsewhere" state.
+    //   - openTabIds: filter to sessions that still exist server-side.
+    //   - last_session_id: if remote says a different (valid + open) tab
+    //     is current, ACTIVATE it via activateTab(). The other device is
+    //     authoritative because it pushed more recently. No healing —
+    //     currentId being cross-synced means the local view follows the
+    //     last device that switched tabs.
+    //   - previewTabs: replace wholesale. Content is lazy-fetched on click.
+    //
+    // To avoid yanking the user mid-conversation, we suppress the currentId
+    // sync when the local tab is actively streaming (a turn would visually
+    // jump away from the user). Local will catch up next visibilitychange.
+    async _pullUIStateAndMerge() {
+      if (!this.token) return false;
+      let data;
+      try {
+        const r = await this.api("/api/settings/ui-state");
+        if (!r.ok) return false;
+        data = r.data || {};
+      } catch (_) { return false; }
+      let changed = false;
+      const validIds = new Set((this.sessions || []).map(s => s.id));
+      if (Array.isArray(data.open_tab_ids)) {
+        const remote = data.open_tab_ids.filter(id => validIds.has(id));
+        const before = JSON.stringify(this.openTabIds || []);
+        if (JSON.stringify(remote) !== before) {
+          this.openTabIds = remote;
+          changed = true;
+        }
+      }
+      // currentId sync via last_session_id. Only switch if (a) remote is
+      // different from local, (b) the target session still exists, (c) it's
+      // in the open tab strip, and (d) the local tab isn't streaming (don't
+      // interrupt an in-flight turn the user is reading).
+      const remoteCur = typeof data.last_session_id === "string"
+        ? data.last_session_id : null;
+      const localStreaming = !!(this.tabState && this.tabState[this.currentId]
+                                 && this.tabState[this.currentId].streaming);
+      if (remoteCur && remoteCur !== this.currentId
+          && validIds.has(remoteCur)
+          && (this.openTabIds || []).includes(remoteCur)
+          && !localStreaming) {
+        this.activateTab(remoteCur);
+        changed = true;
+      } else if (this.currentId && !(this.openTabIds || []).includes(this.currentId)
+                 && (this.openTabIds || []).length) {
+        // currentId got dropped by the openTabIds replacement above and
+        // we couldn't (or didn't) jump to the remote current → fall back
+        // to the first surviving tab so we don't end up on a closed one.
+        this.activateTab(this.openTabIds[0]);
+        changed = true;
+      }
+      if (Array.isArray(data.preview_tabs)) {
+        const remote = data.preview_tabs
+          .filter(t => t && typeof t.path === "string")
+          .map(t => ({ path: t.path, name: t.name || t.path.split("/").pop() }));
+        const before = JSON.stringify((this.tabs || []).map(t => ({ path: t.path, name: t.name })));
+        const after = JSON.stringify(remote);
+        if (before !== after) {
+          this.tabs = remote;
+          changed = true;
+        }
+      }
+      // Persist the merged view to localStorage so a reload reflects what
+      // we just synced. savePrefs() also re-pushes to server, but the
+      // payload will match what's already there → server is a no-op.
+      if (changed) {
+        try { this.savePrefs(); } catch (_) {}
+      }
+      return changed;
+    },
+
     loadPrefs() {
       try {
         const p = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
@@ -3487,6 +3652,11 @@ function portal() {
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
+      // Cross-device merge: pull the tab strip + preview tabs that other
+      // devices last pushed. Happens AFTER local reconciliation so the
+      // merge sees a clean local baseline. currentId is preserved by the
+      // healing logic inside _pullUIStateAndMerge.
+      try { await this._pullUIStateAndMerge(); } catch (_) {}
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
@@ -7158,6 +7328,40 @@ function portal() {
       });
     },
 
+    // Pause streaming bubble re-renders while the user has an active text
+    // selection in the chat area. The streaming text path assigns to m.html
+    // on every chunk; Alpine's x-html replaces innerHTML, which forces the
+    // browser to collapse any selection inside the bubble — making it
+    // impossible to "select while Muse is typing, then Ctrl+C". The stream
+    // closure stashes its deferred-render callback on streamState as
+    // _pendingHtmlRender; when the selection clears we walk every tabState
+    // and flush whichever streams accumulated text in the meantime.
+    _initStreamSelectionGuard() {
+      if (this._streamSelGuardBound) return;
+      this._streamSelGuardBound = true;
+      document.addEventListener("selectionchange", () => {
+        if (this._selectionInChatBody()) return;
+        const tabs = this.tabState || {};
+        for (const sid in tabs) {
+          const fn = tabs[sid] && tabs[sid]._pendingHtmlRender;
+          if (typeof fn === "function") fn();
+        }
+      });
+    },
+
+    // Returns true iff the current Selection is non-collapsed AND its
+    // anchor sits inside a .chat-body element. Used by the streaming text
+    // handler to decide whether to defer the next mdRender → x-html assign.
+    _selectionInChatBody() {
+      const sel = (typeof window !== "undefined") && window.getSelection && window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false;
+      const range = sel.getRangeAt(0);
+      const node = range.commonAncestorContainer;
+      if (!node) return false;
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      return !!(el && el.closest && el.closest(".chat-body"));
+    },
+
     // Lazy-loads vendored mermaid.min.js (~3.3 MB) and initializes it
     // with strict securityLevel. Returns a Promise that resolves once
     // window.mermaid is ready. Subsequent calls reuse the cached promise.
@@ -8999,16 +9203,35 @@ function portal() {
       };
       const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
 
+      // Re-render the in-flight assistant bubble from the accumulated text.
+      // Exposed on streamState so the global selectionchange guard (see
+      // _initStreamSelectionGuard) can flush a deferred render once the user
+      // releases their text selection. Re-reads curBubble/acc from the closure
+      // every call, so it stays correct even after openAsst/closeAsst swap
+      // bubbles mid-stream.
+      const renderStreamingHtml = () => {
+        if (curBubble) curBubble.html = this.mdRender(acc);
+        streamState._pendingHtmlRender = null;
+      };
+      streamState._renderStreamingHtml = renderStreamingHtml;
+
       es.addEventListener("text", ev => {
         const d = JSON.parse(ev.data);
         openAsst();
         acc += d.text;
         curBubble.text = acc;
-        // Direct synchronous render — drop the 80ms throttle / setTimeout
-        // path because it was causing "first chunk shows then frozen
-        // until tab switch" symptom. Throttling was a perf nicety for
-        // long replies but reactivity was unreliable through the timer.
-        curBubble.html = this.mdRender(acc);
+        // Skip the mdRender → x-html assignment while the user has an active
+        // text selection in the chat body. x-html replaces innerHTML on every
+        // chunk, which forces the browser to collapse any selection inside the
+        // bubble — making "select while streaming, then Ctrl+C" impossible.
+        // We still accumulate `acc`; the selectionchange listener flushes a
+        // deferred render the moment the selection clears, and the `done`
+        // handler's flushRender catches anything still pending at stream end.
+        if (this._selectionInChatBody()) {
+          streamState._pendingHtmlRender = renderStreamingHtml;
+        } else {
+          renderStreamingHtml();
+        }
         _scrollIfActive();
       });
       es.addEventListener("thinking", ev => {

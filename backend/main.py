@@ -297,6 +297,12 @@ def index() -> HTMLResponse:
     raw = (FRONTEND / "index.html").read_text(encoding="utf-8")
     ver = _asset_version()
     html = _STATIC_REF_RE.sub(lambda m: f'{m.group(1)}{m.group(2)}?v={ver}{m.group(3)}', raw)
+    # Substitute the asset-version placeholder so the loaded HTML can
+    # tell, via the <meta name="muselab-asset-version"> tag, which JS
+    # bundle it was bootstrapped with. The app.js client compares this
+    # against /api/meta.asset_version on visibilitychange and reloads
+    # when out-of-date.
+    html = html.replace("__MUSELAB_ASSET_VERSION__", ver)
     # The HTML itself must never be cached — it embeds the per-deploy
     # version stamps that point at the cacheable static assets.
     return HTMLResponse(
@@ -321,6 +327,32 @@ class _VersionedStaticFiles(StaticFiles):
         else:
             resp.headers["Cache-Control"] = "no-cache, must-revalidate"
         return resp
+
+
+# Dynamic manifest handler — MUST be registered before the /static mount
+# so the route matches first. Without this, manifest.webmanifest is served
+# as a flat static file with hard-coded icon paths like
+# `/static/assets/icon.svg`. PWA installers (Chrome, Edge, Safari) fetch
+# icons via those literal URLs and the browser hits whatever it has in
+# the favicon / image cache — which on a long-running install can be
+# weeks-stale. Injecting `?v=<asset_version>` into every icon src here
+# forces a fresh fetch whenever any frontend file changes mtime.
+@app.get("/static/assets/manifest.webmanifest")
+def manifest_webmanifest():
+    import json as _json
+    from fastapi.responses import JSONResponse
+    raw = (FRONTEND / "assets" / "manifest.webmanifest").read_text(encoding="utf-8")
+    data = _json.loads(raw)
+    ver = _asset_version()
+    for icon in data.get("icons", []) or []:
+        src = icon.get("src", "")
+        if src and "?" not in src:
+            icon["src"] = f"{src}?v={ver}"
+    return JSONResponse(
+        data,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 app.mount("/static", _VersionedStaticFiles(directory=FRONTEND), name="static")
@@ -360,7 +392,13 @@ def meta() -> dict:
     # muselab instance. Defence-in-depth — token is already required
     # for every meaningful endpoint, this just stops drive-by probes
     # from getting the path + SDK / CLI versions for free.
-    return {"root": str(ROOT), **_VERSIONS}
+    # `asset_version` matches the ?v=… stamp the index() handler embeds
+    # in <link>/<script src> URLs. Clients poll /api/meta (visibilitychange
+    # + 10s heartbeat) and compare against the version their HTML was
+    # served with — a mismatch means the user's PWA / Safari tab is
+    # running stale JS (common when "restart" only resumed a backgrounded
+    # tab without re-fetching HTML), and the client should hard-reload.
+    return {"root": str(ROOT), "asset_version": _asset_version(), **_VERSIONS}
 
 
 @app.get("/api/health")
