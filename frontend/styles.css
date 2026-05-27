@@ -30,6 +30,17 @@
   --c-accent-hover: #7aa3ff;
   --c-accent-soft: rgba(96, 147, 255, 0.12);
   --c-accent-fg: #b8cdff;
+  /* Primary-CTA tokens. Kept separate from --c-accent so accent can
+     stay vivid for links / focus / active state, while button labels
+     get a WCAG-safe pair. Naïvely using `var(--c-accent) + white` gave
+     ratios of 2.95 (dark) / 4.10 (light) / 3.77 (eyecare) — all below
+     AA. Per theme we pick a bg + fg pair that clears 4.5:1.
+     Dark theme: bright accent bg looks best with dark text (reverse-
+     contrast button — common in flat dark UIs). Light/eyecare keep
+     the conventional "white text on darker accent" pattern. */
+  --c-btn-primary-bg: var(--c-accent);
+  --c-btn-primary-hover: var(--c-accent-hover);
+  --c-on-accent: #0e1014;  /* dark text on bright #6093ff = 6.45:1 */
 
   --c-success: #4ade80;
   --c-warn: #fbbf24;
@@ -159,9 +170,22 @@ html[data-theme="light"] {
   --c-accent-hover: #2962d9;
   --c-accent-soft: rgba(58, 120, 240, 0.10);
   --c-accent-fg: #1d4dcc;
+  /* Light theme: white text on a darker bg keeps the conventional
+     "primary CTA" look. white on --c-accent (#3a78f0) was only 4.10,
+     so use the deeper accent-fg shade as button bg: 7.03:1. Hover
+     goes deeper still. */
+  --c-btn-primary-bg: var(--c-accent-fg);     /* #1d4dcc */
+  --c-btn-primary-hover: #1e40af;              /* white = 8.72 */
+  --c-on-accent: #ffffff;
 
   --c-success: #16a34a;
-  --c-warn: #d97706;
+  /* Light theme override for warn / warning. Original #d97706 / #f59e0b
+     hit only 3.07 / 2.07 vs bg-1 — failed WCAG AA on every muted-text
+     surface (editor-status .dirty, settings-hint.warn, conn-banner
+     text, toast.warn icon). #92500a is amber-700-ish (warm orange, not
+     coffee brown) and clears 6.01 on bg-1 / 5.69 on bg-2. */
+  --c-warn: #92500a;
+  --c-warning: #92500a;
   --c-danger: #dc2626;
   --c-danger-hover: #b91c1c;
   --c-danger-soft: rgba(220, 38, 38, 0.08);
@@ -202,9 +226,19 @@ html[data-theme="eyecare"] {
   --c-accent-hover: #4a7d5a;
   --c-accent-soft: rgba(90, 143, 106, 0.10);
   --c-accent-fg: #3a5a30;
+  /* Eyecare: sage accent + white was only 3.77; deepen to #3f6b4c
+     (white = 6.14:1) for button bg. Hover goes deeper still. */
+  --c-btn-primary-bg: #3f6b4c;
+  --c-btn-primary-hover: #2d5239;             /* white = 8.83 */
+  --c-on-accent: #ffffff;
 
   --c-success: #4a8f4a;
-  --c-warn: #b08030;
+  /* Eyecare override for warn / warning. Original #b08030 / #f59e0b
+     hit only 2.89 / 1.77 vs the warm-beige bg-1 — invisible. #92500a
+     (same value as light theme) clears 5.13 on bg-1 / 4.80 on bg-2,
+     and its earthy amber tone pairs well with the warm-cream palette. */
+  --c-warn: #92500a;
+  --c-warning: #92500a;
   --c-danger: #c05050;
   --c-danger-hover: #a04040;
   --c-danger-soft: rgba(192, 80, 80, 0.08);
@@ -260,8 +294,13 @@ button.btn-primary, button.btn-danger, button.btn-ghost {
   font-size: var(--fs-sm); font-weight: var(--fw-medium);
   line-height: 1;
 }
-button.btn-primary { background: var(--c-accent); border-color: var(--c-accent); color: white; }
-button.btn-primary:hover { background: var(--c-accent-hover); border-color: var(--c-accent-hover); }
+button.btn-primary {
+  background: var(--c-btn-primary-bg); border-color: var(--c-btn-primary-bg);
+  color: var(--c-on-accent);
+}
+button.btn-primary:hover {
+  background: var(--c-btn-primary-hover); border-color: var(--c-btn-primary-hover);
+}
 button.btn-danger { background: var(--c-danger); border-color: var(--c-danger); color: white; }
 button.btn-danger:hover { background: var(--c-danger-hover); }
 button.btn-ghost { background: transparent; border-color: transparent; color: var(--c-fg-2); }
@@ -934,7 +973,7 @@ body.kb-open .mobile-tab-bar { display: none; }
 .chat-outline-fab {
   position: absolute; bottom: 64px; right: 18px;
   width: 36px; height: 36px; border-radius: var(--r-full);
-  background: var(--c-accent); color: white; border: 0;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent); border: 0;
   display: flex; align-items: center; justify-content: center;
   box-shadow: var(--shadow-lg); cursor: pointer;
   transition: transform var(--t-fast), background var(--t-fast);
@@ -1685,7 +1724,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   color: #fff;
 }
 .preview-drop-inner {
-  background: var(--c-accent); color: #fff;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   padding: 24px 36px; border-radius: var(--r-lg);
   font-size: var(--fs-md); font-weight: var(--fw-semibold);
   display: flex; flex-direction: column; align-items: center; gap: 10px;
@@ -1953,7 +1992,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   font-size: var(--fs-xs); color: var(--c-fg-3); padding: 1px 6px;
   background: var(--c-bg-2); border-radius: var(--r-full);
 }
-.session-picker-row.active .session-picker-count { background: var(--c-accent); color: #fff; }
+.session-picker-row.active .session-picker-count { background: var(--c-btn-primary-bg); color: var(--c-on-accent); }
 .session-picker-del {
   background: none; border: none; color: var(--c-fg-3); cursor: pointer;
   width: 22px; height: 22px; line-height: 18px; font-size: var(--fs-lg);
@@ -2000,7 +2039,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   flex-shrink: 0;
 }
 .session-picker-rename-ok { color: var(--c-accent); }
-.session-picker-rename-ok:hover { background: var(--c-accent); color: #fff; }
+.session-picker-rename-ok:hover { background: var(--c-btn-primary-bg); color: var(--c-on-accent); }
 .session-picker-rename-cancel { color: var(--c-fg-3); }
 .session-picker-rename-cancel:hover { background: var(--c-bg-3); }
 @media (pointer: coarse) {
@@ -2467,7 +2506,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   }
 }
 .user-avatar {
-  background: var(--c-accent); color: white; border: none;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent); border: none;
   font-weight: var(--fw-semibold); font-size: var(--fs-base);
   letter-spacing: 0;
 }
@@ -3681,8 +3720,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-danger, #dc3545); color: white;
 }
 .ctx-meter-action:hover {
-  background: var(--c-accent); color: white;
-  border-color: var(--c-accent);
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
+  border-color: var(--c-btn-primary-bg);
 }
 
 /* Inline system note (model switch / compact / etc.) — accent-colored so
@@ -4141,10 +4180,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-error, #dc3545);
 }
 .perm-actions .btn-allow {
-  background: var(--c-accent); color: var(--c-accent-fg, #fff);
-  border-color: var(--c-accent);
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
+  border-color: var(--c-btn-primary-bg);
 }
-.perm-actions .btn-allow:hover { filter: brightness(1.1); }
+.perm-actions .btn-allow:hover {
+  background: var(--c-btn-primary-hover);
+  border-color: var(--c-btn-primary-hover);
+}
 .perm-actions .btn-always:hover {
   background: var(--c-accent-soft); border-color: var(--c-accent);
 }
@@ -4195,7 +4237,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .jump-bottom {
   position: absolute; bottom: 18px; right: 18px;
   width: 36px; height: 36px; border-radius: var(--r-full);
-  background: var(--c-accent); color: white; border: 0;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent); border: 0;
   display: flex; align-items: center; justify-content: center;
   box-shadow: var(--shadow-lg); cursor: pointer;
   transition: transform var(--t-fast), background var(--t-fast);
@@ -4359,10 +4401,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   height: 26px; width: 26px; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: var(--r-md); cursor: pointer;
-  background: var(--c-accent); color: white;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   transition: background var(--t-fast), opacity var(--t-fast), transform var(--t-fast);
 }
-.chat-toolbar-send:hover:not(:disabled) { background: var(--c-accent-hover); }
+.chat-toolbar-send:hover:not(:disabled) { background: var(--c-btn-primary-hover); }
 .chat-toolbar-send:active:not(:disabled) { transform: scale(0.95); }
 .chat-toolbar-send:disabled { opacity: 0.35; cursor: not-allowed; }
 .chat-toolbar-send svg { width: 14px; height: 14px; }
@@ -4381,7 +4423,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   top: -5px; right: -5px;
   min-width: 14px; height: 14px; padding: 0 3px;
   border-radius: 7px;
-  background: var(--c-accent); color: white;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   font-size: 10px; font-weight: 600; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
   box-sizing: border-box;
@@ -4454,9 +4496,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .queue-paused-btn:hover { background: var(--c-bg-3); }
 .queue-paused-btn.primary {
-  background: var(--c-accent); color: white; border-color: var(--c-accent);
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
+  border-color: var(--c-btn-primary-bg);
 }
-.queue-paused-btn.primary:hover { background: var(--c-accent-hover); }
+.queue-paused-btn.primary:hover { background: var(--c-btn-primary-hover); }
 /* Legacy .chat-input-row + .chat-input textarea + .chat-btns removed —
    replaced by .chat-input-wrap / .chat-input-textarea / .chat-toolbar
    above (2026-05-18 VSCode-style layout refactor). Old class names left
@@ -5191,7 +5234,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: background var(--t-fast), color var(--t-fast);
 }
 .lang-picker .btn-ghost.active {
-  background: var(--c-accent); color: #fff;
+  background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   font-weight: 600;
 }
 .lang-picker .btn-ghost:hover:not(.active) { background: var(--c-bg-2); color: var(--c-fg-0); }
@@ -6408,8 +6451,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-top: 10px;
   padding: 6px 12px;
   font-size: var(--fs-sm);
-  background: var(--c-accent);
-  color: #fff;
+  background: var(--c-btn-primary-bg);
+  color: var(--c-on-accent);
   border: none;
   border-radius: var(--r-md);
   cursor: pointer;
@@ -6653,13 +6696,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   min-width: 0;
 }
 
-/* Status-specific colors */
-.task-log-line.task-created .task-log-icon { background: #dbeafe; color: #1e40af; }
-.task-log-line.task-started .task-log-icon { background: #fef3c7; color: #92400e; }
-.task-log-line.task-done    .task-log-icon { background: #d1fae5; color: #065f46; }
-.task-log-line.task-deleted .task-log-icon { background: #e5e7eb; color: #6b7280; }
-.task-log-line.task-pending .task-log-icon { background: #f3f4f6; color: #6b7280; }
-.task-log-line.task-updated .task-log-icon { background: #ede9fe; color: #5b21b6; }
+/* Status-specific colors — see the per-theme blocks lower in this file
+   (dark default ~L7066, light + eyecare scoped overrides ~L7082-7089).
+   The previous hardcoded definitions here were dead code because every
+   status had a same-specificity override later in the cascade. */
 
 /* ============================================================
    MCP tool enhancements — emoji per server + structured result.
@@ -7105,8 +7145,8 @@ html[data-theme="eyecare"] .task-log-line.task-updated .task-log-icon { backgrou
   border-color: var(--c-border);
 }
 .muse-opener-text { color: var(--c-fg-1); }
-.muse-opener-action { background: var(--c-accent); }
-.muse-opener-action:hover { background: var(--c-accent-hover); }
+.muse-opener-action { background: var(--c-btn-primary-bg); }
+.muse-opener-action:hover { background: var(--c-btn-primary-hover); }
 
 /* ---- Nine-muses grid ---- */
 .muse-grid-divider { color: var(--c-fg-3); }
@@ -7285,11 +7325,14 @@ html[data-theme="eyecare"] .tool-error-hint {
   border-color: var(--c-accent);
 }
 .artifact-btn.primary {
-  background: var(--c-accent);
-  color: #fff;
-  border-color: var(--c-accent);
+  background: var(--c-btn-primary-bg);
+  color: var(--c-on-accent);
+  border-color: var(--c-btn-primary-bg);
 }
-.artifact-btn.primary:hover { filter: brightness(1.08); }
+.artifact-btn.primary:hover {
+  background: var(--c-btn-primary-hover);
+  border-color: var(--c-btn-primary-hover);
+}
 .artifact-render {
   padding: var(--sp-3);
   background: var(--c-bg-1);
