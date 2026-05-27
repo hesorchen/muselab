@@ -14,7 +14,13 @@
   --c-fg-0: #f5f7fa;
   --c-fg-1: #e0e4ea;
   --c-fg-2: #a4adbb;
-  --c-fg-3: #6b7280;
+  /* fg-3 was #6b7280 — at 3.7:1 vs bg-1 it failed WCAG AA for the
+     22 selectors that use it as muted body text (xlsx-meta /
+     cmd-palette-foot / diff-strip / task-log / load-earlier /
+     editor-status / settings-save-mode / mcp-server-tag …). Lifting
+     to #9ca3af raises ratio to ≥4.8 across all bg layers while still
+     reading as muted. */
+  --c-fg-3: #9ca3af;
   --c-fg-4: #4a5160;
 
   --c-border: #232830;
@@ -61,8 +67,12 @@
   --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   --fs-xs: 11px;
   --fs-sm: 12px;
-  --fs-base: 13.5px;
-  --fs-md: 14.5px;
+  /* Was 13.5 / 14.5 — sub-pixel rendering is unreliable on Windows
+     ClearType + many mobile devices, and long Chinese paragraphs
+     (PingFang / YaHei) blur noticeably at half-pixel sizes. Integers
+     keep glyph hinting clean. */
+  --fs-base: 13px;
+  --fs-md: 14px;
   --fs-lg: 16px;
   --fs-xl: 20px;
   --fw-normal: 400;
@@ -109,10 +119,19 @@ textarea, input { caret-color: var(--c-accent); }
 /* 链接（不在 markdown / bubble 里时也有主题色） */
 a { color: var(--c-accent); }
 a:hover { color: var(--c-accent-hover); }
-/* 表单 focus 已用 accent — 这里加强 outline */
+/* Keyboard focus indicator. 2px solid accent outline + soft halo. The halo
+   matters because icon-only buttons (icon-btn / chat-toolbar-btn /
+   tree-action / tab-close) sit on `--c-bg-0`-ish backgrounds, and a bare
+   2px outline alone gets lost in the eyecare theme (sage accent on warm
+   beige is low-contrast). The accent-soft halo gives it a "lit" feel that
+   reads from a meter away. Mouse clicks still suppress focus (:not(:focus-visible)). */
 input:focus-visible, textarea:focus-visible, select:focus-visible,
-button:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 1px; }
-button:focus:not(:focus-visible) { outline: none; }
+button:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px var(--c-accent-soft);
+}
+button:focus:not(:focus-visible) { outline: none; box-shadow: none; }
 
 /* =========================================================================
    Light theme — overrides dark tokens when data-theme="light" on <html>
@@ -128,7 +147,9 @@ html[data-theme="light"] {
   --c-fg-0: #1a1d22;
   --c-fg-1: #2d323a;
   --c-fg-2: #525a66;
-  --c-fg-3: #8a939f;
+  /* Lifted from #8a939f (3.00:1 on bg-1, fails WCAG AA). New value
+     #5c6470 hits 4.92 on bg-1 while staying clearly muted vs fg-1. */
+  --c-fg-3: #5c6470;
   --c-fg-4: #b4bbc6;
 
   --c-border: #e3e6eb;
@@ -168,7 +189,10 @@ html[data-theme="eyecare"] {
   --c-fg-0: #3d3526;
   --c-fg-1: #4a4233;
   --c-fg-2: #6b6050;
-  --c-fg-3: #8c8070;
+  /* Lifted from #8c8070 (2.98:1 on bg-1, fails). New value #5e5447
+     hits 6.46 on bg-1 — eyecare's warm low-contrast bg needs deeper
+     muted text than light theme does. */
+  --c-fg-3: #5e5447;
   --c-fg-4: #a3988a;
 
   --c-border: #e0d8c4;
@@ -318,7 +342,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 .splash-hint {
   font-size: var(--fs-xs); color: var(--c-fg-3);
   max-width: 320px; text-align: center; line-height: 1.5;
-  margin-top: 8px;
+  margin-top: var(--sp-2);
   animation: splash-fade-in .4s ease;
 }
 @keyframes splash-fade-in {
@@ -431,8 +455,8 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 .mobile-tab-bar button {
   flex: 1; display: flex; flex-direction: row;
   align-items: center; justify-content: center;
-  gap: 4px; background: transparent; border: none;
-  color: var(--c-fg-3); font-size: 11px;
+  gap: var(--sp-1); background: transparent; border: none;
+  color: var(--c-fg-3); font-size: var(--fs-xs);
   cursor: pointer; padding: 0;
   transition: color var(--t-fast);
 }
@@ -495,10 +519,10 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      screens — trim padding so they fit. Font sizes here intentionally
      larger than the desktop --fs-sm (12px) so labels next to inputs
      don't look mismatched against the auto-zoom-forced 16px inputs. */
-  .session-bar { padding: 6px var(--sp-1); gap: 4px; min-height: 40px; }
-  .session-bar select { font-size: 14px; padding: 0 8px; height: 32px; }
+  .session-bar { padding: 6px var(--sp-1); gap: var(--sp-1); min-height: 40px; }
+  .session-bar select { font-size: var(--fs-md); padding: 0 8px; height: 32px; }
   .pane-head { padding: 6px var(--sp-2); height: 46px; }
-  .pane-head .pane-title { font-size: 14.5px; }
+  .pane-head .pane-title { font-size: var(--fs-md); }
   .login { padding: 0 16px; }
   .login input { width: calc(100% - 32px); max-width: 320px; }
   /* Tabs in preview pane — already scrollable horizontally; force on mobile */
@@ -518,7 +542,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
     max-width: 160px; min-width: 90px;
     padding: 0 4px 0 8px;
     font-size: var(--fs-xs);
-    gap: 4px;
+    gap: var(--sp-1);
   }
   .chat-tab-name { padding: 6px 0; }
   /* Mobile: keep × close button (24px, right edge). kebab ⋮ is hidden
@@ -546,7 +570,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .session-picker-kebab:active { background: var(--c-bg-3); }
   /* Make sure chat-tabs strip doesn't grow vertically and squeeze chat-body. */
   .chat-tabs { flex-shrink: 0; }
-  .chat-tab-new { padding: 0 8px; font-size: 16px; }
+  .chat-tab-new { padding: 0 8px; font-size: var(--fs-lg); }
   .chat-tab-history-btn { padding: 0 8px; }
   .chat-tab-history-btn svg { width: 14px; height: 14px; }
 
@@ -560,15 +584,15 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .tab-ctx-menu button { padding: 10px 16px; }
 
   /* Ctx meter and pane heads breathe less on phones */
-  .ctx-meter { padding: 4px 8px; font-size: 12.5px; }
-  .pane.chat .pane-head { gap: 4px; }
+  .ctx-meter { padding: 4px 8px; font-size: var(--fs-sm); }
+  .pane.chat .pane-head { gap: var(--sp-1); }
 
   /* Empty-state hint inside chat pane — desktop 12px reads as cramped
      on phones. Title was already fs-md (14.5px); only the hint needs help. */
-  .empty-hint { font-size: 13.5px; }
+  .empty-hint { font-size: var(--fs-base); }
 
   /* Chat input area — keep input large enough to tap, send button reachable */
-  .chat-input-wrap { padding: 8px; }
+  .chat-input-wrap { padding: var(--sp-2); }
   /* Per-message action bar (Copy etc.) — also enforced by the mobile
      sentinel block at end-of-file, which guarantees source-order win
      against the global `.msg-actions { display: flex }` rule. */
@@ -580,7 +604,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .bubble .markdown h1 { font-size: 1.4em; }
   .bubble .markdown h2 { font-size: 1.2em; }
   .bubble .markdown h3 { font-size: 1.08em; margin-top: 1em; }
-  .bubble .markdown pre { padding: var(--sp-2) var(--sp-3); font-size: 12px; }
+  .bubble .markdown pre { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-sm); }
   .bubble .markdown th, .bubble .markdown td { padding: 4px 8px; }
   /* Bubble itself: slimmer horizontal padding so text starts closer to the
      viewport edge, gaining a few extra characters per line. */
@@ -665,7 +689,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      equal width — looks like iOS/Android native frequency pickers. */
   .sched-field {
     grid-template-columns: 1fr;
-    row-gap: 4px;
+    row-gap: var(--sp-1);
   }
   .sched-field .sched-label {
     font-size: var(--fs-sm); color: var(--c-fg-2);
@@ -681,7 +705,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .sched-input-name, .sched-input-model, .sched-input-date { width: 100%; max-width: none; }
   .sched-time-input { width: 56px; }
   .sched-create-prompt { width: 100%; min-height: 80px; }
-  .sched-create-foot { flex-wrap: wrap; gap: 8px; }
+  .sched-create-foot { flex-wrap: wrap; gap: var(--sp-2); }
   .sched-create-foot .btn-primary,
   .sched-create-foot .btn-ghost { flex: 1 1 auto; min-width: 80px; }
   .sched-create-hint { font-size: var(--fs-xs); flex-basis: 100%; }
@@ -729,7 +753,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .chat-tab-current-chev {
-  color: var(--c-fg-3); font-size: 12px; flex-shrink: 0;
+  color: var(--c-fg-3); font-size: var(--fs-sm); flex-shrink: 0;
 }
 @media (hover: none) {
   /* Touch devices: × visible without hover. Sizing handled in the
@@ -764,7 +788,7 @@ body.kb-open .layout {
   height: calc(100dvh - var(--kb-inset, 0px));
   grid-template-rows: calc(100vh - var(--kb-inset, 0px));
   grid-template-rows: calc(100dvh - var(--kb-inset, 0px));
-  transition: height 120ms ease-out;
+  transition: height var(--t-fast) ease-out;
 }
 body.kb-open .mobile-tab-bar { display: none; }
 /* Safety net: even on browsers where layout shrink fails, scrollIntoView
@@ -774,7 +798,7 @@ body.kb-open .mobile-tab-bar { display: none; }
    against it (cramped one-line height where you can't see what you
    typed). */
 .chat-input-textarea {
-  scroll-margin-bottom: 16px;
+  scroll-margin-bottom: var(--sp-4);
 }
 
 @supports (padding-bottom: env(safe-area-inset-bottom)) {
@@ -796,7 +820,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   position: fixed; inset: 0; z-index: 200;
   background: rgba(0, 0, 0, 0.45);
   display: flex; align-items: center; justify-content: center;
-  padding: 24px;
+  padding: var(--sp-6);
 }
 .msg-outline-panel {
   background: var(--c-bg-1);
@@ -852,14 +876,14 @@ body.kb-open .mobile-tab-bar { display: none; }
 .msg-outline-idx {
   color: var(--c-fg-3);
   font-variant-numeric: tabular-nums;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   min-width: 28px;
 }
 .msg-outline-text { color: var(--c-fg-0); min-width: 0; }
 .msg-outline-time {
   color: var(--c-fg-3);
   font-variant-numeric: tabular-nums;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .msg-outline-empty {
   padding: 28px;
@@ -877,7 +901,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   .msg-outline-panel {
     max-width: 100%;
     max-height: 75vh;
-    border-radius: 16px 16px 0 0;
+    border-radius: var(--r-xl) var(--r-xl) 0 0;
     border-bottom: none;
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -1065,18 +1089,18 @@ body.kb-open .mobile-tab-bar { display: none; }
   .settings-row label {
     /* desktop ellipsis would clip multi-word i18n labels in stacked layout */
     overflow: visible; text-overflow: clip; white-space: normal;
-    font-size: 14.5px;
+    font-size: var(--fs-md);
   }
-  .settings-row .chk { font-size: 14.5px; }
-  .settings-section-title { font-size: 13px; letter-spacing: 0.6px; }
-  .settings-hint { font-size: 13px; line-height: 1.55; }
-  .settings-sub-label { font-size: 12.5px; }
-  .settings-badge { font-size: 12px; height: 24px; }
-  .settings-empty { font-size: 14px; padding: 16px; }
+  .settings-row .chk { font-size: var(--fs-md); }
+  .settings-section-title { font-size: var(--fs-base); letter-spacing: 0.6px; }
+  .settings-hint { font-size: var(--fs-base); line-height: 1.55; }
+  .settings-sub-label { font-size: var(--fs-sm); }
+  .settings-badge { font-size: var(--fs-sm); height: 24px; }
+  .settings-empty { font-size: var(--fs-md); padding: var(--sp-4); }
   /* Bump base body font so checkbox labels, helper text, etc. inherit
      a readable size on a phone. Input/textarea stay forced to 16px by
      the auto-zoom override at end-of-file. */
-  .modal-body { font-size: 14.5px; line-height: 1.6; }
+  .modal-body { font-size: var(--fs-md); line-height: 1.6; }
   /* Touch-friendly form control height — 32px is too short for a thumb. */
   .settings-input,
   .settings-row select,
@@ -1092,7 +1116,7 @@ body.kb-open .mobile-tab-bar { display: none; }
    touch. Bump the primary send button + ring; keep selects at 26px since
    they have a wider hit area via the surrounding text. */
 @media (pointer: coarse) {
-  .chat-toolbar { gap: 4px; padding: 6px; }
+  .chat-toolbar { gap: var(--sp-1); padding: 6px; }
   .chat-toolbar-btn,
   .chat-toolbar-ring,
   .chat-toolbar-send {
@@ -1181,17 +1205,17 @@ body.kb-open .mobile-tab-bar { display: none; }
 .ptr-indicator {
   position: absolute; top: -50px; left: 0; right: 0;
   height: 50px;
-  display: flex; align-items: center; justify-content: center; gap: 8px;
+  display: flex; align-items: center; justify-content: center; gap: var(--sp-2);
   font-size: var(--fs-sm); color: var(--c-fg-2);
   background: transparent;
   pointer-events: none;
   opacity: 0;
-  transition: transform 0.18s ease, opacity 0.18s ease;
+  transition: transform var(--t-base) ease, opacity var(--t-base) ease;
   z-index: 3;
 }
 .ptr-indicator .ptr-icon {
-  font-size: 16px; display: inline-block;
-  transition: transform 0.18s ease;
+  font-size: var(--fs-lg); display: inline-block;
+  transition: transform var(--t-base) ease;
 }
 .ptr-indicator.ptr-spinning .ptr-icon {
   animation: ptr-spin 0.9s linear infinite;
@@ -1232,7 +1256,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   flex-shrink: 0;
 }
 .open-files-head {
-  display: flex; align-items: center; gap: 4px;
+  display: flex; align-items: center; gap: var(--sp-1);
   padding: 4px 8px;
   color: var(--c-fg-3);
   font-size: var(--fs-xs);
@@ -1364,7 +1388,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   align-items: center;
   gap: 2px;
   opacity: 0;
-  transition: opacity 120ms;
+  transition: opacity var(--t-fast);
   flex-shrink: 0;
 }
 .filelist li.dir:hover .tree-actions { opacity: 1; }
@@ -1374,7 +1398,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   padding: 0;
   color: var(--c-fg-3);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-md);
   line-height: 1;
   border-radius: var(--r-sm);
   height: 20px;
@@ -1541,7 +1565,7 @@ body.kb-open .mobile-tab-bar { display: none; }
 .tab .tab-close {
   background: transparent; border: 0; color: var(--c-fg-3);
   width: 18px; height: 18px; padding: 0; line-height: 16px;
-  border-radius: var(--r-sm); cursor: pointer; font-size: 14px;
+  border-radius: var(--r-sm); cursor: pointer; font-size: var(--fs-md);
 }
 .tab .tab-close:hover { background: var(--c-bg-4); color: var(--c-fg-0); }
 
@@ -1587,7 +1611,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   display: inline-flex; align-items: center; justify-content: center;
   color: var(--c-accent);
   cursor: pointer;
-  transition: transform .25s ease, filter .2s ease;
+  transition: transform var(--t-slow) ease, filter var(--t-base) ease;
 }
 .muse-mascot svg {
   width: 100%; height: 100%;
@@ -1603,9 +1627,9 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 .muse-mascot:hover { transform: scale(1.12) rotate(-8deg); }
 .muse-domain {
-  display: inline-block; padding: 1px 8px; margin-right: 4px;
+  display: inline-block; padding: 1px 8px; margin-right: var(--sp-1);
   font-size: var(--fs-xs); color: var(--c-accent);
-  background: var(--c-accent-soft); border-radius: 999px;
+  background: var(--c-accent-soft); border-radius: var(--r-full);
   letter-spacing: 0.5px;
 }
 .muse-mascot.greet { animation: muse-bounce .9s ease; }
@@ -1670,7 +1694,7 @@ body.kb-open .mobile-tab-bar { display: none; }
 .editor {
   width: 100%; height: 100%; padding: var(--sp-5);
   border: 0; background: var(--c-bg-0); color: var(--c-fg-0);
-  font-family: var(--font-mono); font-size: 13px; line-height: 1.65;
+  font-family: var(--font-mono); font-size: var(--fs-base); line-height: 1.65;
   resize: none;
 }
 
@@ -1679,7 +1703,7 @@ body.kb-open .mobile-tab-bar { display: none; }
 .editor-cm { flex: 1; min-height: 0; }
 .editor-cm .CodeMirror {
   height: 100%; font-family: var(--font-mono);
-  font-size: 13px; line-height: 1.6;
+  font-size: var(--fs-base); line-height: 1.6;
 }
 .editor-status {
   display: flex; align-items: center; gap: var(--sp-3);
@@ -1687,7 +1711,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   background: var(--c-bg-1); border-top: 1px solid var(--c-border);
   font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--c-fg-3);
 }
-.editor-status .seg { display: inline-flex; align-items: center; gap: 4px; line-height: 1; }
+.editor-status .seg { display: inline-flex; align-items: center; gap: var(--sp-1); line-height: 1; }
 .editor-status .seg b { color: var(--c-fg-0); font-weight: var(--fw-medium); }
 .editor-status .spacer { flex: 1; }
 .editor-status .seg.dirty { color: var(--c-warn); }
@@ -1725,7 +1749,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   background: var(--c-bg-1); padding: var(--sp-3) var(--sp-4);
   border-radius: var(--r-md); overflow-x: auto;
   border: 1px solid var(--c-border);
-  font-size: 12.5px; line-height: 1.6;
+  font-size: var(--fs-sm); line-height: 1.6;
 }
 .markdown pre code { background: transparent; padding: 0; }
 /* Tables: display:block + overflow-x lets a wide table scroll horizontally
@@ -1760,7 +1784,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .text {
   padding: var(--sp-4); margin: 0;
   white-space: pre-wrap; word-break: break-word;
-  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.65;
+  font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.65;
 }
 
 /* Empty states */
@@ -1781,7 +1805,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   font-size: var(--fs-xs);
   padding: 0 8px;
   height: 22px;
-  display: inline-flex; align-items: center; gap: 4px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
   border-radius: var(--r-full);
   color: var(--c-accent-fg);
   background: var(--c-accent-soft); border: 1px solid var(--c-accent);
@@ -1829,7 +1853,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 /* Copy-button just-flashed state — accent color + slight scale to make the
    icon change feel intentional. .icon-btn already has the base style. */
-.icon-btn.copied-flash { color: var(--c-accent); transform: scale(1.05); transition: transform 120ms; }
+.icon-btn.copied-flash { color: var(--c-accent); transform: scale(1.05); transition: transform var(--t-fast); }
 .icon-btn.retry-btn { color: var(--c-danger, #dc3545); }
 .icon-btn.retry-btn:hover { color: var(--c-accent); }
 
@@ -1849,7 +1873,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   position: fixed; inset: 0; z-index: 10000;
   background: rgba(0,0,0,0.85);
   display: flex; align-items: center; justify-content: center;
-  padding: 24px;
+  padding: var(--sp-6);
 }
 .lightbox-img {
   max-width: 100%; max-height: 100%;
@@ -1892,7 +1916,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-picker-group + .session-picker-group { margin-top: 6px; }
 .session-picker-group-label {
   padding: 6px 12px 4px;
-  font-size: 11px; font-weight: 600;
+  font-size: var(--fs-xs); font-weight: 600;
   color: var(--c-fg-4); text-transform: uppercase; letter-spacing: 0.5px;
   background: var(--c-bg-1);
   border-bottom: 1px solid var(--c-border);
@@ -1910,7 +1934,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-picker-pin.active { color: var(--c-accent); opacity: 1; }
 .session-picker-row.pinned { background: rgba(96, 147, 255, 0.05); }
 .session-picker-row {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   padding: 7px 10px;
   cursor: pointer;
   font-size: var(--fs-sm);
@@ -1926,13 +1950,13 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-picker-row.active { background: var(--c-accent-soft); color: var(--c-accent); }
 .session-picker-row .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-picker-count {
-  font-size: 11px; color: var(--c-fg-3); padding: 1px 6px;
-  background: var(--c-bg-2); border-radius: 999px;
+  font-size: var(--fs-xs); color: var(--c-fg-3); padding: 1px 6px;
+  background: var(--c-bg-2); border-radius: var(--r-full);
 }
 .session-picker-row.active .session-picker-count { background: var(--c-accent); color: #fff; }
 .session-picker-del {
   background: none; border: none; color: var(--c-fg-3); cursor: pointer;
-  width: 22px; height: 22px; line-height: 18px; font-size: 16px;
+  width: 22px; height: 22px; line-height: 18px; font-size: var(--fs-lg);
   border-radius: var(--r-sm); padding: 0;
 }
 .session-picker-del:hover { background: var(--c-danger); color: #fff; }
@@ -1972,7 +1996,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   width: 22px; height: 22px;
   border-radius: var(--r-sm); padding: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 13px;
+  font-size: var(--fs-base);
   flex-shrink: 0;
 }
 .session-picker-rename-ok { color: var(--c-accent); }
@@ -1997,7 +2021,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   font-size: var(--fs-xs); color: var(--c-accent);
   background: none; border: none; cursor: pointer;
   text-align: left; opacity: 0.8;
-  transition: opacity 0.15s;
+  transition: opacity var(--t-base);
 }
 .session-picker-show-more:hover { opacity: 1; }
 .session-picker-row.open:not(.active) {
@@ -2143,11 +2167,11 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 }
 .chat-tab-close {
   background: none; border: none; cursor: pointer;
-  color: var(--c-fg-3); font-size: 16px; line-height: 1;
+  color: var(--c-fg-3); font-size: var(--fs-lg); line-height: 1;
   width: 18px; height: 18px; border-radius: var(--r-sm);
   padding: 0; display: flex; align-items: center; justify-content: center;
   opacity: 0;
-  transition: opacity .12s ease;
+  transition: opacity var(--t-fast) ease;
   flex-shrink: 0;
 }
 /* Kebab "⋮" — hidden on desktop (right-click works), shown on mobile in the
@@ -2156,7 +2180,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .session-picker-kebab {
   display: none;
   background: none; border: none; cursor: pointer;
-  color: var(--c-fg-2); font-size: 16px; line-height: 1;
+  color: var(--c-fg-2); font-size: var(--fs-lg); line-height: 1;
   padding: 0; border-radius: var(--r-sm);
   flex-shrink: 0;
 }
@@ -2220,7 +2244,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .tab-ctx-menu button.danger:hover { background: var(--c-danger); color: #fff; }
 .tab-ctx-menu hr { border: none; border-top: 1px solid var(--c-border); margin: 4px 0; }
 .chk {
-  display: inline-flex; align-items: center; gap: 4px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
   font-size: var(--fs-xs); color: var(--c-fg-2);
   padding: 0 8px; border-radius: var(--r-md); cursor: pointer;
   user-select: none;
@@ -2311,7 +2335,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
    message lands exactly at the same edge as the avatar from the
    OTHER side — true wechat mirror layout. */
 .msg-row {
-  display: flex; align-items: flex-start; gap: 8px;
+  display: flex; align-items: flex-start; gap: var(--sp-2);
   width: 100%;
   min-width: 0;
 }
@@ -2350,7 +2374,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
    row width. */
 .turn-blocks {
   display: flex; flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-2);
   flex: 1 1 auto; min-width: 0;
 }
 .turn-block { min-width: 0; }
@@ -2444,7 +2468,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 }
 .user-avatar {
   background: var(--c-accent); color: white; border: none;
-  font-weight: var(--fw-semibold); font-size: 13px;
+  font-weight: var(--fw-semibold); font-size: var(--fs-base);
   letter-spacing: 0;
 }
 /* WeChat-style edge alignment.
@@ -2502,7 +2526,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 @media (max-width: 480px) {
   .msg-avatar { width: 26px; height: 26px; }
   .msg-avatar svg { width: 18px; height: 18px; }
-  .user-avatar { font-size: 12px; }
+  .user-avatar { font-size: var(--fs-sm); }
   /* Mobile bubble cap — same principle as desktop, but with mobile's
      smaller avatar (26 + 8 gap = 34 each side, × 2 = 68 reserved).
      The bubble's far edge lands at exactly where the opposing avatar
@@ -2590,7 +2614,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   margin-bottom: 6px;
   background: var(--c-accent-soft); color: var(--c-accent);
   border: 1px dashed var(--c-accent);
-  border-radius: 999px;
+  border-radius: var(--r-full);
   font-size: var(--fs-xs); font-weight: var(--fw-semibold);
   letter-spacing: 0.2px;
 }
@@ -2600,7 +2624,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   border-bottom-left-radius: var(--r-sm);
 }
 .bubble.pending {
-  color: var(--c-fg-3); display: inline-flex; align-items: center; gap: 8px;
+  color: var(--c-fg-3); display: inline-flex; align-items: center; gap: var(--sp-2);
 }
 .bubble.pending .thinking-label { font-size: var(--fs-sm); opacity: 0.7; }
 
@@ -2655,7 +2679,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .chat-skeleton-line {
   height: 10px;
   background: var(--c-bg-2);
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   animation: skeleton-shimmer 1.4s ease-in-out infinite;
 }
 .chat-skeleton-line:nth-child(1) { width: 55%; animation-delay: 0s; }
@@ -2687,7 +2711,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   padding: 4px 0 6px 40px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   min-height: 18px;            /* avoid layout jitter when dots → time */
 }
 @media (max-width: 480px) {
@@ -2696,7 +2720,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   .turn-footer { padding-left: 34px; }
 }
 
-.thinking-dots { display: inline-flex; gap: 4px; align-items: center; }
+.thinking-dots { display: inline-flex; gap: var(--sp-1); align-items: center; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
   animation: thinking-pulse 1.2s ease-in-out infinite;
@@ -2723,7 +2747,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 .bubble pre {
   background: var(--c-bg-0); padding: var(--sp-2) var(--sp-3);
   border-radius: var(--r-md); border: 1px solid var(--c-border);
-  overflow-x: auto; font-size: 12px; margin: 8px 0;
+  overflow-x: auto; font-size: var(--fs-sm); margin: 8px 0;
 }
 .bubble code { background: var(--c-bg-0); padding: 1px 5px; border-radius: var(--r-sm); font-size: 0.9em; }
 .bubble pre code { background: transparent; padding: 0; }
@@ -2769,10 +2793,10 @@ pre.has-copy-btn .code-copy-btn {
   background: var(--c-bg-2); color: var(--c-fg-2);
   border: 1px solid var(--c-border);
   border-radius: var(--r-sm);
-  font-size: 11px; font-family: var(--font-mono);
+  font-size: var(--fs-xs); font-family: var(--font-mono);
   cursor: pointer;
   opacity: 0;                   /* hidden by default */
-  transition: opacity .15s ease, background .15s ease, color .15s ease;
+  transition: opacity var(--t-base) ease, background var(--t-base) ease, color var(--t-base) ease;
 }
 pre.has-copy-btn:hover .code-copy-btn,
 pre.has-copy-btn:focus-within .code-copy-btn,
@@ -2844,7 +2868,7 @@ pre.has-copy-btn .code-copy-btn.copied {
    left gutter so contents align naturally. */
 
 .tool {
-  display: flex; gap: 8px; align-items: baseline;
+  display: flex; gap: var(--sp-2); align-items: baseline;
   background: var(--c-tool-bg); color: var(--c-tool-fg);
   border-left: 2px solid var(--c-tool-fg);
   padding: 5px 12px; border-radius: 0 var(--r-md) var(--r-md) 0;
@@ -2969,10 +2993,10 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .bash-meta {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--sp-1);
   padding: 1px 6px;
   border-radius: var(--r-sm);
 }
@@ -3007,7 +3031,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
   fill: none;
   vertical-align: -0.2em;
-  margin-left: 4px;
+  margin-left: var(--sp-1);
 }
 .probe-result-icon.ok  { stroke: #50c878; }
 .probe-result-icon.err { stroke: #ff6464; }
@@ -3018,7 +3042,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   stroke: currentColor; fill: none;
   stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
   vertical-align: -0.15em;
-  margin-right: 4px;
+  margin-right: var(--sp-1);
 }
 /* Upgrade-result inline icon. ok variant is colored green, err red — the
    wrapper .upgrade-result.ok / .err already provides text color, the SVG
@@ -3206,13 +3230,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   padding: 4px 6px;
   border-radius: var(--r-sm);
   overflow-x: auto;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .ask-option-preview code {
   background: var(--c-bg-2);
   padding: 1px 4px;
   border-radius: 3px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 
 /* ==========================================================================
@@ -3257,25 +3281,25 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex: 1; min-width: 0; max-width: 100%;
 }
 .ask-header {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   margin-bottom: 10px;
   font-size: var(--fs-sm);
 }
 .ask-title { font-weight: var(--fw-semibold); color: var(--c-fg-0); }
 .ask-submitted-tag {
   margin-left: auto;
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--r-full);
   background: var(--c-accent-soft); color: var(--c-accent);
   font-size: var(--fs-xs); letter-spacing: 0.5px;
 }
-.ask-question-block { margin-bottom: 12px; }
+.ask-question-block { margin-bottom: var(--sp-3); }
 .ask-question-block:last-child { margin-bottom: 0; }
 .ask-question-head {
-  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
-  margin-bottom: 8px;
+  display: flex; align-items: baseline; gap: var(--sp-2); flex-wrap: wrap;
+  margin-bottom: var(--sp-2);
 }
 .ask-question-chip {
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--r-full);
   background: var(--c-bg-3); color: var(--c-fg-2);
   font-size: var(--fs-xs); letter-spacing: 0.4px;
   flex-shrink: 0;
@@ -3283,7 +3307,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ask-question-text { font-size: var(--fs-md); color: var(--c-fg-0); line-height: 1.4; }
 .ask-multi-tag {
   font-size: var(--fs-xs); color: var(--c-fg-3);
-  border: 1px solid var(--c-border-strong); border-radius: 4px;
+  border: 1px solid var(--c-border-strong); border-radius: var(--r-sm);
   padding: 0 6px;
 }
 .ask-options {
@@ -3365,10 +3389,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .ask-other-form {
   display: flex; flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-2);
   /* Sit slightly inset so it visually nests under the toggle's slot
      when expanded, rather than appearing as a separate floating block. */
-  padding: 8px;
+  padding: var(--sp-2);
   border: 1px solid var(--c-accent);
   border-radius: var(--r-md);
   background: var(--c-bg-0);
@@ -3393,7 +3417,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   box-shadow: 0 0 0 3px var(--c-accent-soft);
 }
 .ask-other-actions {
-  display: flex; gap: 8px; justify-content: flex-end;
+  display: flex; gap: var(--sp-2); justify-content: flex-end;
 }
 .ask-other-cancel {
   background: transparent;
@@ -3478,7 +3502,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-radius: var(--r-md);
   border: 1px solid var(--c-border-strong);
   display: block;
-  cursor: zoom-in; transition: transform 100ms;
+  cursor: zoom-in; transition: transform var(--t-fast);
 }
 .user-msg-img:hover { transform: scale(1.02); }
 .user-msg-img-wrap {
@@ -3547,7 +3571,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ctx-breakdown-body { padding: 10px 14px; max-height: 60vh; overflow-y: auto; }
 .ctx-breakdown-body.err { color: var(--c-danger); }
 .ctx-breakdown-summary {
-  font-weight: var(--fw-semibold); margin-bottom: 8px;
+  font-weight: var(--fw-semibold); margin-bottom: var(--sp-2);
   font-family: var(--font-mono);
 }
 /* Stacked horizontal bar — gives a glanceable answer to "where did
@@ -3564,7 +3588,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ctx-breakdown-stack-seg { height: 100%; transition: width var(--t-fast); }
 .ctx-breakdown-row {
   display: flex; align-items: center;
-  padding: 6px 0; gap: 8px;
+  padding: 6px 0; gap: var(--sp-2);
   border-bottom: 1px dashed var(--c-border);
 }
 .ctx-breakdown-row:last-child { border-bottom: 0; }
@@ -3600,7 +3624,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .ctx-breakdown-subrow {
   display: flex; justify-content: space-between; align-items: baseline;
-  padding: 3px 0; gap: 12px;
+  padding: 3px 0; gap: var(--sp-3);
   font-size: var(--fs-xs);
 }
 .ctx-breakdown-subname {
@@ -3669,7 +3693,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-accent-soft);
   color: var(--c-accent);
   border: 1px solid var(--c-accent);
-  border-radius: 999px;
+  border-radius: var(--r-full);
   font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   animation: sys-note-in .35s ease;
@@ -3699,7 +3723,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .provider-row { display: grid; grid-template-columns: 220px 1fr; column-gap: var(--sp-3); }
 .provider-row .probe-result {
   grid-column: 2;
-  margin-top: 4px; padding: 4px 10px;
+  margin-top: var(--sp-1); padding: 4px 10px;
   border-radius: var(--r-md);
   font-size: var(--fs-xs); font-family: var(--font-mono);
   line-height: 1.5;
@@ -3710,7 +3734,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* Per-provider help text (where to get key, alt paths) */
 .provider-row .provider-help {
   grid-column: 2;
-  margin-top: 4px;
+  margin-top: var(--sp-1);
   font-size: var(--fs-xs);
   color: var(--c-text-2);
   line-height: 1.55;
@@ -3751,7 +3775,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: var(--font-mono, monospace);
   font-size: 0.85em;
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   background: var(--c-bg-0);
   border: 1px solid var(--c-border);
   color: var(--c-accent);
@@ -3771,7 +3795,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   list-style: none;
   counter-reset: welcome-step;
   padding: 0; margin: 4px 0 0;
-  display: flex; flex-direction: column; gap: 8px;
+  display: flex; flex-direction: column; gap: var(--sp-2);
 }
 .welcome-steps li {
   counter-increment: welcome-step;
@@ -3791,7 +3815,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-radius: 50%;
   background: var(--c-accent);
   color: white;
-  font-size: 11px; font-weight: var(--fw-semibold);
+  font-size: var(--fs-xs); font-weight: var(--fw-semibold);
   display: inline-flex; align-items: center; justify-content: center;
 }
 .welcome-steps code {
@@ -3806,7 +3830,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* Title + shuffle button on one row when the inspire-prompts card is
    showing. Without flex they stack and the shuffle hangs awkwardly. */
 .onboard-card-head {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   margin-bottom: 6px;
 }
 .onboard-card-head .onboard-card-title { margin-bottom: 0; flex: 1; }
@@ -3829,7 +3853,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-accent-soft);
 }
 .onboard-shuffle:active { transform: rotate(30deg) scale(0.94); }
-.onboard-card-body  { font-size: var(--fs-sm); color: var(--c-fg-2); line-height: 1.55; margin-bottom: 12px; }
+.onboard-card-body  { font-size: var(--fs-sm); color: var(--c-fg-2); line-height: 1.55; margin-bottom: var(--sp-3); }
 .onboard-card button.btn-primary { font-size: var(--fs-sm); padding: 6px 14px; }
 
 .onboard-subdirs { display: flex; flex-direction: column; gap: 6px; }
@@ -3861,7 +3885,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .onboard-skills-label {
   font-size: var(--fs-xs); color: var(--c-fg-3); margin-bottom: 6px;
   display: flex; align-items: baseline; justify-content: space-between;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 .onboard-skills-seeall {
   background: none; border: none; padding: 0;
@@ -3871,8 +3895,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .onboard-skills-seeall:hover { text-decoration: underline; }
 .onboard-skills-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .skill-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 4px 10px; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  padding: 4px 10px; border-radius: var(--r-full);
   background: rgba(245, 158, 11, 0.10); color: #d97706;
   border: 1px solid rgba(245, 158, 11, 0.3);
   cursor: pointer; font: inherit; font-size: var(--fs-xs);
@@ -3914,13 +3938,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    against the adjacent text. */
 .ctx-chip-icon,
 .mcp-badge-icon {
-  margin-right: 4px;
+  margin-right: var(--sp-1);
 }
 
 /* CLAUDE.md context chip */
 .ctx-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 2px 8px; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  padding: 2px 8px; border-radius: var(--r-full);
   font-size: var(--fs-xs); font-family: var(--font-mono);
   cursor: default;
 }
@@ -3948,20 +3972,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin: 4px 0;
 }
 .todo-card-head {
-  display: flex; align-items: center; gap: 8px;
-  font-size: var(--fs-sm); margin-bottom: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-sm); margin-bottom: var(--sp-2);
 }
 .todo-card-icon { width: 16px; height: 16px; color: var(--c-accent); }
 .todo-card-title { font-weight: var(--fw-semibold); }
 .todo-card-count {
   margin-left: auto;
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--r-full);
   background: var(--c-bg-3); color: var(--c-fg-2);
   font-size: var(--fs-xs); font-family: var(--font-mono);
 }
-.todo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.todo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
 .todo-item {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   padding: 4px 0; font-size: var(--fs-sm);
 }
 .todo-status {
@@ -3987,7 +4011,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .todo-in_progress .todo-text { font-weight: var(--fw-semibold); }
 .todo-tag {
-  padding: 1px 6px; border-radius: 4px;
+  padding: 1px 6px; border-radius: var(--r-sm);
   background: var(--c-accent-soft); color: var(--c-accent);
   font-size: var(--fs-xs);
 }
@@ -4002,20 +4026,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin: 4px 0;
 }
 .subagent-head {
-  display: flex; align-items: center; gap: 8px;
-  font-size: var(--fs-sm); margin-bottom: 4px;
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-sm); margin-bottom: var(--sp-1);
 }
 .subagent-icon { width: 14px; height: 14px; color: #8b5cf6; }
 .subagent-label { font-weight: var(--fw-semibold); }
 .subagent-type {
   margin-left: auto;
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--r-full);
   background: rgba(139, 92, 246, 0.15); color: #8b5cf6;
   font-size: var(--fs-xs); font-family: var(--font-mono);
 }
 .subagent-desc {
   font-size: var(--fs-sm); color: var(--c-fg-1);
-  margin-bottom: 4px;
+  margin-bottom: var(--sp-1);
 }
 .subagent-prompt { font-size: var(--fs-xs); }
 .subagent-prompt summary {
@@ -4023,7 +4047,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   padding: 2px 0;
 }
 .subagent-prompt pre {
-  margin: 4px 0 0; padding: 8px;
+  margin: 4px 0 0; padding: var(--sp-2);
   background: var(--c-bg-0); border-radius: var(--r-md);
   font-family: var(--font-mono); font-size: var(--fs-xs);
   color: var(--c-fg-2);
@@ -4041,8 +4065,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin: 4px 0;
 }
 .plan-head {
-  display: flex; align-items: center; gap: 8px;
-  font-size: var(--fs-sm); margin-bottom: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-sm); margin-bottom: var(--sp-2);
 }
 .plan-icon { width: 16px; height: 16px; color: var(--c-accent); }
 .plan-title { font-weight: var(--fw-semibold); }
@@ -4053,7 +4077,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* ===== MCP / Skill tool prefix polish ===== */
 .tool-mcp { border-left: 3px solid #06b6d4; }
 .tool-skill { border-left: 3px solid #f59e0b; }
-.tool-prefix-icon { font-size: 0.9em; margin-right: 4px; }
+.tool-prefix-icon { font-size: 0.9em; margin-right: var(--sp-1); }
 
 /* ==========================================================================
    permission_request — Muse asks user to allow / deny a tool call
@@ -4069,14 +4093,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .perm-request.resolved { opacity: 0.85; border-color: var(--c-border-strong); }
 .perm-header {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   margin-bottom: 10px;
   font-size: var(--fs-sm);
 }
 .perm-title { font-weight: var(--fw-semibold); color: var(--c-fg-0); }
 .perm-decision-tag {
   margin-left: auto;
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--r-full);
   font-size: var(--fs-xs); letter-spacing: 0.5px;
 }
 .perm-decision-allow { background: var(--c-accent-soft); color: var(--c-accent); }
@@ -4101,7 +4125,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   max-height: 160px; overflow-y: auto;
 }
 .perm-actions {
-  display: flex; gap: 8px; justify-content: flex-end;
+  display: flex; gap: var(--sp-2); justify-content: flex-end;
   flex-wrap: wrap;
 }
 .perm-actions button {
@@ -4186,7 +4210,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      row 3: chat-toolbar — every control compactly stacked here */
 .chat-input {
   display: flex; flex-direction: column;
-  gap: 6px; padding: 8px;
+  gap: 6px; padding: var(--sp-2);
   border-top: 1px solid var(--c-border); background: var(--c-bg-1);
   position: relative;
   /* Match .chat-body's centered reading column on wide viewports so
@@ -4203,7 +4227,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .chat-input-wrap {
   display: flex; flex-direction: column;
   border: 1px solid var(--c-border-strong);
-  border-radius: 10px;
+  border-radius: var(--r-lg);
   background: var(--c-bg-2);
   overflow: hidden;
   transition: border-color var(--t-fast), box-shadow var(--t-fast);
@@ -4233,7 +4257,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   line-height: 1.5;
 }
 .chat-input-textarea::placeholder { color: var(--c-fg-3); }
-.chat-input-textarea:focus::placeholder { opacity: 0.35; transition: opacity 120ms; }
+.chat-input-textarea:focus::placeholder { opacity: 0.35; transition: opacity var(--t-fast); }
 
 /* Toolbar — hairline separator above, very tight spacing, ALL controls
    share the same 26px height + same hover behavior. */
@@ -4254,6 +4278,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .chat-toolbar-btn:hover:not(:disabled) {
   background: var(--c-bg-3); color: var(--c-fg-0);
+}
+/* Press-state visual feedback. Touch devices have no :hover at all, so
+   without :active a tap looks like nothing happened until the next
+   re-render. Combined with --t-fast it reads as a tactile click on
+   desktop too. */
+.chat-toolbar-btn:active:not(:disabled) {
+  background: var(--c-bg-4); transform: scale(0.94);
 }
 .chat-toolbar-btn.active { color: var(--c-accent); background: var(--c-accent-soft); }
 .chat-toolbar-btn.warn {
@@ -4329,7 +4360,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: inline-flex; align-items: center; justify-content: center;
   border: 0; border-radius: var(--r-md); cursor: pointer;
   background: var(--c-accent); color: white;
-  transition: background var(--t-fast), opacity var(--t-fast), transform 80ms;
+  transition: background var(--t-fast), opacity var(--t-fast), transform var(--t-fast);
 }
 .chat-toolbar-send:hover:not(:disabled) { background: var(--c-accent-hover); }
 .chat-toolbar-send:active:not(:disabled) { transform: scale(0.95); }
@@ -4373,7 +4404,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .queued-header {
   display: flex; align-items: center; gap: 6px;
   font-size: var(--fs-xs); color: rgba(255, 255, 255, 0.78);
-  margin-bottom: 4px; padding-bottom: 4px;
+  margin-bottom: var(--sp-1); padding-bottom: 4px;
   border-bottom: 1px dotted rgba(255, 255, 255, 0.3);
 }
 .queued-icon { font-size: var(--fs-sm); }
@@ -4382,7 +4413,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   width: 18px; height: 18px;
   display: inline-flex; align-items: center; justify-content: center;
   background: transparent; border: 0; color: rgba(255, 255, 255, 0.78);
-  cursor: pointer; padding: 0; border-radius: 4px;
+  cursor: pointer; padding: 0; border-radius: var(--r-sm);
 }
 .queued-act:hover { background: rgba(255, 255, 255, 0.18); color: white; }
 .queued-act svg { width: 12px; height: 12px; }
@@ -4391,14 +4422,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-sm);
 }
 .queued-attach {
-  display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
+  display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: 6px;
 }
 .queued-img {
-  width: 36px; height: 36px; border-radius: 4px; object-fit: cover;
+  width: 36px; height: 36px; border-radius: var(--r-sm); object-fit: cover;
 }
 .queued-doc-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  background: var(--c-bg-2); padding: 2px 6px; border-radius: 4px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
+  background: var(--c-bg-2); padding: 2px 6px; border-radius: var(--r-sm);
   font-size: var(--fs-xs); color: var(--c-fg-1);
 }
 .queued-doc-chip svg { width: 12px; height: 12px; }
@@ -4407,17 +4438,17 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    when a turn errored out leaving the queue with un-drained items.
    Subdued yellow so the user notices without it screaming. */
 .queue-paused-banner {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   margin: 8px 4px; padding: 8px 12px;
   background: color-mix(in srgb, var(--c-warn, #f0a800) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--c-warn, #f0a800) 40%, transparent);
-  border-radius: 6px;
+  border-radius: var(--r-md);
   font-size: var(--fs-sm); color: var(--c-fg-0);
 }
 .queue-paused-icon { font-size: var(--fs-md); }
 .queue-paused-text { flex: 1; }
 .queue-paused-btn {
-  padding: 3px 10px; border-radius: 4px;
+  padding: 3px 10px; border-radius: var(--r-sm);
   border: 1px solid var(--c-bg-4); background: var(--c-bg-1);
   color: var(--c-fg-0); cursor: pointer; font-size: var(--fs-xs);
 }
@@ -4450,7 +4481,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* Document chip — sits in the same row as image chips above the input. */
 .doc-chip {
   position: relative;
-  display: inline-flex; align-items: center; gap: 8px;
+  display: inline-flex; align-items: center; gap: var(--sp-2);
   padding: 6px 28px 6px 10px;
   min-height: 48px; max-width: 280px;
   background: var(--c-bg-1);
@@ -4486,7 +4517,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .doc-chip-x svg { width: 10px; height: 10px; }
 .chat-btns {
-  display: flex; flex-direction: column; gap: 4px;
+  display: flex; flex-direction: column; gap: var(--sp-1);
   align-items: stretch; justify-content: stretch;
 }
 .chat-btns button {
@@ -4528,7 +4559,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ========================================================================== */
 .toast-stack {
   position: fixed; top: 16px; right: 16px; z-index: 1000;
-  display: flex; flex-direction: column; gap: 8px; pointer-events: none;
+  display: flex; flex-direction: column; gap: var(--sp-2); pointer-events: none;
 }
 .toast {
   pointer-events: auto;
@@ -4558,8 +4589,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: transparent; border: 1px solid var(--c-border-strong);
   color: var(--c-accent); cursor: pointer;
   padding: 2px 10px; border-radius: var(--r-sm);
-  font-size: 12px; font-family: inherit;
-  margin-right: 4px;
+  font-size: var(--fs-sm); font-family: inherit;
+  margin-right: var(--sp-1);
 }
 .toast-action:hover { background: var(--c-accent-soft); border-color: var(--c-accent); }
 
@@ -4615,7 +4646,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: flex; align-items: center; gap: var(--sp-2);
   padding: var(--sp-3) var(--sp-4) var(--sp-3) var(--sp-5);
   border-bottom: 1px solid var(--c-border);
-  border-top: 3px solid var(--c-accent);   /* modal 顶部主色条 */
+  /* Was `border-top: 3px solid var(--c-accent)` — a heavy accent stripe
+     on every modal (incl. confirm / rename, which don't warrant
+     emphasis), and in eyecare-theme green + amber bg it read as
+     warning-colored. Quieter to drop it; primary-action emphasis lives
+     in the modal's button bar where it belongs. */
   border-radius: var(--r-lg) var(--r-lg) 0 0;
   font-weight: var(--fw-semibold); font-size: var(--fs-md); color: var(--c-fg-0);
 }
@@ -4638,7 +4673,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .modal-foot {
   display: flex; align-items: center; justify-content: flex-end; gap: var(--sp-2);
   padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--c-border);
-  background: var(--c-bg-2); border-radius: 0 0 var(--r-lg) var(--r-lg);
+  /* Was `background: var(--c-bg-2)` — created a "double-drawer" effect
+     where the footer felt sunken into a darker tray below the body. In
+     eyecare, where bg-2 is darker than bg-1, this read as a footer dip;
+     in light, it read as visual noise on a calm modal. Transparent
+     footer + the existing border-top is enough separation, and matches
+     how Linear / Notion / GitHub render modal action bars now. */
+  background: transparent; border-radius: 0 0 var(--r-lg) var(--r-lg);
 }
 
 /* ---- Cheat-sheet modal ---- */
@@ -4661,7 +4702,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .cheatsheet-table td:first-child .kbd { margin-right: 3px; }
 .cheatsheet-table tr:not(:last-child) td { border-bottom: 1px solid var(--c-border); }
 .cheatsheet-hint {
-  margin-top: 12px; font-size: var(--fs-xs); color: var(--c-fg-3);
+  margin-top: var(--sp-3); font-size: var(--fs-xs); color: var(--c-fg-3);
   text-align: center;
 }
 
@@ -4695,7 +4736,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border: 1px solid var(--c-border);
 }
 .settings-menu-item {
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: center; gap: var(--sp-3);
   padding: 14px 14px;
   border-bottom: 1px solid var(--c-border);
   cursor: pointer;
@@ -4705,14 +4746,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .settings-menu-item:last-child { border-bottom: 0; }
 .settings-menu-item:active { background: var(--c-bg-3); }
-.settings-menu-icon { font-size: 20px; line-height: 1; flex-shrink: 0; }
+.settings-menu-icon { font-size: var(--fs-xl); line-height: 1; flex-shrink: 0; }
 .settings-menu-title { flex: 1; }
 .settings-menu-chevron {
   color: var(--c-fg-3); font-size: 22px; line-height: 1;
   font-weight: 300;
 }
 .settings-back {
-  display: inline-flex; align-items: center; gap: 4px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
   background: transparent; border: 0; padding: 8px 4px;
   margin: -4px 0 12px -4px;
   color: var(--c-accent); cursor: pointer;
@@ -4737,7 +4778,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .settings-section-title::before {
   content: ""; display: inline-block;
   width: 3px; height: 12px; background: var(--c-accent);
-  margin-right: 8px; vertical-align: -1px; border-radius: 2px;
+  margin-right: var(--sp-2); vertical-align: -1px; border-radius: 2px;
 }
 .settings-hint {
   font-size: var(--fs-xs); color: var(--c-fg-3);
@@ -4750,7 +4791,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    in the notifications section where some toggles auto-save and some
    don't. Always sits to the right of the section title, never wraps. */
 .settings-section-title {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
 }
 .settings-save-mode {
   margin-left: auto;
@@ -4822,7 +4863,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .switch input { opacity: 0; width: 0; height: 0; }
 .switch-slider {
   position: absolute; inset: 0;
-  background: var(--c-bg-4);
+  /* off-state track. --c-fg-4 is the muted-foreground level — across all
+     three themes it sits at ~30% delta-L from the surrounding bg-1
+     container, so the off track stays clearly visible. Previously was
+     --c-bg-4, which in eyecare (warm grey #ccc4ab) on bg-1 (#efe9d6
+     warm beige) had only ~14% contrast and looked like "no switch
+     there". */
+  background: var(--c-fg-4);
   border-radius: var(--r-full);
   transition: background var(--t-fast);
 }
@@ -4845,11 +4892,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* ===== MCP settings ===== */
 .settings-hint { font-size: var(--fs-xs); color: var(--c-fg-3); margin-bottom: 10px; line-height: 1.5; }
 .settings-empty {
-  padding: 12px; text-align: center; color: var(--c-fg-3);
+  padding: var(--sp-3); text-align: center; color: var(--c-fg-3);
   border: 1px dashed var(--c-border-strong); border-radius: var(--r-md);
-  font-size: var(--fs-sm); margin-bottom: 12px;
+  font-size: var(--fs-sm); margin-bottom: var(--sp-3);
 }
-.settings-sub-label { font-size: var(--fs-xs); color: var(--c-fg-3); margin-right: 8px; }
+.settings-sub-label { font-size: var(--fs-xs); color: var(--c-fg-3); margin-right: var(--sp-2); }
 .mcp-server-row {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 10px; margin-bottom: 6px;
@@ -4867,7 +4914,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .mcp-server-dot.active { background: var(--c-accent); box-shadow: 0 0 0 2px var(--c-accent-soft); }
 .mcp-server-tag {
-  font-size: var(--fs-xs); padding: 1px 6px; border-radius: 4px;
+  font-size: var(--fs-xs); padding: 1px 6px; border-radius: var(--r-sm);
   background: var(--c-bg-3); color: var(--c-fg-3);
 }
 .mcp-server-cmd {
@@ -4883,7 +4930,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .mcp-preset-chip {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 10px; border-radius: 999px;
+  padding: 4px 10px; border-radius: var(--r-full);
   background: var(--c-bg-1); border: 1px solid var(--c-border-strong);
   cursor: pointer; font-family: inherit; font-size: var(--fs-xs);
   color: var(--c-fg-1);
@@ -4894,7 +4941,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .mcp-preset-chip:disabled { opacity: 0.5; cursor: not-allowed; }
 .mcp-preset-desc { color: var(--c-fg-3); }
-.mcp-add-row { margin-top: 8px; }
+.mcp-add-row { margin-top: var(--sp-2); }
 .skill-row {
   padding: 8px 10px; margin-bottom: 6px;
   background: var(--c-bg-1); border: 1px solid var(--c-border-strong);
@@ -4902,12 +4949,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-radius: var(--r-md);
 }
 .skill-row-head {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
   font-size: var(--fs-sm); margin-bottom: 2px;
 }
 .skill-row-name { font-weight: var(--fw-semibold); }
 .skill-row-scope {
-  padding: 1px 6px; border-radius: 999px;
+  padding: 1px 6px; border-radius: var(--r-full);
   font-size: var(--fs-xs); font-family: var(--font-mono);
   text-transform: uppercase;
 }
@@ -4932,7 +4979,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-accent-soft);
   color: var(--c-accent);
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   font-weight: var(--fw-semibold);
 }
 .skills-meta-sep { color: var(--c-border-strong); }
@@ -4970,7 +5017,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-sm);
   min-width: 0;
 }
-.skill-card-icon { flex-shrink: 0; font-size: 14px; }
+.skill-card-icon { flex-shrink: 0; font-size: var(--fs-md); }
 .skill-card-name {
   font-weight: var(--fw-semibold);
   flex: 1;
@@ -4982,7 +5029,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .skill-card-scope {
   flex-shrink: 0;
   padding: 1px 6px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   font-size: 10px;
   font-family: var(--font-mono);
   text-transform: lowercase;
@@ -5041,7 +5088,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   max-width: 720px;
   max-height: 80vh;
   display: flex; flex-direction: column;
-  padding: 16px;
+  padding: var(--sp-4);
   box-shadow: 0 -8px 32px rgba(0,0,0,0.2);
 }
 @media (min-width: 640px) {
@@ -5049,8 +5096,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .skills-drawer-head {
   display: flex; align-items: baseline; justify-content: space-between;
-  margin-bottom: 8px;
-  gap: 12px;
+  margin-bottom: var(--sp-2);
+  gap: var(--sp-3);
 }
 .skills-drawer-title {
   font-size: var(--fs-md);
@@ -5064,7 +5111,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .skills-drawer-close {
   background: transparent;
   border: none;
-  font-size: 20px;
+  font-size: var(--fs-xl);
   line-height: 1;
   color: var(--c-fg-3);
   cursor: pointer;
@@ -5095,14 +5142,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 .mcp-add-form {
-  margin-top: 8px; padding: 10px;
+  margin-top: var(--sp-2); padding: 10px;
   background: var(--c-bg-1); border: 1px solid var(--c-border-strong);
   border-radius: var(--r-md);
 }
 
 /* Accent 颜色选择器 */
 .accent-picker {
-  display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  display: inline-flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
 }
 .accent-swatch {
   width: 24px; height: 24px; border-radius: 50%;
@@ -5117,7 +5164,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: transparent; cursor: pointer;
 }
 .accent-custom::-webkit-color-swatch-wrapper { padding: 2px; }
-.accent-custom::-webkit-color-swatch { border: 0; border-radius: 4px; }
+.accent-custom::-webkit-color-swatch { border: 0; border-radius: var(--r-sm); }
 
 /* Mobile: shrink swatches + custom picker so all 6 presets + 1 custom
    fit on a single row inside the settings drawer's right column. iOS
@@ -5168,7 +5215,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .version-table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: 4px;
+  margin-top: var(--sp-1);
   font-size: var(--fs-sm);
 }
 .version-table th, .version-table td {
@@ -5183,7 +5230,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .upgrade-badge {
   display: inline-block;
-  padding: 1px 8px; border-radius: 999px;
+  padding: 1px 8px; border-radius: var(--r-full);
   font-size: 10px; font-weight: var(--fw-semibold);
   background: var(--c-accent-soft); color: var(--c-accent);
   /* Without nowrap a narrow viewport (mobile, the rightmost column
@@ -5202,19 +5249,19 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 @media (max-width: 720px) {
   .version-table td:last-child {
     display: flex; flex-direction: column;
-    align-items: flex-end; gap: 4px;
+    align-items: flex-end; gap: var(--sp-1);
   }
 }
-.settings-hint.warn { color: var(--c-warning, #b45309); margin-top: 8px; }
+.settings-hint.warn { color: var(--c-warning, #b45309); margin-top: var(--sp-2); }
 
 .upgrade-result {
-  margin-top: 12px; padding: 10px 14px;
+  margin-top: var(--sp-3); padding: 10px 14px;
   border-radius: var(--r-md);
   background: var(--c-bg-1); border-left: 3px solid var(--c-accent);
   font-size: var(--fs-sm);
 }
 .upgrade-result.err { border-left-color: var(--c-danger); }
-.upgrade-result .restart-hint { margin-top: 8px; }
+.upgrade-result .restart-hint { margin-top: var(--sp-2); }
 .upgrade-result .restart-hint pre {
   margin: 4px 0 0 0; padding: 8px 10px;
   background: var(--c-bg-0); color: var(--c-fg-1);
@@ -5222,11 +5269,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: var(--font-mono); font-size: var(--fs-xs);
   white-space: pre-wrap; word-break: break-all;
 }
-.upgrade-result details { margin-top: 8px; }
+.upgrade-result details { margin-top: var(--sp-2); }
 .upgrade-result details summary {
   cursor: pointer; color: var(--c-accent); font-size: var(--fs-xs);
 }
-.upgrade-step { margin-top: 8px; }
+.upgrade-step { margin-top: var(--sp-2); }
 .upgrade-step-name {
   font-family: var(--font-mono); font-size: var(--fs-xs);
   color: var(--c-fg-2);
@@ -5235,7 +5282,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin: 4px 0 0 0; padding: 6px 10px;
   background: var(--c-bg-0); color: var(--c-fg-2);
   border-radius: var(--r-sm);
-  font-family: var(--font-mono); font-size: 11px; line-height: 1.4;
+  font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1.4;
   max-height: 240px; overflow-y: auto;
   white-space: pre-wrap; word-break: break-all;
 }
@@ -5263,13 +5310,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .csv-toolbar .btn-text { padding: 2px 8px; }
 .csv-range { font-family: var(--font-mono); }
 .csv-meta { color: var(--c-fg-3); margin-left: auto; }
-.csv-meta + .csv-meta { margin-left: 8px; }
+.csv-meta + .csv-meta { margin-left: var(--sp-2); }
 .csv-loading {
-  padding: 12px; text-align: center; color: var(--c-fg-3);
+  padding: var(--sp-3); text-align: center; color: var(--c-fg-3);
   font-size: var(--fs-sm);
 }
 .xlsx-tabs {
-  display: flex; gap: 4px;
+  display: flex; gap: var(--sp-1);
   padding: 6px 8px;
   border-bottom: 1px solid var(--c-border);
   background: var(--c-bg-2);
@@ -5312,7 +5359,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .xlsx-table {
   border-collapse: collapse;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   background: var(--c-bg-1);
 }
 .xlsx-table td {
@@ -5343,7 +5390,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-fg-3);
   background: var(--c-bg-2);
   border-top: 1px solid var(--c-border);
-  display: flex; gap: 12px;
+  display: flex; gap: var(--sp-3);
   flex-shrink: 0;
 }
 
@@ -5450,14 +5497,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .cost-kpi {
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
-  border-radius: 8px;
+  border-radius: var(--r-md);
   padding: 10px 12px;
   text-align: center;
 }
 .cost-kpi-label {
   font-size: var(--fs-xs);
   color: var(--c-fg-3);
-  margin-bottom: 4px;
+  margin-bottom: var(--sp-1);
 }
 .cost-kpi-value {
   font-size: 22px;
@@ -5472,13 +5519,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .cost-token-filters {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--sp-2);
   margin: 6px 0 14px;
 }
 .cost-token-chip {
   display: inline-block;
   padding: 4px 12px;
-  border-radius: 999px;
+  border-radius: var(--r-full);
   font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   background: var(--c-bg-2);
@@ -5512,7 +5559,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   padding: 0 4px;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
-  border-radius: 8px;
+  border-radius: var(--r-md);
   position: relative;
 }
 .cost-bar {
@@ -5528,9 +5575,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .cost-bar-fill {
   width: 70%;
-  background: linear-gradient(180deg, #8b5cf6 0%, #6366f1 100%);
-  border-radius: 3px 3px 0 0;
-  transition: opacity 120ms;
+  /* Was hardcoded violet→indigo gradient — "AI 紫" Tailwind default that
+     bypassed the theme token system and clashed in dark/eyecare themes
+     where --c-accent is blue / green respectively. Solid accent honors
+     the active theme. */
+  background: var(--c-accent);
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  transition: opacity var(--t-fast);
   min-height: 0;
 }
 .cost-bar:hover .cost-bar-fill {
@@ -5557,7 +5608,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: grid;
   grid-template-columns: 180px 1fr 130px;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   font-size: var(--fs-sm);
 }
 .cost-model-name {
@@ -5569,14 +5620,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .cost-model-bar-track {
   height: 8px;
   background: var(--c-bg-2);
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   overflow: hidden;
 }
 .cost-model-bar-fill {
   height: 100%;
   background: var(--c-accent);
-  border-radius: 4px;
-  transition: width 200ms;
+  border-radius: var(--r-sm);
+  transition: width var(--t-base);
 }
 .cost-model-amount {
   text-align: right;
@@ -5605,7 +5656,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-sm);
 }
 .cmd-palette-foot {
-  display: flex; gap: 16px;
+  display: flex; gap: var(--sp-4);
   padding: 8px 14px;
   border-top: 1px solid var(--c-border);
   background: var(--c-bg-2);
@@ -5698,7 +5749,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   min-height: 32px;
 }
 .sched-field-prompt { align-items: flex-start; }
-.sched-field-prompt .sched-label { margin-top: 8px; }
+.sched-field-prompt .sched-label { margin-top: var(--sp-2); }
 .sched-label {
   font-size: var(--fs-sm);
   color: var(--c-fg-2);
@@ -5709,7 +5760,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .sched-input-model { width: 100%; max-width: 320px; }
 
 .sched-freq {
-  display: inline-flex; gap: 4px;
+  display: inline-flex; gap: var(--sp-1);
   background: var(--c-bg-1);
   padding: 3px;
   border-radius: var(--r-md);
@@ -5731,7 +5782,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 .sched-weekdays {
-  display: flex; gap: 4px; flex-wrap: wrap;
+  display: flex; gap: var(--sp-1); flex-wrap: wrap;
 }
 .sched-weekday {
   width: 36px; height: 32px;
@@ -5741,7 +5792,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-fg-2);
   font-size: var(--fs-sm);
   cursor: pointer;
-  transition: all var(--t-fast);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
 .sched-weekday:hover { color: var(--c-fg-0); border-color: var(--c-border-strong); }
 .sched-weekday.active {
@@ -5752,7 +5803,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 .sched-monthly {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: var(--sp-2);
 }
 .sched-day-input { width: 64px; text-align: center; }
 .sched-monthly-suffix {
@@ -5760,7 +5811,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 .sched-time {
-  display: inline-flex; align-items: center; gap: 4px;
+  display: inline-flex; align-items: center; gap: var(--sp-1);
 }
 .sched-time-input {
   width: 64px; text-align: center;
@@ -5794,10 +5845,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 .sched-create-foot {
-  display: flex; align-items: center; gap: 12px;
+  display: flex; align-items: center; gap: var(--sp-3);
   padding-top: 4px;
   border-top: 1px solid var(--c-border);
-  margin-top: 4px;
+  margin-top: var(--sp-1);
 }
 .sched-create-foot .sched-create-hint { flex: 1; }
 .sched-create-hint {
@@ -5809,18 +5860,18 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 @media (max-width: 720px) {
   .sched-field {
     grid-template-columns: 1fr;
-    row-gap: 4px;
+    row-gap: var(--sp-1);
   }
-  .sched-field .sched-label { margin-top: 4px; }
+  .sched-field .sched-label { margin-top: var(--sp-1); }
   .sched-create-foot { flex-direction: column; align-items: stretch; }
   .sched-create-foot .btn-primary { width: 100%; }
 }
 
-.sched-section { margin-bottom: 16px; }
+.sched-section { margin-bottom: var(--sp-4); }
 .sched-section-title {
   font-size: var(--fs-xs); font-weight: var(--fw-semibold);
   color: var(--c-accent); letter-spacing: 0.6px; text-transform: uppercase;
-  margin-bottom: 8px; padding-bottom: 4px;
+  margin-bottom: var(--sp-2); padding-bottom: 4px;
   border-bottom: 1px solid var(--c-border);
 }
 /* Section head wrapper — title on the left, bulk-action button(s) on
@@ -5828,8 +5879,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    border-bottom from .sched-section-title so the wrapper as a whole
    reads as a single header band. */
 .sched-section-head {
-  display: flex; align-items: baseline; gap: 8px;
-  margin-bottom: 8px; padding-bottom: 4px;
+  display: flex; align-items: baseline; gap: var(--sp-2);
+  margin-bottom: var(--sp-2); padding-bottom: 4px;
   border-bottom: 1px solid var(--c-border);
 }
 .sched-section-head > .sched-section-title {
@@ -5880,22 +5931,22 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .sched-row-prompt {
   font-size: var(--fs-sm); color: var(--c-fg-2);
-  margin-bottom: 4px; line-height: 1.4;
+  margin-bottom: var(--sp-1); line-height: 1.4;
   overflow: hidden; text-overflow: ellipsis;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
 .sched-row-meta {
   font-size: var(--fs-xs); color: var(--c-fg-3);
   font-family: var(--font-mono);
-  display: flex; gap: 12px;
+  display: flex; gap: var(--sp-3);
 }
 .sched-row-actions {
-  display: flex; align-items: center; gap: 4px;
+  display: flex; align-items: center; gap: var(--sp-1);
   flex-shrink: 0;
 }
 
 .sched-hist-row {
-  padding: 8px 12px; margin-bottom: 4px;
+  padding: 8px 12px; margin-bottom: var(--sp-1);
   background: var(--c-bg-2); border-radius: var(--r-sm);
   border-left: 2px solid var(--c-accent);
 }
@@ -5903,8 +5954,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-left-color: var(--c-danger, #ef4444);
 }
 .sched-hist-head {
-  display: flex; gap: 8px; align-items: center;
-  margin-bottom: 4px;
+  display: flex; gap: var(--sp-2); align-items: center;
+  margin-bottom: var(--sp-1);
 }
 .sched-hist-name {
   font-size: var(--fs-sm); font-weight: var(--fw-semibold);
@@ -6029,7 +6080,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      soft corners, max width capped so it doesn't sprawl on tablets. */
   .confirm-backdrop {
     align-items: center; justify-content: center;
-    padding: 16px;
+    padding: var(--sp-4);
   }
   .confirm-modal {
     width: auto; max-width: min(92vw, 420px);
@@ -6098,7 +6149,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   .modal input,
   .modal textarea,
   .modal select {
-    font-size: 16px;
+    font-size: var(--fs-lg);
   }
   /* Mobile textarea baseline = 36px (slightly taller than PC's 34px).
      On touch, iOS forces font-size: 16px (anti-zoom rule below) and
@@ -6170,55 +6221,55 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    identity panel when connected, single CTA when not.
    ============================================================ */
 .claude-auth-card {
-  background: var(--bg-soft, #f6f7f9);
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 10px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
   padding: 16px 18px;
   margin-bottom: 14px;
 }
 .claude-auth-head {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: var(--sp-3);
   margin-bottom: 10px;
 }
 .claude-auth-title-wrap { flex: 1; min-width: 0; }
 .claude-auth-title {
   font-size: 15px;
   font-weight: 600;
-  color: var(--fg, #111);
+  color: var(--c-fg-0);
 }
 .claude-auth-subtitle {
-  font-size: 12.5px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-3);
   margin-top: 3px;
   line-height: 1.45;
 }
 .claude-auth-connected {
-  margin-top: 4px;
+  margin-top: var(--sp-1);
 }
 .claude-auth-field {
   display: flex;
   align-items: baseline;
   gap: 10px;
   padding: 6px 0;
-  font-size: 13px;
+  font-size: var(--fs-base);
 }
 .claude-auth-label {
   flex: 0 0 90px;
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
 }
 .claude-auth-value {
-  color: var(--fg, #111);
+  color: var(--c-fg-0);
   font-weight: 500;
   word-break: break-all;
 }
 .claude-auth-actions {
   display: flex;
-  gap: 8px;
-  margin-top: 12px;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
   padding-top: 12px;
-  border-top: 1px dashed var(--border, #e5e7eb);
+  border-top: 1px dashed var(--c-border);
 }
 .claude-auth-disconnected {
   display: flex;
@@ -6226,21 +6277,21 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   gap: 10px;
 }
 .claude-auth-cli-warn {
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   color: var(--warn, #c97a00);
   background: rgba(217, 119, 6, 0.08);
   border: 1px solid rgba(217, 119, 6, 0.25);
-  border-radius: 6px;
+  border-radius: var(--r-md);
   padding: 8px 10px;
 }
 .claude-auth-cli-warn code {
   display: inline-block;
-  margin-top: 4px;
+  margin-top: var(--sp-1);
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   background: rgba(0,0,0,0.05);
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--r-sm);
 }
 
 /* Connect modal */
@@ -6249,41 +6300,41 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-bottom: 14px;
 }
 .claude-auth-step-text {
-  font-size: 13.5px;
-  color: var(--fg, #111);
+  font-size: var(--fs-base);
+  color: var(--c-fg-0);
   margin-bottom: 6px;
 }
 .claude-auth-cmd-row {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-2);
   align-items: center;
 }
 .claude-auth-cmd {
   flex: 1;
   font-family: monospace;
-  font-size: 13px;
+  font-size: var(--fs-base);
   background: var(--bg-code, #0f172a);
   color: #e2e8f0;
   padding: 8px 12px;
-  border-radius: 6px;
+  border-radius: var(--r-md);
   word-break: break-all;
 }
 .claude-auth-waiting {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   margin-top: 14px;
   padding: 10px 12px;
   background: rgba(59, 130, 246, 0.08);
   border: 1px solid rgba(59, 130, 246, 0.25);
-  border-radius: 6px;
-  font-size: 13px;
-  color: var(--fg-soft, #6b7280);
+  border-radius: var(--r-md);
+  font-size: var(--fs-base);
+  color: var(--c-fg-3);
 }
 .claude-auth-tip {
   margin-top: 10px;
-  font-size: 12px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-3);
   line-height: 1.5;
   font-style: italic;
 }
@@ -6310,10 +6361,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: var(--sp-3);
   padding: 64px 24px;
   color: var(--c-fg-3);
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 @keyframes spin {
   to { transform: rotate(360deg); }
@@ -6338,31 +6389,31 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .muse-opener > .muse-mascot.sm {
   flex: 0 0 28px;
-  margin-top: 4px;
+  margin-top: var(--sp-1);
 }
 .muse-opener-bubble {
   flex: 1;
-  background: var(--bg-soft, #f6f7f9);
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 14px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-xl);
   border-top-left-radius: 4px;
   padding: 12px 16px;
 }
 .muse-opener-text {
-  font-size: 14px;
+  font-size: var(--fs-md);
   line-height: 1.55;
-  color: var(--fg, #1f2937);
+  color: var(--c-fg-0);
 }
 .muse-opener-action {
   margin-top: 10px;
   padding: 6px 12px;
-  font-size: 12.5px;
-  background: var(--accent, #3b82f6);
+  font-size: var(--fs-sm);
+  background: var(--c-accent);
   color: #fff;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--r-md);
   cursor: pointer;
-  transition: opacity 0.15s;
+  transition: opacity var(--t-base);
 }
 .muse-opener-action:hover { opacity: 0.85; }
 
@@ -6377,8 +6428,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .muse-grid-divider {
   text-align: center;
-  font-size: 12.5px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-3);
   margin-bottom: 14px;
   position: relative;
 }
@@ -6389,14 +6440,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   top: 50%;
   width: 25%;
   height: 1px;
-  background: var(--border, #e5e7eb);
+  background: var(--c-border);
 }
 .muse-grid-divider::before { left: 8%; }
 .muse-grid-divider::after  { right: 8%; }
 .muse-grid-divider span {
   display: inline-block;
   padding: 0 14px;
-  background: var(--bg, #fff);
+  background: var(--c-bg-1);
   position: relative;
   z-index: 1;
 }
@@ -6405,52 +6456,60 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   grid-template-columns: repeat(3, 1fr);
   gap: 10px;
 }
+/* Token sanity pass: previously referenced --bg / --border / --accent /
+   --fg / --bg-soft / --fg-soft, none of which are defined anywhere in
+   this stylesheet — they were Tailwind / shadcn naming carried in by
+   reflex. Every cell fell through to the hardcoded fallback (#fff /
+   #e5e7eb / #3b82f6 …), which is fine on light theme by coincidence but
+   completely wrong on dark and eyecare. Replaced with the real muselab
+   token namespace --c-*. */
 .muse-cell {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 4px;
+  gap: var(--sp-1);
   text-align: left;
   padding: 14px 14px 12px;
-  background: var(--bg, #fff);
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 10px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
   font-family: inherit;
   min-height: 120px;
 }
 .muse-cell:hover {
-  border-color: var(--accent, #3b82f6);
-  background: var(--bg-soft, #f6f7f9);
+  border-color: var(--c-accent);
+  background: var(--c-bg-3);
   transform: translateY(-1px);
 }
+.muse-cell:active { transform: translateY(0); }
 .muse-cell.active {
-  border-color: var(--accent, #3b82f6);
-  background: rgba(59, 130, 246, 0.05);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
 }
 .muse-cell-icon {
   width: 22px;
   height: 22px;
-  margin-bottom: 4px;
-  color: var(--accent, #3b82f6);
+  margin-bottom: var(--sp-1);
+  color: var(--c-accent);
   flex-shrink: 0;
 }
 .muse-cell-icon svg { width: 100%; height: 100%; }
 .muse-cell-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--fg, #1f2937);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg-0);
 }
 .muse-cell-domain {
-  font-size: 11.5px;
-  color: var(--fg-soft, #6b7280);
-  margin-bottom: 4px;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-3);
+  margin-bottom: var(--sp-1);
 }
 .muse-cell-invite {
-  font-size: 11.5px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
@@ -6461,7 +6520,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 @media (max-width: 720px) {
   .muse-grid {
     grid-template-columns: 1fr;
-    gap: 8px;
+    gap: var(--sp-2);
   }
   .muse-cell {
     min-height: auto;
@@ -6486,27 +6545,28 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   align-items: center;
   gap: 6px;
   padding: 10px 16px;
-  margin-bottom: 8px;
+  margin-bottom: var(--sp-2);
 }
 .load-earlier-btn {
-  font-size: 12.5px;
-  color: var(--fg-soft, #6b7280);
-  background: var(--bg-soft, #f6f7f9);
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 16px;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-3);
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-full);
   padding: 6px 16px;
   cursor: pointer;
   font-family: inherit;
-  transition: all 0.15s;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
 .load-earlier-btn:hover {
-  background: var(--bg, #fff);
-  border-color: var(--accent, #3b82f6);
-  color: var(--accent, #3b82f6);
+  background: var(--c-bg-3);
+  border-color: var(--c-accent);
+  color: var(--c-accent);
 }
+.load-earlier-btn:active { background: var(--c-bg-4); }
 .load-earlier-truncated-note {
-  font-size: 11.5px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
   font-style: italic;
   text-align: center;
   max-width: 480px;
@@ -6523,14 +6583,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .task-log-line {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   padding: 6px 14px;
   margin: 0 0 0 38px;  /* indent under assistant avatar column */
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   line-height: 1.4;
-  color: var(--fg-soft, #6b7280);
-  background: var(--bg-soft, #f6f7f9);
-  border: 1px solid var(--border, #e5e7eb);
+  color: var(--c-fg-3);
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
   border-top: none;
   border-bottom: none;
 }
@@ -6538,26 +6598,26 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .msg:not(:has(+ .msg .task-log-line)) .task-log-line,
 .task-log-line:first-child,
 .msg:not(:has(.task-log-line)) + .msg .task-log-line {
-  border-top: 1px solid var(--border, #e5e7eb);
+  border-top: 1px solid var(--c-border);
   border-top-left-radius: 8px;
   border-top-right-radius: 8px;
-  margin-top: 8px;
+  margin-top: var(--sp-2);
 }
 /* Last in a run */
 .msg:has(.task-log-line):not(:has(+ .msg .task-log-line)) .task-log-line {
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  border-bottom: 1px solid var(--c-border);
   border-bottom-left-radius: 8px;
   border-bottom-right-radius: 8px;
-  margin-bottom: 8px;
+  margin-bottom: var(--sp-2);
 }
 /* Always show borders on isolated single line (fallback for browsers w/o :has) */
 @supports not selector(:has(*)) {
   .task-log-line {
-    border-top: 1px solid var(--border, #e5e7eb);
-    border-bottom: 1px solid var(--border, #e5e7eb);
-    border-radius: 8px;
-    margin-top: 4px;
-    margin-bottom: 4px;
+    border-top: 1px solid var(--c-border);
+    border-bottom: 1px solid var(--c-border);
+    border-radius: var(--r-md);
+    margin-top: var(--sp-1);
+    margin-bottom: var(--sp-1);
   }
 }
 .task-log-icon {
@@ -6567,7 +6627,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   width: 18px;
   height: 18px;
   font-weight: 700;
-  font-size: 13px;
+  font-size: var(--fs-base);
   border-radius: 50%;
   flex-shrink: 0;
 }
@@ -6577,15 +6637,15 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .task-log-ref {
   font-family: monospace;
-  font-size: 11.5px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
   background: rgba(0,0,0,0.04);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   flex-shrink: 0;
 }
 .task-log-subject {
-  color: var(--fg, #111);
+  color: var(--c-fg-0);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6605,31 +6665,31 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    MCP tool enhancements — emoji per server + structured result.
    ============================================================ */
 .mcp-emoji {
-  font-size: 14px;
+  font-size: var(--fs-md);
   line-height: 1;
   margin-right: 2px;
 }
 .mcp-server-label {
   font-weight: 600;
-  color: var(--fg, #1f2937);
+  color: var(--c-fg-0);
 }
 .mcp-sep {
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
   margin: 0 2px;
 }
 .mcp-tool-label {
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .mcp-input-preview {
   font-family: monospace;
-  font-size: 11.5px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
   background: rgba(0,0,0,0.03);
   padding: 2px 8px;
-  border-radius: 4px;
-  margin-left: 8px;
+  border-radius: var(--r-sm);
+  margin-left: var(--sp-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6637,7 +6697,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: inline-block;
 }
 .mcp-result-wrap {
-  font-size: 13px;
+  font-size: var(--fs-base);
 }
 .mcp-result-list {
   list-style: none;
@@ -6651,13 +6711,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: flex;
   gap: 10px;
   padding: 8px 10px;
-  background: var(--bg-soft, #f6f7f9);
-  border-left: 3px solid var(--accent, #3b82f6);
-  border-radius: 4px;
+  background: var(--c-bg-2);
+  border-left: 3px solid var(--c-accent);
+  border-radius: var(--r-sm);
 }
 .mcp-result-idx {
-  font-size: 11px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
   font-family: monospace;
   flex-shrink: 0;
   padding-top: 2px;
@@ -6666,7 +6726,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex: 1;
   margin: 0;
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   white-space: pre-wrap;
   word-break: break-word;
   background: transparent;
@@ -6674,16 +6734,16 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .mcp-result-truncated {
   text-align: center;
   font-style: italic;
-  color: var(--fg-soft, #6b7280);
-  font-size: 12px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
   padding: 6px;
 }
 .mcp-result-json {
   font-family: monospace;
-  font-size: 12px;
-  background: var(--bg-soft, #f6f7f9);
+  font-size: var(--fs-sm);
+  background: var(--c-bg-2);
   padding: 10px 12px;
-  border-radius: 4px;
+  border-radius: var(--r-sm);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -6699,9 +6759,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .diff-badge {
   display: inline-flex;
   gap: 5px;
-  margin-left: 8px;
+  margin-left: var(--sp-2);
   font-family: monospace;
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   align-items: center;
   cursor: help;
@@ -6710,13 +6770,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: #16a34a;
   background: rgba(22, 163, 74, 0.1);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--r-sm);
 }
 .diff-badge-minus {
   color: #dc2626;
   background: rgba(220, 38, 38, 0.1);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--r-sm);
 }
 
 /* ============================================================
@@ -6726,33 +6786,33 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: flex;
   flex-direction: column;
   font-family: monospace;
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   max-height: 480px;
   overflow-y: auto;
 }
 .search-hit {
   display: flex;
   align-items: baseline;
-  gap: 4px;
+  gap: var(--sp-1);
   padding: 4px 8px;
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  border-bottom: 1px solid var(--c-border);
 }
 .search-hit:hover {
-  background: var(--bg-soft, #f6f7f9);
+  background: var(--c-bg-2);
 }
 .search-hit-path {
-  color: var(--accent, #3b82f6);
+  color: var(--c-accent);
   text-decoration: none;
   flex-shrink: 0;
   font-weight: 500;
 }
 .search-hit-path:hover { text-decoration: underline; }
 .search-hit-lineno {
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
   flex-shrink: 0;
 }
 .search-hit-content {
-  color: var(--fg, #1f2937);
+  color: var(--c-fg-0);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6761,12 +6821,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .search-hit-truncated {
   text-align: center;
   font-style: italic;
-  color: var(--fg-soft, #6b7280);
-  padding: 8px;
-  font-size: 11.5px;
+  color: var(--c-fg-3);
+  padding: var(--sp-2);
+  font-size: var(--fs-xs);
 }
 .search-hit-raw {
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
   white-space: pre-wrap;
 }
 
@@ -6778,19 +6838,19 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
-  background: var(--bg-soft, #f6f7f9);
-  border-bottom: 1px solid var(--border, #e5e7eb);
-  font-size: 12.5px;
+  background: var(--c-bg-2);
+  border-bottom: 1px solid var(--c-border);
+  font-size: var(--fs-sm);
 }
 .web-source-icon {
-  font-size: 13px;
+  font-size: var(--fs-base);
   flex-shrink: 0;
 }
 .web-source-link {
-  color: var(--accent, #3b82f6);
+  color: var(--c-accent);
   text-decoration: none;
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6798,8 +6858,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .web-source-link:hover { text-decoration: underline; }
 .web-source-query {
   font-style: italic;
-  color: var(--fg-soft, #6b7280);
-  font-size: 12px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
 }
 
 /* ============================================================
@@ -6808,23 +6868,23 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ============================================================ */
 .tool-error-hint {
   display: flex;
-  gap: 8px;
+  gap: var(--sp-2);
   align-items: flex-start;
   margin: 6px 0;
   padding: 8px 12px;
   background: rgba(220, 38, 38, 0.06);
   border: 1px solid rgba(220, 38, 38, 0.18);
   border-left: 3px solid #dc2626;
-  border-radius: 4px;
-  font-size: 12.5px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
   line-height: 1.5;
 }
 .tool-error-hint-icon {
   flex-shrink: 0;
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 .tool-error-hint-text {
-  color: var(--fg, #1f2937);
+  color: var(--c-fg-0);
   flex: 1;
 }
 
@@ -6834,21 +6894,21 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ============================================================ */
 .diff-strip-cr {
   margin: 8px 0 8px 38px;
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 6px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
   overflow: hidden;
-  background: var(--bg, #fff);
+  background: var(--c-bg-1);
 }
 .diff-strip-cr .diff-strip-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   padding: 6px 12px;
-  background: var(--bg-soft, #f6f7f9);
-  border-bottom: 1px solid var(--border, #e5e7eb);
+  background: var(--c-bg-2);
+  border-bottom: 1px solid var(--c-border);
   cursor: pointer;
-  font-size: 12px;
-  color: var(--fg-soft, #6b7280);
+  font-size: var(--fs-sm);
+  color: var(--c-fg-3);
 }
 .diff-strip-cr .diff-strip-label {
   font-weight: 500;
@@ -6859,14 +6919,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   gap: 6px;
   margin-left: auto;
   font-family: monospace;
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   font-weight: 600;
 }
 .diff-strip-plus  { color: #16a34a; }
 .diff-strip-minus { color: #dc2626; }
 .diff-body-cr {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   line-height: 1.55;
   max-height: 540px;
   overflow-y: auto;
@@ -6891,13 +6951,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: transparent;
   border-left: 3px solid transparent;
   padding-left: 9px;
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
 }
 .diff-body-cr .diff-line.diff-sep {
-  background: var(--bg-soft, #f6f7f9);
-  border-top: 1px dashed var(--border, #e5e7eb);
-  border-bottom: 1px dashed var(--border, #e5e7eb);
-  color: var(--fg-soft, #6b7280);
+  background: var(--c-bg-2);
+  border-top: 1px dashed var(--c-border);
+  border-bottom: 1px dashed var(--c-border);
+  color: var(--c-fg-3);
   font-style: italic;
   padding: 2px 12px;
   margin: 2px 0;
@@ -6919,7 +6979,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* ============================================================
    Theme-aware overrides for the chat-renderer additions
    (commit a9421dc / 664304a / eafb7ad). The original CSS used
-   hard-coded greens/reds + var(--bg-soft, #f6f7f9) fallbacks
+   hard-coded greens/reds + var(--c-bg-2) fallbacks
    that don't exist as project tokens — so light/eyecare themes
    ended up with broken diff-strip backgrounds.
    ============================================================ */
@@ -7052,21 +7112,9 @@ html[data-theme="eyecare"] .task-log-line.task-updated .task-log-icon { backgrou
 .muse-grid-divider { color: var(--c-fg-3); }
 .muse-grid-divider::before, .muse-grid-divider::after { background: var(--c-border); }
 .muse-grid-divider span { background: var(--c-bg-0); }
-.muse-cell {
-  background: var(--c-bg-1);
-  border-color: var(--c-border);
-}
-.muse-cell:hover {
-  border-color: var(--c-accent);
-  background: var(--c-bg-2);
-}
-.muse-cell.active {
-  border-color: var(--c-accent);
-  background: var(--c-accent-soft);
-}
-.muse-cell-icon { color: var(--c-accent); }
-.muse-cell-name { color: var(--c-fg-1); }
-.muse-cell-domain, .muse-cell-invite { color: var(--c-fg-3); }
+/* (muse-cell visual properties moved to the canonical .muse-cell rule
+   higher up in this file — the token-namespace fix made this duplicate
+   block redundant. Kept here only as a historical note.) */
 
 /* ---- Claude Auth card ---- */
 .claude-auth-card {
@@ -7160,7 +7208,7 @@ html[data-theme="eyecare"] .tool-error-hint {
 }
 .task-log-line {
   padding: 4px 14px;
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   line-height: 1.35;
   margin-left: 38px;
 }
@@ -7188,7 +7236,7 @@ html[data-theme="eyecare"] .tool-error-hint {
 /* Tighter padding inside */
 .task-log-line {
   padding: 5px 14px !important;
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   line-height: 1.35;
   margin: 0 0 0 38px !important;
 }
@@ -7199,9 +7247,9 @@ html[data-theme="eyecare"] .tool-error-hint {
    ============================================================ */
 .artifact-wrap {
   margin: 10px 0;
-  border: 1px solid var(--border, #e5e7eb);
-  border-radius: 8px;
-  background: var(--bg-soft, #f6f7f9);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-2);
   overflow: hidden;
 }
 .artifact-toolbar {
@@ -7209,42 +7257,42 @@ html[data-theme="eyecare"] .tool-error-hint {
   align-items: center;
   gap: 6px;
   padding: 6px 10px;
-  background: var(--bg, #fff);
-  border-bottom: 1px solid var(--border, #e5e7eb);
-  font-size: 12px;
+  background: var(--c-bg-1);
+  border-bottom: 1px solid var(--c-border);
+  font-size: var(--fs-sm);
 }
 .artifact-label {
   font-weight: 600;
-  color: var(--fg-soft, #6b7280);
+  color: var(--c-fg-3);
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   margin-right: auto;
 }
 .artifact-btn {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 3px 9px;
-  border: 1px solid var(--border, #e5e7eb);
-  background: var(--bg, #fff);
-  color: var(--fg, #111);
+  border: 1px solid var(--c-border);
+  background: var(--c-bg-1);
+  color: var(--c-fg-0);
   border-radius: 5px;
   cursor: pointer;
   line-height: 1.4;
-  transition: background 0.12s, border-color 0.12s;
+  transition: background var(--t-fast), border-color var(--t-fast);
 }
 .artifact-btn:hover {
-  background: var(--bg-soft, #f6f7f9);
-  border-color: var(--accent, #6093ff);
+  background: var(--c-bg-2);
+  border-color: var(--c-accent);
 }
 .artifact-btn.primary {
-  background: var(--accent, #6093ff);
+  background: var(--c-accent);
   color: #fff;
-  border-color: var(--accent, #6093ff);
+  border-color: var(--c-accent);
 }
 .artifact-btn.primary:hover { filter: brightness(1.08); }
 .artifact-render {
-  padding: 12px;
-  background: var(--bg, #fff);
+  padding: var(--sp-3);
+  background: var(--c-bg-1);
   overflow: auto;
 }
 .artifact-mermaid .artifact-render {
@@ -7271,7 +7319,7 @@ html[data-theme="eyecare"] .tool-error-hint {
 .artifact-error {
   margin: 4px 0 10px;
   padding: 6px 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   background: rgba(201, 122, 0, 0.08);
   color: var(--warn, #c97a00);
   border-left: 3px solid var(--warn, #c97a00);
@@ -7410,7 +7458,7 @@ html[data-theme="eyecare"] .tool-error-hint {
 .trash-sep { margin: 0 6px; opacity: 0.5; }
 .trash-path {
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   color: var(--c-fg-2);
 }
 .trash-actions {

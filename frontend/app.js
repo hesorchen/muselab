@@ -834,6 +834,7 @@ function portal() {
       this.configureMarked();
       this._initArtifacts();
       this._initStreamSelectionGuard();
+      this._initAriaLabelMirror();
       // NOTE: loadTrash() does NOT run here — init() executes before the
       // user has supplied a token (token gating happens in _bootApp /
       // login). Calling it here produced a 401 spam in the network tab.
@@ -7346,6 +7347,63 @@ function portal() {
           const fn = tabs[sid] && tabs[sid]._pendingHtmlRender;
           if (typeof fn === "function") fn();
         }
+      });
+    },
+
+    // A11y: mirror every button's `title` attribute into `aria-label` so
+    // screen readers announce the localized tooltip text. Alpine renders
+    // ~170 buttons across the app, the vast majority already have a
+    // :title binding (lang === 'zh' ? '复制' : 'Copy'). Manually
+    // duplicating each one as :aria-label would double the i18n surface
+    // and is easy to forget when adding new buttons. Instead, watch the
+    // DOM and copy title → aria-label whenever a button gets/changes its
+    // title. Skips buttons that already have their own explicit
+    // aria-label (the explicit one wins). Idempotent: re-running on a
+    // button that's already mirrored is a no-op because aria-label gets
+    // set with the same value.
+    _initAriaLabelMirror() {
+      if (this._ariaMirrorBound) return;
+      this._ariaMirrorBound = true;
+      const mirror = (root) => {
+        const buttons = (root || document).querySelectorAll
+          ? (root || document).querySelectorAll("button[title]")
+          : [];
+        buttons.forEach((b) => {
+          const t = b.getAttribute("title");
+          if (!t) return;
+          const existing = b.getAttribute("aria-label");
+          // Only mirror if there is no aria-label yet, OR the existing one
+          // was previously set by us (matches our marker). This lets
+          // explicit hand-written aria-label="..." on a button keep
+          // priority.
+          if (existing && b.dataset.ariaMirrored !== "1") return;
+          if (existing === t) return;
+          b.setAttribute("aria-label", t);
+          b.dataset.ariaMirrored = "1";
+        });
+      };
+      // Initial pass after Alpine has done its first render.
+      this.$nextTick(() => mirror(document));
+      // Long-running: watch for added buttons (new tabs, dynamic modals)
+      // and for `title` attribute mutations (locale switch). The observer
+      // is cheap because it only reacts to childList + attribute changes
+      // and the mirror callback is microsecond-fast per node.
+      const obs = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === "childList") {
+            m.addedNodes.forEach((n) => {
+              if (n.nodeType !== 1) return;
+              if (n.tagName === "BUTTON") mirror(n.parentNode);
+              else mirror(n);
+            });
+          } else if (m.type === "attributes" && m.target.tagName === "BUTTON") {
+            mirror(m.target.parentNode);
+          }
+        }
+      });
+      obs.observe(document.body, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ["title"],
       });
     },
 
