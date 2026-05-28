@@ -266,6 +266,58 @@ def test_rename_to_existing_refused(client, auth):
     assert r.status_code == 409
 
 
+# ---- copy-bak ----
+
+def test_copy_bak_basic(client, auth, temp_root):
+    r = client.post("/api/files/copy-bak", headers=auth,
+                    json={"src": "README.md"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["path"] == "README.md.bak"
+    assert (temp_root / "README.md.bak").exists()
+    # Original untouched.
+    assert (temp_root / "README.md").exists()
+    # Content copied verbatim.
+    assert (temp_root / "README.md.bak").read_text() == \
+           (temp_root / "README.md").read_text()
+
+
+def test_copy_bak_increments_on_conflict(client, auth, temp_root):
+    # Three rounds: .bak, .bak.2, .bak.3
+    for expected in ["README.md.bak", "README.md.bak.2", "README.md.bak.3"]:
+        r = client.post("/api/files/copy-bak", headers=auth,
+                        json={"src": "README.md"})
+        assert r.status_code == 200, r.text
+        assert r.json()["path"] == expected
+        assert (temp_root / expected).exists()
+
+
+def test_copy_bak_cross_dir(client, auth, temp_root):
+    r = client.post("/api/files/copy-bak", headers=auth,
+                    json={"src": "README.md", "dst_dir": "notes"})
+    assert r.status_code == 200, r.text
+    assert r.json()["path"] == "notes/README.md.bak"
+    assert (temp_root / "notes" / "README.md.bak").exists()
+
+
+def test_copy_bak_refuses_directory(client, auth):
+    r = client.post("/api/files/copy-bak", headers=auth,
+                    json={"src": "notes"})
+    assert r.status_code == 400
+
+
+def test_copy_bak_missing_source(client, auth):
+    r = client.post("/api/files/copy-bak", headers=auth,
+                    json={"src": "no-such-file.md"})
+    assert r.status_code == 404
+
+
+def test_copy_bak_missing_dst_dir(client, auth):
+    r = client.post("/api/files/copy-bak", headers=auth,
+                    json={"src": "README.md", "dst_dir": "no/such/dir"})
+    assert r.status_code == 404
+
+
 def test_search_with_show_hidden(client, auth):
     """show_hidden lets search/grep see .* files."""
     r = client.get("/api/files/grep?q=hidden&show_hidden=true", headers=auth)

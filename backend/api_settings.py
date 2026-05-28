@@ -59,8 +59,6 @@ PROVIDER_KEYS = _build_provider_keys()
 DEFAULT_KEYS = [
     "MUSELAB_DEFAULT_MODEL",
     "MUSELAB_DEFAULT_PERMISSION",
-    "MUSELAB_THINKING_BUDGET",
-    "MUSELAB_MAX_TURNS",
 ]
 
 
@@ -94,15 +92,12 @@ class SettingsIn(BaseModel):
     # Defaults
     default_model: str | None = None
     default_permission: str | None = None
-    # Params
-    thinking_budget: int | None = None
-    max_turns: int | None = None
-    # Push notification toggles — server-side decision on whether to
-    # send_to_all for each event class. notify_scheduled covers the
-    # scheduler.py daemon's task-done push; notify_normal covers
-    # chat.py's per-turn done push.
-    notify_scheduled: bool | None = None
-    notify_normal: bool | None = None
+    # (Removed 2026-05-28) notify_scheduled / notify_normal —
+    # The 4-toggle notification panel collapsed to a single client-side
+    # "notify me" switch. Subscription state IS the on/off; no per-class
+    # server-side env-var gate needed. Both chat.py and scheduler.py now
+    # rely on presence.recently_active() for "don't double-notify while
+    # the user is actively at a device".
     # Per-provider visibility toggle — dict of {probe_model: true/false}.
     # true = disable (hide from model picker). Sent as a partial diff: only
     # the toggled provider appears in the dict, not all providers.
@@ -174,10 +169,6 @@ _SETTING_DEFAULTS: dict[str, str] = {
     "MUSELAB_MODEL":                "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_MODEL":        "claude-sonnet-4-6",
     "MUSELAB_DEFAULT_PERMISSION":   "bypassPermissions",
-    "MUSELAB_THINKING_BUDGET":      "4000",
-    "MUSELAB_MAX_TURNS":            "0",
-    "MUSELAB_NOTIFY_SCHEDULED":     "true",
-    "MUSELAB_NOTIFY_NORMAL":        "true",
 }
 
 
@@ -214,12 +205,10 @@ def get_settings() -> dict:
                 os.environ.get("MUSELAB_MODEL", _SETTING_DEFAULTS["MUSELAB_MODEL"])),
             "permission": _current("MUSELAB_DEFAULT_PERMISSION"),
         },
-        "params": {
-            "thinking_budget": int(_current("MUSELAB_THINKING_BUDGET")),
-            "max_turns": int(_current("MUSELAB_MAX_TURNS")),
-            "notify_scheduled": _current("MUSELAB_NOTIFY_SCHEDULED").lower() != "false",
-            "notify_normal":    _current("MUSELAB_NOTIFY_NORMAL").lower()    != "false",
-        },
+        # `params` retained as an empty dict for FE backwards-compat — old
+        # builds spread `d.params` into draftParams and would TypeError on
+        # null. Will drop once all clients are >= 2026-05-28.
+        "params": {},
     }
 
 
@@ -278,8 +267,7 @@ def put_settings(req: SettingsIn) -> dict:
     # list inflates. Symptom: user only flipped the language toggle (which
     # is pure client-side localStorage, doesn't even hit this endpoint) and
     # the toast says "已修改 7 项设置" — model writes 2 env keys, plus
-    # permission/thinking_budget/max_turns/notify_scheduled/notify_normal
-    # = 7, all of them just re-asserting their current value (2026-05-23
+    # permission, all just re-asserting their current value (2026-05-23
     # user feedback). Comparing against _current() (which falls back to
     # the canonical default for unset envs) keeps the count honest AND
     # avoids pointless .env rewrites on no-op saves.
@@ -288,12 +276,9 @@ def put_settings(req: SettingsIn) -> dict:
     # unset, os.environ.get returns None, GET endpoint returned the default
     # to the FE, FE sends the default back, naive `None != default` → diff
     # → "changed" → bogus count. _current() bakes in the default so the
-    # round-trip is comparable. (First fix attempt 2026-05-23 only handled
-    # notify_* this way; missed the other 5 fields. Second pass fixes all.)
+    # round-trip is comparable.
     def _changed(env_key: str, new_val: str) -> bool:
-        return _current(env_key).lower() != new_val.lower() \
-            if env_key.startswith("MUSELAB_NOTIFY_") \
-            else _current(env_key) != new_val
+        return _current(env_key) != new_val
 
     if req.default_model is not None:
         # Write both keys so `chat.py` (reads `settings.MODEL` → `MUSELAB_MODEL`)
@@ -309,20 +294,6 @@ def put_settings(req: SettingsIn) -> dict:
     if req.default_permission is not None and _changed(
             "MUSELAB_DEFAULT_PERMISSION", req.default_permission):
         updates["MUSELAB_DEFAULT_PERMISSION"] = req.default_permission
-    if req.thinking_budget is not None and _changed(
-            "MUSELAB_THINKING_BUDGET", str(req.thinking_budget)):
-        updates["MUSELAB_THINKING_BUDGET"] = str(req.thinking_budget)
-    if req.max_turns is not None and _changed(
-            "MUSELAB_MAX_TURNS", str(req.max_turns)):
-        updates["MUSELAB_MAX_TURNS"] = str(req.max_turns)
-    if req.notify_scheduled is not None:
-        new_v = "true" if req.notify_scheduled else "false"
-        if _changed("MUSELAB_NOTIFY_SCHEDULED", new_v):
-            updates["MUSELAB_NOTIFY_SCHEDULED"] = new_v
-    if req.notify_normal is not None:
-        new_v = "true" if req.notify_normal else "false"
-        if _changed("MUSELAB_NOTIFY_NORMAL", new_v):
-            updates["MUSELAB_NOTIFY_NORMAL"] = new_v
     if req.provider_disabled is not None:
         raw = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
         disabled_models = set(raw.split(",")) if raw else set()

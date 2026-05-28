@@ -189,6 +189,26 @@
   <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
   <!-- Dollar sign — cost / usage dashboard menu. Replaces 💰 -->
   <symbol id="i-dollar" viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></symbol>
+  <!-- List — "configured tasks" section header. -->
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <!-- History — clock with circular arrow, "recent runs" section header. -->
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/><polyline points="12 7 12 12 15 14"/></symbol>
+  <!-- ===== Image annotation editor tools (added 2026-05-28) ===== -->
+  <!-- Pen — freedraw stroke tool. -->
+  <symbol id="i-pen" viewBox="0 0 24 24"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></symbol>
+  <!-- Square — rectangle tool (outline). -->
+  <symbol id="i-square" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
+  <!-- Arrow up-right — arrow tool. -->
+  <symbol id="i-arrow-ur" viewBox="0 0 24 24"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></symbol>
+  <!-- Eraser. -->
+  <symbol id="i-eraser" viewBox="0 0 24 24"><path d="M20 20H7L3 16a2 2 0 0 1 0-3l8.5-8.5a2 2 0 0 1 3 0L21 11a2 2 0 0 1 0 3l-6 6"/><line x1="18" y1="13" x2="9" y2="4"/></symbol>
+  <!-- Undo — Lucide-style "left-arrow with up-curving return path".
+       The previous shape (`M3 7v6h6` + a half-circle arc) rendered as
+       an ellipsis-with-hook that nobody could read as "undo" — user
+       feedback 2026-05-28 with a screenshot. This is the universally
+       recognized undo glyph: clear `<` arrowhead on the left + line
+       turning up and right, mirrored from Lucide's `undo-2`. -->
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></symbol>
 
   <!-- ===== Nine Muses (希腊九缪斯) — 抽象几何形象，按日期+小时哈希挑一个 =====
        每个 id 对应 app.js MASCOTS 表里的一位缪斯（Calliope/Clio/Erato/...）。 -->
@@ -441,9 +461,15 @@
     <!-- ============ 中：预览 ============ -->
     <section class="pane preview">
       <header class="pane-head">
-        <button @click="leftOpen=!leftOpen; savePrefs()" class="icon-btn" :title="leftOpen?t('btn.hide_left'):t('btn.show_left')">
-          <svg x-show="leftOpen"><use href="#i-chevron-left"/></svg>
-          <svg x-show="!leftOpen"><use href="#i-chevron-right"/></svg>
+        <button @click="toggleFilesPane()" class="icon-btn"
+                :title="desktopFullPane === 'preview'
+                  ? (lang==='zh' ? '退出全屏并显示文件区' : 'Exit fullscreen & show files')
+                  : (leftOpen ? t('btn.hide_left') : t('btn.show_left'))">
+          <!-- In preview-fullscreen the chevron always reads as "show left"
+               (chevron-right) since files pane is hidden by the fullscreen
+               layout — tapping it exits fullscreen + un-hides the pane. -->
+          <svg x-show="leftOpen && desktopFullPane !== 'preview'"><use href="#i-chevron-left"/></svg>
+          <svg x-show="!leftOpen || desktopFullPane === 'preview'"><use href="#i-chevron-right"/></svg>
         </button>
         <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
         <span class="spacer"></span>
@@ -1271,7 +1297,7 @@
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
           <template x-for="(m, i) in messages" :key="m._k || m.uuid || ('m-' + i)">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role)"
+            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden')"
                  :data-uuid="m.uuid || ''">
               <!-- compact-summary pill -->
               <template x-if="m._is_compact_summary">
@@ -1609,7 +1635,8 @@
                    The role guard here recovers what the parent x-if used to
                    filter for. -->
               <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
-                <div class="diff-strip diff-strip-cr">
+                <div class="diff-strip diff-strip-cr"
+                     :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m)) }">
                   <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
                     <span class="thinking-chevron">
                       <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
@@ -2157,12 +2184,16 @@
         <div class="mention-pop" x-show="mentionShow" x-transition.opacity>
           <div class="mention-hint" x-html="lang==='zh' ? '<span class=&quot;kbd&quot;>↑↓</span> 选 · <span class=&quot;kbd&quot;>Enter</span> 插入 · <span class=&quot;kbd&quot;>Esc</span> 关' : '<span class=&quot;kbd&quot;>↑↓</span> nav · <span class=&quot;kbd&quot;>Enter</span> insert · <span class=&quot;kbd&quot;>Esc</span> close'"></div>
           <template x-for="(f, i) in mentionResults" :key="f.path">
-            <div :class="'mention-item ' + (mentionIdx===i?'sel':'')"
+            <div :class="'mention-item ' + (mentionIdx===i?'sel':'') + (f._open?' is-open':'')"
                  :title="f.path"
                  @mousedown.prevent="pickMention(i)" @mouseenter="mentionIdx=i">
               <span class="icon"><svg><use :href="iconRef(f)"/></svg></span>
               <div class="body">
-                <div class="name ellipsis" x-text="f.name"></div>
+                <div class="name-row">
+                  <span class="name ellipsis" x-text="f.name"></span>
+                  <span x-show="f._open" class="mention-open-badge"
+                        x-text="lang==='zh' ? '已打开' : 'open'"></span>
+                </div>
                 <div class="path-hint ellipsis" x-text="f.path"></div>
               </div>
             </div>
@@ -2184,6 +2215,15 @@
               <!-- empty :src would resolve to page URL and fail (see queued-img guard) -->
               <img :src="img.preview || 'data:image/gif;base64,R0lGODlhAQABAAAAACw='"
                    alt="" :style="img.preview ? '' : 'opacity:0.3'" />
+              <!-- "Annotate" button — opens the image editor over this image.
+                   Disabled while the chip is still uploading so we don't lose
+                   the user's edits if the upload errors out mid-edit. -->
+              <button class="img-chip-edit icon-btn sm"
+                      @click="openImageEditor(i)"
+                      :disabled="img.uploading || !img.file"
+                      :title="lang==='zh' ? '画笔编辑' : 'Annotate'">
+                <svg><use href="#i-pen"/></svg>
+              </button>
               <button class="img-chip-x icon-btn sm"
                       @click="removePendingImage(i)" :title="t('img.remove')">
                 <svg><use href="#i-x"/></svg>
@@ -2506,6 +2546,10 @@
     <button class="ctx-item" @click="ctxAction('download')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-download"/></svg></span><span x-text="t('btn.download')"></span>
     </button>
+    <!-- 文件专属：复制为 .bak -->
+    <button class="ctx-item" @click="ctxAction('copyAsBak')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+      <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_as_bak')"></span>
+    </button>
     <!-- 通用 -->
     <button class="ctx-item" @click="ctxAction('copyPath')">
       <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_path')"></span>
@@ -2566,11 +2610,6 @@
           <li class="settings-menu-item" @click="settings.activePage='defaults'">
             <span class="settings-menu-icon"><svg><use href="#i-cog"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
-            <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='model_params'">
-            <span class="settings-menu-icon"><svg><use href="#i-brain"/></svg></span>
-            <span class="settings-menu-title" x-text="t('set.sec.model_params')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item" @click="settings.activePage='skills'">
@@ -2722,7 +2761,7 @@
                      or (b) the user clicked 修改 to update an existing key. -->
                 <input x-show="!p.configured || editing"
                        type="password" class="settings-input"
-                       :placeholder="editing ? t('set.key_edit_placeholder') : t('set.key_unset')"
+                       :placeholder="editing ? t('set.key_edit_placeholder') : t('set.placeholder_key')"
                        x-model="settings.draftKeys[p.env_key]" />
                 <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
                 <!-- Edit-mode actions: 保存 (primary, only if input has content) + 取消 -->
@@ -3066,98 +3105,32 @@
                  : '⚠ In bypass mode Muse can read / edit / delete any file under your archive without confirmation. Only use it when you fully trust what you ask.'"></div>
         </div>
 
-        <div class="settings-section" data-page="model_params"
-             x-show="isWideScreen || settings.activePage === 'model_params'">
-          <div class="settings-section-title">
-            <span x-text="t('set.sec.model_params')"></span>
-            <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
-          </div>
-          <div class="settings-row">
-            <label x-text="t('set.label.thinking_budget')"></label>
-            <input type="number" min="1024" max="32000" step="1024"
-                   x-model.number="settings.draftParams.thinking_budget" class="settings-input" />
-          </div>
-          <div class="settings-row">
-            <label x-text="lang==='zh' ? '最大 tool 轮数 (0=不限)' : 'Max tool turns (0=unlimited)'"></label>
-            <input type="number" min="0" max="50"
-                   x-model.number="settings.draftParams.max_turns" class="settings-input" />
-          </div>
-        </div>
-
-        <!-- Notification prefs — per-device (lives in localStorage),
-             does NOT round-trip through /api/settings. Vibrate works
-             whenever muselab is open in this tab; push covers the
-             "muselab closed, still notify" case via a service worker. -->
+        <!-- Notifications — single switch (2026-05-28, collapsed from 4
+             toggles into one). ON does best-effort across capabilities:
+             foreground vibration when scheduler unread ticks up, Web Push
+             subscription for background. The backend gates both event
+             classes (scheduled task done, chat turn done) on
+             presence.recently_active() so the user is never double-
+             notified while actively at a device — no per-class server-
+             side mute needed. -->
         <div class="settings-section" data-page="notification"
              x-show="isWideScreen || settings.activePage === 'notification'">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
-            <!-- Mixed mode: 本设备 toggles are live (localStorage); 服务端开关
-                 (notify_normal / notify_scheduled) need Save. Tag the
-                 section "batch" since the server-side toggles are the
-                 ones with delayed effect — local ones flip instantly
-                 anyway, so users won't be confused by the badge. -->
-            <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
-          </div>
-
-          <!-- Per-device (localStorage) — controls how THIS browser/device
-               reacts when push arrives. -->
-          <div class="settings-subtitle"
-               x-text="lang==='zh' ? '本设备' : 'This device'"></div>
-          <div class="settings-row">
-            <label x-text="lang==='zh' ? '完成时震动（前台）' : 'Vibrate on completion (foreground)'"></label>
-            <label class="switch">
-              <input type="checkbox" x-model="notifyPrefs.vibrate"
-                     @change="saveNotifyPrefs()" />
-              <span class="switch-slider"></span>
-            </label>
+            <span class="settings-save-mode instant" x-text="t('set.mode.instant')"></span>
           </div>
           <div class="settings-row">
-            <label x-text="lang==='zh' ? '推送通知（即使关掉 muselab）' : 'Push notifications (even when muselab is closed)'"></label>
+            <label x-text="lang==='zh' ? '任务完成时通知我' : 'Notify me when tasks finish'"></label>
             <label class="switch">
-              <input type="checkbox" x-model="notifyPrefs.push"
-                     @change="onPushToggle($event)" />
-              <span class="switch-slider"></span>
-            </label>
-          </div>
-          <div class="settings-hint" x-show="notifyPrefs.push"
-               x-text="lang==='zh'
-                 ? '已开启：浏览器会弹通知 + 震动。需要把 muselab 添加到主屏 (PWA) 才能在 iOS 上后台收推送。'
-                 : 'Enabled — browser shows a notification + vibrates. iOS requires adding muselab to home screen (PWA) for background push.'"></div>
-
-          <!-- Server-side gates — control which event classes muselab even
-               sends to your devices. Saved with the rest of /api/settings. -->
-          <div class="settings-subtitle"
-               style="margin-top: 16px;"
-               x-text="lang==='zh' ? '服务端推送开关' : 'Server-side push gates'"></div>
-          <div class="settings-hint"
-               x-text="lang==='zh'
-                 ? '关掉对应分类后，muselab 后端就不会再为该类事件发推送（独立控制）。'
-                 : 'Disabling a class stops the backend from sending pushes of that class entirely.'"></div>
-          <div class="settings-row">
-            <label>
-              <svg class="settings-row-label-icon"><use href="#i-clock"/></svg>
-              <span x-text="lang==='zh' ? '定时任务完成' : 'Scheduled task done'"></span>
-            </label>
-            <label class="switch">
-              <input type="checkbox" x-model="settings.draftParams.notify_scheduled" />
-              <span class="switch-slider"></span>
-            </label>
-          </div>
-          <div class="settings-row">
-            <label>
-              <svg class="settings-row-label-icon"><use href="#i-msg"/></svg>
-              <span x-text="lang==='zh' ? '普通会话回复完成' : 'Normal chat turn done'"></span>
-            </label>
-            <label class="switch">
-              <input type="checkbox" x-model="settings.draftParams.notify_normal" />
+              <input type="checkbox" x-model="notifyEnabled"
+                     @change="onNotifyToggle($event)" />
               <span class="switch-slider"></span>
             </label>
           </div>
           <div class="settings-hint"
                x-text="lang==='zh'
-                 ? '这两个开关需要点底部「保存」才生效。'
-                 : 'These two need clicking Save at the bottom to take effect.'"></div>
+                 ? '覆盖普通会话回复完成 + 定时任务完成。前台震动 + 后台推送通知；正在使用 muselab 时不打扰。iOS 需把 muselab 添加到主屏（PWA）才能在后台收推送。'
+                 : 'Covers chat replies AND scheduled tasks. Foreground vibration + background Web Push; suppressed while you are actively using muselab. iOS requires adding muselab to home screen (PWA) for background push.'"></div>
         </div>
 
         <div class="settings-section" data-page="skills"
@@ -3326,6 +3299,14 @@
             <tr>
               <td><span class="kbd">⌘</span><span class="kbd">S</span></td>
               <td x-text="lang==='zh' ? '保存当前文件（编辑模式）' : 'Save file (in edit mode)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">C</span> / <span class="kbd">⌘</span><span class="kbd">V</span></td>
+              <td x-text="lang==='zh' ? '在文件树：复制选中文件 / 粘贴为 .bak（仅文件树有选中且焦点不在输入框时生效）' : 'In file tree: copy selected file / paste as .bak (only fires when a tree file is selected and focus is outside any input)'"></td>
+            </tr>
+            <tr>
+              <td><span class="kbd">⌘</span><span class="kbd">Z</span></td>
+              <td x-text="lang==='zh' ? '图片标注编辑器：撤销上一笔' : 'Image annotator: undo last stroke'"></td>
             </tr>
             <tr>
               <td><span class="kbd">Enter</span></td>
@@ -3625,7 +3606,7 @@
        @click.self="closeScheduler()">
     <div class="modal sched-modal" @keydown.escape.window="closeScheduler()">
       <div class="modal-head">
-        <span class="modal-title">⏰ <span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span></span>
+        <span class="modal-title"><svg class="modal-title-icon"><use href="#i-clock"/></svg><span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span></span>
         <button class="modal-close" @click="closeScheduler()"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
@@ -3646,61 +3627,88 @@
                    x-model="scheduler.draft.name"
                    :placeholder="lang==='zh' ? '例：每日复盘' : 'e.g. Daily review'" />
           </div>
-          <div class="sched-field">
-            <label class="sched-label" x-text="lang==='zh' ? '频率' : 'Repeat'"></label>
-            <div class="sched-freq">
-              <template x-for="k in ['daily','weekly','monthly','once']" :key="k">
-                <button type="button" class="sched-freq-btn"
-                        :class="{ active: scheduler.draft.kind === k }"
-                        @click="scheduler.draft.kind = k"
-                        x-text="lang==='zh'
-                          ? ({daily:'每天',weekly:'每周',monthly:'每月',once:'一次'})[k]
-                          : ({daily:'Daily',weekly:'Weekly',monthly:'Monthly',once:'Once'})[k]"></button>
-              </template>
+          <!-- Trigger block — groups all schedule-shape inputs (frequency,
+               variant rows, time) inside a subtle inset card so the user
+               reads it as "WHEN this runs", distinct from name / prompt
+               / model which are "WHAT it does". -->
+          <div class="sched-trigger-block">
+            <div class="sched-field">
+              <label class="sched-label" x-text="lang==='zh' ? '频率' : 'Repeat'"></label>
+              <div class="sched-freq">
+                <template x-for="k in ['daily','weekly','monthly','once']" :key="k">
+                  <button type="button" class="sched-freq-btn"
+                          :class="{ active: scheduler.draft.kind === k }"
+                          @click="scheduler.draft.kind = k"
+                          x-text="lang==='zh'
+                            ? ({daily:'每天',weekly:'每周',monthly:'每月',once:'一次'})[k]
+                            : ({daily:'Daily',weekly:'Weekly',monthly:'Monthly',once:'Once'})[k]"></button>
+                </template>
+              </div>
             </div>
-          </div>
 
-          <!-- Weekday picker — only visible for weekly. -->
-          <div class="sched-field" x-show="scheduler.draft.kind === 'weekly'">
-            <label class="sched-label" x-text="lang==='zh' ? '星期几' : 'Weekdays'"></label>
-            <div class="sched-weekdays">
-              <template x-for="(wd, idx) in (lang==='zh'
-                  ? ['一','二','三','四','五','六','日']
-                  : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])" :key="idx">
-                <button type="button" class="sched-weekday"
-                        :class="{ active: scheduler.draft.weekdays.includes(idx) }"
-                        @click="toggleDraftWeekday(idx)"
-                        x-text="wd"></button>
-              </template>
+            <!-- Weekday picker — only visible for weekly. -->
+            <div class="sched-field" x-show="scheduler.draft.kind === 'weekly'">
+              <label class="sched-label" x-text="lang==='zh' ? '星期几' : 'Weekdays'"></label>
+              <div class="sched-weekdays">
+                <template x-for="(wd, idx) in (lang==='zh'
+                    ? ['一','二','三','四','五','六','日']
+                    : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])" :key="idx">
+                  <button type="button" class="sched-weekday"
+                          :class="{ active: scheduler.draft.weekdays.includes(idx) }"
+                          @click="toggleDraftWeekday(idx)"
+                          x-text="wd"></button>
+                </template>
+              </div>
             </div>
-          </div>
 
-          <!-- Day-of-month — only for monthly. -->
-          <div class="sched-field" x-show="scheduler.draft.kind === 'monthly'">
-            <label class="sched-label" x-text="lang==='zh' ? '每月第' : 'Day of month'"></label>
-            <div class="sched-monthly">
-              <input type="number" min="1" max="31" class="settings-input sched-day-input"
-                     x-model.number="scheduler.draft.day" />
-              <span class="sched-monthly-suffix"
-                    x-text="lang==='zh' ? '日（超过月底自动顺延到月底当天）' : '(falls back to last day for short months)'"></span>
+            <!-- Day-of-month — only for monthly. -->
+            <div class="sched-field" x-show="scheduler.draft.kind === 'monthly'">
+              <label class="sched-label" x-text="lang==='zh' ? '每月第' : 'Day of month'"></label>
+              <div class="sched-monthly">
+                <input type="number" min="1" max="31" class="settings-input sched-day-input"
+                       x-model.number="scheduler.draft.day" />
+                <span class="sched-monthly-suffix"
+                      x-text="lang==='zh' ? '日（超过月底自动顺延到月底当天）' : '(falls back to last day for short months)'"></span>
+              </div>
             </div>
-          </div>
 
-          <!-- Once: date picker. -->
-          <div class="sched-field" x-show="scheduler.draft.kind === 'once'">
-            <label class="sched-label" x-text="lang==='zh' ? '日期' : 'Date'"></label>
-            <input type="date" class="settings-input sched-input-date"
-                   x-model="scheduler.draft.onceDate" />
-          </div>
+            <!-- Once: date picker. -->
+            <div class="sched-field" x-show="scheduler.draft.kind === 'once'">
+              <label class="sched-label" x-text="lang==='zh' ? '日期' : 'Date'"></label>
+              <input type="date" class="settings-input sched-input-date"
+                     x-model="scheduler.draft.onceDate" />
+            </div>
 
-          <div class="sched-field">
-            <label class="sched-label" x-text="lang==='zh' ? '时间' : 'Time'"></label>
-            <div class="sched-time">
-              <input type="number" min="0" max="23" class="settings-input sched-time-input"
-                     x-model.number="scheduler.draft.hour" />
-              <span class="sched-time-sep">:</span>
-              <input type="number" min="0" max="59" class="settings-input sched-time-input"
-                     x-model.number="scheduler.draft.minute" />
+            <!-- Time slot list. Always rendered as a list (draft.times is
+                 always length >= 1), but the +/- affordances only appear
+                 for `daily` since weekly/monthly/once are conceptually
+                 single-time-per-occurrence. Each row is a native HTML5
+                 time picker bound to its slot via updateDraftTime(i, val). -->
+            <div class="sched-field sched-field-times">
+              <label class="sched-label" x-text="lang==='zh' ? '时间' : 'Time'"></label>
+              <div class="sched-times">
+                <template x-for="(t, i) in scheduler.draft.times" :key="i">
+                  <div class="sched-times-row">
+                    <input type="time" class="settings-input sched-input-time"
+                           :value="padTime(t.hour, t.minute)"
+                           @input="updateDraftTime(i, $event.target.value)" />
+                    <button type="button" class="sched-times-del"
+                            x-show="scheduler.draft.kind === 'daily' && scheduler.draft.times.length > 1"
+                            @click="removeDraftTime(i)"
+                            :title="lang==='zh' ? '删除此时段' : 'Remove this time'"
+                            :aria-label="lang==='zh' ? '删除' : 'Remove'">×</button>
+                  </div>
+                </template>
+                <button type="button" class="sched-times-add"
+                        x-show="scheduler.draft.kind === 'daily' && scheduler.draft.times.length < 24"
+                        @click="addDraftTime()"
+                        x-text="lang==='zh' ? '+ 添加时段' : '+ Add time'"></button>
+                <div class="sched-times-hint"
+                     x-show="scheduler.draft.kind === 'daily' && scheduler.draft.times.length > 1"
+                     x-text="lang==='zh'
+                       ? '每天将在以上每个时段各执行一次'
+                       : 'Will fire once at each time, every day'"></div>
+              </div>
             </div>
           </div>
 
@@ -3744,9 +3752,12 @@
 
         <!-- Tasks list -->
         <div class="sched-section">
-          <div class="sched-section-title" x-text="lang==='zh'
-              ? `已配置（${scheduler.tasks.length}）`
-              : `Configured (${scheduler.tasks.length})`"></div>
+          <div class="sched-section-title">
+            <svg class="sched-section-icon"><use href="#i-list"/></svg>
+            <span x-text="lang==='zh'
+                ? `已配置（${scheduler.tasks.length}）`
+                : `Configured (${scheduler.tasks.length})`"></span>
+          </div>
           <div class="sched-empty" x-show="!scheduler.tasks.length"
                x-text="lang==='zh' ? '还没有任务。在上方添加一个。'
                                    : 'No tasks yet. Add one above.'"></div>
@@ -3800,9 +3811,12 @@
         <!-- Recent runs -->
         <div class="sched-section">
           <div class="sched-section-head">
-            <div class="sched-section-title" x-text="lang==='zh'
-                ? `最近运行（${scheduler.history.length}）`
-                : `Recent runs (${scheduler.history.length})`"></div>
+            <div class="sched-section-title">
+              <svg class="sched-section-icon"><use href="#i-history"/></svg>
+              <span x-text="lang==='zh'
+                  ? `最近运行（${scheduler.history.length}）`
+                  : `Recent runs (${scheduler.history.length})`"></span>
+            </div>
             <!-- Clear-all only shown when history is non-empty (otherwise
                  the button is dead weight). Sits at the section head as
                  a single "bulk action" affordance; per-row × is below. -->
@@ -3849,6 +3863,109 @@
             </div>
           </template>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Image annotation editor — full-screen modal for drawing on a pending
+       image attachment. Opens via the ✎ button on an .img-chip in the chat
+       composer. Tools: pen (freedraw), rect (outline), arrow, eraser.
+       Undo: multi-level via dataURL frame stack (capped at 15 frames).
+       Save flow: canvas.toBlob → new File → swap entry.file → re-upload via
+       the same /api/chat/upload-image endpoint the original used.
+       Cancel just closes; no destructive ops on the original chip. -->
+  <!-- Cmd/Ctrl+Z bound on the backdrop (x-show keeps the element in DOM
+       so the listener exists only while the editor is open). `.prevent`
+       stops Safari's swipe-back gesture on iPad with magic keyboard.
+       Shift+Cmd/Ctrl+Z reserved for future redo — currently no-op since
+       redo isn't surfaced yet. -->
+  <div class="img-editor-backdrop" x-show="imageEditor.show"
+       x-transition.opacity.duration.120ms
+       @keydown.escape.window="closeImageEditor(false)"
+       @keydown.window.ctrl.z.prevent="imageEditor.show && !imageEditor._drawing && undoImageEdit()"
+       @keydown.window.meta.z.prevent="imageEditor.show && !imageEditor._drawing && undoImageEdit()"
+       @click.self="closeImageEditor(false)">
+    <div class="img-editor" @click.stop>
+      <div class="img-editor-head">
+        <span class="img-editor-title"
+              x-text="lang==='zh' ? '画笔编辑' : 'Annotate'"></span>
+        <button class="modal-close" @click="closeImageEditor(false)"
+                :aria-label="lang==='zh' ? '关闭' : 'Close'">×</button>
+      </div>
+      <div class="img-editor-canvas-wrap">
+        <canvas x-ref="imgEditorCanvas" class="img-editor-canvas"></canvas>
+      </div>
+      <div class="img-editor-toolbar">
+        <!-- Tool group -->
+        <div class="img-editor-tool-group">
+          <button class="img-editor-tool"
+                  :class="{ active: imageEditor.tool === 'pen' }"
+                  @click="imageEditor.tool = 'pen'"
+                  :title="lang==='zh' ? '画笔' : 'Pen'">
+            <svg><use href="#i-pen"/></svg>
+          </button>
+          <button class="img-editor-tool"
+                  :class="{ active: imageEditor.tool === 'rect' }"
+                  @click="imageEditor.tool = 'rect'"
+                  :title="lang==='zh' ? '矩形' : 'Rectangle'">
+            <svg><use href="#i-square"/></svg>
+          </button>
+          <button class="img-editor-tool"
+                  :class="{ active: imageEditor.tool === 'arrow' }"
+                  @click="imageEditor.tool = 'arrow'"
+                  :title="lang==='zh' ? '箭头' : 'Arrow'">
+            <svg><use href="#i-arrow-ur"/></svg>
+          </button>
+          <button class="img-editor-tool"
+                  :class="{ active: imageEditor.tool === 'eraser' }"
+                  @click="imageEditor.tool = 'eraser'"
+                  :title="lang==='zh' ? '橡皮（恢复原图）' : 'Eraser (restore original)'">
+            <svg><use href="#i-eraser"/></svg>
+          </button>
+        </div>
+        <!-- Color group -->
+        <div class="img-editor-color-group">
+          <template x-for="c in ['#ef4444','#22c55e','#facc15','#3b82f6','#111827']" :key="c">
+            <button class="img-editor-color"
+                    :class="{ active: imageEditor.color === c }"
+                    :style="'background:' + c"
+                    @click="imageEditor.color = c"
+                    :aria-label="c"></button>
+          </template>
+        </div>
+        <!-- Size group -->
+        <div class="img-editor-size-group">
+          <template x-for="s in [3, 6, 12]" :key="s">
+            <button class="img-editor-size"
+                    :class="{ active: imageEditor.size === s }"
+                    @click="imageEditor.size = s"
+                    :title="lang==='zh' ? '粗细 ' + s : 'Size ' + s">
+              <span class="img-editor-size-dot"
+                    :style="'width:' + s + 'px;height:' + s + 'px;'"></span>
+            </button>
+          </template>
+        </div>
+        <!-- Action group — wraps undo (and future redo) into its own
+             container with a leading divider, so it reads as "global
+             action", not "5th tool". `margin-left: auto` on the group
+             (not the button) pushes the whole group right; the divider
+             gives a clean visual break from size pickers. Title now
+             advertises the keyboard shortcut. -->
+        <div class="img-editor-action-group">
+          <span class="img-editor-divider" aria-hidden="true"></span>
+          <button class="img-editor-action"
+                  @click="undoImageEdit()"
+                  :disabled="!canUndoImageEdit()"
+                  :title="(lang==='zh' ? '撤销' : 'Undo') + ' (⌘Z / Ctrl+Z)'">
+            <svg><use href="#i-undo"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="img-editor-foot">
+        <button class="btn-ghost" @click="closeImageEditor(false)"
+                x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
+        <button class="btn-primary" @click="closeImageEditor(true)"
+                x-text="lang==='zh' ? '保存' : 'Save'"></button>
       </div>
     </div>
   </div>

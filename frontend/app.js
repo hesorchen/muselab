@@ -267,7 +267,11 @@ function portal() {
         editingId: null,
         name: "", prompt: "", model: "",
         kind: "daily",         // daily / weekly / monthly / once
-        hour: 9, minute: 0,
+        // times: list of {hour, minute}. Always length >= 1. For daily, the
+        // user can add multiple slots ("每天 08:00 / 14:00 / 22:00"); other
+        // kinds use times[0] as the single fire time. Replaced the old
+        // top-level hour/minute pair to keep a single source of truth.
+        times: [{ hour: 9, minute: 0 }],
         weekdays: [1, 2, 3, 4, 5],  // weekly: Mon-Fri default
         day: 1,                // monthly day-of-month
         onceDate: "",          // once: "YYYY-MM-DD"
@@ -276,11 +280,18 @@ function portal() {
     // Per-task "run-now" inflight flag — disables retry / send buttons
     // until the LLM call returns and history is reloaded. Keyed by task id.
     schedRunning: {},
-    // Notification prefs — purely client-side. Vibration is a foreground-
-    // only nicety (when muselab is open, vibrate on unread count tick up).
-    // pushEnabled is a UI hint mirroring the actual SW push subscription
-    // state; the subscribe flow itself lives in pushSubscribe().
-    notifyPrefs: { vibrate: false, push: false },
+    // Single notification switch — collapsed from 4 toggles (vibrate /
+    // push / notify_scheduled / notify_normal) on 2026-05-28 because the
+    // user-facing intent was always just "tell me when something finishes".
+    // Behavior when ON, best-effort across capabilities:
+    //   - foreground: navigator.vibrate on unread tick-up (any device with
+    //     a vibration motor — handheld; PC silently no-ops)
+    //   - background: Web Push subscription via service worker, gated by
+    //     server-side presence.recently_active() so we never double-notify
+    //     a user who's actively at a screen
+    // Storage: localStorage `muselab_notify_enabled`. Migration from the
+    // old 2-key shape lives in loadNotifyPrefs().
+    notifyEnabled: false,
     // Last-seen unread, used to detect a tick-up and trigger vibration.
     _lastSeenUnread: 0,
 
@@ -344,8 +355,29 @@ function portal() {
     streamElapsed: 0,
     _streamTimer: null,
     _streamStartedAt: 0,
-    pendingImages: [],    // [{id, mime, preview (data URL), uploading, error}]
+    pendingImages: [],    // [{id, mime, preview (data URL), uploading, error, file}]
     pendingDocs: [],      // [{id, name, kind: 'pdf'|'text', uploading, error}]
+    // Image annotation editor (L1: pen / rect / arrow / eraser + 5 colors + 3 sizes).
+    // Opened via the ✎ button on an .img-chip. State is module-scoped on `this`
+    // so the modal template can read it via x-show / :class. _baseBitmap is the
+    // pristine ImageBitmap decoded once on open — kept around for the eraser
+    // tool, which "erases" by re-drawing original pixels from this bitmap into
+    // a circular clip region (so annotations vanish but image content beneath
+    // is restored — better than the naive "paint with white" approach).
+    // history[] caps at 15 dataURL JPEG-70% frames (~100 KB each, ~1.5 MB total).
+    imageEditor: {
+      show: false,
+      entryIndex: -1,
+      tool: "pen",           // pen / rect / arrow / eraser
+      color: "#ef4444",      // red default — most common for "look at this"
+      size: 6,
+      history: [],           // dataURL strings, oldest first
+      historyIdx: -1,        // pointer into history; -1 = empty
+      _drawing: false,
+      _startX: 0, _startY: 0,
+      _snapshot: null,       // ImageData captured at pointerdown (for rect/arrow live preview)
+      _baseBitmap: null,     // original ImageBitmap — used by eraser
+    },
     // Flipped true inside sendMessage when the user clicks send while an
     // attachment upload is still in flight. Disables the send button so a
     // double-click can't enqueue two sends. Auto-resets when the wait
@@ -527,6 +559,13 @@ function portal() {
     toasts: [], _toastId: 0,
     modal: { show: false, title: "", body: "", input: null, confirm: null, cancel: null, okText: "", cancelText: "", danger: false },
     ctxMenu: { show: false, x: 0, y: 0, node: null },
+    // File-tree clipboard. Ctrl+C on a selected file (focus outside any
+    // input) sets this; Ctrl+V calls /api/files/copy-bak to materialise a
+    // .bak in the currently-selected directory (or the source's parent if
+    // nothing else is selected). Files only — directories are out of scope.
+    // Cleared after a successful paste so the same source doesn't keep
+    // duplicating on accidental repeated Ctrl+V.
+    fileClipboard: { path: "", name: "" },
 
     // ===== settings =====
     // Keyboard cheat-sheet modal — toggled by `?` keypress outside any
@@ -539,8 +578,9 @@ function portal() {
       providers: [],
       draftKeys: {},
       draftDefaults: { model: "", permission: "" },
-      draftParams: { thinking_budget: 4000, max_turns: 0,
-                       notify_scheduled: true, notify_normal: true },
+      // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
+      // notify_normal server-side toggles. Subscription state is now the
+      // sole on/off; see `notifyEnabled` at the top of this object.
       // MCP server list (loaded from /api/settings/mcp)
       mcpServers: [],
       mcpExamples: [],
@@ -710,6 +750,46 @@ function portal() {
         if (this.editing && this.selected) {
           ev.preventDefault();
           this.saveEdit();
+        }
+        return;
+      }
+      // Ctrl/Cmd+C / Ctrl/Cmd+V — file-tree "copy as .bak" flow.
+      // Strict gating so we don't hijack normal text copy/paste:
+      //   1. Focus must NOT be in an input / textarea / contenteditable
+      //      (editor, chat input, prompt modal etc.)
+      //   2. A file (not a directory) must be selected in the tree.
+      //   3. Modifier must be Ctrl/Cmd alone — no shift/alt combos.
+      // Anything else falls through to native behaviour.
+      if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey
+          && (ev.key === "c" || ev.key === "C" || ev.key === "v" || ev.key === "V")) {
+        const ae = document.activeElement;
+        const tag = ae && ae.tagName;
+        const inField = tag === "INPUT" || tag === "TEXTAREA"
+                        || (ae && ae.isContentEditable);
+        // Don't fight native copy/paste of selected text in any input.
+        if (inField) return;
+        // Also bail if user has a non-empty text selection — they're
+        // probably copying rendered text from the preview pane.
+        const sel = window.getSelection && window.getSelection();
+        if (sel && sel.toString && sel.toString().length > 0) return;
+        const isCopy = ev.key === "c" || ev.key === "C";
+        if (isCopy) {
+          // Need a selected file (not directory). this.selected holds the
+          // path string of the currently-highlighted tree node.
+          const node = this._findTreeNode(this.selected);
+          if (!node || node.is_dir) return;
+          ev.preventDefault();
+          this.fileClipboard = { path: node.path, name: node.name };
+          this.toast(
+            this.t("toast.copy_marked").replace("{name}", node.name),
+            "success",
+            1800,
+          );
+        } else {
+          // Paste
+          if (!this.fileClipboard.path) return;
+          ev.preventDefault();
+          this.doPasteBak();
         }
         return;
       }
@@ -1964,8 +2044,12 @@ function portal() {
         // the data URI is a self-contained string that never expires.
         // The chip and the sent-message bubble both use this thumbnail.
         const preview = await this._imageToThumbDataURL(file);
+        // Stash the compressed File on the entry so the in-chip "✎ Annotate"
+        // button can re-open the bitmap in the image editor without
+        // round-tripping back to the server. Memory cost is small (~300 KB
+        // per image after compression), cleared on send.
         const raw = { id: null, mime: file.type, preview,
-                       uploading: true, error: false };
+                       uploading: true, error: false, file };
         this.pendingImages.push(raw);
         // Alpine v3 wraps each pushed item in a Proxy. The local `raw`
         // reference still points at the original (non-proxied) object;
@@ -2077,6 +2161,307 @@ function portal() {
       this.pendingImages.splice(i, 1);
     },
     removePendingDoc(i) { this.pendingDocs.splice(i, 1); },
+
+    // ===== image annotation editor (L1) =====
+    // Open the editor over pendingImages[i]. The chip must have already
+    // finished its initial upload (img.uploading false) AND retained its
+    // File ref (entry.file, stashed at attach time). We decode the file
+    // into an ImageBitmap, draw it onto the canvas at up to 1280px on the
+    // long edge (matches _maybeCompressImage's cap), and start the history
+    // stack with this clean frame.
+    async openImageEditor(i) {
+      const entry = this.pendingImages[i];
+      if (!entry || !entry.file) {
+        this.toast(this.lang === "zh"
+          ? "无法编辑此图（原图引用丢失）"
+          : "Can't edit — image source missing", "warn", 3000);
+        return;
+      }
+      this.imageEditor.show = true;
+      this.imageEditor.entryIndex = i;
+      this.imageEditor.history = [];
+      this.imageEditor.historyIdx = -1;
+      this.imageEditor._drawing = false;
+      this.imageEditor._baseBitmap = null;
+      this.imageEditor._snapshot = null;
+      // Defer canvas init until Alpine has rendered the modal — $refs is
+      // only populated for visible elements.
+      await this.$nextTick();
+      try {
+        await this._initImageEditorCanvas(entry.file);
+      } catch (e) {
+        console.error("[imgEditor] init failed:", e);
+        this.toast(this.lang === "zh" ? "图片加载失败" : "Failed to load image",
+                    "error", 3000);
+        this.imageEditor.show = false;
+      }
+    },
+
+    async _initImageEditorCanvas(file) {
+      const canvas = this.$refs.imgEditorCanvas;
+      if (!canvas) throw new Error("canvas ref missing");
+      // Decode → ImageBitmap. Honors EXIF orientation when supported so
+      // portrait photos taken on iPhone don't render sideways.
+      let bitmap;
+      try {
+        bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+      } catch (_) {
+        bitmap = await createImageBitmap(file);
+      }
+      // Cap canvas at 1280px on the long edge — matches our compress ceiling.
+      // Going larger would burn memory on phones and add latency to every
+      // history-snapshot toDataURL call.
+      const MAX = 1280;
+      const ratio = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
+      const w = Math.max(1, Math.round(bitmap.width * ratio));
+      const h = Math.max(1, Math.round(bitmap.height * ratio));
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      // Keep the bitmap around — eraser tool re-draws regions from it.
+      this.imageEditor._baseBitmap = bitmap;
+      // Seed history with the clean frame so the first undo returns here.
+      this._pushImageEditHistory();
+      // Wire pointer events. Stored on the canvas itself so they auto-clean
+      // when the modal closes and Alpine x-show hides the parent.
+      this._bindImageEditorPointer(canvas);
+    },
+
+    _bindImageEditorPointer(canvas) {
+      const ed = this.imageEditor;
+      // Translate a pointer's clientX/Y into canvas pixel coordinates.
+      // CSS may scale the canvas down (e.g. on phones canvas pixels =
+      // 1280×960 but rendered at 360×270) — without rescaling, strokes
+      // would appear "drift" by the inverse of that ratio.
+      const getPos = (ev) => {
+        const rect = canvas.getBoundingClientRect();
+        const sx = canvas.width / rect.width;
+        const sy = canvas.height / rect.height;
+        return { x: (ev.clientX - rect.left) * sx,
+                  y: (ev.clientY - rect.top) * sy };
+      };
+
+      canvas.onpointerdown = (ev) => {
+        ev.preventDefault();
+        try { canvas.setPointerCapture(ev.pointerId); } catch (_) {}
+        const { x, y } = getPos(ev);
+        ed._drawing = true;
+        ed._startX = x; ed._startY = y;
+        const ctx = canvas.getContext("2d");
+        // Snapshot before drawing — used by rect/arrow for live preview.
+        try {
+          ed._snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        } catch (_) { ed._snapshot = null; }
+        if (ed.tool === "pen") {
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+        } else if (ed.tool === "eraser") {
+          this._eraseAt(ctx, x, y);
+        }
+      };
+
+      canvas.onpointermove = (ev) => {
+        if (!ed._drawing) return;
+        const { x, y } = getPos(ev);
+        const ctx = canvas.getContext("2d");
+        if (ed.tool === "pen") {
+          ctx.strokeStyle = ed.color;
+          ctx.lineWidth = ed.size;
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          ctx.lineTo(x, y);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+        } else if (ed.tool === "eraser") {
+          this._eraseAt(ctx, x, y);
+        } else if (ed.tool === "rect" && ed._snapshot) {
+          // Restore pre-stroke state + redraw rect from start to current.
+          ctx.putImageData(ed._snapshot, 0, 0);
+          ctx.strokeStyle = ed.color;
+          ctx.lineWidth = ed.size;
+          ctx.strokeRect(ed._startX, ed._startY,
+                          x - ed._startX, y - ed._startY);
+        } else if (ed.tool === "arrow" && ed._snapshot) {
+          ctx.putImageData(ed._snapshot, 0, 0);
+          this._drawArrow(ctx, ed._startX, ed._startY, x, y, ed.color, ed.size);
+        }
+      };
+
+      const endStroke = (ev) => {
+        if (!ed._drawing) return;
+        ed._drawing = false;
+        try { canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
+        ed._snapshot = null;
+        // Snapshot the new state for undo.
+        this._pushImageEditHistory();
+      };
+      canvas.onpointerup = endStroke;
+      canvas.onpointercancel = endStroke;
+      // Pointer-leave does NOT end the stroke — we want the user to drag
+      // off the canvas and back (e.g. extending an arrow), which is the
+      // standard freehand-tool behavior.
+    },
+
+    // Erase by re-drawing the original bitmap into a circular clip region.
+    // This restores the actual image pixels at that spot (so an annotation
+    // disappears AND the underlying photo content comes back through),
+    // which is what users expect from "eraser" — the naive "paint white"
+    // approach would leave a white blob over an otherwise correct photo.
+    _eraseAt(ctx, x, y) {
+      const ed = this.imageEditor;
+      if (!ed._baseBitmap) return;
+      const r = Math.max(8, ed.size * 4);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, 2 * Math.PI);
+      ctx.clip();
+      const canvas = ctx.canvas;
+      ctx.drawImage(ed._baseBitmap, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    },
+
+    _drawArrow(ctx, x1, y1, x2, y2, color, size) {
+      const headLen = Math.max(12, size * 3.5);
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = size;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      // Shaft — stop slightly short of the tip so the line doesn't poke
+      // out the front of the arrowhead triangle.
+      const shaftEndX = x2 - Math.cos(angle) * headLen * 0.5;
+      const shaftEndY = y2 - Math.sin(angle) * headLen * 0.5;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(shaftEndX, shaftEndY);
+      ctx.stroke();
+      // Filled arrowhead.
+      ctx.beginPath();
+      ctx.moveTo(x2, y2);
+      ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 6),
+                  y2 - headLen * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(x2 - headLen * Math.cos(angle + Math.PI / 6),
+                  y2 - headLen * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+    },
+
+    _pushImageEditHistory() {
+      const canvas = this.$refs.imgEditorCanvas;
+      if (!canvas) return;
+      const ed = this.imageEditor;
+      // If user undid then drew new content, discard redo branch.
+      if (ed.historyIdx < ed.history.length - 1) {
+        ed.history = ed.history.slice(0, ed.historyIdx + 1);
+      }
+      // JPEG @ 70% is the sweet spot — ~100 KB per 1280×960 frame.
+      // PNG would be 2-3× bigger and slower to encode.
+      const url = canvas.toDataURL("image/jpeg", 0.7);
+      ed.history.push(url);
+      // Cap depth to bound memory.
+      const HIST_CAP = 15;
+      if (ed.history.length > HIST_CAP) {
+        ed.history = ed.history.slice(ed.history.length - HIST_CAP);
+      }
+      ed.historyIdx = ed.history.length - 1;
+    },
+
+    canUndoImageEdit() { return this.imageEditor.historyIdx > 0; },
+
+    undoImageEdit() {
+      const ed = this.imageEditor;
+      if (ed.historyIdx <= 0) return;
+      ed.historyIdx--;
+      this._restoreImageEditFrame(ed.history[ed.historyIdx]);
+    },
+
+    _restoreImageEditFrame(url) {
+      const canvas = this.$refs.imgEditorCanvas;
+      if (!canvas || !url) return;
+      const img = new Image();
+      img.onload = () => {
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+      img.src = url;
+    },
+
+    // Close the editor. commit=true → flatten canvas to JPEG, replace the
+    // chip's File ref, re-thumbnail, re-upload. commit=false → just close.
+    // Either way we drop the history stack + base bitmap so memory comes
+    // back. The modal's x-show hides the DOM; pointer handlers will be
+    // re-bound when the editor opens next time.
+    async closeImageEditor(commit) {
+      if (commit) {
+        await this._saveImageEdit();
+      }
+      const ed = this.imageEditor;
+      ed.show = false;
+      ed.entryIndex = -1;
+      ed.history = [];
+      ed.historyIdx = -1;
+      if (ed._baseBitmap && ed._baseBitmap.close) {
+        try { ed._baseBitmap.close(); } catch (_) {}
+      }
+      ed._baseBitmap = null;
+      ed._snapshot = null;
+    },
+
+    async _saveImageEdit() {
+      const canvas = this.$refs.imgEditorCanvas;
+      const i = this.imageEditor.entryIndex;
+      const entry = this.pendingImages[i];
+      if (!canvas || !entry) return;
+      // Flatten the canvas to a JPEG blob @ 88% — high enough to look
+      // crisp, low enough that re-upload payload doesn't balloon.
+      const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.88));
+      if (!blob) {
+        this.toast(this.lang === "zh" ? "保存失败：导出 blob 失败"
+                                       : "Save failed: blob export error",
+                    "error", 3000);
+        return;
+      }
+      const baseName = ((entry.file && entry.file.name) || "image")
+                         .replace(/\.[^.]+$/, "");
+      const file = new File([blob], baseName + ".jpg",
+                              { type: "image/jpeg", lastModified: Date.now() });
+      // In-place swap — keep the chip at its current array index so the
+      // user's mental model ("the 2nd image is the one I just edited")
+      // holds. Mark uploading so the chip shows the upload progress hairline.
+      entry.file = file;
+      entry.uploading = true;
+      entry.error = false;
+      entry.preview = await this._imageToThumbDataURL(file);
+      // Re-upload to the same endpoint. Backend returns a fresh `id` —
+      // tool_use messages built at send-time use this latest id.
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        const r = await fetch("/api/chat/upload-image",
+                                { method: "POST", headers: this.hdr(), body: fd });
+        if (!r.ok) {
+          entry.error = true; entry.uploading = false;
+          let body = "";
+          try { body = await r.text(); } catch (_) {}
+          this.toast(`${this.t("img.upload_failed")} (HTTP ${r.status})${body ? ": " + body : ""}`,
+                      "error", 4000);
+          return;
+        }
+        const d = await r.json();
+        entry.id = d.id; entry.uploading = false;
+        if (d.attach_ext) entry.attach_ext = d.attach_ext;
+      } catch (e) {
+        entry.error = true; entry.uploading = false;
+        const reason = (e && (e.name + (e.message ? ": " + e.message : "")))
+                          || "network error";
+        this.toast(`${this.t("img.upload_failed")} — ${reason}`, "error", 4000);
+      }
+    },
 
     // Alias for use in inline x-html (shorter name reads better in markup).
     renderMd(text) { return this.mdRender(text); },
@@ -2816,9 +3201,16 @@ function portal() {
 
     // ===== modal =====
     confirm({ title, body = "", okText, cancelText, danger = false }) {
-      title = title || this.t("btn.confirm");
-      okText = okText || this.t("btn.confirm");
-      cancelText = cancelText || this.t("btn.cancel");
+      // Don't depend on this.t() for default labels — in some call paths
+      // (observed 2026-05-28 from deleteSchedTask) `this.t` evaluates to
+      // undefined and the entire confirm flow throws "this.t is not a
+      // function" before the modal even opens (so the user sees nothing
+      // happen). Inline the zh/en strings directly off this.lang to
+      // sidestep whatever's eating the i18n method in that context.
+      const zh = this.lang === "zh";
+      if (!title) title = zh ? "确认" : "Confirm";
+      if (!okText) okText = zh ? "确认" : "Confirm";
+      if (!cancelText) cancelText = zh ? "取消" : "Cancel";
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: null,
@@ -2829,9 +3221,11 @@ function portal() {
       });
     },
     prompt({ title, body = "", placeholder = "", value = "", okText, cancelText }) {
-      title = title || (this.lang === "zh" ? "输入" : "Input");
-      okText = okText || this.t("btn.confirm");
-      cancelText = cancelText || this.t("btn.cancel");
+      // Same defensive pattern as confirm() above — avoid this.t for defaults.
+      const zh = this.lang === "zh";
+      if (!title) title = zh ? "输入" : "Input";
+      if (!okText) okText = zh ? "确认" : "Confirm";
+      if (!cancelText) cancelText = zh ? "取消" : "Cancel";
       return new Promise((resolve) => {
         this.modal = {
           show: true, title, body, input: value,
@@ -2868,11 +3262,19 @@ function portal() {
     // browser state (scroll position, open file tabs, typed draft, etc.).
     async refreshChat() {
       this.toast(this.lang === "zh" ? "刷新中…" : "Refreshing…", "info", 1500);
+      // Manual refresh is the user's "pull updates from other devices"
+      // intent — same flush→pull dance as visibilitychange. Flush any
+      // pending local ui-state PUT first so the subsequent GET doesn't
+      // overwrite changes we haven't pushed yet; then refresh sessions
+      // (pullUIStateAndMerge filters openTabIds by this.sessions, so
+      // session list must land first); then merge remote ui-state.
+      try { await this._flushUIStatePush(); } catch (_) {}
       await Promise.all([
         this.fetchContextInfo(),
         this.refreshSessions(),
         this.fetchStats(),
       ]);
+      try { await this._pullUIStateAndMerge(); } catch (_) {}
       if (this.currentId) await this.loadSession(this.currentId);
     },
 
@@ -4204,6 +4606,62 @@ function portal() {
       const name = m.tool_name || "";
       if (["Edit", "Write", "MultiEdit"].includes(name)) return true;
       return false;
+    },
+    // Will this message render any visible content? Mirrors the x-if
+    // conditions in index.html's message loop. Used by `:class` on the
+    // .msg wrapper to add an `is-hidden` class on no-render messages,
+    // which CSS then `display: none`s — collapsing the wrapper out of
+    // flex layout so chat-body's `gap` doesn't reserve space for it.
+    //
+    // We had a CSS-only version via `.msg:not(:has(> :not(template)))
+    // { display: none }`, but iOS Safari 15.x has known bugs where
+    // :has() doesn't re-evaluate when Alpine adds/removes the rendered
+    // sibling next to a <template x-if>. Symptom: persistent ~30-40px
+    // blank space between consecutive Edits in chat (2026-05-28 user
+    // report). Explicit class-based gate is browser-portable.
+    //
+    // Turn-tail exception (2026-05-28 follow-up): a tail muse-side msg
+    // always renders even with no body content, because the .turn-footer
+    // (HH:MM stamp + streaming dots) lives INSIDE the msg wrapper. If we
+    // hid the wrapper because the body was empty (e.g. successful Edit
+    // tool_result is suppressed by shouldHideToolResult), the footer
+    // disappeared from the end of the turn. Symptom: "改动预览下方好像
+    // 不会出现 footer 了". Cost: a 28px timestamp-only row at the end of
+    // turns whose last msg has no body content — acceptable visual artifact
+    // since it preserves the "turn ended at HH:MM" signal.
+    isMsgRenderable(m, i) {
+      if (!m) return false;
+      // Tail check first: dominates any "body is empty" judgment below.
+      const msgs = this.messages || [];
+      const isTurnTail = m.role !== "user"
+        && (i === msgs.length - 1
+            || (msgs[i + 1] && msgs[i + 1].role === "user"));
+      if (isTurnTail) return true;
+
+      if (m._is_compact_summary) return true;
+      switch (m.role) {
+        case "user":
+        case "assistant":
+        case "assistant-turn":
+        case "thinking":
+        case "permission_request":
+        case "ask_user_question":
+          return true;
+        case "tool_use": {
+          // TodoWrite / Task / ExitPlanMode always render their own card.
+          if (m.name === "TodoWrite" || m.name === "Task"
+              || m.name === "ExitPlanMode") return true;
+          // Task* (TaskList / TaskGet / TaskOutput) family uses one-line
+          // log; shouldRenderTaskLine decides if even THAT shows.
+          if (this.isTaskTool(m)) return this.shouldRenderTaskLine(m);
+          // Default tool bubble.
+          return true;
+        }
+        case "tool_result":
+          return !this.shouldHideToolResult(m);
+        default:
+          return true;
+      }
     },
 
     // True iff this Edit/Write/MultiEdit tool_use is Muse's CURRENT
@@ -5628,7 +6086,7 @@ function portal() {
       this.settings.providers = d.providers;
       this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
       this.settings.draftDefaults = { ...d.defaults };
-      this.settings.draftParams = { ...d.params };
+      // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
       // Mobile 2-level menu: always land on the top-level entry list
       // when opening. activePage stays null so the menu is shown and
       // every section is hidden until the user picks one.
@@ -6268,10 +6726,6 @@ function portal() {
       const body = {
         default_model: this.settings.draftDefaults.model,
         default_permission: this.settings.draftDefaults.permission,
-        thinking_budget: this.settings.draftParams.thinking_budget,
-        max_turns: this.settings.draftParams.max_turns,
-        notify_scheduled: this.settings.draftParams.notify_scheduled,
-        notify_normal:    this.settings.draftParams.notify_normal,
       };
       // Send every typed provider key through the generic provider_keys
       // map. Backend whitelists against PROVIDER_KEYS (derived from
@@ -6539,6 +6993,13 @@ function portal() {
           await navigator.clipboard?.writeText(n.path);
           this.toast(this.t("toast.copied") + ": " + n.path, "success", 1500);
           break;
+        case "copyAsBak":
+          // Right-click "Copy as .bak" — paste-target defaults to the
+          // source's own parent dir, matching user expectation of an
+          // in-place duplicate. Cross-dir duplication is the Ctrl+C / V
+          // path which lets the user pick the target via tree selection.
+          if (!n.is_dir) await this.doCopyAsBak(n);
+          break;
         case "download":
           if (!n.is_dir) window.open(this.downloadUrl(n.path), "_blank");
           break;
@@ -6632,6 +7093,72 @@ function portal() {
         this.reloadTree();
         this.toast(this.t("toast.renamed"), "success");
       } else this.errToast("rename", await r.text());
+    },
+    // Look up a tree node by path in the current flat-rendered tree.
+    // Returns the node object or null. Used by the Ctrl+C keyboard
+    // handler (which only has `this.selected` as a path string).
+    _findTreeNode(path) {
+      if (!path) return null;
+      return this.visible.find(n => n.path === path) || null;
+    },
+    // Server-side derives the .bak[.N] name; we just refresh the parent
+    // directory listing and toast the result. Shared by the right-click
+    // "Copy as .bak" menu (dst_dir omitted → same-dir duplicate) and
+    // the Ctrl+V paste path (dst_dir = selected directory).
+    async _postCopyBak(srcPath, dstDir) {
+      const body = dstDir ? { src: srcPath, dst_dir: dstDir }
+                          : { src: srcPath };
+      const r = await fetch("/api/files/copy-bak", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const msg = await r.text();
+        this.toast(this.t("toast.copy_failed") + ": " + msg, "error", 4000);
+        return null;
+      }
+      const data = await r.json();
+      // In-place tree update: only re-fetch the destination parent dir
+      // (or fall back to full reload if parent isn't visible — root /
+      // collapsed parent). Avoids the whole-tree flicker that the prior
+      // reloadTree() caused, matching how delete + drag-to-trash
+      // already optimise. The newly-created .bak appears in-place.
+      await this._refreshParentInTree(data.path);
+      this.toast(
+        this.t("toast.copied_as_bak").replace("{name}", data.name),
+        "success",
+        1800,
+      );
+      return data;
+    },
+    async doCopyAsBak(n) {
+      // In-place duplicate: backend defaults dst_dir to src.parent when
+      // we omit it.
+      await this._postCopyBak(n.path, "");
+    },
+    async doPasteBak() {
+      const src = this.fileClipboard.path;
+      if (!src) return;
+      // Decide paste target directory:
+      //   - currently-selected node is a dir → paste there
+      //   - currently-selected node is a file → paste in its parent dir
+      //   - nothing selected → fall through (backend defaults to src
+      //     parent, i.e. same-directory duplicate)
+      let dstDir = "";
+      const selNode = this._findTreeNode(this.selected);
+      if (selNode) {
+        dstDir = selNode.is_dir
+          ? selNode.path
+          : selNode.path.split("/").slice(0, -1).join("/");
+      }
+      const ok = await this._postCopyBak(src, dstDir);
+      if (ok) {
+        // Clear clipboard so an accidental repeated Ctrl+V doesn't keep
+        // generating .bak.2 / .bak.3 / … User can Ctrl+C again to
+        // re-arm.
+        this.fileClipboard = { path: "", name: "" };
+      }
     },
     async doDelete(n) {
       const zh = this.lang === "zh";
@@ -7770,7 +8297,22 @@ function portal() {
     // ===== search =====
     async doSearch() {
       const q = this.searchQ.trim();
-      if (q.length < 2) { this.clearSearch(); return; }
+      if (q.length < 2) {
+        // Don't full clearSearch() here — that resets `searchQ = ""` and
+        // breaks IME composition on mobile (observed 2026-05-28 on iOS
+        // Chinese pinyin: every keystroke triggered 300ms-debounced
+        // doSearch which saw length<2 and wiped the input mid-composition
+        // → user thinks "can only type numbers"). Just exit search mode
+        // and drop hits; leave the input value alone so the IME keeps
+        // its session and the user can finish typing a Chinese word.
+        this.searchMode = false;
+        this.searchHits = [];
+        this.grepHits = [];
+        this.searchTruncated = false;
+        this.grepTruncated = false;
+        this.searching = false;
+        return;
+      }
       this.searchMode = true;
       this.searching = true;
       const [a, b] = await Promise.all([
@@ -7976,6 +8518,26 @@ function portal() {
       const name = path.split("/").pop().toLowerCase();
       const ext = name.includes(".") ? name.split(".").pop() : name;
       return EDITABLE_EXT.has(ext);
+    },
+
+    // Files-pane visibility toggle wired to the preview-pane header's chevron
+    // button. Special-cased for fullscreen: when the preview pane is in
+    // desktop-fullscreen mode (this.desktopFullPane === "preview"), the files
+    // pane is already hidden by the fullscreen layout CSS — so tapping the
+    // chevron in that state should EXIT fullscreen (not just flip a flag
+    // that does nothing visible). We also force leftOpen=true on the exit
+    // path so the user lands on a layout where the files pane IS visible,
+    // matching the affordance the chevron just promised them.
+    // 2026-05-28 user request: "全屏预览模式下，点击 隐藏文件区按钮，
+    // 应该要自动退出全屏预览".
+    toggleFilesPane() {
+      if (this.desktopFullPane) {
+        this.desktopFullPane = "";
+        this.leftOpen = true;
+      } else {
+        this.leftOpen = !this.leftOpen;
+      }
+      this.savePrefs();
     },
 
     layoutStyle() {
@@ -8827,8 +9389,16 @@ function portal() {
         this.slashShow = false;
       }
 
+      // Trigger the @ picker on the LAST @ in the prefix, regardless of what
+      // sits before it. Previously we required @ to be at position 0 or
+      // preceded by whitespace — that broke mid-sentence usage like
+      // "看下 @foo.md 里写的什么" where @ follows a Chinese character.
+      // Trade-off: typing an email address ("user@example.com") will also
+      // pop the picker; that's accepted since chat input rarely contains
+      // emails and the picker auto-hides as soon as a space is typed.
+      // 2026-05-28 user request: "任何时候 @ 都弹出".
       const at = text.lastIndexOf("@");
-      if (at < 0 || (at > 0 && /\S/.test(text[at - 1]))) { this.mentionShow = false; return; }
+      if (at < 0) { this.mentionShow = false; return; }
       const query = text.slice(at + 1);
       if (/\s/.test(query)) { this.mentionShow = false; return; }
       this.mentionAnchor = at;
@@ -8836,12 +9406,41 @@ function portal() {
       this._mentionDebounce = setTimeout(() => this.fetchMention(query), 200);
     },
     async fetchMention(q) {
+      // Currently open preview tabs — surface them at the top of the picker
+      // so the user can quickly @-reference whatever they're already looking
+      // at. `this.tabs` is the preview-pane tab strip; each entry has
+      // { path, name }. We mark them with `_open: true` so the template can
+      // badge them visually.
+      const openTabs = (this.tabs || [])
+        .filter(t => t && t.path)
+        .map(t => ({ path: t.path, name: t.name || t.path.split("/").pop(), _open: true }));
+
       if (q.length === 0) {
-        this.mentionResults = (await this.fetchChildren("")).slice(0, 8);
+        // Empty query: open files first (most likely what the user wants),
+        // then a few root entries to keep the original "browse from root"
+        // affordance. Dedupe so an open file at the root doesn't appear
+        // twice.
+        const root = (await this.fetchChildren("")).slice(0, 8);
+        const openPaths = new Set(openTabs.map(t => t.path));
+        const rootFresh = root.filter(e => !openPaths.has(e.path));
+        this.mentionResults = [...openTabs, ...rootFresh].slice(0, 12);
       } else {
-        const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15", { headers: this.hdr() });
+        // With query: filter open tabs first (substring match against name/
+        // path), then run the server-side fuzzy search. Merge with open
+        // matches up front so "open and matching" wins over "elsewhere in
+        // archive and matching".
+        const ql = q.toLowerCase();
+        const openMatches = openTabs.filter(t =>
+          (t.name || "").toLowerCase().includes(ql)
+          || (t.path || "").toLowerCase().includes(ql)
+        );
+        const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15",
+                                { headers: this.hdr() });
         const d = r.ok ? await r.json() : { entries: [] };
-        this.mentionResults = d.entries.filter(e => !e.is_dir).slice(0, 12);
+        const searchResults = (d.entries || []).filter(e => !e.is_dir);
+        const openPaths = new Set(openMatches.map(t => t.path));
+        const fresh = searchResults.filter(e => !openPaths.has(e.path));
+        this.mentionResults = [...openMatches, ...fresh].slice(0, 15);
       }
       this.mentionIdx = 0;
       this.mentionShow = true;
@@ -10250,11 +10849,46 @@ function portal() {
         editingId: null,
         name: "", prompt: "", model: this.model || "",
         kind: "daily",
-        hour: 9, minute: 0,
+        times: [{ hour: 9, minute: 0 }],
         weekdays: [1, 2, 3, 4, 5],
         day: 1,
         onceDate: "",
       };
+    },
+    // ---- multi-time helpers (used by the daily-only time list) ----
+    // Pad a (hour, minute) pair into the "HH:MM" string that
+    // <input type="time"> expects as its `value`.
+    padTime(h, m) {
+      return String(h ?? 0).padStart(2, "0") + ":"
+           + String(m ?? 0).padStart(2, "0");
+    },
+    // Append a new time slot to the draft. Defaults the new slot to a copy
+    // of the last slot (usually what the user wants when adding "another"
+    // time) rather than 00:00 which would feel random. Capped at 24 — same
+    // ceiling as the backend Pydantic schema.
+    addDraftTime() {
+      const arr = this.scheduler.draft.times;
+      if (arr.length >= 24) return;
+      const last = arr[arr.length - 1] || { hour: 9, minute: 0 };
+      arr.push({ hour: last.hour, minute: last.minute });
+    },
+    // Remove a time slot by index. Refuses to remove the last one —
+    // there must always be at least one fire time, otherwise the
+    // backend schedule has no hh:mm to fall back to.
+    removeDraftTime(i) {
+      const arr = this.scheduler.draft.times;
+      if (arr.length <= 1) return;
+      arr.splice(i, 1);
+    },
+    // Update a slot from an <input type="time"> change event. Value comes
+    // as "HH:MM" or empty (cleared). Empty falls back to 00:00 rather
+    // than leaving NaN in the data — backend would reject NaN with 422.
+    updateDraftTime(i, val) {
+      const arr = this.scheduler.draft.times;
+      if (!arr[i]) return;
+      const [hh, mm] = (val || "00:00").split(":");
+      arr[i].hour = Number(hh) || 0;
+      arr[i].minute = Number(mm) || 0;
     },
     // Load an existing task into the draft form. The same form template
     // then becomes "edit mode" because draft.editingId is set; the save
@@ -10262,14 +10896,28 @@ function portal() {
     editSchedTask(t) {
       if (!t) return;
       const s = t.schedule || {};
+      // Hydrate `times`: prefer the multi-slot list when present (saved by
+      // newer tasks); otherwise synthesize a single-slot list from the
+      // legacy (hour, minute) pair so pre-multi-time tasks edit fine.
+      let times = [];
+      if (Array.isArray(s.times) && s.times.length) {
+        times = s.times
+          .filter(x => x && typeof x.hour === "number" && typeof x.minute === "number")
+          .map(x => ({ hour: x.hour, minute: x.minute }));
+      }
+      if (!times.length) {
+        times = [{
+          hour: (typeof s.hour === "number") ? s.hour : 9,
+          minute: (typeof s.minute === "number") ? s.minute : 0,
+        }];
+      }
       this.scheduler.draft = {
         editingId: t.id,
         name: t.name || "",
         prompt: t.prompt || "",
         model: t.model || "",
         kind: s.kind || "daily",
-        hour: (typeof s.hour === "number") ? s.hour : 9,
-        minute: (typeof s.minute === "number") ? s.minute : 0,
+        times,
         weekdays: Array.isArray(s.weekdays) ? s.weekdays.slice() : [1, 2, 3, 4, 5],
         day: (typeof s.day === "number") ? s.day : 1,
         onceDate: (s.kind === "once" && s.year && s.month && s.day)
@@ -10322,12 +10970,33 @@ function portal() {
       // edit so the backend fires at the user's local hh:mm regardless of
       // where the server clock thinks it is — fixes the Docker/UTC case
       // where "daily 09:00" fired at 17:00 Beijing time.
+      //
+      // Time slots: we always send (hour, minute) = times[0] so the
+      // Pydantic schema's required fields are satisfied (keeps the
+      // single-time path identical to before). For daily with multiple
+      // slots, also send the full `times` array — sorted + deduped by
+      // (h, m) so display order is stable and "08:00 / 08:00" collapses
+      // before hitting the backend.
+      const sortedTimes = [...(d.times || [{ hour: 9, minute: 0 }])]
+        .filter(t => Number.isFinite(t.hour) && Number.isFinite(t.minute))
+        .sort((a, b) => (a.hour - b.hour) || (a.minute - b.minute))
+        .filter((t, i, arr) => i === 0
+          || t.hour !== arr[i - 1].hour || t.minute !== arr[i - 1].minute);
+      const firstTime = sortedTimes[0] || { hour: 9, minute: 0 };
       const sched = {
         kind: d.kind,
-        hour: Number(d.hour),
-        minute: Number(d.minute),
+        hour: Number(firstTime.hour),
+        minute: Number(firstTime.minute),
         tz_offset_minutes: -new Date().getTimezoneOffset(),
       };
+      // Only attach `times` for daily with >1 slot — keeps weekly/monthly/
+      // once and single-time daily payloads byte-identical to the pre-
+      // multi-time format, so nothing about old behavior changes.
+      if (d.kind === "daily" && sortedTimes.length > 1) {
+        sched.times = sortedTimes.map(t => ({
+          hour: Number(t.hour), minute: Number(t.minute),
+        }));
+      }
       if (d.kind === "weekly") {
         if (!d.weekdays.length) {
           this.toast(this.lang === "zh"
@@ -10389,7 +11058,23 @@ function portal() {
       const zh = this.lang === "zh";
       const hh = String(s.hour).padStart(2, "0") + ":"
                 + String(s.minute).padStart(2, "0");
-      if (s.kind === "daily") return (zh ? "每天 " : "Daily ") + hh;
+      if (s.kind === "daily") {
+        // Multi-time daily: show all slots up to 4 inline; collapse beyond
+        // that into "每天 N 个时段（首个 HH:MM）" so a 12-slot list doesn't
+        // overflow the row.
+        const arr = Array.isArray(s.times) ? s.times : null;
+        if (arr && arr.length > 1) {
+          const fmt = (t) => String(t.hour).padStart(2, "0") + ":"
+                          + String(t.minute).padStart(2, "0");
+          if (arr.length <= 4) {
+            return (zh ? "每天 " : "Daily ") + arr.map(fmt).join(", ");
+          }
+          return zh
+            ? `每天 ${arr.length} 个时段（首个 ${fmt(arr[0])}）`
+            : `Daily ${arr.length} times (first ${fmt(arr[0])})`;
+        }
+        return (zh ? "每天 " : "Daily ") + hh;
+      }
       if (s.kind === "weekly") {
         const names = zh
           ? ["一", "二", "三", "四", "五", "六", "日"]
@@ -10410,20 +11095,52 @@ function portal() {
     },
     async deleteSchedTask(t) {
       const zh = this.lang === "zh";
-      const ok = await this.confirm({
-        title: zh ? "删除任务" : "Delete task",
-        body: zh
-          ? `确定删除「${t.name}」？关联的 [定时] 会话会一并删除。`
-          : `Delete "${t.name}"? The bound [Scheduled] session is removed too.`,
-        danger: true,
-        okText: zh ? "删除" : "Delete",
-      });
+      // Diagnostic: log entry so we can tell from console whether the
+      // click handler is firing at all. (Failure mode "trash button does
+      // nothing" — without this we can't tell whether the click never
+      // fired or the confirm/fetch silently failed.)
+      console.log("[muselab][sched] deleteSchedTask invoked for", t && t.id, t && t.name);
+      let ok;
+      try {
+        ok = await this.confirm({
+          title: zh ? "删除任务" : "Delete task",
+          body: zh
+            ? `确定删除「${t.name}」？关联的 [定时] 会话会一并删除。`
+            : `Delete "${t.name}"? The bound [Scheduled] session is removed too.`,
+          danger: true,
+          okText: zh ? "删除" : "Delete",
+        });
+      } catch (e) {
+        this.toast(zh ? "确认弹窗异常：" + (e && e.message)
+                       : "Confirm error: " + (e && e.message),
+                    "error", 4000);
+        return;
+      }
       if (!ok) return;
-      const r = await fetch("/api/scheduler/tasks/" + encodeURIComponent(t.id),
-        { method: "DELETE", headers: this.hdr() });
-      if (r.ok) {
+      try {
+        const r = await fetch("/api/scheduler/tasks/" + encodeURIComponent(t.id),
+          { method: "DELETE", headers: this.hdr() });
+        if (!r.ok) {
+          // Surface the actual HTTP status + body so we stop the "delete
+          // did nothing" mystery (previously: silent return on r.ok=false).
+          let body = "";
+          try { body = await r.text(); } catch (_) {}
+          this.toast(
+            (zh ? "删除失败 HTTP " : "Delete failed HTTP ")
+              + r.status + (body ? ": " + body.slice(0, 200) : ""),
+            "error", 5000);
+          return;
+        }
         if (this.scheduler.draft.editingId === t.id) this._resetSchedDraft();
         await this.loadSchedulerTasks();
+        this.toast(zh ? "任务已删除" : "Task deleted", "success", 2000);
+      } catch (e) {
+        // Network-level failure — typically iOS Safari losing the request
+        // mid-flight on flaky 4G. Show the user what happened.
+        this.toast(
+          (zh ? "删除请求失败：" : "Delete network error: ")
+            + (e && (e.name + (e.message ? " — " + e.message : ""))),
+          "error", 5000);
       }
     },
     async toggleSchedEnabled(t) {
@@ -10536,7 +11253,7 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           const next = d.unread_count || 0;
-          if (next > this._lastSeenUnread && this.notifyPrefs.vibrate) {
+          if (next > this._lastSeenUnread && this.notifyEnabled) {
             // 3-pulse "task done" pattern. navigator.vibrate is a no-op
             // (returns false) on devices without a vibration motor, so
             // it's safe to call unconditionally.
@@ -10549,19 +11266,40 @@ function portal() {
     },
     saveNotifyPrefs() {
       try {
-        localStorage.setItem("muselab_notify",
-          JSON.stringify(this.notifyPrefs));
+        localStorage.setItem("muselab_notify_enabled",
+          this.notifyEnabled ? "1" : "0");
       } catch {}
     },
-    async onPushToggle(ev) {
-      const wantOn = ev?.target?.checked ?? this.notifyPrefs.push;
+    // Single entry point for the one notification switch. ON does best-
+    // effort across capabilities: (1) request Notification permission,
+    // (2) subscribe to Web Push so background events come through even
+    // when muselab is closed. Vibration is automatic — `notifyEnabled`
+    // is the gate fetchSchedulerUnread() checks. We treat "some capability
+    // worked" as success; on most desktops vibration is a no-op and push
+    // is the meaningful part, on iOS-without-PWA push fails silently and
+    // only foreground vibration works — but the toggle still reflects
+    // "you'll be notified to whatever extent your device allows".
+    async onNotifyToggle(ev) {
+      const wantOn = ev?.target?.checked ?? this.notifyEnabled;
       if (wantOn) {
-        const ok = await this.pushSubscribe();
-        this.notifyPrefs.push = ok;
-        if (ev?.target) ev.target.checked = ok;
+        // Best-effort push subscribe. Even if it fails (browser unsupported,
+        // permission denied, iOS-without-PWA, …), foreground vibrate still
+        // works, so we keep the switch ON unless the user explicitly toggles
+        // it off. pushSubscribe() already toasts its own error reason.
+        const pushOk = await this.pushSubscribe();
+        this.notifyEnabled = true;
+        if (!pushOk) {
+          // Surface the partial-success state so the user understands why
+          // they may not get background pushes — but doesn't think the
+          // whole switch is broken.
+          this.toast(this.lang === "zh"
+            ? "已开启前台提醒；后台推送不可用（详见上一条）"
+            : "Foreground reminders on; background push unavailable (see prior toast)",
+            "warn", 4500);
+        }
       } else {
         await this.pushUnsubscribe();
-        this.notifyPrefs.push = false;
+        this.notifyEnabled = false;
       }
       this.saveNotifyPrefs();
     },
@@ -10638,10 +11376,23 @@ function portal() {
       return buf;
     },
     loadNotifyPrefs() {
+      // New key first; fall back to the 2026-05 vibrate/push pair so
+      // existing users don't get silently flipped to OFF on upgrade.
+      // Migration rule: either old flag → new switch ON. After one save
+      // the old key is gone; next read just hits the new key.
       try {
+        const v = localStorage.getItem("muselab_notify_enabled");
+        if (v === "0" || v === "1") {
+          this.notifyEnabled = v === "1";
+          return;
+        }
+        // Legacy shape — `{"vibrate": bool, "push": bool}`.
         const p = JSON.parse(localStorage.getItem("muselab_notify") || "{}");
-        if (typeof p.vibrate === "boolean") this.notifyPrefs.vibrate = p.vibrate;
-        if (typeof p.push === "boolean")    this.notifyPrefs.push    = p.push;
+        if (p && (p.vibrate === true || p.push === true)) {
+          this.notifyEnabled = true;
+          this.saveNotifyPrefs();
+          localStorage.removeItem("muselab_notify");
+        }
       } catch {}
     },
     async openSchedTaskSession(t) {

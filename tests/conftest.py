@@ -82,8 +82,7 @@ def app_module(monkeypatch, temp_root, tmp_path):
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
               "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
               "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",
-              "MUSELAB_MAX_TURNS", "MUSELAB_NOTIFY_SCHEDULED",
-              "MUSELAB_NOTIFY_NORMAL"):
+              "MUSELAB_MAX_TURNS"):
         monkeypatch.delenv(k, raising=False)
 
     return main_mod

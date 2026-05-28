@@ -1765,6 +1765,16 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 .markdown {
   padding: var(--sp-6) var(--sp-8);
   max-width: 920px;
+  /* Auto-center the content column when the parent (preview-body) is wider
+     than max-width — without this, a fullscreen preview on a 1920px monitor
+     leaves the markdown stuck to the left edge with a huge empty band on
+     the right. The cap at 920px matches comfortable reading width (~75 chars
+     at our font size) and avoids exhausting line lengths. HTML preview
+     (iframe) doesn't need this because the HTML doc controls its own
+     layout; markdown preview is the rendered output we own.
+     2026-05-28 user feedback: "只有 html 全屏预览才是居中的". */
+  margin-left: auto;
+  margin-right: auto;
   font-size: var(--fs-md);
   line-height: 1.75;
 }
@@ -2330,12 +2340,12 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
    TaskOutput tool_uses skipped by shouldRenderTaskLine) the wrapper is
    visually empty but still participates in `.chat-body`'s `gap: var(--sp-2)`
    between siblings, leaving a visible band of whitespace below the
-   preceding bubble. `:has(> :not(template))` matches wrappers that have
-   at least one rendered (non-template-placeholder) direct child; negate
-   it to catch the all-templates-falsy case. Requires :has support
-   (Chrome 105+, Safari 15.4+, Firefox 121+) — already a baseline
-   elsewhere in this stylesheet. */
-.msg:not(:has(> :not(template))) { display: none; }
+   preceding bubble.
+   The class `is-hidden` is computed in JS via isMsgRenderable(m) and
+   set on the .msg wrapper at :class binding time — reliably cross-
+   browser. (Old version used `.msg:not(:has(> :not(template)))` but
+   iOS Safari 15.x has dynamic-:has bugs that left the wrapper visible.) */
+.msg.is-hidden { display: none; }
 /* Bubble-internal first/last block: kill the outer markdown margin
    so the bubble's own padding (8px 11px) is the only top/bottom inset.
    Without this, a leading `<p>` adds ~12px (margin: 0.7em 0 from
@@ -2349,13 +2359,11 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
    children (e.g. tables, blockquotes), which need their margins. */
 .bubble > :first-child { margin-top: 0; }
 .bubble > :last-child { margin-bottom: 0; }
-/* When the code-review diff strip is collapsed (Alpine x-show writes
-   `style="display: none;"` on `.diff-body`), kill the strip's bottom
-   margin so the next bubble sits flush. Expanded keeps the 8px
-   breathing room defined on `.diff-strip-cr`. The `[style*="none"]`
-   substring match tolerates Alpine's exact whitespace (`display: none;`
-   vs `display:none`) and any future format tweak. */
-.diff-strip-cr:has(> .diff-body[style*="none"]) { margin-bottom: 0; }
+/* (Old `.diff-strip-cr.is-collapsed { margin-bottom: 0 }` and the
+   :has() rule it replaced are both removed — diff-strip-cr now has
+   `margin-bottom: 0` unconditionally at its base declaration below.
+   chat-body's gap handles vertical separation between messages, which
+   is enough breathing room in both expanded and collapsed states.) */
 /* user side hugs the right; muse side hugs the left. Both with the
    SAME max-row-width — true wechat mirror layout. */
 .msg.user { align-items: flex-end; }
@@ -3532,6 +3540,236 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   cursor: pointer;
 }
 .img-chip-x svg { width: 10px; height: 10px; }
+/* "✎ Annotate" button on the image chip — sits at the bottom-right of the
+   chip (paired diagonally with the × at top-right). Same circular dark
+   pill style as -x so the two controls read as a set. Hidden until chip
+   hover on desktop to keep the 64×64 thumbnail clean; always visible on
+   touch since hover isn't a discoverable affordance there. */
+.img-chip-edit {
+  position: absolute; bottom: 2px; right: 2px;
+  width: 18px; height: 18px;
+  background: rgba(0,0,0,0.55); color: #fff; border: none;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--t-fast), background var(--t-fast);
+}
+.img-chip-edit:hover { background: var(--c-accent); }
+.img-chip-edit svg { width: 10px; height: 10px; }
+.img-chip-edit[disabled] { opacity: 0; pointer-events: none; }
+.img-chip:hover .img-chip-edit:not([disabled]) { opacity: 1; }
+/* Touch fallback: always visible (faded) so users find it without hover. */
+@media (hover: none) {
+  .img-chip-edit:not([disabled]) { opacity: 0.85; }
+  .img-chip-edit { width: 22px; height: 22px; }
+  .img-chip-edit svg { width: 12px; height: 12px; }
+}
+
+/* ============================================================
+   Image annotation editor modal — opened by the ✎ button on an
+   img-chip. Full-viewport overlay; the canvas takes the central
+   area, toolbar across the bottom, actions row at the very foot.
+   Mobile uses 100dvw / 100dvh so iOS Safari URL bar movements
+   don't shrink the available area.
+   ============================================================ */
+.img-editor-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  z-index: 1200;
+  display: flex; align-items: center; justify-content: center;
+  padding: var(--sp-3);
+}
+.img-editor {
+  background: var(--c-bg-1);
+  border-radius: var(--r-md);
+  display: flex; flex-direction: column;
+  width: 100%; max-width: 880px;
+  max-height: 100%;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.4);
+}
+.img-editor-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--c-border);
+}
+.img-editor-title {
+  flex: 1;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--c-fg-0);
+}
+.img-editor-head .modal-close {
+  background: transparent; border: 0; padding: 4px 8px;
+  font-size: 22px; line-height: 1;
+  color: var(--c-fg-2); cursor: pointer;
+  border-radius: var(--r-sm);
+}
+.img-editor-head .modal-close:hover { color: var(--c-fg-0); background: var(--c-bg-2); }
+
+/* Canvas surrounds — center the canvas, give it a checkered backdrop
+   (so the user can tell where the image ends if it has white margins),
+   and let it scale down to fit without scrollbars. */
+.img-editor-canvas-wrap {
+  flex: 1; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 12px;
+  background:
+    repeating-conic-gradient(var(--c-bg-2) 0% 25%, var(--c-bg-1) 0% 50%)
+    0 0 / 16px 16px;
+  overflow: hidden;
+}
+.img-editor-canvas {
+  max-width: 100%; max-height: 100%;
+  background: #fff;
+  /* Crucial on touch: stop the browser from interpreting drag-pan / pinch
+     while the user is drawing. Without this iOS Safari treats every
+     pointermove as a scroll attempt. */
+  touch-action: none;
+  cursor: crosshair;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+}
+
+/* Toolbar — three pill groups (tools / colors / sizes) + undo on the
+   right. Scrolls horizontally on narrow screens so we never have to
+   make trade-offs about which tool to hide. */
+.img-editor-toolbar {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: 8px 14px;
+  border-top: 1px solid var(--c-border);
+  border-bottom: 1px solid var(--c-border);
+  background: var(--c-bg-2);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.img-editor-tool-group,
+.img-editor-color-group,
+.img-editor-size-group {
+  display: flex; align-items: center; gap: 4px;
+  flex-shrink: 0;
+}
+.img-editor-tool {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--c-fg-2);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+  touch-action: manipulation;
+}
+.img-editor-tool svg {
+  width: 18px; height: 18px;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.img-editor-tool:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.img-editor-tool.active {
+  background: var(--c-accent-soft);
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+}
+.img-editor-tool[disabled] {
+  opacity: 0.4; cursor: not-allowed; pointer-events: none;
+}
+/* Action group — undo (and any future redo) live here, visually
+   separated from the tool/color/size groups by a vertical divider.
+   `margin-left: auto` on the group (not the button) pushes the whole
+   block to the toolbar's trailing edge in LTR layouts. */
+.img-editor-action-group {
+  display: flex; align-items: center; gap: 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.img-editor-divider {
+  display: inline-block;
+  width: 1px; height: 20px;
+  background: var(--c-border);
+  margin: 0 4px;
+}
+/* Action button — same 36×36 footprint as .img-editor-tool so the
+   click target stays consistent, but visually distinct: no `.active`
+   state (an action never stays "on"), and a press feedback (scale
+   0.95) so the user gets tactile confirmation the click fired even
+   when the canvas changes subtly. Disabled state mirrors the tool
+   buttons for visual consistency. */
+.img-editor-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--c-fg-2);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
+  touch-action: manipulation;
+}
+.img-editor-action svg {
+  width: 18px; height: 18px;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.img-editor-action:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.img-editor-action:active:not([disabled]) { background: var(--c-bg-3); transform: scale(0.92); }
+.img-editor-action[disabled] {
+  opacity: 0.35; cursor: not-allowed; pointer-events: none;
+}
+
+.img-editor-color {
+  width: 24px; height: 24px;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  cursor: pointer; padding: 0;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
+  transition: transform var(--t-fast), border-color var(--t-fast);
+  touch-action: manipulation;
+}
+.img-editor-color.active {
+  border-color: var(--c-fg-0);
+  transform: scale(1.15);
+}
+
+.img-editor-size {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px;
+  background: transparent;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  color: var(--c-fg-2);
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+  touch-action: manipulation;
+}
+.img-editor-size.active {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+}
+.img-editor-size-dot {
+  display: inline-block;
+  background: currentColor;
+  border-radius: 50%;
+}
+.img-editor-size.active .img-editor-size-dot { background: var(--c-accent); }
+
+.img-editor-foot {
+  display: flex; gap: var(--sp-2);
+  justify-content: flex-end;
+  padding: 10px 14px;
+}
+
+/* Mobile: full-screen modal, vertical toolbar layout if too narrow. */
+@media (max-width: 640px) {
+  .img-editor-backdrop { padding: 0; }
+  .img-editor {
+    border-radius: 0;
+    width: 100vw; height: 100vh; height: 100dvh;
+    max-height: 100dvh; max-width: 100vw;
+  }
+  .img-editor-toolbar { padding: 8px 10px; gap: 12px; }
+  .img-editor-foot { padding: 10px; }
+}
 .user-msg-imgs {
   display: flex; flex-wrap: wrap; gap: 6px;
   margin-bottom: 6px;
@@ -3773,9 +4011,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* Per-provider help text (where to get key, alt paths) */
 .provider-row .provider-help {
   grid-column: 2;
-  margin-top: var(--sp-1);
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-1);
+  border-top: 1px dashed var(--c-border);
   font-size: var(--fs-xs);
-  color: var(--c-text-2);
+  color: var(--c-fg-3);
   line-height: 1.55;
 }
 .provider-row .provider-help a {
@@ -3785,6 +4025,71 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   white-space: nowrap;
 }
 .provider-row .provider-help a:hover { text-decoration: underline; }
+
+/* Mobile / narrow-pane layout for provider rows (2026-05-28 user-reported
+   "样式很差劲" on iPhone portrait). Issues on mobile:
+   - 220px label column left ~130px for [toggle + input + 保存], all squashed
+   - Help text fused visually with the control row (same bg, tiny gap)
+   - Tap targets cramped, easy to mis-tap
+   Fix: card-ify each row (bg + padding + radius), stack to single column,
+   bold the label, allow controls to wrap, enlarge tap targets. */
+@media (max-width: 720px) {
+  .provider-row {
+    grid-template-columns: 1fr;
+    row-gap: var(--sp-2);
+    padding: 12px;
+    background: var(--c-bg-2);
+    border: 1px solid var(--c-border);
+    border-radius: var(--r-md);
+    margin-bottom: var(--sp-3);
+  }
+  .provider-row > label {
+    font-weight: var(--fw-medium);
+    color: var(--c-fg-0);
+    word-break: break-word;
+  }
+  .provider-row .settings-input-wrap {
+    flex-wrap: wrap;
+    column-gap: var(--sp-2);
+    row-gap: var(--sp-2);
+    align-items: center;
+  }
+  /* Input takes priority — grows to fill the row; 保存/取消 sit beside it
+     when there's room, drop to the next line otherwise. */
+  .provider-row .settings-input-wrap .settings-input {
+    flex: 1 1 60%;
+    min-width: 140px;
+  }
+  /* Toggle pushed to its own logical "header" position: visually first,
+     so the row reads "[enable] [key field] [save]". */
+  .provider-row .settings-input-wrap > .switch {
+    flex-shrink: 0;
+  }
+  /* Larger tap targets for buttons on touch (default 32px is below the
+     44px Apple guideline). 保存/取消/测试/修改 all benefit. */
+  .provider-row .settings-input-wrap .btn-primary,
+  .provider-row .settings-input-wrap .btn-ghost {
+    height: 36px;
+    padding: 0 14px;
+    flex-shrink: 0;
+  }
+  /* Help text: card-bg already separates the row visually, so the dashed
+     top border becomes redundant and a bit busy. Drop it on mobile and
+     keep some breathing room via margin. */
+  .provider-row .provider-help {
+    grid-column: 1;
+    border-top: none;
+    padding-top: 0;
+    margin-top: 4px;
+  }
+  /* Status badge: a hair more padding on mobile so "已配置" reads as a
+     proper pill rather than a cramped sticker next to the toggle. */
+  .provider-row .settings-badge {
+    height: 26px;
+    padding: 0 10px;
+    font-size: var(--fs-sm);
+  }
+}
 
 /* Onboarding cards in chat empty state */
 .onboard-card {
@@ -4596,6 +4901,42 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .mention-item .body { flex: 1; min-width: 0; }
 .mention-item .name { font-size: var(--fs-sm); color: var(--c-fg-0); }
 .mention-item .path-hint { font-size: var(--fs-xs); color: var(--c-fg-3); }
+/* Name row when there's a "已打开" badge — flex with the badge so the
+   name truncates and the badge stays pinned next to it. Without this
+   the badge would wrap on long filenames. */
+.mention-item .name-row {
+  display: flex; align-items: center; gap: 6px;
+  min-width: 0;
+}
+.mention-item .name-row .name { flex: 0 1 auto; min-width: 0; }
+/* Open-tab badge — small pill that distinguishes "currently open in a
+   preview tab" from generic archive search hits. Color matches the
+   accent so it reads as "active / live" rather than incidental. */
+.mention-open-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: var(--fw-medium);
+  padding: 1px 6px;
+  border-radius: var(--r-full);
+  background: var(--c-accent-soft);
+  color: var(--c-accent);
+  line-height: 1.5;
+}
+.mention-item.sel .mention-open-badge,
+.mention-item:hover .mention-open-badge {
+  background: var(--c-accent);
+  color: var(--c-on-accent, #fff);
+}
+/* Visually nudge open items: subtle left accent border so even when the
+   list mixes open + archive results, you can spot the open ones at a
+   glance without reading the badge. */
+.mention-item.is-open {
+  box-shadow: inset 3px 0 0 var(--c-accent-soft);
+}
+.mention-item.is-open:hover,
+.mention-item.is-open.sel {
+  box-shadow: inset 3px 0 0 var(--c-accent);
+}
 
 /* ==========================================================================
    Toast
@@ -4672,6 +5013,15 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: flex; align-items: center; justify-content: center;
   animation: backdrop-in var(--t-base);
 }
+/* Confirm / prompt dialogs MUST sit above any other modal — they're
+   spawned FROM other modals (e.g. scheduler delete → confirm) and need
+   to be visible & clickable on top. Without this, the scheduler modal's
+   backdrop (same z-index 900) wins on source order (it's rendered AFTER
+   the confirm-backdrop in DOM), so the confirm appears behind the
+   scheduler and the user's "delete" tap goes nowhere. Bug surfaced
+   2026-05-28: "点击定时任务的删除没效果". 1300 also keeps the confirm
+   above the image-editor backdrop (z-index 1200). */
+.confirm-backdrop { z-index: 1300; }
 @keyframes backdrop-in { from { opacity: 0; } to { opacity: 1; } }
 .modal {
   background: var(--c-bg-1); border: 1px solid var(--c-border-strong);
@@ -5749,8 +6099,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .sched-body { max-height: 70vh; overflow-y: auto; padding: 12px 16px; }
 .sched-create {
-  display: flex; flex-direction: column; gap: 10px;
-  padding: 14px; margin-bottom: 18px;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 16px; margin-bottom: 20px;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);
@@ -5822,6 +6172,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .sched-freq-btn.active {
   background: var(--c-accent);
   color: white;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.12);
+  font-weight: var(--fw-medium);
 }
 
 .sched-weekdays {
@@ -5853,25 +6205,84 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); color: var(--c-fg-3);
 }
 
-.sched-time {
-  display: inline-flex; align-items: center; gap: var(--sp-1);
-}
-.sched-time-input {
-  width: 64px; text-align: center;
+/* Native HTML5 time picker — replaces the old hour + ":" + minute
+   number-input combo. Fixed width keeps it from stretching to full
+   field; mono font keeps the digits aligned. */
+.sched-input-time {
+  width: 110px; text-align: center;
   font-family: var(--font-mono);
+  letter-spacing: 0.5px;
 }
-.sched-time-sep {
-  color: var(--c-fg-3); font-weight: var(--fw-semibold);
-  font-family: var(--font-mono);
+
+/* Multi-time list (daily). One row per slot — time picker + delete button
+   side-by-side; "+ Add time" stacked underneath. For non-daily kinds the
+   list still renders but with only one row and no +/- affordances. */
+.sched-field-times { align-items: flex-start; }
+.sched-field-times .sched-label { margin-top: 6px; }
+.sched-times {
+  display: flex; flex-direction: column; gap: 6px;
+  min-width: 0;
 }
-/* Hide number-input spinners — they overflow our narrow 64px cells. */
-.sched-time-input::-webkit-outer-spin-button,
-.sched-time-input::-webkit-inner-spin-button,
+.sched-times-row {
+  display: flex; align-items: center; gap: 8px;
+}
+/* Per-slot delete (×). Small, muted by default — red on hover. Sits
+   right of the time picker; absent for the only-remaining slot
+   (refuse-to-delete-last logic lives in removeDraftTime). */
+.sched-times-del {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0;
+  background: transparent; border: 0; border-radius: var(--r-sm);
+  color: var(--c-fg-3); font-size: 18px; line-height: 1;
+  cursor: pointer; flex-shrink: 0;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.sched-times-del:hover {
+  background: var(--c-bg-3);
+  color: var(--c-danger, #ef4444);
+}
+/* Add-slot button. Sits below the row list, ghost-link styling so it
+   reads as "secondary affordance" — primary is the green "+ 添加任务"
+   button at the form foot. */
+.sched-times-add {
+  align-self: flex-start;
+  background: transparent; border: 1px dashed var(--c-border-strong);
+  padding: 4px 10px; border-radius: var(--r-sm);
+  color: var(--c-fg-2); font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+}
+.sched-times-add:hover {
+  color: var(--c-accent);
+  border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+.sched-times-hint {
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  margin-top: 2px;
+}
+/* Hide number-input spinner on the remaining .sched-day-input (monthly
+   day-of-month). Webkit spinners overflow our narrow 64px cell. */
 .sched-day-input::-webkit-outer-spin-button,
 .sched-day-input::-webkit-inner-spin-button {
   -webkit-appearance: none; margin: 0;
 }
-.sched-time-input, .sched-day-input { -moz-appearance: textfield; }
+.sched-day-input { -moz-appearance: textfield; }
+
+/* Trigger block — visually groups everything that defines WHEN a task
+   runs (frequency, variant-specific picker, time). Sits as a subtle
+   inset card inside the create form so the eye separates schedule
+   shape from content (name / prompt / model). */
+.sched-trigger-block {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px;
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+}
+.sched-create.is-editing .sched-trigger-block {
+  background: var(--c-bg-2);
+}
 
 .sched-create-prompt {
   width: 100%; padding: 8px 10px; resize: vertical;
@@ -5912,10 +6323,21 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 
 .sched-section { margin-bottom: var(--sp-4); }
 .sched-section-title {
+  display: flex; align-items: center; gap: 6px;
   font-size: var(--fs-xs); font-weight: var(--fw-semibold);
   color: var(--c-accent); letter-spacing: 0.6px; text-transform: uppercase;
   margin-bottom: var(--sp-2); padding-bottom: 4px;
   border-bottom: 1px solid var(--c-border);
+}
+/* Small leading icon for section titles (list / history). Matches the
+   2026-05-22 icon-sweep style: stroked Lucide, currentColor so it
+   inherits the accent color from the title text. */
+.sched-section-icon {
+  width: 13px; height: 13px;
+  stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  flex-shrink: 0;
+  opacity: 0.85;
 }
 /* Section head wrapper — title on the left, bulk-action button(s) on
    the right (e.g. "清空" on the recent-runs section). Inherits the
@@ -5948,15 +6370,27 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border: 1px dashed var(--c-border-strong); border-radius: var(--r-md);
 }
 
+/* Task row — left-edge status band makes enabled / disabled state
+   readable at a glance (was: only opacity 0.55 on the whole row, easy
+   to miss). Border-left thickens to 3px and shifts color by state:
+     enabled → accent
+     disabled → muted gray
+   `padding-left` is reduced by 2px so total visual width stays the
+   same as before the thicker border was added. */
 .sched-row {
+  position: relative;
   display: flex; align-items: flex-start; gap: 10px;
-  padding: 10px 12px; margin-bottom: 6px;
+  padding: 10px 12px 10px 10px; margin-bottom: 6px;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
+  border-left: 3px solid var(--c-accent);
   border-radius: var(--r-md);
-  transition: background var(--t-fast);
+  transition: background var(--t-fast), border-color var(--t-fast);
 }
-.sched-row.disabled { opacity: 0.55; }
+.sched-row.disabled {
+  opacity: 0.6;
+  border-left-color: var(--c-border-strong);
+}
 .sched-row:hover { background: var(--c-bg-3); }
 /* Rows are click-through to their bound session — cursor + a stronger
    hover state telegraph that. Applies to both .sched-row (configured
@@ -5983,9 +6417,50 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: var(--font-mono);
   display: flex; gap: var(--sp-3);
 }
+/* Action buttons fade in on row hover — keeps the list visually quiet
+   when scanning many tasks. The switch always stays visible since it's
+   the primary on/off affordance; only the per-row icon buttons fade. */
 .sched-row-actions {
   display: flex; align-items: center; gap: var(--sp-1);
   flex-shrink: 0;
+}
+.sched-row-actions .icon-btn {
+  opacity: 0;
+  transition: opacity var(--t-fast);
+}
+.sched-row:hover .sched-row-actions .icon-btn,
+.sched-row-actions .icon-btn:focus-visible,
+.sched-row-actions .icon-btn.active {
+  opacity: 1;
+}
+/* Touch / small-screen fallback. Three changes vs desktop hover:
+   1. Keep icon buttons visible (faded), since hover-discovery doesn't work
+   2. Expand the touch target to 40×40 — the desktop .icon-btn.sm is 22×22
+      which is below Apple's 44×44 minimum and finger-taps frequently miss,
+      landing on the row instead → opens the bound session and looks like
+      "the button does nothing".
+   3. `touch-action: manipulation` removes the 300ms tap delay on iOS
+      Safari and prevents accidental double-tap-zoom on the button area.
+
+   Belt-and-suspenders selector: `(hover: none), (pointer: coarse), (max-width: 720px)`.
+   Any one matching is enough — defends against iPads-with-trackpad
+   reporting `hover: hover` and against unusual UA hover-feature behaviour.
+   Visual hit area is 40×40 even though the underlying SVG icon stays
+   13×13 (.icon-btn.sm svg rule, unchanged) — so the chip's visual weight
+   doesn't increase. */
+@media (hover: none), (pointer: coarse), (max-width: 720px) {
+  .sched-row-actions .icon-btn,
+  .sched-row-actions .icon-btn.sm {
+    opacity: 0.9;
+    width: 40px; height: 40px;
+    min-width: 40px; min-height: 40px;
+    touch-action: manipulation;
+  }
+  .sched-row-actions .icon-btn:active { opacity: 1; }
+  .sched-row-actions .switch.sm { padding: 8px 4px; }
+  /* Increase visible icon a bit so the 40×40 target doesn't have a tiny
+     13px icon floating in space — feels more clickable. */
+  .sched-row-actions .icon-btn.sm svg { width: 16px; height: 16px; }
 }
 
 .sched-hist-row {
@@ -6933,7 +7408,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    Default expanded; +/− rows get full-bleed green/red backgrounds.
    ============================================================ */
 .diff-strip-cr {
-  margin: 8px 0 8px 38px;
+  /* No bottom margin — chat-body's `gap: var(--sp-2)` provides separation
+     to the next .msg. Adding bottom margin here used to double-count and
+     created visible blank space below collapsed strips (2026-05-28). */
+  margin: 8px 0 0 38px;
   border: 1px solid var(--c-border);
   border-radius: var(--r-md);
   overflow: hidden;

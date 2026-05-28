@@ -114,7 +114,11 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
     users from getting their windows shifted overnight.
 
     Supported `kind` values:
-      daily            — every day at hour:minute (user-local)
+      daily            — every day at hour:minute (user-local). If
+                          schedule["times"] is a non-empty list of
+                          {hour, minute} dicts, fires at EACH of those
+                          times per day instead of the single hour:minute
+                          (multi-time-per-day support).
       weekly           — schedule["weekdays"] is a list of ints 0..6
                           (0=Mon, 6=Sun), at hour:minute
       monthly          — every month on schedule["day"] (1..31), at
@@ -159,10 +163,34 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
         ref_ts if ref_ts is not None else time.time(), tz=tz)
 
     if kind == "daily":
-        target = base.replace(hour=h, minute=m, second=0, microsecond=0)
-        if target <= base:
-            target += timedelta(days=1)
-        return target.timestamp()
+        # Collect candidate (h, m) slots. Multi-time path: schedule["times"]
+        # non-empty list of dicts. Single-time fallback: just (h, m) from
+        # the top-level fields — preserves pre-multi-time tasks unchanged.
+        raw = schedule.get("times") or []
+        slots: list[tuple[int, int]] = []
+        for entry in raw:
+            try:
+                th = int(entry.get("hour"))
+                tm = int(entry.get("minute"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if 0 <= th <= 23 and 0 <= tm <= 59:
+                slots.append((th, tm))
+        if not slots:
+            slots = [(h, m)]
+        # Find the earliest candidate strictly > base. Probe today + tomorrow
+        # since with multiple slots the next fire might still be today even
+        # if the first slot is already past (e.g. slots = [08, 14, 22], now
+        # is 15:00 → next is today 22:00).
+        best: datetime | None = None
+        for delta in (0, 1):
+            day_base = base + timedelta(days=delta)
+            for th, tm in slots:
+                cand = day_base.replace(hour=th, minute=tm,
+                                         second=0, microsecond=0)
+                if cand > base and (best is None or cand < best):
+                    best = cand
+        return best.timestamp() if best else None
 
     if kind == "weekly":
         wds = schedule.get("weekdays") or []
@@ -480,12 +508,24 @@ async def _execute_task(task: dict) -> None:
             if len(_state["history"]) > _HISTORY_CAP:
                 _state["history"] = _state["history"][-_HISTORY_CAP:]
             _save_state()
-            # Fire Web Push to every subscribed device. Gated by the
-            # `notify_scheduled` setting so users can mute scheduled-task pushes
-            # independently from normal turn-done pushes (see api_settings.py).
+            # Fire Web Push to every subscribed device — but skip when the
+            # user is actively at one of their devices (presence heartbeat
+            # within GRACE_SECONDS). In-app the UI already flashes the bell
+            # badge / fires foreground vibration on unread_count tick;
+            # adding a push banner on top would be doubled noise. This
+            # mirrors the gate chat.py uses for turn-done pushes, so the
+            # behavior is consistent across both event classes — the
+            # subscription is the only "notify on / off" switch a user has
+            # to manage, not a per-class env toggle (2026-05-28: collapsed
+            # 4-toggle UI down to one "notify me" switch).
             # Errors swallowed — push is best-effort, must never break the loop.
-            if os.environ.get("MUSELAB_NOTIFY_SCHEDULED", "true").lower() != "false":
-                try:
+            try:
+                from . import presence as _presence
+                if _presence.recently_active():
+                    # User is at their screen — UI badge + foreground vibrate
+                    # handle the notification. Don't double-buzz.
+                    pass
+                else:
                     from . import push as _push
                     # Prefix with ⏰ so the notification banner is universally
                     # recognizable as muselab scheduler output across both zh
@@ -502,8 +542,8 @@ async def _execute_task(task: dict) -> None:
                         body = _plain_preview(preview or "")
                     _push.send_to_all(title=title, body=body or "—",
                                       url="/", tag=f"task-{tid}")
-                except Exception as e:
-                    sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
+            except Exception as e:
+                sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 
 
 # ---------- daemon loop ----------

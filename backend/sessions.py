@@ -584,11 +584,27 @@ def bump_session(sid: str, message_count: int | None = None,
                   turn_count: int | None = None,
                   auto_rename_from: str | None = None) -> None:
     """Update updated_at and optionally message_count / turn_count;
-    opportunistically auto-rename from the first substantive user message
-    text. Auto-rename also writes an `ai-title` entry to the CLI JSONL so
-    that `claude --resume` picker shows muselab-created sessions (without
-    the ai-title entry, cc's picker silently skips them — only
-    `--resume <sid>` explicit resume works)."""
+    opportunistically write a local fallback `name` from the first
+    substantive user message text.
+
+    We deliberately do NOT call SDK rename_session here. CC CLI auto-
+    generates a real `aiTitle` (Haiku-summarized, often higher quality
+    than a first-line snippet) and writes it to the JSONL after each
+    turn. SDK rename_session would write `customTitle`, which beats
+    aiTitle in the merge — preempting CLI's AI summary forever. Instead
+    we just stash a local snippet in the muselab index; the merge in
+    `_merge_sdk_with_index` falls back to it via:
+        info.custom_title (= customTitle OR aiTitle from CLI)
+        or m.get("name")      ← us, the fallback
+        or first-line snippet
+    so the CLI-generated aiTitle naturally takes over once CLI writes it.
+
+    Side effect of this change: `claude --resume` picker may briefly skip
+    muselab-created sessions that haven't yet had CLI write an ai-title
+    entry (picker filters on ai-title). The gap closes as soon as CLI
+    runs aiTitle generation on the next turn — empty / first-turn-only
+    sessions in the picker is the tradeoff for getting real AI summaries.
+    """
     with _INDEX_LOCK:
         idx = _load_index()
         for s in idx:
@@ -605,20 +621,5 @@ def bump_session(sid: str, message_count: int | None = None,
                     if title:
                         s["name"] = title
                         s["auto_named"] = False
-                        # Propagate to CLI JSONL so cc's `/resume` picker sees us.
-                        # rename_session writes a {"type":"ai-title", "aiTitle":...}
-                        # entry — this is what the picker filters on. Silent on
-                        # FileNotFound (JSONL not created yet) / ValueError.
-                        try:
-                            from claude_agent_sdk import rename_session as _sdk_rn
-                            from .settings import ROOT as _ROOT
-                            if _ROOT is not None:
-                                _sdk_rn(sid, title, directory=str(_ROOT))
-                        except (FileNotFoundError, ValueError):
-                            pass
-                        except Exception as _e:
-                            sys.stderr.write(
-                                f"[sessions] auto-rename ai-title write "
-                                f"failed for {sid}: {type(_e).__name__}: {_e}\n")
                 _save_index(idx)
                 return

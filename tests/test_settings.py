@@ -47,7 +47,6 @@ def test_put_settings_writes_env_and_refreshes(client, auth, monkeypatch, tmp_pa
     r = client.put("/api/settings", headers=auth, json={
         "deepseek_api_key": "sk-newvalue",
         "default_model": "claude-haiku-4-5-20251001",
-        "thinking_budget": 8000,
     })
     assert r.status_code == 200
     assert r.json()["ok"] is True
@@ -56,7 +55,6 @@ def test_put_settings_writes_env_and_refreshes(client, auth, monkeypatch, tmp_pa
     content = fake_env.read_text()
     assert "DEEPSEEK_API_KEY=sk-newvalue" in content
     assert "MUSELAB_DEFAULT_MODEL=claude-haiku-4-5-20251001" in content
-    assert "MUSELAB_THINKING_BUDGET=8000" in content
     # 原有内容保留
     assert "MUSELAB_TOKEN=existing-test-token-1234567890" in content
 

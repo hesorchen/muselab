@@ -706,7 +706,9 @@ async def _build_and_connect_client(
     supports_thinking = (provider is None) or provider.supports_thinking
     if supports_thinking:
         from claude_agent_sdk import ThinkingConfigEnabled
-        budget = env_int("MUSELAB_THINKING_BUDGET", 4000, min_value=0)
+        # Fixed at 10000 — no UI knob (2026-05-28). Power users can still
+        # override via the env var if they really need to.
+        budget = env_int("MUSELAB_THINKING_BUDGET", 10000, min_value=0)
         opts_kwargs["thinking"] = ThinkingConfigEnabled(
             type="enabled", budget_tokens=budget)
     else:
@@ -4083,13 +4085,16 @@ async def stream(
             # (2026-05-23 user report)
             was_cancelled = session_id in _pending_interrupts
             _pending_interrupts.discard(session_id)
-            # Web Push on turn-done. Four gates, in order:
-            #   1. MUSELAB_NOTIFY_NORMAL toggle (env-level mute switch)
-            #   2. Turn was NOT user-cancelled — see was_cancelled above.
-            #   3. No device has heartbeated /api/presence recently — i.e.
+            # Web Push on turn-done. Three gates, in order:
+            #   1. Turn was NOT user-cancelled — see was_cancelled above.
+            #   2. No device has heartbeated /api/presence recently — i.e.
             #      the user is NOT actively at any screen. See below.
-            #   4. Wrapped in try/except — push failure must never block
+            #   3. Wrapped in try/except — push failure must never block
             #      the stream's done event.
+            # (Previously also gated on MUSELAB_NOTIFY_NORMAL env var, but
+            # the UI's 4-toggle notification panel collapsed to a single
+            # "notify me" switch on 2026-05-28: subscription state IS the
+            # on/off — no need for a per-class server-side mute.)
             #
             # History of the gating logic:
             #   - v1: gated on "no live SSE subscriber" → broke multi-device
@@ -4107,8 +4112,7 @@ async def stream(
             #
             # Body intentionally minimal: session name + "Muse 已回复". No
             # preview text — the actual reply is one tap away in chat.
-            if (not was_cancelled
-                    and os.environ.get("MUSELAB_NOTIFY_NORMAL", "true").lower() != "false"):
+            if not was_cancelled:
                 from . import presence as _presence
                 if _presence.recently_active():
                     # User is at one of their devices — they'll see the

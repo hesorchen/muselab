@@ -913,6 +913,69 @@ def rename(req: RenameReq) -> dict:
     return {"ok": True, "path": str(dst.relative_to(ROOT))}
 
 
+# ============================================================
+# Copy as .bak — the only "copy" we expose. Frontend supports both a
+# Ctrl+C / Ctrl+V flow and a "Copy as .bak" context-menu item; both
+# land here. Files only (directories rejected with 400) and the new
+# name is server-side derived so the API can't be tricked into
+# clobbering anything: <stem><suffix>.bak, .bak.2, .bak.3 … picking
+# the first non-existing name in the target directory.
+# ============================================================
+class CopyBakReq(BaseModel):
+    src: str
+    # Where to drop the .bak. Empty / omitted = same directory as src
+    # (covers the "Ctrl+D / context-menu duplicate" path). Frontend
+    # passes the currently-selected directory for cross-dir paste.
+    dst_dir: str = ""
+
+
+def _next_bak_name(parent: Path, original_name: str) -> str:
+    """Pick the first non-existing <original_name>.bak[.N] under parent.
+
+    Always appends `.bak`, even if original already ends in `.bak` (so
+    `foo.txt.bak` → `foo.txt.bak.bak`). Increments via `.bak.2`, `.bak.3`,
+    … This keeps the rule mechanical and predictable instead of trying
+    to be clever about "already a backup".
+    """
+    base = f"{original_name}.bak"
+    if not (parent / base).exists():
+        return base
+    # .bak exists → try .bak.2, .bak.3, … Cap at a sane upper bound so a
+    # pathological directory full of .bak.N siblings can't hang the call.
+    for i in range(2, 1000):
+        cand = f"{original_name}.bak.{i}"
+        if not (parent / cand).exists():
+            return cand
+    raise HTTPException(status_code=409, detail="too many .bak siblings")
+
+
+@router.post("/copy-bak", dependencies=[Depends(require_token)])
+def copy_bak(req: CopyBakReq) -> dict:
+    src = safe_resolve(req.src)
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source not found")
+    # Files only. Directory copy is a different beast (shutil.copytree,
+    # permission edge cases, can be slow on big trees) — out of scope for
+    # the .bak shortcut.
+    if src.is_dir():
+        raise HTTPException(status_code=400, detail="directories not supported")
+    if req.dst_dir:
+        parent = safe_resolve(req.dst_dir)
+        if not parent.exists() or not parent.is_dir():
+            raise HTTPException(status_code=404, detail="dst_dir not found")
+    else:
+        parent = src.parent
+    new_name = _next_bak_name(parent, src.name)
+    dst = parent / new_name
+    # safe_resolve the final path so the sensitive-name guard fires for
+    # the destination too (e.g. someone trying to copy something into a
+    # `.env.bak` shape — block at the API edge).
+    dst_rel = str(dst.relative_to(ROOT))
+    safe_resolve(dst_rel)
+    shutil.copy2(src, dst)
+    return {"ok": True, "path": dst_rel, "name": new_name}
+
+
 SEARCH_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "venv",
                  ".cache", ".pytest_cache", ".mypy_cache", "dist", "build",
                  # Trash always excluded from search/grep regardless of

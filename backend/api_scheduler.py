@@ -22,6 +22,13 @@ from . import scheduler as sched
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
 
 
+class TimeSlot(BaseModel):
+    """A single hh:mm fire window. Used by `daily` schedules to support
+    multiple fire times per day (e.g. 08:00 + 14:00 + 22:00)."""
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+
+
 class ScheduleIn(BaseModel):
     """Polymorphic schedule. Frontend sends one shape per kind; only the
     fields relevant to that kind are required, rest ignored.
@@ -29,10 +36,20 @@ class ScheduleIn(BaseModel):
     `tz_offset_minutes` is the user's UTC offset east-positive (Beijing=+480,
     NYC=-240). Browser supplies via `-new Date().getTimezoneOffset()`. When
     absent (legacy tasks), scheduler falls back to server-local TZ — keeps
-    existing schedules from drifting after the upgrade."""
+    existing schedules from drifting after the upgrade.
+
+    `times` (opt-in, daily-only) supports multiple fire times per day. When
+    present and non-empty, scheduler.py treats it as the source of truth for
+    daily kind; otherwise falls back to the single (hour, minute) — keeps
+    pre-upgrade tasks running unchanged. `hour`/`minute` are still always
+    required so weekly/monthly/once can stay single-time and the schema
+    contract is unambiguous."""
     kind: str = Field(pattern="^(daily|weekly|monthly|once)$")
     hour: int = Field(ge=0, le=23)
     minute: int = Field(ge=0, le=59)
+    # Cap at 24 slots — one per hour is already absurdly noisy; bounds the
+    # payload size against a malicious or buggy client sending thousands.
+    times: list[TimeSlot] | None = Field(default=None, max_length=24)
     weekdays: list[int] | None = None   # weekly: 0..6 (0=Mon)
     day: int | None = Field(default=None, ge=1, le=31)  # monthly
     year: int | None = Field(default=None, ge=2024, le=2100)   # once
