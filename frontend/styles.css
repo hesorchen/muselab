@@ -6143,6 +6143,27 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .sched-field-prompt { align-items: flex-start; }
 .sched-field-prompt .sched-label { margin-top: var(--sp-2); }
+/* Session-mode row: segmented control + hint stack vertically inside
+   the right (1fr) column. Top-align the label so it lines up with the
+   segmented control, not the middle of the (control + hint) block —
+   without `align-items: flex-start` the 78px label drifts down to the
+   block's vertical center and reads as "floating". */
+.sched-field-mode { align-items: flex-start; }
+.sched-field-mode .sched-label { margin-top: 6px; }
+.sched-mode-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+/* Hint underneath the segmented control fills the right column so the
+   text wraps at the natural form width (~520px), not crushed into a
+   narrow strip like the broken layout did. `max-width` keeps the line
+   length readable on very wide modals — eyeballed at ~52 ch. */
+.sched-mode-hint {
+  max-width: 52ch;
+  line-height: 1.45;
+}
 .sched-label {
   font-size: var(--fs-sm);
   color: var(--c-fg-2);

@@ -3740,28 +3740,36 @@
                segmented-control look so the form has a consistent feel
                with the frequency picker above. Default "fresh" reflects
                the cronjob mental model; users can switch to "reuse" for
-               日报续写 / 长期跟踪 tasks where context accumulation matters. -->
-          <div class="sched-field">
+               日报续写 / 长期跟踪 tasks where context accumulation matters.
+               NB: segmented-control + hint live INSIDE a single wrapper
+               div so the .sched-field grid (78px label + 1fr content)
+               treats them as one grid item. Without the wrapper the
+               hint became a separate grid cell and got crushed into the
+               78px label column on the next row (2026-05-28 user
+               screenshot caught the broken layout). -->
+          <div class="sched-field sched-field-mode">
             <label class="sched-label"
                    x-text="lang==='zh' ? '会话模式' : 'Session mode'"></label>
-            <div class="sched-freq">
-              <button type="button" class="sched-freq-btn"
-                      :class="{ active: scheduler.draft.session_mode === 'fresh' }"
-                      @click="scheduler.draft.session_mode = 'fresh'"
-                      x-text="lang==='zh' ? '每次新开' : 'Fresh'"></button>
-              <button type="button" class="sched-freq-btn"
-                      :class="{ active: scheduler.draft.session_mode === 'reuse' }"
-                      @click="scheduler.draft.session_mode = 'reuse'"
-                      x-text="lang==='zh' ? '持续会话' : 'Reuse'"></button>
+            <div class="sched-mode-col">
+              <div class="sched-freq">
+                <button type="button" class="sched-freq-btn"
+                        :class="{ active: scheduler.draft.session_mode === 'fresh' }"
+                        @click="scheduler.draft.session_mode = 'fresh'"
+                        x-text="lang==='zh' ? '每次新开' : 'Fresh'"></button>
+                <button type="button" class="sched-freq-btn"
+                        :class="{ active: scheduler.draft.session_mode === 'reuse' }"
+                        @click="scheduler.draft.session_mode = 'reuse'"
+                        x-text="lang==='zh' ? '持续会话' : 'Reuse'"></button>
+              </div>
+              <div class="sched-times-hint sched-mode-hint"
+                   x-text="scheduler.draft.session_mode === 'fresh'
+                     ? (lang==='zh'
+                         ? '每次跑都新建一个 session，互不干扰。适合周报 / 调研类。'
+                         : 'Each run spins up a new session. Good for weekly reports / one-shot research.')
+                     : (lang==='zh'
+                         ? '所有运行都接在同一个 session 里，Muse 看得到历史。适合日报续写 / 长期跟踪。'
+                         : 'All runs append to one bound session — Muse sees prior history. Good for daily-report threads.')"></div>
             </div>
-            <div class="sched-times-hint"
-                 x-text="scheduler.draft.session_mode === 'fresh'
-                   ? (lang==='zh'
-                       ? '每次跑都新建一个 session，互不干扰。适合周报 / 调研类。'
-                       : 'Each run spins up a new session. Good for weekly reports / one-shot research.')
-                   : (lang==='zh'
-                       ? '所有运行都接在同一个 session 里，Muse 看得到历史。适合日报续写 / 长期跟踪。'
-                       : 'All runs append to one bound session — Muse sees prior history. Good for daily-report threads.')"></div>
           </div>
 
           <div class="sched-create-foot">
