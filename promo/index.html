@@ -1,0 +1,1406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>muselab · 自部署的多模型 AI 工作台</title>
+<style>
+  :root {
+    --bg: #0e1014;
+    --bg-1: #14171c;
+    --bg-2: #1a1e25;
+    --bg-3: #232830;
+    --fg-0: #f5f7fa;
+    --fg-1: #e0e4ea;
+    --fg-2: #a4adbb;
+    --fg-3: #9ca3af;
+    --fg-4: #4a5160;
+    --accent: #6093ff;
+    --accent-soft: rgba(96, 147, 255, 0.12);
+    --accent-fg: #b8cdff;
+    --green: #4ade80;
+    --green-soft: rgba(74, 222, 128, 0.14);
+    --red: #ef4444;
+    --red-soft: rgba(239, 68, 68, 0.14);
+    --amber: #fbbf24;
+    --user-bg: #1d3464;
+    --user-fg: #e7eeff;
+    --thinking-bg: #1a1f2b;
+    --thinking-fg: #9ab2d6;
+    --border: #232830;
+    --border-strong: #2d333e;
+    --mono: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', monospace;
+    --sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Inter', 'Segoe UI', system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--fg-0);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Muse SVGs — inherit currentColor, no fill default */
+  svg.muse {
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  /* 16:9 stage */
+  .stage {
+    width: min(100vw, calc(100vh * 16 / 9));
+    height: min(100vh, calc(100vw * 9 / 16));
+    aspect-ratio: 16 / 9;
+    position: relative;
+    overflow: hidden;
+  }
+  .stage::before {
+    content: '';
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 48px 48px;
+    pointer-events: none;
+    z-index: 0;
+  }
+  .stage::after {
+    content: '';
+    position: absolute;
+    top: -20%; right: -10%;
+    width: 60%; height: 60%;
+    background: radial-gradient(circle, rgba(96,147,255,0.18) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    padding: 4.5% 6%;
+    display: flex;
+    flex-direction: column;
+    z-index: 1;
+    opacity: 0;
+    transform: translateX(40px);
+    transition: opacity .35s ease, transform .35s ease;
+    pointer-events: none;
+  }
+  .slide.active {
+    opacity: 1;
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  /* Decorative background Muse */
+  .slide .bg-muse {
+    position: absolute;
+    right: -2%;
+    bottom: -8%;
+    width: 40%;
+    color: var(--accent);
+    opacity: 0.04;
+    z-index: 0;
+    pointer-events: none;
+  }
+  .slide .bg-muse svg { width: 100%; height: auto; }
+
+  /* Top bar */
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--fg-4);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    margin-bottom: 3.5%;
+    flex-shrink: 0;
+    position: relative;
+    z-index: 2;
+  }
+  .topbar .brand { display: flex; align-items: center; gap: 0.6em; }
+  .topbar .brand-mark {
+    width: 12px; height: 12px;
+    background: var(--accent);
+    transform: rotate(45deg);
+  }
+  .muse-chip {
+    display: flex; align-items: center; gap: 0.55em;
+    color: var(--fg-3);
+    background: rgba(96,147,255,0.06);
+    border: 1px solid rgba(96,147,255,0.18);
+    padding: 0.25em 0.8em;
+    border-radius: 999px;
+  }
+  .muse-chip svg.muse {
+    width: 16px; height: 16px;
+    color: var(--accent);
+  }
+  .muse-chip .name {
+    color: var(--fg-1);
+    letter-spacing: 0.04em;
+  }
+  .muse-chip .sep { color: var(--fg-4); }
+  .muse-chip .domain { color: var(--fg-3); }
+  .topbar .counter { color: var(--fg-3); }
+
+  /* Body: left text + right mock */
+  .body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1.1fr;
+    gap: 4.5%;
+    align-items: center;
+    min-height: 0;
+    position: relative;
+    z-index: 2;
+  }
+  .col { min-width: 0; min-height: 0; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    color: var(--accent);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 1em;
+  }
+  h1 {
+    font-size: clamp(1.8rem, 3.2vw, 3rem);
+    line-height: 1.18;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin-bottom: 0.7em;
+  }
+  h1 .hl { color: var(--accent); }
+  .sub {
+    font-size: clamp(0.95rem, 1.25vw, 1.2rem);
+    color: var(--fg-2);
+    line-height: 1.6;
+    max-width: 30em;
+  }
+  .micro {
+    font-family: var(--mono);
+    font-size: clamp(0.7rem, 0.88vw, 0.85rem);
+    color: var(--fg-3);
+    margin-top: 1.3em;
+    line-height: 1.7;
+  }
+  .micro .kbd {
+    display: inline-block;
+    padding: 0.1em 0.45em;
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+    background: var(--bg-2);
+    color: var(--fg-1);
+    margin: 0 0.15em;
+    font-size: 0.92em;
+  }
+  .micro .tag {
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 0.05em 0.5em;
+    border-radius: 3px;
+    margin-right: 0.4em;
+    display: inline-block;
+    margin-bottom: 0.3em;
+  }
+
+  /* ======= Mock UI building blocks ======= */
+  .mock {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    overflow: hidden;
+    width: 100%;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.45);
+    font-size: clamp(0.65rem, 0.85vw, 0.85rem);
+  }
+  .mock-bar {
+    height: 28px;
+    background: #0a0c10;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 6px;
+  }
+  .mock-bar .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--fg-4); }
+  .mock-bar .title {
+    margin-left: 12px; color: var(--fg-4);
+    font-family: var(--mono); font-size: 0.72em;
+  }
+
+  /* ====== Slide 3 · 三栏 workspace 模拟 ====== */
+  .ws {
+    display: grid;
+    grid-template-columns: 38% 1fr;
+    min-height: 320px;
+  }
+  .ws-files {
+    background: var(--bg-1);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+  }
+  .ws-head {
+    padding: 0.4em 0.6em;
+    display: flex; align-items: center; gap: 0.4em;
+    font-family: var(--mono); font-size: 0.78em; color: var(--fg-3);
+    border-bottom: 1px solid var(--border);
+  }
+  .ws-head .ico { width: 12px; height: 12px; color: var(--accent); }
+  .ws-search {
+    margin: 0.5em;
+    padding: 0.4em 0.6em;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono);
+    color: var(--fg-2);
+    font-size: 0.78em;
+    display: flex; align-items: center; gap: 0.4em;
+  }
+  .ws-search .placeholder { color: var(--fg-4); }
+  .openfiles {
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 0.35em 0.5em 0.35em 0.6em;
+  }
+  .openfiles-head {
+    display: flex; align-items: center; gap: 0.4em;
+    font-family: var(--mono); font-size: 0.72em; color: var(--fg-3);
+    margin-bottom: 0.25em;
+  }
+  .openfiles-row {
+    display: flex; align-items: center; gap: 0.35em;
+    padding: 0.25em 0.4em;
+    font-family: var(--mono); font-size: 0.78em;
+    color: var(--fg-1);
+    border-radius: 3px;
+  }
+  .openfiles-row.sel { background: var(--accent-soft); color: var(--accent-fg); }
+  .openfiles-row .ico { width: 10px; height: 10px; }
+  .openfiles-row .x { color: var(--fg-4); margin-left: auto; }
+  .openfiles-row .ico.pdf { color: #dc3545; }
+  .openfiles-row .ico.md { color: var(--accent); }
+  .openfiles-row .ico.xlsx { color: #34a853; }
+  .openfiles-row .ico.html { color: #e34c26; }
+
+  .tree {
+    padding: 0.35em 0.3em 0.5em 0.3em;
+    font-family: var(--mono); font-size: 0.76em;
+    flex: 1;
+  }
+  .tree-root {
+    color: var(--fg-3); padding: 0.2em 0.5em;
+    font-size: 0.92em;
+    display: flex; align-items: center; gap: 0.3em;
+  }
+  .tree-row {
+    padding: 0.22em 0.4em;
+    color: var(--fg-1);
+    display: flex; align-items: center; gap: 0.35em;
+    border-radius: 3px;
+  }
+  .tree-row.dir { color: var(--accent-fg); }
+  .tree-row.sel { background: var(--accent-soft); color: var(--accent); }
+  .tree-row .caret { width: 8px; color: var(--fg-4); }
+  .tree-row .ico { width: 11px; height: 11px; }
+  .tree-row .ico.md { color: var(--accent); }
+  .tree-row .ico.xlsx { color: #34a853; }
+  .tree-row .ico.txt { color: var(--fg-3); }
+  .tree-row .ico.folder { color: var(--accent-fg); }
+  .tree-row .size { margin-left: auto; color: var(--fg-4); font-size: 0.88em; }
+  .tree-row.lv1 { padding-left: 1em; }
+  .tree-row.lv2 { padding-left: 1.8em; }
+
+  .ws-preview {
+    background: var(--bg);
+    display: flex; flex-direction: column;
+  }
+  .ws-preview-head {
+    padding: 0.4em 0.7em;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.74em; color: var(--fg-3);
+    display: flex; align-items: center; gap: 0.4em;
+  }
+  .ws-preview-body { padding: 0.7em 0.9em; }
+  .ws-preview-body table {
+    width: 100%; border-collapse: collapse;
+    font-family: var(--mono); font-size: 0.78em;
+  }
+  .ws-preview-body th, .ws-preview-body td {
+    padding: 0.35em 0.6em;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+  }
+  .ws-preview-body th { color: var(--fg-3); font-weight: 500; background: var(--bg-1); }
+  .ws-preview-body td { color: var(--fg-1); }
+  .ws-preview-body td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ws-preview-body td.gr { color: var(--green); }
+
+  /* ====== Slide 4 · session tabs (top of chat pane) ====== */
+  .chat-tabs {
+    display: flex;
+    background: #0a0c10;
+    border-bottom: 1px solid var(--border);
+    overflow-x: hidden;
+    align-items: stretch;
+  }
+  .chat-tab-history-btn {
+    padding: 0 0.7em;
+    color: var(--fg-3);
+    border-right: 1px solid var(--border);
+    display: flex; align-items: center;
+  }
+  .chat-tab-history-btn .ico { width: 13px; height: 13px; }
+  .chat-tab {
+    padding: 0.55em 0.85em;
+    color: var(--fg-2);
+    border-right: 1px solid var(--border);
+    display: flex; align-items: center; gap: 0.4em;
+    font-family: var(--mono);
+    font-size: 0.78em;
+    white-space: nowrap;
+    position: relative;
+  }
+  .chat-tab.active {
+    background: var(--bg-1);
+    color: var(--fg-0);
+    border-bottom: 2px solid var(--accent);
+  }
+  .chat-tab .stream {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    animation: streamPulse 1.4s infinite;
+  }
+  @keyframes streamPulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  .chat-tab .unread {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--amber);
+  }
+  .chat-tab .x { color: var(--fg-4); margin-left: 0.3em; }
+
+  /* session picker dropdown below */
+  .picker-pop {
+    background: var(--bg-1);
+    border-top: none;
+    padding: 0.5em 0;
+  }
+  .picker-search {
+    margin: 0 0.6em 0.4em;
+    padding: 0.35em 0.6em;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.76em;
+    color: var(--fg-2);
+  }
+  .picker-group-label {
+    padding: 0.35em 0.9em 0.2em;
+    color: var(--fg-3);
+    font-family: var(--mono);
+    font-size: 0.7em;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .picker-row {
+    padding: 0.4em 0.7em;
+    margin: 0 0.4em;
+    display: flex; align-items: center; gap: 0.5em;
+    font-family: var(--mono);
+    font-size: 0.78em;
+    color: var(--fg-1);
+    border-radius: 4px;
+  }
+  .picker-row.active {
+    background: var(--accent-soft);
+    color: var(--accent-fg);
+  }
+  .picker-row .pin {
+    color: var(--accent); width: 11px; height: 11px;
+  }
+  .picker-row .pin.off { color: var(--fg-4); }
+  .picker-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .picker-row .actions {
+    color: var(--fg-4);
+    font-family: var(--mono); font-size: 0.85em;
+  }
+  .picker-row.active .actions { color: var(--accent); }
+  .picker-row .stream {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--accent);
+    animation: streamPulse 1.4s infinite;
+  }
+
+  /* ====== Slide 5 · model select (chat-toolbar) ====== */
+  .chat-toolbar {
+    padding: 0.5em 0.7em;
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 0.5em;
+  }
+  .chat-toolbar .toolbar-btn {
+    padding: 0.3em 0.6em;
+    color: var(--fg-3);
+    font-family: var(--mono); font-size: 0.75em;
+    border-radius: 3px;
+  }
+  .chat-toolbar .toolbar-btn.on { background: var(--accent-soft); color: var(--accent); }
+  .chat-toolbar .toolbar-select {
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    color: var(--fg-1);
+    padding: 0.3em 0.6em;
+    border-radius: 3px;
+    font-family: var(--mono); font-size: 0.78em;
+    display: flex; align-items: center; gap: 0.3em;
+  }
+  .chat-toolbar .toolbar-select.model { color: var(--accent); border-color: var(--accent); }
+  .chat-toolbar .toolbar-select .v { color: var(--fg-4); }
+  .chat-toolbar .spacer { flex: 1; }
+  .chat-toolbar .ctx-pill {
+    padding: 0.2em 0.55em;
+    font-family: var(--mono); font-size: 0.7em;
+    background: var(--bg-2); color: var(--fg-3);
+    border-radius: 3px;
+  }
+  .chat-toolbar .ctx-pill .num { color: var(--accent-fg); }
+
+  .select-pop {
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
+    padding: 0.5em 0;
+  }
+  .optgroup-label {
+    padding: 0.35em 0.9em 0.2em;
+    color: var(--fg-3);
+    font-family: var(--mono);
+    font-size: 0.7em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .opt {
+    padding: 0.3em 0.9em;
+    color: var(--fg-1);
+    font-family: var(--mono); font-size: 0.78em;
+    display: flex; align-items: center; gap: 0.4em;
+  }
+  .opt.sel { background: var(--accent-soft); color: var(--accent); }
+  .opt::before { content: ''; width: 8px; }
+  .opt.sel::before { content: '●'; color: var(--accent); width: auto; margin-right: 0.2em; }
+
+  /* ====== Slide 6 · plan mode (thinking + plan card) ====== */
+  .chat-area {
+    padding: 1em 1.2em;
+    background: var(--bg);
+    min-height: 320px;
+  }
+  .msg-user {
+    margin: 0.4em 0 0.6em auto;
+    padding: 0.55em 0.8em;
+    background: var(--user-bg);
+    color: var(--user-fg);
+    border-radius: 12px 12px 4px 12px;
+    max-width: 70%;
+    width: fit-content;
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+  .thinking-head {
+    display: flex; align-items: center; gap: 0.45em;
+    padding: 0.4em 0.6em;
+    background: var(--thinking-bg);
+    border-radius: 6px 6px 0 0;
+    color: var(--thinking-fg);
+    font-family: var(--mono); font-size: 0.78em;
+    cursor: pointer;
+  }
+  .thinking-head .chevron { color: var(--accent); }
+  .thinking-body {
+    padding: 0.55em 0.8em;
+    background: var(--thinking-bg);
+    color: var(--thinking-fg);
+    font-style: italic;
+    font-size: 0.82em;
+    line-height: 1.55;
+    border-radius: 0 0 6px 6px;
+    margin-bottom: 0.5em;
+  }
+  .plan-card {
+    border: 1px solid var(--border-strong);
+    background: var(--bg-1);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .plan-head {
+    padding: 0.55em 0.8em;
+    background: var(--accent-soft);
+    color: var(--accent);
+    display: flex; align-items: center; gap: 0.5em;
+    font-family: var(--mono); font-size: 0.8em;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .plan-head .ico { width: 14px; height: 14px; }
+  .plan-body {
+    padding: 0.7em 1em;
+    color: var(--fg-1);
+    font-size: 0.85em;
+    line-height: 1.6;
+  }
+  .plan-body ol { padding-left: 1.4em; }
+  .plan-body li { margin-bottom: 0.25em; }
+
+  /* ====== Slide 7 · diff strip ====== */
+  .diff-strip {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 0.5em;
+  }
+  .diff-head {
+    padding: 0.5em 0.7em;
+    display: flex; align-items: center; gap: 0.5em;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 0.78em;
+    color: var(--fg-2);
+  }
+  .diff-head .chevron { color: var(--accent); }
+  .diff-head .tool { color: var(--accent); }
+  .diff-head .path { color: var(--fg-1); }
+  .diff-head .spacer { flex: 1; }
+  .diff-head .badge-plus { color: var(--green); }
+  .diff-head .badge-minus { color: var(--red); }
+  .diff-body {
+    padding: 0.45em 0.5em;
+    font-family: var(--mono); font-size: 0.74em;
+    line-height: 1.6;
+    background: var(--bg);
+  }
+  .diff-line {
+    padding: 0.05em 0.6em 0.05em 0.4em;
+    border-radius: 2px;
+    color: var(--fg-2);
+    white-space: pre;
+  }
+  .diff-line.ins { background: var(--green-soft); color: var(--green); }
+  .diff-line.del { background: var(--red-soft); color: var(--red); }
+  .diff-line .pre { display: inline-block; width: 1.1em; color: var(--fg-4); }
+  .diff-line.ins .pre { color: var(--green); }
+  .diff-line.del .pre { color: var(--red); }
+
+  /* ====== Slide 8 · mobile PWA ====== */
+  .phone {
+    margin: 0 auto;
+    width: 64%;
+    max-width: 260px;
+    aspect-ratio: 9/19.5;
+    background: #0a0c10;
+    border: 8px solid #1a1e25;
+    border-radius: 36px;
+    padding: 22px 10px 8px;
+    position: relative;
+    display: flex; flex-direction: column;
+    box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+  }
+  .phone::before {
+    content: '';
+    position: absolute;
+    top: 8px; left: 50%;
+    transform: translateX(-50%);
+    width: 38%; height: 18px;
+    background: #1a1e25;
+    border-radius: 0 0 14px 14px;
+  }
+  .phone-statbar {
+    display: flex; justify-content: space-between;
+    font-family: var(--mono); font-size: 0.6em;
+    color: var(--fg-3); padding: 4px 10px;
+  }
+  .phone-app {
+    flex: 1; margin-top: 0.4em;
+    background: var(--bg-1);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex; flex-direction: column;
+    font-size: 0.7em;
+  }
+  .phone-head {
+    padding: 0.4em 0.55em;
+    border-bottom: 1px solid var(--border);
+    color: var(--fg-3);
+    font-family: var(--mono); font-size: 0.95em;
+    display: flex; align-items: center; gap: 0.3em;
+  }
+  .phone-body {
+    flex: 1; padding: 0.4em;
+    display: flex; flex-direction: column; gap: 0.4em;
+  }
+  .phone-msg {
+    padding: 0.4em 0.55em;
+    border-radius: 8px;
+    line-height: 1.4;
+    font-size: 0.95em;
+  }
+  .phone-msg.user {
+    background: var(--user-bg);
+    color: var(--user-fg);
+    margin-left: 1.5em;
+    border-bottom-right-radius: 2px;
+  }
+  .phone-msg.ai {
+    background: var(--bg-2);
+    color: var(--fg-1);
+    margin-right: 1em;
+    border-bottom-left-radius: 2px;
+  }
+  .phone-msg.ai .muse-sig {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.85em;
+    margin-bottom: 0.2em;
+    display: flex; align-items: center; gap: 0.25em;
+  }
+  .phone-msg.ai .muse-sig svg { width: 11px; height: 11px; }
+  .phone-tabbar {
+    display: flex;
+    border-top: 1px solid var(--border);
+    background: #0a0c10;
+  }
+  .phone-tab {
+    flex: 1;
+    padding: 0.55em 0.3em 0.4em;
+    text-align: center;
+    color: var(--fg-3);
+    font-family: var(--mono); font-size: 0.85em;
+    border-top: 2px solid transparent;
+  }
+  .phone-tab.active {
+    color: var(--accent);
+    border-top-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .phone-tab .ico {
+    display: block; width: 14px; height: 14px;
+    margin: 0 auto 2px;
+  }
+
+  /* ====== Slide 1 · hero ====== */
+  .slide.hero .body {
+    grid-template-columns: 1fr;
+    text-align: center;
+  }
+  .slide.hero .col {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 0;
+  }
+  .hero-logo {
+    font-family: var(--mono);
+    font-size: clamp(3rem, 7vw, 6.2rem);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    margin-bottom: 0.2em;
+  }
+  .hero-logo .accent { color: var(--accent); }
+  .hero-tagline {
+    font-size: clamp(1.1rem, 1.8vw, 1.6rem);
+    color: var(--fg-1);
+    margin-bottom: 0.3em;
+  }
+  .hero-sub {
+    font-size: clamp(0.85rem, 1.1vw, 1.05rem);
+    color: var(--fg-4);
+    font-family: var(--mono);
+    letter-spacing: 0.04em;
+  }
+  .hero-muses {
+    margin-top: 2.5em;
+    display: flex; gap: 1.3em;
+    align-items: center;
+    justify-content: center;
+    padding: 1em 1.5em;
+    background: rgba(96,147,255,0.04);
+    border: 1px solid rgba(96,147,255,0.15);
+    border-radius: 12px;
+  }
+  .hero-muses .one {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 0.4em;
+    color: var(--fg-3);
+  }
+  .hero-muses .one svg.muse {
+    width: 24px; height: 24px;
+    color: var(--accent);
+  }
+  .hero-muses .one .nm {
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    color: var(--fg-3);
+    letter-spacing: 0.04em;
+  }
+  .hero-meta {
+    margin-top: 2em;
+    display: flex; gap: 1.5em;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--fg-3);
+  }
+  .hero-meta span::before {
+    content: '·'; margin-right: 1em; color: var(--accent);
+  }
+  .hero-meta span:first-child::before { display: none; }
+
+  /* ====== Slide 2 · big idea ====== */
+  .slide.big .body { grid-template-columns: 1fr; text-align: center; }
+  .slide.big .col { max-width: 24em; margin: 0 auto; display: flex; flex-direction: column; align-items: center; }
+  .slide.big h1 { font-size: clamp(2rem, 4.2vw, 3.6rem); }
+  .slide.big .big-muse {
+    margin-bottom: 1.5em;
+    width: 84px; height: 84px;
+    color: var(--accent);
+  }
+
+  /* ====== Slide 9 · CTA ====== */
+  .slide.cta .body { grid-template-columns: 1fr; text-align: center; }
+  .slide.cta .col {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  .slide.cta .url {
+    font-family: var(--mono);
+    font-size: clamp(1.2rem, 2.2vw, 1.9rem);
+    color: var(--accent);
+    padding: 0.5em 1.2em;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    margin: 1.2em 0 1em;
+    background: var(--accent-soft);
+  }
+  .slide.cta .tags {
+    display: flex; gap: 1.5em;
+    font-family: var(--mono);
+    color: var(--fg-3);
+    font-size: 0.95rem;
+  }
+  .slide.cta .tags span:first-child { color: var(--accent); }
+  .slide.cta .install {
+    margin-top: 1.5em;
+    font-family: var(--mono);
+    font-size: clamp(0.7rem, 0.92vw, 0.88rem);
+    color: var(--fg-2);
+    background: #0a0c10;
+    padding: 0.8em 1.2em;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    text-align: left;
+    max-width: 40em;
+    line-height: 1.6;
+  }
+  .slide.cta .install .prompt { color: var(--accent); }
+  .slide.cta .install .cmt { color: var(--fg-4); }
+
+  /* Navigation */
+  .nav {
+    position: fixed;
+    bottom: 1.2rem; left: 50%;
+    transform: translateX(-50%);
+    display: flex; align-items: center; gap: 0.7em;
+    background: rgba(20, 24, 32, 0.7);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    padding: 0.5em 0.8em;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    z-index: 100;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--fg-3);
+  }
+  .nav button {
+    background: none; border: none; color: var(--fg-3);
+    cursor: pointer; font-size: 1rem;
+    padding: 0.2em 0.5em; border-radius: 4px;
+  }
+  .nav button:hover { color: var(--accent); background: var(--accent-soft); }
+  .nav .count { min-width: 3em; text-align: center; }
+
+  .edge-click {
+    position: fixed; top: 0; height: 100%; width: 15%;
+    z-index: 50; cursor: pointer;
+  }
+  .edge-click.left { left: 0; }
+  .edge-click.right { right: 0; }
+
+  /* Mobile fallback */
+  @media (max-aspect-ratio: 4/3) and (max-width: 720px) {
+    html, body { overflow-y: auto; height: auto; }
+    body { display: block; }
+    .stage { width: 100vw; height: auto; aspect-ratio: auto; display: block; }
+    .stage::before, .stage::after { display: none; }
+    .slide {
+      position: relative; opacity: 1; transform: none;
+      pointer-events: auto;
+      min-height: 100vh;
+      padding: 8% 6%;
+      border-bottom: 1px solid var(--border);
+    }
+    .body { grid-template-columns: 1fr; gap: 2em; }
+    .nav { display: none; }
+    .hero-muses { flex-wrap: wrap; gap: 0.7em; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Muse mascot SVG defs — exact copy from muselab frontend/index.html -->
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="m-hex"      viewBox="0 0 24 24"><path d="M12 3 L20 7.5 L20 16.5 L12 21 L4 16.5 L4 7.5 Z"/></symbol>
+    <symbol id="m-bars"     viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="17" x2="14" y2="17"/></symbol>
+    <symbol id="m-lens"     viewBox="0 0 24 24"><circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/></symbol>
+    <symbol id="m-wave"     viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5 12 Q 8.5 6 12 12 T 19 12"/></symbol>
+    <symbol id="m-crescent" viewBox="0 0 24 24"><path d="M16 3 A 9 9 0 1 0 16 21 A 7 7 0 1 1 16 3 Z"/></symbol>
+    <symbol id="m-halo"     viewBox="0 0 24 24"><circle cx="12" cy="14" r="5"/><path d="M5 8 A 7 4 0 0 1 19 8"/></symbol>
+    <symbol id="m-trio"     viewBox="0 0 24 24"><circle cx="12" cy="6" r="2" fill="currentColor"/><circle cx="6" cy="17" r="2" fill="currentColor"/><circle cx="18" cy="17" r="2" fill="currentColor"/></symbol>
+    <symbol id="m-spark"    viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/><circle cx="12" cy="12" r="2" fill="currentColor"/></symbol>
+    <symbol id="m-orbit"    viewBox="0 0 24 24"><circle cx="11" cy="13" r="5"/><circle cx="18.5" cy="6" r="1.6" fill="currentColor"/></symbol>
+  </defs>
+</svg>
+
+<div class="stage" id="stage">
+
+  <!-- ============ 1 · HERO (Calliope · 史诗) ============ -->
+  <section class="slide hero active">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>MUSELAB</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-hex"/></svg>
+        <span class="name">Calliope</span><span class="sep">·</span><span class="domain">史诗</span>
+      </div>
+      <div class="counter">01 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="hero-logo">muse<span class="accent">·</span>lab</div>
+        <div class="hero-tagline">自部署的多模型 AI 工作台</div>
+        <div class="hero-sub">a self-hosted, multi-model AI workspace</div>
+        <div class="hero-muses">
+          <div class="one"><svg class="muse"><use href="#m-hex"/></svg><span class="nm">Calliope</span></div>
+          <div class="one"><svg class="muse"><use href="#m-bars"/></svg><span class="nm">Clio</span></div>
+          <div class="one"><svg class="muse"><use href="#m-lens"/></svg><span class="nm">Erato</span></div>
+          <div class="one"><svg class="muse"><use href="#m-wave"/></svg><span class="nm">Euterpe</span></div>
+          <div class="one"><svg class="muse"><use href="#m-crescent"/></svg><span class="nm">Melpomene</span></div>
+          <div class="one"><svg class="muse"><use href="#m-halo"/></svg><span class="nm">Polyhymnia</span></div>
+          <div class="one"><svg class="muse"><use href="#m-trio"/></svg><span class="nm">Terpsichore</span></div>
+          <div class="one"><svg class="muse"><use href="#m-spark"/></svg><span class="nm">Thalia</span></div>
+          <div class="one"><svg class="muse"><use href="#m-orbit"/></svg><span class="nm">Urania</span></div>
+        </div>
+        <div class="hero-meta">
+          <span>OPEN SOURCE</span>
+          <span>MIT</span>
+          <span>YOUR MACHINE</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 2 · BIG IDEA (Clio · 历史) ============ -->
+  <section class="slide big">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>核心理念</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-bars"/></svg>
+        <span class="name">Clio</span><span class="sep">·</span><span class="domain">历史</span>
+      </div>
+      <div class="counter">02 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <svg class="muse big-muse"><use href="#m-bars"/></svg>
+        <div class="eyebrow">CORE IDEA</div>
+        <h1>你的<span class="hl">私人档案</span>，<br>就是 AI 的工作集。</h1>
+        <p class="sub">指向一个你自己的目录——里面的文件、笔记、文档，都是 Muse 的一等上下文。不是 RAG 索引，不是云端拷贝，就是磁盘上的原文件。Read · Grep · Edit，按需取用。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 3 · FILES (Polyhymnia · 圣诗) ============ -->
+  <section class="slide">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>FILES · 文件工作流</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-halo"/></svg>
+        <span class="name">Polyhymnia</span><span class="sep">·</span><span class="domain">圣诗</span>
+      </div>
+      <div class="counter">03 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">FILES</div>
+        <h1>所有文件类型，<br>浏览器里<span class="hl">直接渲染</span>。</h1>
+        <p class="sub">Markdown / PDF / 图片 / HTML / CSV / XLSX——打开即所见。左边文件树 + 搜索 + 已开文件三段式，中间预览，右边对话。搬家、删除、上传、grep 都是拖拽 + 一行 input 解决。</p>
+        <div class="micro">
+          <span class="tag">.md</span><span class="tag">.pdf</span><span class="tag">.html</span><span class="tag">.csv</span><span class="tag">.xlsx</span><span class="tag">.png</span><br>
+          软删除 30 天可还原 · <span class="kbd">.gitignore</span> 自动屏蔽 · 拖到底部即删
+        </div>
+      </div>
+      <div class="col">
+        <div class="mock">
+          <div class="mock-bar">
+            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+            <div class="title">~/muselab-archive</div>
+          </div>
+          <div class="ws">
+            <div class="ws-files">
+              <div class="ws-head"><svg class="muse ico"><use href="#m-bars"/></svg>文件</div>
+              <div class="ws-search">🔍 <span class="placeholder">搜索文件名 / 内容…</span></div>
+              <div class="openfiles">
+                <div class="openfiles-head">▼ 已打开 (3)</div>
+                <div class="openfiles-row">
+                  <span class="ico md" style="color:var(--accent)">▣</span>
+                  <span>2026年目标.md</span>
+                  <span class="x">×</span>
+                </div>
+                <div class="openfiles-row sel">
+                  <span class="ico xlsx" style="color:#34a853">▣</span>
+                  <span>PlanDeck MRR 24个月.xlsx</span>
+                  <span class="x">×</span>
+                </div>
+                <div class="openfiles-row">
+                  <span class="ico md">▣</span>
+                  <span>PlanDeck 客户调研笔记.md</span>
+                  <span class="x">×</span>
+                </div>
+              </div>
+              <div class="tree">
+                <div class="tree-root">▾ muselab-archive</div>
+                <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>PlanDeck</span></div>
+                <div class="tree-row sel lv2"><span class="caret"></span><span class="ico xlsx">▣</span><span>MRR 24个月.xlsx</span><span class="size">24 KB</span></div>
+                <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>客户调研笔记.md</span><span class="size">8 KB</span></div>
+                <div class="tree-row dir lv1"><span class="caret">▸</span><span class="ico folder">▣</span><span>家庭</span></div>
+                <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>notes</span></div>
+                <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>2026年目标.md</span><span class="size">3 KB</span></div>
+              </div>
+            </div>
+            <div class="ws-preview">
+              <div class="ws-preview-head">PlanDeck MRR 24个月.xlsx · sheet: monthly</div>
+              <div class="ws-preview-body">
+                <table>
+                  <thead><tr><th>month</th><th>new</th><th>churn</th><th>MRR</th></tr></thead>
+                  <tbody>
+                    <tr><td>2025-09</td><td class="num">+12</td><td class="num">−3</td><td class="num gr">8,420</td></tr>
+                    <tr><td>2025-10</td><td class="num">+18</td><td class="num">−4</td><td class="num gr">10,180</td></tr>
+                    <tr><td>2025-11</td><td class="num">+21</td><td class="num">−2</td><td class="num gr">12,640</td></tr>
+                    <tr><td>2025-12</td><td class="num">+27</td><td class="num">−5</td><td class="num gr">15,210</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-muse"><svg class="muse"><use href="#m-halo"/></svg></div>
+  </section>
+
+  <!-- ============ 4 · SESSIONS (Thalia · 喜剧) ============ -->
+  <section class="slide">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>SESSIONS · 多会话</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-spark"/></svg>
+        <span class="name">Thalia</span><span class="sep">·</span><span class="domain">喜剧</span>
+      </div>
+      <div class="counter">04 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">SESSIONS</div>
+        <h1>每个对话独立 tab，<br><span class="hl">几十条同时开着不串线</span>。</h1>
+        <p class="sub">顶部横向 tab strip 切换；左侧文件夹图标点开 picker，按时间分组、置顶常用、双击改名、搜索过滤。每个会话记得自己的模型 / reasoning effort / 上下文窗口。</p>
+        <div class="micro">
+          流式 tab 有跳动小点 · 未读有橙点提示 · 支持从任意历史消息处分叉新会话
+        </div>
+      </div>
+      <div class="col">
+        <div class="mock">
+          <div class="mock-bar">
+            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+            <div class="title">chat pane · top</div>
+          </div>
+          <div class="chat-tabs">
+            <div class="chat-tab-history-btn"><span class="ico">▣</span></div>
+            <div class="chat-tab"><span>日常对话</span><span class="x">×</span></div>
+            <div class="chat-tab active"><span class="stream"></span><span>PlanDeck 增长策略</span><span class="x">×</span></div>
+            <div class="chat-tab"><span class="unread"></span><span>读论文 · attention</span><span class="x">×</span></div>
+            <div class="chat-tab"><span>翻译润色</span><span class="x">×</span></div>
+            <div class="chat-tab"><span>整理会议纪要</span><span class="x">×</span></div>
+          </div>
+          <div class="picker-pop">
+            <div class="picker-search">🔍 搜索会话…</div>
+            <div class="picker-group-label">📌 置顶</div>
+            <div class="picker-row active">
+              <svg class="muse pin"><use href="#m-spark"/></svg>
+              <span class="name">PlanDeck 增长策略</span>
+              <span class="stream"></span>
+              <span class="actions">✎  ⋯  ×</span>
+            </div>
+            <div class="picker-row">
+              <svg class="muse pin"><use href="#m-spark"/></svg>
+              <span class="name">日常对话</span>
+              <span class="actions">✎  ⋯  ×</span>
+            </div>
+            <div class="picker-group-label" style="margin-top:0.4em">今天</div>
+            <div class="picker-row">
+              <span class="pin off">◌</span>
+              <span class="name">读论文 · attention</span>
+              <span class="actions">✎  ⋯  ×</span>
+            </div>
+            <div class="picker-row">
+              <span class="pin off">◌</span>
+              <span class="name">翻译润色</span>
+              <span class="actions">✎  ⋯  ×</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-muse"><svg class="muse"><use href="#m-spark"/></svg></div>
+  </section>
+
+  <!-- ============ 5 · MODELS (Terpsichore · 舞蹈) ============ -->
+  <section class="slide">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>MODELS · 多模型</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-trio"/></svg>
+        <span class="name">Terpsichore</span><span class="sep">·</span><span class="domain">舞蹈</span>
+      </div>
+      <div class="counter">05 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">MULTI-MODEL</div>
+        <h1>八家模型，<br><span class="hl">一套 agent loop</span>。</h1>
+        <p class="sub">底部 toolbar 一个 select 切换：Claude · DeepSeek · GLM · MiniMax · Kimi · Qwen · 小米 MiMo · 百度 ERNIE。MCP / Skills / Subagent / plan 模式在每家行为一致——Claude Agent SDK 直接驱动，不是协议翻译。</p>
+        <div class="micro">
+          复用 <span class="kbd">Claude Pro / Max</span> 订阅（OAuth）· 其他厂商 vendor anthropic-compat · 切模型 fork 新会话保留原上下文
+        </div>
+      </div>
+      <div class="col">
+        <div class="mock">
+          <div class="mock-bar">
+            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+            <div class="title">chat pane · toolbar + select</div>
+          </div>
+          <div class="chat-toolbar">
+            <span class="toolbar-btn on">plan</span>
+            <span class="toolbar-btn">skills</span>
+            <span class="toolbar-select model">
+              claude-sonnet-4-5 <span class="v">▾</span>
+            </span>
+            <span class="toolbar-select">
+              effort: high <span class="v">▾</span>
+            </span>
+            <span class="spacer"></span>
+            <span class="ctx-pill">ctx <span class="num">38%</span></span>
+          </div>
+          <div class="select-pop">
+            <div class="optgroup-label">Anthropic</div>
+            <div class="opt sel">claude-sonnet-4-5</div>
+            <div class="opt">claude-opus-4-5</div>
+            <div class="opt">claude-haiku-4-5</div>
+            <div class="optgroup-label">DeepSeek</div>
+            <div class="opt">deepseek-chat</div>
+            <div class="opt">deepseek-reasoner</div>
+            <div class="optgroup-label">China</div>
+            <div class="opt">glm-4.6 · zhipu</div>
+            <div class="opt">kimi-k2 · moonshot</div>
+            <div class="opt">qwen3-max · alibaba</div>
+            <div class="opt">mimo · xiaomi</div>
+            <div class="opt">ernie-4.5 · baidu</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-muse"><svg class="muse"><use href="#m-trio"/></svg></div>
+  </section>
+
+  <!-- ============ 6 · PLAN MODE (Urania · 天文) ============ -->
+  <section class="slide">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>PLAN MODE · 计划模式</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-orbit"/></svg>
+        <span class="name">Urania</span><span class="sep">·</span><span class="domain">天文</span>
+      </div>
+      <div class="counter">06 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">PLAN MODE</div>
+        <h1>看着 Muse <span class="hl">想清楚</span><br>再动手。</h1>
+        <p class="sub">复杂任务先进 plan 模式——thinking 块实时显示推理（chevron 折叠）；最后输出一张带 ✓ 图标的 plan card。你点确认才会真正执行，避免 agent 跑偏。</p>
+        <div class="micro">
+          MCP <span class="kbd">sequential-thinking</span> 加持 · TaskCreate/Update 工具链可视化 · 长任务全程透明
+        </div>
+      </div>
+      <div class="col">
+        <div class="mock">
+          <div class="mock-bar">
+            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+            <div class="title">chat pane · plan mode</div>
+          </div>
+          <div class="chat-area">
+            <div class="msg-user">帮我把 PlanDeck 的 2026 增长策略整理成可执行的季度计划</div>
+            <div class="thinking-head"><span class="chevron">▾</span>thinking · 12s</div>
+            <div class="thinking-body">
+              先看现状——MRR 12.6k，月增 ~25 个客户，churn 稳定。整理需要分四块：获客通道 / 转化 / 留存 / 单价…
+            </div>
+            <div class="thinking-head"><span class="chevron">▸</span>thinking · 8s</div>
+            <div class="plan-card">
+              <div class="plan-head">
+                <span class="ico">✓</span> Plan · 待确认
+              </div>
+              <div class="plan-body">
+                <ol>
+                  <li>读 PlanDeck/MRR 24个月.xlsx 摸清基线</li>
+                  <li>读 PlanDeck/客户调研笔记.md 提关键痛点</li>
+                  <li>分 Q1-Q4 列目标 + 关键动作 + 负责人</li>
+                  <li>输出到 PlanDeck/2026-roadmap.md</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-muse"><svg class="muse"><use href="#m-orbit"/></svg></div>
+  </section>
+
+  <!-- ============ 7 · DIFF (Erato · 情诗 · vesica piscis 双圆相交 = 前后两态) ============ -->
+  <section class="slide">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>EDITS · 改了什么</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-lens"/></svg>
+        <span class="name">Erato</span><span class="sep">·</span><span class="domain">情诗</span>
+      </div>
+      <div class="counter">07 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">DIFF STRIPS</div>
+        <h1>改文件就出<br><span class="hl">红绿 diff</span>，看完再决定。</h1>
+        <p class="sub">Muse 每改一个文件，气泡里直接渲染 inline diff——绿加红减、带 +N −M 计数。一眼看出动了哪里，不用切到 git。点击 head 折叠，长对话不挡视线。</p>
+        <div class="micro">
+          所有 Edit / Write / MultiEdit 工具调用都附 diff · 当前 turn 自动展开，历史折叠
+        </div>
+      </div>
+      <div class="col">
+        <div class="mock">
+          <div class="mock-bar">
+            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+            <div class="title">chat pane · tool result</div>
+          </div>
+          <div style="padding:0.8em">
+            <div class="diff-strip">
+              <div class="diff-head">
+                <span class="chevron">▾</span>
+                <span class="tool">Edit</span>
+                <span class="path">PlanDeck/客户调研笔记.md</span>
+                <span class="spacer"></span>
+                <span class="badge-plus">+4</span>
+                <span class="badge-minus">−2</span>
+              </div>
+              <div class="diff-body">
+<div class="diff-line"><span class="pre"> </span>## 客户痛点</div>
+<div class="diff-line del"><span class="pre">−</span>大家普遍觉得不太好用</div>
+<div class="diff-line del"><span class="pre">−</span>需要后续跟进改进</div>
+<div class="diff-line ins"><span class="pre">+</span>① onboarding 第一步流失 38%（埋点数据）</div>
+<div class="diff-line ins"><span class="pre">+</span>② 团队版定价模糊，3 家客户主动问</div>
+<div class="diff-line ins"><span class="pre">+</span>③ 导出 PDF 是 top-3 feature request</div>
+<div class="diff-line ins"><span class="pre">+</span>④ 与 Notion 集成被问及 5 次</div>
+<div class="diff-line"><span class="pre"> </span></div>
+<div class="diff-line"><span class="pre"> </span>## 备注</div>
+              </div>
+            </div>
+            <div class="diff-strip">
+              <div class="diff-head">
+                <span class="chevron">▸</span>
+                <span class="tool">Write</span>
+                <span class="path">PlanDeck/2026-roadmap.md</span>
+                <span class="spacer"></span>
+                <span class="badge-plus">+47</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-muse"><svg class="muse"><use href="#m-lens"/></svg></div>
+  </section>
+
+  <!-- ============ 8 · MOBILE PWA (Euterpe · 音乐 · 声波 = 无线) ============ -->
+  <section class="slide">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>MOBILE · 手机端</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-wave"/></svg>
+        <span class="name">Euterpe</span><span class="sep">·</span><span class="domain">音乐</span>
+      </div>
+      <div class="counter">08 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">MOBILE PWA</div>
+        <h1>同一台服务器，<br>手机也能<span class="hl">无缝接着用</span>。</h1>
+        <p class="sub">添加到主屏，开起来就是全屏 app（standalone display，没有地址栏）。底部三按钮 tab bar：Files / Preview / Chat 单页切换。下拉刷新文件树，长任务跑完 Web Push 推送提醒。归档自始至终在你自己的主机上，不过云。</p>
+        <div class="micro">
+          PWA manifest · 主题色 <span class="kbd">#0f1115</span> · maskable 图标 · Apple Touch icon · 无需上架
+        </div>
+      </div>
+      <div class="col">
+        <div class="phone">
+          <div class="phone-statbar"><span>9:41</span><span>● ● ●</span></div>
+          <div class="phone-app">
+            <div class="phone-head">
+              <svg class="muse" style="width:11px;height:11px;color:var(--accent)"><use href="#m-wave"/></svg>
+              Chat · PlanDeck 增长策略
+            </div>
+            <div class="phone-body">
+              <div class="phone-msg user">把刚拍的白板照片转成 todo</div>
+              <div class="phone-msg ai">
+                <div class="muse-sig"><svg class="muse"><use href="#m-wave"/></svg>Muse</div>
+                已识别 5 项行动，写入 PlanDeck/meeting-2026-05.md
+              </div>
+              <div class="phone-msg user">念给我听</div>
+              <div class="phone-msg ai">
+                <div class="muse-sig"><svg class="muse"><use href="#m-wave"/></svg>Muse</div>
+                — 周三前敲定 onboarding A/B<br>
+                — 周五出团队版定价 v2<br>
+                — 下周一同步导出功能优先级…
+              </div>
+            </div>
+            <div class="phone-tabbar">
+              <div class="phone-tab">
+                <span class="ico">▣</span>Files
+              </div>
+              <div class="phone-tab">
+                <span class="ico">▣</span>Preview
+              </div>
+              <div class="phone-tab active">
+                <span class="ico">▣</span>Chat
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-muse"><svg class="muse"><use href="#m-wave"/></svg></div>
+  </section>
+
+  <!-- ============ 9 · CTA (Melpomene · 悲剧 · 残月 = 闭幕) ============ -->
+  <section class="slide cta">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark"></span><span>GET IT</span></div>
+      <div class="muse-chip">
+        <svg class="muse"><use href="#m-crescent"/></svg>
+        <span class="name">Melpomene</span><span class="sep">·</span><span class="domain">悲剧</span>
+      </div>
+      <div class="counter">09 / 09</div>
+    </div>
+    <div class="body">
+      <div class="col">
+        <div class="eyebrow">在你自己的机器上跑起来</div>
+        <h1 style="font-size:clamp(2.2rem,4.5vw,4rem)">muse<span style="color:var(--accent)">·</span>lab</h1>
+        <div class="hero-muses" style="margin-top:1em">
+          <div class="one"><svg class="muse"><use href="#m-hex"/></svg><span class="nm">Calliope</span></div>
+          <div class="one"><svg class="muse"><use href="#m-bars"/></svg><span class="nm">Clio</span></div>
+          <div class="one"><svg class="muse"><use href="#m-lens"/></svg><span class="nm">Erato</span></div>
+          <div class="one"><svg class="muse"><use href="#m-wave"/></svg><span class="nm">Euterpe</span></div>
+          <div class="one"><svg class="muse"><use href="#m-crescent"/></svg><span class="nm">Melpomene</span></div>
+          <div class="one"><svg class="muse"><use href="#m-halo"/></svg><span class="nm">Polyhymnia</span></div>
+          <div class="one"><svg class="muse"><use href="#m-trio"/></svg><span class="nm">Terpsichore</span></div>
+          <div class="one"><svg class="muse"><use href="#m-spark"/></svg><span class="nm">Thalia</span></div>
+          <div class="one"><svg class="muse"><use href="#m-orbit"/></svg><span class="nm">Urania</span></div>
+        </div>
+        <div class="url">github.com/hesorchen/muselab</div>
+        <div class="tags">
+          <span>★</span> Open source
+          <span>·</span> MIT
+          <span>·</span> Self-hosted
+          <span>·</span> Multi-model
+        </div>
+        <div class="install">
+          <span class="cmt"># Linux / macOS / WSL2 — 一行装上</span><br>
+          <span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/<br>
+          &nbsp;&nbsp;&nbsp;&nbsp;hesorchen/muselab/main/scripts/quick-install.sh | bash
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<div class="edge-click left"  onclick="prev()"></div>
+<div class="edge-click right" onclick="next()"></div>
+
+<nav class="nav">
+  <button onclick="prev()" aria-label="prev">‹</button>
+  <span class="count"><span id="cur">1</span> / <span id="total">9</span></span>
+  <button onclick="next()" aria-label="next">›</button>
+</nav>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let idx = 0;
+  document.getElementById('total').textContent = total;
+
+  function show(i) {
+    idx = (i + total) % total;
+    slides.forEach((s, k) => s.classList.toggle('active', k === idx));
+    document.getElementById('cur').textContent = idx + 1;
+    history.replaceState(null, '', '#' + (idx + 1));
+  }
+  function next() { show(idx + 1); }
+  function prev() { show(idx - 1); }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
+    if (e.key === 'Home') show(0);
+    if (e.key === 'End') show(total - 1);
+    if (/^[1-9]$/.test(e.key)) show(parseInt(e.key) - 1);
+  });
+
+  let touchX = null;
+  document.addEventListener('touchstart', (e) => { touchX = e.touches[0].clientX; });
+  document.addEventListener('touchend', (e) => {
+    if (touchX === null) return;
+    const dx = e.changedTouches[0].clientX - touchX;
+    if (Math.abs(dx) > 50) dx < 0 ? next() : prev();
+    touchX = null;
+  });
+
+  const hash = parseInt(location.hash.replace('#', ''));
+  if (hash >= 1 && hash <= total) show(hash - 1);
+</script>
+
+</body>
+</html>
