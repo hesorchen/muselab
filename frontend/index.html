@@ -970,6 +970,7 @@
                   <div class="session-picker-row"
                        :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
                        @click="pickerOpenSession(s.id)"
+                       @mouseenter="prefetchSession(s.id)"
                        @contextmenu.prevent="pickerRowMenu($event, s.id)"
                        role="option">
                     <button class="session-picker-pin"
@@ -1064,6 +1065,7 @@
                  @drop.prevent="onTabDrop($event, tid)"
                  @dragend="onTabDragEnd()"
                  @click="activateTab(tid)"
+                 @mouseenter="prefetchSession(tid)"
                  @dblclick="startRenameTab(tid)"
                  @contextmenu.prevent="showTabMenu($event, tid)"
                  @auxclick="onTabAuxClick($event, tid)"

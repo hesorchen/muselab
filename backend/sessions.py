@@ -124,13 +124,19 @@ _INDEX_LOCK = threading.Lock()
 #
 # Caching with a short TTL deduplicates "refresh storms" (heartbeat reconnect
 # triggers refreshSessions + fetchContextInfo + scheduler unread simultaneously)
-# without staling user-visible state for more than ~2s. Internal mutations
+# without staling user-visible state for more than ~0.5s. Internal mutations
 # (bump_session / rename / delete / pin) call `invalidate_sessions_cache()`
 # via `_save_index` so muselab-driven changes appear immediately; only
 # external JSONL writes (rare in muselab context) wait for the TTL.
+#
+# TTL was 2.0s until 2026-05-28 — multi-device + external CLI use cases
+# (running `claude --resume xxx` in a terminal while muselab is open in a
+# browser tab) noticed the new turns missing from the list for up to 2s
+# after each external write. 0.5s feels live without sacrificing the
+# refresh-storm dedup (a typical storm completes in ~50 ms anyway).
 
 _LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
-_LIST_CACHE_TTL_S = 2.0
+_LIST_CACHE_TTL_S = 0.5
 _LIST_CACHE_LOCK = threading.Lock()
 
 
