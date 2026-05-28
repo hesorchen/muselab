@@ -7785,7 +7785,17 @@ function portal() {
       return (n / 1024 / 1024).toFixed(1) + "M";
     },
     highlightCode(root) {
-      if (!window.hljs) { console.warn("[muselab] hljs not loaded"); return; }
+      if (!window.hljs) {
+        // Lazy-load hljs on first need, then re-call. Without this guard
+        // a chat with no code blocks never pays the 124 KB download cost.
+        // Re-call returns immediately if the root has no <code> children,
+        // and idempotently highlights any blocks that appeared since the
+        // last paint (data-hl="1" sentinel prevents double work).
+        // Fire-and-forget: failure logs warn but doesn't break rendering.
+        this._loadHljs().then(() => this.highlightCode(root))
+          .catch(e => console.warn("[muselab] hljs lazy-load failed:", e));
+        return;
+      }
       document.querySelectorAll(root + " code").forEach(el => {
         // Dedup: every stream chunk re-runs flushRender → highlightCode,
         // and without this guard we'd re-highlight every code block in
@@ -8008,6 +8018,53 @@ function portal() {
         if (!ready()) throw new Error("loaded but ready() still false for " + key);
       }).catch(clearOnFail);
       return this[key];
+    },
+
+    // highlight.js is ~150 KB (124 KB core + 24 KB extra language files for
+    // dockerfile / makefile / protobuf / accesslog / graphql) — only fires
+    // when a message / file preview contains a ```fenced``` code block.
+    // Plenty of "let me ask Muse a question" turns have zero code, so we
+    // skip the download until the first highlightCode() call.
+    // The hljs theme CSS (~4 KB) IS preloaded in index.html to prevent a
+    // brief unstyled flash when the script lands and re-highlights blocks.
+    // Language files load in parallel after the core (they depend on
+    // window.hljs existing); _loadAssets's sequential model would block
+    // them serially, so we hand-roll the parallel tail here.
+    async _loadHljs() {
+      if (window.hljs) return;
+      if (this._hljsLoadPromise) return this._hljsLoadPromise;
+      const inject = (src) => new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${src}"]`)) {
+          // Already in DOM — just wait for window.hljs to materialize.
+          const t0 = Date.now();
+          (function wait() {
+            if (window.hljs) return resolve();
+            if (Date.now() - t0 > 5000) return reject(new Error("hljs ready timeout"));
+            setTimeout(wait, 50);
+          })();
+          return;
+        }
+        const s = document.createElement("script");
+        s.src = src;
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("load failed: " + src));
+        document.head.appendChild(s);
+      });
+      this._hljsLoadPromise = (async () => {
+        await inject("/static/vendor/highlight.min.js");
+        if (!window.hljs) throw new Error("hljs loaded but window.hljs missing");
+        await Promise.all([
+          inject("/static/vendor/hljs-langs/dockerfile.min.js"),
+          inject("/static/vendor/hljs-langs/makefile.min.js"),
+          inject("/static/vendor/hljs-langs/protobuf.min.js"),
+          inject("/static/vendor/hljs-langs/accesslog.min.js"),
+          inject("/static/vendor/hljs-langs/graphql.min.js"),
+        ]);
+      })().catch(e => {
+        this._hljsLoadPromise = null;   // allow retry next call
+        throw e;
+      });
+      return this._hljsLoadPromise;
     },
 
     // KaTeX is ~562 KB (with fonts) of math rendering — only fires when a

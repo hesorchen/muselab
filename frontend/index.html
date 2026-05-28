@@ -37,14 +37,13 @@
 <meta name="theme-color" content="#f5f0e0" />
 
 <link rel="stylesheet" href="/static/styles.css" />
+<!-- highlight.js theme CSS preloaded (4 KB) so highlighted code blocks
+     don't FOUC when hljs lazy-loads. The 124 KB hljs script itself is
+     lazy-loaded via `_loadHljs()` in app.js on first highlightCode()
+     call — only ~25 % of paint cycles need it (chat without code blocks
+     never triggers). Mirrors the KaTeX / CodeMirror / Mermaid pattern.
+     2026-05-28: lazy-loaded to shave ~150 KB off cold-start payload. -->
 <link id="hljs-theme" rel="stylesheet" href="/static/vendor/highlight-theme.css" />
-<script defer src="/static/vendor/highlight.min.js"></script>
-<!-- 额外语言（common bundle 没的） -->
-<script defer src="/static/vendor/hljs-langs/dockerfile.min.js"></script>
-<script defer src="/static/vendor/hljs-langs/makefile.min.js"></script>
-<script defer src="/static/vendor/hljs-langs/protobuf.min.js"></script>
-<script defer src="/static/vendor/hljs-langs/accesslog.min.js"></script>
-<script defer src="/static/vendor/hljs-langs/graphql.min.js"></script>
 <!-- i18n + static UI data must load BEFORE app.js (which reads
      window.MUSELAB_* at module top-level). `defer` preserves order for
      same-attribute scripts. -->

@@ -83,41 +83,48 @@ async def _lifespan(app: FastAPI):
             f"[muselab] scheduler start failed (continuing without scheduler): "
             f"{type(e).__name__}: {e}\n{traceback.format_exc()}\n")
         sys.stderr.flush()
-    # Prune empty sessions left over from the previous run (e.g. new-session
-    # clicks that were never used). Runs before the first request so the
-    # session list is clean immediately on page load.
-    try:
-        from . import sessions as _sess_mod
-        pruned = _sess_mod.prune_empty_sessions()
-        if pruned:
-            sys.stderr.write(
-                f"[muselab] pruned {len(pruned)} empty session(s) on startup\n")
-            sys.stderr.flush()
-    except Exception as _e:
-        sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
-        sys.stderr.flush()
-    # Purge trash items older than MUSELAB_TRASH_TTL_DAYS (default 30).
-    # Without this the dustbin grows monotonically — soft-delete of large
-    # subtrees over months eventually fills the disk. Mirrors macOS Finder
-    # / GNOME behaviour. Disable with MUSELAB_TRASH_TTL_DAYS=0.
-    try:
-        from . import files as _files_mod
-        purged = _files_mod.auto_purge_expired_trash()
-        if purged:
-            sys.stderr.write(
-                f"[muselab] auto-purged {purged} expired trash item(s) "
-                f"(> {_files_mod._TRASH_TTL_DAYS}d old)\n")
-            sys.stderr.flush()
-    except Exception as _e:
-        sys.stderr.write(
-            f"[muselab] trash auto-purge failed (non-fatal): {_e}\n")
-        sys.stderr.flush()
-    # Fire-and-forget: rewrite turn_count for any session whose value was
-    # written by the old algorithm (which counted every type="user" SDK
-    # frame — including tool_result sidechain echoes — so values were
-    # 5-10× too high). Runs in a background task so it doesn't delay the
-    # event loop or the first user request.
+    # Prune empty sessions + auto-purge expired trash. Both used to block
+    # lifespan before yield (50-300 ms total on archives with many
+    # sessions / a populated trash dir), pushing first-request TTFB out.
+    # Moved to background tasks (2026-05-28) — neither is user-visible at
+    # boot: a stray empty session in the list for ~1s, or a couple of
+    # >30-day trash items not yet cleaned, are both no-ops from the user's
+    # POV. `asyncio.to_thread` runs the sync IO off the event loop so a
+    # slow disk doesn't stall concurrent requests either.
     import asyncio as _asyncio
+
+    async def _bg_prune_sessions() -> None:
+        try:
+            from . import sessions as _sess_mod
+            pruned = await _asyncio.to_thread(_sess_mod.prune_empty_sessions)
+            if pruned:
+                sys.stderr.write(
+                    f"[muselab] pruned {len(pruned)} empty session(s) on startup\n")
+                sys.stderr.flush()
+        except Exception as _e:
+            sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
+            sys.stderr.flush()
+
+    async def _bg_purge_trash() -> None:
+        try:
+            from . import files as _files_mod
+            purged = await _asyncio.to_thread(_files_mod.auto_purge_expired_trash)
+            if purged:
+                sys.stderr.write(
+                    f"[muselab] auto-purged {purged} expired trash item(s) "
+                    f"(> {_files_mod._TRASH_TTL_DAYS}d old)\n")
+                sys.stderr.flush()
+        except Exception as _e:
+            sys.stderr.write(
+                f"[muselab] trash auto-purge failed (non-fatal): {_e}\n")
+            sys.stderr.flush()
+
+    _asyncio.create_task(_bg_prune_sessions())
+    _asyncio.create_task(_bg_purge_trash())
+    # Same fire-and-forget pattern: rewrite turn_count for any session
+    # written by the old algorithm. Gated by a sentinel file so reruns
+    # are cheap; first run can take a few seconds on archives with
+    # hundreds of sessions.
     _asyncio.create_task(_backfill_turn_counts())
     yield
 
