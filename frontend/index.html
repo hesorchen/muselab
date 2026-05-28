@@ -4047,11 +4047,14 @@
              container with a leading divider, so it reads as "global
              action", not "5th tool". `margin-left: auto` on the group
              (not the button) pushes the whole group right; the divider
-             gives a clean visual break from size pickers. Title now
-             advertises the keyboard shortcut. -->
+             gives a clean visual break from size pickers. Undo reuses
+             the .img-editor-tool class for visual parity with pen/rect/
+             arrow/eraser — same 36×36 footprint + same hover/disabled
+             treatment. It can never become .active so no risk of
+             confusion with the soft-accent selected state. -->
         <div class="img-editor-action-group">
           <span class="img-editor-divider" aria-hidden="true"></span>
-          <button class="img-editor-action"
+          <button class="img-editor-tool"
                   @click="undoImageEdit()"
                   :disabled="!canUndoImageEdit()"
                   :title="(lang==='zh' ? '撤销' : 'Undo') + ' (⌘Z / Ctrl+Z)'">

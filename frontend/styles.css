@@ -76,6 +76,11 @@
   --font-sans: -apple-system, "PingFang SC", "Microsoft YaHei", "Inter",
                "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  /* 2xs is muselab's "micro" tier — meta labels, kbd badges, count
+     pills, hint glyphs. Below WCAG comfortable reading size, so only
+     use for short tokens (≤8 chars), never running text. Added
+     2026-05-28 to replace 9+ hardcoded `font-size: 10px`. */
+  --fs-2xs: 10px;
   --fs-xs: 11px;
   --fs-sm: 12px;
   /* Was 13.5 / 14.5 — sub-pixel rendering is unreliable on Windows
@@ -86,6 +91,13 @@
   --fs-md: 14px;
   --fs-lg: 16px;
   --fs-xl: 20px;
+  /* Display scale — used by single-glyph icon buttons (× close, ⊕,
+     etc.) and the brand wordmark in its three render sizes (splash /
+     login / chat-empty / footer). Not for normal text. */
+  --fs-2xl: 22px;        /* Unicode-glyph icon buttons (modal close ×, etc.) */
+  --fs-logo-sm: 28px;    /* small splash / chat-empty brand wordmark */
+  --fs-logo-md: 32px;    /* main splash / login brand wordmark */
+  --fs-logo-hero: 56px;  /* hero splash on the very first paint */
   --fw-normal: 400;
   --fw-medium: 500;
   --fw-semibold: 600;
@@ -99,6 +111,29 @@
   --c-token-in:    #2563eb;
   --c-token-out:   #7c3aed;
   --c-token-cache: #059669;
+
+  /* File-extension icon colors. Mostly brand colors (Python blue, JS
+     yellow, TypeScript blue, PDF red…) — community-recognized so we
+     keep the hex values rather than re-deriving from accent. Defined
+     once here, referenced by BOTH .filelist and .open-files-list rules
+     below. Adding a new ext should only need one new token + two
+     rule lines, not two parallel color edits. */
+  --c-ext-doc:      var(--c-accent);
+  --c-ext-py:       #3776ab;
+  --c-ext-js:       #f7df1e;
+  --c-ext-ts:       #3178c6;
+  --c-ext-config:   #d6b370;
+  --c-ext-web:      #e34c26;
+  --c-ext-image:    #b07cf2;
+  --c-ext-pdf:      #dc3545;
+  --c-ext-compiled: #00ad8f;
+  --c-ext-cstyle:   #5b9bd5;
+  --c-ext-shell:    #9aa0a6;
+  --c-ext-archive:  #8e8e8e;
+  --c-ext-data:     #34a853;
+  --c-ext-audio:    #c084fc;
+  --c-ext-video:    #f87171;
+  --c-ext-log:      #fcd34d;
 
   /* Scrollbar resting thumb */
   --c-scrollbar: rgba(128, 128, 128, 0.25);
@@ -358,7 +393,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   50%      { transform: scale(1.08); opacity: 1; }
 }
 .splash-logo {
-  font-size: 28px; font-weight: var(--fw-semibold);
+  font-size: var(--fs-logo-sm); font-weight: var(--fw-semibold);
   letter-spacing: -0.5px; color: var(--c-fg-0);
 }
 .splash-logo .accent { color: var(--c-accent); }
@@ -419,7 +454,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   background: radial-gradient(ellipse at center, var(--c-bg-1) 0%, var(--c-bg-0) 100%);
 }
 .login-logo {
-  font-size: 28px; font-weight: var(--fw-semibold);
+  font-size: var(--fs-logo-sm); font-weight: var(--fw-semibold);
   letter-spacing: -0.5px; color: var(--c-fg-0);
   margin: 0 0 var(--sp-2);
 }
@@ -806,7 +841,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .pane.chat .pane-head .ctx-chip,
   .pane.chat .pane-head .mcp-badge { display: none; }
   /* Brand title shorter */
-  .brand-logo { font-size: 22px; }
+  .brand-logo { font-size: var(--fs-2xl); }
 }
 
 /* ===== Mobile virtual keyboard handling =====
@@ -884,7 +919,7 @@ body.kb-open .mobile-tab-bar { display: none; }
 .msg-outline-label { flex: 1; }
 .msg-outline-close {
   background: transparent; border: none; cursor: pointer;
-  color: var(--c-fg-3); font-size: 22px; line-height: 1;
+  color: var(--c-fg-3); font-size: var(--fs-2xl); line-height: 1;
   padding: 0 6px;
 }
 .msg-outline-close:hover { color: var(--c-fg-0); }
@@ -1381,14 +1416,14 @@ body.kb-open .mobile-tab-bar { display: none; }
 .open-files-splitter.active { background: var(--c-accent); }
 /* Reuse extension tinting from .filelist — keep colors consistent across
    the two lists. */
-.open-files-list li[data-ext="doc"]     .icon { color: #6093ff; }
-.open-files-list li[data-ext="py"]      .icon { color: #3776ab; }
-.open-files-list li[data-ext="js"]      .icon { color: #f7df1e; }
-.open-files-list li[data-ext="ts"]      .icon { color: #3178c6; }
-.open-files-list li[data-ext="config"]  .icon { color: #d6b370; }
-.open-files-list li[data-ext="web"]     .icon { color: #e34c26; }
-.open-files-list li[data-ext="image"]   .icon { color: #b07cf2; }
-.open-files-list li[data-ext="pdf"]     .icon { color: #dc3545; }
+.open-files-list li[data-ext="doc"]     .icon { color: var(--c-ext-doc); }
+.open-files-list li[data-ext="py"]      .icon { color: var(--c-ext-py); }
+.open-files-list li[data-ext="js"]      .icon { color: var(--c-ext-js); }
+.open-files-list li[data-ext="ts"]      .icon { color: var(--c-ext-ts); }
+.open-files-list li[data-ext="config"]  .icon { color: var(--c-ext-config); }
+.open-files-list li[data-ext="web"]     .icon { color: var(--c-ext-web); }
+.open-files-list li[data-ext="image"]   .icon { color: var(--c-ext-image); }
+.open-files-list li[data-ext="pdf"]     .icon { color: var(--c-ext-pdf); }
 .open-files-list li.sel .icon,
 .open-files-list li:hover .icon { color: var(--c-accent) !important; }
 
@@ -1495,22 +1530,22 @@ body.kb-open .mobile-tab-bar { display: none; }
 /* Per-extension icon tinting — quick visual disambiguation without expanding
    the SVG sprite. data-ext is set by fileExtClass(). Tints are subtle:
    sel / hover state still overrides via inherited color → accent. */
-.filelist li[data-ext="doc"]      .icon { color: #6093ff; }
-.filelist li[data-ext="py"]       .icon { color: #3776ab; }
-.filelist li[data-ext="js"]       .icon { color: #f7df1e; }
-.filelist li[data-ext="ts"]       .icon { color: #3178c6; }
-.filelist li[data-ext="compiled"] .icon { color: #00ad8f; }
-.filelist li[data-ext="cstyle"]   .icon { color: #5b9bd5; }
-.filelist li[data-ext="shell"]    .icon { color: #9aa0a6; }
-.filelist li[data-ext="config"]   .icon { color: #d6b370; }
-.filelist li[data-ext="web"]      .icon { color: #e34c26; }
-.filelist li[data-ext="image"]    .icon { color: #b07cf2; }
-.filelist li[data-ext="pdf"]      .icon { color: #dc3545; }
-.filelist li[data-ext="archive"]  .icon { color: #8e8e8e; }
-.filelist li[data-ext="data"]     .icon { color: #34a853; }
-.filelist li[data-ext="audio"]    .icon { color: #c084fc; }
-.filelist li[data-ext="video"]    .icon { color: #f87171; }
-.filelist li[data-ext="log"]      .icon { color: #fcd34d; }
+.filelist li[data-ext="doc"]      .icon { color: var(--c-ext-doc); }
+.filelist li[data-ext="py"]       .icon { color: var(--c-ext-py); }
+.filelist li[data-ext="js"]       .icon { color: var(--c-ext-js); }
+.filelist li[data-ext="ts"]       .icon { color: var(--c-ext-ts); }
+.filelist li[data-ext="compiled"] .icon { color: var(--c-ext-compiled); }
+.filelist li[data-ext="cstyle"]   .icon { color: var(--c-ext-cstyle); }
+.filelist li[data-ext="shell"]    .icon { color: var(--c-ext-shell); }
+.filelist li[data-ext="config"]   .icon { color: var(--c-ext-config); }
+.filelist li[data-ext="web"]      .icon { color: var(--c-ext-web); }
+.filelist li[data-ext="image"]    .icon { color: var(--c-ext-image); }
+.filelist li[data-ext="pdf"]      .icon { color: var(--c-ext-pdf); }
+.filelist li[data-ext="archive"]  .icon { color: var(--c-ext-archive); }
+.filelist li[data-ext="data"]     .icon { color: var(--c-ext-data); }
+.filelist li[data-ext="audio"]    .icon { color: var(--c-ext-audio); }
+.filelist li[data-ext="video"]    .icon { color: var(--c-ext-video); }
+.filelist li[data-ext="log"]      .icon { color: var(--c-ext-log); }
 /* Selected / hover still overrides — keeps the active row's color unified. */
 .filelist li.sel .icon,
 .filelist li:hover .icon { color: var(--c-accent) !important; }
@@ -1621,11 +1656,11 @@ body.kb-open .mobile-tab-bar { display: none; }
   user-select: none;
 }
 .brand-logo {
-  font-size: 56px; font-weight: 200;
+  font-size: var(--fs-logo-hero); font-weight: 200;
   letter-spacing: -2px; color: var(--c-fg-1);
   margin: 0;
 }
-.brand-logo.small { font-size: 32px; }
+.brand-logo.small { font-size: var(--fs-logo-md); }
 .brand-logo .accent {
   color: var(--c-accent);
   text-shadow: 0 0 20px var(--c-accent-soft);
@@ -1640,8 +1675,8 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 .brand-tip { display: flex; align-items: center; gap: var(--sp-2); }
 .chat-empty { padding: var(--sp-6) var(--sp-4); }
-.chat-empty .brand-logo { font-size: 32px; }
-.chat-empty .brand-logo.small { font-size: 28px; }
+.chat-empty .brand-logo { font-size: var(--fs-logo-md); }
+.chat-empty .brand-logo.small { font-size: var(--fs-logo-sm); }
 
 /* ==========================================================================
    Muse mascot — 16 抽象几何形象，按时间哈希挑一个
@@ -1903,7 +1938,7 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
 /* Copy-button just-flashed state — accent color + slight scale to make the
    icon change feel intentional. .icon-btn already has the base style. */
 .icon-btn.copied-flash { color: var(--c-accent); transform: scale(1.05); transition: transform var(--t-fast); }
-.icon-btn.retry-btn { color: var(--c-danger, #dc3545); }
+.icon-btn.retry-btn { color: var(--c-danger); }
 .icon-btn.retry-btn:hover { color: var(--c-accent); }
 
 /* Fullscreen transparent overlay used by right-click menus to catch
@@ -3602,7 +3637,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .img-editor-head .modal-close {
   background: transparent; border: 0; padding: 4px 8px;
-  font-size: 22px; line-height: 1;
+  font-size: var(--fs-2xl); line-height: 1;
   color: var(--c-fg-2); cursor: pointer;
   border-radius: var(--r-sm);
 }
@@ -3689,33 +3724,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-border);
   margin: 0 4px;
 }
-/* Action button — same 36×36 footprint as .img-editor-tool so the
-   click target stays consistent, but visually distinct: no `.active`
-   state (an action never stays "on"), and a press feedback (scale
-   0.95) so the user gets tactile confirmation the click fired even
-   when the canvas changes subtly. Disabled state mirrors the tool
-   buttons for visual consistency. */
-.img-editor-action {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 36px; height: 36px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-  color: var(--c-fg-2);
-  cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
-  touch-action: manipulation;
-}
-.img-editor-action svg {
-  width: 18px; height: 18px;
-  stroke: currentColor; fill: none;
-  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
-}
-.img-editor-action:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
-.img-editor-action:active:not([disabled]) { background: var(--c-bg-3); transform: scale(0.92); }
-.img-editor-action[disabled] {
-  opacity: 0.35; cursor: not-allowed; pointer-events: none;
-}
+/* (2026-05-28) .img-editor-action removed — was a near-exact copy of
+   .img-editor-tool with one extra `transform: scale` pressed state.
+   The single user (undo button) now uses .img-editor-tool directly so
+   we have one source of truth for "36×36 toolbar button in the image
+   editor". Press feedback via :active was a nice-to-have that didn't
+   justify the duplication. */
 
 .img-editor-color {
   width: 24px; height: 24px;
@@ -3824,9 +3838,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: width var(--t-base), background var(--t-base);
 }
 .ctx-meter.warn .ctx-meter-fill { background: #f59e0b; }
-.ctx-meter.danger .ctx-meter-fill { background: var(--c-danger, #dc3545); }
+.ctx-meter.danger .ctx-meter-fill { background: var(--c-danger); }
 .ctx-meter.warn .ctx-meter-label { color: #f59e0b; }
-.ctx-meter.danger .ctx-meter-label { color: var(--c-danger, #dc3545); font-weight: var(--fw-semibold); }
+.ctx-meter.danger .ctx-meter-label { color: var(--c-danger); font-weight: var(--fw-semibold); }
 /* Context breakdown popup — anchored top-right of viewport, fixed so it
    floats over any pane. Shows SDK get_context_usage() per-category data. */
 .ctx-breakdown-pop {
@@ -3892,7 +3906,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   min-width: 42px; text-align: right;
 }
 .ctx-breakdown-caret {
-  color: var(--c-fg-3); font-size: 10px; width: 10px; flex-shrink: 0;
+  color: var(--c-fg-3); font-size: var(--fs-2xs); width: 10px; flex-shrink: 0;
 }
 /* Per-file / per-tool breakdown shown when a parent row is expanded. */
 .ctx-breakdown-sub {
@@ -3955,7 +3969,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: background var(--t-fast), border-color var(--t-fast);
 }
 .ctx-meter.danger .ctx-meter-action {
-  background: var(--c-danger, #dc3545); color: white;
+  background: var(--c-danger); color: white;
 }
 .ctx-meter-action:hover {
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);
@@ -4505,11 +4519,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .msg:hover .msg-actions { opacity: 1; }
 
 .meta {
-  font-size: 10px; color: var(--c-fg-4); margin-top: 3px; padding: 0 4px;
+  font-size: var(--fs-2xs); color: var(--c-fg-4); margin-top: 3px; padding: 0 4px;
   font-family: var(--font-mono);
 }
 .model-tag {
-  font-size: 10px; color: var(--c-fg-3);
+  font-size: var(--fs-2xs); color: var(--c-fg-3);
   margin-top: 2px; padding: 0 4px;
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
@@ -4524,7 +4538,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    since timestamps are always 5 chars. Sits under the bubble of an
    assistant message once the turn finishes — see fmtHM() in app.js. */
 .msg-ts {
-  font-size: 10px; color: var(--c-fg-3);
+  font-size: var(--fs-2xs); color: var(--c-fg-3);
   margin-top: 2px; padding: 0 4px;
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
@@ -4534,7 +4548,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    compact footer line "13:42 · 2m50s". The · separator is in the
    x-text so spacing stays uniform whether or not elapsed is present. */
 .msg-elapsed {
-  font-size: 10px; color: var(--c-fg-3);
+  font-size: var(--fs-2xs); color: var(--c-fg-3);
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
 }
@@ -4694,7 +4708,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .chat-toolbar-ring:hover { background: var(--c-bg-3); }
 .chat-toolbar-ring.warn { color: #f59e0b; }
-.chat-toolbar-ring.danger { color: var(--c-danger, #dc3545); }
+.chat-toolbar-ring.danger { color: var(--c-danger); }
 .chat-toolbar-ring svg { display: block; }
 .chat-toolbar-ring svg circle:nth-child(2) {
   transition: stroke-dashoffset var(--t-base), stroke var(--t-base);
@@ -4713,7 +4727,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .chat-toolbar-send:active:not(:disabled) { transform: scale(0.95); }
 .chat-toolbar-send:disabled { opacity: 0.35; cursor: not-allowed; }
 .chat-toolbar-send svg { width: 14px; height: 14px; }
-.chat-toolbar-send.btn-danger { background: var(--c-danger, #dc3545); }
+.chat-toolbar-send.btn-danger { background: var(--c-danger); }
 .chat-toolbar-send.btn-danger:hover { background: #b91c2c; }
 /* The Send / Stop label inside the button — hidden by default
    (icon-only). Use nth-child(2) instead of :last-child because the
@@ -4729,7 +4743,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   min-width: 14px; height: 14px; padding: 0 3px;
   border-radius: 7px;
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);
-  font-size: 10px; font-weight: 600; line-height: 1;
+  font-size: var(--fs-2xs); font-weight: 600; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
   box-sizing: border-box;
 }
@@ -4889,7 +4903,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   padding: 6px 12px; font-size: var(--fs-xs); color: var(--c-fg-3);
   border-bottom: 1px solid var(--c-border);
 }
-.mention-hint .kbd { font-size: 10px; padding: 0 4px; }
+.mention-hint .kbd { font-size: var(--fs-2xs); padding: 0 4px; }
 .mention-item {
   display: flex; gap: var(--sp-2); padding: 7px 12px;
   cursor: pointer; align-items: center;
@@ -4914,7 +4928,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    accent so it reads as "active / live" rather than incidental. */
 .mention-open-badge {
   flex-shrink: 0;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: var(--fw-medium);
   padding: 1px 6px;
   border-radius: var(--r-full);
@@ -5142,7 +5156,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .settings-menu-icon { font-size: var(--fs-xl); line-height: 1; flex-shrink: 0; }
 .settings-menu-title { flex: 1; }
 .settings-menu-chevron {
-  color: var(--c-fg-3); font-size: 22px; line-height: 1;
+  color: var(--c-fg-3); font-size: var(--fs-2xl); line-height: 1;
   font-weight: 300;
 }
 .settings-back {
@@ -5154,7 +5168,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   -webkit-tap-highlight-color: transparent;
 }
 .settings-back > span:first-child {
-  font-size: 22px; line-height: 1; margin-right: 2px;
+  font-size: var(--fs-2xl); line-height: 1; margin-right: 2px;
 }
 .settings-back:active { opacity: 0.6; }
 
@@ -5437,7 +5451,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: var(--r-full);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-family: var(--font-mono);
   text-transform: lowercase;
   letter-spacing: 0;
@@ -5638,7 +5652,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .upgrade-badge {
   display: inline-block;
   padding: 1px 8px; border-radius: var(--r-full);
-  font-size: 10px; font-weight: var(--fw-semibold);
+  font-size: var(--fs-2xs); font-weight: var(--fw-semibold);
   background: var(--c-accent-soft); color: var(--c-accent);
   /* Without nowrap a narrow viewport (mobile, the rightmost column
      squeezed by the long-Chinese-name first column) wraps "有更新"
@@ -5869,7 +5883,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-fg-0);
 }
 .cmd-palette-item-type {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-family: var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -5914,7 +5928,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-bottom: var(--sp-1);
 }
 .cost-kpi-value {
-  font-size: 22px;
+  font-size: var(--fs-2xl);
   font-weight: 600;
   color: var(--c-fg-1);
   font-variant-numeric: tabular-nums;
@@ -6093,7 +6107,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   min-width: 14px; height: 14px;
   padding: 0 3px;
   border-radius: var(--r-full);
-  background: var(--c-danger, #ef4444);
+  background: var(--c-danger);
   color: white;
   font-size: 9px;
   font-weight: var(--fw-semibold);
@@ -6210,10 +6224,16 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: color var(--t-fast), background var(--t-fast);
 }
 .sched-freq-btn:hover { color: var(--c-fg-1); }
+/* Active state aligned with the dominant "soft accent" pattern used by
+   .icon-btn.active / .session-picker-row.active / .chat-toolbar-btn.active
+   etc. (21 occurrences in this file). Previously this was the lone hold-
+   out using "full accent fill + white text", which read as too heavy when
+   only 2 buttons existed in the segmented group (the unselected option
+   looked disabled by comparison — 2026-05-28 user feedback on the
+   session-mode picker). */
 .sched-freq-btn.active {
-  background: var(--c-accent);
-  color: white;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.12);
+  background: var(--c-accent-soft);
+  color: var(--c-accent);
   font-weight: var(--fw-medium);
 }
 
@@ -6280,7 +6300,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .sched-times-del:hover {
   background: var(--c-bg-3);
-  color: var(--c-danger, #ef4444);
+  color: var(--c-danger);
 }
 /* Add-slot button. Sits below the row list, ghost-link styling so it
    reads as "secondary affordance" — primary is the green "+ 添加任务"
@@ -6402,8 +6422,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: color var(--t-fast), border-color var(--t-fast);
 }
 .sched-hist-clear:hover {
-  color: var(--c-danger, #ef4444);
-  border-color: var(--c-danger, #ef4444);
+  color: var(--c-danger);
+  border-color: var(--c-danger);
 }
 .sched-empty {
   padding: 14px; text-align: center;
@@ -6525,7 +6545,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); font-weight: var(--fw-normal);
   font-family: var(--font-mono);
   background: var(--c-accent-soft); color: var(--c-accent);
-  border-radius: 999px;
+  border-radius: var(--r-full);
   vertical-align: middle;
 }
 /* Collapsible past-runs panel. Visually a continuation of the row card
@@ -6582,7 +6602,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-left: 2px solid var(--c-accent);
 }
 .sched-hist-row.err {
-  border-left-color: var(--c-danger, #ef4444);
+  border-left-color: var(--c-danger);
 }
 .sched-hist-head {
   display: flex; gap: var(--sp-2); align-items: center;
@@ -6619,7 +6639,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .sched-hist-del:hover {
   background: var(--c-bg-1);
-  color: var(--c-danger, #ef4444);
+  color: var(--c-danger);
 }
 .sched-hist-del:active { background: var(--c-bg-3); }
 .sched-hist-body {
@@ -6628,7 +6648,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.sched-hist-row.err .sched-hist-body { color: var(--c-danger, #ef4444); }
+.sched-hist-row.err .sched-hist-body { color: var(--c-danger); }
 
 /* ==========================================================================
    Touch-device fallbacks for hover-only UI. On `hover: none` pointers
