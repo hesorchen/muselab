@@ -5242,6 +5242,20 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .settings-badge.ok { background: rgba(74,222,128,0.15); color: var(--c-success); }
 
+/* Wrapper for a "button + hint" pair sharing one settings-row right
+   column. Used so the button stays at its natural width instead of
+   being stretched to 1fr (default grid justify-self), and the hint
+   sits cleanly underneath instead of wrapping to (row 2, col 1) and
+   getting crushed into the 220px label column. */
+.settings-row-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+.settings-row-col .settings-hint { margin: 0; }
+
 /* checkbox 一行的右侧布局：label 包 checkbox + 文字 */
 .settings-row .chk {
   height: auto; padding: 0;
@@ -6153,6 +6167,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .sched-mode-col {
   display: flex;
   flex-direction: column;
+  /* CRITICAL: flex column default cross-axis is stretch, which blew the
+     inline-flex `.sched-freq` button group out to the full 1fr column
+     width — segmented control's white card bg stretched across the
+     entire right column with a huge empty trailing band. flex-start
+     keeps children at their natural width. (2026-05-28 screenshot.) */
+  align-items: flex-start;
   gap: 6px;
   min-width: 0;
 }

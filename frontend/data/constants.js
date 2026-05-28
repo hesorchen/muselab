@@ -12,7 +12,9 @@ window.MUSELAB_ACCENT_PRESETS = [
   { name: { zh: "翠绿",   en: "Emerald" },       value: "#34d399" },
   { name: { zh: "暖橙",   en: "Warm orange" },   value: "#fb923c" },
   { name: { zh: "玫红",   en: "Rose" },          value: "#f472b6" },
-  { name: { zh: "石板灰", en: "Slate" },         value: "#94a3b8" },
+  // Slate (#94a3b8) removed 2026-05-28 — too low-contrast against the
+  // neutral bg-1 backgrounds, "accent" effectively invisible. Users can
+  // still pick it via the custom color picker if they really want.
 ];
 
 // Editable file extensions (matches backend TEXT_EXT). A Set so Alpine

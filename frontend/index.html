@@ -2947,16 +2947,25 @@
               </template>
             </div>
           </template>
-          <!-- Standalone restart button — useful any time, not just after upgrade -->
+          <!-- Standalone restart button — useful any time, not just after upgrade.
+               Button + hint wrapped in a single .settings-row-col div so the
+               .settings-row grid (220px label + 1fr content) treats them as
+               ONE cell. Without the wrapper the button was a direct grid
+               item and `justify-self: stretch` (default) blew it up to the
+               full 1fr width = ~700px-wide grey block (2026-05-28 screenshot).
+               The hint was a 3rd grid child that wrapped to (row 2, col 1)
+               and got crushed into the 220px label column. -->
           <div class="settings-row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--c-border)">
             <label x-text="lang==='zh' ? '重启服务' : 'Restart service'"></label>
-            <button class="btn-ghost sm"
-                    :disabled="settings.restarting"
-                    @click="restartService()"
-                    x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '重启' : 'Restart')">
-            </button>
-            <div class="settings-hint"
-                 x-text="lang==='zh' ? '升级 SDK / 修改 .env 后，重启让新配置生效。' : 'Use after upgrading the SDK or editing .env.'"></div>
+            <div class="settings-row-col">
+              <button class="btn-ghost sm"
+                      :disabled="settings.restarting"
+                      @click="restartService()"
+                      x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '重启' : 'Restart')">
+              </button>
+              <div class="settings-hint"
+                   x-text="lang==='zh' ? '升级 SDK / 修改 .env 后，重启让新配置生效。' : 'Use after upgrading the SDK or editing .env.'"></div>
+            </div>
           </div>
           <template x-if="!settings.versions && !settings.versionsLoading">
             <div class="settings-hint"
