@@ -3736,10 +3736,42 @@
                         : 'e.g. Summarize what changed in my archive in the last 24h and flag the 3 worth my attention'"></textarea>
           </div>
 
+          <!-- Session mode — added 2026-05-28. Reuses the .sched-freq-btn
+               segmented-control look so the form has a consistent feel
+               with the frequency picker above. Default "fresh" reflects
+               the cronjob mental model; users can switch to "reuse" for
+               日报续写 / 长期跟踪 tasks where context accumulation matters. -->
+          <div class="sched-field">
+            <label class="sched-label"
+                   x-text="lang==='zh' ? '会话模式' : 'Session mode'"></label>
+            <div class="sched-freq">
+              <button type="button" class="sched-freq-btn"
+                      :class="{ active: scheduler.draft.session_mode === 'fresh' }"
+                      @click="scheduler.draft.session_mode = 'fresh'"
+                      x-text="lang==='zh' ? '每次新开' : 'Fresh'"></button>
+              <button type="button" class="sched-freq-btn"
+                      :class="{ active: scheduler.draft.session_mode === 'reuse' }"
+                      @click="scheduler.draft.session_mode = 'reuse'"
+                      x-text="lang==='zh' ? '持续会话' : 'Reuse'"></button>
+            </div>
+            <div class="sched-times-hint"
+                 x-text="scheduler.draft.session_mode === 'fresh'
+                   ? (lang==='zh'
+                       ? '每次跑都新建一个 session，互不干扰。适合周报 / 调研类。'
+                       : 'Each run spins up a new session. Good for weekly reports / one-shot research.')
+                   : (lang==='zh'
+                       ? '所有运行都接在同一个 session 里，Muse 看得到历史。适合日报续写 / 长期跟踪。'
+                       : 'All runs append to one bound session — Muse sees prior history. Good for daily-report threads.')"></div>
+          </div>
+
           <div class="sched-create-foot">
-            <span class="sched-create-hint" x-text="lang==='zh'
-                ? '运行结果发送到自动创建的同名 session'
-                : 'Output streams into an auto-created session of the same name'"></span>
+            <span class="sched-create-hint" x-text="scheduler.draft.session_mode === 'fresh'
+                ? (lang==='zh'
+                    ? '运行结果发送到一个新建的 session（每次一个）'
+                    : 'Each run sends output into a brand-new session')
+                : (lang==='zh'
+                    ? '运行结果发送到自动创建的同名 session'
+                    : 'Output streams into an auto-created session of the same name')"></span>
             <button class="btn-ghost" x-show="scheduler.draft.editingId"
                     @click="cancelEditSched()"
                     x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
@@ -3762,47 +3794,96 @@
                x-text="lang==='zh' ? '还没有任务。在上方添加一个。'
                                    : 'No tasks yet. Add one above.'"></div>
           <template x-for="t in scheduler.tasks" :key="t.id">
-            <div class="sched-row sched-row-clickable"
-                 :class="{ disabled: !t.enabled }"
-                 @click="openSchedTaskSession(t)"
-                 :title="lang==='zh' ? '点击打开关联 session' : 'Click to open bound session'">
-              <div class="sched-row-main">
-                <div class="sched-row-name">
-                  <span x-text="t.name"></span>
-                  <span class="sched-row-time"
-                        x-text="' · ' + fmtSchedule(t.schedule)"></span>
+            <div class="sched-task-card"
+                 :class="{ 'has-runs-open': scheduler.taskRuns[t.id]?.open }">
+              <div class="sched-row sched-row-clickable"
+                   :class="{ disabled: !t.enabled }"
+                   @click="openSchedTaskSession(t)"
+                   :title="lang==='zh' ? '点击打开最近一次运行的 session' : 'Click to open the most recent run\\'s session'">
+                <div class="sched-row-main">
+                  <div class="sched-row-name">
+                    <span x-text="t.name"></span>
+                    <span class="sched-row-time"
+                          x-text="' · ' + fmtSchedule(t.schedule)"></span>
+                    <!-- Mode badge — only shown when explicit fresh; reuse is
+                         the historical default and would clutter every row
+                         if labelled. Old tasks without session_mode read as
+                         "reuse" (no badge), matching backend fallback. -->
+                    <span class="sched-row-mode" x-show="t.session_mode === 'fresh'"
+                          :title="lang==='zh' ? '每次新开 session' : 'Fresh session per run'"
+                          x-text="lang==='zh' ? '每次新开' : 'fresh'"></span>
+                  </div>
+                  <div class="sched-row-prompt" x-text="t.prompt"></div>
+                  <div class="sched-row-meta">
+                    <span x-show="t.last_run"
+                          x-text="(lang==='zh' ? '上次: ' : 'last: ') + fmtSchedTime(t.last_run)"></span>
+                    <span x-show="t.next_run && t.enabled"
+                          x-text="(lang==='zh' ? '下次: ' : 'next: ') + fmtSchedTime(t.next_run)"></span>
+                  </div>
                 </div>
-                <div class="sched-row-prompt" x-text="t.prompt"></div>
-                <div class="sched-row-meta">
-                  <span x-show="t.last_run"
-                        x-text="(lang==='zh' ? '上次: ' : 'last: ') + fmtSchedTime(t.last_run)"></span>
-                  <span x-show="t.next_run && t.enabled"
-                        x-text="(lang==='zh' ? '下次: ' : 'next: ') + fmtSchedTime(t.next_run)"></span>
+                <!-- All in-row controls .stop so they don't trigger the
+                     row-level click → openSchedTaskSession. -->
+                <div class="sched-row-actions" @click.stop>
+                  <label class="switch sm" :title="lang==='zh' ? '启用 / 暂停' : 'Enable / pause'"
+                         @click.stop>
+                    <input type="checkbox" :checked="t.enabled"
+                           @change="toggleSchedEnabled(t)" />
+                    <span class="switch-slider"></span>
+                  </label>
+                  <button class="icon-btn sm" @click.stop="toggleTaskRuns(t.id)"
+                          :class="{ active: scheduler.taskRuns[t.id]?.open }"
+                          :title="lang==='zh' ? '历史运行' : 'Past runs'">
+                    <svg><use href="#i-history"/></svg>
+                  </button>
+                  <button class="icon-btn sm" @click.stop="runSchedTaskNow(t)"
+                          :disabled="schedRunning[t.id]"
+                          :title="lang==='zh' ? '立即运行一次' : 'Run now'">
+                    <svg><use href="#i-send"/></svg>
+                  </button>
+                  <button class="icon-btn sm" @click.stop="editSchedTask(t)"
+                          :class="{ active: scheduler.draft.editingId === t.id }"
+                          :title="lang==='zh' ? '编辑' : 'Edit'">
+                    <svg><use href="#i-edit"/></svg>
+                  </button>
+                  <button class="icon-btn sm" @click.stop="deleteSchedTask(t)"
+                          :title="lang==='zh' ? '删除' : 'Delete'">
+                    <svg><use href="#i-trash"/></svg>
+                  </button>
                 </div>
               </div>
-              <!-- All in-row controls .stop so they don't trigger the
-                   row-level click → openSchedTaskSession. -->
-              <div class="sched-row-actions" @click.stop>
-                <label class="switch sm" :title="lang==='zh' ? '启用 / 暂停' : 'Enable / pause'"
-                       @click.stop>
-                  <input type="checkbox" :checked="t.enabled"
-                         @change="toggleSchedEnabled(t)" />
-                  <span class="switch-slider"></span>
-                </label>
-                <button class="icon-btn sm" @click.stop="runSchedTaskNow(t)"
-                        :disabled="schedRunning[t.id]"
-                        :title="lang==='zh' ? '立即运行一次' : 'Run now'">
-                  <svg><use href="#i-send"/></svg>
-                </button>
-                <button class="icon-btn sm" @click.stop="editSchedTask(t)"
-                        :class="{ active: scheduler.draft.editingId === t.id }"
-                        :title="lang==='zh' ? '编辑' : 'Edit'">
-                  <svg><use href="#i-edit"/></svg>
-                </button>
-                <button class="icon-btn sm" @click.stop="deleteSchedTask(t)"
-                        :title="lang==='zh' ? '删除' : 'Delete'">
-                  <svg><use href="#i-trash"/></svg>
-                </button>
+              <!-- Collapsible "past runs" panel — lazily loaded on first
+                   expand. Each entry links to its own session (fresh) or
+                   the same bound session (reuse). Shown only when open. -->
+              <div class="sched-task-runs" x-show="scheduler.taskRuns[t.id]?.open"
+                   x-transition.opacity.duration.120ms>
+                <div class="sched-task-runs-loading"
+                     x-show="scheduler.taskRuns[t.id]?.loading"
+                     x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+                <div class="sched-task-runs-empty"
+                     x-show="scheduler.taskRuns[t.id]?.open
+                           && !scheduler.taskRuns[t.id]?.loading
+                           && !(scheduler.taskRuns[t.id]?.runs?.length)"
+                     x-text="lang==='zh' ? '还没有运行记录。' : 'No runs yet.'"></div>
+                <template x-for="run in (scheduler.taskRuns[t.id]?.runs || [])"
+                          :key="run.ts + ':' + (run.session_id || '')">
+                  <div class="sched-task-run sched-row-clickable"
+                       :class="{ err: !run.ok }"
+                       @click="run.session_id && openTab(run.session_id)"
+                       :title="run.session_id
+                         ? (lang==='zh' ? '点击打开此次运行的 session' : 'Open this run\\'s session')
+                         : ''">
+                    <div class="sched-task-run-head">
+                      <span class="sched-task-run-time"
+                            x-text="fmtSchedTime(run.ts)"></span>
+                      <span class="sched-task-run-status" x-show="run.ok"
+                            x-text="lang==='zh' ? '成功' : 'OK'"></span>
+                      <span class="sched-task-run-status err" x-show="!run.ok"
+                            x-text="lang==='zh' ? '失败' : 'Error'"></span>
+                    </div>
+                    <div class="sched-task-run-body"
+                         x-text="run.ok ? (run.reply_preview || '—') : (run.error || '—')"></div>
+                  </div>
+                </template>
               </div>
             </div>
           </template>

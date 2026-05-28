@@ -270,15 +270,27 @@ def get_task(tid: str) -> dict | None:
 
 
 def create_task(name: str, prompt: str, schedule: dict,
-                 model: str = "") -> dict:
+                 model: str = "", session_mode: str = "fresh") -> dict:
     """Create a task with the given schedule dict. The dict shape
     depends on schedule.kind — see _compute_next_run for valid forms.
-    Auto-creates a dedicated muselab session bound to the task so every
-    run appends to the same history. Session name is `[定时] <task name>`."""
-    # Validate the schedule actually resolves to a future fire time —
-    # the API surface (api_scheduler.TaskIn) already validates field
-    # ranges; this catches "once-in-the-past" / "weekly with empty
-    # weekdays" gracefully.
+
+    `session_mode` (added 2026-05-28):
+      * "reuse" — auto-create one dedicated session at task-creation; every
+        run appends to that single JSONL. Muse sees the prior runs as
+        history. Good for "续写日报" / long-running threads.
+      * "fresh" — DON'T pre-create a session. Each `_execute_task` call
+        creates a brand-new session named `[定时] <task> · MM-DD HH:MM`
+        and runs in isolation. `task["session_id"]` holds the MOST RECENT
+        run's session (so "open session" links to the latest); past runs
+        live as independent sessions and can be reached via the
+        `list_task_history(tid)` listing.
+      * Default: "fresh" — matches the cronjob mental model (each run is
+        independent unless you ask otherwise). Old tasks that lack the
+        field at all fall back to "reuse" in _execute_task() so we don't
+        retroactively break their behavior."""
+    if session_mode not in ("reuse", "fresh"):
+        raise ValueError(
+            f"session_mode must be 'reuse' or 'fresh', got {session_mode!r}")
     next_run = _compute_next_run(schedule)
     if next_run is None and schedule.get("kind") != "once":
         # Allow `once` with no next_run only when explicitly so (past
@@ -286,15 +298,23 @@ def create_task(name: str, prompt: str, schedule: dict,
         raise ValueError(f"schedule does not produce a next fire time: {schedule}")
     # Lazy import to avoid backend.sessions ↔ backend.scheduler cycle
     from . import sessions as sess
-    sess_meta = sess.create_session(
-        name=f"{_scheduled_label_prefix()}{name}", model=model)
+    # Only "reuse" pre-allocates the bound session. "fresh" leaves
+    # session_id empty — first run fills it with whatever it just spun
+    # up, and subsequent runs overwrite (the field always points at the
+    # MOST RECENT run, list_task_history gives the full historical view).
+    sid = ""
+    if session_mode == "reuse":
+        sess_meta = sess.create_session(
+            name=f"{_scheduled_label_prefix()}{name}", model=model)
+        sid = sess_meta["id"]
     tid = str(uuid.uuid4())
     task = {
         "id": tid,
         "name": name,
         "prompt": prompt,
         "model": model,
-        "session_id": sess_meta["id"],
+        "session_id": sid,
+        "session_mode": session_mode,
         "schedule": schedule,
         "enabled": True,
         "last_run": None,
@@ -323,11 +343,40 @@ def update_task(tid: str, **changes: Any) -> dict | None:
     if "schedule" in changes and changes["schedule"] is not None:
         t["schedule"] = changes["schedule"]
         t["next_run"] = _compute_next_run(t["schedule"])
-    # Sync bound session name if the task was renamed. Best-effort —
-    # failure to find the session shouldn't roll back the task update.
+    if "session_mode" in changes and changes["session_mode"] is not None:
+        new_mode = changes["session_mode"]
+        if new_mode not in ("reuse", "fresh"):
+            raise ValueError(
+                f"session_mode must be 'reuse' or 'fresh', got {new_mode!r}")
+        old_mode = _effective_session_mode(t)
+        t["session_mode"] = new_mode
+        # Transitioning fresh → reuse: future runs need a bound session
+        # to append to. The most-recent fresh run's session (if any) is
+        # a reasonable seed — Muse already has its prior reply in there.
+        # If no run yet (session_id empty), create one now so the next
+        # run has somewhere to land.
+        if old_mode == "fresh" and new_mode == "reuse" and not t.get("session_id"):
+            try:
+                from . import sessions as sess
+                sess_meta = sess.create_session(
+                    name=f"{_scheduled_label_prefix()}{t.get('name', '')}",
+                    model=t.get("model", ""))
+                t["session_id"] = sess_meta["id"]
+            except Exception as e:
+                sys.stderr.write(
+                    f"[scheduler] update_task({tid}): seed session for "
+                    f"reuse mode failed: {e}\n")
+        # reuse → fresh: keep the existing session_id around (becomes the
+        # "most recent run" pointer); future runs will spin up new ones.
+        # The old bound session is NOT deleted — it has the user's prior
+        # conversation in it and may be wanted as history.
+    # Sync bound session name if the task was renamed — only meaningful
+    # for reuse mode (fresh mode's session_id points at a timestamped
+    # historical run, renaming it to a generic name would lose info).
     new_name = t.get("name")
     sid = t.get("session_id")
-    if sid and new_name and new_name != old_name:
+    if (sid and new_name and new_name != old_name
+            and _effective_session_mode(t) == "reuse"):
         try:
             from . import sessions as sess
             sess.rename_session(
@@ -340,18 +389,48 @@ def update_task(tid: str, **changes: Any) -> dict | None:
     return t
 
 
+def _effective_session_mode(task: dict) -> str:
+    """Resolve session_mode for an in-memory task dict. Old tasks created
+    before 2026-05-28 don't have the field — fall back to "reuse" to
+    preserve their original behavior (they have a bound session sitting
+    in session_id and expect every run to append to it)."""
+    return task.get("session_mode") or "reuse"
+
+
+def list_task_history(tid: str, limit: int = 100) -> list[dict]:
+    """All history entries belonging to `tid`, newest first. Used by the
+    scheduler detail panel to render "all past runs of this task" — most
+    useful in `fresh` mode where each run sits in its own session.
+
+    No new state — filters _state["history"] in place. The history list
+    is already capped at _HISTORY_CAP globally, so this is bounded too."""
+    out = [e for e in _state["history"] if e.get("task_id") == tid]
+    out.sort(key=lambda e: e.get("ts", 0), reverse=True)
+    if limit > 0:
+        out = out[:limit]
+    return out
+
+
 def delete_task(tid: str) -> bool:
-    """Delete a task AND its bound session by default. Leaving the
-    session behind used to create orphan `[定时] xxx` entries in the
-    history picker that the user couldn't easily tell apart from active
-    ones — so we now clean both. The session's on-disk JSONL is removed
-    too (sess.delete_session handles it). Returns True if the task
-    existed and got removed."""
+    """Delete a task and (only for reuse-mode) its bound session.
+
+    Behavior by mode (chosen 2026-05-28 per user spec):
+      * reuse — delete the bound session too. There's exactly one; no
+        per-run history apart from what's inside that JSONL; orphaning
+        it would litter the history picker with un-attributable
+        `[定时] xxx` rows.
+      * fresh — DON'T touch any sessions. Each prior run is its own
+        independent session with potentially valuable history snapshots;
+        cascading delete could nuke dozens at once. The user can multi-
+        select and delete in the regular sessions list if they want.
+
+    Returns True if the task existed and got removed."""
     t = _state["tasks"].pop(tid, None)
     if not t:
         return False
+    mode = _effective_session_mode(t)
     sid = t.get("session_id")
-    if sid:
+    if mode == "reuse" and sid:
         try:
             from . import sessions as sess
             sess.delete_session(sid)
@@ -439,15 +518,58 @@ async def _execute_task(task: dict) -> None:
     waits for the first to finish. This guards against the "run now"
     button overlapping the scheduler tick on the same task — both share
     one ClaudeSDKClient + CLI subprocess and concurrent receive_response
-    calls would interleave / drop messages."""
+    calls would interleave / drop messages.
+
+    Session handling per mode (see create_task docstring):
+      * reuse → use task["session_id"] (always set in this mode).
+      * fresh → mint a brand-new session each call. Name carries the
+        task name + fire timestamp so the user can tell runs apart in
+        the regular session list. task["session_id"] is overwritten to
+        point at the latest run — list_task_history(tid) is the full
+        view via history entries."""
     from .chat import get_client  # local import — avoids startup cycle
+    from datetime import datetime
 
     tid = task["id"]
-    sid = task["session_id"]
+    mode = _effective_session_mode(task)
     reply_text = ""
     error: str | None = None
 
     async with _task_lock(tid):
+        # Resolve `sid` INSIDE the lock so two parallel run-now clicks
+        # don't both mint fresh sessions then race on session_id write.
+        if mode == "fresh":
+            try:
+                from . import sessions as sess
+                ts_label = datetime.now().strftime("%m-%d %H:%M")
+                sess_meta = sess.create_session(
+                    name=f"{_scheduled_label_prefix()}{task['name']} · {ts_label}",
+                    model=task.get("model", ""))
+                sid = sess_meta["id"]
+                task["session_id"] = sid   # "most recent run" pointer
+                _save_state()
+            except Exception as e:
+                # If session minting itself fails (disk full, etc.), record
+                # the failure as a history entry rather than crashing the
+                # scheduler loop. Bail before touching the SDK.
+                sys.stderr.write(
+                    f"[scheduler] task {tid} fresh-session mint failed: "
+                    f"{type(e).__name__}: {e}\n")
+                now = time.time()
+                _state["history"].append({
+                    "task_id": tid,
+                    "task_name": task["name"],
+                    "session_id": "",
+                    "ts": now,
+                    "ok": False,
+                    "error": f"session mint failed: {type(e).__name__}: {e}",
+                    "reply_preview": None,
+                })
+                _state["unread_count"] = _state.get("unread_count", 0) + 1
+                _save_state()
+                return
+        else:
+            sid = task["session_id"]
         try:
             # Tasks created before the scheduler UI had a model picker stored
             # model=""; SDK then silently fell back to its built-in default

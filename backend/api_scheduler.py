@@ -64,6 +64,10 @@ class TaskIn(BaseModel):
     prompt: str = Field(min_length=1)
     schedule: ScheduleIn
     model: str = ""
+    # "fresh" (default) → each run gets a brand-new session, no cross-
+    # contamination. "reuse" → one session pre-allocated at task creation,
+    # every run appends. See scheduler.create_task docstring.
+    session_mode: str = Field(default="fresh", pattern="^(reuse|fresh)$")
 
 
 class TaskPatch(BaseModel):
@@ -72,6 +76,9 @@ class TaskPatch(BaseModel):
     schedule: ScheduleIn | None = None
     model: str | None = None
     enabled: bool | None = None
+    # Pydantic re-checks the pattern when the field is set, so an invalid
+    # value via PATCH gets a 422 with a clear message.
+    session_mode: str | None = Field(default=None, pattern="^(reuse|fresh)$")
 
 
 @router.get("/tasks", dependencies=[Depends(require_token)])
@@ -90,6 +97,7 @@ def create_task_endpoint(req: TaskIn) -> dict:
             prompt=req.prompt,
             schedule=req.schedule.model_dump(exclude_none=True),
             model=req.model,
+            session_mode=req.session_mode,
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
@@ -139,6 +147,20 @@ def history_endpoint(limit: int = Query(50, ge=1, le=500)) -> dict:
     return {
         "history": sched.list_history(limit=limit),
         "unread_count": sched.get_unread(),
+    }
+
+
+@router.get("/tasks/{tid}/history", dependencies=[Depends(require_token)])
+def task_history_endpoint(tid: str,
+                          limit: int = Query(100, ge=1, le=500)) -> dict:
+    """All history entries for ONE task, newest first. Powers the
+    "this task's past runs" list in the scheduler detail view —
+    especially useful for fresh-mode tasks where each run is its own
+    session and the user wants to jump back to a specific snapshot."""
+    if not sched.get_task(tid):
+        raise HTTPException(404, "task not found")
+    return {
+        "history": sched.list_task_history(tid, limit=limit),
     }
 
 

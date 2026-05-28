@@ -6463,6 +6463,78 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   .sched-row-actions .icon-btn.sm svg { width: 16px; height: 16px; }
 }
 
+/* Task card wraps .sched-row + .sched-task-runs collapsible panel. The
+   wrapper just exists so the runs panel can sit visually attached to its
+   parent row (margin-bottom stays on the card, not the row). When the
+   panel is open we lift the card's elevation a notch so the open state
+   reads as "active". */
+.sched-task-card { margin-bottom: 6px; }
+.sched-task-card .sched-row { margin-bottom: 0; }
+.sched-task-card.has-runs-open .sched-row {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+/* "fresh" / "reuse" badge in the row name — only fresh is shown (see
+   HTML comment for why). Pill shape, subtle accent tint so it telegraphs
+   "different behavior" without screaming. */
+.sched-row-mode {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: var(--fs-xs); font-weight: var(--fw-normal);
+  font-family: var(--font-mono);
+  background: var(--c-accent-soft); color: var(--c-accent);
+  border-radius: 999px;
+  vertical-align: middle;
+}
+/* Collapsible past-runs panel. Visually a continuation of the row card
+   (border-top: none + matching bg + flush corners). Each run inside is
+   compact — time + status + one-line preview. */
+.sched-task-runs {
+  padding: 6px 12px 10px 13px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-top: none;
+  border-left: 3px solid var(--c-accent);
+  border-bottom-left-radius: var(--r-md);
+  border-bottom-right-radius: var(--r-md);
+}
+.sched-task-runs-loading,
+.sched-task-runs-empty {
+  font-size: var(--fs-sm); color: var(--c-fg-3);
+  padding: 4px 0;
+}
+.sched-task-run {
+  padding: 6px 8px; margin-top: 4px;
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+.sched-task-run:hover { background: var(--c-bg-2); }
+.sched-task-run.err { border-color: var(--c-error); background: var(--c-error-soft); }
+.sched-task-run-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  font-size: var(--fs-xs); font-family: var(--font-mono);
+  color: var(--c-fg-3);
+  margin-bottom: 2px;
+}
+.sched-task-run-status {
+  color: var(--c-fg-2);
+  padding: 0 4px; border-radius: 2px;
+  background: var(--c-bg-3);
+}
+.sched-task-run-status.err {
+  color: var(--c-error); background: transparent;
+}
+.sched-task-run-body {
+  font-size: var(--fs-sm); color: var(--c-fg-2);
+  line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+
 .sched-hist-row {
   padding: 8px 12px; margin-bottom: var(--sp-1);
   background: var(--c-bg-2); border-radius: var(--r-sm);

@@ -259,6 +259,10 @@ function portal() {
       history: [],
       unreadCount: 0,
       loading: false,
+      // Per-task expansion state for the "show runs" affordance.
+      // Keyed by task id → { open: bool, runs: [...], loading: bool }.
+      // Only populated for tasks the user clicks to expand; lazy fetch.
+      taskRuns: {},
       // Inline-create form state. Polymorphic — only the fields
       // matching `kind` get sent to the backend. Reset by _resetSchedDraft.
       // editingId: when non-null, saveSchedTask() PATCHes that task
@@ -275,6 +279,9 @@ function portal() {
         weekdays: [1, 2, 3, 4, 5],  // weekly: Mon-Fri default
         day: 1,                // monthly day-of-month
         onceDate: "",          // once: "YYYY-MM-DD"
+        // 2026-05-28: "fresh" each run gets a new session; "reuse" all
+        // runs append to one session bound at task creation.
+        session_mode: "fresh",
       },
     },
     // Per-task "run-now" inflight flag — disables retry / send buttons
@@ -10853,6 +10860,11 @@ function portal() {
         weekdays: [1, 2, 3, 4, 5],
         day: 1,
         onceDate: "",
+        // 2026-05-28: "fresh" default for new tasks — matches cronjob
+        // mental model where each fire is independent. Existing tasks
+        // edited via editSchedTask hydrate to whatever they were saved as
+        // (or fallback to "reuse" if the task predates this field).
+        session_mode: "fresh",
       };
     },
     // ---- multi-time helpers (used by the daily-only time list) ----
@@ -10923,6 +10935,11 @@ function portal() {
         onceDate: (s.kind === "once" && s.year && s.month && s.day)
           ? `${s.year}-${String(s.month).padStart(2, "0")}-${String(s.day).padStart(2, "0")}`
           : "",
+        // Old tasks lack the field entirely — fall back to "reuse" so
+        // their original behavior is preserved across edits. Without
+        // this an edit would silently flip them to fresh mode and leak
+        // their bound session.
+        session_mode: t.session_mode || "reuse",
       };
       // Scroll the form into view — list rows are below it so the user
       // is otherwise looking at empty form they can't see.
@@ -10953,6 +10970,45 @@ function portal() {
         const d = await r.json();
         this.scheduler.history = d.history || [];
         this.scheduler.unreadCount = d.unread_count || 0;
+      }
+    },
+    // Lazy "show all past runs of this task" expander. Closed by default
+    // (the task card list would get too tall if every task pre-rendered
+    // its history). First open triggers a fetch; subsequent opens reuse
+    // the cached `runs` until the user explicitly refreshes (which
+    // currently only happens through closeScheduler/loadSchedulerTasks).
+    async toggleTaskRuns(tid) {
+      const cur = this.scheduler.taskRuns[tid];
+      if (cur && cur.open) {
+        // Collapse — keep cached runs around so the next open is instant.
+        this.scheduler.taskRuns[tid] = { ...cur, open: false };
+        return;
+      }
+      // First open or re-open. Show the entry expanded immediately with
+      // a loading spinner, then fill in the data.
+      this.scheduler.taskRuns[tid] = {
+        open: true,
+        loading: !(cur && cur.runs),
+        runs: cur?.runs || [],
+      };
+      try {
+        const r = await fetch(
+          `/api/scheduler/tasks/${encodeURIComponent(tid)}/history?limit=100`,
+          { headers: this.hdr() });
+        if (r.ok) {
+          const d = await r.json();
+          this.scheduler.taskRuns[tid] = {
+            open: true, loading: false, runs: d.history || [],
+          };
+        } else {
+          this.scheduler.taskRuns[tid] = {
+            open: true, loading: false, runs: cur?.runs || [],
+          };
+        }
+      } catch (_) {
+        this.scheduler.taskRuns[tid] = {
+          open: true, loading: false, runs: cur?.runs || [],
+        };
       }
     },
     async createSchedTask() {
@@ -11027,6 +11083,7 @@ function portal() {
           prompt: d.prompt.trim(),
           schedule: sched,
           model: d.model || "",
+          session_mode: d.session_mode || "fresh",
         }),
       });
       if (!r.ok) {
@@ -11101,12 +11158,23 @@ function portal() {
       // fired or the confirm/fetch silently failed.)
       console.log("[muselab][sched] deleteSchedTask invoked for", t && t.id, t && t.name);
       let ok;
+      // Confirm-text varies by mode — fresh keeps all historical run
+      // sessions, reuse removes the single bound session. Default to
+      // "reuse" wording for ancient tasks that lack the field entirely
+      // (these are the ones that DO have a bound session that'll get
+      // deleted), matching scheduler.delete_task's fallback.
+      const mode = t.session_mode || "reuse";
+      const body = mode === "fresh"
+        ? (zh
+            ? `确定删除「${t.name}」？历史运行产生的 session 不会被删除（可在会话列表中手动清理）。`
+            : `Delete "${t.name}"? Past-run sessions are NOT removed — clean them up in the sessions list if you want.`)
+        : (zh
+            ? `确定删除「${t.name}」？关联的 [定时] 会话会一并删除。`
+            : `Delete "${t.name}"? The bound [Scheduled] session is removed too.`);
       try {
         ok = await this.confirm({
           title: zh ? "删除任务" : "Delete task",
-          body: zh
-            ? `确定删除「${t.name}」？关联的 [定时] 会话会一并删除。`
-            : `Delete "${t.name}"? The bound [Scheduled] session is removed too.`,
+          body,
           danger: true,
           okText: zh ? "删除" : "Delete",
         });
