@@ -13,7 +13,7 @@ muselab 以 **Claude Agent SDK** 作为唯一对话后端。非 Claude 模型通
 | **Kimi**（K2 / K2.5 / K2.6 / K2 Thinking） | `MOONSHOT_API_KEY` | ✅ | platform.moonshot.cn |
 | **Qwen**（Qwen3 / 3.5 / 3.6 系列 —— Max / Plus / Flash / Coder；国际站同一把 key） | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com — 国内 + 国际共用一把 key，仅延迟差异 |
 | **小米 MiMo**（V2.5 Pro / V2.5 / V2 Flash） | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com（公测） |
-| **百度千帆**（ERNIE 4 / 4.5 / 5 系列 + X1 推理 + 千帆托管的 DeepSeek V3.2） | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic 兼容路径使用 `sk-xxx` 风格 key，不是 IAM AK/SK |
+| **百度千帆**（ERNIE 4 / 4.5 / 5 系列 + X1 推理 + 千帆托管的 DeepSeek V3.2） | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic 兼容路径需要 IAM **access token**（`bce-v3/ALTAK-xxx/xxx`），不是普通的 `sk-xxx` key |
 
 各家具体型号以 UI 下拉为准 —— 来源是 `backend/endpoints.py` 的 `CATALOG`，更新频率比本表高。
 

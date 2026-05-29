@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,22 +40,32 @@ ENV_PATH = Path(os.environ.get(
     str(Path(__file__).resolve().parent.parent / ".env"),
 ))
 
-# Providers exposed in the settings UI. Derived from endpoints.CATALOG so a
-# new entry there automatically surfaces in Settings — no parallel list to
-# keep in sync. Anthropic is added explicitly (Claude isn't in CATALOG —
-# it routes through `claude login` OAuth, not a third-party adapter).
-def _build_provider_keys() -> list[tuple[str, str, str]]:
+# Providers exposed in the settings UI. Derived from the EFFECTIVE catalog
+# (endpoints.catalog() = built-ins + user overrides + custom providers) so a
+# user-added provider — or an edited built-in — surfaces in Settings without
+# a restart. Anthropic is added explicitly (Claude isn't in the catalog — it
+# routes through `claude login` OAuth, not a third-party adapter).
+#
+# MUST be a function, not a module constant: catalog() reads provider_overrides
+# .json from disk, so a constant snapshot taken at import would freeze the
+# provider list and new providers wouldn't appear until the process restarted.
+def _provider_keys() -> list[tuple[str, str, str]]:
     # Anthropic first — recommended primary provider. Empty here is fine if
     # the user authenticates via `claude login` Pro/Max OAuth instead.
     out: list[tuple[str, str, str]] = [("ANTHROPIC_API_KEY", "Anthropic (Claude API)", "claude-sonnet-4-6")]
     from . import endpoints as _ep
-    for p in _ep.CATALOG:
-        probe_model = p.models[0][0]  # first model ID in the provider's model list
+    for p in _ep.catalog():
+        probe_model = p.models[0][0] if p.models else ""
         out.append((p.env_key, p.display, probe_model))
     return out
 
 
-PROVIDER_KEYS = _build_provider_keys()
+# Env names a user-created provider's auto-minted key follows. The provider
+# CRUD route mints `MUSELAB_PROVIDER_<SLUG>_API_KEY`; we whitelist this shape
+# in put_settings so the generic provider_keys map can carry the api-key for a
+# brand-new provider even on the same request that creates it (before catalog()
+# has the entry). Still tight enough that PATH / MUSELAB_TOKEN can't slip through.
+_CUSTOM_ENV_RE = re.compile(r"^MUSELAB_PROVIDER_[A-Z0-9_]+_API_KEY$")
 
 DEFAULT_KEYS = [
     "MUSELAB_DEFAULT_MODEL",
@@ -181,18 +192,51 @@ def _current(env_key: str) -> str:
 @router.get("", dependencies=[Depends(require_token)])
 def get_settings() -> dict:
     """Return current settings with API keys masked."""
+    from . import endpoints as _ep
     raw_disabled = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
     disabled_models = set(raw_disabled.split(",")) if raw_disabled else set()
     providers: list[dict] = []
-    for key, display, probe_model in PROVIDER_KEYS:
-        v = os.environ.get(key, "")
+    # Anthropic — special OAuth / API-key card, NOT an editable catalog
+    # provider (no endpoint / prefix / model list to tweak). `editable: false`
+    # tells the UI to render the simple key-only row, not the full editor.
+    av = os.environ.get("ANTHROPIC_API_KEY", "")
+    providers.append({
+        "kind": "anthropic",
+        "id": "anthropic",
+        "env_key": "ANTHROPIC_API_KEY",
+        "display": "Anthropic (Claude API)",
+        "configured": bool(av),
+        "masked": _mask(av),
+        "probe_model": "claude-sonnet-4-6",
+        "disabled": False,
+        "base_url": "", "prefix": "", "models": [],
+        "is_builtin": False, "is_overridden": False, "editable": False,
+    })
+    # Third-party providers — full editor payload. endpoints owns the catalog
+    # shape (id / base_url / prefix / models / builtin-vs-override); we layer on
+    # the env-derived bits (configured / masked / disabled) it can't see.
+    for m in _ep.provider_meta():
+        v = os.environ.get(m["env_key"], "")
+        # `disabled` honours BOTH the stable id (new form) and the legacy
+        # first-model-id form earlier builds wrote, so the toggle survives the
+        # disabled-key migration without resetting the user's hidden providers.
+        disabled = (m["id"] in disabled_models) or (
+            m["probe_model"] and m["probe_model"] in disabled_models)
         providers.append({
-            "env_key": key,
-            "display": display,
+            "kind": "third_party",
+            "id": m["id"],
+            "env_key": m["env_key"],
+            "display": m["display"],
             "configured": bool(v),
             "masked": _mask(v),
-            "probe_model": probe_model,
-            "disabled": probe_model in disabled_models,
+            "probe_model": m["probe_model"],
+            "disabled": disabled,
+            "base_url": m["base_url"],
+            "prefix": m["prefix"],
+            "models": m["models"],
+            "is_builtin": m["is_builtin"],
+            "is_overridden": m["is_overridden"],
+            "editable": True,
         })
     return {
         "providers": providers,
@@ -241,9 +285,13 @@ def put_settings(req: SettingsIn) -> dict:
     # keeps a credential-stealing route from existing on principle —
     # otherwise a future XSS could PUT `PATH=/tmp/evil` here).
     if req.provider_keys is not None:
-        allowed_envs = {k for k, _, _ in PROVIDER_KEYS}
+        allowed_envs = {k for k, _, _ in _provider_keys()}
         for env_name, v in req.provider_keys.items():
-            if env_name not in allowed_envs:
+            # Accept a catalog provider's env_key, OR the auto-minted shape a
+            # brand-new custom provider uses (so its key can ride along on the
+            # creating request before catalog() lists it). Everything else is
+            # dropped — no PATH / MUSELAB_TOKEN smuggling.
+            if env_name not in allowed_envs and not _CUSTOM_ENV_RE.match(env_name):
                 continue   # silently drop typo'd / disallowed envs
             if not isinstance(v, str) or v == "":
                 continue
@@ -338,6 +386,84 @@ def put_settings(req: SettingsIn) -> dict:
         "updated": updated_keys,
         "updated_count": updated_count,
     }
+
+
+# ====== Provider catalog management ======
+#
+# The effective provider list = built-in defaults + user overrides, all owned
+# by endpoints.py (persisted in provider_overrides.json). These routes are the
+# write side of the Settings provider editor: create / edit / delete / restore.
+# API keys are NEVER stored here — they go to .env via _write_env and are only
+# ever returned masked. Provider metadata (endpoint / prefix / models) is not
+# secret and lives in the JSON override store.
+
+
+class ProviderIn(BaseModel):
+    # id None → create a new custom provider (endpoints mints a stable id).
+    # id set → edit that provider (built-in override or existing custom).
+    id: str | None = None
+    base_url: str = Field(..., min_length=1)
+    prefix: str = Field(..., min_length=1)
+    display: str | None = None
+    env_key: str | None = None          # None → auto-mint for new providers
+    models: list[str] = Field(default_factory=list)
+    # Optional: write the api-key to .env in the SAME request that creates /
+    # edits the provider. "" / None → leave .env untouched; "_delete_" → remove.
+    api_key: str | None = None
+
+
+class ProviderIdIn(BaseModel):
+    # id carried in the body (not the URL path) so colons in built-in ids
+    # like "b:deepseek-" never need URL-encoding gymnastics.
+    id: str = Field(..., min_length=1)
+
+
+@router.post("/providers", dependencies=[Depends(require_token)])
+def upsert_provider(req: ProviderIn) -> dict:
+    """Create or edit a provider override. Returns the saved provider's stable
+    id + env_key so the FE can immediately PUT the api-key (or read it back).
+    Validation errors (bad URL, dup prefix, model not prefixed) → 422."""
+    from . import endpoints as _ep
+    try:
+        p = _ep.upsert_provider(
+            pid=req.id,
+            base_url=req.base_url,
+            prefix=req.prefix,
+            display=req.display or req.prefix,
+            env_key=req.env_key or "",
+            models=req.models,
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    # Optional api-key write in the same call. Reuse the same mask-guard as
+    # put_settings so a leaked mask string can't overwrite a real key.
+    if req.api_key is not None:
+        if req.api_key == "_delete_":
+            _write_env({p.env_key: None})  # type: ignore[dict-item]
+        elif req.api_key and "•" not in req.api_key:
+            _write_env({p.env_key: req.api_key})
+    return {"ok": True, "id": p.id, "env_key": p.env_key,
+            "configured": bool(os.environ.get(p.env_key))}
+
+
+@router.post("/providers/delete", dependencies=[Depends(require_token)])
+def delete_provider(req: ProviderIdIn) -> dict:
+    """Delete a provider. Built-ins are tombstoned (won't reappear) until
+    restored; custom providers are dropped outright. The api-key stays in
+    .env untouched — removing credentials is a separate, explicit action."""
+    from . import endpoints as _ep
+    changed = _ep.delete_provider(req.id)
+    return {"ok": True, "changed": changed}
+
+
+@router.post("/providers/restore", dependencies=[Depends(require_token)])
+def restore_provider(req: ProviderIdIn) -> dict:
+    """Restore a built-in provider to factory defaults (drop its override +
+    tombstone). No-op for custom providers — they have no default to restore
+    to (the FE should offer Delete instead)."""
+    from . import endpoints as _ep
+    changed = _ep.restore_provider(req.id)
+    return {"ok": True, "changed": changed}
 
 
 # ====== MCP server management ======

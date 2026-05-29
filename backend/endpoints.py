@@ -12,9 +12,11 @@ Adding a new provider:
   4. Restart muselab.
 """
 from __future__ import annotations
+import json
 import os
+import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -39,6 +41,12 @@ class Provider:
     # the cap. Symptom this prevents:
     #     API Error: 400 — max_completion_tokens range is [1, 12288]
     max_output_tokens: int | None = None
+    # Stable internal identity, assigned by the catalog layer (NOT user-
+    # facing). Built-ins get "b:<prefix>"; user-created providers get
+    # "c:<slug>". Persisted overrides / deletions / "restore default" all key
+    # off this, so the endpoint URL stays freely editable without losing the
+    # entry. Empty on the raw CATALOG literal; populated by catalog().
+    id: str = ""
 
 
 # Default base URLs per provider — used when no env override is set. Resolved
@@ -286,9 +294,276 @@ CATALOG: tuple[Provider, ...] = (
 )
 
 
+# ===========================================================================
+# Effective catalog = built-in defaults (CATALOG above) + user overrides.
+#
+# Users can edit any built-in provider's endpoint / api-key env / prefix /
+# model list, create brand-new providers, and "restore default" per provider.
+# Overrides persist in `provider_overrides.json` (next to mcp.json). Built-in
+# definitions in CATALOG are the immutable factory defaults; we never mutate
+# them, we layer overrides on top at read time so a future muselab release can
+# ship new built-in defaults without clobbering user edits.
+#
+# Identity: each provider has a STABLE internal id (not the endpoint URL,
+# which is user-editable). Built-ins → "b:<prefix>"; user-created → "c:<slug>".
+# Overrides / deletions / restore all key off this id.
+# ===========================================================================
+OVERRIDES_PATH = Path(__file__).resolve().parent.parent / "provider_overrides.json"
+
+# Fields a stored override / custom provider may carry. supports_thinking and
+# max_output_tokens are intentionally NOT user-editable in the UI (vendor
+# quirks that break the request if wrong); built-ins keep their baked values,
+# user-created providers take the safe defaults below.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,99}$")
+_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,39}$")
+
+
+def _builtin_id(p: Provider) -> str:
+    """Stable id for a built-in provider, derived from its (code-fixed)
+    prefix. Built-in prefixes never change across releases, so this is a
+    durable key for overrides even after the user edits the displayed URL."""
+    return "b:" + p.prefix
+
+
+def _slug(text: str) -> str:
+    """Lowercase alnum slug from arbitrary text (used to mint ids / env keys
+    for user-created providers)."""
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return s or "provider"
+
+
+def _load_overrides() -> dict:
+    """Read the override store. Tolerates missing / malformed file by
+    returning the empty shape."""
+    try:
+        data = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {"providers": {}, "deleted": []}
+    if not isinstance(data, dict):
+        return {"providers": {}, "deleted": []}
+    prov = data.get("providers")
+    deleted = data.get("deleted")
+    return {
+        "providers": prov if isinstance(prov, dict) else {},
+        "deleted": [d for d in deleted if isinstance(d, str)] if isinstance(deleted, list) else [],
+    }
+
+
+def _save_overrides(store: dict) -> None:
+    from .settings import atomic_write_text
+    atomic_write_text(
+        OVERRIDES_PATH,
+        json.dumps({"providers": store.get("providers", {}),
+                    "deleted": store.get("deleted", [])},
+                   ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
+    """Build a Provider from a stored override dict, falling back to `base`
+    (the built-in) for any field the override omits. For user-created
+    providers base is None and the dict must be self-complete."""
+    def pick(key: str, default):
+        v = d.get(key)
+        return v if v is not None else default
+    base_url = pick("base_url", base.base_url if base else "")
+    prefix = pick("prefix", base.prefix if base else "")
+    env_key = pick("env_key", base.env_key if base else "")
+    display = pick("display", base.display if base else prefix)
+    # models stored as a flat list of ids; label == id for user-touched
+    # providers (built-in pretty labels are only kept when NOT overridden).
+    raw_models = d.get("models")
+    if isinstance(raw_models, list) and raw_models:
+        models = tuple((str(m), str(m)) for m in raw_models)
+    elif base is not None:
+        models = base.models
+    else:
+        models = ()
+    return Provider(
+        prefix=prefix,
+        base_url=base_url,
+        env_key=env_key,
+        display=display,
+        models=models,
+        supports_thinking=base.supports_thinking if base else True,
+        max_output_tokens=base.max_output_tokens if base else None,
+        id=pid,
+    )
+
+
+def catalog() -> tuple[Provider, ...]:
+    """The EFFECTIVE provider list: built-ins (minus user-deleted) with any
+    overrides applied, followed by user-created providers. This is what every
+    routing / UI path should consult — `CATALOG` is only the factory default.
+
+    Read from disk each call (cheap small JSON) so Settings edits take effect
+    on the next request without a restart, matching the rest of muselab."""
+    store = _load_overrides()
+    overrides = store["providers"]
+    deleted = set(store["deleted"])
+    out: list[Provider] = []
+    seen: set[str] = set()
+    for bp in CATALOG:
+        bid = _builtin_id(bp)
+        seen.add(bid)
+        if bid in deleted:
+            continue
+        if bid in overrides and isinstance(overrides[bid], dict):
+            out.append(_provider_from_def(bid, overrides[bid], bp))
+        else:
+            out.append(replace(bp, id=bid))
+    # User-created providers: any override id that isn't a built-in.
+    for pid, d in overrides.items():
+        if pid in seen or pid in deleted or not isinstance(d, dict):
+            continue
+        out.append(_provider_from_def(pid, d, None))
+    return tuple(out)
+
+
+def get_provider(pid: str) -> Provider | None:
+    """Effective provider by stable id."""
+    for p in catalog():
+        if p.id == pid:
+            return p
+    return None
+
+
+def _builtin_by_id(pid: str) -> Provider | None:
+    for bp in CATALOG:
+        if _builtin_id(bp) == pid:
+            return bp
+    return None
+
+
+def validate_provider_fields(base_url: str, prefix: str, models: list[str],
+                             *, this_id: str | None = None) -> None:
+    """Raise ValueError if a provider's user-supplied fields are malformed or
+    would break routing. `this_id` excludes the provider being edited from the
+    prefix-uniqueness check."""
+    url = (base_url or "").strip()
+    if not re.match(r"^https?://", url):
+        raise ValueError("endpoint must be an http(s) URL")
+    pre = (prefix or "").strip()
+    if not _PREFIX_RE.match(pre):
+        raise ValueError("invalid prefix (letters, digits, . _ : + -; ≤40 chars)")
+    # Prefix must be unique across the effective catalog so longest-prefix
+    # lookup() routes deterministically.
+    for p in catalog():
+        if p.id != this_id and p.prefix == pre:
+            raise ValueError(f"prefix '{pre}' already used by another provider")
+    seen: set[str] = set()
+    for m in models:
+        mid = (m or "").strip()
+        if not mid:
+            continue
+        if not _MODEL_ID_RE.match(mid):
+            raise ValueError(f"invalid model id: {mid!r}")
+        if not mid.startswith(pre):
+            raise ValueError(f"model '{mid}' must start with the prefix '{pre}'")
+        low = mid.lower()
+        if low in seen:
+            raise ValueError(f"duplicate model id: {mid}")
+        seen.add(low)
+
+
+def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
+                    display: str, env_key: str, models: list[str]) -> Provider:
+    """Create or update a provider override. Returns the saved effective
+    Provider. api-key is handled separately (stays in .env). Raises ValueError
+    on invalid input."""
+    models = [str(m).strip() for m in models if str(m).strip()]
+    validate_provider_fields(base_url, prefix, models, this_id=pid)
+    store = _load_overrides()
+    # New provider: mint a stable custom id + an env-key slot if none given.
+    if not pid:
+        pid = "c:" + _slug(base_url)
+        # Avoid collision with an existing id.
+        n = 1
+        base_pid = pid
+        existing = set(store["providers"].keys()) | {_builtin_id(b) for b in CATALOG}
+        while pid in existing:
+            n += 1
+            pid = f"{base_pid}-{n}"
+    if not env_key:
+        env_key = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_") + "_API_KEY"
+    entry = {
+        "base_url": base_url.strip(),
+        "prefix": prefix.strip(),
+        "display": (display or prefix).strip(),
+        "env_key": env_key.strip(),
+        "models": models,
+    }
+    store["providers"][pid] = entry
+    # If this id was previously deleted (e.g. re-adding a built-in), un-delete.
+    store["deleted"] = [d for d in store["deleted"] if d != pid]
+    _save_overrides(store)
+    return _provider_from_def(pid, entry, _builtin_by_id(pid))
+
+
+def delete_provider(pid: str) -> bool:
+    """Remove a provider. Built-ins are tombstoned in `deleted` so they don't
+    reappear; user-created providers are dropped outright. Returns True if
+    anything changed."""
+    store = _load_overrides()
+    changed = False
+    if pid in store["providers"]:
+        del store["providers"][pid]
+        changed = True
+    if _builtin_by_id(pid) is not None and pid not in store["deleted"]:
+        store["deleted"].append(pid)
+        changed = True
+    if changed:
+        _save_overrides(store)
+    return changed
+
+
+def restore_provider(pid: str) -> bool:
+    """Restore a built-in provider to its factory default by dropping its
+    override + tombstone. No-op (returns False) for user-created providers
+    (nothing to restore to). Caller should DELETE those instead."""
+    if _builtin_by_id(pid) is None:
+        return False
+    store = _load_overrides()
+    changed = False
+    if pid in store["providers"]:
+        del store["providers"][pid]
+        changed = True
+    if pid in store["deleted"]:
+        store["deleted"] = [d for d in store["deleted"] if d != pid]
+        changed = True
+    if changed:
+        _save_overrides(store)
+    return changed
+
+
+def provider_meta() -> list[dict]:
+    """UI-facing metadata for every effective provider (built-in + custom).
+    Excludes secrets / env-state (configured / masked / disabled) — the api
+    layer layers those on, since they depend on .env which endpoints.py
+    doesn't own. `is_overridden` lets the UI light up the per-provider
+    'restore default' button only when there's something to restore."""
+    store = _load_overrides()
+    overridden = set(store["providers"].keys())
+    out: list[dict] = []
+    for p in catalog():
+        out.append({
+            "id": p.id,
+            "display": p.display,
+            "base_url": p.base_url,
+            "prefix": p.prefix,
+            "env_key": p.env_key,
+            "models": [mid for mid, _ in p.models],
+            "is_builtin": _builtin_by_id(p.id) is not None,
+            "is_overridden": p.id in overridden,
+            "probe_model": p.models[0][0] if p.models else "",
+        })
+    return out
+
+
 # Pretty labels for Claude (Pro OAuth) models — the IDs themselves are ugly
 # (e.g. "claude-haiku-4-5-20251001") so we display human-friendly names.
 CLAUDE_LABELS: dict[str, str] = {
+    "claude-opus-4-8":              "Opus 4.8",
     "claude-opus-4-7":              "Opus 4.7",
     "claude-sonnet-4-6":            "Sonnet 4.6",
     "claude-haiku-4-5-20251001":    "Haiku 4.5",
@@ -337,8 +612,8 @@ def lookup(model: str) -> Provider | None:
     `usage.model` (e.g. MiniMax returns `MiniMax-M2.7`), and we want those
     to route to the same provider as the lowercase catalog entry."""
     low = (model or "").lower()
-    for p in sorted(CATALOG, key=lambda x: -len(x.prefix)):
-        if low.startswith(p.prefix):
+    for p in sorted(catalog(), key=lambda x: -len(x.prefix)):
+        if p.prefix and low.startswith(p.prefix.lower()):
             return p
     return None
 
@@ -349,12 +624,22 @@ def is_third_party(model: str) -> bool:
 
 
 def normalize_model_id(model: str) -> str:
-    """Strip internal prefixes from model id before sending to the API.
-    For example, 'qwen-intl:qwen3-max' becomes 'qwen3-max'."""
-    if model.startswith("qwen-intl:"):
-        return model[len("qwen-intl:"):]
-    if model.startswith("minimax-intl:"):
-        return model[len("minimax-intl:"):]
+    """Strip the provider's INTERNAL routing prefix before sending the id to
+    the vendor. Convention: a prefix ending in ':' is a muselab-internal tag
+    (used to disambiguate two endpoints that serve the same real model id,
+    e.g. domestic vs international mirrors) and is stripped; an ordinary prefix
+    like 'deepseek-' is part of the vendor's real model id and kept as-is.
+
+    Generalised from the old hard-coded 'qwen-intl:' / 'minimax-intl:' so that
+    user-created providers using a colon-tag prefix work the same way. The
+    legacy literals are kept as a fallback in case lookup() can't resolve the
+    provider (e.g. it was deleted)."""
+    p = lookup(model)
+    if p and p.prefix.endswith(":") and model.startswith(p.prefix):
+        return model[len(p.prefix):]
+    for pre in ("qwen-intl:", "minimax-intl:"):
+        if model.startswith(pre):
+            return model[len(pre):]
     return model
 
 
@@ -375,8 +660,9 @@ def env_override(model: str) -> dict[str, str] | None:
       API_KEY is present.
 
     Also: SDK passes this dict to the CLI subprocess as a full env
-    REPLACEMENT (not merge). We must inherit PATH, HOME, etc. so the CLI can
-    even find its config dir."""
+    REPLACEMENT (not merge). We forward only a minimal allowlist of process /
+    proxy / TLS vars (see below) so the agent subprocess never inherits
+    MUSELAB_TOKEN or other providers' API keys."""
     p = lookup(model)
     if p is None:
         return None
@@ -399,7 +685,26 @@ def env_override(model: str) -> dict[str, str] | None:
     # via `<VENDOR>_BASE_URL`) takes effect on the very next stream() — no
     # process restart needed. Falls back to the catalog default.
     base_url = _resolve_base_url(p.env_key, p)
-    merged = dict(os.environ)
+    # Build a MINIMAL allowlisted env rather than copying all of os.environ.
+    # The SDK hands this dict to the CLI subprocess as a full env REPLACEMENT,
+    # and that subprocess runs an internet-capable, prompt-injectable agent
+    # (often under bypassPermissions). Inheriting the whole environment would
+    # leak MUSELAB_TOKEN and every *_API_KEY (the agent could `echo
+    # $MUSELAB_TOKEN` or exfiltrate other vendors' keys). The CLI only needs:
+    #   - process basics (PATH/HOME/shell/locale/tmp) to spawn + find its config
+    #   - proxy / TLS-CA vars so on-prem & proxied deployments still reach the
+    #     vendor endpoint
+    # The vendor's own key is injected below as ANTHROPIC_API_KEY, so we do NOT
+    # forward the raw <VENDOR>_API_KEY either.
+    _ENV_ALLOWLIST = (
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+        "LANG", "LC_ALL", "LC_CTYPE",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+        "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    )
+    merged = {k: v for k in _ENV_ALLOWLIST if (v := os.environ.get(k)) is not None}
     merged.update({
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": key,            # primary — x-api-key header
@@ -448,18 +753,20 @@ def available_groups() -> list[dict]:
                 {"label": CLAUDE_LABELS.get(m, m), "model": m} for m in (
                     "claude-sonnet-4-6",
                     "claude-haiku-4-5-20251001",
+                    "claude-opus-4-8",
                     "claude-opus-4-7",
                 )
             ],
         })
-    for p in CATALOG:
+    for p in catalog():
+        if not p.models:
+            continue
         if not os.environ.get(p.env_key):
             continue
-        # Skip provider if its first model is in the disabled list. We use the
-        # first model ID as the provider's stable identifier — it uniquely
-        # identifies each provider row (including Qwen domestic vs international
-        # which share DASHSCOPE_API_KEY but have different first models).
-        if p.models[0][0] in disabled_models:
+        # Skip provider if disabled in Settings. Disabled set carries the
+        # provider's stable id; for backward-compat we also honour the legacy
+        # first-model-id form that earlier builds wrote.
+        if p.id in disabled_models or p.models[0][0] in disabled_models:
             continue
         groups.append({
             "group": p.display,

@@ -3,6 +3,20 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="muselab — 自部署的多模型 AI 工作台。你的私人档案就是 AI 的工作集。">
+<meta property="og:title" content="muselab · 自部署的多模型 AI 工作台">
+<meta property="og:description" content="你的私人档案就是 AI 的工作集。八家模型共用一套 agent loop，复用 Claude Pro 订阅，跑在你自己的机器上。">
+<meta property="og:type" content="website">
+<!-- NOTE: og-image.png (1200×630) is referenced but not yet committed to promo/.
+     Drop a 1200×630 share card at promo/og-image.png before publishing. -->
+<meta property="og:image" content="og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="muselab · 自部署的多模型 AI 工作台">
+<meta name="twitter:description" content="你的私人档案就是 AI 的工作集。八家模型共用一套 agent loop，复用 Claude Pro 订阅，跑在你自己的机器上。">
+<meta name="twitter:image" content="og-image.png">
+<meta name="theme-color" content="#0e1014">
 <title>muselab · 自部署的多模型 AI 工作台</title>
 <style>
   :root {
@@ -31,21 +45,21 @@
     --border-strong: #2d333e;
     --mono: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', monospace;
     --sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Inter', 'Segoe UI', system-ui, sans-serif;
+    --max-w: 1180px;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; overflow: hidden; }
+  html { scroll-behavior: smooth; }
+  section[id] { scroll-margin-top: 5rem; }  /* sticky nav 不遮挡锚点跳转目标 */
   body {
     background: var(--bg);
     color: var(--fg-0);
     font-family: var(--sans);
+    line-height: 1.6;
     -webkit-font-smoothing: antialiased;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    overflow-x: hidden;
   }
 
-  /* Muse SVGs — inherit currentColor, no fill default */
   svg.muse {
     stroke: currentColor;
     fill: none;
@@ -54,146 +68,121 @@
     stroke-linejoin: round;
   }
 
-  /* 16:9 stage */
-  .stage {
-    width: min(100vw, calc(100vh * 16 / 9));
-    height: min(100vh, calc(100vw * 9 / 16));
-    aspect-ratio: 16 / 9;
-    position: relative;
-    overflow: hidden;
-  }
-  .stage::before {
-    content: '';
-    position: absolute; inset: 0;
-    background-image:
-      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
-    background-size: 48px 48px;
-    pointer-events: none;
-    z-index: 0;
-  }
-  .stage::after {
-    content: '';
-    position: absolute;
-    top: -20%; right: -10%;
-    width: 60%; height: 60%;
-    background: radial-gradient(circle, rgba(96,147,255,0.18) 0%, transparent 60%);
-    pointer-events: none;
-    z-index: 0;
-  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-fg); }
 
-  .slide {
-    position: absolute;
-    inset: 0;
-    padding: 4.5% 6%;
+  /* ===== sticky header ===== */
+  .nav {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(14, 16, 20, 0.72);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .nav-inner {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    padding: 0.9rem 1.5rem;
     display: flex;
-    flex-direction: column;
-    z-index: 1;
-    opacity: 0;
-    transform: translateX(40px);
-    transition: opacity .35s ease, transform .35s ease;
-    pointer-events: none;
-  }
-  .slide.active {
-    opacity: 1;
-    transform: translateX(0);
-    pointer-events: auto;
-  }
-
-  /* Decorative background Muse */
-  .slide .bg-muse {
-    position: absolute;
-    right: -2%;
-    bottom: -8%;
-    width: 40%;
-    color: var(--accent);
-    opacity: 0.04;
-    z-index: 0;
-    pointer-events: none;
-  }
-  .slide .bg-muse svg { width: 100%; height: auto; }
-
-  /* Top bar */
-  .topbar {
-    display: flex;
-    justify-content: space-between;
     align-items: center;
-    color: var(--fg-4);
+    gap: 1.5rem;
+  }
+  .nav-logo {
+    display: flex; align-items: center; gap: 0.5em;
+    font-family: var(--mono);
+    font-weight: 700;
+    color: var(--fg-0);
+    font-size: 1.05rem;
+    letter-spacing: -0.01em;
+  }
+  .nav-logo .accent { color: var(--accent); }
+  .nav-logo svg { width: 18px; height: 18px; color: var(--accent); }
+  .nav-links {
+    display: flex; gap: 1.6rem;
+    margin-left: 2rem;
+  }
+  .nav-links a {
+    color: var(--fg-2);
+    font-size: 0.92rem;
+    font-weight: 500;
+  }
+  .nav-links a:hover { color: var(--fg-0); }
+  .nav-spacer { flex: 1; }
+  .nav-cta {
+    display: flex; gap: 0.5rem; align-items: center;
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 0.4em;
+    padding: 0.55em 1.1em;
+    font-size: 0.9rem;
+    font-weight: 500;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    transition: all .15s;
+    font-family: var(--sans);
+    cursor: pointer;
+  }
+  .btn-ghost {
+    color: var(--fg-1);
+    border-color: var(--border-strong);
+    background: transparent;
+  }
+  .btn-ghost:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #0e1014;
+    font-weight: 600;
+  }
+  .btn-primary:hover {
+    background: #7aa3ff;
+    color: #0e1014;
+  }
+  .btn .star { font-size: 0.95em; }
+
+  /* ===== shared section frame ===== */
+  section {
+    padding: 6rem 1.5rem;
+    position: relative;
+  }
+  .container {
+    max-width: var(--max-w);
+    margin: 0 auto;
+  }
+  .section-label {
     font-family: var(--mono);
     font-size: 0.78rem;
-    letter-spacing: 0.08em;
-    margin-bottom: 3.5%;
-    flex-shrink: 0;
-    position: relative;
-    z-index: 2;
-  }
-  .topbar .brand { display: flex; align-items: center; gap: 0.6em; }
-  .topbar .brand-mark {
-    width: 12px; height: 12px;
-    background: var(--accent);
-    transform: rotate(45deg);
-  }
-  .muse-chip {
-    display: flex; align-items: center; gap: 0.55em;
-    color: var(--fg-3);
-    background: rgba(96,147,255,0.06);
-    border: 1px solid rgba(96,147,255,0.18);
-    padding: 0.25em 0.8em;
-    border-radius: 999px;
-  }
-  .muse-chip svg.muse {
-    width: 16px; height: 16px;
     color: var(--accent);
-  }
-  .muse-chip .name {
-    color: var(--fg-1);
-    letter-spacing: 0.04em;
-  }
-  .muse-chip .sep { color: var(--fg-4); }
-  .muse-chip .domain { color: var(--fg-3); }
-  .topbar .counter { color: var(--fg-3); }
-
-  /* Body: left text + right mock */
-  .body {
-    flex: 1;
-    display: grid;
-    grid-template-columns: 1fr 1.1fr;
-    gap: 4.5%;
-    align-items: center;
-    min-height: 0;
-    position: relative;
-    z-index: 2;
-  }
-  .col { min-width: 0; min-height: 0; }
-
-  .eyebrow {
-    font-family: var(--mono);
-    font-size: 0.82rem;
-    color: var(--accent);
-    letter-spacing: 0.12em;
+    letter-spacing: 0.16em;
     text-transform: uppercase;
-    margin-bottom: 1em;
+    margin-bottom: 1.2rem;
+    display: flex; align-items: center; gap: 0.6em;
   }
-  h1 {
-    font-size: clamp(1.8rem, 3.2vw, 3rem);
+  .section-label svg { width: 14px; height: 14px; color: var(--accent); }
+  h2 {
+    font-size: clamp(2rem, 3.5vw, 2.8rem);
     line-height: 1.18;
     font-weight: 700;
-    letter-spacing: -0.01em;
-    margin-bottom: 0.7em;
+    letter-spacing: -0.015em;
+    margin-bottom: 1.2rem;
   }
-  h1 .hl { color: var(--accent); }
-  .sub {
-    font-size: clamp(0.95rem, 1.25vw, 1.2rem);
+  h2 .hl { color: var(--accent); }
+  .lead {
+    font-size: clamp(1.05rem, 1.3vw, 1.2rem);
     color: var(--fg-2);
-    line-height: 1.6;
-    max-width: 30em;
+    max-width: 36em;
+    line-height: 1.7;
   }
   .micro {
     font-family: var(--mono);
-    font-size: clamp(0.7rem, 0.88vw, 0.85rem);
+    font-size: 0.82rem;
     color: var(--fg-3);
-    margin-top: 1.3em;
-    line-height: 1.7;
+    margin-top: 1.5rem;
+    line-height: 1.8;
   }
   .micro .kbd {
     display: inline-block;
@@ -203,19 +192,155 @@
     background: var(--bg-2);
     color: var(--fg-1);
     margin: 0 0.15em;
-    font-size: 0.92em;
   }
   .micro .tag {
     color: var(--accent);
-    border: 1px solid var(--accent);
-    padding: 0.05em 0.5em;
+    border: 1px solid rgba(96,147,255,0.4);
+    padding: 0.08em 0.55em;
     border-radius: 3px;
     margin-right: 0.4em;
     display: inline-block;
     margin-bottom: 0.3em;
+    background: var(--accent-soft);
   }
 
-  /* ======= Mock UI building blocks ======= */
+  /* ===== scroll fade-in ===== */
+  .reveal {
+    opacity: 0;
+    transform: translateY(24px);
+    transition: opacity .8s ease, transform .8s ease;
+  }
+  .reveal.in {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* ===== reduced-motion: neutralize scroll fade-in + pulses ===== */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+    /* show .reveal content immediately — no fade/slide reliance */
+    .reveal {
+      opacity: 1 !important;
+      transform: none !important;
+    }
+  }
+
+  /* ===== HERO ===== */
+  .hero {
+    padding-top: 7rem;
+    padding-bottom: 5rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -10%; right: -15%;
+    width: 70%; height: 80%;
+    background: radial-gradient(circle, rgba(96,147,255,0.18) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .hero::after {
+    content: '';
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 48px 48px;
+    pointer-events: none;
+    z-index: 0;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+  }
+  .hero-inner {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: 1.05fr 1fr;
+    gap: 4rem;
+    align-items: center;
+  }
+  .hero-pill {
+    display: inline-flex; align-items: center; gap: 0.5em;
+    padding: 0.35em 0.9em;
+    background: var(--accent-soft);
+    border: 1px solid rgba(96,147,255,0.25);
+    border-radius: 999px;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    margin-bottom: 1.4rem;
+  }
+  .hero-pill svg { width: 12px; height: 12px; }
+  .hero h1 {
+    font-size: clamp(2.4rem, 5vw, 4.4rem);
+    line-height: 1.1;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    margin-bottom: 1.2rem;
+  }
+  .hero h1 .hl { color: var(--accent); }
+  .hero-sub {
+    font-size: clamp(1.05rem, 1.4vw, 1.25rem);
+    color: var(--fg-2);
+    line-height: 1.65;
+    margin-bottom: 2rem;
+    max-width: 32em;
+  }
+  .hero-cta {
+    display: flex; gap: 0.8rem; align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 1.8rem;
+  }
+  .hero-cta .btn { padding: 0.7em 1.4em; font-size: 0.98rem; }
+  .hero-install {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    color: var(--fg-2);
+    background: #0a0c10;
+    padding: 0.7em 1em;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    max-width: 30em;
+    display: flex; align-items: center; gap: 0.6em;
+  }
+  .hero-install .prompt { color: var(--accent); }
+  .hero-install .copy-btn {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--fg-3);
+    padding: 0.2em 0.55em;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .hero-install .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .hero-mock {
+    position: relative;
+  }
+  .hero-mock .stack-card {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow:
+      0 24px 60px rgba(0,0,0,0.5),
+      0 0 0 1px rgba(96,147,255,0.08);
+  }
+
+  /* ===== mock UI shared ===== */
   .mock {
     background: var(--bg-1);
     border: 1px solid var(--border-strong);
@@ -223,10 +348,10 @@
     overflow: hidden;
     width: 100%;
     box-shadow: 0 16px 40px rgba(0,0,0,0.45);
-    font-size: clamp(0.65rem, 0.85vw, 0.85rem);
+    font-size: 0.85rem;
   }
   .mock-bar {
-    height: 28px;
+    height: 30px;
     background: #0a0c10;
     border-bottom: 1px solid var(--border);
     display: flex;
@@ -240,11 +365,46 @@
     font-family: var(--mono); font-size: 0.72em;
   }
 
-  /* ====== Slide 3 · 三栏 workspace 模拟 ====== */
+  /* ===== IDEA ===== */
+  .idea {
+    text-align: center;
+    padding-top: 5rem; padding-bottom: 5rem;
+  }
+  .idea .container { max-width: 760px; }
+  .idea h2 { font-size: clamp(2.2rem, 4.5vw, 3.6rem); }
+  .idea .lead { margin: 0 auto; }
+  .idea-muse {
+    width: 56px; height: 56px;
+    color: var(--accent);
+    margin: 0 auto 1.5rem;
+    display: block;
+    opacity: 0.85;
+  }
+
+  /* ===== spotlight ===== */
+  .spotlight {
+    padding: 5rem 1.5rem;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .spotlight-inner {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 1fr 1.1fr;
+    gap: 4rem;
+    align-items: center;
+  }
+  .spotlight.reverse .spotlight-inner {
+    grid-template-columns: 1.1fr 1fr;
+  }
+  .spotlight.reverse .spot-text { order: 2; }
+  .spotlight.reverse .spot-mock { order: 1; }
+
+  /* workspace mock */
   .ws {
     display: grid;
     grid-template-columns: 38% 1fr;
-    min-height: 320px;
+    min-height: 380px;
   }
   .ws-files {
     background: var(--bg-1);
@@ -252,15 +412,14 @@
     display: flex; flex-direction: column;
   }
   .ws-head {
-    padding: 0.4em 0.6em;
+    padding: 0.5em 0.7em;
     display: flex; align-items: center; gap: 0.4em;
-    font-family: var(--mono); font-size: 0.78em; color: var(--fg-3);
+    font-family: var(--mono); font-size: 0.76em; color: var(--fg-3);
     border-bottom: 1px solid var(--border);
   }
-  .ws-head .ico { width: 12px; height: 12px; color: var(--accent); }
   .ws-search {
     margin: 0.5em;
-    padding: 0.4em 0.6em;
+    padding: 0.45em 0.65em;
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -274,40 +433,37 @@
     background: var(--bg-1);
     border-top: 1px solid var(--border);
     border-bottom: 1px solid var(--border);
-    padding: 0.35em 0.5em 0.35em 0.6em;
+    padding: 0.4em 0.5em;
   }
   .openfiles-head {
     display: flex; align-items: center; gap: 0.4em;
     font-family: var(--mono); font-size: 0.72em; color: var(--fg-3);
-    margin-bottom: 0.25em;
+    margin-bottom: 0.3em;
   }
   .openfiles-row {
-    display: flex; align-items: center; gap: 0.35em;
-    padding: 0.25em 0.4em;
+    display: flex; align-items: center; gap: 0.4em;
+    padding: 0.28em 0.45em;
     font-family: var(--mono); font-size: 0.78em;
     color: var(--fg-1);
     border-radius: 3px;
   }
   .openfiles-row.sel { background: var(--accent-soft); color: var(--accent-fg); }
-  .openfiles-row .ico { width: 10px; height: 10px; }
   .openfiles-row .x { color: var(--fg-4); margin-left: auto; }
-  .openfiles-row .ico.pdf { color: #dc3545; }
+  .openfiles-row .ico { width: 11px; height: 11px; display: inline-block; }
   .openfiles-row .ico.md { color: var(--accent); }
   .openfiles-row .ico.xlsx { color: #34a853; }
-  .openfiles-row .ico.html { color: #e34c26; }
 
   .tree {
-    padding: 0.35em 0.3em 0.5em 0.3em;
+    padding: 0.4em 0.3em 0.5em;
     font-family: var(--mono); font-size: 0.76em;
     flex: 1;
   }
   .tree-root {
-    color: var(--fg-3); padding: 0.2em 0.5em;
-    font-size: 0.92em;
+    color: var(--fg-3); padding: 0.25em 0.5em;
     display: flex; align-items: center; gap: 0.3em;
   }
   .tree-row {
-    padding: 0.22em 0.4em;
+    padding: 0.25em 0.4em;
     color: var(--fg-1);
     display: flex; align-items: center; gap: 0.35em;
     border-radius: 3px;
@@ -318,29 +474,27 @@
   .tree-row .ico { width: 11px; height: 11px; }
   .tree-row .ico.md { color: var(--accent); }
   .tree-row .ico.xlsx { color: #34a853; }
-  .tree-row .ico.txt { color: var(--fg-3); }
   .tree-row .ico.folder { color: var(--accent-fg); }
   .tree-row .size { margin-left: auto; color: var(--fg-4); font-size: 0.88em; }
   .tree-row.lv1 { padding-left: 1em; }
-  .tree-row.lv2 { padding-left: 1.8em; }
+  .tree-row.lv2 { padding-left: 1.9em; }
 
   .ws-preview {
     background: var(--bg);
     display: flex; flex-direction: column;
   }
   .ws-preview-head {
-    padding: 0.4em 0.7em;
+    padding: 0.5em 0.8em;
     border-bottom: 1px solid var(--border);
     font-family: var(--mono); font-size: 0.74em; color: var(--fg-3);
-    display: flex; align-items: center; gap: 0.4em;
   }
-  .ws-preview-body { padding: 0.7em 0.9em; }
+  .ws-preview-body { padding: 0.8em 1em; }
   .ws-preview-body table {
     width: 100%; border-collapse: collapse;
     font-family: var(--mono); font-size: 0.78em;
   }
   .ws-preview-body th, .ws-preview-body td {
-    padding: 0.35em 0.6em;
+    padding: 0.4em 0.65em;
     border-bottom: 1px solid var(--border);
     text-align: left;
   }
@@ -349,30 +503,202 @@
   .ws-preview-body td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .ws-preview-body td.gr { color: var(--green); }
 
-  /* ====== Slide 4 · session tabs (top of chat pane) ====== */
+  /* ========== Portfolio preview (HTML render demo) ========== */
+  /* Distinct palette for allocation chips/bars — these are not
+     brand colors, they're "data colors" picked for visual variety
+     while staying readable on dark bg. */
+  .portfolio-preview {
+    --c1: #6093ff;   /* blue (accent family) */
+    --c2: #4ade80;   /* green */
+    --c3: #fbbf24;   /* amber */
+    --c4: #f5b042;   /* gold */
+    --c5: #a78bfa;   /* violet */
+    --c6: #94a3b8;   /* slate (cash) */
+    padding: 1em 1.1em;
+    background: linear-gradient(180deg, var(--bg) 0%, #0a0c10 100%);
+    color: var(--fg-1);
+    font-family: var(--sans);
+  }
+  .pf-title {
+    font-size: 1.05em;
+    font-weight: 600;
+    color: var(--fg-0);
+    margin-bottom: 0.7em;
+    letter-spacing: -0.005em;
+  }
+  .pf-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.6em;
+    margin-bottom: 0.9em;
+    padding-bottom: 0.9em;
+    border-bottom: 1px solid var(--border);
+  }
+  .pf-metric { display: flex; flex-direction: column; gap: 2px; }
+  .pf-metric-lbl {
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    color: var(--fg-3);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .pf-metric-val {
+    font-family: var(--mono);
+    font-size: 0.92rem;
+    color: var(--fg-0);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+  .pf-metric-val.gr { color: var(--green); }
+  .pf-card {
+    margin-bottom: 0.9em;
+  }
+  .pf-card-title {
+    font-size: 0.78rem;
+    color: var(--fg-2);
+    margin-bottom: 0.5em;
+    font-weight: 500;
+    display: flex; align-items: baseline; gap: 0.5em;
+  }
+  .pf-card-sub {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    color: var(--fg-4);
+    letter-spacing: 0.02em;
+  }
+
+  /* allocation horizontal bars */
+  .alloc-list { display: flex; flex-direction: column; gap: 0.32em; }
+  .alloc-row {
+    display: grid;
+    grid-template-columns: 48px 64px 1fr 36px;
+    gap: 0.55em;
+    align-items: center;
+    font-size: 0.74rem;
+  }
+  .alloc-tic {
+    font-family: var(--mono);
+    font-weight: 600;
+    color: var(--fg-1);
+  }
+  .alloc-desc {
+    color: var(--fg-3);
+    font-size: 0.9em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .alloc-track {
+    height: 8px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .alloc-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--c1);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08);
+  }
+  .alloc-fill.c1 { background: var(--c1); }
+  .alloc-fill.c2 { background: var(--c2); }
+  .alloc-fill.c3 { background: var(--c3); }
+  .alloc-fill.c4 { background: var(--c4); }
+  .alloc-fill.c5 { background: var(--c5); }
+  .alloc-fill.c6 { background: var(--c6); }
+  .alloc-pct {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--fg-2);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* sparkline */
+  .sparkline {
+    width: 100%;
+    height: 56px;
+    display: block;
+    margin: 0.3em 0 0.4em;
+  }
+  .spark-axis {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    color: var(--fg-4);
+    padding: 0 2px;
+  }
+
+  /* top holdings table */
+  .holdings {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.74rem;
+    font-family: var(--mono);
+  }
+  .holdings th {
+    text-align: right;
+    color: var(--fg-3);
+    font-weight: 500;
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.3em 0.4em;
+    border-bottom: 1px solid var(--border);
+  }
+  .holdings th:first-child { text-align: left; }
+  .holdings td {
+    padding: 0.35em 0.4em;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+  }
+  .holdings td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-1);
+  }
+  .holdings td.num.gr { color: var(--green); }
+  .holdings td.num.rd { color: var(--red); }
+  .hd-tic {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 2px;
+    font-weight: 600;
+    font-size: 0.9em;
+    background: rgba(255,255,255,0.05);
+    border-left: 2px solid var(--fg-3);
+  }
+  .hd-tic.c1 { border-left-color: var(--c1, #6093ff); color: var(--c1, #6093ff); }
+  .hd-tic.c2 { border-left-color: var(--c2, #4ade80); color: var(--c2, #4ade80); }
+  .hd-tic.c3 { border-left-color: var(--c3, #fbbf24); color: var(--c3, #fbbf24); }
+  .hd-tic.c4 { border-left-color: var(--c4, #f5b042); color: var(--c4, #f5b042); }
+
+  /* file-extension icon colors (additions) */
+  .openfiles-row .ico.html, .tree-row .ico.html { color: #e34c26; }
+  .openfiles-row .ico.pdf,  .tree-row .ico.pdf  { color: #dc3545; }
+  .openfiles-row .ico.png,  .tree-row .ico.png  { color: #b07cf2; }
+
+  /* sessions mock */
   .chat-tabs {
     display: flex;
     background: #0a0c10;
     border-bottom: 1px solid var(--border);
     overflow-x: hidden;
-    align-items: stretch;
   }
   .chat-tab-history-btn {
     padding: 0 0.7em;
     color: var(--fg-3);
     border-right: 1px solid var(--border);
     display: flex; align-items: center;
+    font-family: var(--mono);
+    font-size: 0.8em;
   }
-  .chat-tab-history-btn .ico { width: 13px; height: 13px; }
   .chat-tab {
-    padding: 0.55em 0.85em;
+    padding: 0.6em 0.9em;
     color: var(--fg-2);
     border-right: 1px solid var(--border);
     display: flex; align-items: center; gap: 0.4em;
     font-family: var(--mono);
     font-size: 0.78em;
     white-space: nowrap;
-    position: relative;
   }
   .chat-tab.active {
     background: var(--bg-1);
@@ -392,15 +718,13 @@
   }
   .chat-tab .x { color: var(--fg-4); margin-left: 0.3em; }
 
-  /* session picker dropdown below */
   .picker-pop {
-    background: var(--bg-1);
-    border-top: none;
     padding: 0.5em 0;
+    background: var(--bg-1);
   }
   .picker-search {
     margin: 0 0.6em 0.4em;
-    padding: 0.35em 0.6em;
+    padding: 0.4em 0.6em;
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -409,7 +733,7 @@
     color: var(--fg-2);
   }
   .picker-group-label {
-    padding: 0.35em 0.9em 0.2em;
+    padding: 0.4em 0.9em 0.25em;
     color: var(--fg-3);
     font-family: var(--mono);
     font-size: 0.7em;
@@ -417,7 +741,7 @@
     text-transform: uppercase;
   }
   .picker-row {
-    padding: 0.4em 0.7em;
+    padding: 0.45em 0.7em;
     margin: 0 0.4em;
     display: flex; align-items: center; gap: 0.5em;
     font-family: var(--mono);
@@ -429,15 +753,10 @@
     background: var(--accent-soft);
     color: var(--accent-fg);
   }
-  .picker-row .pin {
-    color: var(--accent); width: 11px; height: 11px;
-  }
+  .picker-row .pin { color: var(--accent); }
   .picker-row .pin.off { color: var(--fg-4); }
   .picker-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-  .picker-row .actions {
-    color: var(--fg-4);
-    font-family: var(--mono); font-size: 0.85em;
-  }
+  .picker-row .actions { color: var(--fg-4); font-size: 0.85em; }
   .picker-row.active .actions { color: var(--accent); }
   .picker-row .stream {
     width: 5px; height: 5px; border-radius: 50%;
@@ -445,15 +764,16 @@
     animation: streamPulse 1.4s infinite;
   }
 
-  /* ====== Slide 5 · model select (chat-toolbar) ====== */
+  /* models mock */
   .chat-toolbar {
-    padding: 0.5em 0.7em;
+    padding: 0.55em 0.8em;
     background: var(--bg-1);
     border-top: 1px solid var(--border);
     display: flex; align-items: center; gap: 0.5em;
+    flex-wrap: wrap;
   }
   .chat-toolbar .toolbar-btn {
-    padding: 0.3em 0.6em;
+    padding: 0.32em 0.65em;
     color: var(--fg-3);
     font-family: var(--mono); font-size: 0.75em;
     border-radius: 3px;
@@ -463,21 +783,33 @@
     background: var(--bg);
     border: 1px solid var(--border-strong);
     color: var(--fg-1);
-    padding: 0.3em 0.6em;
+    padding: 0.32em 0.65em;
     border-radius: 3px;
     font-family: var(--mono); font-size: 0.78em;
     display: flex; align-items: center; gap: 0.3em;
   }
   .chat-toolbar .toolbar-select.model { color: var(--accent); border-color: var(--accent); }
+  .chat-toolbar .toolbar-select.perm {
+    color: var(--accent);
+    border-color: rgba(96,147,255,0.5);
+    background: var(--accent-soft);
+  }
   .chat-toolbar .toolbar-select .v { color: var(--fg-4); }
   .chat-toolbar .spacer { flex: 1; }
   .chat-toolbar .ctx-pill {
-    padding: 0.2em 0.55em;
+    padding: 0.22em 0.6em;
     font-family: var(--mono); font-size: 0.7em;
     background: var(--bg-2); color: var(--fg-3);
     border-radius: 3px;
   }
   .chat-toolbar .ctx-pill .num { color: var(--accent-fg); }
+  .chat-toolbar .toolbar-send {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 22px;
+    background: var(--accent); color: #0e1014;
+    border-radius: 4px;
+    font-size: 0.75em;
+  }
 
   .select-pop {
     background: var(--bg-1);
@@ -485,7 +817,7 @@
     padding: 0.5em 0;
   }
   .optgroup-label {
-    padding: 0.35em 0.9em 0.2em;
+    padding: 0.4em 0.95em 0.25em;
     color: var(--fg-3);
     font-family: var(--mono);
     font-size: 0.7em;
@@ -493,7 +825,7 @@
     text-transform: uppercase;
   }
   .opt {
-    padding: 0.3em 0.9em;
+    padding: 0.32em 0.95em;
     color: var(--fg-1);
     font-family: var(--mono); font-size: 0.78em;
     display: flex; align-items: center; gap: 0.4em;
@@ -502,26 +834,38 @@
   .opt::before { content: ''; width: 8px; }
   .opt.sel::before { content: '●'; color: var(--accent); width: auto; margin-right: 0.2em; }
 
-  /* ====== Slide 6 · plan mode (thinking + plan card) ====== */
+  /* plan-spotlight */
+  .plan-spotlight {
+    background: linear-gradient(180deg, var(--bg) 0%, #0a0d12 50%, var(--bg) 100%);
+    padding: 7rem 1.5rem;
+  }
+  .plan-spotlight .container { text-align: center; }
+  .plan-spotlight .lead { margin: 0 auto 3rem; text-align: center; }
+  .plan-spotlight .section-label { justify-content: center; }
+  .plan-demo {
+    max-width: 720px;
+    margin: 0 auto;
+    text-align: left;
+  }
   .chat-area {
-    padding: 1em 1.2em;
+    padding: 1.2em 1.4em;
     background: var(--bg);
     min-height: 320px;
   }
   .msg-user {
-    margin: 0.4em 0 0.6em auto;
-    padding: 0.55em 0.8em;
+    margin: 0.4em 0 0.8em auto;
+    padding: 0.6em 0.9em;
     background: var(--user-bg);
     color: var(--user-fg);
     border-radius: 12px 12px 4px 12px;
     max-width: 70%;
     width: fit-content;
-    font-size: 0.9em;
+    font-size: 0.92em;
     line-height: 1.5;
   }
   .thinking-head {
-    display: flex; align-items: center; gap: 0.45em;
-    padding: 0.4em 0.6em;
+    display: flex; align-items: center; gap: 0.5em;
+    padding: 0.45em 0.7em;
     background: var(--thinking-bg);
     border-radius: 6px 6px 0 0;
     color: var(--thinking-fg);
@@ -530,14 +874,14 @@
   }
   .thinking-head .chevron { color: var(--accent); }
   .thinking-body {
-    padding: 0.55em 0.8em;
+    padding: 0.65em 0.9em;
     background: var(--thinking-bg);
     color: var(--thinking-fg);
     font-style: italic;
-    font-size: 0.82em;
-    line-height: 1.55;
+    font-size: 0.85em;
+    line-height: 1.6;
     border-radius: 0 0 6px 6px;
-    margin-bottom: 0.5em;
+    margin-bottom: 0.6em;
   }
   .plan-card {
     border: 1px solid var(--border-strong);
@@ -546,51 +890,312 @@
     overflow: hidden;
   }
   .plan-head {
-    padding: 0.55em 0.8em;
+    padding: 0.6em 0.9em;
     background: var(--accent-soft);
     color: var(--accent);
     display: flex; align-items: center; gap: 0.5em;
-    font-family: var(--mono); font-size: 0.8em;
+    font-family: var(--mono); font-size: 0.82em;
     letter-spacing: 0.04em;
     border-bottom: 1px solid var(--border-strong);
   }
-  .plan-head .ico { width: 14px; height: 14px; }
   .plan-body {
-    padding: 0.7em 1em;
+    padding: 0.8em 1.1em;
     color: var(--fg-1);
-    font-size: 0.85em;
-    line-height: 1.6;
+    font-size: 0.88em;
+    line-height: 1.65;
   }
   .plan-body ol { padding-left: 1.4em; }
-  .plan-body li { margin-bottom: 0.25em; }
+  .plan-body li { margin-bottom: 0.3em; }
 
-  /* ====== Slide 7 · diff strip ====== */
-  .diff-strip {
+  /* ===== Rich plan mode (full flow: thinking → plan → approval → exec) ===== */
+  /* collapsed thinking with peek text */
+  .thinking-head.collapsed {
     background: var(--bg-1);
+    border-radius: 6px;
+    color: var(--fg-3);
+    border-left: 2px solid var(--thinking-fg);
+    padding-left: 0.6em;
+    margin-bottom: 0.5em;
+  }
+  .thinking-head .thinking-peek {
+    color: var(--fg-4);
+    font-style: italic;
+    margin-left: 0.6em;
+    font-size: 0.92em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* rich plan card additions */
+  .plan-card-rich { margin-top: 0.4em; }
+  .plan-head .plan-meta {
+    margin-left: auto;
+    color: var(--fg-3);
+    font-size: 0.78em;
+    font-weight: 400;
+    letter-spacing: 0;
+  }
+  .plan-body ol li {
+    margin-bottom: 0.55em;
+    line-height: 1.5;
+  }
+  .plan-step { display: block; color: var(--fg-1); font-size: 0.95em; }
+  .plan-step code {
+    background: var(--bg);
+    color: var(--accent-fg);
+    padding: 0.05em 0.4em;
+    border-radius: 3px;
+    font-size: 0.92em;
+  }
+  .plan-why {
+    display: block;
+    color: var(--fg-3);
+    font-size: 0.85em;
+    margin-top: 0.15em;
+    padding-left: 1.2em;
+  }
+  .plan-why code {
+    background: var(--bg);
+    color: var(--accent-fg);
+    padding: 0 0.3em;
+    border-radius: 2px;
+    font-size: 0.95em;
+  }
+  .plan-scope {
+    margin-top: 0.9em;
+    padding: 0.6em 0.8em;
+    background: var(--bg);
+    border-left: 2px solid var(--accent);
+    border-radius: 4px;
+    display: flex; align-items: baseline; gap: 0.6em;
+  }
+  .plan-scope-lbl {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.72em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .plan-scope-text {
+    color: var(--fg-2);
+    font-size: 0.88em;
+    line-height: 1.5;
+  }
+  .plan-actions {
+    display: flex; justify-content: flex-end; gap: 0.5em;
+    padding: 0.8em 1em;
+    border-top: 1px solid var(--border-strong);
+    background: var(--bg);
+  }
+  .btn-plan {
+    padding: 0.45em 1em;
+    font-size: 0.82em;
+    border-radius: 4px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-1);
+    color: var(--fg-1);
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .btn-plan-deny { color: var(--fg-2); }
+  .btn-plan-allow {
+    background: var(--accent);
+    color: #0e1014;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+
+  /* approval bar */
+  .approval-bar {
+    margin: 1.2em 0 0.8em;
+    padding: 0.5em 0.8em;
+    background: rgba(74,222,128,0.08);
+    border-radius: 4px;
+    display: flex; align-items: center; gap: 0.6em;
+    font-family: var(--mono);
+    font-size: 0.78em;
+    color: var(--green);
+  }
+  .approval-tick {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--green); color: #0e1014;
+    font-weight: 700;
+    font-size: 0.78em;
+  }
+  .approval-text { color: var(--green); }
+  .approval-meta {
+    margin-left: auto;
+    color: var(--fg-3);
+    font-size: 0.9em;
+  }
+
+  /* execution phase: tool chain */
+  .exec-phase {
+    display: flex; flex-direction: column;
+    gap: 0.32em;
+  }
+  .exec-item {
+    display: flex; align-items: center; gap: 0.55em;
+    padding: 0.4em 0.7em;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.78em;
+    color: var(--fg-1);
+  }
+  .exec-item.exec-done { border-left-color: var(--green); }
+  .exec-icon { color: var(--fg-4); width: 12px; }
+  .exec-tool {
+    color: var(--accent);
+    font-weight: 600;
+    min-width: 60px;
+  }
+  .exec-tool-write { color: #fbbf24; }
+  .exec-arg {
+    color: var(--fg-2);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 1; min-width: 0;
+  }
+  .exec-meta {
+    color: var(--fg-4);
+    font-size: 0.88em;
+    flex-shrink: 0;
+  }
+  .exec-batch { background: rgba(96,147,255,0.04); }
+  .exec-badge {
+    padding: 0.05em 0.45em;
+    border-radius: 2px;
+    font-size: 0.85em;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .exec-badge.plus { color: var(--green); background: rgba(74,222,128,0.1); }
+
+  /* mini result preview after Write */
+  .exec-result {
+    margin-top: 0.4em;
+    background: var(--bg);
     border: 1px solid var(--border-strong);
     border-radius: 6px;
     overflow: hidden;
-    margin-bottom: 0.5em;
+  }
+  .exec-result-head {
+    padding: 0.4em 0.7em;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 0.72em;
+    color: var(--fg-3);
+  }
+  .exec-result-body {
+    padding: 0.6em 0.85em;
+    font-size: 0.82em;
+    line-height: 1.7;
+    color: var(--fg-1);
+  }
+  .exec-result-body strong { color: var(--accent); font-weight: 700; }
+  .exec-md-h2 {
+    color: var(--accent-fg);
+    font-weight: 600;
+    font-size: 1.05em;
+    display: block;
+    margin-bottom: 0.2em;
+  }
+  .exec-md-text {
+    color: var(--fg-3);
+    font-style: italic;
+    font-size: 0.9em;
+    display: block;
+  }
+
+  /* priority chip P1/P2/P3 */
+  .pri {
+    display: inline-block;
+    min-width: 22px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 0.78em;
+    font-weight: 600;
+    text-align: center;
+    margin-right: 0.4em;
+  }
+  .pri-1 { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+  .pri-2 { background: rgba(251,191,36,0.15); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+  .pri-3 { background: rgba(148,163,184,0.15); color: var(--fg-3); border: 1px solid rgba(148,163,184,0.3); }
+
+  /* pair cards */
+  .pair {
+    padding: 5rem 1.5rem;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .pair-inner {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2.5rem;
+    align-items: start;
+  }
+  .card {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 2rem;
+    transition: border-color .2s, transform .2s;
+  }
+  .card:hover {
+    border-color: rgba(96,147,255,0.4);
+    transform: translateY(-2px);
+  }
+  .card .icon {
+    width: 36px; height: 36px;
+    color: var(--accent);
+    margin-bottom: 1rem;
+  }
+  .card h3 {
+    font-size: 1.3rem;
+    margin-bottom: 0.6rem;
+    font-weight: 600;
+  }
+  .card p {
+    color: var(--fg-2);
+    font-size: 0.95rem;
+    line-height: 1.65;
+    margin-bottom: 1.5rem;
+  }
+
+  /* diff strip */
+  .diff-strip {
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    overflow: hidden;
   }
   .diff-head {
     padding: 0.5em 0.7em;
     display: flex; align-items: center; gap: 0.5em;
     background: var(--bg-2);
     border-bottom: 1px solid var(--border);
-    font-family: var(--mono); font-size: 0.78em;
+    font-family: var(--mono); font-size: 0.76em;
     color: var(--fg-2);
   }
   .diff-head .chevron { color: var(--accent); }
   .diff-head .tool { color: var(--accent); }
-  .diff-head .path { color: var(--fg-1); }
-  .diff-head .spacer { flex: 1; }
+  .diff-head .path { color: var(--fg-1); flex: 1; overflow: hidden; text-overflow: ellipsis; }
   .diff-head .badge-plus { color: var(--green); }
   .diff-head .badge-minus { color: var(--red); }
   .diff-body {
-    padding: 0.45em 0.5em;
+    padding: 0.5em;
     font-family: var(--mono); font-size: 0.74em;
-    line-height: 1.6;
-    background: var(--bg);
+    line-height: 1.7;
   }
   .diff-line {
     padding: 0.05em 0.6em 0.05em 0.4em;
@@ -600,83 +1205,74 @@
   }
   .diff-line.ins { background: var(--green-soft); color: var(--green); }
   .diff-line.del { background: var(--red-soft); color: var(--red); }
-  .diff-line .pre { display: inline-block; width: 1.1em; color: var(--fg-4); }
+  .diff-line .pre { display: inline-block; width: 1em; color: var(--fg-4); }
   .diff-line.ins .pre { color: var(--green); }
   .diff-line.del .pre { color: var(--red); }
 
-  /* ====== Slide 8 · mobile PWA ====== */
+  /* phone */
   .phone {
     margin: 0 auto;
-    width: 64%;
-    max-width: 260px;
+    width: 200px;
     aspect-ratio: 9/19.5;
     background: #0a0c10;
-    border: 8px solid #1a1e25;
-    border-radius: 36px;
-    padding: 22px 10px 8px;
+    border: 7px solid #1a1e25;
+    border-radius: 28px;
+    padding: 18px 8px 6px;
     position: relative;
     display: flex; flex-direction: column;
-    box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+    box-shadow: 0 20px 50px rgba(0,0,0,0.5);
   }
   .phone::before {
     content: '';
     position: absolute;
-    top: 8px; left: 50%;
+    top: 6px; left: 50%;
     transform: translateX(-50%);
-    width: 38%; height: 18px;
+    width: 38%; height: 14px;
     background: #1a1e25;
-    border-radius: 0 0 14px 14px;
+    border-radius: 0 0 12px 12px;
   }
   .phone-statbar {
     display: flex; justify-content: space-between;
-    font-family: var(--mono); font-size: 0.6em;
-    color: var(--fg-3); padding: 4px 10px;
+    font-family: var(--mono); font-size: 0.55em;
+    color: var(--fg-3); padding: 3px 8px;
   }
   .phone-app {
-    flex: 1; margin-top: 0.4em;
+    flex: 1; margin-top: 0.3em;
     background: var(--bg-1);
-    border-radius: 8px;
+    border-radius: 6px;
     overflow: hidden;
     display: flex; flex-direction: column;
-    font-size: 0.7em;
+    font-size: 0.62em;
   }
   .phone-head {
-    padding: 0.4em 0.55em;
+    padding: 0.4em 0.5em;
     border-bottom: 1px solid var(--border);
     color: var(--fg-3);
-    font-family: var(--mono); font-size: 0.95em;
+    font-family: var(--mono);
     display: flex; align-items: center; gap: 0.3em;
   }
+  .phone-head svg { width: 9px; height: 9px; color: var(--accent); }
   .phone-body {
-    flex: 1; padding: 0.4em;
-    display: flex; flex-direction: column; gap: 0.4em;
+    flex: 1; padding: 0.35em;
+    display: flex; flex-direction: column; gap: 0.3em;
   }
   .phone-msg {
-    padding: 0.4em 0.55em;
-    border-radius: 8px;
+    padding: 0.35em 0.5em;
+    border-radius: 6px;
     line-height: 1.4;
-    font-size: 0.95em;
   }
   .phone-msg.user {
     background: var(--user-bg);
     color: var(--user-fg);
-    margin-left: 1.5em;
+    margin-left: 1em;
     border-bottom-right-radius: 2px;
   }
   .phone-msg.ai {
     background: var(--bg-2);
     color: var(--fg-1);
-    margin-right: 1em;
+    margin-right: 0.8em;
     border-bottom-left-radius: 2px;
   }
-  .phone-msg.ai .muse-sig {
-    color: var(--accent);
-    font-family: var(--mono);
-    font-size: 0.85em;
-    margin-bottom: 0.2em;
-    display: flex; align-items: center; gap: 0.25em;
-  }
-  .phone-msg.ai .muse-sig svg { width: 11px; height: 11px; }
   .phone-tabbar {
     display: flex;
     border-top: 1px solid var(--border);
@@ -684,10 +1280,10 @@
   }
   .phone-tab {
     flex: 1;
-    padding: 0.55em 0.3em 0.4em;
+    padding: 0.5em 0.2em 0.35em;
     text-align: center;
     color: var(--fg-3);
-    font-family: var(--mono); font-size: 0.85em;
+    font-family: var(--mono);
     border-top: 2px solid transparent;
   }
   .phone-tab.active {
@@ -695,178 +1291,494 @@
     border-top-color: var(--accent);
     background: var(--accent-soft);
   }
-  .phone-tab .ico {
-    display: block; width: 14px; height: 14px;
-    margin: 0 auto 2px;
+
+  /* ===== Multi-device spotlight (MacBook + iPhone same session) ===== */
+  .device-spotlight {
+    padding: 7rem 1.5rem;
+    background: linear-gradient(180deg, transparent 0%, rgba(96,147,255,0.025) 50%, transparent 100%);
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .device-pair {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 240px);
+    gap: 3rem;
+    align-items: center;
+    max-width: 1100px;
+    margin: 0 auto;
   }
 
-  /* ====== Slide 1 · hero ====== */
-  .slide.hero .body {
-    grid-template-columns: 1fr;
-    text-align: center;
+  /* MacBook frame */
+  .macbook {
+    position: relative;
+    filter: drop-shadow(0 30px 50px rgba(0,0,0,0.45));
   }
-  .slide.hero .col {
-    display: flex; flex-direction: column; align-items: center;
-    gap: 0;
+  .macbook-screen {
+    background: #0a0c10;
+    border: 10px solid #1c1f26;
+    border-bottom-width: 22px;
+    border-radius: 14px 14px 4px 4px;
+    overflow: hidden;
+    position: relative;
   }
-  .hero-logo {
+  .macbook-screen::before {
+    /* camera notch */
+    content: '';
+    position: absolute;
+    top: -3px; left: 50%;
+    transform: translateX(-50%);
+    width: 70px; height: 4px;
+    background: #1c1f26;
+    border-radius: 0 0 6px 6px;
+    z-index: 2;
+  }
+  .macbook-hinge {
+    height: 6px;
+    width: 104%;
+    margin-left: -2%;
+    background: #14161b;
+    border-radius: 0 0 2px 2px;
+  }
+  .macbook-base {
+    height: 12px;
+    width: 116%;
+    margin-left: -8%;
+    background: linear-gradient(180deg, #2a2f38 0%, #1a1e25 70%, #0d0f13 100%);
+    border-radius: 0 0 14px 14px;
+    position: relative;
+  }
+  .macbook-base::after {
+    /* trackpad cutout hint */
+    content: '';
+    position: absolute;
+    bottom: 0; left: 50%;
+    transform: translateX(-50%);
+    width: 18%; height: 4px;
+    background: rgba(0,0,0,0.55);
+    border-radius: 0 0 6px 6px;
+  }
+
+  .desktop-content {
+    display: grid;
+    grid-template-columns: 24% 36% 1fr;
+    min-height: 340px;
+    background: var(--bg);
+  }
+  .dt-files {
+    background: var(--bg-1);
+    border-right: 1px solid var(--border);
+    padding: 0.5em;
     font-family: var(--mono);
-    font-size: clamp(3rem, 7vw, 6.2rem);
-    font-weight: 700;
-    letter-spacing: -0.03em;
+    font-size: 0.72em;
+  }
+  /* dt-preview: middle pane showing rendered markdown */
+  .dt-preview {
+    background: var(--bg);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    min-width: 0;
+  }
+  .dt-preview-head {
+    padding: 0.5em 0.7em;
+    border-bottom: 1px solid var(--border);
+    color: var(--fg-2);
+    font-family: var(--mono); font-size: 0.7em;
+  }
+  .dt-preview-body {
+    padding: 0.7em 0.85em;
+    color: var(--fg-1);
+    font-size: 0.72em;
+    line-height: 1.6;
+    flex: 1;
+    overflow: hidden;
+  }
+  .dt-md-h2 {
+    color: var(--accent-fg);
+    font-weight: 600;
+    font-size: 1.05em;
+    margin-bottom: 0.4em;
+  }
+  .dt-md-li {
+    display: flex; align-items: flex-start; gap: 0.4em;
     margin-bottom: 0.2em;
   }
-  .hero-logo .accent { color: var(--accent); }
-  .hero-tagline {
-    font-size: clamp(1.1rem, 1.8vw, 1.6rem);
+  .dt-md-li strong { color: var(--accent); font-weight: 700; }
+  .dt-md-bullet {
+    color: var(--accent);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .dt-md-text {
+    color: var(--fg-3);
+    font-style: italic;
+  }
+  .dt-files-head {
+    color: var(--fg-3);
+    padding: 0.2em 0.5em 0.5em;
+    font-size: 0.92em;
+  }
+  .dt-files-row {
+    padding: 0.28em 0.5em;
     color: var(--fg-1);
-    margin-bottom: 0.3em;
+    display: flex; align-items: center; gap: 0.4em;
+    border-radius: 3px;
   }
-  .hero-sub {
-    font-size: clamp(0.85rem, 1.1vw, 1.05rem);
-    color: var(--fg-4);
-    font-family: var(--mono);
-    letter-spacing: 0.04em;
+  .dt-files-row.dir { color: var(--accent-fg); }
+  .dt-files-row.sel { background: var(--accent-soft); color: var(--accent); }
+  .dt-files-row .ico.md { color: var(--accent); }
+  .dt-files-row .ico.xlsx { color: #34a853; }
+  .dt-files-row .ico { width: 11px; height: 11px; }
+
+  .dt-chat {
+    background: var(--bg);
+    display: flex; flex-direction: column;
+    min-width: 0;
   }
-  .hero-muses {
-    margin-top: 2.5em;
-    display: flex; gap: 1.3em;
+  .dt-chat-head {
+    padding: 0.55em 0.85em;
+    border-bottom: 1px solid var(--border);
+    color: var(--fg-2);
+    font-family: var(--mono); font-size: 0.74em;
+    display: flex; align-items: center; gap: 0.45em;
+  }
+  .dt-chat-head svg { width: 12px; height: 12px; color: var(--accent); }
+  .dt-chat-body {
+    padding: 0.8em 0.9em;
+    display: flex; flex-direction: column; gap: 0.5em;
+    font-size: 0.78em;
+    line-height: 1.5;
+    flex: 1;
+  }
+  .dt-msg.user {
+    background: var(--user-bg); color: var(--user-fg);
+    padding: 0.5em 0.7em;
+    border-radius: 10px 10px 4px 10px;
+    align-self: flex-end;
+    max-width: 80%;
+    font-size: 0.92em;
+  }
+  .dt-thinking {
+    background: var(--thinking-bg); color: var(--thinking-fg);
+    padding: 0.4em 0.7em;
+    border-radius: 5px;
+    font-family: var(--mono); font-size: 0.78em;
+    font-style: italic;
+  }
+  .dt-plan {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .dt-plan-head {
+    padding: 0.4em 0.6em;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-family: var(--mono); font-size: 0.75em;
+    display: flex; align-items: center; gap: 0.4em;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .dt-plan-body {
+    padding: 0.55em 0.7em;
+    color: var(--fg-1);
+    font-size: 0.82em;
+    line-height: 1.7;
+  }
+
+  /* install + arch */
+  .install-arch {
+    padding: 6rem 1.5rem;
+    background: linear-gradient(180deg, transparent, rgba(96,147,255,0.03));
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .install-arch .container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4rem;
     align-items: center;
-    justify-content: center;
-    padding: 1em 1.5em;
-    background: rgba(96,147,255,0.04);
-    border: 1px solid rgba(96,147,255,0.15);
-    border-radius: 12px;
   }
-  .hero-muses .one {
+  .install-cmd {
+    font-family: var(--mono);
+    font-size: 0.88rem;
+    color: var(--fg-1);
+    background: #0a0c10;
+    padding: 1.2em 1.4em;
+    border-radius: 8px;
+    border: 1px solid var(--border-strong);
+    margin-top: 1.5rem;
+    line-height: 1.7;
+    overflow-x: auto;
+  }
+  .install-cmd .prompt { color: var(--accent); }
+  .install-cmd .cmt { color: var(--fg-4); }
+  .install-cmd .copy-row {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-top: 0.6em;
+    padding-top: 0.6em;
+    border-top: 1px dashed var(--border);
+  }
+  .install-cmd .copy-btn {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--fg-3);
+    padding: 0.3em 0.7em;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 0.75em;
+    cursor: pointer;
+  }
+  .install-cmd .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .arch-block { text-align: center; }
+  .arch-block .section-label { justify-content: center; }
+  .arch-diagram {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--fg-2);
+    line-height: 1.8;
+  }
+  .arch-row {
+    display: flex; gap: 0.5em; justify-content: center; align-items: center;
+    flex-wrap: wrap;
+    margin: 0.4em 0;
+  }
+  .arch-node {
+    padding: 0.5em 0.9em;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-1);
+    border-radius: 4px;
+    color: var(--fg-1);
+  }
+  .arch-node.primary {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent-fg);
+  }
+  .arch-arrow { color: var(--fg-4); font-size: 1.2em; }
+  .arch-fan {
+    margin-top: 0.5em;
+    display: flex; gap: 0.35em;
+    justify-content: center; flex-wrap: wrap;
+  }
+  .arch-fan .tag {
+    padding: 0.2em 0.55em;
+    background: var(--bg-2);
+    color: var(--fg-2);
+    border-radius: 3px;
+    font-size: 0.75rem;
+    border: 1px solid var(--border);
+  }
+
+  /* compare table */
+  .compare {
+    padding: 6rem 1.5rem;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 2rem;
+    font-size: 0.9rem;
+    background: var(--bg-1);
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border-strong);
+  }
+  .compare-table th, .compare-table td {
+    padding: 0.85em 1.1em;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .compare-table th {
+    font-family: var(--mono);
+    font-weight: 500;
+    color: var(--fg-3);
+    font-size: 0.82em;
+    letter-spacing: 0.04em;
+    background: #0a0c10;
+  }
+  .compare-table th.us { color: var(--accent); }
+  .compare-table td:first-child {
+    text-align: left;
+    color: var(--fg-2);
+    font-weight: 500;
+  }
+  .compare-table td.us { color: var(--accent); font-weight: 600; }
+  .compare-table .yes { color: var(--accent); }
+  .compare-table .no { color: var(--fg-4); }
+  .compare-table .partial { color: #d2a04b; font-size: 0.85em; }
+
+  /* ===== privacy + capabilities (shared card grid) ===== */
+  .privacy, .capabilities, .faq {
+    padding: 6rem 1.5rem;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .privacy-grid, .capability-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.2rem;
+    max-width: var(--max-w);
+    margin: 0 auto;
+  }
+  .privacy-card, .capability-card {
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 1.6rem 1.5rem;
+    transition: border-color .2s, transform .2s;
+  }
+  .privacy-card:hover, .capability-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-3px);
+  }
+  .privacy-card svg.muse, .capability-card svg.muse {
+    width: 26px; height: 26px;
+    color: var(--accent);
+    margin-bottom: 0.9rem;
+  }
+  .pc-title, .cap-title {
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: var(--fg-0);
+    margin-bottom: 0.5rem;
+  }
+  .pc-desc, .cap-desc {
+    color: var(--fg-2);
+    font-size: 0.92rem;
+    line-height: 1.65;
+  }
+
+  /* ===== faq ===== */
+  .faq-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1.4rem 2.5rem;
+    max-width: var(--max-w);
+    margin: 0 auto;
+  }
+  .faq-item {
+    border-top: 1px solid var(--border);
+    padding-top: 1.2rem;
+  }
+  .faq-q {
+    font-weight: 600;
+    font-size: 1.02rem;
+    color: var(--fg-0);
+    margin-bottom: 0.5rem;
+    display: flex; align-items: baseline; gap: 0.5em;
+  }
+  .faq-q::before {
+    content: "Q";
+    font-family: var(--mono);
+    color: var(--accent);
+    font-size: 0.85em;
+    font-weight: 700;
+  }
+  .faq-a {
+    color: var(--fg-2);
+    font-size: 0.92rem;
+    line-height: 1.7;
+  }
+
+  /* kbd outside .micro (lead / cards / faq use sans, need mono kbd) */
+  .lead .kbd, .pc-desc .kbd, .cap-desc .kbd, .faq-a .kbd {
+    display: inline-block;
+    padding: 0.08em 0.42em;
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+    background: var(--bg-2);
+    color: var(--fg-1);
+    font-family: var(--mono);
+    font-size: 0.85em;
+    margin: 0 0.1em;
+  }
+
+  /* footer */
+  footer {
+    padding: 4rem 1.5rem 3rem;
+    border-top: 1px solid var(--border);
+    background: #0a0c10;
+  }
+  .footer-inner {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    text-align: center;
+  }
+  .footer-muses {
+    display: flex; gap: 1.4rem;
+    justify-content: center;
+    margin-bottom: 2rem;
+    flex-wrap: wrap;
+  }
+  .footer-muses .one {
     display: flex; flex-direction: column; align-items: center;
     gap: 0.4em;
     color: var(--fg-3);
   }
-  .hero-muses .one svg.muse {
-    width: 24px; height: 24px;
+  .footer-muses .one svg.muse {
+    width: 26px; height: 26px;
     color: var(--accent);
+    opacity: 0.7;
+    transition: opacity .2s;
   }
-  .hero-muses .one .nm {
+  .footer-muses .one:hover svg.muse { opacity: 1; }
+  .footer-muses .one .nm {
     font-family: var(--mono);
-    font-size: 0.62rem;
+    font-size: 0.66rem;
     color: var(--fg-3);
     letter-spacing: 0.04em;
   }
-  .hero-meta {
-    margin-top: 2em;
-    display: flex; gap: 1.5em;
-    font-family: var(--mono);
-    font-size: 0.85rem;
-    color: var(--fg-3);
-  }
-  .hero-meta span::before {
-    content: '·'; margin-right: 1em; color: var(--accent);
-  }
-  .hero-meta span:first-child::before { display: none; }
-
-  /* ====== Slide 2 · big idea ====== */
-  .slide.big .body { grid-template-columns: 1fr; text-align: center; }
-  .slide.big .col { max-width: 24em; margin: 0 auto; display: flex; flex-direction: column; align-items: center; }
-  .slide.big h1 { font-size: clamp(2rem, 4.2vw, 3.6rem); }
-  .slide.big .big-muse {
-    margin-bottom: 1.5em;
-    width: 84px; height: 84px;
-    color: var(--accent);
-  }
-
-  /* ====== Slide 9 · CTA ====== */
-  .slide.cta .body { grid-template-columns: 1fr; text-align: center; }
-  .slide.cta .col {
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-  }
-  .slide.cta .url {
-    font-family: var(--mono);
-    font-size: clamp(1.2rem, 2.2vw, 1.9rem);
-    color: var(--accent);
-    padding: 0.5em 1.2em;
-    border: 1px solid var(--accent);
-    border-radius: 6px;
-    margin: 1.2em 0 1em;
-    background: var(--accent-soft);
-  }
-  .slide.cta .tags {
-    display: flex; gap: 1.5em;
+  .footer-tag {
     font-family: var(--mono);
     color: var(--fg-3);
-    font-size: 0.95rem;
+    font-size: 0.88rem;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.6rem;
   }
-  .slide.cta .tags span:first-child { color: var(--accent); }
-  .slide.cta .install {
-    margin-top: 1.5em;
+  .footer-meta {
+    color: var(--fg-4);
+    font-size: 0.82rem;
     font-family: var(--mono);
-    font-size: clamp(0.7rem, 0.92vw, 0.88rem);
-    color: var(--fg-2);
-    background: #0a0c10;
-    padding: 0.8em 1.2em;
-    border-radius: 6px;
-    border: 1px solid var(--border-strong);
-    text-align: left;
-    max-width: 40em;
-    line-height: 1.6;
+    display: flex;
+    justify-content: center;
+    gap: 1.2rem;
+    flex-wrap: wrap;
   }
-  .slide.cta .install .prompt { color: var(--accent); }
-  .slide.cta .install .cmt { color: var(--fg-4); }
+  .footer-meta a { color: var(--fg-3); }
+  .footer-meta a:hover { color: var(--accent); }
 
-  /* Navigation */
-  .nav {
-    position: fixed;
-    bottom: 1.2rem; left: 50%;
-    transform: translateX(-50%);
-    display: flex; align-items: center; gap: 0.7em;
-    background: rgba(20, 24, 32, 0.7);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    padding: 0.5em 0.8em;
-    border-radius: 999px;
-    border: 1px solid var(--border-strong);
-    z-index: 100;
-    font-family: var(--mono);
-    font-size: 0.78rem;
-    color: var(--fg-3);
-  }
-  .nav button {
-    background: none; border: none; color: var(--fg-3);
-    cursor: pointer; font-size: 1rem;
-    padding: 0.2em 0.5em; border-radius: 4px;
-  }
-  .nav button:hover { color: var(--accent); background: var(--accent-soft); }
-  .nav .count { min-width: 3em; text-align: center; }
-
-  .edge-click {
-    position: fixed; top: 0; height: 100%; width: 15%;
-    z-index: 50; cursor: pointer;
-  }
-  .edge-click.left { left: 0; }
-  .edge-click.right { right: 0; }
-
-  /* Mobile fallback */
-  @media (max-aspect-ratio: 4/3) and (max-width: 720px) {
-    html, body { overflow-y: auto; height: auto; }
-    body { display: block; }
-    .stage { width: 100vw; height: auto; aspect-ratio: auto; display: block; }
-    .stage::before, .stage::after { display: none; }
-    .slide {
-      position: relative; opacity: 1; transform: none;
-      pointer-events: auto;
-      min-height: 100vh;
-      padding: 8% 6%;
-      border-bottom: 1px solid var(--border);
+  /* responsive */
+  @media (max-width: 900px) {
+    .nav-inner { padding: 0.8rem 1rem; gap: 0.8rem; }
+    .nav-links { display: none; }
+    .nav-cta .btn { padding: 0.5em 0.9em; font-size: 0.85rem; }
+    .hero-inner, .spotlight-inner, .spotlight.reverse .spotlight-inner,
+    .pair-inner, .install-arch .container {
+      grid-template-columns: 1fr;
+      gap: 2.5rem;
     }
-    .body { grid-template-columns: 1fr; gap: 2em; }
-    .nav { display: none; }
-    .hero-muses { flex-wrap: wrap; gap: 0.7em; }
+    .spotlight.reverse .spot-text { order: 1; }
+    .spotlight.reverse .spot-mock { order: 2; }
+    section { padding: 4rem 1rem; }
+    .hero { padding-top: 4rem; padding-bottom: 3rem; }
+    .hero-mock .stack-card-2 { display: none; }
+    .footer-muses { gap: 0.8rem; }
+    .compare-table { font-size: 0.75rem; }
+    .compare-table th, .compare-table td { padding: 0.55em 0.5em; }
+    .privacy-grid, .capability-grid, .faq-grid { grid-template-columns: 1fr; }
+    /* device-pair: MacBook stacks above iPhone on mobile */
+    .device-pair {
+      grid-template-columns: 1fr;
+      gap: 2.5rem;
+      justify-items: center;
+    }
+    .macbook { width: 100%; max-width: 520px; }
+    .desktop-content { min-height: 240px; }
   }
 </style>
 </head>
 <body>
 
-<!-- Muse mascot SVG defs — exact copy from muselab frontend/index.html -->
+<!-- Muse SVG defs -->
 <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true">
   <defs>
     <symbol id="m-hex"      viewBox="0 0 24 24"><path d="M12 3 L20 7.5 L20 16.5 L12 21 L4 16.5 L4 7.5 Z"/></symbol>
@@ -881,131 +1793,292 @@
   </defs>
 </svg>
 
-<div class="stage" id="stage">
+<!-- STICKY HEADER -->
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="#" class="nav-logo">
+      <svg class="muse"><use href="#m-hex"/></svg>
+      muse<span class="accent">·</span>lab
+    </a>
+    <div class="nav-links">
+      <a href="#privacy">Privacy</a>
+      <a href="#features">Features</a>
+      <a href="#plan-mode">Plan mode</a>
+      <a href="#install">Install</a>
+      <a href="#compare">Compare</a>
+    </div>
+    <div class="nav-spacer"></div>
+    <div class="nav-cta">
+      <a href="https://github.com/hesorchen/muselab" class="btn btn-ghost" target="_blank" rel="noopener">
+        <span class="star">★</span> GitHub
+      </a>
+      <a href="#install" class="btn btn-primary">Install</a>
+    </div>
+  </div>
+</nav>
 
-  <!-- ============ 1 · HERO (Calliope · 史诗) ============ -->
-  <section class="slide hero active">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>MUSELAB</span></div>
-      <div class="muse-chip">
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-inner">
+    <div class="hero-text">
+      <div class="hero-pill">
         <svg class="muse"><use href="#m-hex"/></svg>
-        <span class="name">Calliope</span><span class="sep">·</span><span class="domain">史诗</span>
+        Open source · MIT · Pre-1.0
       </div>
-      <div class="counter">01 / 09</div>
+      <h1>你的私人档案，<br>就是 AI 的<span class="hl">工作集</span>。</h1>
+      <p class="hero-sub">
+        想让 AI 读懂你的文件，通常得先把它们传上云、切成向量。muselab 反过来——指向一个你自己的目录，里面的原文件直接就是 Muse 的一等上下文。八家模型共用一套 agent loop，复用 Claude Pro 订阅，跑在你自己的机器上。
+      </p>
+      <div class="hero-cta">
+        <a href="#install" class="btn btn-primary">→ 一行命令装上</a>
+        <a href="https://github.com/hesorchen/muselab" class="btn btn-ghost" target="_blank" rel="noopener">
+          <span class="star">★</span> Star on GitHub
+        </a>
+      </div>
+      <div class="hero-install">
+        <span class="prompt">$</span>
+        <span>curl -fsSL …/quick-install.sh | bash</span>
+        <button class="copy-btn" onclick="copyInstall(this)">Copy</button>
+      </div>
     </div>
-    <div class="body">
-      <div class="col">
-        <div class="hero-logo">muse<span class="accent">·</span>lab</div>
-        <div class="hero-tagline">自部署的多模型 AI 工作台</div>
-        <div class="hero-sub">a self-hosted, multi-model AI workspace</div>
-        <div class="hero-muses">
-          <div class="one"><svg class="muse"><use href="#m-hex"/></svg><span class="nm">Calliope</span></div>
-          <div class="one"><svg class="muse"><use href="#m-bars"/></svg><span class="nm">Clio</span></div>
-          <div class="one"><svg class="muse"><use href="#m-lens"/></svg><span class="nm">Erato</span></div>
-          <div class="one"><svg class="muse"><use href="#m-wave"/></svg><span class="nm">Euterpe</span></div>
-          <div class="one"><svg class="muse"><use href="#m-crescent"/></svg><span class="nm">Melpomene</span></div>
-          <div class="one"><svg class="muse"><use href="#m-halo"/></svg><span class="nm">Polyhymnia</span></div>
-          <div class="one"><svg class="muse"><use href="#m-trio"/></svg><span class="nm">Terpsichore</span></div>
-          <div class="one"><svg class="muse"><use href="#m-spark"/></svg><span class="nm">Thalia</span></div>
-          <div class="one"><svg class="muse"><use href="#m-orbit"/></svg><span class="nm">Urania</span></div>
+    <div class="hero-mock">
+      <div class="stack-card">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title">localhost:8765 · 本周周报</div>
         </div>
-        <div class="hero-meta">
-          <span>OPEN SOURCE</span>
-          <span>MIT</span>
-          <span>YOUR MACHINE</span>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============ 2 · BIG IDEA (Clio · 历史) ============ -->
-  <section class="slide big">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>核心理念</span></div>
-      <div class="muse-chip">
-        <svg class="muse"><use href="#m-bars"/></svg>
-        <span class="name">Clio</span><span class="sep">·</span><span class="domain">历史</span>
-      </div>
-      <div class="counter">02 / 09</div>
-    </div>
-    <div class="body">
-      <div class="col">
-        <svg class="muse big-muse"><use href="#m-bars"/></svg>
-        <div class="eyebrow">CORE IDEA</div>
-        <h1>你的<span class="hl">私人档案</span>，<br>就是 AI 的工作集。</h1>
-        <p class="sub">指向一个你自己的目录——里面的文件、笔记、文档，都是 Muse 的一等上下文。不是 RAG 索引，不是云端拷贝，就是磁盘上的原文件。Read · Grep · Edit，按需取用。</p>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============ 3 · FILES (Polyhymnia · 圣诗) ============ -->
-  <section class="slide">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>FILES · 文件工作流</span></div>
-      <div class="muse-chip">
-        <svg class="muse"><use href="#m-halo"/></svg>
-        <span class="name">Polyhymnia</span><span class="sep">·</span><span class="domain">圣诗</span>
-      </div>
-      <div class="counter">03 / 09</div>
-    </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">FILES</div>
-        <h1>所有文件类型，<br>浏览器里<span class="hl">直接渲染</span>。</h1>
-        <p class="sub">Markdown / PDF / 图片 / HTML / CSV / XLSX——打开即所见。左边文件树 + 搜索 + 已开文件三段式，中间预览，右边对话。搬家、删除、上传、grep 都是拖拽 + 一行 input 解决。</p>
-        <div class="micro">
-          <span class="tag">.md</span><span class="tag">.pdf</span><span class="tag">.html</span><span class="tag">.csv</span><span class="tag">.xlsx</span><span class="tag">.png</span><br>
-          软删除 30 天可还原 · <span class="kbd">.gitignore</span> 自动屏蔽 · 拖到底部即删
-        </div>
-      </div>
-      <div class="col">
-        <div class="mock">
-          <div class="mock-bar">
-            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <div class="title">~/muselab-archive</div>
+        <div style="padding: 1em 1.2em">
+          <div class="msg-user" style="margin: 0 0 0.7em auto">把这周 5 篇 daily log 汇总成一份周报，分进展 / 阻塞 / 下周计划</div>
+          <div class="thinking-head" style="margin-bottom: 0.3em">
+            <span class="chevron">▾</span>thinking · 12s
           </div>
-          <div class="ws">
-            <div class="ws-files">
-              <div class="ws-head"><svg class="muse ico"><use href="#m-bars"/></svg>文件</div>
-              <div class="ws-search">🔍 <span class="placeholder">搜索文件名 / 内容…</span></div>
-              <div class="openfiles">
-                <div class="openfiles-head">▼ 已打开 (3)</div>
-                <div class="openfiles-row">
-                  <span class="ico md" style="color:var(--accent)">▣</span>
-                  <span>2026年目标.md</span>
-                  <span class="x">×</span>
-                </div>
-                <div class="openfiles-row sel">
-                  <span class="ico xlsx" style="color:#34a853">▣</span>
-                  <span>PlanDeck MRR 24个月.xlsx</span>
-                  <span class="x">×</span>
-                </div>
-                <div class="openfiles-row">
-                  <span class="ico md">▣</span>
-                  <span>PlanDeck 客户调研笔记.md</span>
-                  <span class="x">×</span>
-                </div>
+          <div class="plan-card">
+            <div class="plan-head">
+              <svg class="muse" style="width:14px;height:14px"><use href="#m-orbit"/></svg>
+              Plan · 待确认
+            </div>
+            <div class="plan-body" style="padding: 0.7em 1em; font-size: 0.85em">
+              <ol style="padding-left: 1.3em; margin: 0">
+                <li>读 logs/ 下本周 5 篇 daily log</li>
+                <li>归并进展、阻塞点、零散待办</li>
+                <li>按 进展 / 阻塞 / 下周计划 三段组织</li>
+                <li>写入 周报-W22.md</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- IDEA -->
+<section class="idea reveal">
+  <div class="container">
+    <svg class="muse idea-muse"><use href="#m-bars"/></svg>
+    <div class="section-label" style="justify-content:center">CORE IDEA</div>
+    <h2>不是 RAG，不是云端拷贝，<br>就是<span class="hl">磁盘上的原文件</span>。</h2>
+    <p class="lead">
+      muselab 不预先向量化你的档案。Muse 通过 Read / Grep / Edit 工具按需访问——和你自己在 IDE 里翻文件一样直接。文件改了立即生效，没有索引同步，没有 embedding 漂移。你的档案始终是你能直接打开、修改、删除的原文件，不是某个服务里的黑盒索引。
+    </p>
+  </div>
+</section>
+
+<!-- PRIVACY / DATA SOVEREIGNTY -->
+<section class="privacy reveal" id="privacy">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-hex"/></svg>
+      PRIVACY · 隐私与数据主权
+    </div>
+    <h2 style="text-align:center">私密性不是开关，<br>是<span class="hl">架构默认</span>。</h2>
+    <p class="lead" style="margin:0 auto 3.5rem; text-align:center">
+      muselab 是单用户、自托管的。没有遥测、没有云端副本、没有第三方账号——文件在你的磁盘上，密钥在你的 <span class="kbd">.env</span> 里，连 Muse 自己都被禁止读取凭证文件。
+    </p>
+    <div class="privacy-grid">
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-crescent"/></svg>
+        <div class="pc-title">零遥测</div>
+        <div class="pc-desc">不接任何 analytics，不回传使用数据。除了你主动发起的模型 API 调用，muselab 不与任何第三方服务器通信。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-hex"/></svg>
+        <div class="pc-title">连密钥都对 Muse 不可见</div>
+        <div class="pc-desc"><span class="kbd">.env</span> · SSH 私钥 · <span class="kbd">*.pem</span> · credentials.json——这类凭证文件即便持有有效 token 也被拒绝读写。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-bars"/></svg>
+        <div class="pc-title">文件就在你的磁盘上</div>
+        <div class="pc-desc">archive 是你机器上一个普通目录。没有向量库、没有云端镜像、没有数据搬运——随时能用文件管理器或终端直接打开。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-lens"/></svg>
+        <div class="pc-title">越权即拒</div>
+        <div class="pc-desc">所有读写被锁在 archive 根目录内；指向 <span class="kbd">/</span>、<span class="kbd">/etc</span> 等系统路径会在启动时直接拒绝。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-wave"/></svg>
+        <div class="pc-title">不被搜索引擎收录</div>
+        <div class="pc-desc">默认 <span class="kbd">noindex</span> + robots.txt，万一误暴露也不会被爬；token 用 constant-time 比较，过短拒绝启动。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-spark"/></svg>
+        <div class="pc-title">MIT 开源，可审计</div>
+        <div class="pc-desc">全部代码公开。每一条数据流向哪里，你都能自己读源码确认，而不是信一句"我们很安全"。</div>
+      </div>
+    </div>
+    <div class="micro" style="text-align:center; margin-top:2.5rem">
+      威胁模型 · 防护清单 · 反代加固建议 → <a href="https://github.com/hesorchen/muselab/blob/main/SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a>
+    </div>
+  </div>
+</section>
+
+<!-- SPOTLIGHT 1 -->
+<section class="spotlight reveal" id="features">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-halo"/></svg>
+        FILES · 文件工作流
+      </div>
+      <h2>多种常见格式，<br>浏览器里<span class="hl">直接渲染</span>。</h2>
+      <p class="lead">
+        XLSX 看表格、HTML 看图表、PDF 看页面、Markdown 看格式化、图片直接预览——不用为了"看个文件"再开 Numbers / Preview / VSCode。所有渲染在三栏 workspace 中间那一栏完成，右边随时让 Muse 对它做事。
+      </p>
+      <div class="micro">
+        <span class="tag">.md</span><span class="tag">.html</span><span class="tag">.xlsx</span><span class="tag">.csv</span><span class="tag">.pdf</span><span class="tag">.png/.jpg</span><span class="tag">.txt</span><br>
+        软删除 30 天可还原 · <span class="kbd">.gitignore</span> 自动屏蔽 · 拖到底部即删
+      </div>
+    </div>
+    <div class="spot-mock">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title">~/muselab-archive</div>
+        </div>
+        <div class="ws">
+          <div class="ws-files">
+            <div class="ws-head">▣ 文件</div>
+            <div class="ws-search">🔍 <span class="placeholder">搜索文件名 / 内容…</span></div>
+            <div class="openfiles">
+              <div class="openfiles-head">▼ 已打开 (3)</div>
+              <div class="openfiles-row">
+                <span class="ico xlsx">▣</span><span>预算明细.xlsx</span><span class="x">×</span>
               </div>
-              <div class="tree">
-                <div class="tree-root">▾ muselab-archive</div>
-                <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>PlanDeck</span></div>
-                <div class="tree-row sel lv2"><span class="caret"></span><span class="ico xlsx">▣</span><span>MRR 24个月.xlsx</span><span class="size">24 KB</span></div>
-                <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>客户调研笔记.md</span><span class="size">8 KB</span></div>
-                <div class="tree-row dir lv1"><span class="caret">▸</span><span class="ico folder">▣</span><span>家庭</span></div>
-                <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>notes</span></div>
-                <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>2026年目标.md</span><span class="size">3 KB</span></div>
+              <div class="openfiles-row sel">
+                <span class="ico html">▣</span><span>关西行程.html</span><span class="x">×</span>
+              </div>
+              <div class="openfiles-row">
+                <span class="ico md">▣</span><span>攻略笔记.md</span><span class="x">×</span>
               </div>
             </div>
-            <div class="ws-preview">
-              <div class="ws-preview-head">PlanDeck MRR 24个月.xlsx · sheet: monthly</div>
-              <div class="ws-preview-body">
-                <table>
-                  <thead><tr><th>month</th><th>new</th><th>churn</th><th>MRR</th></tr></thead>
+            <div class="tree">
+              <div class="tree-root">▾ muselab-archive</div>
+              <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>关西旅行</span></div>
+              <div class="tree-row sel lv2"><span class="caret"></span><span class="ico html">▣</span><span>关西行程.html</span><span class="size">16 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico xlsx">▣</span><span>预算明细.xlsx</span><span class="size">32 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>攻略笔记.md</span><span class="size">11 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico pdf">▣</span><span>机票行程单.pdf</span><span class="size">1.4 MB</span></div>
+              <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>notes</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>想去的地方.md</span><span class="size">3 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico png">▣</span><span>地图截图.png</span><span class="size">820 KB</span></div>
+              <div class="tree-row dir lv1"><span class="caret">▸</span><span class="ico folder">▣</span><span>archives</span></div>
+            </div>
+          </div>
+          <div class="ws-preview">
+            <div class="ws-preview-head">关西旅行/关西行程.html · HTML 渲染</div>
+            <div class="ws-preview-body portfolio-preview">
+              <!-- dashboard header -->
+              <div class="pf-title">关西 9 天自由行 · 2026 年 4 月</div>
+              <div class="pf-metrics">
+                <div class="pf-metric">
+                  <div class="pf-metric-lbl">天数</div>
+                  <div class="pf-metric-val">9</div>
+                </div>
+                <div class="pf-metric">
+                  <div class="pf-metric-lbl">总预算</div>
+                  <div class="pf-metric-val">¥18,400</div>
+                </div>
+                <div class="pf-metric">
+                  <div class="pf-metric-lbl">景点</div>
+                  <div class="pf-metric-val gr">14</div>
+                </div>
+                <div class="pf-metric">
+                  <div class="pf-metric-lbl">酒店</div>
+                  <div class="pf-metric-val">4</div>
+                </div>
+              </div>
+
+              <!-- budget breakdown bars -->
+              <div class="pf-card">
+                <div class="pf-card-title">预算构成 <span class="pf-card-sub">by 类别</span></div>
+                <div class="alloc-list">
+                  <div class="alloc-row">
+                    <span class="alloc-tic">住宿</span>
+                    <span class="alloc-desc">¥6,200</span>
+                    <div class="alloc-track"><div class="alloc-fill c1" style="width:34%"></div></div>
+                    <span class="alloc-pct">34%</span>
+                  </div>
+                  <div class="alloc-row">
+                    <span class="alloc-tic">交通</span>
+                    <span class="alloc-desc">¥4,800</span>
+                    <div class="alloc-track"><div class="alloc-fill c2" style="width:26%"></div></div>
+                    <span class="alloc-pct">26%</span>
+                  </div>
+                  <div class="alloc-row">
+                    <span class="alloc-tic">餐饮</span>
+                    <span class="alloc-desc">¥3,500</span>
+                    <div class="alloc-track"><div class="alloc-fill c3" style="width:19%"></div></div>
+                    <span class="alloc-pct">19%</span>
+                  </div>
+                  <div class="alloc-row">
+                    <span class="alloc-tic">门票</span>
+                    <span class="alloc-desc">¥2,300</span>
+                    <div class="alloc-track"><div class="alloc-fill c4" style="width:13%"></div></div>
+                    <span class="alloc-pct">13%</span>
+                  </div>
+                  <div class="alloc-row">
+                    <span class="alloc-tic">购物</span>
+                    <span class="alloc-desc">¥1,600</span>
+                    <div class="alloc-track"><div class="alloc-fill c5" style="width:8%"></div></div>
+                    <span class="alloc-pct">8%</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- daily cumulative spend sparkline -->
+              <div class="pf-card">
+                <div class="pf-card-title">每日累计花费 <span class="pf-card-sub">¥0 → ¥18.4k</span></div>
+                <svg class="sparkline" viewBox="0 0 240 60" preserveAspectRatio="none">
+                  <defs>
+                    <linearGradient id="spk" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stop-color="#6093ff" stop-opacity="0.45"/>
+                      <stop offset="100%" stop-color="#6093ff" stop-opacity="0"/>
+                    </linearGradient>
+                  </defs>
+                  <polygon fill="url(#spk)"
+                    points="0,52 10,50 20,48 30,46 40,44 50,42 60,40 70,36 80,34 90,32 100,30 110,26 120,24 130,22 140,20 150,18 160,16 170,14 180,12 190,10 200,9 210,8 220,7 230,6 240,5 240,60 0,60"/>
+                  <polyline fill="none" stroke="#6093ff" stroke-width="1.8"
+                    points="0,52 10,50 20,48 30,46 40,44 50,42 60,40 70,36 80,34 90,32 100,30 110,26 120,24 130,22 140,20 150,18 160,16 170,14 180,12 190,10 200,9 210,8 220,7 230,6 240,5"/>
+                  <circle cx="240" cy="5" r="3" fill="#6093ff"/>
+                  <circle cx="60" cy="40" r="2.5" fill="#fbbf24" opacity="0.85"/>
+                  <circle cx="150" cy="18" r="2.5" fill="#fbbf24" opacity="0.85"/>
+                </svg>
+                <div class="spark-axis">
+                  <span>Day1</span><span>Day3</span><span>Day5</span><span>Day7</span><span>Day9</span>
+                </div>
+              </div>
+
+              <!-- daily itinerary -->
+              <div class="pf-card">
+                <div class="pf-card-title">每日行程 <span class="pf-card-sub">by 城市</span></div>
+                <table class="holdings">
+                  <thead><tr><th>Day</th><th>城市</th><th>主行程</th><th>住宿</th></tr></thead>
                   <tbody>
-                    <tr><td>2025-09</td><td class="num">+12</td><td class="num">−3</td><td class="num gr">8,420</td></tr>
-                    <tr><td>2025-10</td><td class="num">+18</td><td class="num">−4</td><td class="num gr">10,180</td></tr>
-                    <tr><td>2025-11</td><td class="num">+21</td><td class="num">−2</td><td class="num gr">12,640</td></tr>
-                    <tr><td>2025-12</td><td class="num">+27</td><td class="num">−5</td><td class="num gr">15,210</td></tr>
+                    <tr><td><span class="hd-tic c1">D1–2</span></td><td>大阪</td><td>道顿堀 · 环球影城</td><td class="num">难波 ×2</td></tr>
+                    <tr><td><span class="hd-tic c2">D3–4</span></td><td>京都</td><td>伏见稻荷 · 清水寺</td><td class="num">祇园 ×2</td></tr>
+                    <tr><td><span class="hd-tic c3">D5–6</span></td><td>奈良</td><td>东大寺 · 喂鹿</td><td class="num">京都 ×2</td></tr>
+                    <tr><td><span class="hd-tic c4">D7–9</span></td><td>神户</td><td>异人馆 · 摩耶山夜景</td><td class="num">三宫 ×3</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -1014,392 +2087,623 @@
         </div>
       </div>
     </div>
-    <div class="bg-muse"><svg class="muse"><use href="#m-halo"/></svg></div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============ 4 · SESSIONS (Thalia · 喜剧) ============ -->
-  <section class="slide">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>SESSIONS · 多会话</span></div>
-      <div class="muse-chip">
+<!-- SPOTLIGHT 2 -->
+<section class="spotlight reverse reveal">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
         <svg class="muse"><use href="#m-spark"/></svg>
-        <span class="name">Thalia</span><span class="sep">·</span><span class="domain">喜剧</span>
+        SESSIONS · 多会话
       </div>
-      <div class="counter">04 / 09</div>
+      <h2>每个对话独立 tab，<br><span class="hl">几十条同时开着</span>不串线。</h2>
+      <p class="lead">
+        顶部横向 tab strip 切换；左侧文件夹图标点开 picker，按时间分组、置顶常用、双击改名、搜索过滤。每个会话记得自己的模型 / reasoning effort / 上下文窗口。流式 tab 有跳动小点，未读有橙点提示。
+      </p>
+      <div class="micro">
+        支持从任意历史消息处分叉新会话 · 50 个 session 同开无压力
+      </div>
     </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">SESSIONS</div>
-        <h1>每个对话独立 tab，<br><span class="hl">几十条同时开着不串线</span>。</h1>
-        <p class="sub">顶部横向 tab strip 切换；左侧文件夹图标点开 picker，按时间分组、置顶常用、双击改名、搜索过滤。每个会话记得自己的模型 / reasoning effort / 上下文窗口。</p>
-        <div class="micro">
-          流式 tab 有跳动小点 · 未读有橙点提示 · 支持从任意历史消息处分叉新会话
+    <div class="spot-mock">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title">chat pane · top</div>
         </div>
-      </div>
-      <div class="col">
-        <div class="mock">
-          <div class="mock-bar">
-            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <div class="title">chat pane · top</div>
+        <div class="chat-tabs">
+          <div class="chat-tab-history-btn">▣</div>
+          <div class="chat-tab"><span>日常对话</span><span class="x">×</span></div>
+          <div class="chat-tab active"><span class="stream"></span><span>周报汇总</span><span class="x">×</span></div>
+          <div class="chat-tab"><span class="unread"></span><span>读论文 · 系外行星</span><span class="x">×</span></div>
+          <div class="chat-tab"><span>旅行预算</span><span class="x">×</span></div>
+        </div>
+        <div class="picker-pop">
+          <div class="picker-search">🔍 搜索会话…</div>
+          <div class="picker-group-label">📌 置顶</div>
+          <div class="picker-row active">
+            <span class="pin">📌</span>
+            <span class="name">周报汇总</span>
+            <span class="stream"></span>
+            <span class="actions">✎ ⋯ ×</span>
           </div>
-          <div class="chat-tabs">
-            <div class="chat-tab-history-btn"><span class="ico">▣</span></div>
-            <div class="chat-tab"><span>日常对话</span><span class="x">×</span></div>
-            <div class="chat-tab active"><span class="stream"></span><span>PlanDeck 增长策略</span><span class="x">×</span></div>
-            <div class="chat-tab"><span class="unread"></span><span>读论文 · attention</span><span class="x">×</span></div>
-            <div class="chat-tab"><span>翻译润色</span><span class="x">×</span></div>
-            <div class="chat-tab"><span>整理会议纪要</span><span class="x">×</span></div>
+          <div class="picker-row">
+            <span class="pin">📌</span>
+            <span class="name">日常对话</span>
+            <span class="actions">✎ ⋯ ×</span>
           </div>
-          <div class="picker-pop">
-            <div class="picker-search">🔍 搜索会话…</div>
-            <div class="picker-group-label">📌 置顶</div>
-            <div class="picker-row active">
-              <svg class="muse pin"><use href="#m-spark"/></svg>
-              <span class="name">PlanDeck 增长策略</span>
-              <span class="stream"></span>
-              <span class="actions">✎  ⋯  ×</span>
-            </div>
-            <div class="picker-row">
-              <svg class="muse pin"><use href="#m-spark"/></svg>
-              <span class="name">日常对话</span>
-              <span class="actions">✎  ⋯  ×</span>
-            </div>
-            <div class="picker-group-label" style="margin-top:0.4em">今天</div>
-            <div class="picker-row">
-              <span class="pin off">◌</span>
-              <span class="name">读论文 · attention</span>
-              <span class="actions">✎  ⋯  ×</span>
-            </div>
-            <div class="picker-row">
-              <span class="pin off">◌</span>
-              <span class="name">翻译润色</span>
-              <span class="actions">✎  ⋯  ×</span>
-            </div>
+          <div class="picker-group-label" style="margin-top:0.4em">今天</div>
+          <div class="picker-row">
+            <span class="pin off">◌</span>
+            <span class="name">读论文 · 系外行星</span>
+            <span class="actions">✎ ⋯ ×</span>
+          </div>
+          <div class="picker-row">
+            <span class="pin off">◌</span>
+            <span class="name">整理会议纪要</span>
+            <span class="actions">✎ ⋯ ×</span>
           </div>
         </div>
       </div>
     </div>
-    <div class="bg-muse"><svg class="muse"><use href="#m-spark"/></svg></div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============ 5 · MODELS (Terpsichore · 舞蹈) ============ -->
-  <section class="slide">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>MODELS · 多模型</span></div>
-      <div class="muse-chip">
+<!-- SPOTLIGHT 3 -->
+<section class="spotlight reveal">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
         <svg class="muse"><use href="#m-trio"/></svg>
-        <span class="name">Terpsichore</span><span class="sep">·</span><span class="domain">舞蹈</span>
+        MODELS · 多模型
       </div>
-      <div class="counter">05 / 09</div>
+      <h2>八家模型，<br><span class="hl">一套 agent loop</span>。</h2>
+      <p class="lead">
+        底部 toolbar 一个 select 切换：Claude · DeepSeek · GLM · MiniMax · Kimi · Qwen · 小米 MiMo · 百度 ERNIE。MCP / Skills / Subagent / plan 模式在每家行为一致——Claude Agent SDK 直接驱动，不是协议翻译。
+      </p>
+      <div class="micro">
+        复用 <span class="kbd">Claude Pro / Max</span> 订阅（OAuth）· 其他厂商 vendor anthropic-compat · 切模型 fork 新会话保留原上下文
+      </div>
     </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">MULTI-MODEL</div>
-        <h1>八家模型，<br><span class="hl">一套 agent loop</span>。</h1>
-        <p class="sub">底部 toolbar 一个 select 切换：Claude · DeepSeek · GLM · MiniMax · Kimi · Qwen · 小米 MiMo · 百度 ERNIE。MCP / Skills / Subagent / plan 模式在每家行为一致——Claude Agent SDK 直接驱动，不是协议翻译。</p>
-        <div class="micro">
-          复用 <span class="kbd">Claude Pro / Max</span> 订阅（OAuth）· 其他厂商 vendor anthropic-compat · 切模型 fork 新会话保留原上下文
+    <div class="spot-mock">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title">chat pane · toolbar + model select</div>
         </div>
-      </div>
-      <div class="col">
-        <div class="mock">
-          <div class="mock-bar">
-            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <div class="title">chat pane · toolbar + select</div>
-          </div>
-          <div class="chat-toolbar">
-            <span class="toolbar-btn on">plan</span>
-            <span class="toolbar-btn">skills</span>
-            <span class="toolbar-select model">
-              claude-sonnet-4-5 <span class="v">▾</span>
-            </span>
-            <span class="toolbar-select">
-              effort: high <span class="v">▾</span>
-            </span>
-            <span class="spacer"></span>
-            <span class="ctx-pill">ctx <span class="num">38%</span></span>
-          </div>
-          <div class="select-pop">
-            <div class="optgroup-label">Anthropic</div>
-            <div class="opt sel">claude-sonnet-4-5</div>
-            <div class="opt">claude-opus-4-5</div>
-            <div class="opt">claude-haiku-4-5</div>
-            <div class="optgroup-label">DeepSeek</div>
-            <div class="opt">deepseek-chat</div>
-            <div class="opt">deepseek-reasoner</div>
-            <div class="optgroup-label">China</div>
-            <div class="opt">glm-4.6 · zhipu</div>
-            <div class="opt">kimi-k2 · moonshot</div>
-            <div class="opt">qwen3-max · alibaba</div>
-            <div class="opt">mimo · xiaomi</div>
-            <div class="opt">ernie-4.5 · baidu</div>
-          </div>
+        <div class="chat-toolbar">
+          <span class="toolbar-btn" title="附件">📎</span>
+          <span class="toolbar-btn" title="Skills">🧩</span>
+          <span class="toolbar-btn" title="MCP">🔌</span>
+          <span class="toolbar-select model">Opus 4.8 <span class="v">▾</span></span>
+          <span class="toolbar-select perm">plan <span class="v">▾</span></span>
+          <span class="toolbar-select">high <span class="v">▾</span></span>
+          <span class="spacer"></span>
+          <span class="ctx-pill">ctx <span class="num">38%</span></span>
+          <span class="toolbar-send">▶</span>
+        </div>
+        <div class="select-pop">
+          <div class="optgroup-label">Anthropic</div>
+          <div class="opt sel">Opus 4.8</div>
+          <div class="opt">Sonnet 4.6</div>
+          <div class="opt">Haiku 4.5</div>
+          <div class="optgroup-label">DeepSeek</div>
+          <div class="opt">deepseek-v4-pro</div>
+          <div class="opt">deepseek-v4-flash</div>
+          <div class="optgroup-label">China</div>
+          <div class="opt">glm-5.1 · zhipu</div>
+          <div class="opt">minimax-m2 · minimax</div>
+          <div class="opt">kimi-k2.6 · moonshot</div>
+          <div class="opt">qwen3-max · alibaba</div>
+          <div class="opt">mimo-v2.5-pro · xiaomi</div>
+          <div class="opt">ernie-5.0 · baidu</div>
         </div>
       </div>
     </div>
-    <div class="bg-muse"><svg class="muse"><use href="#m-trio"/></svg></div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============ 6 · PLAN MODE (Urania · 天文) ============ -->
-  <section class="slide">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>PLAN MODE · 计划模式</span></div>
-      <div class="muse-chip">
+<!-- CAPABILITIES -->
+<section class="capabilities reveal" id="capabilities">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-spark"/></svg>
+      AGENT SDK · 完整能力面
+    </div>
+    <h2 style="text-align:center">不只是聊天框，<br>是<span class="hl">完整的 agent</span>。</h2>
+    <p class="lead" style="margin:0 auto 3.5rem; text-align:center">
+      muselab 由 Claude Agent SDK 直接驱动——Skills、MCP、Subagent、plan 模式都是原生能力，且在八家模型上行为一致。不是套壳聊天，是能调工具、能拆任务、能扩展的工作 agent。
+    </p>
+    <div class="capability-grid">
+      <div class="capability-card">
+        <svg class="muse"><use href="#m-halo"/></svg>
+        <div class="cap-title">Skills · 11 个预置技能包</div>
+        <div class="cap-desc">模型按任务自动选用——web-search、code-reviewer、mermaid-helper、csv-analyzer、pptx、translate、meeting-notes…… 放一个 <span class="kbd">SKILL.md</span> 进目录，就能加你自己的。</div>
+      </div>
+      <div class="capability-card">
         <svg class="muse"><use href="#m-orbit"/></svg>
-        <span class="name">Urania</span><span class="sep">·</span><span class="domain">天文</span>
+        <div class="cap-title">MCP · 接外部工具与数据源</div>
+        <div class="cap-desc">通过 Model Context Protocol 接入 filesystem、git、fetch、memory、time、sequential-thinking 等 server，能力随开放生态持续扩展。</div>
       </div>
-      <div class="counter">06 / 09</div>
-    </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">PLAN MODE</div>
-        <h1>看着 Muse <span class="hl">想清楚</span><br>再动手。</h1>
-        <p class="sub">复杂任务先进 plan 模式——thinking 块实时显示推理（chevron 折叠）；最后输出一张带 ✓ 图标的 plan card。你点确认才会真正执行，避免 agent 跑偏。</p>
-        <div class="micro">
-          MCP <span class="kbd">sequential-thinking</span> 加持 · TaskCreate/Update 工具链可视化 · 长任务全程透明
-        </div>
-      </div>
-      <div class="col">
-        <div class="mock">
-          <div class="mock-bar">
-            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <div class="title">chat pane · plan mode</div>
-          </div>
-          <div class="chat-area">
-            <div class="msg-user">帮我把 PlanDeck 的 2026 增长策略整理成可执行的季度计划</div>
-            <div class="thinking-head"><span class="chevron">▾</span>thinking · 12s</div>
-            <div class="thinking-body">
-              先看现状——MRR 12.6k，月增 ~25 个客户，churn 稳定。整理需要分四块：获客通道 / 转化 / 留存 / 单价…
-            </div>
-            <div class="thinking-head"><span class="chevron">▸</span>thinking · 8s</div>
-            <div class="plan-card">
-              <div class="plan-head">
-                <span class="ico">✓</span> Plan · 待确认
-              </div>
-              <div class="plan-body">
-                <ol>
-                  <li>读 PlanDeck/MRR 24个月.xlsx 摸清基线</li>
-                  <li>读 PlanDeck/客户调研笔记.md 提关键痛点</li>
-                  <li>分 Q1-Q4 列目标 + 关键动作 + 负责人</li>
-                  <li>输出到 PlanDeck/2026-roadmap.md</li>
-                </ol>
-              </div>
-            </div>
-          </div>
-        </div>
+      <div class="capability-card">
+        <svg class="muse"><use href="#m-trio"/></svg>
+        <div class="cap-title">Subagent · 拆分子任务并行</div>
+        <div class="cap-desc">复杂任务派生出独立上下文的子 agent 并行处理，各自跑工具链再汇总——主线程不被一次性塞满。</div>
       </div>
     </div>
-    <div class="bg-muse"><svg class="muse"><use href="#m-orbit"/></svg></div>
-  </section>
+    <div class="micro" style="text-align:center; margin-top:2.5rem">
+      <span class="kbd">skills="all"</span> 启动时自动发现 · MCP server 配置见 <span class="kbd">mcp.json</span> · plan 模式见下一节
+    </div>
+  </div>
+</section>
 
-  <!-- ============ 7 · DIFF (Erato · 情诗 · vesica piscis 双圆相交 = 前后两态) ============ -->
-  <section class="slide">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>EDITS · 改了什么</span></div>
-      <div class="muse-chip">
+<!-- PLAN MODE SPOTLIGHT -->
+<section class="plan-spotlight reveal" id="plan-mode">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-orbit"/></svg>
+      PLAN MODE · 计划模式
+    </div>
+    <h2>看着 Muse <span class="hl">想清楚</span>再动手。</h2>
+    <p class="lead">
+      复杂任务先进 plan 模式——thinking 块实时显示推理；最后输出 plan card 列出每一步 + 依据 + 范围约束。**你点 ✓ 通过才会真正执行**，写工具在 plan 模式下被禁用，没有审批前不会动你任何文件。
+    </p>
+    <div class="plan-demo">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title">chat pane · plan mode</div>
+        </div>
+        <div class="chat-area">
+
+          <!-- User question -->
+          <div class="msg-user">把我收藏的 12 篇城市交通文章整理成一份主题综述，按议题归类，每条标注共识 / 争议 + 原文出处</div>
+
+          <!-- Thinking chain -->
+          <div class="thinking-head collapsed"><span class="chevron">▸</span>thinking · 12s <span class="thinking-peek">先看 12 篇文章存在哪…</span></div>
+
+          <div class="thinking-head"><span class="chevron">▾</span>thinking · 24s</div>
+          <div class="thinking-body">
+            每个观点要打 2 维分：<strong>提及频次</strong>（多少篇文章讨论）× <strong>证据强度</strong>（有数据 / 案例 vs 仅观点）。
+            <br>规则：频次 ≥ 6 且证据强 → 核心议题；频次 3–5 → 次要；频次 ≤ 2 → 边缘（仅记录）。
+            <br>需要交叉读：articles/ 提观点 + 给每条标 <code>file:line</code> 出处。
+          </div>
+
+          <div class="thinking-head collapsed"><span class="chevron">▸</span>thinking · 8s <span class="thinking-peek">输出格式：分主题 + 每条附原文引用…</span></div>
+
+          <!-- Plan card -->
+          <div class="plan-card plan-card-rich">
+            <div class="plan-head">
+              <svg class="muse" style="width:14px;height:14px"><use href="#m-orbit"/></svg>
+              <span>Plan · 待你确认</span>
+              <span class="plan-meta">est. 4 工具调用 · ~26k token</span>
+            </div>
+            <div class="plan-body">
+              <ol>
+                <li>
+                  <span class="plan-step">读 <code>archives/articles/*.md</code> （12 篇）</span>
+                  <span class="plan-why">↳ 提取所有观点 mention，记录 <code>file:line</code></span>
+                </li>
+                <li>
+                  <span class="plan-step">按议题聚类，去重合并相近观点</span>
+                  <span class="plan-why">↳ 同一议题下不同文章的说法归到一组</span>
+                </li>
+                <li>
+                  <span class="plan-step">按二维矩阵分级 核心 / 次要 / 边缘</span>
+                  <span class="plan-why">↳ 频次 × 证据强度打分，按上面规则归档</span>
+                </li>
+                <li>
+                  <span class="plan-step">写入 <code>notes/城市交通-综述.md</code></span>
+                  <span class="plan-why">↳ 分主题 + 每条附 2 句原文引用 + 共识/争议标记</span>
+                </li>
+              </ol>
+              <div class="plan-scope">
+                <span class="plan-scope-lbl">范围</span>
+                <span class="plan-scope-text">只读 12 篇文章；新建 1 个 md 文件；不修改任何现有材料</span>
+              </div>
+            </div>
+            <div class="plan-actions">
+              <button class="btn-plan btn-plan-deny">✗ 让我改改</button>
+              <button class="btn-plan btn-plan-allow">✓ 通过执行</button>
+            </div>
+          </div>
+
+          <!-- User approved divider -->
+          <div class="approval-bar">
+            <span class="approval-tick">✓</span>
+            <span class="approval-text">用户已批准 · 11s 前</span>
+            <span class="approval-meta">permission: plan → default</span>
+          </div>
+
+          <!-- Execution phase: tool chain -->
+          <div class="exec-phase">
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read</span>
+              <span class="exec-arg">archives/articles/article-01.md</span>
+              <span class="exec-meta">312 行</span>
+            </div>
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read</span>
+              <span class="exec-arg">archives/articles/article-02.md</span>
+              <span class="exec-meta">280 行</span>
+            </div>
+            <div class="exec-item exec-done exec-batch">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read × 10</span>
+              <span class="exec-arg">article-03…12.md</span>
+              <span class="exec-meta">~3.2k 行</span>
+            </div>
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool exec-tool-write">Write</span>
+              <span class="exec-arg">notes/城市交通-综述.md</span>
+              <span class="exec-badge plus">+127</span>
+            </div>
+
+            <!-- mini diff preview of what was written -->
+            <div class="exec-result">
+              <div class="exec-result-head">城市交通-综述.md · preview</div>
+              <div class="exec-result-body">
+                <span class="exec-md-h2">## 核心议题 · 高频 + 强证据</span><br>
+                <span class="pri pri-1">核心</span> 公交专用道提速 — <strong>9/12</strong> 篇 · 多城实测数据<br>
+                <span class="pri pri-1">核心</span> 票价一体化降换乘成本 — <strong>7/12</strong> 篇 · 3 个案例<br>
+                <span class="pri pri-1">核心</span> 自行车道连通性 — <strong>6/12</strong> 篇 · top 诉求<br>
+                <span class="exec-md-h2" style="margin-top:0.4em">## 次要议题 · 本季关注</span><br>
+                <span class="pri pri-2">次要</span> 夜间公交覆盖 — <strong>5/12</strong> 篇<br>
+                <span class="pri pri-2">次要</span> 无障碍站台改造 — <strong>4/12</strong> 篇<br>
+                <span class="exec-md-text" style="margin-top:0.4em">…还有 边缘议题 · 仅记录（6 项）</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+    <div class="micro" style="text-align:center; margin-top: 2.5rem">
+      <span class="kbd">permission: plan</span> 禁用一切写工具 · MCP sequential-thinking 加持 · 长任务全程透明可中断
+    </div>
+  </div>
+</section>
+
+<!-- SPOTLIGHT 4: DIFF -->
+<section class="spotlight reverse reveal">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
         <svg class="muse"><use href="#m-lens"/></svg>
-        <span class="name">Erato</span><span class="sep">·</span><span class="domain">情诗</span>
+        EDITS · 改了什么
       </div>
-      <div class="counter">07 / 09</div>
+      <h2>改文件就出<br><span class="hl">红绿 diff</span>，看完再决定。</h2>
+      <p class="lead">
+        Muse 每次 Edit / Write / MultiEdit，气泡里直接渲染 inline diff——绿加红减、带 +N −M 计数。一眼看出动了哪里，不用切到 git。点击 head 折叠，长对话不挡视线。
+      </p>
+      <div class="micro">
+        默认展开当前 turn 的 diff · 历史 turn 自动折叠 · git-blame 风格
+      </div>
     </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">DIFF STRIPS</div>
-        <h1>改文件就出<br><span class="hl">红绿 diff</span>，看完再决定。</h1>
-        <p class="sub">Muse 每改一个文件，气泡里直接渲染 inline diff——绿加红减、带 +N −M 计数。一眼看出动了哪里，不用切到 git。点击 head 折叠，长对话不挡视线。</p>
-        <div class="micro">
-          所有 Edit / Write / MultiEdit 工具调用都附 diff · 当前 turn 自动展开，历史折叠
+    <div class="spot-mock">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title">chat pane · Edit 工具结果</div>
+        </div>
+        <div style="padding: 1em 1.2em">
+          <div class="diff-strip">
+            <div class="diff-head">
+              <span class="chevron">▾</span>
+              <span class="tool">Edit</span>
+              <span class="path">读书笔记/思考快与慢.md</span>
+              <span class="badge-plus">+4</span>
+              <span class="badge-minus">−2</span>
+            </div>
+            <div class="diff-body">
+<div class="diff-line"><span class="pre"> </span>## 第 3 章 · 锚定效应</div>
+<div class="diff-line del"><span class="pre">−</span>这章大概讲判断会受先看到的数影响</div>
+<div class="diff-line del"><span class="pre">−</span>后面再补充细节</div>
+<div class="diff-line ins"><span class="pre">+</span>① 锚定：先接触的数值会拉偏后续估计</div>
+<div class="diff-line ins"><span class="pre">+</span>② 实验：随机转盘数显著影响联合国席位猜测</div>
+<div class="diff-line ins"><span class="pre">+</span>③ 调整不足：从锚点出发的修正常停得太早</div>
+<div class="diff-line ins"><span class="pre">+</span>④ 应用：谈判先开价者常占锚定优势</div>
+            </div>
+          </div>
+          <div class="diff-strip" style="margin-top: 0.6em">
+            <div class="diff-head">
+              <span class="chevron">▸</span>
+              <span class="tool">Write</span>
+              <span class="path">notes/书摘卡片.md</span>
+              <span style="margin-left:auto"></span>
+              <span class="badge-plus">+47</span>
+            </div>
+          </div>
         </div>
       </div>
-      <div class="col">
-        <div class="mock">
+    </div>
+  </div>
+</section>
+
+<!-- MULTI-DEVICE: desktop + phone showing same session -->
+<section class="device-spotlight reveal" id="mobile">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-wave"/></svg>
+      MULTI-DEVICE · 一台服务器，多端同步
+    </div>
+    <h2 style="text-align:center">桌面起的话题，<br>手机<span class="hl">接着聊</span>。</h2>
+    <p class="lead" style="margin: 0 auto 3.5rem; text-align: center">
+      手机和桌面访问的是<strong style="color:var(--fg-1)">同一台服务器、同一个会话、同一份归档</strong>。没有云端同步、没有第三方账号、没有数据搬运——切设备就接着。
+    </p>
+
+    <div class="device-pair">
+      <!-- MacBook -->
+      <div class="macbook">
+        <div class="macbook-screen">
           <div class="mock-bar">
             <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <div class="title">chat pane · tool result</div>
+            <div class="title">localhost:8765 · 统计学复习</div>
           </div>
-          <div style="padding:0.8em">
-            <div class="diff-strip">
-              <div class="diff-head">
-                <span class="chevron">▾</span>
-                <span class="tool">Edit</span>
-                <span class="path">PlanDeck/客户调研笔记.md</span>
-                <span class="spacer"></span>
-                <span class="badge-plus">+4</span>
-                <span class="badge-minus">−2</span>
-              </div>
-              <div class="diff-body">
-<div class="diff-line"><span class="pre"> </span>## 客户痛点</div>
-<div class="diff-line del"><span class="pre">−</span>大家普遍觉得不太好用</div>
-<div class="diff-line del"><span class="pre">−</span>需要后续跟进改进</div>
-<div class="diff-line ins"><span class="pre">+</span>① onboarding 第一步流失 38%（埋点数据）</div>
-<div class="diff-line ins"><span class="pre">+</span>② 团队版定价模糊，3 家客户主动问</div>
-<div class="diff-line ins"><span class="pre">+</span>③ 导出 PDF 是 top-3 feature request</div>
-<div class="diff-line ins"><span class="pre">+</span>④ 与 Notion 集成被问及 5 次</div>
-<div class="diff-line"><span class="pre"> </span></div>
-<div class="diff-line"><span class="pre"> </span>## 备注</div>
+          <div class="desktop-content">
+            <div class="dt-files">
+              <div class="dt-files-head">▣ 文件</div>
+              <div class="dt-files-row dir"><span>▾</span><span>统计学</span></div>
+              <div class="dt-files-row"><span class="ico pdf">▣</span><span>习题集.pdf</span></div>
+              <div class="dt-files-row sel"><span class="ico md">▣</span><span>讲义-假设检验.md</span></div>
+              <div class="dt-files-row"><span class="ico md">▣</span><span>公式速查.md</span></div>
+              <div class="dt-files-row dir"><span>▸</span><span>notes</span></div>
+            </div>
+            <div class="dt-preview">
+              <div class="dt-preview-head">讲义-假设检验.md</div>
+              <div class="dt-preview-body">
+                <div class="dt-md-h2">## 假设检验 · 要点</div>
+                <div class="dt-md-li"><span class="dt-md-bullet">①</span> 原假设 H₀ vs 备择 H₁</div>
+                <div class="dt-md-li"><span class="dt-md-bullet">②</span> p 值：H₀ 为真时观测到该结果的概率</div>
+                <div class="dt-md-li"><span class="dt-md-bullet">③</span> 显著性水平 α 常取 <strong>0.05</strong></div>
+                <div class="dt-md-li"><span class="dt-md-bullet">④</span> p &lt; α 则拒绝 H₀</div>
+                <div class="dt-md-h2" style="margin-top:0.5em">## 易错</div>
+                <div class="dt-md-text">p 值不是"H₀ 为真的概率"…</div>
               </div>
             </div>
-            <div class="diff-strip">
-              <div class="diff-head">
-                <span class="chevron">▸</span>
-                <span class="tool">Write</span>
-                <span class="path">PlanDeck/2026-roadmap.md</span>
-                <span class="spacer"></span>
-                <span class="badge-plus">+47</span>
+            <div class="dt-chat">
+              <div class="dt-chat-head">
+                <svg class="muse"><use href="#m-orbit"/></svg>
+                <span>统计学复习</span>
+              </div>
+              <div class="dt-chat-body">
+                <div class="dt-msg user">把这章整理成一页 anki 卡片，正反两面</div>
+                <div class="dt-thinking">▾ thinking · 14s</div>
+                <div class="dt-plan">
+                  <div class="dt-plan-head">
+                    <svg class="muse" style="width:11px;height:11px"><use href="#m-orbit"/></svg>
+                    Plan · 待确认
+                  </div>
+                  <div class="dt-plan-body">
+                    ① 提 5 个核心概念<br>
+                    ② 每个写 问题 → 答案<br>
+                    ③ 导出 cards.md
+                  </div>
+                </div>
               </div>
             </div>
           </div>
         </div>
+        <div class="macbook-hinge"></div>
+        <div class="macbook-base"></div>
       </div>
-    </div>
-    <div class="bg-muse"><svg class="muse"><use href="#m-lens"/></svg></div>
-  </section>
 
-  <!-- ============ 8 · MOBILE PWA (Euterpe · 音乐 · 声波 = 无线) ============ -->
-  <section class="slide">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>MOBILE · 手机端</span></div>
-      <div class="muse-chip">
-        <svg class="muse"><use href="#m-wave"/></svg>
-        <span class="name">Euterpe</span><span class="sep">·</span><span class="domain">音乐</span>
-      </div>
-      <div class="counter">08 / 09</div>
-    </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">MOBILE PWA</div>
-        <h1>同一台服务器，<br>手机也能<span class="hl">无缝接着用</span>。</h1>
-        <p class="sub">添加到主屏，开起来就是全屏 app（standalone display，没有地址栏）。底部三按钮 tab bar：Files / Preview / Chat 单页切换。下拉刷新文件树，长任务跑完 Web Push 推送提醒。归档自始至终在你自己的主机上，不过云。</p>
-        <div class="micro">
-          PWA manifest · 主题色 <span class="kbd">#0f1115</span> · maskable 图标 · Apple Touch icon · 无需上架
-        </div>
-      </div>
-      <div class="col">
-        <div class="phone">
-          <div class="phone-statbar"><span>9:41</span><span>● ● ●</span></div>
-          <div class="phone-app">
-            <div class="phone-head">
-              <svg class="muse" style="width:11px;height:11px;color:var(--accent)"><use href="#m-wave"/></svg>
-              Chat · PlanDeck 增长策略
+      <!-- iPhone -->
+      <div class="phone">
+        <div class="phone-statbar"><span>8:12</span><span>4G · 95%</span></div>
+        <div class="phone-app">
+          <div class="phone-head">
+            <svg class="muse"><use href="#m-orbit"/></svg>
+            <span>统计学复习</span>
+          </div>
+          <div class="phone-body">
+            <div class="phone-msg ai" style="opacity:0.55; font-size: 0.92em">
+              <span style="color:var(--fg-4); font-size:0.85em">↑ 昨晚在桌面</span><br>
+              已生成 12 张 anki 卡片 · 假设检验
             </div>
-            <div class="phone-body">
-              <div class="phone-msg user">把刚拍的白板照片转成 todo</div>
-              <div class="phone-msg ai">
-                <div class="muse-sig"><svg class="muse"><use href="#m-wave"/></svg>Muse</div>
-                已识别 5 项行动，写入 PlanDeck/meeting-2026-05.md
-              </div>
-              <div class="phone-msg user">念给我听</div>
-              <div class="phone-msg ai">
-                <div class="muse-sig"><svg class="muse"><use href="#m-wave"/></svg>Muse</div>
-                — 周三前敲定 onboarding A/B<br>
-                — 周五出团队版定价 v2<br>
-                — 下周一同步导出功能优先级…
-              </div>
+            <div class="phone-msg user">通勤抽两张考我，我答你判对错</div>
+            <div class="phone-msg ai">
+              第 1 张正面：<br>
+              「p 值的正确定义是？」<br>
+              想好了说"翻面"…
             </div>
-            <div class="phone-tabbar">
-              <div class="phone-tab">
-                <span class="ico">▣</span>Files
-              </div>
-              <div class="phone-tab">
-                <span class="ico">▣</span>Preview
-              </div>
-              <div class="phone-tab active">
-                <span class="ico">▣</span>Chat
-              </div>
-            </div>
+          </div>
+          <div class="phone-tabbar">
+            <div class="phone-tab">文件</div>
+            <div class="phone-tab">预览</div>
+            <div class="phone-tab active">Muse</div>
           </div>
         </div>
       </div>
     </div>
-    <div class="bg-muse"><svg class="muse"><use href="#m-wave"/></svg></div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============ 9 · CTA (Melpomene · 悲剧 · 残月 = 闭幕) ============ -->
-  <section class="slide cta">
-    <div class="topbar">
-      <div class="brand"><span class="brand-mark"></span><span>GET IT</span></div>
-      <div class="muse-chip">
+<!-- INSTALL + ARCH -->
+<section class="install-arch reveal" id="install">
+  <div class="container">
+    <div class="install-block">
+      <div class="section-label">
         <svg class="muse"><use href="#m-crescent"/></svg>
-        <span class="name">Melpomene</span><span class="sep">·</span><span class="domain">悲剧</span>
+        INSTALL
       </div>
-      <div class="counter">09 / 09</div>
-    </div>
-    <div class="body">
-      <div class="col">
-        <div class="eyebrow">在你自己的机器上跑起来</div>
-        <h1 style="font-size:clamp(2.2rem,4.5vw,4rem)">muse<span style="color:var(--accent)">·</span>lab</h1>
-        <div class="hero-muses" style="margin-top:1em">
-          <div class="one"><svg class="muse"><use href="#m-hex"/></svg><span class="nm">Calliope</span></div>
-          <div class="one"><svg class="muse"><use href="#m-bars"/></svg><span class="nm">Clio</span></div>
-          <div class="one"><svg class="muse"><use href="#m-lens"/></svg><span class="nm">Erato</span></div>
-          <div class="one"><svg class="muse"><use href="#m-wave"/></svg><span class="nm">Euterpe</span></div>
-          <div class="one"><svg class="muse"><use href="#m-crescent"/></svg><span class="nm">Melpomene</span></div>
-          <div class="one"><svg class="muse"><use href="#m-halo"/></svg><span class="nm">Polyhymnia</span></div>
-          <div class="one"><svg class="muse"><use href="#m-trio"/></svg><span class="nm">Terpsichore</span></div>
-          <div class="one"><svg class="muse"><use href="#m-spark"/></svg><span class="nm">Thalia</span></div>
-          <div class="one"><svg class="muse"><use href="#m-orbit"/></svg><span class="nm">Urania</span></div>
-        </div>
-        <div class="url">github.com/hesorchen/muselab</div>
-        <div class="tags">
-          <span>★</span> Open source
-          <span>·</span> MIT
-          <span>·</span> Self-hosted
-          <span>·</span> Multi-model
-        </div>
-        <div class="install">
-          <span class="cmt"># Linux / macOS / WSL2 — 一行装上</span><br>
-          <span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/<br>
-          &nbsp;&nbsp;&nbsp;&nbsp;hesorchen/muselab/main/scripts/quick-install.sh | bash
+      <h2>一行命令，<br>装在<span class="hl">你自己的机器</span>上。</h2>
+      <p class="lead">
+        Linux · macOS · WSL2。安装器自动装 uv / Node LTS / Anthropic claude CLI，并注册服务。
+      </p>
+      <div class="install-cmd">
+        <span class="cmt"># 一行装上</span><br>
+        <span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;hesorchen/muselab/main/scripts/quick-install.sh | bash
+        <div class="copy-row">
+          <span class="cmt"># 装完打开 localhost:8765</span>
+          <button class="copy-btn" onclick="copyInstall(this)">Copy command</button>
         </div>
       </div>
     </div>
-  </section>
+    <div class="arch-block">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-hex"/></svg>
+        ARCHITECTURE
+      </div>
+      <h2 style="font-size:clamp(1.5rem,2.4vw,2rem); margin-bottom:1.5rem">无构建步骤。<br>改文件，刷新浏览器。</h2>
+      <div class="arch-diagram">
+        <div class="arch-row">
+          <div class="arch-node">Browser · HTML + Alpine</div>
+        </div>
+        <div class="arch-row"><span class="arch-arrow">↓</span></div>
+        <div class="arch-row">
+          <div class="arch-node">FastAPI · /api/files · /api/chat</div>
+        </div>
+        <div class="arch-row"><span class="arch-arrow">↓</span></div>
+        <div class="arch-row">
+          <div class="arch-node primary">Claude Agent SDK</div>
+        </div>
+        <div class="arch-row"><span class="arch-arrow">↓</span></div>
+        <div class="arch-fan">
+          <span class="tag">Anthropic</span>
+          <span class="tag">DeepSeek</span>
+          <span class="tag">GLM</span>
+          <span class="tag">Kimi</span>
+          <span class="tag">Qwen</span>
+          <span class="tag">+3</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
 
-</div>
+<!-- COMPARE -->
+<section class="compare reveal" id="compare">
+  <div class="container">
+    <div class="section-label">
+      <svg class="muse"><use href="#m-lens"/></svg>
+      HOW IT COMPARES
+    </div>
+    <h2>归档之于 muselab，<br>犹如<span class="hl">代码库</span>之于 Claude Code。</h2>
+    <p class="lead">
+      不是 IDE，不是 RAG，不是插件市场——而是把私人档案当一等上下文的 AI 工作台。
+    </p>
+    <table class="compare-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th class="us">muselab</th>
+          <th>LobeChat</th>
+          <th>AnythingLLM</th>
+          <th>claudecodeui</th>
+          <th>Claude Code</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Self-hosted</td><td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">—</td></tr>
+        <tr><td>Browser UI</td><td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">TTY</td></tr>
+        <tr><td>Full agent SDK · all models</td><td class="us yes">✓</td><td class="no">chat only</td><td class="no">RAG focus</td><td class="partial">Claude only</td><td class="partial">Claude only</td></tr>
+        <tr><td>Reuse Claude Pro sub</td><td class="us yes">✓</td><td class="no">—</td><td class="no">—</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>Archive as 1st-class context</td><td class="us yes">✓</td><td class="no">—</td><td class="partial">vectorized</td><td class="no">codebase</td><td class="no">codebase</td></tr>
+        <tr><td>Mobile PWA</td><td class="us yes">✓</td><td class="yes">✓</td><td class="no">—</td><td class="partial">resp</td><td class="no">—</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
 
-<div class="edge-click left"  onclick="prev()"></div>
-<div class="edge-click right" onclick="next()"></div>
+<!-- FAQ -->
+<section class="faq reveal" id="faq">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-trio"/></svg>
+      FAQ · 常见问题
+    </div>
+    <h2 style="text-align:center; margin-bottom:3rem">开工前，<br>你可能想问的<span class="hl">几件事</span>。</h2>
+    <div class="faq-grid">
+      <div class="faq-item">
+        <div class="faq-q">需要 API key 吗？</div>
+        <div class="faq-a">Claude 走一次 <span class="kbd">claude login</span> 的 OAuth，复用你的 Pro / Max 订阅——不需要 API key，也不按 token 另计费。其他七家各填自己的 API key，在设置里粘贴即可。</div>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">muselab 自己收费吗？</div>
+        <div class="faq-a">不收。MIT 开源，完全免费。模型调用直连各厂商、走你自己的订阅或 key——muselab 不中转、不加价（后端无代理层）。</div>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">我的数据存在哪？</div>
+        <div class="faq-a">全部在你的机器上：archive 是一个本地目录，对话记录是本地 JSONL 文件。没有云端副本，没有第三方账号，没有数据搬运。</div>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">能接本地模型 / 完全离线吗？</div>
+        <div class="faq-a">后端是 Claude Agent SDK，需要 Anthropic 兼容端点。目前不内置 Ollama 等纯本地推理；但模型 base_url 可在会话级覆盖，能指向任何兼容 Anthropic 协议的端点，包括你自建的代理。</div>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">怎么升级和卸载？</div>
+        <div class="faq-a">升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和 archive 文件原样保留。</div>
+      </div>
+      <div class="faq-item">
+        <div class="faq-q">手机上怎么用？</div>
+        <div class="faq-a">和桌面访问同一台服务器、同一个会话。窄屏自动折叠成「文件 / 预览 / Muse」三 tab 单栏，还能作为 PWA 添加到主屏。</div>
+      </div>
+    </div>
+  </div>
+</section>
 
-<nav class="nav">
-  <button onclick="prev()" aria-label="prev">‹</button>
-  <span class="count"><span id="cur">1</span> / <span id="total">9</span></span>
-  <button onclick="next()" aria-label="next">›</button>
-</nav>
+<!-- FOOTER -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-muses">
+      <div class="one"><svg class="muse"><use href="#m-hex"/></svg><span class="nm">Calliope</span></div>
+      <div class="one"><svg class="muse"><use href="#m-bars"/></svg><span class="nm">Clio</span></div>
+      <div class="one"><svg class="muse"><use href="#m-lens"/></svg><span class="nm">Erato</span></div>
+      <div class="one"><svg class="muse"><use href="#m-wave"/></svg><span class="nm">Euterpe</span></div>
+      <div class="one"><svg class="muse"><use href="#m-crescent"/></svg><span class="nm">Melpomene</span></div>
+      <div class="one"><svg class="muse"><use href="#m-halo"/></svg><span class="nm">Polyhymnia</span></div>
+      <div class="one"><svg class="muse"><use href="#m-trio"/></svg><span class="nm">Terpsichore</span></div>
+      <div class="one"><svg class="muse"><use href="#m-spark"/></svg><span class="nm">Thalia</span></div>
+      <div class="one"><svg class="muse"><use href="#m-orbit"/></svg><span class="nm">Urania</span></div>
+    </div>
+    <div class="footer-tag">9 位缪斯 · 1 个 Muse · 你自己的 muselab</div>
+    <div class="footer-meta">
+      <a href="https://github.com/hesorchen/muselab" target="_blank" rel="noopener">★ GitHub</a>
+      <span>·</span>
+      <a href="https://github.com/hesorchen/muselab/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+      <span>·</span>
+      <a href="https://github.com/hesorchen/muselab/blob/main/docs/quickstart.md" target="_blank" rel="noopener">Quick start</a>
+      <span>·</span>
+      <a href="https://github.com/hesorchen/muselab/blob/main/docs/architecture.md" target="_blank" rel="noopener">Architecture</a>
+      <span>·</span>
+      <a href="https://github.com/hesorchen/muselab/blob/main/SECURITY.md" target="_blank" rel="noopener">Security</a>
+    </div>
+  </div>
+</footer>
 
 <script>
-  const slides = document.querySelectorAll('.slide');
-  const total = slides.length;
-  let idx = 0;
-  document.getElementById('total').textContent = total;
+  // Scroll fade-in
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('in');
+        io.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
+  document.querySelectorAll('.reveal').forEach(el => io.observe(el));
 
-  function show(i) {
-    idx = (i + total) % total;
-    slides.forEach((s, k) => s.classList.toggle('active', k === idx));
-    document.getElementById('cur').textContent = idx + 1;
-    history.replaceState(null, '', '#' + (idx + 1));
+  // Copy install
+  const INSTALL_CMD = 'curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash';
+  function copyInstall(btn) {
+    navigator.clipboard.writeText(INSTALL_CMD).then(() => {
+      const orig = btn.textContent;
+      btn.textContent = '✓ Copied';
+      btn.style.color = 'var(--accent)';
+      setTimeout(() => {
+        btn.textContent = orig;
+        btn.style.color = '';
+      }, 1800);
+    }).catch(() => {
+      btn.textContent = 'Copy failed';
+    });
   }
-  function next() { show(idx + 1); }
-  function prev() { show(idx - 1); }
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
-    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
-    if (e.key === 'Home') show(0);
-    if (e.key === 'End') show(total - 1);
-    if (/^[1-9]$/.test(e.key)) show(parseInt(e.key) - 1);
-  });
-
-  let touchX = null;
-  document.addEventListener('touchstart', (e) => { touchX = e.touches[0].clientX; });
-  document.addEventListener('touchend', (e) => {
-    if (touchX === null) return;
-    const dx = e.changedTouches[0].clientX - touchX;
-    if (Math.abs(dx) > 50) dx < 0 ? next() : prev();
-    touchX = null;
-  });
-
-  const hash = parseInt(location.hash.replace('#', ''));
-  if (hash >= 1 && hash <= total) show(hash - 1);
 </script>
 
 </body>

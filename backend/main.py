@@ -22,8 +22,21 @@ class _TokenFilter(logging.Filter):
     _re = re.compile(r'token=[^&\s"]+')
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.getMessage():
-            record.msg = self._re.sub("token=***", record.msg)
+        # uvicorn's access logger calls info("%s - \"%s %s HTTP/%s\" %d", ...)
+        # so the token-bearing URL lives in record.args, NOT record.msg (which
+        # is just the format template). Mutating record.msg alone never
+        # redacts anything. Render the final message, scrub it, then replace
+        # msg with the scrubbed string and drop args so logging emits it
+        # verbatim. (2026-05-29 audit: the original record.msg-only filter was
+        # a no-op for uvicorn access logs → token leaked to journald/docker.)
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = self._re.sub("token=***", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
         return True
 
 
@@ -284,7 +297,7 @@ def _startup_config_banner() -> None:
     from . import endpoints as _ep
     host = os.environ.get("MUSELAB_HOST", "127.0.0.1")
     port = os.environ.get("MUSELAB_PORT", "8765")
-    enabled = [p.display for p in _ep.CATALOG
+    enabled = [p.display for p in _ep.catalog()
                  if os.environ.get(p.env_key)]
     enabled_s = ", ".join(enabled) if enabled else "(none — Claude only)"
     print(f"[muselab] config: host={host} port={port} root={ROOT} "

@@ -16,7 +16,7 @@ agent loop** — not just chat. No proxy, no protocol translation.
 | **Kimi** (K2 / K2.5 / K2.6 / K2 Thinking) | `MOONSHOT_API_KEY` | ✅ | platform.moonshot.cn |
 | **Qwen** (Qwen3 / 3.5 / 3.6 series — Max / Plus / Flash / Coder; 国际 endpoint via same key) | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com — one key works for 国内 + 国际 (latency-only difference) |
 | **Xiaomi MiMo** (V2.5 Pro / V2.5 / V2 Flash) | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com (beta) |
-| **Baidu Qianfan** (ERNIE 4 / 4.5 / 5 series + X1 reasoning + DeepSeek V3.2 via Qianfan) | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic-compat path uses `sk-xxx` key, not IAM AK/SK |
+| **Baidu Qianfan** (ERNIE 4 / 4.5 / 5 series + X1 reasoning + DeepSeek V3.2 via Qianfan) | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic-compat path needs an IAM **access token** (`bce-v3/ALTAK-xxx/xxx`), not a plain `sk-xxx` key |
 
 Exact model ids in each family come from the UI dropdown — they're sourced
 from `backend/endpoints.py`'s `CATALOG` and may evolve faster than this table.

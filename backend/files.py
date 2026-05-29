@@ -1104,7 +1104,20 @@ def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
                 continue
             full = Path(dirpath) / fname
             try:
-                if _is_sensitive(Path(full)):
+                # Symlink escape guard: resolve() follows symlinks, so a file
+                # named `notes.md` inside ROOT pointing at /etc/passwd would
+                # otherwise be opened and grepped. Confirm the real target is
+                # still under ROOT before reading. Also run _is_sensitive on the
+                # RESOLVED path so a symlink masking a `.env`/`*.pem` target is
+                # caught (name-only check misses that).
+                try:
+                    resolved = full.resolve()
+                except (OSError, ValueError):
+                    continue
+                root_real = ROOT.resolve()
+                if root_real != resolved and root_real not in resolved.parents:
+                    continue
+                if _is_sensitive(full) or _is_sensitive(resolved):
                     continue
                 # File-level stat IS NOT cached (file content changes
                 # don't bump parent dir mtime on ext4/btrfs, so a cached

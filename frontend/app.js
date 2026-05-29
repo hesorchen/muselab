@@ -592,6 +592,13 @@ function portal() {
       mcpServers: [],
       mcpExamples: [],
       mcpDraft: { show: false, name: "", command: "", argsStr: "" },
+      // Provider editor drafts — keyed by stable provider id. Each holds the
+      // in-flight edit of a provider's endpoint / prefix / model-list / key,
+      // plus an `open` flag toggling the inline editor. Separate from the
+      // committed `providers` list so cancel just drops the draft.
+      providerDrafts: {},
+      // "Add a brand-new provider" form (id minted server-side on save).
+      providerNew: { show: false, base_url: "", prefix: "", models: "", api_key: "" },
       skills: [],         // discovered skill list (read-only browse)
       skillFilter: "",    // free-text filter (name / description / source)
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
@@ -847,7 +854,9 @@ function portal() {
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
         if (this.settings.show) { this.settings.show = false; return; }
         if (this.modal.show && this.modal.cancel) { this.modal.cancel(); return; }
-        if (this.editing) { this.editing = false; return; }   // 退出编辑
+        // 退出编辑 — guard against silently discarding unsaved edits when ESC
+        // is pressed out of habit (blur the focus). Only confirm when dirty.
+        if (this.editing) { if (this._confirmLoseEdits()) this.editing = false; return; }
         if (this.streaming) { this.stop(); return; }          // 停止流式
       }
       // `?` shows keyboard cheat-sheet — only when nothing has focus
@@ -1084,6 +1093,15 @@ function portal() {
       // Removed: rightOpen toast ("Muse 回来了") — the panel opening is self-evident.
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
       this.$watch("selected", () => { if (this.editing) { this.unmountCM(); this.mountCM(); } });
+      // beforeunload guard for the editor: register a handler ONLY while there
+      // are unsaved edits, and remove it the moment they're saved/discarded.
+      // Attaching beforeunload unconditionally would defeat the browser's
+      // back/forward cache (bfcache) and degrade the "refresh = SSE reconnect"
+      // experience the chat side relies on — so we keep it scoped to dirty.
+      // cmStatus mutates on every CM change (dirty flips there); editing
+      // toggles entry/exit — watch both so the guard syncs on each.
+      this.$watch("cmStatus", () => this._syncBeforeUnloadGuard());
+      this.$watch("editing", () => this._syncBeforeUnloadGuard());
       // 注意：之前这里挂过 `$watch("model", ...)` 自动 toast「模型已切」。
       // 但 dropdown 的 x-model 是 onchange 之前就把 this.model 写新值——
       // watch 会比 onModelChange() 的 confirm modal 先 fire，让用户看到"已
@@ -3661,7 +3679,14 @@ function portal() {
       return (model || "").startsWith("claude-");
     },
     _isOpus47(model) {
-      return (model || "").startsWith("claude-opus-4-7");
+      // Misnomer kept for blast-radius reasons: this gate fires for any
+      // Opus model that supports the `xhigh` effort level. Per Anthropic
+      // docs (effort.md), that is Opus 4.7 AND Opus 4.8 — both are listed
+      // as "Available on Claude Opus 4.8 and Claude Opus 4.7". Future
+      // Opus models will likely keep the privilege; extend this match
+      // when they ship.
+      const m = (model || "");
+      return m.startsWith("claude-opus-4-7") || m.startsWith("claude-opus-4-8");
     },
     _supportsEffort(model) {
       // The whole dropdown shows only for Claude models.
@@ -5314,6 +5339,19 @@ function portal() {
       if (!m) return;
       const path = m.path;
       this.previewTabCtxMenu = null;
+      // Unsaved-edits guard for bulk-close actions that may evict the tab
+      // currently being edited. closeAll always does; closeOthers evicts the
+      // active edit unless it's the kept tab; closeRight evicts it only when
+      // the active edit sits to the right of `path`.
+      if (this.editing) {
+        const ti = this.tabs.findIndex(t => t.path === path);
+        const si = this.tabs.findIndex(t => t.path === this.selected);
+        const evictsEdit =
+          action === "closeAll" ||
+          (action === "closeOthers" && this.selected !== path) ||
+          (action === "closeRight" && ti >= 0 && si > ti);
+        if (evictsEdit && !this._confirmLoseEdits()) return;
+      }
       switch (action) {
         case "close":
           this.closeTab(path);
@@ -5801,13 +5839,18 @@ function portal() {
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
+      // Snapshot only drives the INITIAL skeleton flag (pre-await). After any
+      // await the active tab may have changed, so every post-await decision
+      // must re-check `sid === this.currentId` live — otherwise switching tabs
+      // mid-load corrupts the now-active tab (messages not assigned / skeleton
+      // stuck / model/effort overwritten by the old session). See loadSession race.
       const isCurrent = sid === this.currentId;
       if (isCurrent) this.messagesLoading = true;
       try {
         const r = await fetch("/api/chat/sessions/" + sid, { headers: this.hdr() });
         if (!r.ok) {
           st.messages.length = 0;
-          if (isCurrent) this.messages = st.messages;
+          if (sid === this.currentId) this.messages = st.messages;
           return;
         }
         const s = await r.json();
@@ -5855,7 +5898,10 @@ function portal() {
         // for several seconds on initial load. Rendering only the recent
         // 30 keeps switch-to-session snappy; "Load earlier" lets the user
         // page back in batches of 50 as needed.
-        const INITIAL_LOAD = 30;
+        // Narrower first paint on mobile — WebViews have far less headroom
+        // than desktop, so render fewer bubbles up front and let "Load
+        // earlier" page the rest in on demand.
+        const INITIAL_LOAD = this._isMobileLayout() ? 15 : 30;
         const renderMarkdown = (m) => {
           if (m.role === "assistant" && m.text && !m.html) {
             m.html = this.mdRender(m.text);
@@ -5944,7 +5990,7 @@ function portal() {
         } else {
           st._truncatedFromTop = false;
         }
-        if (isCurrent) {
+        if (sid === this.currentId) {
           this.messages = st.messages;
           // Background-completion: if there's an in-flight turn on this
           // session that finished while we were elsewhere, the JSONL we
@@ -5964,7 +6010,10 @@ function portal() {
         }
         await this._fetchTabUsage(sid);
       } finally {
-        if (isCurrent) this.messagesLoading = false;
+        // Re-check live: only clear the skeleton if this sid is STILL the
+        // active tab. If the user switched away mid-load, the now-active tab
+        // owns messagesLoading and must not be cleared by our stale completion.
+        if (sid === this.currentId) this.messagesLoading = false;
       }
     },
 
@@ -5974,6 +6023,14 @@ function portal() {
     // position so the user's current viewport doesn't jump when older
     // content unfolds above.
     LOAD_MORE_BATCH: 50,
+    // Live-session DOM ceiling. loadSession's INITIAL_LOAD / MAX_TOTAL caps
+    // only apply when (re)entering a session — NOTHING trims messages[] while
+    // a session is actively chatted in, so a long coding session grows DOM
+    // nodes without bound and OOM-crashes mobile WebViews (desktop has the
+    // headroom to mask it). Before each new user turn _capLiveMessages evicts
+    // the oldest rendered bubbles back into the _earlierMessages stash so
+    // "Load earlier" can page them back in. Mobile uses a tighter ceiling.
+    LIVE_MESSAGE_CAP: 200,
     // Reactivity ping: bumped whenever refreshOutlineFromBackend writes
     // new data. outlineMessages() reads it so Alpine knows to re-render
     // the msg-outline-modal when async fetch completes. Without this,
@@ -6037,7 +6094,8 @@ function portal() {
       if (!st._earlierMessages || !st._earlierMessages.length) return;
       // Take from the END of the earlier stash (those are the messages
       // immediately preceding what's currently shown — "closest in time").
-      const batch = st._earlierMessages.splice(-this.LOAD_MORE_BATCH);
+      const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
+      const batch = st._earlierMessages.splice(-batchSize);
       // Now do the deferred mdRender pass on this batch only.
       batch.forEach(m => {
         if (m.role === "assistant" && m.text && !m.html) {
@@ -6063,6 +6121,27 @@ function portal() {
           this.highlightCode(".chat-body");
         });
       }
+    },
+    // Evict the oldest rendered messages back to the lazy stash so a long
+    // LIVE session doesn't accumulate unbounded DOM (the mobile OOM root
+    // cause). Called right before a new user turn is appended — the mirror
+    // image of loadEarlierMessages: front-of-messages[] → end-of-stash.
+    // The evicted bubbles already carry .html, so paging them back via
+    // "Load earlier" re-renders nothing. Eviction happens at the TOP while
+    // the user sits at the bottom sending, so there's no scroll jump.
+    _capLiveMessages(st) {
+      if (!st || !st.messages) return;
+      const cap = this._isMobileLayout()
+        ? Math.min(80, this.LIVE_MESSAGE_CAP)
+        : this.LIVE_MESSAGE_CAP;
+      const overflow = st.messages.length - cap;
+      if (overflow <= 0) return;
+      const evicted = st.messages.splice(0, overflow);
+      // Append to the END of the stash: these bubbles are newer than
+      // everything already stashed but older than what stays visible, so
+      // they're the "closest in time" batch loadEarlierMessages pops first.
+      st._earlierMessages = (st._earlierMessages || []).concat(evicted);
+      st._hasMoreHistory = st._earlierMessages.length > 0;
     },
     hasMoreHistory(sid) {
       sid = sid || this.currentId;
@@ -6133,6 +6212,10 @@ function portal() {
       const d = await r.json();
       this.settings.providers = d.providers;
       this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
+      // Reset provider-editor drafts each open so a stale half-edit from a
+      // previous session doesn't reappear.
+      this.settings.providerDrafts = {};
+      this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
       this.settings.draftDefaults = { ...d.defaults };
       // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
       // Mobile 2-level menu: always land on the top-level entry list
@@ -6556,19 +6639,154 @@ function portal() {
       }
     },
 
-    async toggleProvider(probeModel, disabled) {
+    async toggleProvider(providerId, disabled) {
+      // Visibility toggle now keys off the provider's STABLE id (not its
+      // first model id, which changes when the user edits the model list).
+      // Backend honours both forms so older toggles survive the migration.
       const r = await fetch("/api/settings", {
         method: "PUT",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ provider_disabled: { [probeModel]: disabled } }),
+        body: JSON.stringify({ provider_disabled: { [providerId]: disabled } }),
       });
       const d = await r.json();
       if (d.ok) {
         // Update local state so the toggle reflects immediately.
-        const p = this.settings.providers.find(x => x.probe_model === probeModel);
+        const p = this.settings.providers.find(x => x.id === providerId);
         if (p) p.disabled = disabled;
         // Refresh the model list so the picker drops the hidden provider.
         await this._fetchModels();
+      }
+    },
+
+    // ===== Provider editor (full endpoint / prefix / models / key) =====
+    // Open or close the inline editor for one provider. Opening seeds the
+    // draft from the committed values; closing just drops the open flag so
+    // the next open re-seeds (cancel = discard).
+    toggleProviderEditor(p) {
+      const drafts = this.settings.providerDrafts;
+      if (drafts[p.id] && drafts[p.id].open) {
+        drafts[p.id].open = false;
+        return;
+      }
+      drafts[p.id] = {
+        open: true,
+        base_url: p.base_url || "",
+        prefix: p.prefix || "",
+        models: (p.models || []).join("\n"),
+        api_key: "",
+      };
+    },
+
+    _parseModels(text) {
+      // Models entered one-per-line (or comma-separated); trim + drop blanks.
+      return (text || "").split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+    },
+
+    async _submitProvider(body, pid) {
+      try {
+        const r = await fetch("/api/settings/providers", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          let msg = "status " + r.status;
+          try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
+          throw new Error(msg);
+        }
+        this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
+        if (pid && this.settings.providerDrafts[pid]) {
+          this.settings.providerDrafts[pid].open = false;
+        }
+        await this._reloadProviders();
+        await this._fetchModels();
+        return true;
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "保存失败：" : "Save failed: ") + e.message, "error", 4000);
+        return false;
+      }
+    },
+
+    async saveProvider(p) {
+      const dr = this.settings.providerDrafts[p.id];
+      if (!dr) return;
+      const body = {
+        id: p.id,
+        base_url: (dr.base_url || "").trim(),
+        prefix: (dr.prefix || "").trim(),
+        display: p.display,
+        env_key: p.env_key,
+        models: this._parseModels(dr.models),
+      };
+      if ((dr.api_key || "").trim()) body.api_key = dr.api_key.trim();
+      await this._submitProvider(body, p.id);
+    },
+
+    async addProviderFromDraft() {
+      const n = this.settings.providerNew;
+      const body = {
+        id: null,
+        base_url: (n.base_url || "").trim(),
+        prefix: (n.prefix || "").trim(),
+        models: this._parseModels(n.models),
+      };
+      if ((n.api_key || "").trim()) body.api_key = n.api_key.trim();
+      const ok = await this._submitProvider(body, null);
+      if (ok) {
+        this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
+      }
+    },
+
+    async restoreProvider(p) {
+      try {
+        const r = await fetch("/api/settings/providers/restore", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ id: p.id }),
+        });
+        if (!r.ok) throw new Error("status " + r.status);
+        this.toast(this.lang === "zh" ? "✓ 已恢复默认" : "✓ Restored to default", "success", 1800);
+        if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
+        await this._reloadProviders();
+        await this._fetchModels();
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "恢复失败：" : "Restore failed: ") + e.message, "error", 4000);
+      }
+    },
+
+    async deleteProvider(p) {
+      const msg = this.lang === "zh"
+        ? (p.is_builtin
+            ? `隐藏内置 provider「${p.display}」？随时可恢复默认。`
+            : `删除 provider「${p.display}」？`)
+        : (p.is_builtin
+            ? `Hide built-in provider "${p.display}"? You can restore it anytime.`
+            : `Delete provider "${p.display}"?`);
+      if (!confirm(msg)) return;
+      try {
+        const r = await fetch("/api/settings/providers/delete", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ id: p.id }),
+        });
+        if (!r.ok) throw new Error("status " + r.status);
+        this.toast(this.lang === "zh" ? "✓ 已删除" : "✓ Deleted", "success", 1800);
+        await this._reloadProviders();
+        await this._fetchModels();
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "删除失败：" : "Delete failed: ") + e.message, "error", 4000);
+      }
+    },
+
+    // Re-fetch the provider list (after a CRUD op) without wiping the rest of
+    // the settings modal state. Adds draftKeys slots for any new env_keys.
+    async _reloadProviders() {
+      const r = await fetch("/api/settings", { headers: this.hdr() });
+      if (!r.ok) return;
+      const d = await r.json();
+      this.settings.providers = d.providers;
+      for (const p of d.providers) {
+        if (!(p.env_key in this.settings.draftKeys)) this.settings.draftKeys[p.env_key] = "";
       }
     },
 
@@ -7437,6 +7655,13 @@ function portal() {
       return (n / 1024 / 1024).toFixed(1) + " MB";
     },
     async openFile(n) {
+      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
+      // is dirty would silently drop the changes. Confirm first; abort the
+      // switch if the user cancels. Re-opening the same path is a no-op for
+      // dirtiness (we'd just re-enter the same buffer), so skip the prompt.
+      if (this.editing && n && n.path !== this.selected && !this._confirmLoseEdits()) {
+        return;
+      }
       // multi-tab：第一次打开就推进 tabs；已存在则切换
       if (!this.tabs.find(t => t.path === n.path)) {
         this.tabs.push({ path: n.path, name: n.name || n.path.split("/").pop() });
@@ -7675,6 +7900,8 @@ function portal() {
     closeTab(path) {
       const idx = this.tabs.findIndex(t => t.path === path);
       if (idx < 0) return;
+      // Closing the tab being edited would discard unsaved changes — confirm.
+      if (this.editing && path === this.selected && !this._confirmLoseEdits()) return;
       this.tabs.splice(idx, 1);
       if (this.selected === path) {
         // 关掉的是当前 tab，切到旁边
@@ -7704,6 +7931,8 @@ function portal() {
     },
     closeAllTabs() {
       if (!this.tabs.length) return;
+      // Closing all tabs evicts the edited buffer — confirm if dirty.
+      if (this.editing && !this._confirmLoseEdits()) return;
       this.tabs = [];
       this._clearPreviewState();
       this.savePrefs();
@@ -8791,8 +9020,53 @@ function portal() {
       document.addEventListener("mouseup", onUp);
     },
 
+    // ===== Editor unsaved-changes guard =====
+    // Single source of truth for "the editor has edits that aren't saved".
+    // CodeMirror keeps cmStatus.dirty in sync (mountCM); the textarea
+    // fallback (CM init failure) has no cmStatus, so we also compare
+    // editText against the last-saved rawText. Either signal means dirty.
+    _editorDirty() {
+      if (!this.editing) return false;
+      if (this.cmStatus && this.cmStatus.dirty) return true;
+      return String(this.editText || "") !== String(this.rawText || "");
+    },
+    // Returns true if it's safe to leave/replace the current editor buffer:
+    // not dirty, or the user confirmed discarding. Native confirm() is used
+    // intentionally — it's synchronous, so callers in non-async paths (ESC
+    // handler, closeTab) can branch on the result without awaiting.
+    _confirmLoseEdits() {
+      if (!this._editorDirty()) return true;
+      return window.confirm(this.lang === "zh"
+        ? "当前文件有未保存的改动，确定要放弃吗？"
+        : "You have unsaved changes. Discard them?");
+    },
+    // Attach/detach the beforeunload handler to match the current dirty state.
+    // Idempotent: only touches the listener when the desired state changes,
+    // so it never leaves a stale handler attached (which would break bfcache).
+    _syncBeforeUnloadGuard() {
+      const wantGuard = this._editorDirty();
+      if (wantGuard && !this._beforeUnloadFn) {
+        this._beforeUnloadFn = (e) => {
+          // Re-check at fire time — state may have changed since attach.
+          if (!this._editorDirty()) return;
+          e.preventDefault();
+          // Legacy browsers need returnValue set to trigger the native prompt;
+          // the string itself is ignored by modern browsers.
+          e.returnValue = "";
+          return "";
+        };
+        window.addEventListener("beforeunload", this._beforeUnloadFn);
+      } else if (!wantGuard && this._beforeUnloadFn) {
+        window.removeEventListener("beforeunload", this._beforeUnloadFn);
+        this._beforeUnloadFn = null;
+      }
+    },
     async toggleEdit() {
-      if (this.editing) { this.editing = false; return; }
+      if (this.editing) {
+        if (!this._confirmLoseEdits()) return;
+        this.editing = false;
+        return;
+      }
       // 进入编辑：确保 rawText 已加载（html/img/pdf 走 raw 模式时没 fetch 文本）
       if (!this.rawText || this.previewMode === "html" || this.previewMode === "pdf" || this.previewMode === "img") {
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(this.selected), { headers: this.hdr() });
@@ -9779,6 +10053,9 @@ function portal() {
       // has the user prompt from the original turn, and the
       // broadcast-rebuild on `/sessions/{sid}` GET produced it for us.
       if (!isReconnect) {
+        // Trim the live backlog before growing it again — keeps long
+        // sessions from ballooning the DOM past the mobile crash point.
+        this._capLiveMessages(sendState);
         sendState.messages.push({
           role: "user", text,
           images: readyImages.map(im => ({
@@ -9992,7 +10269,11 @@ function portal() {
         if (this._selectionInChatBody()) {
           streamState._pendingHtmlRender = renderStreamingHtml;
         } else {
-          renderStreamingHtml();
+          // Throttle to RENDER_MIN_INTERVAL instead of re-parsing the full
+          // accumulated text on every token. scheduleRender() drives the same
+          // mdRender → m.html path (via renderNow); flushRender() on done/close
+          // catches any trailing chunk still inside the throttle window.
+          scheduleRender();
         }
         _scrollIfActive();
       });

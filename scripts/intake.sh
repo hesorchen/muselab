@@ -114,30 +114,21 @@ _patch() {
     && mv "$ARCHIVE/CLAUDE.md.tmp" "$ARCHIVE/CLAUDE.md"
 }
 if [[ "$MUSE_LOCALE" == "zh" ]]; then
-  _patch "- 称呼 / 名字（你希望 Muse 叫你什么）：" "$INTAKE_NAME"
-  _patch "- 出生年份（年龄段就行，不必精确）："     "$INTAKE_BIRTH"
-  _patch "- 现在住在："                              "$INTAKE_CITY"
-  _patch "- 我现在主要在做："                        "$INTAKE_DOING"
-  _patch "- 这一年最想做成的一件事："                "$INTAKE_GOAL"
-  _patch "- 当前最关心的健康问题（如有）："         "$INTAKE_HEALTH"
-  STAGE_NEEDLE='（如：「大三在准备保研」'
+  _patch "- 称呼："                     "$INTAKE_NAME"
+  _patch "- 出生年份："                 "$INTAKE_BIRTH"
+  _patch "- 现在住在："                 "$INTAKE_CITY"
+  _patch "- 一句话当前人生阶段："       "$INTAKE_STAGE"
+  _patch "- 主要在做："                 "$INTAKE_DOING"
+  _patch "- 这一年最想做成的一件事："   "$INTAKE_GOAL"
+  _patch "- 当前最关心的健康问题："     "$INTAKE_HEALTH"
 else
-  _patch "- Name / how you'd like Muse to address you:" "$INTAKE_NAME"
-  _patch "- Birth year (an age range is fine, no need for exact):" "$INTAKE_BIRTH"
-  _patch "- Where you currently live:" "$INTAKE_CITY"
-  _patch "- What I'm mainly doing:" "$INTAKE_DOING"
-  _patch "- One thing I most want to make happen this year:" "$INTAKE_GOAL"
-  _patch "- Top health concern right now (if any):" "$INTAKE_HEALTH"
-  STAGE_NEEDLE='(e.g. "junior in college prepping for grad school"'
-fi
-if [[ -n "$INTAKE_STAGE" ]]; then
-  STAGE_ESC="$(printf '%s' "$INTAKE_STAGE" | sed -e 's/[\\&|]/\\&/g')"
-  # Portable in-place sed (GNU vs BSD)
-  if sed --version >/dev/null 2>&1; then
-    sed -i "s|$STAGE_NEEDLE|$STAGE_ESC\\n\\n$STAGE_NEEDLE|" "$ARCHIVE/CLAUDE.md"
-  else
-    sed -i '' "s|$STAGE_NEEDLE|$STAGE_ESC\\n\\n$STAGE_NEEDLE|" "$ARCHIVE/CLAUDE.md"
-  fi
+  _patch "- Name:"                      "$INTAKE_NAME"
+  _patch "- Birth year:"                "$INTAKE_BIRTH"
+  _patch "- Lives in:"                  "$INTAKE_CITY"
+  _patch "- Life stage (one line):"     "$INTAKE_STAGE"
+  _patch "- Main activity:"             "$INTAKE_DOING"
+  _patch "- Main goal this year:"       "$INTAKE_GOAL"
+  _patch "- Top health concern:"        "$INTAKE_HEALTH"
 fi
 
 ok "CLAUDE.md updated"

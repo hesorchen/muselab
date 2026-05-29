@@ -40,6 +40,19 @@ _always_allow: dict[str, set[tuple[str, str]]] = {}
 
 DECISION_TIMEOUT_S = 600
 
+# Bash binaries whose flags/subcommands radically change blast radius. For
+# these we must NOT collapse the always-allow cache to the first word — e.g.
+# approving `git status` would otherwise silently green-light `git push
+# --force` / `git reset --hard`. The full command string is used as the cache
+# key instead, so each distinct invocation re-prompts. (2026-05-29 audit:
+# privilege-escalation via first-word caching.)
+_DANGEROUS_BASH_BINS = frozenset({
+    "git", "rm", "rmdir", "mv", "cp", "dd", "curl", "wget", "ssh", "scp",
+    "rsync", "chmod", "chown", "sudo", "kill", "pkill", "killall",
+    "bash", "sh", "zsh", "eval", "python", "python3", "node", "npm",
+    "npx", "pip", "pip3", "uv", "docker", "systemctl", "mkfs",
+})
+
 
 def register_session_queue(session_id: str) -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue()
@@ -74,8 +87,20 @@ def _input_key(tool_name: str, tool_input: dict[str, Any]) -> str:
     """Pick a stable identifying field per tool for the always-allow cache."""
     if tool_name == "Bash":
         cmd = (tool_input.get("command") or "").strip()
-        # First word/binary — broaden the cache so "ls -la X" and "ls Y" share.
-        return cmd.split()[0] if cmd else ""
+        if not cmd:
+            return ""
+        bin0 = cmd.split()[0]
+        # Strip a leading path so /usr/bin/git is matched as "git".
+        bin_name = bin0.rsplit("/", 1)[-1]
+        # Dangerous binaries: key by the FULL command so always-allow can't
+        # escalate from a benign subcommand to a destructive one. Also key by
+        # full command whenever the line contains shell metacharacters that
+        # could chain a second command past the first word.
+        if bin_name in _DANGEROUS_BASH_BINS or any(
+                c in cmd for c in (";", "&&", "||", "|", "`", "$(", ">", "<")):
+            return cmd
+        # Safe binaries: first word — so "ls -la X" and "ls Y" share a grant.
+        return bin0
     if tool_name in ("Read", "Edit", "Write", "NotebookEdit"):
         return str(tool_input.get("file_path") or "")
     if tool_name in ("Glob", "Grep"):
@@ -150,7 +175,8 @@ async def _handle_ask_user_question(
         updated_input={"questions": questions, "answers": answers})
 
 
-def build_callback_for_session(session_id: str, bypass: bool = False):
+def build_callback_for_session(session_id: str,
+                                bypass_state: dict | None = None):
     """Return an async callable matching the SDK's can_use_tool signature.
 
     Wired UNCONDITIONALLY now (2026-05-23) — not just when permission_mode
@@ -161,13 +187,20 @@ def build_callback_for_session(session_id: str, bypass: bool = False):
     great when the model remembers to use that name, but models often
     forget and call the shorter built-in instead.
 
-    `bypass=True` (set when permission_mode == bypassPermissions): every
-    non-AskUserQuestion tool is auto-allowed without showing a permission
-    card to the user. AskUserQuestion still gets forwarded to the UI
-    because it's interactive by design — there's no other meaningful
-    response than asking the human.
-
-    `bypass=False`: full per-tool prompting (the original behavior)."""
+    `bypass_state` is a MUTABLE dict `{"bypass": bool}` owned by the caller
+    (chat.get_client). The callback reads `bypass_state["bypass"]` at call
+    time — NOT baked in as a constant — so that switching permission mode on
+    a cached/pooled client (via set_permission_mode) takes effect without
+    rebuilding the closure. When `bypass` is True (permission_mode ==
+    bypassPermissions) every non-AskUserQuestion tool is auto-allowed
+    without showing a permission card; when False, full per-tool prompting.
+    AskUserQuestion is always forwarded to the UI regardless — it's
+    interactive by design. (2026-05-29: previously this captured a constant
+    `bypass`, so switching from bypassPermissions to default left the cached
+    closure unconditionally allowing every tool — permission cards silently
+    failed.)"""
+    if bypass_state is None:
+        bypass_state = {"bypass": False}
 
     async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], context: Any
@@ -184,7 +217,9 @@ def build_callback_for_session(session_id: str, bypass: bool = False):
         # Bypass: auto-allow everything else without prompting. This
         # keeps the "no permission cards" UX promise of bypassPermissions
         # while still letting AskUserQuestion above route through the UI.
-        if bypass:
+        # Read the flag LIVE (not a captured constant) so a mode switch on
+        # the pooled client takes effect immediately.
+        if bypass_state.get("bypass"):
             return PermissionResultAllow(updated_input=tool_input)
 
         # Always-allow cache check. Empty set is falsy, so don't use `or`.

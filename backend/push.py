@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 
 from .settings import ROOT, atomic_write_text
@@ -219,7 +220,19 @@ def send_to_all(title: str, body: str, *, url: str = "/",
             )
             sent += 1
         except WebPushException as e:
-            code = getattr(e.response, "status_code", None) if e.response else None
+            # CAREFUL: `if e.response` is a trap — requests.Response.__bool__
+            # returns self.ok, which is False for ANY 4xx/5xx. That's
+            # precisely the 404/410 "dead subscription" responses we need to
+            # detect, so the old truthiness gate short-circuited to None and
+            # dead subs were never dropped (they re-failed on every send).
+            # Use an explicit `is not None`, with a regex fallback off the
+            # message string for the rare case .response is genuinely absent.
+            resp = e.response
+            code = getattr(resp, "status_code", None) if resp is not None else None
+            if code is None:
+                m = re.search(r"\b(404|410)\b", str(e))
+                if m:
+                    code = int(m.group(1))
             if code in (404, 410):
                 # Subscription is dead (user uninstalled / cleared) — drop it.
                 del _subs[endpoint]

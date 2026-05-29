@@ -173,6 +173,14 @@ _clients: dict[tuple[str, str, str], ClaudeSDKClient] = {}
 # client whose mode no longer matches the request swap via
 # client.set_permission_mode() instead of needing a full rebuild.
 _client_permission: dict[tuple[str, str, str], str] = {}
+# Per-client mutable bypass flag, shared by reference with the can_use_tool
+# closure built in permission_request. Switching permission mode on a pooled
+# client (set_permission_mode) must flip this flag so the closure stops/starts
+# auto-allowing tools — otherwise the bypass value baked in at build time
+# leaks across mode switches (2026-05-29 audit). Value is `{"bypass": bool}`;
+# the SAME dict object is captured by the closure, so mutating it here takes
+# effect on the next tool call without a rebuild.
+_bypass_state: dict[tuple[str, str, str], dict] = {}
 
 
 class TurnBroadcast:
@@ -387,6 +395,7 @@ _session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
 MODEL_CONTEXT_LIMITS = {
     # Anthropic — 1M on Pro/Max plans (auto-upgrade, no flag needed). Haiku
     # stayed at the older 200K since it's the speed/cost tier.
+    "claude-opus-4-8":            1_000_000,
     "claude-opus-4-7":            1_000_000,
     "claude-sonnet-4-6":          1_000_000,
     "claude-haiku-4-5-20251001":    200_000,
@@ -734,8 +743,16 @@ async def _build_and_connect_client(
     # The `bypass` flag tells the callback to auto-allow everything except
     # AskUserQuestion, preserving the no-prompts UX while still surfacing
     # the model's questions.
+    # The bypass flag is a mutable dict captured by reference inside the
+    # can_use_tool closure, then registered under this (sid, model, effort)
+    # key so set_permission_mode can flip it on a cached client without a
+    # rebuild. Register BEFORE connect so the key is live the moment the
+    # client is usable.
+    key = (session_id, model, effort)
+    bypass_state = {"bypass": permission == "bypassPermissions"}
+    _bypass_state[key] = bypass_state
     opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
-        session_id, bypass=(permission == "bypassPermissions"))
+        session_id, bypass_state=bypass_state)
     try:
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
         await client.connect()
@@ -820,6 +837,13 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             try:
                 await cached.set_permission_mode(permission)
                 _client_permission[key] = permission
+                # Flip the can_use_tool bypass flag to match the new mode.
+                # Without this the closure keeps the bypass value baked in at
+                # build time, so switching bypassPermissions → default would
+                # still auto-allow every tool (permission cards never show).
+                st = _bypass_state.get(key)
+                if st is not None:
+                    st["bypass"] = (permission == "bypassPermissions")
             except Exception as e:
                 import sys as _sys
                 _sys.stderr.write(
@@ -873,6 +897,7 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 old_key = _client_lru.pop(candidate_idx)
                 old_client = _clients.pop(old_key, None)
                 _client_permission.pop(old_key, None)
+                _bypass_state.pop(old_key, None)
                 if old_client is not None:
                     to_disconnect.append((old_key, old_client))
 
@@ -899,6 +924,7 @@ async def disconnect_client(session_id: str) -> None:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
+            _bypass_state.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -1967,6 +1993,11 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
                         snapshot_still_valid = True
                         _clients.pop(old_key, None)
                         perm = _client_permission.pop(old_key, "bypassPermissions")
+                        # The client object (and its can_use_tool closure) is
+                        # reused under new_key, so move the shared bypass dict
+                        # too — otherwise a later set_permission_mode can't
+                        # find it to flip the flag.
+                        bstate = _bypass_state.pop(old_key, None)
                         if old_key in _client_lru:
                             _client_lru.remove(old_key)
                         # Preserve the effort dimension when remapping under
@@ -1975,6 +2006,8 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
                         new_key = (sid, req.model, old_key[2])
                         _clients[new_key] = client
                         _client_permission[new_key] = perm
+                        if bstate is not None:
+                            _bypass_state[new_key] = bstate
                         _client_lru.append(new_key)
                 if not snapshot_still_valid:
                     # Our client is orphaned now (the cache entry was
@@ -2776,7 +2809,7 @@ def context_info() -> dict:
     # user-facing list. A prior refactor briefly emitted env_key; broke
     # test_settings_put_reflects_in_context_info. Stay on display names.
     third_party_configured = [
-        p.display for p in _ep.CATALOG
+        p.display for p in _ep.catalog()
         if os.environ.get(p.env_key)
     ]
     # Back-compat: keep claude_md_exists / lines / mtime fields for any
@@ -2959,12 +2992,18 @@ async def reset(session_id: str | None = None) -> dict:
         keys = list(_clients.keys())
         for k in keys:
             c = _clients.pop(k, None)
+            _client_permission.pop(k, None)
+            _bypass_state.pop(k, None)
+            _creation_locks.pop(k, None)
+            if k in _client_lru:
+                _client_lru.remove(k)
             if c is not None:
                 try:
                     await c.disconnect()
                 except Exception:
                     pass
-    return {"ok": True, "reset": [f"{s}@{m}" for s, m in keys]}
+    # key is a 3-tuple (session_id, model, effort) — unpack the first two.
+    return {"ok": True, "reset": [f"{k[0]}@{k[1]}" for k in keys]}
 
 
 # ====== streaming ======
@@ -3996,7 +4035,7 @@ async def stream(
             # new user/assistant UUIDs, then write cost / model / images /
             # docs against those rows in muselab's per-session sidecar.
             try:
-                all_msgs = _get_session_msgs(session_id, model)
+                all_msgs = _get_session_msgs(session_id, model_to_use)
             except Exception:
                 all_msgs = []
             new_asst_uuid = None
@@ -4130,7 +4169,12 @@ async def stream(
                         except Exception:
                             pass
                         _body = _plain_preview(assistant_acc) or "Muse 已回复"
-                        _push.send_to_all(
+                        # pywebpush does synchronous per-subscription HTTPS
+                        # (TTL + retries); offload to a thread so a slow/dead
+                        # push endpoint can't block this turn's done event and
+                        # every other concurrent SSE/HTTP request on the loop.
+                        await asyncio.to_thread(
+                            _push.send_to_all,
                             title=sname or "muselab",
                             body=_body,
                             url=f"/?session={session_id}",

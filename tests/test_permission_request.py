@@ -32,10 +32,30 @@ def test_submit_decision_bad_decision_returns_false():
     assert perm.submit_decision("s1", "qid", "maybe") is False
 
 
-def test_input_key_bash_uses_first_word():
+def test_input_key_bash_safe_binary_uses_first_word():
+    # Safe binaries broaden the always-allow cache to the first word so
+    # "ls -la X" and "ls Y" share one grant.
     assert perm._input_key("Bash", {"command": "ls -la /tmp"}) == "ls"
-    assert perm._input_key("Bash", {"command": "  rm -rf x"}) == "rm"
     assert perm._input_key("Bash", {"command": ""}) == ""
+    # Path-qualified dangerous binary is still recognized (bin name is
+    # stripped for the membership check) and keyed by full command.
+    assert perm._input_key("Bash", {"command": "/usr/bin/git push"}) == "/usr/bin/git push"
+
+
+def test_input_key_bash_dangerous_binary_uses_full_command():
+    # Dangerous binaries (rm/git/curl/...) key by the FULL command so an
+    # always-allow grant for a benign subcommand can't escalate to a
+    # destructive one (2026-05-29 privilege-escalation hardening).
+    assert perm._input_key("Bash", {"command": "  rm -rf x"}) == "rm -rf x"
+    assert perm._input_key("Bash", {"command": "git status"}) == "git status"
+    assert perm._input_key("Bash", {"command": "git push --force"}) == "git push --force"
+
+
+def test_input_key_bash_shell_metachars_use_full_command():
+    # Even a "safe" first word keys by full command when the line can chain
+    # a second command past it (;, &&, |, $(), redirects, backticks).
+    assert perm._input_key("Bash", {"command": "ls; rm -rf /"}) == "ls; rm -rf /"
+    assert perm._input_key("Bash", {"command": "echo $(rm x)"}) == "echo $(rm x)"
 
 
 def test_input_key_file_tools_use_path():

@@ -509,14 +509,16 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   display: none;
   position: fixed;
   bottom: 0; left: 0; right: 0;
-  height: 36px !important; z-index: 100;
+  height: 48px !important; z-index: 100;
   background: var(--c-bg-1);
   border-top: 1px solid var(--c-border);
   box-shadow: 0 -2px 8px rgba(0,0,0,0.05);
   /* iOS notch / Android gesture bar — push the buttons above the safe area
      so they're still tappable on full-screen devices. */
   padding-bottom: env(safe-area-inset-bottom);
-  height: calc(36px + env(safe-area-inset-bottom)) !important;
+  /* 48px row clears the WCAG 2.5.5 / Apple HIG 44px minimum touch target for
+     the primary mobile navigation (was 36px). */
+  height: calc(48px + env(safe-area-inset-bottom)) !important;
   transition: transform var(--t-base);
   /* Keyboard-up handling is centralized on body.kb-open — see the
      mobile @media block above for the full set (display: none on
@@ -571,7 +573,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   /* Force single-column grid regardless of inline :style="layoutStyle()". */
   .layout {
     grid-template-columns: 1fr !important;
-    grid-template-rows: 1fr calc(36px + env(safe-area-inset-bottom)) !important;
+    grid-template-rows: 1fr calc(48px + env(safe-area-inset-bottom)) !important;
     transition: grid-template-rows var(--t-base);
   }
   /* Hide every pane by default; show only the one matching the active tab. */
@@ -586,8 +588,8 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   /* Pane height: viewport - tab bar. dvh for mobile Safari address-bar collapse;
      safe-area-inset-bottom for the notch / gesture-bar on iOS / Android. */
   .pane {
-    height: calc(100vh - 36px);
-    height: calc(100dvh - 36px - env(safe-area-inset-bottom));
+    height: calc(100vh - 48px);
+    height: calc(100dvh - 48px - env(safe-area-inset-bottom));
   }
   /* Chat textarea / context meter / session bar sometimes overflow on tiny
      screens — trim padding so they fit. Font sizes here intentionally
@@ -625,8 +627,14 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      which is the mobile-primary navigation surface anyway. Net effect:
      each chat-tab has just two zones — large name (tap to switch) +
      small × (tap to close), no overlap. */
-  .chat-tab-close { display: flex; opacity: 0.7; width: 24px; height: 24px; }
+  .chat-tab-close { display: flex; opacity: 0.7; width: 24px; height: 24px; position: relative; }
   .chat-tab-close:active { opacity: 1; background: var(--c-bg-3); }
+  /* Keep the × visually 24px but expand the touch hit area to ~44px (WCAG
+     2.5.5 / HIG) via a transparent overlay — same trick as .resizer::before. */
+  .chat-tab-close::before {
+    content: ""; position: absolute;
+    top: -10px; bottom: -10px; left: -10px; right: -10px;
+  }
   /* Kebab is hidden on mobile — its actions (rename / edit prompt / export
      / delete) are all reachable from the picker (📁), the mobile-primary
      navigation surface. Avoids competing with × for the right edge. */
@@ -707,15 +715,18 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
   .pane.preview .pane-head .btn-primary { display: none; }
 
-  /* Chat toolbar: keep attach + model + effort + ctx-ring + send.
-     Permission is still hidden — it's low-frequency on mobile and
-     Settings provides a default. Effort restored on mobile per user
-     request (2026-05-22): users want per-turn reasoning depth control
-     on phone too, e.g. dropping to "low" before a quick lookup.
-     ctx-ring stays since the old hairline progress bar above the
-     toolbar was removed (2026-05-22) — ring is now the sole context-
-     usage surface, on every viewport. */
-  .chat-toolbar-permission { display: none; }
+  /* Chat toolbar: keep attach + model + permission + effort + ctx-ring + send.
+     Permission restored on mobile (2026-05-28): the prior "low-frequency,
+     Settings is sufficient" judgment underestimated plan mode's role as a
+     core differentiator. Hiding the permission select buried plan mode in
+     Settings → "Default permission" — a label that gives no signal it's
+     the plan/bypass/acceptEdits switch. Users couldn't find it. Restore
+     to toolbar on every viewport; Settings still owns the new-session
+     default. Effort restored on mobile per user request (2026-05-22):
+     users want per-turn reasoning depth control on phone too, e.g.
+     dropping to "low" before a quick lookup. ctx-ring stays since the
+     old hairline progress bar above the toolbar was removed (2026-05-22)
+     — ring is now the sole context-usage surface, on every viewport. */
   /* Effort dropdown — share the toolbar row with the model picker without
      pushing the send button off-screen. ⚠ Do NOT set font-size below
      16px here: the end-of-file iOS auto-zoom defeat (line ~5703) forces
@@ -726,6 +737,19 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      with ellipsis via the .chat-toolbar-select base rule. */
   .chat-toolbar-effort {
     max-width: 110px;
+  }
+
+  /* Tighten select chrome on narrow viewports so the model name doesn't
+     truncate after permission was restored to the row (2026-05-29).
+     Padding: 22px → 14px right (chevron arrow) + 8px → 4px left saves
+     ~12px per select × 3 selects = ~36px regained for label content.
+     Permission max-width capped since its values (plan / default /
+     bypass / acceptEdits) are short and don't need 150px. */
+  .chat-toolbar-select {
+    padding: 0 14px 0 4px;
+  }
+  .chat-toolbar-permission {
+    max-width: 90px;
   }
 
   /* Chat tab strip: horizontal-scroll session list eats vertical
@@ -1194,8 +1218,8 @@ body.kb-open .mobile-tab-bar { display: none; }
   .chat-toolbar-btn,
   .chat-toolbar-ring,
   .chat-toolbar-send {
-    height: 36px;
-    min-width: 36px;
+    height: 44px;
+    min-width: 44px;
   }
   .chat-toolbar-send { width: auto; padding: 0 12px; }
   .chat-toolbar-send svg { width: 16px; height: 16px; }
@@ -1465,7 +1489,9 @@ body.kb-open .mobile-tab-bar { display: none; }
   transition: opacity var(--t-fast);
   flex-shrink: 0;
 }
-.filelist li.dir:hover .tree-actions { opacity: 1; }
+/* File rows now also render the "⋯" more-menu (not just dirs), so reveal
+   the action bar on hover for any row, not only directories. */
+.filelist li:hover .tree-actions { opacity: 1; }
 .tree-action {
   background: transparent;
   border: 0;
@@ -4040,6 +4066,65 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .provider-row .provider-help a:hover { text-decoration: underline; }
 
+/* The x-if branch wraps each provider's contents in a single <div>. Dissolve
+   that wrapper with display:contents so its children (label / control row /
+   editor / probe) participate DIRECTLY in the .provider-row 2-column grid —
+   otherwise the grid would see one child and the label|control layout breaks. */
+.provider-row > div { display: contents; }
+
+/* Inline meta tags next to an editable provider's name (prefix, model count,
+   edited / custom badges). */
+.provider-meta-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  background: var(--c-bg-3);
+  color: var(--c-fg-3);
+  vertical-align: middle;
+}
+.provider-meta-tag.mono { font-family: var(--font-mono); }
+.provider-meta-tag.edited { background: var(--c-accent-soft); color: var(--c-accent); }
+.provider-meta-tag.custom { background: rgba(99, 102, 241, 0.12); color: #6366f1; }
+
+/* Expanded provider editor (endpoint / prefix / models / api-key). Lives in
+   the control column (grid-column 2) under the summary row. */
+.provider-editor {
+  grid-column: 2;
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.provider-editor .settings-row {
+  grid-template-columns: 110px 1fr;
+  align-items: start;
+  margin-bottom: 0;
+}
+/* The shared .settings-input rule forces height:32px — undo it for the models
+   textarea so it can actually grow to its rows. */
+.provider-editor textarea.settings-input {
+  height: auto;
+  min-height: 84px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  resize: vertical;
+  font-size: var(--fs-xs);
+}
+.provider-editor .settings-hint { font-size: var(--fs-xs); color: var(--c-fg-3); }
+.provider-editor-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+
+/* Mobile: editor spans full width (the grid collapses to one column). */
+@media (max-width: 720px) {
+  .provider-editor { grid-column: 1; }
+  .provider-editor .settings-row { grid-template-columns: 1fr; row-gap: 4px; }
+}
+
 /* Mobile / narrow-pane layout for provider rows (2026-05-28 user-reported
    "样式很差劲" on iPhone portrait). Issues on mobile:
    - 220px label column left ~130px for [toggle + input + 保存], all squashed
@@ -4057,7 +4142,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
     border-radius: var(--r-md);
     margin-bottom: var(--sp-3);
   }
-  .provider-row > label {
+  /* Top provider label is now nested one level under the x-if wrapper div,
+     so target it as a grandchild. The editor's own field labels (deeper,
+     inside .provider-editor) are intentionally excluded. */
+  .provider-row > div > label {
     font-weight: var(--fw-medium);
     color: var(--c-fg-0);
     word-break: break-word;
@@ -4440,51 +4528,56 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* ==========================================================================
    permission_request — Muse asks user to allow / deny a tool call
    ========================================================================== */
+/* Compact card: tool name + (optional) decision tag inline + summary.
+   Warning yellow border only when pending user decision; resolved cards
+   use neutral border to fade into the message stream alongside Read /
+   Grep / Edit tool bubbles. */
 .perm-request {
   background: var(--c-bg-1);
-  border: 1px solid var(--c-warn, #d97706);
-  border-left: 3px solid var(--c-warn, #d97706);
+  border: 1px solid var(--c-border-strong);
+  border-left: 3px solid var(--c-border-strong);
   border-radius: var(--r-md);
-  padding: 12px 14px;
+  padding: 6px 10px;
   margin: 4px 0;
   flex: 1; min-width: 0; max-width: 100%;
 }
-.perm-request.resolved { opacity: 0.85; border-color: var(--c-border-strong); }
-.perm-header {
-  display: flex; align-items: center; gap: var(--sp-2);
-  margin-bottom: 10px;
-  font-size: var(--fs-sm);
+.perm-request:not(.resolved) {
+  border-color: var(--c-warn, #d97706);
+  border-left-color: var(--c-warn, #d97706);
 }
-.perm-title { font-weight: var(--fw-semibold); color: var(--c-fg-0); }
+.perm-request.resolved { opacity: 1; }
 .perm-decision-tag {
   margin-left: auto;
   padding: 1px 8px; border-radius: var(--r-full);
   font-size: var(--fs-xs); letter-spacing: 0.5px;
+  flex-shrink: 0;
 }
 .perm-decision-allow { background: var(--c-accent-soft); color: var(--c-accent); }
 .perm-decision-always { background: var(--c-accent-soft); color: var(--c-accent); }
 .perm-decision-deny { background: var(--c-error-soft, rgba(220,53,69,0.1)); color: var(--c-error, #dc3545); }
-.perm-body { margin-bottom: 10px; }
+.perm-body { margin-bottom: 0; }
 .perm-tool {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 2px 8px; border-radius: var(--r-md);
-  background: var(--c-bg-3); font-family: var(--font-mono); font-size: var(--fs-xs);
-  margin-bottom: 6px;
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 4px;
+  font-family: var(--font-mono); font-size: var(--fs-xs);
 }
-.perm-tool-icon { width: 14px; height: 14px; }
-.perm-tool-name { color: var(--c-fg-1); font-weight: var(--fw-semibold); }
+.perm-tool-name {
+  color: var(--c-accent);
+  font-weight: var(--fw-semibold);
+}
 .perm-summary {
-  margin: 0; padding: 8px 10px;
-  background: var(--c-bg-0); border: 1px solid var(--c-border-strong);
-  border-radius: var(--r-md);
+  margin: 0; padding: 6px 8px;
+  background: var(--c-bg-0); border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
   font-family: var(--font-mono); font-size: var(--fs-xs);
   color: var(--c-fg-1);
   white-space: pre-wrap; word-break: break-word;
-  max-height: 160px; overflow-y: auto;
+  max-height: 120px; overflow-y: auto;
 }
 .perm-actions {
   display: flex; gap: var(--sp-2); justify-content: flex-end;
   flex-wrap: wrap;
+  margin-top: 8px;
 }
 .perm-actions button {
   padding: 6px 14px; border-radius: var(--r-md);
@@ -6749,8 +6842,21 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 
   /* Per-message floating action bar (Copy etc.) — `position:absolute;
      top:-8px` drifts above narrow bubbles and overlaps the previous
-     message. iOS / Android long-press-to-select handles copy anyway. */
+     message. User bubbles get a tap-to-edit fallback (onUserBubbleClick),
+     so hiding their floating bar is fine. */
   .msg-actions { display: none; }
+  /* ...but the ASSISTANT copy bar has NO touch fallback (long-press select
+     only works for code blocks; prose/tables/lists had no path to copy).
+     Keep it visible, anchored inline below the bubble instead of floating,
+     mirroring the trash-actions touch pattern (styles.css ~8157). */
+  .msg-actions.msg-actions-assistant {
+    display: flex;
+    position: static;
+    margin: 4px 0 0 40px;   /* align under bubble text, past the 32px avatar gutter */
+    background: none; border: none; box-shadow: none; padding: 0;
+    opacity: 0.7;
+  }
+  .msg-actions.msg-actions-assistant:active { opacity: 1; }
 }
 
 /* ==========================================================================

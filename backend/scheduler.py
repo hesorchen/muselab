@@ -591,15 +591,15 @@ async def _execute_task(task: dict) -> None:
             # never matching, which left reply_text empty and made every
             # push notification say "(no reply)". isinstance check is what
             # chat.py uses too — mirror it here.
-            from claude_agent_sdk import TextBlock
+            from claude_agent_sdk import (
+                AssistantMessage, ResultMessage, TextBlock)
             await client.query(task["prompt"])
             async for msg in client.receive_response():
-                tname = type(msg).__name__
-                if tname == "AssistantMessage":
+                if isinstance(msg, AssistantMessage):
                     for block in getattr(msg, "content", []) or []:
                         if isinstance(block, TextBlock):
                             reply_text += getattr(block, "text", "") or ""
-                elif tname == "ResultMessage":
+                elif isinstance(msg, ResultMessage):
                     break
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
@@ -661,8 +661,13 @@ async def _execute_task(task: dict) -> None:
                         # instead of table rows, code fences, etc.
                         from .chat import _plain_preview
                         body = _plain_preview(preview or "")
-                    _push.send_to_all(title=title, body=body or "—",
-                                      url="/", tag=f"task-{tid}")
+                    # Offload pywebpush's synchronous per-subscription HTTPS
+                    # to a thread so a slow/dead push endpoint can't block the
+                    # event loop (and every concurrent SSE/HTTP request) while
+                    # the scheduler fans out task notifications.
+                    await asyncio.to_thread(
+                        _push.send_to_all, title=title, body=body or "—",
+                        url="/", tag=f"task-{tid}")
             except Exception as e:
                 sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 

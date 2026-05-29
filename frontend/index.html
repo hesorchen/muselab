@@ -375,18 +375,22 @@
             </span>
             <span class="icon"><svg><use :href="iconRef(n)"/></svg></span>
             <span class="name" x-text="n.name" :title="n.name"></span>
-            <!-- VSCode-style inline actions on directory rows. Hidden by
-                 default; revealed on hover (desktop) or always faded
-                 (touch — no hover). @click.stop so the action doesn't
-                 also collapse/expand the row. -->
-            <span class="tree-actions" x-show="n.is_dir">
+            <!-- VSCode-style inline actions. Hidden by default; revealed on
+                 hover (desktop) or always faded (touch — no hover). The "⋯"
+                 more-menu renders for BOTH files and dirs — plain files used
+                 to rely on @contextmenu only, which iOS Safari long-press
+                 intercepts (system callout), leaving touch users no way to
+                 rename / delete / copy a file. The "+" (new file here) stays
+                 dir-only. @click.stop so the action doesn't also toggle the row. -->
+            <span class="tree-actions">
               <button class="tree-action" type="button"
+                      x-show="n.is_dir"
                       @click.stop="doNewFile(n)"
                       :title="lang==='zh' ? '在此目录新建文件' : 'New file here'"
                       aria-label="New file">+</button>
               <button class="tree-action" type="button"
                       @click.stop="openCtxMenu($event, n)"
-                      :title="lang==='zh' ? '更多操作（重命名 / 删除 / 上传 / 新建目录…）' : 'More (rename / delete / upload / new folder…)'"
+                      :title="lang==='zh' ? '更多操作（重命名 / 删除 / 复制 / 上传…）' : 'More (rename / delete / copy / upload…)'"
                       aria-label="More">⋯</button>
             </span>
             <span class="size" x-show="!n.is_dir" x-text="fmtSize(n.size)"></span>
@@ -1439,7 +1443,10 @@
                        a turn made up of thinking + tool_use + tool_
                        result + assistant gets ONE timestamp at the
                        bottom, not three. -->
-                  <div class="msg-actions">
+                  <!-- msg-actions-assistant: the assistant copy bar stays
+                       visible on touch devices (no hover, no bubble-tap
+                       fallback like user msgs get) — see styles.css. -->
+                  <div class="msg-actions msg-actions-assistant">
                     <button @click="copyMsg(m)" class="icon-btn sm"
                             :class="{ 'copied-flash': m._copied }"
                             :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
@@ -1943,16 +1950,21 @@
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
                   <div class="perm-request" :class="{ resolved: m.resolved }">
-                    <div class="perm-header">
-                      <span class="perm-title" x-text="t('perm.title')"></span>
-                      <span x-show="m.resolved" class="perm-decision-tag"
-                            :class="'perm-decision-' + m.decision"
-                            x-text="t('perm.decision_' + m.decision)"></span>
-                    </div>
+                    <!-- Compact tool card: tool name + decision tag on top
+                         line (mirrors Read/Grep/Edit tool bubble layout),
+                         summary below. The previous `.perm-header` row
+                         (containing "Muse 想用一个工具" + a hero wrench
+                         icon) was hero-treatment overkill — especially in
+                         bypass mode where the card lands in the stream
+                         already resolved and the user doesn't need a big
+                         decision prompt. See plan
+                         ~/.claude/plans/permission-claude-smooth-codd.md. -->
                     <div class="perm-body">
                       <div class="perm-tool">
-                        <span class="perm-tool-icon"><svg><use href="#i-tool"/></svg></span>
                         <span class="perm-tool-name" x-text="m.tool"></span>
+                        <span x-show="m.resolved" class="perm-decision-tag"
+                              :class="'perm-decision-' + m.decision"
+                              x-text="t('perm.decision_' + m.decision)"></span>
                       </div>
                       <pre class="perm-summary" x-text="m.summary"></pre>
                     </div>
@@ -2745,61 +2757,161 @@
           </div>
 
           <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
-          <template x-for="(p, idx) in settings.providers" :key="idx">
-            <!-- editing: local UI flag — only show the input box when the user
-                 explicitly clicks 修改 on a configured provider, so the steady
-                 state for a configured row is "switch + 已配置 + 测试 + 修改"
-                 (no contradictory empty input next to a green badge). -->
+          <template x-for="(p, idx) in settings.providers" :key="p.id || idx">
             <div class="settings-row provider-row" x-data="{ editing: false }">
-              <label x-text="localizeProviderDisplay(p.display) + ' (' + p.env_key + ')'"></label>
-              <div class="settings-input-wrap">
-                <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
-                  <input type="checkbox" :checked="!p.disabled"
-                         @change="toggleProvider(p.probe_model, !$event.target.checked)" />
-                  <span class="switch-slider"></span>
-                </label>
-                <!-- Input only appears when (a) provider isn't configured yet,
-                     or (b) the user clicked 修改 to update an existing key. -->
-                <input x-show="!p.configured || editing"
-                       type="password" class="settings-input"
-                       :placeholder="editing ? t('set.key_edit_placeholder') : t('set.placeholder_key')"
-                       x-model="settings.draftKeys[p.env_key]" />
-                <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
-                <!-- Edit-mode actions: 保存 (primary, only if input has content) + 取消 -->
-                <button x-show="!p.configured || editing" class="btn-primary sm"
-                        :disabled="!(settings.draftKeys[p.env_key] || '').trim()"
-                        @click="(async () => { if (await saveProviderKey(p.env_key)) editing = false })()"
-                        x-text="t('btn.save')"></button>
-                <button x-show="p.configured && editing" class="btn-ghost sm"
-                        @click="editing = false; settings.draftKeys[p.env_key] = ''"
-                        x-text="t('set.key_cancel')"></button>
-                <!-- Read-mode actions: 测试 + 修改 -->
-                <button x-show="p.configured && !editing" class="btn-ghost sm"
-                        @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
-                        x-text="t('set.probe')"></button>
-                <button x-show="p.configured && !editing" class="btn-ghost sm"
-                        @click="editing = true"
-                        x-text="t('set.key_edit')"></button>
-              </div>
-              <!-- Per-provider help text + console link -->
-              <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
-                <span x-text="PROVIDER_HELP[p.env_key]?.[lang]"></span>
-                <a x-show="PROVIDER_HELP[p.env_key]?.url"
-                   :href="PROVIDER_HELP[p.env_key]?.url"
-                   target="_blank" rel="noopener"
-                   x-text="lang==='zh' ? '打开控制台 ↗' : 'Open console ↗'"></a>
-              </div>
-              <!-- Inline result of last test, persisted until next test -->
-              <div x-show="settings.probeResults[p.probe_model]"
-                   class="probe-result"
-                   :class="{ ok: settings.probeResults[p.probe_model]?.ok,
-                              err: !settings.probeResults[p.probe_model]?.ok }">
-                <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
-                <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
-                <span x-text="settings.probeResults[p.probe_model]?.text"></span>
-              </div>
+
+              <!-- ===== Anthropic / non-editable: simple api-key row ===== -->
+              <template x-if="!p.editable">
+                <div>
+                  <label x-text="localizeProviderDisplay(p.display) + ' (' + p.env_key + ')'"></label>
+                  <div class="settings-input-wrap">
+                    <input x-show="!p.configured || editing"
+                           type="password" class="settings-input"
+                           :placeholder="editing ? t('set.key_edit_placeholder') : t('set.placeholder_key')"
+                           x-model="settings.draftKeys[p.env_key]" />
+                    <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
+                    <button x-show="!p.configured || editing" class="btn-primary sm"
+                            :disabled="!(settings.draftKeys[p.env_key] || '').trim()"
+                            @click="(async () => { if (await saveProviderKey(p.env_key)) editing = false })()"
+                            x-text="t('btn.save')"></button>
+                    <button x-show="p.configured && editing" class="btn-ghost sm"
+                            @click="editing = false; settings.draftKeys[p.env_key] = ''"
+                            x-text="t('set.key_cancel')"></button>
+                    <button x-show="p.configured && !editing" class="btn-ghost sm"
+                            @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
+                            x-text="t('set.probe')"></button>
+                    <button x-show="p.configured && !editing" class="btn-ghost sm"
+                            @click="editing = true"
+                            x-text="t('set.key_edit')"></button>
+                  </div>
+                  <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
+                    <span x-text="PROVIDER_HELP[p.env_key]?.[lang]"></span>
+                    <a x-show="PROVIDER_HELP[p.env_key]?.url"
+                       :href="PROVIDER_HELP[p.env_key]?.url"
+                       target="_blank" rel="noopener"
+                       x-text="lang==='zh' ? '打开控制台 ↗' : 'Open console ↗'"></a>
+                  </div>
+                  <div x-show="settings.probeResults[p.probe_model]"
+                       class="probe-result"
+                       :class="{ ok: settings.probeResults[p.probe_model]?.ok,
+                                  err: !settings.probeResults[p.probe_model]?.ok }">
+                    <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
+                    <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
+                    <span x-text="settings.probeResults[p.probe_model]?.text"></span>
+                  </div>
+                </div>
+              </template>
+
+              <!-- ===== Third-party editable provider (full editor) ===== -->
+              <template x-if="p.editable">
+                <div>
+                  <label>
+                    <span x-text="localizeProviderDisplay(p.display)"></span>
+                    <span class="provider-meta-tag mono" x-text="p.prefix"></span>
+                    <span class="provider-meta-tag" x-text="(p.models?.length || 0) + (lang==='zh' ? ' 个模型' : ' models')"></span>
+                    <span x-show="p.is_builtin && p.is_overridden" class="provider-meta-tag edited"
+                          x-text="lang==='zh' ? '已改' : 'edited'"></span>
+                    <span x-show="!p.is_builtin" class="provider-meta-tag custom"
+                          x-text="lang==='zh' ? '自定义' : 'custom'"></span>
+                  </label>
+                  <div class="settings-input-wrap">
+                    <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
+                      <input type="checkbox" :checked="!p.disabled"
+                             @change="toggleProvider(p.id, !$event.target.checked)" />
+                      <span class="switch-slider"></span>
+                    </label>
+                    <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
+                    <span x-show="!p.configured" class="settings-badge" x-text="lang==='zh' ? '未配置' : 'No key'"></span>
+                    <button x-show="p.configured" class="btn-ghost sm"
+                            @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
+                            x-text="t('set.probe')"></button>
+                    <button class="btn-ghost sm"
+                            @click="toggleProviderEditor(p)"
+                            x-text="settings.providerDrafts[p.id]?.open ? t('btn.cancel') : t('set.key_edit')"></button>
+                  </div>
+
+                  <!-- Expanded editor: endpoint / prefix / models / api-key -->
+                  <div x-show="settings.providerDrafts[p.id]?.open" class="provider-editor">
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.endpoint')"></label>
+                      <input class="settings-input mono" x-model="settings.providerDrafts[p.id].base_url"
+                             :placeholder="t('set.prov.endpoint_ph')" />
+                    </div>
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.prefix')"></label>
+                      <input class="settings-input mono" x-model="settings.providerDrafts[p.id].prefix"
+                             :placeholder="t('set.prov.prefix_ph')" />
+                    </div>
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.models')"></label>
+                      <textarea class="settings-input mono" rows="4"
+                                x-model="settings.providerDrafts[p.id].models"
+                                :placeholder="t('set.prov.models_ph')"></textarea>
+                    </div>
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.apikey')"></label>
+                      <input type="password" class="settings-input"
+                             x-model="settings.providerDrafts[p.id].api_key"
+                             :placeholder="p.configured ? t('set.key_edit_placeholder') : t('set.placeholder_key')" />
+                    </div>
+                    <div class="settings-hint" x-text="t('set.prov.hint')"></div>
+                    <div class="settings-row provider-editor-actions">
+                      <button class="btn-primary sm" @click="saveProvider(p)" x-text="t('btn.save')"></button>
+                      <button class="btn-ghost sm" @click="toggleProviderEditor(p)" x-text="t('btn.cancel')"></button>
+                      <button x-show="p.is_builtin && p.is_overridden" class="btn-ghost sm"
+                              @click="restoreProvider(p)" x-text="t('set.prov.restore')"></button>
+                      <button class="btn-ghost sm danger" @click="deleteProvider(p)"
+                              x-text="p.is_builtin ? t('set.prov.hide') : t('set.prov.delete')"></button>
+                    </div>
+                  </div>
+
+                  <div x-show="settings.probeResults[p.probe_model]"
+                       class="probe-result"
+                       :class="{ ok: settings.probeResults[p.probe_model]?.ok,
+                                  err: !settings.probeResults[p.probe_model]?.ok }">
+                    <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
+                    <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
+                    <span x-text="settings.probeResults[p.probe_model]?.text"></span>
+                  </div>
+                </div>
+              </template>
+
             </div>
           </template>
+
+          <!-- Add a brand-new provider from scratch -->
+          <div class="settings-row mcp-add-row">
+            <button class="btn-ghost sm" @click="settings.providerNew.show = !settings.providerNew.show"
+                    x-text="settings.providerNew.show ? t('btn.cancel') : t('set.prov.add')"></button>
+          </div>
+          <div x-show="settings.providerNew.show" class="provider-editor">
+            <div class="settings-row">
+              <label x-text="t('set.prov.endpoint')"></label>
+              <input class="settings-input mono" x-model="settings.providerNew.base_url"
+                     :placeholder="t('set.prov.endpoint_ph')" />
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.prov.prefix')"></label>
+              <input class="settings-input mono" x-model="settings.providerNew.prefix"
+                     :placeholder="t('set.prov.prefix_ph')" />
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.prov.models')"></label>
+              <textarea class="settings-input mono" rows="4"
+                        x-model="settings.providerNew.models"
+                        :placeholder="t('set.prov.models_ph')"></textarea>
+            </div>
+            <div class="settings-row">
+              <label x-text="t('set.prov.apikey')"></label>
+              <input type="password" class="settings-input"
+                     x-model="settings.providerNew.api_key"
+                     :placeholder="t('set.placeholder_key')" />
+            </div>
+            <div class="settings-hint" x-text="t('set.prov.hint')"></div>
+            <div class="settings-row">
+              <button class="btn-primary sm" @click="addProviderFromDraft()" x-text="t('set.prov.add')"></button>
+            </div>
+          </div>
         </div>
 
         <div class="settings-section" data-page="appearance"
