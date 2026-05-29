@@ -9,8 +9,6 @@ import json
 
 import pytest
 
-from tests.conftest import TEST_TOKEN
-
 
 @pytest.fixture()
 def push_mod(app_module):
@@ -236,8 +234,10 @@ def test_send_to_all_records_non_fatal_error(push_mod):
     sub — transient failures shouldn't lose the subscription."""
     push_mod.add_subscription(_sub_body(endpoint="https://flaky.example.com/x"))
 
-    import pywebpush, py_vapid
     import unittest.mock as mock
+
+    import py_vapid
+    import pywebpush
 
     class _FakeResp:
         status_code = 500
