@@ -186,6 +186,11 @@ def _env(new_name: str, old_name: str = "", default: str = "") -> str:
 
 
 _root_str = _env("MUSELAB_ROOT", "PORTAL_ROOT")
+# Keep the literal (pre-resolve) path too. On macOS /etc, /var, /home are
+# symlinks/firmlinks (→ /private/etc, /private/var, …), so ROOT.resolve()
+# canonicalises them AWAY from the literal blocklist entries below and the
+# system-path guard would silently pass. Checking the raw input closes that.
+_raw_root = Path(_root_str) if _root_str else None
 ROOT = Path(_root_str).resolve() if _root_str else None
 TOKEN = _env("MUSELAB_TOKEN", "PORTAL_TOKEN")
 _port_raw = _env("MUSELAB_PORT", "PORTAL_PORT", "8765")
@@ -241,7 +246,16 @@ if not ROOT.exists():
 # the UI without changing the actual blast radius.
 _FORBIDDEN_ROOTS = {Path("/"), Path("/etc"), Path("/root"), Path("/home"),
                     Path("/var"), Path("/usr"), Path("/boot")}
-if ROOT in _FORBIDDEN_ROOTS:
+# Also resolve every blocklist entry so a user who passes the canonical form
+# directly (e.g. macOS /private/etc) is caught too.
+_forbidden_resolved = set(_FORBIDDEN_ROOTS)
+for _p in _FORBIDDEN_ROOTS:
+    try:
+        _forbidden_resolved.add(_p.resolve())
+    except OSError:
+        pass
+if (ROOT in _forbidden_resolved
+        or (_raw_root is not None and _raw_root in _FORBIDDEN_ROOTS)):
     raise RuntimeError(
         f"MUSELAB_ROOT={ROOT} is a system / cross-user path. Point it at "
         f"your $HOME or a sub-directory you own."
