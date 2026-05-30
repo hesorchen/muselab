@@ -1802,13 +1802,13 @@
                                 </template>
                               </div>
                             </template>
-                            <div class="web-card-body" x-html="mdRender(toolResultBodyText(m))"></div>
+                            <div class="web-card-body" x-html="toolResultMd(m)"></div>
                           </div>
                         </template>
                         <!-- Glob / Grep: parsed hits with clickable file paths -->
                         <template x-if="toolResultKind(m) === 'search'">
                           <div class="search-hits-list">
-                            <template x-for="(hit, hi) in parseSearchHits(toolResultBodyText(m)).slice(0, 100)" :key="hi">
+                            <template x-for="(hit, hi) in searchHitsFor(m).slice(0, 100)" :key="hi">
                               <div class="search-hit">
                                 <template x-if="hit.path">
                                   <a class="search-hit-path file-link" href="#"
@@ -1827,9 +1827,9 @@
                                 </template>
                               </div>
                             </template>
-                            <template x-if="parseSearchHits(toolResultBodyText(m)).length > 100">
+                            <template x-if="searchHitsFor(m).length > 100">
                               <div class="search-hit-truncated"
-                                   x-text="(lang==='zh' ? '… 还有 ' : '… ') + (parseSearchHits(toolResultBodyText(m)).length - 100) + (lang==='zh' ? ' 项匹配未显示' : ' more matches not shown')"></div>
+                                   x-text="(lang==='zh' ? '… 还有 ' : '… ') + (searchHitsFor(m).length - 100) + (lang==='zh' ? ' 项匹配未显示' : ' more matches not shown')"></div>
                             </template>
                           </div>
                         </template>

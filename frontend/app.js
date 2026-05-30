@@ -146,6 +146,26 @@ const STRINGS = (typeof window !== "undefined" && window.MUSELAB_STRINGS)
 const ACCENT_PRESETS = window.MUSELAB_ACCENT_PRESETS || [];
 const EDITABLE_EXT = window.MUSELAB_EDITABLE_EXT || new Set();
 
+// Per-message memo caches for the expensive tool-result parsers the message
+// x-for re-invokes on EVERY reactive re-render (tab switch, every stream
+// chunk). Keyed by the RAW message object (via Alpine.raw) so writes don't
+// touch reactive props — no re-render loop — and entries GC with the message.
+// editDiffOps in particular builds an O(m·n) LCS table; editDiffStats calls it
+// again — without memo that's 2+ full diffs per Edit bubble per render.
+const _diffOpsCache = new WeakMap();   // raw msg -> ops[]
+const _mcpFmtCache  = new WeakMap();   // raw msg -> { kind, value }
+const _readLinesCache = new WeakMap(); // raw msg -> { src, lines }
+const _searchHitsCache = new WeakMap();// raw msg -> { src, hits }
+const _toolMdCache = new WeakMap();    // raw msg -> { src, html }
+// Unwrap an Alpine reactive proxy to its stable underlying object so the
+// WeakMap key is identity-stable across renders. Falls back to the proxy
+// (Alpine v3 caches proxies per target, so even that key is stable).
+function _rawMsg(m) {
+  try {
+    return (window.Alpine && typeof Alpine.raw === "function") ? Alpine.raw(m) : m;
+  } catch (_) { return m; }
+}
+
 function portal() {
   return {
     // ===== auth =====
@@ -2930,6 +2950,18 @@ function portal() {
     // raw text on parse failure (always safe — never throws).
     mcpResultFormatted(m) {
       const text = (m && (m.text || m.preview)) || "";
+      // Memo: the template calls this TWICE per render (value slice + md
+      // render) and the message x-for re-invokes on every render. JSON.parse
+      // of a large MCP payload each time is wasteful. Cache keyed by raw msg,
+      // re-derived only if the source text actually changed (streaming-safe).
+      const _raw = _rawMsg(m);
+      const _hit = _mcpFmtCache.get(_raw);
+      if (_hit && _hit.src === text) return _hit.value;
+      const value = this._computeMcpResultFormatted(text);
+      _mcpFmtCache.set(_raw, { src: text, value });
+      return value;
+    },
+    _computeMcpResultFormatted(text) {
       if (!text) return { kind: "empty", value: "" };
       const trimmed = text.trim();
       // Try JSON first
@@ -5246,6 +5278,17 @@ function portal() {
       // synthetic entry when the format doesn't match (vendor wrapper,
       // mocked test, etc.).
       const body = this.toolResultBodyText(m);
+      // Memo: re-split only when the body changes. The message x-for nests an
+      // x-for over these lines, so without a cache every parent re-render
+      // re-splits a potentially large Read result line-by-line.
+      const _raw = _rawMsg(m);
+      const _hit = _readLinesCache.get(_raw);
+      if (_hit && _hit.src === body) return _hit.lines;
+      const lines = this._computeReadResultLines(body);
+      _readLinesCache.set(_raw, { src: body, lines });
+      return lines;
+    },
+    _computeReadResultLines(body) {
       const out = [];
       const re = /^\s*(\d+)→(.*)$/;
       for (const ln of body.split("\n")) {
@@ -5267,6 +5310,31 @@ function portal() {
         }
       }
       return out;
+    },
+    // Memoized markdown render of a tool-result body, keyed by raw msg. The
+    // template binds x-html to this for web/search-card bodies; mdRender()
+    // itself is already text-LRU-cached, but this avoids re-running the body
+    // extraction + the full-string Map hash on every re-render of a long list.
+    toolResultMd(m) {
+      const body = this.toolResultBodyText(m);
+      const _raw = _rawMsg(m);
+      const _hit = _toolMdCache.get(_raw);
+      if (_hit && _hit.src === body) return _hit.html;
+      const html = this.mdRender(body);
+      _toolMdCache.set(_raw, { src: body, html });
+      return html;
+    },
+    // Memoized search-hit parse for a tool-result body, keyed by raw msg.
+    // parseSearchHits scans the whole body with a regex; the template slices
+    // the first 100 but the parse runs over everything each render without this.
+    searchHitsFor(m) {
+      const body = this.toolResultBodyText(m);
+      const _raw = _rawMsg(m);
+      const _hit = _searchHitsCache.get(_raw);
+      if (_hit && _hit.src === body) return _hit.hits;
+      const hits = this.parseSearchHits(body);
+      _searchHitsCache.set(_raw, { src: body, hits });
+      return hits;
     },
     bashResultText(m) {
       // Prefer the structured parse (stdout/stderr/exit_code separated)
@@ -5341,6 +5409,18 @@ function portal() {
       // `edits` array is flattened into a single op list with a separator
       // op between sub-edits so the template can render section labels.
       if (!m || !m.input) return [];
+      // Memo: a tool_use's input/name is immutable after creation, so the
+      // diff never changes. Cache keyed by the raw msg — editDiffOps and
+      // editDiffStats both hit this, and the message x-for re-invokes it on
+      // every render; the underlying _lineDiff is an O(m·n) LCS build.
+      const _raw = _rawMsg(m);
+      const _hit = _diffOpsCache.get(_raw);
+      if (_hit !== undefined) return _hit;
+      const _ops = this._computeEditDiffOps(m);
+      _diffOpsCache.set(_raw, _ops);
+      return _ops;
+    },
+    _computeEditDiffOps(m) {
       const inp = m.input;
       if (m.name === "MultiEdit" && Array.isArray(inp.edits)) {
         const out = [];
@@ -5847,6 +5927,18 @@ function portal() {
     // always floats to the top; the rest are based on updated_at
     // (epoch seconds — same source as the existing sort).
     groupedFilteredSessions() {
+      // The popup is x-show (not x-if), so this binding stays live even while
+      // hidden — without this guard the full filter+bucket reran on every
+      // unrelated re-render (each keystroke, each stream tick). When closed
+      // nothing here is visible: return the last computed groups and skip the
+      // work. Reading sessionPickerOpen registers it as a reactive dep so
+      // reopening recomputes. When open we always recompute fresh, so renames
+      // / reorders are never served stale.
+      if (!this.sessionPickerOpen) return this._groupedSessionsCache || [];
+      this._groupedSessionsCache = this._computeGroupedFilteredSessions();
+      return this._groupedSessionsCache;
+    },
+    _computeGroupedFilteredSessions() {
       const items = this.filteredSessions();
       if (!items.length) return [];
       const now = new Date();
@@ -7884,6 +7976,9 @@ function portal() {
       } catch (e) { this.errToast("rename", String((e && e.message) || e)); return; }
       if (r.ok) {
         if (this.selected === n.path) this.selected = newPath;
+        // Old path no longer exists; drop its cached body so a future file
+        // created at the same path can't serve this one's stale content.
+        this._previewCacheDel(n.path);
         delete this.childCache[parent];
         this.reloadTree();
         this.toast(this.t("toast.renamed"), "success");
@@ -8187,6 +8282,7 @@ function portal() {
       let data = {};
       try { data = await r.json(); } catch (_) {}
       this.tabs = this.tabs.filter(t => t.path !== path);
+      this._previewCacheDel(path);
       if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
       // In-place removal — see _removeNodeFromTree for rationale.
       this._removeNodeFromTree(path);
@@ -8218,6 +8314,62 @@ function portal() {
       if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
       return (n / 1024 / 1024).toFixed(1) + " MB";
     },
+    // ===== Preview-tab content cache =====
+    // Chat-session tabs cache their loaded state (tabState[id]._loaded) so
+    // switching back is instant; preview tabs had no equivalent — every
+    // switchTab re-fetched the file body over HTTP and re-rendered, flashing
+    // a "loading" state even for a file already shown moments ago. This LRU
+    // caches the parsed/rendered preview for md / text / xlsx so a tab switch
+    // back is synchronous (no fetch, no loading flash). Bounded by entry count
+    // and per-entry body size so it can't hoard memory on huge files. csv is
+    // paginated (stateful) and html/img/pdf are URL-based (already instant), so
+    // neither is cached. Invalidated on edit-save / reload / external write.
+    PREVIEW_CACHE_MAX_ENTRIES: 16,
+    PREVIEW_CACHE_MAX_CHARS: 512 * 1024,   // skip caching bodies larger than this
+    LARGE_MD_DEFER_CHARS: 200 * 1024,      // above this, render md off the click frame
+    _previewCacheGet(path) {
+      if (!this._previewCache || !path) return null;
+      const e = this._previewCache.get(path);
+      if (e === undefined) return null;
+      // LRU bump
+      this._previewCache.delete(path);
+      this._previewCache.set(path, e);
+      return e;
+    },
+    _previewCacheSet(path, entry) {
+      if (!path || !entry) return;
+      if (!this._previewCache) this._previewCache = new Map();
+      this._previewCache.delete(path);
+      this._previewCache.set(path, entry);
+      while (this._previewCache.size > this.PREVIEW_CACHE_MAX_ENTRIES) {
+        this._previewCache.delete(this._previewCache.keys().next().value);
+      }
+    },
+    _previewCacheDel(path) {
+      if (this._previewCache && path) this._previewCache.delete(path);
+    },
+    // Restore preview-pane reactive state from a cache entry; mirrors the
+    // post-fetch assignments in openFile's per-mode branches.
+    _applyPreviewCache(e) {
+      this.rawText = e.rawText || "";
+      this.renderedMd = e.renderedMd || "";
+      this.xlsxSheets = e.xlsxSheets || [];
+      this.csvData = null;
+      this.previewMode = e.mode;
+      if (e.mode === "md") {
+        this.$nextTick(() => this.highlightCode(".markdown"));
+      } else if (e.mode === "text") {
+        this.previewLang = e.previewLang || "plaintext";
+        this.$nextTick(() => {
+          document.querySelectorAll(".text code").forEach(el => { delete el.dataset.hl; });
+          this.highlightCode(".text");
+        });
+      } else if (e.mode === "xlsx") {
+        this.xlsxActive = e.xlsxActive || "";
+        this.xlsxLimits = e.xlsxLimits || null;
+        this.xlsxSheetsTruncated = !!e.xlsxSheetsTruncated;
+      }
+    },
     async openFile(n) {
       // Unsaved-edits guard: switching to a DIFFERENT file while the editor
       // is dirty would silently drop the changes. Confirm first; abort the
@@ -8243,6 +8395,13 @@ function portal() {
       // don't have to hunt for it. `block/inline: "nearest"` is a no-op if
       // the item is already visible, so this is cheap on the common path.
       this.$nextTick(() => this._scrollPreviewSelectedIntoView());
+      // Cache hit: serve a previously-loaded md/text/xlsx body synchronously —
+      // no fetch, no "loading" flash. Invalidated on edit/reload/external write.
+      const cachedPrev = this._previewCacheGet(n.path);
+      if (cachedPrev) {
+        this._applyPreviewCache(cachedPrev);
+        return;
+      }
       // Clear the previous file's preview data and surface a loading
       // indicator. Without this, switching from a 10MB markdown file to
       // a small csv would briefly show the old markdown while the new
@@ -8261,8 +8420,27 @@ function portal() {
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
         if (r.ok) {
           this.rawText = await r.text();
-          this.renderedMd = this.mdRender(this.rawText);
-          this.$nextTick(() => this.highlightCode(".markdown"));
+          // For large markdown the synchronous markdown-it + sanitize pass can
+          // block the main thread long enough to make the click feel frozen
+          // ("点开即卡"). Paint the loading spinner first, then render on the
+          // next animation frame. The `selected` guard aborts the deferred
+          // render if the user switched tabs while it was pending.
+          const targetPath = n.path;
+          const renderMd = () => {
+            if (this.selected !== targetPath) return;   // switched away mid-defer
+            this.renderedMd = this.mdRender(this.rawText);
+            this.previewMode = "md";
+            if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+              this._previewCacheSet(targetPath, { mode: "md", rawText: this.rawText, renderedMd: this.renderedMd });
+            }
+            this.$nextTick(() => this.highlightCode(".markdown"));
+          };
+          if (this.rawText.length > this.LARGE_MD_DEFER_CHARS) {
+            this.previewMode = "loading";
+            requestAnimationFrame(() => requestAnimationFrame(renderMd));
+          } else {
+            renderMd();
+          }
         } else {
           // Without this branch a failed read left previewMode="md" with empty
           // rawText/renderedMd → blank white pane, no error. Mirror the text
@@ -8289,6 +8467,10 @@ function portal() {
           this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
           this.xlsxLimits = data.limits || null;
           this.xlsxSheetsTruncated = !!data.sheets_truncated;
+          this._previewCacheSet(n.path, {
+            mode: "xlsx", xlsxSheets: this.xlsxSheets, xlsxActive: this.xlsxActive,
+            xlsxLimits: this.xlsxLimits, xlsxSheetsTruncated: this.xlsxSheetsTruncated,
+          });
         } else {
           this.previewMode = "unsupported";
         }
@@ -8312,6 +8494,9 @@ function portal() {
           this.previewMode = "text";
           this.rawText = await r.text();
           this.previewLang = this.hljsLang(n.path);
+          if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+            this._previewCacheSet(n.path, { mode: "text", rawText: this.rawText, previewLang: this.previewLang });
+          }
           // 强制重新高亮：删 dataset.hl 让 highlightCode 重新跑
           this.$nextTick(() => {
             document.querySelectorAll(".text code").forEach(el => { delete el.dataset.hl; });
@@ -8520,6 +8705,9 @@ function portal() {
       // muselab's normal write paths (terminal git pull, external editor).
       if (!this.selected) return;
       this.previewVersion = Date.now();
+      // File content changed underneath us — drop any stale cached body so a
+      // later tab switch back re-fetches instead of serving the old render.
+      this._previewCacheDel(this.selected);
       if (this.previewMode === "md" || this.previewMode === "text") {
         const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
                      + "&_v=" + this.previewVersion;
@@ -8529,8 +8717,18 @@ function portal() {
             this.rawText = await r.text();
             if (this.previewMode === "md") {
               this.renderedMd = this.mdRender(this.rawText);
+              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+                this._previewCacheSet(this.selected, {
+                  mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
+                });
+              }
               this.$nextTick(() => this.highlightCode(".markdown"));
             } else {
+              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+                this._previewCacheSet(this.selected, {
+                  mode: "text", rawText: this.rawText, previewLang: this.previewLang,
+                });
+              }
               this.$nextTick(() => {
                 document.querySelectorAll(".text code")
                   .forEach(el => { delete el.dataset.hl; });
@@ -8560,6 +8758,8 @@ function portal() {
       // previewVersion flows through rawUrl on next render; for md/text we
       // also need to re-fetch since rawText is cached in the component.
       this.previewVersion = Date.now();
+      // An external/tool write invalidated the cached body — drop it.
+      this._previewCacheDel(this.selected);
       if (this.previewMode === "md" || this.previewMode === "text") {
         const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
                      + "&_v=" + this.previewVersion;
@@ -8569,8 +8769,18 @@ function portal() {
             this.rawText = await r.text();
             if (this.previewMode === "md") {
               this.renderedMd = this.mdRender(this.rawText);
+              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+                this._previewCacheSet(this.selected, {
+                  mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
+                });
+              }
               this.$nextTick(() => this.highlightCode(".markdown"));
             } else {
+              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+                this._previewCacheSet(this.selected, {
+                  mode: "text", rawText: this.rawText, previewLang: this.previewLang,
+                });
+              }
               this.$nextTick(() => {
                 document.querySelectorAll(".text code")
                   .forEach(el => { delete el.dataset.hl; });
@@ -9834,9 +10044,23 @@ function portal() {
       }
       if (r.ok) {
         this.rawText = this.editText;
+        // Keep the preview cache in step with the just-saved body. For md/text
+        // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
+        // the stale entry so the next switch-back re-fetches.
+        this._previewCacheDel(this.selected);
         if (this.previewMode === "md") {
           this.renderedMd = this.mdRender(this.rawText);
+          if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+            this._previewCacheSet(this.selected, {
+              mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
+            });
+          }
           this.$nextTick(() => this.highlightCode(".markdown"));
+        } else if (this.previewMode === "text"
+                   && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+          this._previewCacheSet(this.selected, {
+            mode: "text", rawText: this.rawText, previewLang: this.previewLang,
+          });
         }
         // Bump previewVersion so HTML / PDF / image iframes pick up the new
         // file content. Without this, iframes keep showing the stale render
