@@ -41,14 +41,14 @@ classifiers = [
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.2.82",
-    "fastapi>=0.136.1",
+    "fastapi>=0.136.3",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
     # CVE-scan CI job stays green.
     "starlette>=1.0.1",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.28",
-    "uvicorn[standard]>=0.47.0",
+    "uvicorn[standard]>=0.48.0",
     # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
     # native deps; safe to ship in the muselab Docker image.
     "openpyxl>=3.1.5",
