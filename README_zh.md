@@ -10,9 +10,10 @@
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
 - 🧠 **归档即工作集**。`MUSELAB_ROOT` 指向用户自有目录——其中的文件是 Muse（muselab 内置的 AI 助手）的一等上下文。
-- 🤖 **所有模型共用同一套 agent loop**。MCP / Skills / Subagent / plan 模式在 Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo、百度 ERNIE 上行为一致。
+- 🤖 **所有模型共用同一套 agent loop**。MCP / Skills / Subagent / plan 模式在 Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo、百度千帆（ERNIE）上行为一致。
 - 💸 **复用 Claude Pro / Max 订阅**（OAuth），无按令牌计费。也可填入第三方 API key。
-- 🔄 **多端共享一台服务器**。手机 / 平板 / 桌面共用会话；归档数据始终保存在用户自己的主机上。
+- 🔄 **多端共享一台服务器**。手机 / 平板 / 桌面共用会话；可作为 PWA 安装到主屏，回合或定时任务完成时通过 Web Push 推送通知；归档数据始终保存在用户自己的主机上。
+- ⏰ **定时 prompt**。按每日 / 每周 / 每月 / 单次计划运行保存好的 prompt；结果落到铃铛角标抽屉，并可推送到手机。
 - 🛠 **无构建步骤**。原生 HTML + Alpine.js + CSS，以静态文件形式直接提供——修改文件后刷新浏览器即可生效。
 
 > **单用户专属：一个 token，一个归档目录，运行在用户自己的机器上。**
@@ -50,6 +51,7 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 [模型](docs/providers_zh.md) ·
 [架构](docs/architecture_zh.md) ·
 [手机端 PWA](docs/mobile_zh.md) ·
+[定时任务](docs/scheduler_zh.md) ·
 [安全](SECURITY.md) ·
 [同类对比](docs/comparison_zh.md) ·
 [九位缪斯](docs/muses_zh.md) ·

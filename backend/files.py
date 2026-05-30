@@ -35,6 +35,23 @@ def _trash_dir() -> Path:
     return ROOT / TRASH_DIR_NAME
 
 
+def _guard_not_trash(target: Path) -> None:
+    """Refuse write/upload/rename/copy operations that target the dustbin.
+
+    /delete already blocks the dustbin (writes there have dedicated
+    /trash/* endpoints with a different mental model), but the write
+    endpoints used to let callers freely create / overwrite / rename
+    files inside .muselab-dustbin, corrupting the soft-delete bookkeeping
+    (orphan payloads, manifest mismatch). Apply the same guard everywhere
+    for consistency."""
+    trash_root = _trash_dir()
+    if target == trash_root or trash_root in target.parents:
+        raise HTTPException(
+            status_code=400,
+            detail="cannot write inside the dustbin — use /trash/* endpoints",
+        )
+
+
 def _ensure_trash_dir() -> Path:
     d = _trash_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -571,11 +588,19 @@ def read_file(path: str) -> PlainTextResponse:
     # Fast reject for known binary extensions.
     if suffix in BINARY_EXT:
         raise HTTPException(status_code=415, detail="binary file — not previewable as text")
-    if target.stat().st_size > MAX_TEXT_SIZE:
+    # Single stat() reused for both the size gate and the empty-file check.
+    # The previous code called target.stat() twice; if the file vanished
+    # between the two calls (TOCTOU) the second stat raised
+    # FileNotFoundError → 500 instead of a clean 404.
+    try:
+        st_size = target.stat().st_size
+    except OSError:
+        raise HTTPException(status_code=404, detail="not a file") from None
+    if st_size > MAX_TEXT_SIZE:
         raise HTTPException(status_code=413, detail="file too large for preview")
     # Empty extension + not a known text name? Sniff content. Empty files OK.
     # This is the path that picks up .tmpl, .conf.j2, .env.staging, etc.
-    if target.stat().st_size > 0 and _looks_binary(target):
+    if st_size > 0 and _looks_binary(target):
         raise HTTPException(status_code=415, detail="binary content — not previewable as text")
     content = target.read_text(encoding="utf-8", errors="replace")
     if len(content) > MAX_TEXT_SIZE:
@@ -688,6 +713,7 @@ def write_file(req: WriteReq) -> dict:
     truncated half-file. Capped at MAX_WRITE_BYTES to prevent the editor
     from accidentally serving as an unbounded ingest path."""
     target = safe_resolve(req.path)
+    _guard_not_trash(target)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="path is a directory")
     # Two-stage size gate. Each char is 1-4 UTF-8 bytes, so the upper
@@ -723,9 +749,15 @@ UPLOAD_BLOCKED_SUFFIX = {
 @router.post("/upload", dependencies=[Depends(require_token)])
 async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
     target_dir = safe_resolve(path)
+    _guard_not_trash(target_dir)
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="target dir invalid")
     safe_name = Path(file.filename or "upload.bin").name
+    # Path("." ).name and Path("..").name are both "" — those filenames
+    # produced an empty safe_name → `target_dir / ""` == target_dir, and
+    # the directory checks below raised 500 instead of a clean 400.
+    if not safe_name or safe_name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid filename")
     # Block dangerous extensions early.
     suffix = Path(safe_name).suffix.lower()
     if suffix in UPLOAD_BLOCKED_SUFFIX:
@@ -754,6 +786,22 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
                         detail=f"upload exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB cap",
                     )
                 f.write(chunk)
+        # Overwrite protection: a same-name upload used to silently clobber the
+        # existing file via rename() — no 409, no trash, no undo — which
+        # contradicts /rename's 409 guard and the whole soft-delete design.
+        # Move the old file to trash first (recoverable) only AFTER the new
+        # upload fully streamed to tmp, so a failed/aborted upload never
+        # destroys the existing file. A name colliding with a directory can't
+        # be auto-resolved → 409.
+        trashed = None
+        if dest.exists():
+            if dest.is_dir():
+                tmp_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"a directory named {safe_name!r} already exists here",
+                )
+            trashed = _move_to_trash(dest)
         tmp_path.rename(dest)
     except HTTPException:
         tmp_path.unlink(missing_ok=True)
@@ -761,7 +809,14 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
-    return {"ok": True, "path": str(dest.relative_to(ROOT)), "size": dest.stat().st_size}
+    return {
+        "ok": True,
+        "path": str(dest.relative_to(ROOT)),
+        "size": dest.stat().st_size,
+        # Non-null when an existing same-name file was moved to trash so the
+        # frontend can surface "replaced (old version in trash)".
+        "replaced_trash_id": (trashed or {}).get("trash_id"),
+    }
 
 
 class DeleteReq(BaseModel):
@@ -788,10 +843,16 @@ def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
             detail="cannot delete trash via /delete — use /trash/purge or /trash/empty",
         )
     if permanent:
+        # ignore_errors mirrors the soft-delete _purge_one path. A
+        # permission / busy-file error here previously bubbled up as a 500
+        # with a traceback that leaked absolute internal paths.
         if target.is_dir():
-            shutil.rmtree(target)
+            shutil.rmtree(target, ignore_errors=True)
         else:
-            target.unlink()
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
         return {"ok": True, "permanent": True}
     manifest = _move_to_trash(target)
     return {"ok": True, "permanent": False,
@@ -892,6 +953,7 @@ class MkdirReq(BaseModel):
 @router.post("/mkdir", dependencies=[Depends(require_token)])
 def mkdir(req: MkdirReq) -> dict:
     target = safe_resolve(req.path)
+    _guard_not_trash(target)
     target.mkdir(parents=True, exist_ok=True)
     return {"ok": True, "path": str(target.relative_to(ROOT))}
 
@@ -905,6 +967,8 @@ class RenameReq(BaseModel):
 def rename(req: RenameReq) -> dict:
     src = safe_resolve(req.src)
     dst = safe_resolve(req.dst)
+    _guard_not_trash(src)
+    _guard_not_trash(dst)
     if not src.exists():
         raise HTTPException(status_code=404, detail="source not found")
     if dst.exists():
@@ -953,6 +1017,7 @@ def _next_bak_name(parent: Path, original_name: str) -> str:
 @router.post("/copy-bak", dependencies=[Depends(require_token)])
 def copy_bak(req: CopyBakReq) -> dict:
     src = safe_resolve(req.src)
+    _guard_not_trash(src)
     if not src.exists():
         raise HTTPException(status_code=404, detail="source not found")
     # Files only. Directory copy is a different beast (shutil.copytree,
@@ -968,11 +1033,25 @@ def copy_bak(req: CopyBakReq) -> dict:
         parent = src.parent
     new_name = _next_bak_name(parent, src.name)
     dst = parent / new_name
-    # safe_resolve the final path so the sensitive-name guard fires for
-    # the destination too (e.g. someone trying to copy something into a
-    # `.env.bak` shape — block at the API edge).
+    _guard_not_trash(dst)
+    # safe_resolve the final path so the anti-traversal guard fires for
+    # the destination too.
     dst_rel = str(dst.relative_to(ROOT))
-    safe_resolve(dst_rel)
+    safe_resolve(dst_rel, allow_sensitive=True)
+    # The appended `.bak[.N]` suffix means `_is_sensitive` (exact-name /
+    # suffix match) never fires on the destination — `secrets.env.bak`
+    # wouldn't match `.env.*`. Strip the trailing `.bak[.N]` chain and
+    # re-check the underlying name so a copy can't smuggle a sensitive
+    # file into a `.bak` wrapper. (Source is already blocked by the
+    # default safe_resolve above; this hardens the dst symmetrically.)
+    underlying = new_name
+    while True:
+        m = re.match(r"^(.*)\.bak(?:\.\d+)?$", underlying)
+        if not m:
+            break
+        underlying = m.group(1)
+    if _is_sensitive(Path(underlying)):
+        raise HTTPException(status_code=403, detail="sensitive file blocked")
     shutil.copy2(src, dst)
     return {"ok": True, "path": dst_rel, "name": new_name}
 
@@ -1088,7 +1167,11 @@ def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
     instead of O(all-dirs) — repeat searches on a quiet archive only stat
     file contents, not the directory structure itself."""
     q_lower = q.strip().lower()
-    if not q_lower:
+    # Minimum query length: a single character matches nearly every file
+    # and always runs the full archive scan to the 8s time budget while
+    # holding a threadpool thread hostage. Short queries early-return empty
+    # (the UI debounces and only the user typing 1 char hits this).
+    if len(q_lower) < 2:
         return {"hits": []}
     hits: list[dict] = []
     started = time.monotonic()

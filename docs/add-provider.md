@@ -20,9 +20,9 @@ known integrations:
 | 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` | ✅ built-in |
 | MiniMax | `https://api.minimaxi.com/anthropic` | ✅ built-in |
 | Kimi (Moonshot) | `https://api.moonshot.cn/anthropic` | ✅ built-in |
-| Qwen (DashScope) | `https://dashscope-intl.aliyuncs.com/apps/anthropic` | ✅ built-in |
+| Qwen (DashScope) | `https://dashscope.aliyuncs.com/apps/anthropic` (domestic default; international group uses `dashscope-intl.aliyuncs.com`) | ✅ built-in |
 | Xiaomi MiMo | `https://api.xiaomimimo.com/anthropic` | ✅ built-in |
-| Baidu Qianfan | `https://qianfan.baidubce.com/anthropic` | ✅ built-in |
+| Baidu Qianfan (ERNIE) | `https://qianfan.baidubce.com/anthropic` | ✅ built-in |
 
 **Vendors without an Anthropic endpoint** are not supported. Options are to
 request that the vendor ship a compatible endpoint, or to use
@@ -54,7 +54,7 @@ Provider(
 ### 2. Add the API key in `.env`
 
 ```bash
-echo "DASHSCOPE_API_KEY=sk-xxx" >> .env
+echo "ACME_API_KEY=sk-xxx" >> .env
 ```
 
 Alternatively, paste it via the Settings modal in the UI (recommended — it
@@ -70,7 +70,7 @@ docker compose restart
 # kill the old uvicorn, then uv run uvicorn ...
 ```
 
-The browser **model dropdown** will now show a new "Qwen" group. Select it
+The browser **model dropdown** will now show a new "Acme" group. Select it
 to start chatting and using tools immediately.
 
 ---

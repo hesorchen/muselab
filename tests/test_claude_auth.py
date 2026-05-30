@@ -221,17 +221,35 @@ def test_disconnect_moves_credentials_to_timestamped_bak(client, monkeypatch, tm
 def test_disconnect_preserves_earlier_backup(client, monkeypatch, tmp_path):
     """Two disconnect cycles must produce TWO distinct .bak files —
     timestamp suffix prevents clobbering."""
+    import datetime as _dt
     import backend.api_settings as mod
     cred = tmp_path / ".credentials.json"
     cred.write_text(json.dumps({"v": 1}))
     monkeypatch.setattr(mod, "_CLAUDE_CRED", cred)
+
+    # Deterministic, instant: instead of `time.sleep(1.1)` (real wall-clock
+    # wait so the YYYYMMDD-HHMMSS stamp differs), feed the endpoint two fixed
+    # instants one second apart. The endpoint does `import datetime as _dt;
+    # _dt.datetime.now()`, so patching the stdlib `datetime.datetime` class is
+    # seen by its re-import.
+    _ticks = iter([
+        _dt.datetime(2026, 5, 15, 9, 0, 0),
+        _dt.datetime(2026, 5, 15, 9, 0, 1),
+    ])
+    _real_dt = _dt.datetime
+
+    class _Stepped(_real_dt):  # type: ignore[misc, valid-type]
+        @classmethod
+        def now(cls, tz=None):
+            return next(_ticks)
+
+    monkeypatch.setattr(_dt, "datetime", _Stepped)
+
     r1 = client.post("/api/settings/claude-auth/disconnect", headers=_hdr())
     backup1 = Path(r1.json()["backup_path"])
     assert backup1.exists()
     # Simulate re-connect: write a new credentials file
     cred.write_text(json.dumps({"v": 2}))
-    # Sleep > 1s so the next timestamp is distinct (format is YYYYMMDD-HHMMSS)
-    time.sleep(1.1)
     r2 = client.post("/api/settings/claude-auth/disconnect", headers=_hdr())
     backup2 = Path(r2.json()["backup_path"])
     assert backup2.exists()

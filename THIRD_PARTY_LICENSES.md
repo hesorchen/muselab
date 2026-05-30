@@ -27,6 +27,7 @@ step** and runs offline after install.
 | highlight.js | v11.x + language extras + theme CSS | BSD 3-Clause | <https://github.com/highlightjs/highlight.js> |
 | KaTeX (incl. fonts + `auto-render`) | v0.16.x | MIT | <https://github.com/KaTeX/KaTeX> |
 | CodeMirror 6 (`cm/codemirror.min.{js,css}` + `addon/` + `mode/` + `theme/`) | v6.x | MIT | <https://github.com/codemirror/dev> |
+| Mermaid (`mermaid.min.js`, diagram rendering) | v11.x | MIT | <https://github.com/mermaid-js/mermaid> |
 
 ### License notes
 
@@ -47,7 +48,7 @@ step** and runs offline after install.
 
 These are SKILL.md instruction files (plain text, no compiled code)
 shipped with muselab to give Muse out-of-the-box capabilities.
-The first four are muselab-native; the four below are community-authored
+The first seven are muselab-native; the four below are community-authored
 and included here with attribution.
 
 | Skill | Author / Repo | License | Upstream |

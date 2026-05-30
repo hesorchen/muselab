@@ -32,6 +32,9 @@ on:
       - '.github/workflows/install-test.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Linux: 22.04 + 24.04 (both LTS releases users actually run). The runner
@@ -83,9 +86,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.os }}-logs
+          # NOTE: do NOT upload .env — it holds MUSELAB_TOKEN (a secret) and
+          # any provider API keys the install wrote. Artifacts are downloadable
+          # by anyone with repo read access, so uploading .env leaks creds.
+          # backend.log is enough to debug a failed boot.
           path: |
             backend.log
-            .env
 
   # ---------------------------------------------------------------------------
   # macOS: 13 (Intel) + 14 (Apple Silicon). Runner has brew pre-installed
@@ -146,9 +152,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.os }}-logs
+          # NOTE: do NOT upload .env — it holds MUSELAB_TOKEN (a secret) and
+          # any provider API keys. Artifacts are downloadable by anyone with
+          # repo read access. backend.log is enough to debug a failed boot.
           path: |
             backend.log
-            .env
 
   # ---------------------------------------------------------------------------
   # Docker: build the image AND actually run it. Existing ci.yml docker

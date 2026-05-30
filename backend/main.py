@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Depends, FastAPI, Request
@@ -45,6 +46,35 @@ logging.getLogger("uvicorn.access").addFilter(_TokenFilter())
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 
+# Strong references to long-lived fire-and-forget startup tasks so the
+# event loop's weak task references don't let them be GC'd mid-run.
+_BG_TASKS: set = set()
+
+
+_ASSET_VERSION_CANDIDATES = (
+    FRONTEND / "app.js", FRONTEND / "styles.css", FRONTEND / "index.html",
+    # Split-out modules so editing only translations / data still bumps the
+    # stamp and forces clients to refetch.
+    FRONTEND / "i18n" / "index.js", FRONTEND / "data" / "constants.js",
+)
+# Cache: {computed_version_string} keyed by the max-mtime we last saw. index()
+# / manifest / meta each called _asset_version() (5 stat()s + a max()) on
+# EVERY "/" request; the value only changes on deploy. We still stat the
+# candidate files each call (cheap, sub-µs, and the only reliable change
+# signal) but skip recomputation when the mtime is unchanged. Also memoize
+# the fully-rendered index HTML keyed by the same mtime so the per-request
+# file read + double regex sub disappears on the hot path.
+_asset_cache: dict[str, object] = {"mtime": None, "version": "0", "index_html": None}
+_asset_cache_lock = threading.Lock()
+
+
+def _max_asset_mtime() -> int:
+    try:
+        return max(p.stat().st_mtime_ns
+                   for p in _ASSET_VERSION_CANDIDATES if p.exists())
+    except (ValueError, OSError):
+        return 0
+
 
 def _asset_version() -> str:
     """One version stamp shared across every /static URL the HTML emits.
@@ -52,19 +82,14 @@ def _asset_version() -> str:
     deploy (app.js / index.html / styles.css). When ANY of them change the
     stamp bumps, every HTML-emitted /static URL changes, and browsers refetch
     everything fresh — even though we still ask them to cache /static
-    aggressively (one year + immutable)."""
-    candidates = [FRONTEND / n for n in ("app.js", "styles.css", "index.html")]
-    # Include split-out modules so editing only translations / data still bumps
-    # the stamp and forces clients to refetch.
-    for sub in ("i18n/index.js", "data/constants.js"):
-        p = FRONTEND / sub
-        if p.exists():
-            candidates.append(p)
-    try:
-        latest = max(p.stat().st_mtime_ns for p in candidates if p.exists())
-        return str(latest // 1_000_000)  # ms granularity, short enough
-    except Exception:
-        return "0"
+    aggressively (one year + immutable). Cached by mtime (see _asset_cache)."""
+    mt = _max_asset_mtime()
+    with _asset_cache_lock:
+        if _asset_cache["mtime"] != mt:
+            _asset_cache["mtime"] = mt
+            _asset_cache["version"] = str(mt // 1_000_000)  # ms granularity
+            _asset_cache["index_html"] = None  # invalidate rendered HTML
+        return _asset_cache["version"]  # type: ignore[return-value]
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -132,13 +157,19 @@ async def _lifespan(app: FastAPI):
                 f"[muselab] trash auto-purge failed (non-fatal): {_e}\n")
             sys.stderr.flush()
 
-    _asyncio.create_task(_bg_prune_sessions())
-    _asyncio.create_task(_bg_purge_trash())
+    # Keep strong references to fire-and-forget tasks. asyncio only holds a
+    # weak reference to a task, so a bare `create_task(...)` whose result is
+    # discarded can be garbage-collected mid-run, silently cancelling the
+    # background work. Stash them on a module-level set and drop each one
+    # when it finishes so the set doesn't grow unbounded.
+    for _coro in (_bg_prune_sessions(), _bg_purge_trash(), _backfill_turn_counts()):
+        _t = _asyncio.create_task(_coro)
+        _BG_TASKS.add(_t)
+        _t.add_done_callback(_BG_TASKS.discard)
     # Same fire-and-forget pattern: rewrite turn_count for any session
     # written by the old algorithm. Gated by a sentinel file so reruns
     # are cheap; first run can take a few seconds on archives with
     # hundreds of sessions.
-    _asyncio.create_task(_backfill_turn_counts())
     yield
 
 
@@ -314,19 +345,29 @@ _STATIC_REF_RE = re.compile(r'((?:href|src)=")(/static/[^"?#]+)(")')
 
 @app.get("/")
 def index() -> HTMLResponse:
-    raw = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    # _asset_version() refreshes the cache (incl. invalidating the rendered
+    # HTML) when any frontend file's mtime changed. On the common case
+    # (nothing changed) we reuse the memoized render — no disk read, no
+    # regex sub — collapsing the per-"/" cost to a single max-mtime stat.
     ver = _asset_version()
-    html = _STATIC_REF_RE.sub(lambda m: f'{m.group(1)}{m.group(2)}?v={ver}{m.group(3)}', raw)
-    # Substitute the asset-version placeholder so the loaded HTML can
-    # tell, via the <meta name="muselab-asset-version"> tag, which JS
-    # bundle it was bootstrapped with. The app.js client compares this
-    # against /api/meta.asset_version on visibilitychange and reloads
-    # when out-of-date.
-    html = html.replace("__MUSELAB_ASSET_VERSION__", ver)
+    with _asset_cache_lock:
+        html = _asset_cache.get("index_html")
+    if html is None:
+        raw = (FRONTEND / "index.html").read_text(encoding="utf-8")
+        html = _STATIC_REF_RE.sub(
+            lambda m: f'{m.group(1)}{m.group(2)}?v={ver}{m.group(3)}', raw)
+        # Substitute the asset-version placeholder so the loaded HTML can
+        # tell, via the <meta name="muselab-asset-version"> tag, which JS
+        # bundle it was bootstrapped with. The app.js client compares this
+        # against /api/meta.asset_version on visibilitychange and reloads
+        # when out-of-date.
+        html = html.replace("__MUSELAB_ASSET_VERSION__", ver)
+        with _asset_cache_lock:
+            _asset_cache["index_html"] = html
     # The HTML itself must never be cached — it embeds the per-deploy
     # version stamps that point at the cacheable static assets.
     return HTMLResponse(
-        html,
+        html,  # type: ignore[arg-type]
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
@@ -505,7 +546,13 @@ async def client_error_log(request: Request) -> dict:
         payload = _json.loads(raw.decode("utf-8", errors="replace"))
         line = _json.dumps(payload, ensure_ascii=False)[:8192]
     except Exception:
+        # Invalid-JSON fallback writes the raw body. json.dumps above
+        # escapes embedded newlines, but this path doesn't — a body with
+        # CR/LF would forge extra "[client-error] …" log lines (log
+        # injection). Collapse CR/LF to spaces so one request stays one
+        # log line.
         line = raw.decode("utf-8", errors="replace")[:8192]
+        line = line.replace("\r", " ").replace("\n", " ")
     sys.stderr.write(f"[client-error] {line}\n")
     sys.stderr.flush()
     return {"ok": True}

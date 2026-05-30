@@ -21,7 +21,8 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-ARCHIVE="$(grep -oP 'MUSELAB_ROOT=\K\S+' .env || true)"
+# Portable .env value extraction (BSD/macOS grep lacks -P/\K).
+ARCHIVE="$(grep -E '^MUSELAB_ROOT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
 if [[ -z "$ARCHIVE" || ! -d "$ARCHIVE" ]]; then
   err "MUSELAB_ROOT in .env is missing or not a directory: '$ARCHIVE'"
   exit 1

@@ -46,6 +46,17 @@ from pathlib import Path
 # signature (typically ~88 chars). Third-party vendors either omit the
 # field entirely, ship an empty string, or use a placeholder shorter
 # than ~40 chars. We treat anything under MIN_SIG_LEN as suspect.
+#
+# FRAGILITY NOTE (known, documented — see audit D/232): this is a pure
+# LENGTH heuristic, not signature verification. It assumes Claude's real
+# signatures stay comfortably above 40 chars. If Anthropic ever ships a
+# shorter (but still valid) signature format, those legitimate Claude
+# thinking blocks would be misclassified as invalid and DROPPED here —
+# silently losing real reasoning content. We accept this because (a) we
+# can't verify the ed25519 signature ourselves without Anthropic's public
+# key, and (b) the cost of a missed strip (resume 400s) is recoverable,
+# while the current ~88 vs <40 gap is wide. If signatures shrink, revisit
+# this threshold (or switch to a vendor allowlist) before it bites.
 MIN_SIG_LEN = 40
 
 # Placeholder content block we insert when stripping all content from a
@@ -118,10 +129,22 @@ def clean_jsonl(path: Path) -> CleanupReport:
     Idempotent: running again on a clean file is a no-op (no rewrite)."""
     report = CleanupReport(path=path)
     try:
-        raw = path.read_text(encoding="utf-8")
+        # newline="" disables universal-newline translation so we can SEE the
+        # file's real terminators (read_text() would have already collapsed
+        # \r\n → \n, making CRLF undetectable). We translate to \n ourselves
+        # for parsing but remember the original ending for re-emit.
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            raw = f.read()
     except (OSError, UnicodeDecodeError) as e:
         report.error = f"read failed: {e}"
         return report
+
+    # Preserve the file's original line ending. `splitlines()` strips both
+    # \n and \r\n, and naively re-joining with "\n" would silently rewrite a
+    # CRLF file to LF (audit O/403). Treat the file as CRLF if it contains
+    # any \r\n; otherwise LF. (Anthropic's CLI tolerates either, but
+    # rewriting line endings is gratuitous and noisy in diffs / git.)
+    _newline = "\r\n" if "\r\n" in raw else "\n"
 
     new_lines: list[str] = []
     any_change = False
@@ -153,13 +176,16 @@ def clean_jsonl(path: Path) -> CleanupReport:
     if not any_change:
         return report
 
-    # Atomic write — same dir as target so rename is atomic.
+    # Atomic write — same dir as target so rename is atomic. newline=""
+    # so our explicit _newline (which may be \r\n) is written verbatim and
+    # not re-translated by text-mode newline handling.
     fd, tmp = tempfile.mkstemp(prefix=".clean.", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("\n".join(new_lines))
-            if raw.endswith("\n"):
-                f.write("\n")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(_newline.join(new_lines))
+            # Re-emit a trailing terminator iff the original had one.
+            if raw.endswith("\n"):   # covers both \n and \r\n
+                f.write(_newline)
         os.replace(tmp, path)
     except Exception as e:
         try:

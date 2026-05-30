@@ -157,6 +157,12 @@ async def _handle_ask_user_question(
         "data": json.dumps({"id": question_id, "questions": questions},
                             ensure_ascii=False),
     })
+    # FIX ⑨: the MCP-alias path (ask_user_question.py) already pushes a
+    # "Muse 需要你拍板" notification, but the SDK's built-in AskUserQuestion
+    # routes through HERE and previously pushed nothing — so a headless queued
+    # turn that hit the built-in tool left the user with no signal. Presence-
+    # gated + fire-and-forget inside.
+    auq._maybe_push_needs_input(session_id)
 
     try:
         answers = await asyncio.wait_for(fut, timeout=auq.ANSWER_TIMEOUT_S)
@@ -260,6 +266,11 @@ def build_callback_for_session(session_id: str,
                 "input": tool_input,
             }, ensure_ascii=False),
         })
+        # FIX ⑨: a tool-permission prompt is just as blocking as a question.
+        # Push the same presence-gated "needs你拍板" notification so a headless
+        # queued turn that stops on a permission card reaches the user even
+        # when no screen is open.
+        auq._maybe_push_needs_input(session_id)
 
         try:
             result = await asyncio.wait_for(fut, timeout=DECISION_TIMEOUT_S)

@@ -16,6 +16,11 @@ EnvironmentFile={{REPO_PATH}}/.env
 ExecStart={{UV_PATH}} run python -m backend.main
 Restart=on-failure
 RestartSec=10
+# Hardening: forbid the service (or any subprocess: MCP servers, skills, the
+# SDK-spawned claude CLI) from gaining new privileges via setuid/setgid/caps.
+# Zero-cost — muselab never needs to escalate. (ProtectHome is intentionally
+# omitted: the service must read/write your archive ROOT under $HOME.)
+NoNewPrivileges=true
 # Resource limits — generous but bounded
 LimitNOFILE=8192
 # Memory: MemoryHigh is the soft throttle ceiling, MemoryMax is the hard

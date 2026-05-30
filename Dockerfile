@@ -8,8 +8,10 @@
 # ---------- builder ----------
 FROM python:3.12-slim AS builder
 
-# uv: single static binary, fast resolver
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# uv: single static binary, fast resolver. Pinned (not :latest) so the image
+# is reproducible and matches the "frozen" promise of `uv sync --frozen`.
+# Bump deliberately (or via renovate/dependabot), not implicitly on rebuild.
+COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /bin/
 
 WORKDIR /app
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
@@ -30,16 +32,19 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
+    # claude-code pin — keep in lockstep with CLAUDE_CLI_VERSION in
+    # scripts/versions.env (the native installers read it from there).
     npm install -g \
-        @anthropic-ai/claude-code@latest \
-        @modelcontextprotocol/server-filesystem \
-        @modelcontextprotocol/server-memory && \
+        @anthropic-ai/claude-code@2.1.156 \
+        @modelcontextprotocol/server-filesystem@2026.1.14 \
+        @modelcontextprotocol/server-memory@2026.1.26 && \
     apt-get purge -y --auto-remove gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
 
-# uv binary (for `uvx mcp-server-fetch` / `uvx mcp-server-git`)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+# uv binary (for `uvx mcp-server-fetch` / `uvx mcp-server-git`). Pinned — keep
+# in lockstep with the builder-stage uv above.
+COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 

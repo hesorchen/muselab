@@ -16,7 +16,7 @@
   ```bash
   claude login
   ```
-  非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度 ERNIE）只需 API key——稍后在 Settings UI 内填即可，无需 CLI。
+  非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度千帆（ERNIE））只需 API key——稍后在 Settings UI 内填即可，无需 CLI。
 
 ## 安装
 
@@ -103,7 +103,7 @@ ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
 保持终端不关。然后在笔记本浏览器访问 `http://localhost:8765` 就能命中 VPS 上的
 muselab。不开防火墙、不暴露认证、零额外组件。
 
-### B. Tailscale / WireGuard（适合"常驻"远程）
+### B. Tailscale / WireGuard（适合“常驻”远程）
 
 把 VPS 和笔记本加入同一个 Tailscale 网络，访问
 `http://<vps-tailscale-ip>:8765`。tunnel 端到端加密，由 Tailscale 提供认证，

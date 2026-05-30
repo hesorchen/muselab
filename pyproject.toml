@@ -5,7 +5,7 @@ description = "Self-hosted web UI for the Claude Agent SDK — talk to your own 
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "chenxiaosen", email = "hesorchen@gmail.com" },
+    { name = "hesorchen", email = "hesorchen@gmail.com" },
 ]
 keywords = [
     "claude",

@@ -1,18 +1,15 @@
 ---
-name: csv-data-summarizer
-description: Analyzes CSV files, generates summary stats, and plots quick visualizations using Python and pandas.
-metadata:
-  version: 2.1.0
-  dependencies: python>=3.8, pandas>=2.0.0, matplotlib>=3.7.0, seaborn>=0.12.0
+name: csv-analyzer
+description: USE WHEN a user shares or references a CSV file and wants it summarized, analyzed, or visualized — produces data overview, summary statistics, missing-data report, and relevant charts using built-in tools (Read + Bash running Python/pandas).
 ---
 
-# CSV Data Summarizer
+# CSV Analyzer
 
-This Skill analyzes CSV files and provides comprehensive summaries with statistical insights and visualizations.
+This Skill analyzes CSV files and provides comprehensive summaries with statistical insights and visualizations, using your built-in tools — no bundled scripts required.
 
 ## When to Use This Skill
 
-Claude should use this Skill whenever the user:
+Use this Skill whenever the user:
 - Uploads or references a CSV file
 - Asks to summarize, analyze, or visualize tabular data
 - Requests insights from CSV data
@@ -20,26 +17,36 @@ Claude should use this Skill whenever the user:
 
 ## How It Works
 
-## ⚠️ CRITICAL BEHAVIOR REQUIREMENT ⚠️
+### Default behavior
 
-**DO NOT ASK THE USER WHAT THEY WANT TO DO WITH THE DATA.**
-**DO NOT OFFER OPTIONS OR CHOICES.**
-**DO NOT SAY "What would you like me to help you with?"**
-**DO NOT LIST POSSIBLE ANALYSES.**
+By default, run the analysis directly — don't make the user pick from a menu of options first. Read the file, inspect its structure, and present a complete summary with relevant charts.
 
-**IMMEDIATELY AND AUTOMATICALLY:**
-1. Run the comprehensive analysis
-2. Generate ALL relevant visualizations
-3. Present complete results
-4. NO questions, NO options, NO waiting for user input
+The one exception: if the data is genuinely ambiguous (e.g., unclear what a column means, multiple plausible date formats, or it's unclear whether a value is the metric of interest), ask a single short clarifying question, then proceed. This keeps the skill fast while staying consistent with muselab's "ask when ambiguous" stance.
 
-**THE USER WANTS A FULL ANALYSIS RIGHT AWAY - JUST DO IT.**
+### How to run the analysis
 
-### Automatic Analysis Steps:
+Use the built-in tools directly — there is no separate script to call:
+- Use **Read** to peek at the first rows and understand the columns.
+- Use **Bash** to run inline Python (pandas, and matplotlib/seaborn if available) for stats and charts.
 
-**The skill intelligently adapts to different data types and industries by inspecting the data first, then determining what analyses are most relevant.**
+A typical inline analysis looks like:
 
-1. **Load and inspect** the CSV file into pandas DataFrame
+```bash
+python3 - <<'PY'
+import pandas as pd
+df = pd.read_csv("data.csv")
+print(df.shape)
+print(df.dtypes)
+print(df.describe(include="all"))
+print(df.isna().sum())
+PY
+```
+
+For charts, save figures to PNG files (e.g. `plt.savefig("trend.png")`) and reference them in your summary.
+
+### Analysis steps
+
+1. **Load and inspect** the CSV file into a pandas DataFrame
 2. **Identify data structure** - column types, date columns, numeric columns, categories
 3. **Determine relevant analyses** based on what's actually in the data:
    - **Sales/E-commerce data** (order dates, revenue, products): Time-series trends, revenue analysis, product performance
@@ -50,9 +57,9 @@ Claude should use this Skill whenever the user:
    - **Generic tabular data**: Adapts based on column types found
 
 4. **Only create visualizations that make sense** for the specific dataset:
-   - Time-series plots ONLY if date/timestamp columns exist
-   - Correlation heatmaps ONLY if multiple numeric columns exist
-   - Category distributions ONLY if categorical columns exist
+   - Time-series plots only if a date/timestamp column exists
+   - Correlation heatmaps only if multiple numeric columns exist
+   - Category distributions only if categorical columns exist
    - Histograms for numeric distributions when relevant
    
 5. **Generate comprehensive output** automatically including:
@@ -72,42 +79,18 @@ Claude should use this Skill whenever the user:
 
 ### Behavior Guidelines
 
-✅ **CORRECT APPROACH - SAY THIS:**
-- "I'll analyze this data comprehensively right now."
-- "Here's the complete analysis with visualizations:"
-- "I've identified this as [type] data and generated relevant insights:"
-- Then IMMEDIATELY show the full analysis
+**Do:**
+- Lead with the analysis itself rather than a menu of options
+- Generate the relevant charts automatically
+- Be thorough and complete in the first response
+- Save charts to files and reference them in the summary
 
-✅ **DO:**
-- Immediately run the analysis script
-- Generate ALL relevant charts automatically
-- Provide complete insights without being asked
-- Be thorough and complete in first response
-- Act decisively without asking permission
+**Avoid:**
+- Stalling with "What would you like me to do?" when the intent is clearly "analyze this"
+- Listing options for the user to choose from instead of just analyzing
+- Providing a partial analysis that forces a follow-up
 
-❌ **NEVER SAY THESE PHRASES:**
-- "What would you like to do with this data?"
-- "What would you like me to help you with?"
-- "Here are some common options:"
-- "Let me know what you'd like help with"
-- "I can create a comprehensive analysis if you'd like!"
-- Any sentence ending with "?" asking for user direction
-- Any list of options or choices
-- Any conditional "I can do X if you want"
-
-❌ **FORBIDDEN BEHAVIORS:**
-- Asking what the user wants
-- Listing options for the user to choose from
-- Waiting for user direction before analyzing
-- Providing partial analysis that requires follow-up
-- Describing what you COULD do instead of DOING it
-
-### Usage
-
-The Skill provides a Python function `summarize_csv(file_path)` that:
-- Accepts a path to a CSV file
-- Returns a comprehensive text summary with statistics
-- Generates multiple visualizations automatically based on data structure
+**Ask first only when:** the data is genuinely ambiguous (unclear column meaning, ambiguous date format, or unclear target metric) — then ask one short question and proceed.
 
 ### Example Prompts
 
@@ -133,17 +116,19 @@ The Skill provides a Python function `summarize_csv(file_path)` that:
 - Peak activity in Q4
 *(Attached: trend plot)*
 
-## Files
+## Dependencies
 
-- `analyze.py` - Core analysis logic
-- `requirements.txt` - Python dependencies
-- `resources/sample.csv` - Example dataset for testing
-- `resources/README.md` - Additional documentation
+Uses your built-in Read and Bash tools. The inline Python relies on:
+
+- `pandas` (required) — `pip install pandas`
+- `matplotlib` / `seaborn` (optional, for charts) — `pip install matplotlib seaborn`
+
+If a charting library is missing, still produce the statistical summary and note that charts were skipped.
 
 ## Notes
 
-- Automatically detects date columns (columns containing 'date' in name)
-- Handles missing data gracefully
-- Generates visualizations only when date columns are present
-- All numeric columns are included in statistical summary
+- Detects date columns by dtype and by name (columns containing 'date'/'time'); parse with `pd.to_datetime` when needed
+- Handles missing data gracefully and reports it explicitly
+- Produces a chart only when the data supports it — time-series needs a date column, correlation heatmaps need multiple numeric columns, etc.
+- All numeric columns are included in the statistical summary
 

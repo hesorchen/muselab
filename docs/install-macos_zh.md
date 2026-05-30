@@ -17,7 +17,7 @@
   ```bash
   claude login
   ```
-  会把 OAuth 写到 `~/.claude/`，agent 复用之。非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度 ERNIE）只需 API key——稍后在 Settings UI 里填。
+  会把 OAuth 写到 `~/.claude/`，agent 复用之。非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度千帆（ERNIE））只需 API key——稍后在 Settings UI 里填。
 
 ## 安装
 

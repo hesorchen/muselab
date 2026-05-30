@@ -19,7 +19,7 @@ else
 fi
 
 # Some launchctl versions also need an explicit bootout
-if launchctl list | grep -q com.muselab; then
+if launchctl list 2>/dev/null | grep -q com.muselab; then
   launchctl bootout "gui/$(id -u)/com.muselab" 2>/dev/null || true
 fi
 

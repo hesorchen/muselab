@@ -110,6 +110,18 @@ def _save_index(items: list[dict]) -> None:
 # is non-reentrant but no mutator calls another while holding it.
 _INDEX_LOCK = threading.Lock()
 
+# Same rationale as _INDEX_LOCK, but for the per-session sidecar files
+# (annotations + pending attachments). set_message_annotation /
+# append_pending_attachments / consume_one_pending_attachments each do
+# _load_sidecar → mutate → _save_sidecar; FastAPI runs sync handlers in a
+# threadpool, so a turn-done cost-annotation write can interleave with a
+# heartbeat GET /sessions/{sid} that runs consume_one_pending — the second
+# save would clobber the first's mutation (lost annotation / attachment).
+# atomic_write_text only guarantees a single write isn't torn; it can't stop
+# a lost update across the read-modify-write. One coarse lock is fine — the
+# sidecars are tiny and the critical sections are sub-millisecond.
+_SIDECAR_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # list_sessions() TTL cache
@@ -379,6 +391,12 @@ def delete_session(sid: str) -> bool:
             p.unlink()
         except OSError:
             pass
+    q = _queue_path(sid)
+    if q.exists():
+        try:
+            q.unlink()
+        except OSError:
+            pass
     return True
 
 
@@ -422,6 +440,12 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
         if p.exists():
             try:
                 p.unlink()
+            except OSError:
+                pass
+        q = _queue_path(sid)
+        if q.exists():
+            try:
+                q.unlink()
             except OSError:
                 pass
         if ROOT is not None:
@@ -495,14 +519,15 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     """Update one message's annotations (cost, model, images, etc.).
     Fields with value None are skipped (use update with explicit empty
     if you want to clear). Atomic per-call write."""
-    data = _load_sidecar(sid)
-    msgs = data.setdefault("messages", {})
-    cur = msgs.setdefault(msg_uuid, {})
-    for k, v in fields.items():
-        if v is None:
-            continue
-        cur[k] = v
-    _save_sidecar(sid, data)
+    with _SIDECAR_LOCK:
+        data = _load_sidecar(sid)
+        msgs = data.setdefault("messages", {})
+        cur = msgs.setdefault(msg_uuid, {})
+        for k, v in fields.items():
+            if v is None:
+                continue
+            cur[k] = v
+        _save_sidecar(sid, data)
 
 
 # Hard cap on pending_attachments to prevent unbounded sidecar growth.
@@ -539,47 +564,49 @@ def append_pending_attachments(sid: str, images: list[dict] | None = None,
     if not images and not docs:
         return
     now_ms = int(__import__("time").time() * 1000)
-    data = _load_sidecar(sid)
-    pend = data.setdefault("pending_attachments", [])
-    # GC stale entries first (age them out by ts).
-    cutoff = now_ms - _PENDING_ATTACH_TTL_MS
-    if pend and any((p.get("ts") or 0) < cutoff for p in pend):
-        pend = [p for p in pend if (p.get("ts") or 0) >= cutoff]
-        data["pending_attachments"] = pend
-    pend.append({
-        "ts": now_ms,
-        "images": images or [],
-        "docs": docs or [],
-    })
-    # Hard cap — drop oldest (FIFO) so the freshest are kept for the
-    # next consume call.
-    if len(pend) > _PENDING_ATTACH_CAP:
-        del pend[: len(pend) - _PENDING_ATTACH_CAP]
-    _save_sidecar(sid, data)
+    with _SIDECAR_LOCK:
+        data = _load_sidecar(sid)
+        pend = data.setdefault("pending_attachments", [])
+        # GC stale entries first (age them out by ts).
+        cutoff = now_ms - _PENDING_ATTACH_TTL_MS
+        if pend and any((p.get("ts") or 0) < cutoff for p in pend):
+            pend = [p for p in pend if (p.get("ts") or 0) >= cutoff]
+            data["pending_attachments"] = pend
+        pend.append({
+            "ts": now_ms,
+            "images": images or [],
+            "docs": docs or [],
+        })
+        # Hard cap — drop oldest (FIFO) so the freshest are kept for the
+        # next consume call.
+        if len(pend) > _PENDING_ATTACH_CAP:
+            del pend[: len(pend) - _PENDING_ATTACH_CAP]
+        _save_sidecar(sid, data)
 
 
 def consume_one_pending_attachments(sid: str, msg_uuid: str) -> dict | None:
     """Pop the oldest pending bundle and bind it to `msg_uuid` as a
     normal annotation. Returns the bundle (or None if no pending /
     already bound). Idempotent."""
-    data = _load_sidecar(sid)
-    msgs = data.setdefault("messages", {})
-    cur = msgs.setdefault(msg_uuid, {})
-    if cur.get("images") or cur.get("docs"):
-        return None  # already bound elsewhere
-    pend = data.get("pending_attachments") or []
-    if not pend:
-        return None
-    first = pend[0]
-    images = first.get("images") or []
-    docs = first.get("docs") or []
-    if images:
-        cur["images"] = images
-    if docs:
-        cur["docs"] = docs
-    data["pending_attachments"] = pend[1:]
-    _save_sidecar(sid, data)
-    return first
+    with _SIDECAR_LOCK:
+        data = _load_sidecar(sid)
+        msgs = data.setdefault("messages", {})
+        cur = msgs.setdefault(msg_uuid, {})
+        if cur.get("images") or cur.get("docs"):
+            return None  # already bound elsewhere
+        pend = data.get("pending_attachments") or []
+        if not pend:
+            return None
+        first = pend[0]
+        images = first.get("images") or []
+        docs = first.get("docs") or []
+        if images:
+            cur["images"] = images
+        if docs:
+            cur["docs"] = docs
+        data["pending_attachments"] = pend[1:]
+        _save_sidecar(sid, data)
+        return first
 
 
 # ============================================================================
@@ -629,3 +656,148 @@ def bump_session(sid: str, message_count: int | None = None,
                         s["auto_named"] = False
                 _save_index(idx)
                 return
+
+
+# ============================================================================
+# Per-session message queue (server-side — drives autonomous draining)
+# ============================================================================
+# Stored in its OWN file (`{sid}.queue.json`), not the annotations sidecar,
+# because the annotations sidecar is rewritten on every turn-done and every
+# pending-attachment consume; mixing the queue in would widen the lost-update
+# window between a queue mutation and an annotation write. A dedicated file +
+# lock keeps the two independent.
+#
+# Shape: {"items": [{"id","text","image_ids","enqueued_at"}], "paused": bool}
+#   - items: FIFO; head is sent next by the drain trigger in chat.py
+#   - paused: set True when a queued turn errors / hits ask_user_question /
+#     is user-cancelled; auto-drain stops until the user resumes
+#
+# Attachment caveat: image_ids reference the in-memory _image_store in chat.py
+# which expires entries after 10 min. A long-queued item's attachments may be
+# gone by drain time — _start_turn silently skips expired ids and sends the
+# text alone. (Mirrors the frontend's prior choice not to persist attachment
+# blobs in the queue.)
+_QUEUE_LOCK = threading.Lock()
+_QUEUE_MAX = 10   # mirror the frontend cap
+
+
+def _queue_path(sid: str) -> Path:
+    return SESS_DIR / f"{sid}.queue.json"
+
+
+def _load_queue(sid: str) -> dict:
+    p = _queue_path(sid)
+    if not p.exists():
+        return {"items": [], "paused": False}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        d.setdefault("items", [])
+        d.setdefault("paused", False)
+        if not isinstance(d["items"], list):
+            d["items"] = []
+        return d
+    except Exception:
+        return {"items": [], "paused": False}
+
+
+def _save_queue(sid: str, data: dict) -> None:
+    # An empty, un-paused queue leaves no file behind (avoids littering
+    # sessions/ with thousands of empty queue.json files over time).
+    if not data.get("items") and not data.get("paused"):
+        p = _queue_path(sid)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return
+    atomic_write_text(_queue_path(sid), json.dumps(data, ensure_ascii=False))
+
+
+def get_queue(sid: str) -> dict:
+    """Return the current queue snapshot: {'items': [...], 'paused': bool}."""
+    with _QUEUE_LOCK:
+        return _load_queue(sid)
+
+
+def enqueue_message(sid: str, text: str, image_ids: str = "") -> dict:
+    """Append a message to the session's queue. Returns
+    {'ok': bool, 'item'?: dict, 'queue': dict, 'error'?: str}. Rejects past
+    _QUEUE_MAX (mirrors frontend cap)."""
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        if len(data["items"]) >= _QUEUE_MAX:
+            return {"ok": False, "error": "queue_full", "queue": data}
+        item = {
+            "id": "q-" + uuid.uuid4().hex[:8],
+            "text": text or "",
+            "image_ids": image_ids or "",
+            "enqueued_at": int(time.time() * 1000),
+        }
+        data["items"].append(item)
+        _save_queue(sid, data)
+        return {"ok": True, "item": item, "queue": data}
+
+
+def dequeue_message(sid: str) -> dict | None:
+    """Pop + return the head item (FIFO) IF the queue is non-empty and not
+    paused; else None. Called by the drain trigger after a turn completes."""
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        if data.get("paused") or not data["items"]:
+            return None
+        item = data["items"].pop(0)
+        _save_queue(sid, data)
+        return item
+
+
+def requeue_head(sid: str, item: dict) -> dict:
+    """Re-insert a previously-dequeued item at the HEAD of the queue (FIFO
+    restore). Used by the drain trigger when it loses the _active_turns race
+    or fails to start the turn — so the item isn't silently dropped. Bypasses
+    the _QUEUE_MAX cap (it's restoring an item that was already accepted)."""
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        data["items"].insert(0, item)
+        _save_queue(sid, data)
+        return data
+
+
+def remove_queue_item(sid: str, item_id: str) -> dict:
+    """Remove one item by id. Returns the updated queue snapshot."""
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        data["items"] = [it for it in data["items"] if it.get("id") != item_id]
+        _save_queue(sid, data)
+        return data
+
+
+def clear_queue(sid: str) -> None:
+    """Drop all items + clear the paused flag (removes the file)."""
+    with _QUEUE_LOCK:
+        _save_queue(sid, {"items": [], "paused": False})
+
+
+def set_queue_paused(sid: str, paused: bool) -> dict:
+    """Set the paused flag. Returns the updated queue snapshot. Resuming
+    (paused=False) does NOT itself drain — the caller kicks the drain."""
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        data["paused"] = bool(paused)
+        _save_queue(sid, data)
+        return data
+
+
+def reorder_queue(sid: str, order: list[str]) -> dict:
+    """Reorder items to match `order` (list of item ids). Ids not present in
+    `order` are appended in their existing relative order (defensive)."""
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        by_id = {it["id"]: it for it in data["items"]}
+        new = [by_id[i] for i in order if i in by_id]
+        for it in data["items"]:
+            if it["id"] not in order:
+                new.append(it)
+        data["items"] = new
+        _save_queue(sid, data)
+        return data

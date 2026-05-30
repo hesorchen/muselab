@@ -37,10 +37,16 @@ if ! uv lock --upgrade-package claude-agent-sdk; then
 fi
 uv sync --frozen
 NEW_SDK="$(uv pip show claude-agent-sdk 2>/dev/null | awk '/^Version:/{print $2}')"
-if [[ "$CUR_SDK" == "$NEW_SDK" ]]; then
+if [[ -z "$NEW_SDK" ]]; then
+  # `uv pip show` reads the active venv; empty here means it couldn't resolve
+  # the installed version (no .venv yet / uv layout changed). Don't claim
+  # "already latest" off two empty strings — uv lock/sync above did run.
+  warn "couldn't read installed claude-agent-sdk version (uv pip show empty)"
+  warn "  uv lock --upgrade-package + uv sync ran; verify with: uv pip show claude-agent-sdk"
+elif [[ "$CUR_SDK" == "$NEW_SDK" ]]; then
   ok "claude-agent-sdk already at latest ($NEW_SDK)"
 else
-  ok "claude-agent-sdk: $CUR_SDK → $NEW_SDK"
+  ok "claude-agent-sdk: ${CUR_SDK:-(none)} → $NEW_SDK"
 fi
 
 # ----- Bump CLI -----------------------------------------------------------
@@ -58,10 +64,18 @@ fi
 
 # ----- Smoke test ---------------------------------------------------------
 bold "Running tests to catch SDK API breaks"
-if uv run pytest tests/ -q 2>&1 | tail -3; then
+# Capture full output to a log so a failure shows WHICH test broke (a bare
+# `| tail -3` hid that). On success we still print only a short tail.
+TEST_LOG="$(mktemp -t muselab-upgrade-pytest.XXXXXX)"
+if uv run pytest tests/ -q >"$TEST_LOG" 2>&1; then
+  tail -3 "$TEST_LOG"
   ok "tests pass against new SDK"
+  rm -f "$TEST_LOG"
 else
-  err "tests FAILED — rollback recommended: git checkout uv.lock pyproject.toml && uv sync"
+  err "tests FAILED — full output below:"
+  cat "$TEST_LOG" >&2
+  err "(saved at $TEST_LOG)"
+  err "rollback recommended: git checkout uv.lock pyproject.toml && uv sync"
   exit 1
 fi
 

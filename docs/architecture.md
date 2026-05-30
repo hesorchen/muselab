@@ -4,11 +4,11 @@
 
 ```mermaid
 flowchart TB
-  subgraph Browser["Browser · ~21k LOC vanilla HTML + Alpine.js + CSS"]
+  subgraph Browser["Browser · ~25k LOC vanilla HTML + Alpine.js + CSS"]
     F[📁 files] --- P[📄 preview + tabs] --- C[💬 chat + multi-model]
   end
   Browser ==>|HTTP / SSE| BE
-  subgraph BE["Backend · FastAPI ~10k LOC"]
+  subgraph BE["Backend · FastAPI ~12k LOC"]
     A["/api/files/*<br/>safe-resolve · read/write/grep"]
     B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model)"]
   end
@@ -21,7 +21,7 @@ flowchart TB
   V --> KM[Kimi]
   V --> QW[Qwen]
   V --> XM[Xiaomi MiMo]
-  V --> QF[Baidu Qianfan]
+  V --> QF[Baidu Qianfan (ERNIE)]
 ```
 
 ## Key design decisions

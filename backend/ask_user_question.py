@@ -30,7 +30,52 @@ _pending: dict[tuple[str, str], asyncio.Future] = {}
 _session_queues: dict[str, asyncio.Queue] = {}
 
 # How long to wait for a user answer before timing out the tool call.
-ANSWER_TIMEOUT_S = 600
+# Aligned with chat.py's BG_TIMEOUT_S (30-min turn ceiling): a headless
+# queued turn (Option B) may hit a question with nobody watching. Per the
+# product decision it HANGS here until the user comes back to answer, capped
+# at the same 30 min the whole turn is capped at — so the question can't
+# outlive its turn. (Was 600s/10min when every turn had a live browser;
+# headless execution needs the longer human-response window.)
+ANSWER_TIMEOUT_S = 1800
+
+
+def _maybe_push_needs_input(session_id: str) -> None:
+    """Push 'Muse 需要你拍板' when a turn hits ask_user_question and the user
+    isn't at any screen (headless queued turn, Option B). Presence-gated +
+    best-effort + fire-and-forget — never blocks the awaiting handler. If the
+    user IS active they'll see the question in-app, so no push.
+
+    Imports are lazy + local to dodge any import cycle (chat → this module)
+    and to keep this file importable in tests without the push stack."""
+    async def _go():
+        try:
+            from . import presence as _presence
+            if _presence.recently_active():
+                return
+            from . import push as _push
+            from . import sessions as _sess
+            sname = ""
+            try:
+                for s in _sess.list_sessions():
+                    if s.get("id") == session_id:
+                        sname = s.get("name", "")
+                        break
+            except Exception:
+                pass
+            await asyncio.to_thread(
+                _push.send_to_all,
+                title=sname or "muselab",
+                body="Muse 需要你拍板",
+                url=f"/?session={session_id}",
+                tag=f"needs-input-{session_id}",
+            )
+        except Exception as e:
+            import sys
+            sys.stderr.write(f"[ask] needs-input push failed: {e}\n")
+    try:
+        asyncio.get_running_loop().create_task(_go())
+    except RuntimeError:
+        pass  # no running loop — nothing to do
 
 
 def _normalize_questions(raw: list) -> list[dict]:
@@ -159,6 +204,18 @@ def build_server_for_session(session_id: str):
             "[{label, description}, ...]}, ...]} where header is a <12-char chip tag, "
             "and each option has a 1-5 word label + short description."
         ),
+        # Schema is DELIBERATELY loose ({"questions": list}) rather than a
+        # strict JSON Schema. Models frequently emit malformed shapes here —
+        # `options: ["yes","no"]` (bare strings), `[{text: ...}]` (wrong key),
+        # or a missing `multiSelect`. A strict schema would make the SDK
+        # harness REJECT those tool calls outright, leaving the user staring
+        # at the question text with no buttons and no error. Instead we accept
+        # anything list-shaped and repair it in `_normalize_questions` below,
+        # so a slightly-wrong tool call still renders. Tightening only the
+        # top-level (questions must be a non-empty list) would be safe, but
+        # the SDK's `{key: type}` mini-schema can't express "non-empty" — the
+        # handler already returns a clean is_error for empty/unusable input,
+        # which covers it. See 2026-05-21 frontend feedback + audit E/250.
         {"questions": list},
     )
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
@@ -205,13 +262,19 @@ def build_server_for_session(session_id: str):
             "data": json.dumps({"id": question_id, "questions": questions},
                                 ensure_ascii=False),
         })
+        # Headless-turn nudge: if nobody's at a screen, push so the user knows
+        # Muse is blocked on their decision. The question already sits in the
+        # session's broadcast buffer, so opening the session later replays it
+        # and they can answer — as long as we're still within the timeout
+        # window below. (Browser present → no push; they see it in-app.)
+        _maybe_push_needs_input(session_id)
 
         try:
             answers = await asyncio.wait_for(fut, timeout=ANSWER_TIMEOUT_S)
         except asyncio.TimeoutError:
             return {
                 "content": [{"type": "text",
-                              "text": "User did not respond within 10 minutes."}],
+                              "text": "User did not respond within 30 minutes."}],
                 "is_error": True,
             }
         except asyncio.CancelledError:

@@ -21,14 +21,24 @@ ok()   { printf '\033[32m  [+] %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m  [!] %s\033[0m\n' "$*"; }
 err()  { printf '\033[31m  [x] %s\033[0m\n' "$*" >&2; }
 ask()  {
-  local q="$1" def="${2:-}"
+  # Use a local var (not the global $REPLY) so callers that themselves read
+  # into $REPLY after calling ask() don't get clobbered.
+  local q="$1" def="${2:-}" ans
   local prompt
   if [[ -n "$def" ]]; then prompt="$q [$def]: "; else prompt="$q: "; fi
-  read -r -p "$prompt" REPLY
-  echo "${REPLY:-$def}"
+  read -r -p "$prompt" ans
+  echo "${ans:-$def}"
 }
 
 bold "muselab — VPS HTTPS setup via Caddy"
+
+# This script is Linux-only (apt/Caddy/systemd/GNU sed -i). Guard up front so
+# a macOS user doesn't hit a cryptic GNU `sed -i` / apt-get failure mid-run.
+if [[ "$(uname -s)" != "Linux" ]]; then
+  err "setup-https.sh is Linux-only (apt + Caddy + systemd). Detected: $(uname -s)."
+  err "  On macOS, put muselab behind your own reverse proxy / tunnel instead."
+  exit 1
+fi
 
 # ----- 1. Verify prereqs ---------------------------------------------------
 if [[ ! -f .env ]]; then
@@ -82,8 +92,19 @@ if ! command -v caddy >/dev/null 2>&1; then
   bold "Installing Caddy"
   sudo apt-get update -qq
   sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+  # --fail (the `f` in -1sLf) makes curl exit non-zero on HTTP errors so a
+  # 404/HTML error page can't be piped into gpg as a bogus "key". With
+  # pipefail set, a curl failure aborts the whole pipeline. Verify the
+  # dearmored keyring is non-empty before trusting it.
+  KEYRING=/usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    | sudo gpg --dearmor -o "$KEYRING"
+  if ! sudo test -s "$KEYRING"; then
+    err "Caddy GPG key download/dearmor produced an empty keyring — aborting."
+    err "  Check network access to dl.cloudsmith.io and retry."
+    sudo rm -f "$KEYRING"
+    exit 1
+  fi
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
     | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
   sudo apt-get update -qq
@@ -114,9 +135,11 @@ ${HOST} {
 EOF
 ok "wrote $SNIPPET"
 
-# Ensure main Caddyfile imports conf.d
-if ! sudo grep -q "conf.d" /etc/caddy/Caddyfile 2>/dev/null; then
-  echo "import /etc/caddy/conf.d/*.caddy" | sudo tee -a /etc/caddy/Caddyfile > /dev/null
+# Ensure main Caddyfile imports conf.d. Match the exact import directive (not a
+# fuzzy "conf.d" substring, which a comment mentioning conf.d would falsely hit).
+IMPORT_LINE="import /etc/caddy/conf.d/*.caddy"
+if ! sudo grep -qxF "$IMPORT_LINE" /etc/caddy/Caddyfile 2>/dev/null; then
+  echo "$IMPORT_LINE" | sudo tee -a /etc/caddy/Caddyfile > /dev/null
   ok "added 'import conf.d' to /etc/caddy/Caddyfile"
 fi
 

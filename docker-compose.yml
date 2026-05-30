@@ -28,6 +28,21 @@ services:
       - ${ARCHIVE_DIR:-./data}:/data
       # Reuse the host's claude CLI OAuth credentials.
       # Default: ~/.claude. Override CLAUDE_HOME in .env for non-standard locations.
+      #
+      # SECURITY NOTE — this mount is read-WRITE on purpose, and that has a real
+      # blast radius: ~/.claude/.credentials.json holds your Pro/Max OAuth
+      # tokens, and the container (which runs an LLM agent that can execute
+      # tools) can read them. A read-only (`:ro`) mount is NOT a drop-in fix —
+      # the CLI needs write access to (a) refresh the OAuth token when it
+      # expires and (b) write session history under ~/.claude/projects/. Making
+      # the whole dir `:ro` breaks token refresh and session persistence.
+      #
+      # To reduce exposure on a shared/hostile host, mount ONLY the subpaths the
+      # CLI actually needs instead of the whole home dir, e.g.:
+      #   - ${CLAUDE_HOME:-${HOME}/.claude}/.credentials.json:/home/muse/.claude/.credentials.json
+      #   - ${CLAUDE_HOME:-${HOME}/.claude}/projects:/home/muse/.claude/projects
+      # That keeps the rest of ~/.claude (settings, other secrets) off the
+      # container. See SECURITY.md.
       - ${CLAUDE_HOME:-${HOME}/.claude}:/home/muse/.claude
       # Persist chat sessions across container recreations.
       - ./sessions:/app/sessions

@@ -18,7 +18,7 @@ yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 echo "== Check 1: Python read_text/write_text without encoding =="
 # Multi-line tolerant: match the call, then look 0–3 lines for `encoding=`.
 violations=$(
-  grep -rnP --include="*.py" '\b(read_text|write_text)\s*\(' backend/ 2>/dev/null \
+  grep -rnE --include="*.py" '(^|[^A-Za-z0-9_])(read_text|write_text)[[:space:]]*\(' backend/ 2>/dev/null \
     | grep -v __pycache__ \
     | while IFS=: read -r f ln rest; do
         # Read lines f starting at $ln through $((ln+3)) and check encoding=

@@ -14,11 +14,15 @@
   built-in AI assistant).
 - 🤖 **Full agent loop on every model.** MCP / Skills / Subagents / plan
   mode work the same on Claude, DeepSeek, GLM, MiniMax, Kimi, Qwen,
-  Xiaomi MiMo, Baidu ERNIE.
+  Xiaomi MiMo, Baidu Qianfan (ERNIE).
 - 💸 **Reuse your Claude Pro / Max subscription** via OAuth — no
   per-token billing. Or bring a vendor API key.
 - 🔄 **Multi-device, one server.** Phone / tablet / desktop share
-  sessions; archive never leaves your host.
+  sessions; install as a PWA and get Web Push notifications when a turn or
+  scheduled task finishes; archive never leaves your host.
+- ⏰ **Scheduled prompts.** Run a saved prompt on a daily / weekly /
+  monthly / one-off schedule; results land in a bell-badge drawer and can
+  push to your phone.
 - 🛠 **No build step.** Vanilla HTML + Alpine.js + CSS, served as static
   files — edit, refresh, done.
 
@@ -63,6 +67,7 @@ For prerequisites, Docker, dev mode and per-OS detail, see
 [Providers](docs/providers.md) ·
 [Architecture](docs/architecture.md) ·
 [Mobile (PWA)](docs/mobile.md) ·
+[Scheduled tasks](docs/scheduler.md) ·
 [Security](SECURITY.md) ·
 [How it compares](docs/comparison.md) ·
 [The nine Muses](docs/muses.md) ·

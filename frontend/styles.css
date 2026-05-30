@@ -213,7 +213,17 @@ html[data-theme="light"] {
   --c-btn-primary-hover: #1e40af;              /* white = 8.72 */
   --c-on-accent: #ffffff;
 
-  --c-success: #16a34a;
+  /* Lifted from #16a34a (3.02–3.30:1 on light bg, fails WCAG AA where
+     used as text: settings-badge.ok, cmd-palette type-session). #166534
+     clears 6.52–6.88 and matches the green already used by bash-meta.ok
+     / task-log done. */
+  --c-success: #166534;
+  /* Token chips render text on bg-2 with no fill. The dark-theme values
+     fail WCAG AA here — esp. --c-token-cache (#059669 = 3.45:1). Deepen
+     all three: in 7.98 / out 8.22 / cache 7.03 on light bg-2. */
+  --c-token-in:    #1e40af;
+  --c-token-out:   #5b21b6;
+  --c-token-cache: #065f46;
   /* Light theme override for warn / warning. Original #d97706 / #f59e0b
      hit only 3.07 / 2.07 vs bg-1 — failed WCAG AA on every muted-text
      surface (editor-status .dirty, settings-hint.warn, conn-banner
@@ -267,7 +277,14 @@ html[data-theme="eyecare"] {
   --c-btn-primary-hover: #2d5239;             /* white = 8.83 */
   --c-on-accent: #ffffff;
 
-  --c-success: #4a8f4a;
+  /* Lifted from #4a8f4a (3.04–3.25:1 on warm bg, fails WCAG AA as text).
+     #2f6a2f clears 5.02–5.37 and keeps the muted-sage feel. */
+  --c-success: #2f6a2f;
+  /* Token chips on warm bg-2 — dark-theme values all fail AA here.
+     Deepen: in 6.73 / out 6.93 / cache 5.92 on eyecare bg-2. */
+  --c-token-in:    #1e40af;
+  --c-token-out:   #5b21b6;
+  --c-token-cache: #065f46;
   /* Eyecare override for warn / warning. Original #b08030 / #f59e0b
      hit only 2.89 / 1.77 vs the warm-beige bg-1 — invisible. #92500a
      (same value as light theme) clears 5.13 on bg-1 / 4.80 on bg-2,
@@ -282,7 +299,9 @@ html[data-theme="eyecare"] {
   --c-user-fg: #3a5a30;
   --c-assistant-bg: #efe9d6;
   --c-tool-bg: #f0e8d0;
-  --c-tool-fg: #8a6a38;
+  /* Lifted from #8a6a38 (4.09:1 on tool-bg, just under WCAG AA). .tool
+     renders this as body text, so deepen to #6f5226 (5.89:1). */
+  --c-tool-fg: #6f5226;
   --c-thinking-bg: #e8e8d8;
   --c-thinking-fg: #5a6a4a;
 }
@@ -342,6 +361,11 @@ button.btn-ghost { background: transparent; border-color: transparent; color: va
 button.btn-ghost:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
 button.btn-ghost.xs, button.btn-primary.xs {
   padding: 2px 8px; font-size: var(--fs-xs); margin-left: 6px;
+}
+/* Compact save button in the preview-pane toolbar — was an inline style
+   (padding:4px 12px;font-size:12px), tokenized to match the design system. */
+button.btn-primary.btn-compact {
+  padding: var(--sp-1) var(--sp-3); font-size: var(--fs-sm);
 }
 button:disabled { opacity: 0.35; cursor: not-allowed; }
 
@@ -576,13 +600,24 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
     grid-template-rows: 1fr calc(48px + env(safe-area-inset-bottom)) !important;
     transition: grid-template-rows var(--t-base);
   }
-  /* Hide every pane by default; show only the one matching the active tab. */
+  /* Hide every pane by default; show only the one matching the active tab.
+     `!important` on the active pane is load-bearing: leftOpen/rightOpen are
+     persisted from DESKTOP use, where collapsing a side pane sets them false
+     and adds `.pane-hidden` (display:none !important). On mobile the bottom
+     tab bar — NOT leftOpen/rightOpen — owns pane visibility, but without
+     !important here the persisted `.pane-hidden` wins and the Files/Chat tab
+     renders a blank pane (no file tree, no search box). Re-assert. */
   .layout .pane { display: none; }
-  .layout[data-mobile-tab="files"]   .pane.files   { display: flex; grid-column: 1; }
-  .layout[data-mobile-tab="preview"] .pane.preview { display: flex; grid-column: 1; }
-  .layout[data-mobile-tab="chat"]    .pane.chat    { display: flex; grid-column: 1; }
+  .layout[data-mobile-tab="files"]   .pane.files   { display: flex !important; grid-column: 1; }
+  .layout[data-mobile-tab="preview"] .pane.preview { display: flex !important; grid-column: 1; }
+  .layout[data-mobile-tab="chat"]    .pane.chat    { display: flex !important; grid-column: 1; }
   /* Drop the resizer bars (they belong to columns we no longer render) */
   .layout .resizer { display: none; }
+  /* Hide the trash footer entirely on mobile. Its only live affordance on
+     touch was click-to-open-trash (drag-to-delete is dead — HTML5 DnD never
+     fires on touchscreens). Per product call, drop it: deletion already has
+     a 6s Undo toast, and removing the dead drag target declutters the pane. */
+  .files-foot { display: none !important; }
   /* Show the tab bar */
   .mobile-tab-bar { display: flex; }
   /* Pane height: viewport - tab bar. dvh for mobile Safari address-bar collapse;
@@ -699,10 +734,12 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      two lines. Surgical strikes:
      ============================================================ */
 
-  /* Files pane head: drop upload / mkdir / hidden-toggle / refresh /
-     theme. User asks Muse for new dirs; pull-to-refresh covers reload
-     (planned); theme moves to Settings. Title stays. */
-  .pane.files .pane-head .icon-btn { display: none; }
+  /* Files pane head: drop upload / mkdir / hidden-toggle / refresh.
+     User asks Muse for new dirs; pull-to-refresh covers reload (planned).
+     Theme toggle is KEPT on mobile (marker `.files-keep-mobile`) — phone
+     users switch theme often and Settings is too many taps away. The
+     file-search bar lives below the header and stays visible regardless. */
+  .pane.files .pane-head .icon-btn:not(.files-keep-mobile) { display: none; }
 
   /* Preview pane head on mobile: keep @-mention + download + reload
      (marker class `.preview-keep-mobile`). Edit/save is desktop-only —
@@ -1141,7 +1178,10 @@ body.kb-open .mobile-tab-bar { display: none; }
   }
   .modal {
     min-width: 0;
-    width: 100vw; max-width: 100vw;
+    /* dvw excludes the scrollbar gutter, so it can't push a horizontal
+       scrollbar the way 100vw does in landscape / with a visible bar.
+       100vw kept as a fallback for browsers without dvw. */
+    width: 100vw; width: 100dvw; max-width: 100vw; max-width: 100dvw;
     max-height: 100dvh;
     height: auto;
     border-radius: 0;
@@ -1149,7 +1189,7 @@ body.kb-open .mobile-tab-bar { display: none; }
   }
   .settings-modal {
     min-width: 0;
-    width: 100vw; max-width: 100vw;
+    width: 100vw; width: 100dvw; max-width: 100vw; max-width: 100dvw;
   }
   /* Confirm / prompt dialog carve-out lives in the end-of-file sentinel
      block (search ":confirm-modal" in this file) — putting it here got
@@ -1207,6 +1247,18 @@ body.kb-open .mobile-tab-bar { display: none; }
   .settings-row input[type="number"] {
     height: 40px; line-height: 38px; padding: 0 12px;
   }
+}
+
+/* Smallest phones (iPhone SE / compact Android, ≤360px). The ≤720px row
+   already tightens select chrome, but six controls (attach + model +
+   permission + effort + ctx-ring + send) still overflow here. Clamp the
+   two short-value selects harder — permission (plan/default/bypass/
+   acceptEdits) and effort (low/medium/high) carry little text — so the
+   model picker keeps the freed space. Send + attach + ring are never
+   shrunk; model truncates via the base ellipsis rule if still tight. */
+@media (max-width: 360px) {
+  .chat-toolbar-permission { max-width: 72px; }
+  .chat-toolbar-effort { max-width: 84px; }
 }
 
 /* Touch devices — bigger tap targets in the chat toolbar. 26px is a
@@ -1460,7 +1512,16 @@ body.kb-open .mobile-tab-bar { display: none; }
   /* VSCode-tight: was 26px → 22px. Saves vertical space, matches what
      users expect from a file tree. */
   padding: 2px 10px; min-height: 22px;
-  cursor: pointer; user-select: none;
+  cursor: pointer;
+  /* -webkit-/-moz- prefixes are REQUIRED: mobile WebKit (iOS Safari) ignores
+     the unprefixed `user-select: none`, so without these the long-press on a
+     dir/file row selects the name text instead of staying inert. */
+  user-select: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  /* Kill the iOS Safari long-press callout so our own long-press timer
+     (onTreeTouchStart) can pop the ctx menu instead of the system menu. */
+  -webkit-touch-callout: none;
   color: var(--c-fg-1);
   transition: background var(--t-fast);
   position: relative;
@@ -1668,6 +1729,12 @@ body.kb-open .mobile-tab-bar { display: none; }
   border-radius: var(--r-sm); cursor: pointer; font-size: var(--fs-md);
 }
 .tab .tab-close:hover { background: var(--c-bg-4); color: var(--c-fg-0); }
+/* Unsaved-edits dot in the preview tab. Sits where the close button is, so
+   it reads as "this tab has changes" until saved. */
+.tab .tab-dirty {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--c-accent); flex-shrink: 0;
+}
 
 /* ==========================================================================
    Brand empty state (preview + chat 共用)
@@ -2392,7 +2459,23 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
      with the message column visually. */
   padding-inline: max(var(--sp-3), calc(50% - 440px));
 }
-.msg { display: flex; flex-direction: column; position: relative; animation: msg-in var(--t-base); }
+.msg {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  animation: msg-in var(--t-base);
+  /* Skip layout/paint for off-screen bubbles. Long conversations render
+     every message into the DOM (no virtualization), so on phones the
+     accumulated layout/paint cost of scrolled-away bubbles freezes the
+     WebView. content-visibility:auto makes the browser skip rendering work
+     for any bubble outside the viewport while keeping it in the DOM —
+     find-in-page still matches it, and the on-screen streaming bubble is
+     unaffected. `auto` in contain-intrinsic-size lets the browser remember
+     each bubble's last-rendered height, so scrolled-up content doesn't
+     collapse to the 200px placeholder and jump the scrollbar. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 200px;
+}
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 /* Collapse empty message wrappers. Every msg is rendered as
    <div class="msg role"> regardless of whether any inner <template x-if>
@@ -2767,6 +2850,10 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   display: flex; flex-direction: column;
   gap: 18px;
 }
+/* FIX ⑤: keep already-mounted message rows hidden behind the skeleton until
+   loadSession finishes highlighting (messagesReady). Prevents the half-rendered
+   "partway then stuck" flash on big sessions, especially on mobile. */
+.chat-body.msgs-hidden .msg { display: none; }
 .chat-skeleton-msg {
   display: flex; gap: 10px;
   align-items: flex-start;
@@ -3863,9 +3950,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   height: 100%; background: var(--c-accent);
   transition: width var(--t-base), background var(--t-base);
 }
-.ctx-meter.warn .ctx-meter-fill { background: #f59e0b; }
+.ctx-meter.warn .ctx-meter-fill { background: var(--c-warn); }
 .ctx-meter.danger .ctx-meter-fill { background: var(--c-danger); }
-.ctx-meter.warn .ctx-meter-label { color: #f59e0b; }
+.ctx-meter.warn .ctx-meter-label { color: var(--c-warn); }
 .ctx-meter.danger .ctx-meter-label { color: var(--c-danger); font-weight: var(--fw-semibold); }
 /* Context breakdown popup — anchored top-right of viewport, fixed so it
    floats over any pane. Shows SDK get_context_usage() per-category data. */
@@ -4204,7 +4291,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   max-width: 480px;
   text-align: left;
 }
-.onboard-card.warn  { border-left-color: #d97706; background: rgba(245, 158, 11, 0.05); }
+.onboard-card.warn  { border-left-color: var(--c-warn); background: rgba(245, 158, 11, 0.05); }
 .onboard-card.calm  { border-left-color: var(--c-accent-soft); }
 
 /* Welcome card — one-time orientation card. Wider than the state cards
@@ -4343,7 +4430,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .skill-chip {
   display: inline-flex; align-items: center; gap: var(--sp-1);
   padding: 4px 10px; border-radius: var(--r-full);
-  background: rgba(245, 158, 11, 0.10); color: #d97706;
+  background: rgba(245, 158, 11, 0.10); color: var(--c-warn);
   border: 1px solid rgba(245, 158, 11, 0.3);
   cursor: pointer; font: inherit; font-size: var(--fs-xs);
   transition: filter var(--t-fast);
@@ -4398,7 +4485,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-accent-soft); color: var(--c-accent);
 }
 .ctx-chip.warn {
-  background: rgba(245, 158, 11, 0.12); color: #d97706;
+  background: rgba(245, 158, 11, 0.12); color: var(--c-warn);
   cursor: pointer;
 }
 .ctx-chip.warn:hover { filter: brightness(1.05); }
@@ -4522,7 +4609,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 
 /* ===== MCP / Skill tool prefix polish ===== */
 .tool-mcp { border-left: 3px solid #06b6d4; }
-.tool-skill { border-left: 3px solid #f59e0b; }
+.tool-skill { border-left: 3px solid var(--c-warn); }
 .tool-prefix-icon { font-size: 0.9em; margin-right: var(--sp-1); }
 
 /* ==========================================================================
@@ -4743,7 +4830,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .chat-toolbar-btn.active { color: var(--c-accent); background: var(--c-accent-soft); }
 .chat-toolbar-btn.warn {
   width: auto; padding: 0 8px;
-  color: #f59e0b; font-size: var(--fs-xs);
+  color: var(--c-warn); font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
 }
 .chat-toolbar-btn.warn:hover { background: rgba(245, 158, 11, 0.15); }
@@ -4800,7 +4887,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: background var(--t-fast);
 }
 .chat-toolbar-ring:hover { background: var(--c-bg-3); }
-.chat-toolbar-ring.warn { color: #f59e0b; }
+.chat-toolbar-ring.warn { color: var(--c-warn); }
 .chat-toolbar-ring.danger { color: var(--c-danger); }
 .chat-toolbar-ring svg { display: block; }
 .chat-toolbar-ring svg circle:nth-child(2) {
@@ -4881,12 +4968,25 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .queued-img {
   width: 36px; height: 36px; border-radius: var(--r-sm); object-fit: cover;
 }
+/* FIX ③: real attachment thumbnail in the queued bubble (was a neutral
+   "含附件" marker). Slightly larger than .queued-img so the preview is
+   actually legible; same rounded/cover treatment as sent-message thumbs. */
+.queued-thumb {
+  width: 48px; height: 48px; border-radius: var(--r-sm); object-fit: cover;
+  border: 1px solid var(--c-bg-4);
+}
 .queued-doc-chip {
   display: inline-flex; align-items: center; gap: var(--sp-1);
   background: var(--c-bg-2); padding: 2px 6px; border-radius: var(--r-sm);
   font-size: var(--fs-xs); color: var(--c-fg-1);
 }
 .queued-doc-chip svg { width: 12px; height: 12px; }
+/* Expired-attachment chip — muted + warning tint so the user understands the
+   upload aged out of the 10-min window and won't be sent. */
+.queued-attach-expired {
+  color: var(--c-warn, #f0a800);
+  background: color-mix(in srgb, var(--c-warn, #f0a800) 12%, transparent);
+}
 
 /* Queue paused banner — appears between queued bubbles and the input
    when a turn errored out leaving the queue with un-drained items.
@@ -5116,7 +5216,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    ========================================================================== */
 .modal-backdrop {
   position: fixed; inset: 0; z-index: 900;
-  background: rgba(0,0,0,0.55); backdrop-filter: blur(4px);
+  background: rgba(0,0,0,0.55); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
   display: flex; align-items: center; justify-content: center;
   animation: backdrop-in var(--t-base);
 }
@@ -5212,22 +5312,58 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    otherwise let `min-width: 560px` win on a 360px screen and the modal
    blew past the viewport edge). */
 @media (min-width: 721px) {
-  .settings-modal { min-width: 560px; max-width: 680px; }
-  .settings-modal-body { max-height: 70vh; overflow-y: auto; }
+  /* Wider modal: now a two-column sidebar(tabs) + content layout, so it
+     needs more horizontal room than the old single-column scroll.
+     FIXED width (not a min/max range): with a range the browser sizes the
+     dialog to its content clamped to [720,880], so a narrow tab (Language)
+     shrinks it and a wide tab (Providers) grows it — the dialog visibly
+     jumps sideways when switching tabs. A single fixed width keeps it
+     rock-steady; max-width guards small laptops. */
+  .settings-modal {
+    width: 860px; min-width: 0; max-width: calc(100vw - 32px);
+  }
+  /* FIXED height (not max-height): the modal must stay one constant size
+     no matter which tab is active — otherwise switching from a short tab
+     (e.g. Language) to a tall one (Providers) resizes the whole dialog and
+     it visibly jumps. The body is a flex row; its two columns
+     (sidebar / content) scroll independently inside this fixed frame. */
+  .settings-modal-body {
+    display: flex; gap: var(--sp-5);
+    height: 70vh; overflow: hidden;
+  }
+  /* Left tab rail — fixed width, full height (stretch), scrolls if the tab
+     list ever outgrows the modal. */
+  .settings-menu {
+    flex: 0 0 184px; align-self: stretch;
+    overflow-y: auto;
+  }
+  /* No drill-down chevron on desktop — the active highlight is the cue. */
+  .settings-menu-chevron { display: none; }
+  /* Active tab: accent text + soft accent fill + a left accent bar. */
+  .settings-menu-item.active {
+    background: var(--c-accent-soft);
+    color: var(--c-accent-fg);
+    box-shadow: inset 3px 0 0 var(--c-accent);
+  }
+  .settings-menu-item:hover { background: var(--c-bg-3); }
+  /* Right content pane — the only scroll region for section content. It
+     fills the fixed-height body (stretch) so the frame never resizes. */
+  .settings-content {
+    flex: 1 1 auto; min-width: 0;
+    overflow-y: auto;
+    padding-right: var(--sp-2);
+  }
 }
 
-/* ---- Settings iOS-style 2-level menu (mobile only) ----
-   On desktop both .settings-menu + .settings-back are kept out of the
-   layout via x-show (the alpine condition !isWideScreen evaluates to
-   false). On mobile, when settings.activePage is null the menu is
-   shown and every .settings-section is hidden (also via x-show on each
-   section). Tapping a row sets activePage; that flips the visibility
-   so only the matching section + a Back button are shown.
-
-   Why x-show (per-section) + CSS for the menu, not the other way:
-   we WANT the desktop to render all sections inline as before, which
-   the x-show `isWideScreen || ...` condition already does for free.
-   Hiding the menu on desktop just needs `display: none` here. */
+/* ---- Settings nav menu (shared base; desktop tab-rail tweaks live in
+   the @media (min-width:721px) block above) ----
+   Visibility is driven entirely by x-show on the elements, not CSS:
+   - Desktop: the menu is a persistent left tab-rail (x-show isWideScreen),
+     and exactly one .settings-section shows (x-show activePage===id).
+   - Mobile: activePage=null shows this menu full-width; tapping a row sets
+     activePage, hiding the menu and showing that section + a Back button.
+   These base styles (list reset, row padding, icon) apply on both; the
+   desktop block layers on the flex rail width + .active highlight. */
 .settings-menu {
   list-style: none; margin: 0; padding: 0;
   border-radius: var(--r-md);
@@ -5459,7 +5595,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .skill-row {
   padding: 8px 10px; margin-bottom: 6px;
   background: var(--c-bg-1); border: 1px solid var(--c-border-strong);
-  border-left: 3px solid #f59e0b;
+  border-left: 3px solid var(--c-warn);
   border-radius: var(--r-md);
 }
 .skill-row-head {
@@ -5472,7 +5608,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); font-family: var(--font-mono);
   text-transform: uppercase;
 }
-.skill-scope-project { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.skill-scope-project { background: rgba(245, 158, 11, 0.15); color: var(--c-warn); }
 .skill-scope-user { background: var(--c-accent-soft); color: var(--c-accent); }
 .skill-scope-plugin { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
 .skill-row-desc {
@@ -5691,7 +5827,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 /* 语言切换：两个胶囊按钮 */
-.lang-picker {
+.lang-picker, .theme-picker {
   display: inline-flex; gap: 0;
   border: 1px solid var(--c-border-strong); border-radius: var(--r-md);
   overflow: hidden;
@@ -5699,16 +5835,17 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
                               产生右侧空白带边框 — 强制 hug 内容宽 */
   width: fit-content;
 }
-.lang-picker .btn-ghost {
+.lang-picker .btn-ghost, .theme-picker .btn-ghost {
   height: 32px; padding: 0 14px; border-radius: 0; border: 0;
   background: transparent; color: var(--c-fg-3);
   transition: background var(--t-fast), color var(--t-fast);
 }
-.lang-picker .btn-ghost.active {
+.lang-picker .btn-ghost.active, .theme-picker .btn-ghost.active {
   background: var(--c-btn-primary-bg); color: var(--c-on-accent);
   font-weight: 600;
 }
-.lang-picker .btn-ghost:hover:not(.active) { background: var(--c-bg-2); color: var(--c-fg-0); }
+.lang-picker .btn-ghost:hover:not(.active),
+.theme-picker .btn-ghost:hover:not(.active) { background: var(--c-bg-2); color: var(--c-fg-0); }
 
 /* ==========================================================================
    Scrollbars
@@ -5945,7 +6082,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex: 1;
   background: transparent; border: 0; outline: none;
   color: var(--c-fg-0);
-  font-size: 15px;
+  /* 16px (not 15) so iOS Safari doesn't auto-zoom the page on focus —
+     matches the app-wide anti-zoom rule for all inputs on mobile. */
+  font-size: 16px;
   font-family: var(--font-sans);
 }
 .cmd-palette-input::placeholder { color: var(--c-fg-3); }
@@ -6051,9 +6190,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
               color var(--t-fast), border-color var(--t-fast);
 }
 .cost-token-chip:hover { background: var(--c-bg-3); }
-.cost-token-chip.in    { color: var(--c-token-in);    border-color: rgba(37,99,235,0.4); }
-.cost-token-chip.out   { color: var(--c-token-out);   border-color: rgba(124,58,237,0.4); }
-.cost-token-chip.cache { color: var(--c-token-cache); border-color: rgba(5,150,105,0.4); }
+/* Border tracks the (theme-aware) token color so it stays in sync across
+   dark/light/eyecare instead of being pinned to the dark-theme hues. */
+.cost-token-chip.in    { color: var(--c-token-in);    border-color: color-mix(in srgb, var(--c-token-in) 40%, transparent); }
+.cost-token-chip.out   { color: var(--c-token-out);   border-color: color-mix(in srgb, var(--c-token-out) 40%, transparent); }
+.cost-token-chip.cache { color: var(--c-token-cache); border-color: color-mix(in srgb, var(--c-token-cache) 40%, transparent); }
 .cost-token-chip.inactive {
   opacity: 0.42;
   text-decoration: line-through;
@@ -6571,6 +6712,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: var(--font-mono);
   display: flex; gap: var(--sp-3);
 }
+/* Paused task's "next" time: still shown (so users see the original plan)
+   but dimmed + struck to signal it won't actually fire while disabled. */
+.sched-time-muted { color: var(--c-fg-4); text-decoration: line-through; opacity: 0.7; }
 /* Action buttons fade in on row hover — keeps the list visually quiet
    when scanning many tasks. The switch always stays visible since it's
    the primary on/off affordance; only the per-row icon buttons fade. */
@@ -6799,7 +6943,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   .settings-modal,
   .sched-modal {
     min-width: 0;
-    width: 100vw; max-width: 100vw;
+    /* dvw avoids the 100vw scrollbar-overflow gotcha; 100vw is the
+       fallback for browsers without dvw support. */
+    width: 100vw; width: 100dvw; max-width: 100vw; max-width: 100dvw;
     max-height: 100dvh;
     height: auto;
     border-radius: 0;
@@ -6847,14 +6993,22 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   .msg-actions { display: none; }
   /* ...but the ASSISTANT copy bar has NO touch fallback (long-press select
      only works for code blocks; prose/tables/lists had no path to copy).
-     Keep it visible, anchored inline below the bubble instead of floating,
-     mirroring the trash-actions touch pattern (styles.css ~8157). */
+     Keep it visible — but DON'T let it claim its own full-width line below
+     the bubble (the old `position:static; margin:4px 0 0 40px` read as a
+     stray, orphaned row — 2026-05-29 user feedback "单独一行，很奇怪").
+     Instead float it at the bubble's bottom-right corner: out of flow (no
+     extra vertical band), anchored to .asst-msg-wrap (the assistant
+     template's root, which wraps ONLY the msg-row → its box == the bubble
+     row). The turn-footer/timestamp lives OUTSIDE this wrapper, so there's
+     no overlap with the time. bottom-right (not the desktop top:-8px) avoids
+     drifting up over the previous message on narrow bubbles. */
+  .asst-msg-wrap { position: relative; }
   .msg-actions.msg-actions-assistant {
     display: flex;
-    position: static;
-    margin: 4px 0 0 40px;   /* align under bubble text, past the 32px avatar gutter */
+    position: absolute;
+    top: auto; bottom: 2px; right: 4px;
     background: none; border: none; box-shadow: none; padding: 0;
-    opacity: 0.7;
+    opacity: 0.55;
   }
   .msg-actions.msg-actions-assistant:active { opacity: 1; }
 }
@@ -6924,6 +7078,16 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
     min-height: 36px;
     height: 36px;
   }
+  /* Anti-zoom for controls whose own class/compound selector out-specifies
+     the bare input/select/textarea rules above. iOS Safari zooms the page
+     when a focused control is < 16px, so force 16px on touch. Each selector
+     here matches (or beats) the desktop rule's specificity so it wins. */
+  .chat-toolbar-select { font-size: 16px; }
+  .searchbar input { font-size: 16px; min-height: 40px; }
+  .settings-input { font-size: 16px; }
+  .session-picker-search { font-size: 16px; }
+  .skills-filter { font-size: 16px; }
+  .provider-editor textarea.settings-input { font-size: 16px; }
 }
 
 /* ── Edit-in-place (user message) ──────────────────────────────────────

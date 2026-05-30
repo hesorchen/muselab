@@ -170,6 +170,8 @@ def render(size: int, *, maskable: bool) -> bytes:
 
 TARGETS = [
     ("apple-touch-icon.png", 180, False),
+    ("icon-192.png", 192, False),
+    ("icon-192-maskable.png", 192, True),
     ("icon-512.png", 512, False),
     ("icon-512-maskable.png", 512, True),
 ]

@@ -57,6 +57,13 @@ class ScheduleIn(BaseModel):
     # 'day' is reused for the day-of-month in `once` too.
     # ±24h (1440 min) covers every real-world TZ including Kiribati / Samoa.
     tz_offset_minutes: int | None = Field(default=None, ge=-1440, le=1440)
+    # IANA timezone name (e.g. "America/New_York"), browser supplies via
+    # Intl.DateTimeFormat().resolvedOptions().timeZone. Preferred over the
+    # raw offset because it's DST-aware — the scheduler keeps firing at the
+    # same wall-clock time across spring-forward / fall-back. Validated for
+    # real at ZoneInfo() construction in scheduler.py; here we just bound the
+    # length. tz_offset_minutes stays as the legacy fallback.
+    tz: str | None = Field(default=None, max_length=64)
 
 
 class TaskIn(BaseModel):

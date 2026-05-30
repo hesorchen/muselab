@@ -54,10 +54,17 @@ The remaining sections can be completed any time via the top-bar
 ### Manual
 
 ```bash
-cp scripts/templates/default-CLAUDE.md ~/muselab-archive/CLAUDE.md
-sed -i "s/%DATE%/$(date +%Y-%m-%d)/" ~/muselab-archive/CLAUDE.md
-# subdirectory skeleton
-cp -r scripts/templates/archive-skeleton/* ~/muselab-archive/
+cp scripts/templates/default-CLAUDE.en.md ~/muselab-archive/CLAUDE.md
+# portable in-place edit (GNU and BSD/macOS sed differ on -i)
+sed -e "s/%DATE%/$(date +%Y-%m-%d)/" ~/muselab-archive/CLAUDE.md > ~/muselab-archive/CLAUDE.md.tmp \
+  && mv ~/muselab-archive/CLAUDE.md.tmp ~/muselab-archive/CLAUDE.md
+# subdirectory skeleton — copy each subdir, keep only the English README
+# (each skeleton subdir ships both README.md (zh) and README.en.md (en))
+for sub in scripts/templates/archive-skeleton/*/; do
+  name=$(basename "$sub")
+  mkdir -p ~/muselab-archive/"$name"
+  cp "$sub/README.en.md" ~/muselab-archive/"$name"/README.md
+done
 ```
 
 ---

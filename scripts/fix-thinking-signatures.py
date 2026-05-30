@@ -40,7 +40,13 @@ from pathlib import Path
 # Allow this script to be run directly (not as a module) from anywhere
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
-from backend import jsonl_cleanup  # noqa: E402
+try:
+    from backend import jsonl_cleanup  # noqa: E402
+except ImportError as e:
+    print(f"✗ could not import backend.jsonl_cleanup: {e}")
+    print("  Run this from the muselab repo after dependencies are installed:")
+    print("    uv sync && uv run python scripts/fix-thinking-signatures.py")
+    sys.exit(1)
 
 
 def _default_projects_root() -> Path:
@@ -97,10 +103,15 @@ def main() -> int:
                 import shutil
                 import tempfile
                 with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tf:
-                    shutil.copy(f, tf.name)
-                    rep = jsonl_cleanup.clean_jsonl(Path(tf.name))
+                    tmp_path = Path(tf.name)
+                try:
+                    shutil.copy(f, tmp_path)
+                    rep = jsonl_cleanup.clean_jsonl(tmp_path)
                     rep.path = f  # report the real path, not the temp
-                    Path(tf.name).unlink(missing_ok=True)
+                finally:
+                    # delete=False means we own cleanup — unlink even if
+                    # copy/clean raised, so we don't leak temps in /tmp.
+                    tmp_path.unlink(missing_ok=True)
 
             if rep.error:
                 print(f"  ✗ {rep.summary()}")

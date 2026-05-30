@@ -15,7 +15,7 @@ your use case, or whether one of the alternatives is a better match.
 | HTML / PDF / image preview | ✅ | ⚠️ | ⚠️ | ⚠️ | ❌ |
 | **Full agent SDK on every model** | ✅ | ⚠️ Claude-mostly | ❌ chat only | ❌ RAG focus | ✅ Claude only |
 | Reuse Claude Pro subscription | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Lines of code | ~31 k | tens of k | hundreds of k | ~150 k | closed |
+| Lines of code | ~37 k | tens of k | hundreds of k | ~150 k | closed |
 | Install command count | 3 | many | docker compose | docker | brew / npm |
 
 For **IDE breadth**, consider claudecodeui or code-server.

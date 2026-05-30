@@ -31,9 +31,13 @@ node_modules/
 #   Public roadmap lives in GitHub Issues / Discussions instead.
 # - docs/competitive-analysis.md: candid positioning + launch-strategy
 #   memo; reads as internal pitch deck if published, not user docs.
+# - COMPARISON_REPORT_2026-05.md / docs/research-code-artifacts-2026-05.md:
+#   Chinese-only Muse auto-research outputs (2026-05-25); no EN version, not
+#   linked from README/docs index — noise for open-source readers.
 TODO.md
 docs/competitive-analysis.md
+COMPARISON_REPORT_2026-05.md
+docs/research-code-artifacts-2026-05.md
 
 # Demo archives — local-only, never published
 demo/
-

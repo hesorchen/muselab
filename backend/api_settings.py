@@ -118,7 +118,19 @@ class SettingsIn(BaseModel):
 def _write_env(updates: dict[str, str]) -> None:
     """Atomically merge updates into .env. Keys with empty-string value get
     written as `KEY=` (allowed); to actually remove a key, pass None and we
-    drop the line."""
+    drop the line.
+
+    Security: values are stripped of CR/LF before writing. A newline in a
+    value would otherwise split into extra `KEY=VALUE` lines on the next
+    load_dotenv, letting a caller inject arbitrary env vars (e.g. PATH,
+    MUSELAB_HOST) through a single whitelisted key — defeating the
+    PROVIDER_KEYS name whitelist in put_settings. API keys never contain
+    newlines, so stripping is safe and also fixes the benign case of a
+    pasted key with a trailing newline silently corrupting .env."""
+    updates = {
+        k: (v if v is None else v.replace("\r", "").replace("\n", ""))
+        for k, v in updates.items()
+    }
     lines: list[str] = []
     if ENV_PATH.exists():
         lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
@@ -196,10 +208,12 @@ def get_settings() -> dict:
     raw_disabled = os.environ.get("MUSELAB_DISABLED_PROVIDERS", "").strip()
     disabled_models = set(raw_disabled.split(",")) if raw_disabled else set()
     providers: list[dict] = []
-    # Anthropic — special OAuth / API-key card, NOT an editable catalog
-    # provider (no endpoint / prefix / model list to tweak). `editable: false`
-    # tells the UI to render the simple key-only row, not the full editor.
+    # Anthropic — special OAuth / API-key card. `editable: false` keeps the
+    # simple key-only row (no endpoint/prefix/key editor), but its MODEL LIST
+    # IS user-editable: `models_editable: true` tells the UI to render the
+    # model-list sub-editor, and `is_overridden` lights up "restore default".
     av = os.environ.get("ANTHROPIC_API_KEY", "")
+    claude_models = _ep.anthropic_models()
     providers.append({
         "kind": "anthropic",
         "id": "anthropic",
@@ -207,10 +221,12 @@ def get_settings() -> dict:
         "display": "Anthropic (Claude API)",
         "configured": bool(av),
         "masked": _mask(av),
-        "probe_model": "claude-sonnet-4-6",
+        "probe_model": claude_models[0] if claude_models else "claude-sonnet-4-6",
         "disabled": False,
-        "base_url": "", "prefix": "", "models": [],
-        "is_builtin": False, "is_overridden": False, "editable": False,
+        "base_url": "", "prefix": "",
+        "models": claude_models,
+        "is_builtin": True, "is_overridden": _ep.anthropic_models_overridden(),
+        "editable": False, "models_editable": True,
     })
     # Third-party providers — full editor payload. endpoints owns the catalog
     # shape (id / base_url / prefix / models / builtin-vs-override); we layer on
@@ -460,10 +476,30 @@ def delete_provider(req: ProviderIdIn) -> dict:
 def restore_provider(req: ProviderIdIn) -> dict:
     """Restore a built-in provider to factory defaults (drop its override +
     tombstone). No-op for custom providers — they have no default to restore
-    to (the FE should offer Delete instead)."""
+    to (the FE should offer Delete instead). id="anthropic" reverts the
+    Claude model list to the built-in default."""
     from . import endpoints as _ep
     changed = _ep.restore_provider(req.id)
     return {"ok": True, "changed": changed}
+
+
+class AnthropicModelsIn(BaseModel):
+    # Claude's model list (ids only — labels are derived). Anthropic keeps its
+    # special key/OAuth auth row, so this is the one editable knob it exposes.
+    models: list[str] = Field(default_factory=list)
+
+
+@router.post("/providers/anthropic-models", dependencies=[Depends(require_token)])
+def set_anthropic_models(req: AnthropicModelsIn) -> dict:
+    """Override the Claude model list shown in the picker. Validation (empty,
+    non-`claude-` id, dup) → 422. Restore the default via /providers/restore
+    with id='anthropic'."""
+    from . import endpoints as _ep
+    try:
+        _ep.set_anthropic_models(req.models)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return {"ok": True, "models": _ep.anthropic_models()}
 
 
 # ====== MCP server management ======
@@ -694,11 +730,37 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
     own files; muselab only owns its mcp.json. If `name` happens to also
     exist in a Claude Code config, this muselab entry will win in the
     merged view (see _load_mcp_merged)."""
+    # The URL path `name` is the authoritative key. MCPServerSpec also
+    # carries a required `name` field; if a client sends a body whose
+    # `name` disagrees with the path (e.g. a frontend rename typo), we
+    # used to silently honour the path and discard the body name — a
+    # rename could then write the wrong entry with no error. Reject the
+    # mismatch loudly instead of guessing intent.
+    if spec.name != name:
+        raise HTTPException(
+            422,
+            f"body name {spec.name!r} does not match URL name {name!r}",
+        )
     cfg = _load_mcp()
+    # Defence (mirror of put_settings' "•" guard): GET /mcp masks env values
+    # via _mask() (U+2022 BULLET). A FE that PUTs an unchanged entry back would
+    # otherwise overwrite the real secret with bullets — unrecoverable. For any
+    # env value that still looks masked, recover the real value from the current
+    # merged view (the same source the mask was derived from); if none exists,
+    # drop the key rather than persist bullets.
+    new_env = dict(spec.env or {})
+    if any(isinstance(v, str) and "•" in v for v in new_env.values()):
+        existing_env = (_load_mcp_merged().get(name) or {}).get("env") or {}
+        for k, v in list(new_env.items()):
+            if isinstance(v, str) and "•" in v:
+                if k in existing_env:
+                    new_env[k] = existing_env[k]
+                else:
+                    new_env.pop(k)
     cfg["mcpServers"][name] = {
         "command": spec.command,
         "args": spec.args,
-        "env": spec.env,
+        "env": new_env,
         "disabled": spec.disabled,
     }
     _save_mcp(cfg)
@@ -833,8 +895,31 @@ SKILL_PROJECT_DIR = Path(__file__).resolve().parent.parent / "skills"
 SKILL_PLUGIN_ROOT = Path.home() / ".claude" / "plugins" / "marketplaces"
 
 
+def _strip_yaml_scalar(v: str) -> str:
+    """Unwrap a single-line YAML scalar value the hand parser collected.
+
+    Only the two common cases matter for SKILL frontmatter: a value fully
+    wrapped in matching single or double quotes (then unescape the doubled /
+    backslash forms), or a bare scalar with a trailing `# comment`. We
+    deliberately do NOT try to be a full YAML engine here — that's what the
+    optional PyYAML fast path above is for."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        inner = v[1:-1]
+        if v[0] == '"':
+            return inner.replace('\\"', '"').replace("\\\\", "\\")
+        return inner.replace("''", "'")
+    return v.strip('"\'')
+
+
 def _parse_skill_md(p: Path) -> dict | None:
-    """Parse frontmatter of a SKILL.md (or skill.md). Cheap, no YAML dep."""
+    """Parse the YAML frontmatter of a SKILL.md (or skill.md).
+
+    Prefers PyYAML when it's importable (it's a transitive dependency of
+    the toolchain, not a declared one — so we treat it as best-effort and
+    fall back to a small hand parser when absent). This fixes the common
+    breakages of the old hand parser: quoted values containing colons,
+    escaped / doubled quotes, and `key: value  # comment` trailers."""
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -846,6 +931,20 @@ def _parse_skill_md(p: Path) -> dict | None:
         return {"name": p.parent.name, "description": ""}
     fm = text[3:end].strip()
     out: dict = {"name": p.parent.name, "description": ""}
+    # Fast path: a real YAML parser if available.
+    try:
+        import yaml  # type: ignore
+        parsed = yaml.safe_load(fm)
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                if isinstance(k, str):
+                    out[k] = v if isinstance(v, str) else ("" if v is None else str(v))
+            out.setdefault("name", p.parent.name)
+            return out
+    except Exception:
+        # ImportError (yaml absent) or any malformed-YAML error → fall back
+        # to the tolerant hand parser below, which never raises.
+        pass
     cur_key = None
     cur_val: list[str] = []
     for line in fm.splitlines():
@@ -855,7 +954,7 @@ def _parse_skill_md(p: Path) -> dict | None:
             cur_val.append(line.strip())
             continue
         if cur_key:
-            out[cur_key] = " ".join(cur_val).strip().strip('"\'')
+            out[cur_key] = _strip_yaml_scalar(" ".join(cur_val))
         if ":" in line:
             k, _, v = line.partition(":")
             cur_key = k.strip()
@@ -864,7 +963,7 @@ def _parse_skill_md(p: Path) -> dict | None:
             cur_key = None
             cur_val = []
     if cur_key:
-        out[cur_key] = " ".join(cur_val).strip().strip('"\'')
+        out[cur_key] = _strip_yaml_scalar(" ".join(cur_val))
     return out
 
 
@@ -1165,7 +1264,24 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
     """Run the upgrade flow in-process. Returns step-by-step output for the
     UI to render. Does NOT restart muselab — the running Python process keeps
     serving the old SDK in memory until you restart it (Scheduled Task /
-    systemd / launchctl). UI shows the restart command after upgrade ends."""
+    systemd / launchctl). UI shows the restart command after upgrade ends.
+
+    SECURITY — RCE surface, deliberately gated:
+      This endpoint shells out to `uv lock` / `uv sync` / `npm install -g`.
+      Package installs run arbitrary install scripts (npm postinstall, build
+      hooks), so anyone who can reach this endpoint can achieve code execution
+      as the muselab process user. That is acceptable ONLY because the route
+      is gated behind `require_token` — the same admin token that already
+      grants full archive read/write and unattended bypassPermissions agent
+      runs. In muselab's single-tenant, self-hosted threat model the token
+      holder is the owner, so /upgrade grants no privilege they don't already
+      have. The args are fixed string literals (no user-controlled package
+      names) and `uv sync --frozen` installs only what's already pinned in
+      uv.lock, so a leaked token can't be steered to install attacker-chosen
+      packages here. Self-hosters who want to remove the surface entirely can
+      block POST /api/settings/upgrade at their reverse proxy. Do NOT widen
+      this to accept caller-supplied package names without re-reviewing.
+    """
     if _UPGRADE_LOCK.locked():
         raise HTTPException(409, "upgrade already in progress")
     async with _UPGRADE_LOCK:

@@ -12,10 +12,12 @@ Adding a new provider:
   4. Restart muselab.
 """
 from __future__ import annotations
+import copy
 import json
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -67,10 +69,13 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     # defaults but worth knowing if a downstream user tunes temperature.
     "MOONSHOT_API_KEY":       "https://api.moonshot.cn/anthropic",
     # Alibaba DashScope Qwen — official "Migrate Anthropic Workloads to
-    # Qwen" doc names this path. International (Singapore) endpoint by
-    # default because it's reachable globally (incl. mainland); domestic
-    # users can override to dashscope.aliyuncs.com if latency matters.
-    "DASHSCOPE_API_KEY":      "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+    # Qwen" doc names this path. Domestic (dashscope.aliyuncs.com) is the
+    # default to match the CATALOG "Qwen" group; international users pick
+    # the separate "Qwen (国际)" group (qwen-intl: prefix →
+    # dashscope-intl.aliyuncs.com), or override DASHSCOPE_BASE_URL. This
+    # value is only the last-resort fallback when no CATALOG provider
+    # matches — for normal use the provider's own base_url wins.
+    "DASHSCOPE_API_KEY":      "https://dashscope.aliyuncs.com/apps/anthropic",
     # Xiaomi MiMo — V2.5-Pro public beta 2026-04-22; platform.xiaomimimo
     # explicitly documents the /anthropic endpoint.
     "XIAOMI_MIMO_API_KEY":    "https://api.xiaomimimo.com/anthropic",
@@ -117,7 +122,35 @@ def _resolve_base_url(env_key: str, provider: Provider | None = None) -> str:
     own base_url (from CATALOG) > per-key default. The provider fallback is
     critical for families that share one API key but need different endpoints
     (e.g. Qwen domestic vs international — both use DASHSCOPE_API_KEY but
-    route to different hosts)."""
+    route to different hosts).
+
+    OVERRIDE PRECEDENCE — two providers that share one API key must NOT
+    collapse to the same endpoint when the user sets `<KEY>_BASE_URL`.
+    Qwen domestic (prefix "qwen") and intl (prefix "qwen-intl:") both use
+    DASHSCOPE_API_KEY, so a bare `DASHSCOPE_BASE_URL` override used to apply
+    to BOTH — silently routing intl traffic to the domestic host (or vice
+    versa). To preserve the distinction, a provider whose prefix is a
+    colon-tagged mirror (e.g. "qwen-intl:") gets its OWN, more specific
+    override env derived from the tag: `<KEY base>_<TAG>_BASE_URL`
+    (DASHSCOPE_API_KEY + tag "intl" → DASHSCOPE_INTL_BASE_URL). That tagged
+    var wins for the mirror group; the generic `DASHSCOPE_BASE_URL` only
+    affects the untagged (domestic) group. If the tagged var is unset we
+    fall through to the provider's catalog base_url, so the domestic/intl
+    host split is kept by default."""
+    # Colon-tagged mirror groups (prefix like "qwen-intl:") get a dedicated
+    # override env so they don't share the generic <KEY>_BASE_URL with the
+    # primary group that holds the same api key.
+    if provider is not None and provider.prefix.endswith(":"):
+        generic_env = _BASE_URL_ENV_BY_KEY.get(env_key, "")
+        if generic_env.endswith("_BASE_URL"):
+            tag = provider.prefix.rstrip(":").rsplit("-", 1)[-1].upper()
+            tagged_env = generic_env[:-len("_BASE_URL")] + f"_{tag}_BASE_URL"
+            v = os.environ.get(tagged_env, "").strip()
+            if v:
+                return v.rstrip("/")
+            # No tagged override → keep the catalog host (don't fall through
+            # to the generic override, which belongs to the primary group).
+            return provider.base_url.rstrip("/")
     override_env = _BASE_URL_ENV_BY_KEY.get(env_key, "")
     if override_env:
         v = os.environ.get(override_env, "").strip()
@@ -332,30 +365,90 @@ def _slug(text: str) -> str:
     return s or "provider"
 
 
-def _load_overrides() -> dict:
-    """Read the override store. Tolerates missing / malformed file by
-    returning the empty shape."""
+# Process-wide caches keyed on the override file's (mtime_ns, size). catalog()
+# /lookup() consult the store many times per request (the cost dashboard runs
+# lookup() once per assistant JSONL row → thousands of calls), so re-reading +
+# re-parsing the JSON, then rebuilding+sorting the Provider list, each call is
+# pure waste. Caching by stat() signature keeps the "edit Settings → effective
+# next request, no restart" contract: _save_overrides() rewrites the file via
+# atomic rename, which bumps mtime, which misses the cache on the next load.
+# A cheap stat() syscall stays on every call; the read + json.loads + normalize
+# (_load_overrides) and the build + sort (catalog) are skipped on a hit.
+_OVERRIDES_CACHE: tuple[tuple[int, int], dict] | None = None
+_CATALOG_CACHE: tuple[tuple[int, int] | None, tuple[Provider, ...]] | None = None
+_OVERRIDES_CACHE_LOCK = threading.Lock()
+
+
+def _overrides_stat_key() -> tuple[int, int] | None:
+    """(mtime_ns, size) signature of the override file, or None if it's
+    absent/unreadable. None is a stable key meaning "no file" — both caches
+    treat it as a hittable state so a factory-default install (file never
+    created) still benefits."""
     try:
-        data = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        return {"providers": {}, "deleted": []}
+        st = OVERRIDES_PATH.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _parse_overrides(text: str) -> dict:
+    """Normalize the raw JSON text into the canonical store shape. Tolerates
+    malformed content by returning the empty shape."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {"providers": {}, "deleted": [], "anthropic_models": None}
     if not isinstance(data, dict):
-        return {"providers": {}, "deleted": []}
+        return {"providers": {}, "deleted": [], "anthropic_models": None}
     prov = data.get("providers")
     deleted = data.get("deleted")
+    # Anthropic/Claude is special-cased (OAuth-or-key auth, no editable
+    # endpoint/prefix), but its MODEL LIST is user-editable like any other
+    # provider's. None = "use the built-in default list"; a list = override.
+    am = data.get("anthropic_models")
     return {
         "providers": prov if isinstance(prov, dict) else {},
         "deleted": [d for d in deleted if isinstance(d, str)] if isinstance(deleted, list) else [],
+        "anthropic_models": [str(m) for m in am] if isinstance(am, list) else None,
     }
+
+
+def _load_overrides() -> dict:
+    """Read the override store, cached by the file's (mtime_ns, size). Tolerates
+    a missing / malformed file by returning the empty shape.
+
+    Returns a deep copy so write-path callers (which mutate `store` in place
+    before _save_overrides) can't corrupt the shared cache."""
+    global _OVERRIDES_CACHE
+    key = _overrides_stat_key()
+    if key is None:
+        return {"providers": {}, "deleted": [], "anthropic_models": None}
+    with _OVERRIDES_CACHE_LOCK:
+        cached = _OVERRIDES_CACHE
+        if cached is not None and cached[0] == key:
+            return copy.deepcopy(cached[1])
+    try:
+        text = OVERRIDES_PATH.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return {"providers": {}, "deleted": [], "anthropic_models": None}
+    store = _parse_overrides(text)
+    with _OVERRIDES_CACHE_LOCK:
+        _OVERRIDES_CACHE = (key, store)
+    return copy.deepcopy(store)
 
 
 def _save_overrides(store: dict) -> None:
     from .settings import atomic_write_text
+    out = {"providers": store.get("providers", {}),
+           "deleted": store.get("deleted", [])}
+    # Only persist the anthropic model override when it's actually set, so a
+    # factory-default install keeps a clean two-key file.
+    am = store.get("anthropic_models")
+    if isinstance(am, list):
+        out["anthropic_models"] = am
     atomic_write_text(
         OVERRIDES_PATH,
-        json.dumps({"providers": store.get("providers", {}),
-                    "deleted": store.get("deleted", [])},
-                   ensure_ascii=False, indent=2) + "\n",
+        json.dumps(out, ensure_ascii=False, indent=2) + "\n",
     )
 
 
@@ -396,8 +489,18 @@ def catalog() -> tuple[Provider, ...]:
     overrides applied, followed by user-created providers. This is what every
     routing / UI path should consult — `CATALOG` is only the factory default.
 
-    Read from disk each call (cheap small JSON) so Settings edits take effect
-    on the next request without a restart, matching the rest of muselab."""
+    Memoized by the override file's stat signature so Settings edits still take
+    effect on the next request without a restart (the rename bumps mtime →
+    cache miss), but the hot read path — lookup() runs this once per usage-model
+    resolution — skips the rebuild + sort entirely on a hit. The returned tuple
+    holds immutable Provider dataclasses that no reader mutates, so it's safe to
+    share without copying."""
+    global _CATALOG_CACHE
+    key = _overrides_stat_key()
+    with _OVERRIDES_CACHE_LOCK:
+        cached = _CATALOG_CACHE
+        if cached is not None and cached[0] == key:
+            return cached[1]
     store = _load_overrides()
     overrides = store["providers"]
     deleted = set(store["deleted"])
@@ -417,7 +520,10 @@ def catalog() -> tuple[Provider, ...]:
         if pid in seen or pid in deleted or not isinstance(d, dict):
             continue
         out.append(_provider_from_def(pid, d, None))
-    return tuple(out)
+    result = tuple(out)
+    with _OVERRIDES_CACHE_LOCK:
+        _CATALOG_CACHE = (key, result)
+    return result
 
 
 def get_provider(pid: str) -> Provider | None:
@@ -521,6 +627,10 @@ def restore_provider(pid: str) -> bool:
     """Restore a built-in provider to its factory default by dropping its
     override + tombstone. No-op (returns False) for user-created providers
     (nothing to restore to). Caller should DELETE those instead."""
+    # Anthropic isn't in CATALOG (special auth), but its model list IS
+    # overridable — route restore to the dedicated Claude-models reset.
+    if pid == "anthropic":
+        return restore_anthropic_models()
     if _builtin_by_id(pid) is None:
         return False
     store = _load_overrides()
@@ -568,6 +678,58 @@ CLAUDE_LABELS: dict[str, str] = {
     "claude-sonnet-4-6":            "Sonnet 4.6",
     "claude-haiku-4-5-20251001":    "Haiku 4.5",
 }
+
+# Factory-default Claude model list (the picker order). User-editable via
+# Settings → overridden in provider_overrides.json["anthropic_models"]; this
+# tuple is what `restore` reverts to and what a clean install shows.
+ANTHROPIC_DEFAULT_MODELS: tuple[str, ...] = (
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+)
+
+
+def anthropic_models() -> list[str]:
+    """Effective Claude model id list: the user override if set, else the
+    factory default. Read from disk each call so Settings edits apply on the
+    next request without a restart (matches the rest of the catalog)."""
+    am = _load_overrides().get("anthropic_models")
+    return list(am) if am else list(ANTHROPIC_DEFAULT_MODELS)
+
+
+def anthropic_models_overridden() -> bool:
+    """True when the Claude model list has been customized (so the UI can
+    offer a 'restore default' affordance)."""
+    return _load_overrides().get("anthropic_models") is not None
+
+
+def set_anthropic_models(models: list[str]) -> None:
+    """Persist a custom Claude model list. Validates non-empty + that every id
+    looks like a Claude model (the auth/endpoint are fixed to Anthropic, so a
+    non-`claude-` id here would 404). Raises ValueError on bad input."""
+    cleaned = [str(m).strip() for m in (models or []) if str(m).strip()]
+    if not cleaned:
+        raise ValueError("model list cannot be empty")
+    for m in cleaned:
+        if not m.lower().startswith("claude-"):
+            raise ValueError(f"not a Claude model id: {m!r} (must start with 'claude-')")
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError("duplicate model ids")
+    store = _load_overrides()
+    store["anthropic_models"] = cleaned
+    _save_overrides(store)
+
+
+def restore_anthropic_models() -> bool:
+    """Drop the Claude model override (revert to factory default). Returns
+    True if there was an override to remove, False if already default."""
+    store = _load_overrides()
+    if store.get("anthropic_models") is None:
+        return False
+    store["anthropic_models"] = None
+    _save_overrides(store)
+    return True
 
 
 _CLAUDE_LABEL_RE = __import__("re").compile(
@@ -747,17 +909,16 @@ def available_groups() -> list[dict]:
     disabled_models = set(raw_disabled.split(",")) if raw_disabled else set()
     groups: list[dict] = []
     if has_anthropic_auth():
-        groups.append({
-            "group": "Claude",
-            "items": [
-                {"label": CLAUDE_LABELS.get(m, m), "model": m} for m in (
-                    "claude-sonnet-4-6",
-                    "claude-haiku-4-5-20251001",
-                    "claude-opus-4-8",
-                    "claude-opus-4-7",
-                )
-            ],
-        })
+        # Model list is user-editable (anthropic_models override); falls back
+        # to ANTHROPIC_DEFAULT_MODELS. Honour the Settings disable toggle and
+        # use friendly labels where we know them, else a derived label.
+        claude_items = [
+            {"label": label_for(m), "model": m}
+            for m in anthropic_models()
+            if m not in disabled_models
+        ]
+        if claude_items:
+            groups.append({"group": "Claude", "items": claude_items})
     for p in catalog():
         if not p.models:
             continue

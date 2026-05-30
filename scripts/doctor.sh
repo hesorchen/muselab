@@ -60,9 +60,11 @@ echo
 bold "2. Configuration"
 if [[ -f .env ]]; then
   ok ".env present"
-  TOKEN=$(grep -oP 'MUSELAB_TOKEN=\K\S+' .env 2>/dev/null || echo "")
-  ROOT=$(grep -oP 'MUSELAB_ROOT=\K\S+' .env 2>/dev/null || echo "")
-  PORT=$(grep -oP 'MUSELAB_PORT=\K\S+' .env 2>/dev/null || echo "8765")
+  # Portable .env value extraction (BSD/macOS grep lacks -P/\K).
+  TOKEN=$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+  ROOT=$(grep -E '^MUSELAB_ROOT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+  PORT=$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+  PORT="${PORT:-8765}"
   if [[ -z "$TOKEN" ]]; then err "MUSELAB_TOKEN missing in .env"; FAIL=$((FAIL+1))
   elif (( ${#TOKEN} < 16 )); then err "MUSELAB_TOKEN too short (${#TOKEN} chars; need ≥16)"; FAIL=$((FAIL+1))
   else ok "MUSELAB_TOKEN set (${TOKEN:0:4}…${TOKEN: -4}, ${#TOKEN} chars)"; fi
@@ -150,12 +152,14 @@ fi
 
 echo
 bold "6. Provider keys"
-[[ -n "${DEEPSEEK_API_KEY:-}"    ]] || DEEPSEEK_API_KEY=$(grep -oP 'DEEPSEEK_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${ZHIPUAI_API_KEY:-}"     ]] || ZHIPUAI_API_KEY=$(grep -oP 'ZHIPUAI_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${MINIMAX_API_KEY:-}"     ]] || MINIMAX_API_KEY=$(grep -oP 'MINIMAX_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${MOONSHOT_API_KEY:-}"    ]] || MOONSHOT_API_KEY=$(grep -oP 'MOONSHOT_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${DASHSCOPE_API_KEY:-}"   ]] || DASHSCOPE_API_KEY=$(grep -oP 'DASHSCOPE_API_KEY=\K\S+' .env 2>/dev/null || echo "")
-[[ -n "${XIAOMI_MIMO_API_KEY:-}" ]] || XIAOMI_MIMO_API_KEY=$(grep -oP 'XIAOMI_MIMO_API_KEY=\K\S+' .env 2>/dev/null || echo "")
+# Portable .env value extraction (BSD/macOS grep lacks -P/\K).
+_env_val() { grep -E "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]'; }
+[[ -n "${DEEPSEEK_API_KEY:-}"    ]] || DEEPSEEK_API_KEY=$(_env_val DEEPSEEK_API_KEY)
+[[ -n "${ZHIPUAI_API_KEY:-}"     ]] || ZHIPUAI_API_KEY=$(_env_val ZHIPUAI_API_KEY)
+[[ -n "${MINIMAX_API_KEY:-}"     ]] || MINIMAX_API_KEY=$(_env_val MINIMAX_API_KEY)
+[[ -n "${MOONSHOT_API_KEY:-}"    ]] || MOONSHOT_API_KEY=$(_env_val MOONSHOT_API_KEY)
+[[ -n "${DASHSCOPE_API_KEY:-}"   ]] || DASHSCOPE_API_KEY=$(_env_val DASHSCOPE_API_KEY)
+[[ -n "${XIAOMI_MIMO_API_KEY:-}" ]] || XIAOMI_MIMO_API_KEY=$(_env_val XIAOMI_MIMO_API_KEY)
 for entry in \
     "DEEPSEEK_API_KEY:DeepSeek" \
     "ZHIPUAI_API_KEY:GLM" \

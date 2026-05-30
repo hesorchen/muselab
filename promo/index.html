@@ -16,41 +16,81 @@
 <meta name="twitter:title" content="muselab · 自部署的多模型 AI 工作台">
 <meta name="twitter:description" content="你的私人档案就是 AI 的工作集。八家模型共用一套 agent loop，复用 Claude Pro 订阅，跑在你自己的机器上。">
 <meta name="twitter:image" content="og-image.png">
-<meta name="theme-color" content="#0e1014">
+<meta name="theme-color" content="#11100e">
 <title>muselab · 自部署的多模型 AI 工作台</title>
 <style>
+  /* Self-hosted fonts — no third-party CDN, so the page honours its own
+     "zero telemetry / no third-party calls" claim. Latin (display serif +
+     mono) ships as local variable woff2; CJK falls back to system serif
+     (Songti SC / system Noto) per the --serif/--sans stacks below. */
+  @font-face {
+    font-family: 'Fraunces'; font-style: normal; font-weight: 400 700; font-display: swap;
+    src: url('fonts/fraunces-var-latin.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: 'Fraunces'; font-style: normal; font-weight: 400 700; font-display: swap;
+    src: url('fonts/fraunces-var-latin-ext.woff2') format('woff2');
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+  }
+  @font-face {
+    font-family: 'JetBrains Mono'; font-style: normal; font-weight: 400 700; font-display: swap;
+    src: url('fonts/jetbrainsmono-var-latin.woff2') format('woff2');
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: 'JetBrains Mono'; font-style: normal; font-weight: 400 700; font-display: swap;
+    src: url('fonts/jetbrainsmono-var-latin-ext.woff2') format('woff2');
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+  }
   :root {
-    --bg: #0e1014;
-    --bg-1: #14171c;
-    --bg-2: #1a1e25;
-    --bg-3: #232830;
-    --fg-0: #f5f7fa;
-    --fg-1: #e0e4ea;
-    --fg-2: #a4adbb;
-    --fg-3: #9ca3af;
-    --fg-4: #4a5160;
-    --accent: #6093ff;
-    --accent-soft: rgba(96, 147, 255, 0.12);
-    --accent-fg: #b8cdff;
-    --green: #4ade80;
-    --green-soft: rgba(74, 222, 128, 0.14);
-    --red: #ef4444;
-    --red-soft: rgba(239, 68, 68, 0.14);
-    --amber: #fbbf24;
-    --user-bg: #1d3464;
-    --user-fg: #e7eeff;
-    --thinking-bg: #1a1f2b;
-    --thinking-fg: #9ab2d6;
-    --border: #232830;
-    --border-strong: #2d333e;
+    --bg: #11100e;
+    --bg-1: #181612;
+    --bg-2: #211e18;
+    --bg-3: #2b2720;
+    --fg-0: #f7f3ea;
+    --fg-1: #e8e1d3;
+    --fg-2: #b4ab98;
+    --fg-3: #8a8273;
+    --fg-4: #4f483c;
+    --accent: #e0a458;
+    --accent-soft: rgba(224, 164, 88, 0.12);
+    --accent-fg: #f0c98a;
+    --green: #8cbf73;
+    --green-soft: rgba(140, 191, 115, 0.14);
+    --red: #d9685b;
+    --red-soft: rgba(217, 104, 91, 0.14);
+    --amber: #f0b54a;
+    --user-bg: #33291a;
+    --user-fg: #f5ead4;
+    --thinking-bg: #1c1913;
+    --thinking-fg: #c2b291;
+    --border: #2b2720;
+    --border-strong: #3a352c;
+    --serif: 'Fraunces', 'Songti SC', 'Noto Serif CJK SC', Georgia, 'Times New Roman', serif;
     --mono: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', monospace;
-    --sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Inter', 'Segoe UI', system-ui, sans-serif;
+    --sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', system-ui, sans-serif;
     --max-w: 1180px;
+    /* This deck is dark-only; declare it so form controls, scrollbars and
+       the iOS rubber-band band render dark instead of defaulting to light. */
+    color-scheme: dark;
+  }
+
+  /* Keyboard focus ring — links/buttons only had :hover, so keyboard
+     users got no visible focus indicator on the dark background. */
+  a:focus-visible, button:focus-visible, .btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scroll-behavior: smooth; }
   section[id] { scroll-margin-top: 5rem; }  /* sticky nav 不遮挡锚点跳转目标 */
+  /* overflow-x:hidden on body alone is unreliable — the viewport scroll can
+     propagate to <html>, which then scrolls a wide descendant anyway. Setting
+     it on html too makes the clip actually take effect. */
+  html { overflow-x: hidden; }
   body {
     background: var(--bg);
     color: var(--fg-0);
@@ -76,7 +116,7 @@
     position: sticky;
     top: 0;
     z-index: 100;
-    background: rgba(14, 16, 20, 0.72);
+    background: rgba(17, 16, 14, 0.74);
     backdrop-filter: blur(18px) saturate(140%);
     -webkit-backdrop-filter: blur(18px) saturate(140%);
     border-bottom: 1px solid rgba(255,255,255,0.04);
@@ -135,12 +175,12 @@
   }
   .btn-primary {
     background: var(--accent);
-    color: #0e1014;
+    color: #11100e;
     font-weight: 600;
   }
   .btn-primary:hover {
-    background: #7aa3ff;
-    color: #0e1014;
+    background: #ecbf7a;
+    color: #11100e;
   }
   .btn .star { font-size: 0.95em; }
 
@@ -164,10 +204,11 @@
   }
   .section-label svg { width: 14px; height: 14px; color: var(--accent); }
   h2 {
+    font-family: var(--serif);
     font-size: clamp(2rem, 3.5vw, 2.8rem);
-    line-height: 1.18;
-    font-weight: 700;
-    letter-spacing: -0.015em;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.008em;
     margin-bottom: 1.2rem;
   }
   h2 .hl { color: var(--accent); }
@@ -195,7 +236,7 @@
   }
   .micro .tag {
     color: var(--accent);
-    border: 1px solid rgba(96,147,255,0.4);
+    border: 1px solid rgba(224,164,88,0.4);
     padding: 0.08em 0.55em;
     border-radius: 3px;
     margin-right: 0.4em;
@@ -242,7 +283,7 @@
     position: absolute;
     top: -10%; right: -15%;
     width: 70%; height: 80%;
-    background: radial-gradient(circle, rgba(96,147,255,0.18) 0%, transparent 60%);
+    background: radial-gradient(circle, rgba(224,164,88,0.18) 0%, transparent 60%);
     pointer-events: none;
     z-index: 0;
   }
@@ -272,7 +313,7 @@
     display: inline-flex; align-items: center; gap: 0.5em;
     padding: 0.35em 0.9em;
     background: var(--accent-soft);
-    border: 1px solid rgba(96,147,255,0.25);
+    border: 1px solid rgba(224,164,88,0.25);
     border-radius: 999px;
     color: var(--accent);
     font-family: var(--mono);
@@ -282,13 +323,24 @@
   }
   .hero-pill svg { width: 12px; height: 12px; }
   .hero h1 {
+    font-family: var(--serif);
     font-size: clamp(2.4rem, 5vw, 4.4rem);
-    line-height: 1.1;
-    font-weight: 700;
-    letter-spacing: -0.025em;
+    line-height: 1.08;
+    font-weight: 600;
+    letter-spacing: -0.018em;
     margin-bottom: 1.2rem;
   }
   .hero h1 .hl { color: var(--accent); }
+  .hero-claim {
+    font-family: var(--serif);
+    font-size: clamp(1.3rem, 2vw, 1.7rem);
+    color: var(--fg-1);
+    line-height: 1.32;
+    font-weight: 500;
+    margin-bottom: 1.2rem;
+    max-width: 24em;
+  }
+  .hero-claim .hl { color: var(--accent); }
   .hero-sub {
     font-size: clamp(1.05rem, 1.4vw, 1.25rem);
     color: var(--fg-2);
@@ -306,7 +358,7 @@
     font-family: var(--mono);
     font-size: 0.82rem;
     color: var(--fg-2);
-    background: #0a0c10;
+    background: #0c0b09;
     padding: 0.7em 1em;
     border-radius: 6px;
     border: 1px solid var(--border-strong);
@@ -337,7 +389,7 @@
     overflow: hidden;
     box-shadow:
       0 24px 60px rgba(0,0,0,0.5),
-      0 0 0 1px rgba(96,147,255,0.08);
+      0 0 0 1px rgba(224,164,88,0.08);
   }
 
   /* ===== mock UI shared ===== */
@@ -352,7 +404,7 @@
   }
   .mock-bar {
     height: 30px;
-    background: #0a0c10;
+    background: #0c0b09;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
@@ -508,14 +560,14 @@
      brand colors, they're "data colors" picked for visual variety
      while staying readable on dark bg. */
   .portfolio-preview {
-    --c1: #6093ff;   /* blue (accent family) */
-    --c2: #4ade80;   /* green */
+    --c1: #e0a458;   /* blue (accent family) */
+    --c2: #8cbf73;   /* green */
     --c3: #fbbf24;   /* amber */
     --c4: #f5b042;   /* gold */
     --c5: #a78bfa;   /* violet */
     --c6: #94a3b8;   /* slate (cash) */
     padding: 1em 1.1em;
-    background: linear-gradient(180deg, var(--bg) 0%, #0a0c10 100%);
+    background: linear-gradient(180deg, var(--bg) 0%, #0c0b09 100%);
     color: var(--fg-1);
     font-family: var(--sans);
   }
@@ -666,8 +718,8 @@
     background: rgba(255,255,255,0.05);
     border-left: 2px solid var(--fg-3);
   }
-  .hd-tic.c1 { border-left-color: var(--c1, #6093ff); color: var(--c1, #6093ff); }
-  .hd-tic.c2 { border-left-color: var(--c2, #4ade80); color: var(--c2, #4ade80); }
+  .hd-tic.c1 { border-left-color: var(--c1, #e0a458); color: var(--c1, #e0a458); }
+  .hd-tic.c2 { border-left-color: var(--c2, #8cbf73); color: var(--c2, #8cbf73); }
   .hd-tic.c3 { border-left-color: var(--c3, #fbbf24); color: var(--c3, #fbbf24); }
   .hd-tic.c4 { border-left-color: var(--c4, #f5b042); color: var(--c4, #f5b042); }
 
@@ -679,7 +731,7 @@
   /* sessions mock */
   .chat-tabs {
     display: flex;
-    background: #0a0c10;
+    background: #0c0b09;
     border-bottom: 1px solid var(--border);
     overflow-x: hidden;
   }
@@ -791,7 +843,7 @@
   .chat-toolbar .toolbar-select.model { color: var(--accent); border-color: var(--accent); }
   .chat-toolbar .toolbar-select.perm {
     color: var(--accent);
-    border-color: rgba(96,147,255,0.5);
+    border-color: rgba(224,164,88,0.5);
     background: var(--accent-soft);
   }
   .chat-toolbar .toolbar-select .v { color: var(--fg-4); }
@@ -806,7 +858,7 @@
   .chat-toolbar .toolbar-send {
     display: inline-flex; align-items: center; justify-content: center;
     width: 28px; height: 22px;
-    background: var(--accent); color: #0e1014;
+    background: var(--accent); color: #11100e;
     border-radius: 4px;
     font-size: 0.75em;
   }
@@ -833,206 +885,6 @@
   .opt.sel { background: var(--accent-soft); color: var(--accent); }
   .opt::before { content: ''; width: 8px; }
   .opt.sel::before { content: '●'; color: var(--accent); width: auto; margin-right: 0.2em; }
-
-  /* plan-spotlight */
-  .plan-spotlight {
-    background: linear-gradient(180deg, var(--bg) 0%, #0a0d12 50%, var(--bg) 100%);
-    padding: 7rem 1.5rem;
-  }
-  .plan-spotlight .container { text-align: center; }
-  .plan-spotlight .lead { margin: 0 auto 3rem; text-align: center; }
-  .plan-spotlight .section-label { justify-content: center; }
-  .plan-demo {
-    max-width: 720px;
-    margin: 0 auto;
-    text-align: left;
-  }
-  .chat-area {
-    padding: 1.2em 1.4em;
-    background: var(--bg);
-    min-height: 320px;
-  }
-  .msg-user {
-    margin: 0.4em 0 0.8em auto;
-    padding: 0.6em 0.9em;
-    background: var(--user-bg);
-    color: var(--user-fg);
-    border-radius: 12px 12px 4px 12px;
-    max-width: 70%;
-    width: fit-content;
-    font-size: 0.92em;
-    line-height: 1.5;
-  }
-  .thinking-head {
-    display: flex; align-items: center; gap: 0.5em;
-    padding: 0.45em 0.7em;
-    background: var(--thinking-bg);
-    border-radius: 6px 6px 0 0;
-    color: var(--thinking-fg);
-    font-family: var(--mono); font-size: 0.78em;
-    cursor: pointer;
-  }
-  .thinking-head .chevron { color: var(--accent); }
-  .thinking-body {
-    padding: 0.65em 0.9em;
-    background: var(--thinking-bg);
-    color: var(--thinking-fg);
-    font-style: italic;
-    font-size: 0.85em;
-    line-height: 1.6;
-    border-radius: 0 0 6px 6px;
-    margin-bottom: 0.6em;
-  }
-  .plan-card {
-    border: 1px solid var(--border-strong);
-    background: var(--bg-1);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .plan-head {
-    padding: 0.6em 0.9em;
-    background: var(--accent-soft);
-    color: var(--accent);
-    display: flex; align-items: center; gap: 0.5em;
-    font-family: var(--mono); font-size: 0.82em;
-    letter-spacing: 0.04em;
-    border-bottom: 1px solid var(--border-strong);
-  }
-  .plan-body {
-    padding: 0.8em 1.1em;
-    color: var(--fg-1);
-    font-size: 0.88em;
-    line-height: 1.65;
-  }
-  .plan-body ol { padding-left: 1.4em; }
-  .plan-body li { margin-bottom: 0.3em; }
-
-  /* ===== Rich plan mode (full flow: thinking → plan → approval → exec) ===== */
-  /* collapsed thinking with peek text */
-  .thinking-head.collapsed {
-    background: var(--bg-1);
-    border-radius: 6px;
-    color: var(--fg-3);
-    border-left: 2px solid var(--thinking-fg);
-    padding-left: 0.6em;
-    margin-bottom: 0.5em;
-  }
-  .thinking-head .thinking-peek {
-    color: var(--fg-4);
-    font-style: italic;
-    margin-left: 0.6em;
-    font-size: 0.92em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-    min-width: 0;
-  }
-
-  /* rich plan card additions */
-  .plan-card-rich { margin-top: 0.4em; }
-  .plan-head .plan-meta {
-    margin-left: auto;
-    color: var(--fg-3);
-    font-size: 0.78em;
-    font-weight: 400;
-    letter-spacing: 0;
-  }
-  .plan-body ol li {
-    margin-bottom: 0.55em;
-    line-height: 1.5;
-  }
-  .plan-step { display: block; color: var(--fg-1); font-size: 0.95em; }
-  .plan-step code {
-    background: var(--bg);
-    color: var(--accent-fg);
-    padding: 0.05em 0.4em;
-    border-radius: 3px;
-    font-size: 0.92em;
-  }
-  .plan-why {
-    display: block;
-    color: var(--fg-3);
-    font-size: 0.85em;
-    margin-top: 0.15em;
-    padding-left: 1.2em;
-  }
-  .plan-why code {
-    background: var(--bg);
-    color: var(--accent-fg);
-    padding: 0 0.3em;
-    border-radius: 2px;
-    font-size: 0.95em;
-  }
-  .plan-scope {
-    margin-top: 0.9em;
-    padding: 0.6em 0.8em;
-    background: var(--bg);
-    border-left: 2px solid var(--accent);
-    border-radius: 4px;
-    display: flex; align-items: baseline; gap: 0.6em;
-  }
-  .plan-scope-lbl {
-    color: var(--accent);
-    font-family: var(--mono);
-    font-size: 0.72em;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    flex-shrink: 0;
-  }
-  .plan-scope-text {
-    color: var(--fg-2);
-    font-size: 0.88em;
-    line-height: 1.5;
-  }
-  .plan-actions {
-    display: flex; justify-content: flex-end; gap: 0.5em;
-    padding: 0.8em 1em;
-    border-top: 1px solid var(--border-strong);
-    background: var(--bg);
-  }
-  .btn-plan {
-    padding: 0.45em 1em;
-    font-size: 0.82em;
-    border-radius: 4px;
-    border: 1px solid var(--border-strong);
-    background: var(--bg-1);
-    color: var(--fg-1);
-    cursor: pointer;
-    font-family: var(--sans);
-  }
-  .btn-plan-deny { color: var(--fg-2); }
-  .btn-plan-allow {
-    background: var(--accent);
-    color: #0e1014;
-    border-color: var(--accent);
-    font-weight: 600;
-  }
-
-  /* approval bar */
-  .approval-bar {
-    margin: 1.2em 0 0.8em;
-    padding: 0.5em 0.8em;
-    background: rgba(74,222,128,0.08);
-    border-radius: 4px;
-    display: flex; align-items: center; gap: 0.6em;
-    font-family: var(--mono);
-    font-size: 0.78em;
-    color: var(--green);
-  }
-  .approval-tick {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 18px; height: 18px; border-radius: 50%;
-    background: var(--green); color: #0e1014;
-    font-weight: 700;
-    font-size: 0.78em;
-  }
-  .approval-text { color: var(--green); }
-  .approval-meta {
-    margin-left: auto;
-    color: var(--fg-3);
-    font-size: 0.9em;
-  }
 
   /* execution phase: tool chain */
   .exec-phase {
@@ -1068,7 +920,7 @@
     font-size: 0.88em;
     flex-shrink: 0;
   }
-  .exec-batch { background: rgba(96,147,255,0.04); }
+  .exec-batch { background: rgba(224,164,88,0.04); }
   .exec-badge {
     padding: 0.05em 0.45em;
     border-radius: 2px;
@@ -1076,7 +928,7 @@
     font-weight: 600;
     flex-shrink: 0;
   }
-  .exec-badge.plus { color: var(--green); background: rgba(74,222,128,0.1); }
+  .exec-badge.plus { color: var(--green); background: rgba(140,191,115,0.1); }
 
   /* mini result preview after Write */
   .exec-result {
@@ -1152,7 +1004,7 @@
     transition: border-color .2s, transform .2s;
   }
   .card:hover {
-    border-color: rgba(96,147,255,0.4);
+    border-color: rgba(224,164,88,0.4);
     transform: translateY(-2px);
   }
   .card .icon {
@@ -1212,29 +1064,93 @@
   /* phone */
   .phone {
     margin: 0 auto;
-    width: 200px;
+    width: 210px;
     aspect-ratio: 9/19.5;
-    background: #0a0c10;
-    border: 7px solid #1a1e25;
-    border-radius: 28px;
-    padding: 18px 8px 6px;
+    background: #0c0b09;
+    border: 8px solid #26221a;
+    border-radius: 36px;
+    padding: 24px 9px 18px;
     position: relative;
     display: flex; flex-direction: column;
-    box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    box-shadow:
+      0 30px 64px rgba(0,0,0,0.6),
+      inset 0 0 0 1.5px #3a352c,
+      inset 0 1.5px 2px rgba(255,255,255,0.07);
   }
+  /* dynamic-island pill */
   .phone::before {
     content: '';
     position: absolute;
-    top: 6px; left: 50%;
+    top: 11px; left: 50%;
     transform: translateX(-50%);
-    width: 38%; height: 14px;
-    background: #1a1e25;
-    border-radius: 0 0 12px 12px;
+    width: 32%; height: 11px;
+    background: #000;
+    border-radius: 999px;
+    z-index: 4;
+  }
+  /* home indicator */
+  .phone::after {
+    content: '';
+    position: absolute;
+    bottom: 7px; left: 50%;
+    transform: translateX(-50%);
+    width: 32%; height: 4px;
+    background: var(--fg-3);
+    opacity: 0.55;
+    border-radius: 999px;
+    z-index: 4;
   }
   .phone-statbar {
-    display: flex; justify-content: space-between;
-    font-family: var(--mono); font-size: 0.55em;
-    color: var(--fg-3); padding: 3px 8px;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 2px 14px 5px;
+  }
+  .phone-statbar .t {
+    font-family: var(--sans); font-weight: 700;
+    font-size: 0.62em; color: var(--fg-0); letter-spacing: 0.02em;
+  }
+  .phone-statbar .ic { display: flex; align-items: flex-end; gap: 5px; }
+  /* signal bars (4 ascending) */
+  .phone-statbar .sig {
+    width: 14px; height: 9px;
+    background:
+      linear-gradient(var(--fg-1),var(--fg-1)) 0    100%/2.4px 35% no-repeat,
+      linear-gradient(var(--fg-1),var(--fg-1)) 3.8px 100%/2.4px 55% no-repeat,
+      linear-gradient(var(--fg-1),var(--fg-1)) 7.6px 100%/2.4px 78% no-repeat,
+      linear-gradient(var(--fg-1),var(--fg-1)) 11.4px 100%/2.4px 100% no-repeat;
+  }
+  /* battery */
+  .phone-statbar .bat {
+    width: 17px; height: 9px;
+    border: 1px solid var(--fg-2);
+    border-radius: 2.5px; position: relative;
+  }
+  .phone-statbar .bat::before {
+    content: ''; position: absolute; inset: 1.3px;
+    width: 72%; background: var(--green); border-radius: 1px;
+  }
+  .phone-statbar .bat::after {
+    content: ''; position: absolute; right: -3px; top: 2.5px; bottom: 2.5px;
+    width: 1.6px; background: var(--fg-2); border-radius: 0 2px 2px 0;
+  }
+  .phone-daysep {
+    text-align: center; font-family: var(--mono);
+    font-size: 0.86em; color: var(--fg-4); margin: 0.35em 0 0.15em;
+  }
+  .phone-hint { color: var(--fg-3); }
+  .phone-msg strong { color: var(--fg-0); font-weight: 600; }
+  .phone-typing {
+    display: inline-flex; gap: 3.5px; align-items: center;
+    width: max-content; padding: 0.55em 0.7em !important;
+  }
+  .phone-typing span {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--fg-3); animation: ptype 1.2s infinite ease-in-out;
+  }
+  .phone-typing span:nth-child(2) { animation-delay: 0.18s; }
+  .phone-typing span:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes ptype {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-2.5px); }
   }
   .phone-app {
     flex: 1; margin-top: 0.3em;
@@ -1253,8 +1169,11 @@
   }
   .phone-head svg { width: 9px; height: 9px; color: var(--accent); }
   .phone-body {
-    flex: 1; padding: 0.35em;
-    display: flex; flex-direction: column; gap: 0.3em;
+    flex: 1; padding: 0.35em 0.4em 0.5em;
+    display: flex; flex-direction: column; justify-content: flex-end; gap: 0.32em;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 8%);
+            mask-image: linear-gradient(to bottom, transparent 0, #000 8%);
   }
   .phone-msg {
     padding: 0.35em 0.5em;
@@ -1276,7 +1195,7 @@
   .phone-tabbar {
     display: flex;
     border-top: 1px solid var(--border);
-    background: #0a0c10;
+    background: #0c0b09;
   }
   .phone-tab {
     flex: 1;
@@ -1292,10 +1211,118 @@
     background: var(--accent-soft);
   }
 
+  /* ===== lock screen + push notification (scheduled-task spotlight) ===== */
+  .lock {
+    flex: 1;
+    margin-top: 0.3em;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 1.5em 0.3em 0.7em;
+    position: relative;
+  }
+  .lock-time {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 2.2rem;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    color: var(--fg-0);
+  }
+  .lock-date {
+    font-family: var(--sans);
+    font-size: 0.72rem;
+    color: var(--fg-2);
+    margin-top: 0.4em;
+  }
+  .lock-push {
+    margin-top: auto;
+    width: 100%;
+    background: rgba(43, 39, 32, 0.92);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 0.55em 0.65em;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+  }
+  .lock-push-head {
+    display: flex; align-items: center; gap: 0.4em;
+    margin-bottom: 0.3em;
+  }
+  .lock-push-head svg { width: 11px; height: 11px; color: var(--accent); }
+  .lock-push-app {
+    font-family: var(--mono);
+    font-size: 0.6rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-3);
+  }
+  .lock-push-time {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 0.6rem;
+    color: var(--fg-4);
+  }
+  .lock-push-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--fg-0);
+    margin-bottom: 0.15em;
+    line-height: 1.35;
+  }
+  .lock-push-body {
+    font-size: 0.72rem;
+    color: var(--fg-2);
+    line-height: 1.5;
+  }
+
+  /* ===== photo-capture mock (capture spotlight) ===== */
+  .phone-shot {
+    width: 62%;
+    margin-left: auto;
+    aspect-ratio: 4 / 3;
+    border-radius: 7px;
+    background: linear-gradient(135deg, #2f2a22, #181612);
+    border: 1px solid var(--border-strong);
+    padding: 0.5em 0.55em;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    gap: 3px;
+    position: relative;
+    overflow: hidden;
+  }
+  .phone-shot .tag {
+    position: absolute; top: 4px; left: 6px;
+    font-family: var(--mono);
+    color: var(--fg-2);
+  }
+  .phone-shot i {
+    display: block;
+    height: 2.5px;
+    border-radius: 2px;
+    background: var(--fg-3);
+    opacity: 0.7;
+  }
+  .phone-shot i:nth-child(2) { width: 85%; }
+  .phone-shot i:nth-child(3) { width: 62%; }
+  .phone-shot i:nth-child(4) { width: 74%; }
+  .phone-file {
+    margin-right: 0.8em;
+    display: flex; align-items: center; gap: 0.4em;
+    font-family: var(--mono);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    border-radius: 4px;
+    padding: 0.4em 0.55em;
+    color: var(--fg-1);
+  }
+  .phone-file .plus { margin-left: auto; color: var(--green); }
+
   /* ===== Multi-device spotlight (MacBook + iPhone same session) ===== */
   .device-spotlight {
     padding: 7rem 1.5rem;
-    background: linear-gradient(180deg, transparent 0%, rgba(96,147,255,0.025) 50%, transparent 100%);
+    background: linear-gradient(180deg, transparent 0%, rgba(224,164,88,0.025) 50%, transparent 100%);
     border-top: 1px solid rgba(255,255,255,0.04);
   }
   .device-pair {
@@ -1307,54 +1334,25 @@
     margin: 0 auto;
   }
 
-  /* MacBook frame */
+  /* Desktop window (clean browser-style card, not a faux laptop) */
   .macbook {
     position: relative;
-    filter: drop-shadow(0 30px 50px rgba(0,0,0,0.45));
+    filter: drop-shadow(0 22px 44px rgba(0,0,0,0.38));
   }
   .macbook-screen {
-    background: #0a0c10;
-    border: 10px solid #1c1f26;
-    border-bottom-width: 22px;
-    border-radius: 14px 14px 4px 4px;
+    background: #0c0b09;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
     overflow: hidden;
     position: relative;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
   }
-  .macbook-screen::before {
-    /* camera notch */
+  /* faint screen glare */
+  .macbook-screen::after {
     content: '';
-    position: absolute;
-    top: -3px; left: 50%;
-    transform: translateX(-50%);
-    width: 70px; height: 4px;
-    background: #1c1f26;
-    border-radius: 0 0 6px 6px;
-    z-index: 2;
-  }
-  .macbook-hinge {
-    height: 6px;
-    width: 104%;
-    margin-left: -2%;
-    background: #14161b;
-    border-radius: 0 0 2px 2px;
-  }
-  .macbook-base {
-    height: 12px;
-    width: 116%;
-    margin-left: -8%;
-    background: linear-gradient(180deg, #2a2f38 0%, #1a1e25 70%, #0d0f13 100%);
-    border-radius: 0 0 14px 14px;
-    position: relative;
-  }
-  .macbook-base::after {
-    /* trackpad cutout hint */
-    content: '';
-    position: absolute;
-    bottom: 0; left: 50%;
-    transform: translateX(-50%);
-    width: 18%; height: 4px;
-    background: rgba(0,0,0,0.55);
-    border-radius: 0 0 6px 6px;
+    position: absolute; inset: 0;
+    background: linear-gradient(118deg, rgba(255,255,255,0.045) 0%, rgba(255,255,255,0) 30%);
+    pointer-events: none; z-index: 3;
   }
 
   .desktop-content {
@@ -1487,7 +1485,7 @@
   /* install + arch */
   .install-arch {
     padding: 6rem 1.5rem;
-    background: linear-gradient(180deg, transparent, rgba(96,147,255,0.03));
+    background: linear-gradient(180deg, transparent, rgba(224,164,88,0.03));
     border-top: 1px solid rgba(255,255,255,0.04);
   }
   .install-arch .container {
@@ -1500,7 +1498,7 @@
     font-family: var(--mono);
     font-size: 0.88rem;
     color: var(--fg-1);
-    background: #0a0c10;
+    background: #0c0b09;
     padding: 1.2em 1.4em;
     border-radius: 8px;
     border: 1px solid var(--border-strong);
@@ -1573,10 +1571,18 @@
     padding: 6rem 1.5rem;
     border-top: 1px solid rgba(255,255,255,0.04);
   }
+  /* Wide 6-column table: on narrow panes its min-content width exceeds the
+     viewport. Let it scroll inside this wrapper instead of widening the page. */
+  .compare-table-wrap {
+    margin-top: 2rem;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-radius: 10px;
+  }
   .compare-table {
     width: 100%;
+    min-width: 560px;
     border-collapse: collapse;
-    margin-top: 2rem;
     font-size: 0.9rem;
     background: var(--bg-1);
     border-radius: 10px;
@@ -1594,7 +1600,7 @@
     color: var(--fg-3);
     font-size: 0.82em;
     letter-spacing: 0.04em;
-    background: #0a0c10;
+    background: #0c0b09;
   }
   .compare-table th.us { color: var(--accent); }
   .compare-table td:first-child {
@@ -1605,7 +1611,7 @@
   .compare-table td.us { color: var(--accent); font-weight: 600; }
   .compare-table .yes { color: var(--accent); }
   .compare-table .no { color: var(--fg-4); }
-  .compare-table .partial { color: #d2a04b; font-size: 0.85em; }
+  .compare-table .partial { color: var(--amber); font-size: 0.85em; }
 
   /* ===== privacy + capabilities (shared card grid) ===== */
   .privacy, .capabilities, .faq {
@@ -1696,7 +1702,7 @@
   footer {
     padding: 4rem 1.5rem 3rem;
     border-top: 1px solid var(--border);
-    background: #0a0c10;
+    background: #0c0b09;
   }
   .footer-inner {
     max-width: var(--max-w);
@@ -1751,6 +1757,14 @@
     .nav-inner { padding: 0.8rem 1rem; gap: 0.8rem; }
     .nav-links { display: none; }
     .nav-cta .btn { padding: 0.5em 0.9em; font-size: 0.85rem; }
+    /* Touch targets: WCAG 2.5.5 wants ≥44px. The compact copy / nav buttons
+       were ~28px tall on phones — too small to tap reliably. */
+    .nav-cta .btn, .hero-install .copy-btn, .install-cmd .copy-btn {
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
     .hero-inner, .spotlight-inner, .spotlight.reverse .spotlight-inner,
     .pair-inner, .install-arch .container {
       grid-template-columns: 1fr;
@@ -1774,7 +1788,93 @@
     .macbook { width: 100%; max-width: 520px; }
     .desktop-content { min-height: 240px; }
   }
+
+  /* ===== message-queue mock ===== */
+  .q-divider {
+    display: flex; align-items: center; gap: 0.6em;
+    margin: 1.1em 0 0.7em;
+    font-family: var(--mono); font-size: 0.82em;
+    color: var(--fg-4); text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  .q-divider::before, .q-divider::after {
+    content: ""; flex: 1; height: 1px; background: var(--border);
+  }
+  .q-item {
+    margin: 0 0 0.55em auto; max-width: 82%;
+    border: 1px dashed var(--border-strong); border-radius: 12px;
+    background: var(--bg-1); padding: 0.55em 0.8em;
+  }
+  .q-item-head {
+    display: flex; align-items: center; gap: 0.5em;
+    font-family: var(--mono); font-size: 0.78em; color: var(--accent);
+    margin-bottom: 0.32em;
+  }
+  .q-num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.4em; height: 1.4em; border-radius: 50%;
+    background: var(--bg-2); color: var(--fg-2);
+  }
+  .q-item-head .q-act { margin-left: auto; color: var(--fg-4); letter-spacing: 0.06em; }
+  .q-text { color: var(--fg-1); font-size: 0.92em; line-height: 1.5; }
+  .q-foot { text-align: center; margin-top: 0.5em; font-size: 0.87em; color: var(--fg-4); }
+  .q-dot {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); margin-right: 0.45em; vertical-align: middle;
+    animation: qpulse 1.2s ease-in-out infinite;
+  }
+  @keyframes qpulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+  /* ===== chat-area mock (user bubble + thinking header) ===== */
+  .chat-area {
+    padding: 1.2em 1.4em;
+    background: var(--bg);
+    min-height: 320px;
+  }
+  .msg-user {
+    margin: 0.4em 0 0.8em auto;
+    padding: 0.6em 0.9em;
+    background: var(--user-bg);
+    color: var(--user-fg);
+    border-radius: 12px 12px 4px 12px;
+    max-width: 70%;
+    width: fit-content;
+    font-size: 0.92em;
+    line-height: 1.5;
+  }
+  .thinking-head {
+    display: flex; align-items: center; gap: 0.5em;
+    padding: 0.45em 0.7em;
+    background: var(--thinking-bg);
+    border-radius: 6px 6px 0 0;
+    color: var(--thinking-fg);
+    font-family: var(--mono);
+    font-size: 0.78em;
+    cursor: pointer;
+  }
+  .thinking-head .chevron { color: var(--accent); }
+
+  /* Language toggle */
+  .lang-toggle {
+    appearance: none; cursor: pointer;
+    font: 600 0.8rem/1 var(--sans, inherit);
+    letter-spacing: 0.04em;
+    color: var(--fg-2); background: transparent;
+    border: 1px solid var(--border, rgba(255,255,255,0.14));
+    border-radius: 999px; padding: 0.45em 0.85em;
+    transition: color 0.18s, border-color 0.18s, background 0.18s;
+  }
+  .lang-toggle:hover { color: var(--accent); border-color: var(--accent); }
+  .lang-en { display: none; }
+  html[data-lang="en"] .lang-zh { display: none; }
+  html[data-lang="en"] .lang-en { display: inline; }
+  @media (max-width: 720px) { .lang-toggle { padding: 0.4em 0.7em; font-size: 0.74rem; } }
 </style>
+<noscript>
+  <!-- .reveal starts at opacity:0 and is unhidden by IntersectionObserver.
+       With JS off (or if the observer never fires), every section below the
+       hero would be invisible. Show everything immediately instead. -->
+  <style>.reveal { opacity: 1 !important; transform: none !important; }</style>
+</noscript>
 </head>
 <body>
 
@@ -1794,25 +1894,28 @@
 </svg>
 
 <!-- STICKY HEADER -->
-<nav class="nav">
+<nav class="nav" id="top">
   <div class="nav-inner">
-    <a href="#" class="nav-logo">
+    <a href="#top" class="nav-logo">
       <svg class="muse"><use href="#m-hex"/></svg>
       muse<span class="accent">·</span>lab
     </a>
     <div class="nav-links">
+      <a href="#concept">Concept</a>
       <a href="#privacy">Privacy</a>
       <a href="#features">Features</a>
-      <a href="#plan-mode">Plan mode</a>
       <a href="#install">Install</a>
       <a href="#compare">Compare</a>
     </div>
     <div class="nav-spacer"></div>
     <div class="nav-cta">
+      <button class="lang-toggle" onclick="toggleLang()" aria-label="Switch language" title="中文 / English">
+        <span class="lang-zh">EN</span><span class="lang-en">中文</span>
+      </button>
       <a href="https://github.com/hesorchen/muselab" class="btn btn-ghost" target="_blank" rel="noopener">
-        <span class="star">★</span> GitHub
+        <span class="star" aria-hidden="true">★</span> GitHub
       </a>
-      <a href="#install" class="btn btn-primary">Install</a>
+      <a href="#install" class="btn btn-primary" data-i18n="nav.install">Install</a>
     </div>
   </div>
 </nav>
@@ -1825,48 +1928,82 @@
         <svg class="muse"><use href="#m-hex"/></svg>
         Open source · MIT · Pre-1.0
       </div>
-      <h1>你的私人档案，<br>就是 AI 的<span class="hl">工作集</span>。</h1>
-      <p class="hero-sub">
+      <h1 data-i18n="hero.h1">Context <span class="hl">×</span> Harness<br><span class="hl">×</span> foundation model</h1>
+      <p class="hero-claim" data-i18n="hero.claim">你的私人档案，就是 AI 的<span class="hl">工作集</span>。</p>
+      <p class="hero-sub" data-i18n="hero.sub">
         想让 AI 读懂你的文件，通常得先把它们传上云、切成向量。muselab 反过来——指向一个你自己的目录，里面的原文件直接就是 Muse 的一等上下文。八家模型共用一套 agent loop，复用 Claude Pro 订阅，跑在你自己的机器上。
       </p>
       <div class="hero-cta">
-        <a href="#install" class="btn btn-primary">→ 一行命令装上</a>
+        <a href="#install" class="btn btn-primary" data-i18n="hero.cta">→ 一行命令装上</a>
         <a href="https://github.com/hesorchen/muselab" class="btn btn-ghost" target="_blank" rel="noopener">
-          <span class="star">★</span> Star on GitHub
+          <span class="star" aria-hidden="true">★</span> Star on GitHub
         </a>
       </div>
       <div class="hero-install">
+        <!-- Abbreviated display only; full command lives in the #install
+             section and the JS `INSTALL_CMD` const (source of truth). -->
         <span class="prompt">$</span>
         <span>curl -fsSL …/quick-install.sh | bash</span>
-        <button class="copy-btn" onclick="copyInstall(this)">Copy</button>
+        <button class="copy-btn" onclick="copyInstall(this)" data-i18n="hero.copy">Copy</button>
       </div>
     </div>
-    <div class="hero-mock">
+    <div class="hero-mock" aria-hidden="true">
       <div class="stack-card">
         <div class="mock-bar">
           <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-          <div class="title">localhost:8765 · 本周周报</div>
+          <div class="title" data-i18n="hero.mock.title">localhost:8765 · 本周周报</div>
         </div>
         <div style="padding: 1em 1.2em">
-          <div class="msg-user" style="margin: 0 0 0.7em auto">把这周 5 篇 daily log 汇总成一份周报，分进展 / 阻塞 / 下周计划</div>
-          <div class="thinking-head" style="margin-bottom: 0.3em">
+          <div class="msg-user" style="margin: 0 0 0.7em auto" data-i18n="hero.mock.user">把这周 5 篇 daily log 汇总成一份周报，分进展 / 阻塞 / 下周计划</div>
+          <div class="thinking-head" style="margin-bottom: 0.5em">
             <span class="chevron">▾</span>thinking · 12s
           </div>
-          <div class="plan-card">
-            <div class="plan-head">
-              <svg class="muse" style="width:14px;height:14px"><use href="#m-orbit"/></svg>
-              Plan · 待确认
+          <div class="exec-phase">
+            <div class="exec-item exec-done exec-batch">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read × 5</span>
+              <span class="exec-arg">logs/2026-W22-*.md</span>
+              <span class="exec-meta" data-i18n="hero.mock.lines">~640 行</span>
             </div>
-            <div class="plan-body" style="padding: 0.7em 1em; font-size: 0.85em">
-              <ol style="padding-left: 1.3em; margin: 0">
-                <li>读 logs/ 下本周 5 篇 daily log</li>
-                <li>归并进展、阻塞点、零散待办</li>
-                <li>按 进展 / 阻塞 / 下周计划 三段组织</li>
-                <li>写入 周报-W22.md</li>
-              </ol>
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool exec-tool-write">Write</span>
+              <span class="exec-arg" data-i18n="hero.mock.file">周报-W22.md</span>
+              <span class="exec-badge plus">+58</span>
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CONCEPT: Context × Harness × model -->
+<section class="capabilities reveal" id="concept">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-hex"/></svg>
+      <span data-i18n="concept.label">CONCEPT · muselab 的三层</span>
+    </div>
+    <h2 style="text-align:center" data-i18n="concept.h2">一个 agent 的上限，<br>由这<span class="hl">三层</span>共同决定。</h2>
+    <p class="lead" style="margin:0 auto 3.5rem; text-align:center" data-i18n="concept.lead">
+      多数产品只把最上层的会话框交给你；muselab 让三层都归你掌控——上下文是你磁盘上的原文件，harness 是跑在你机器上、能读能改的开源代码，连底座模型也不被锁定：八家随手可换，还能自己加一家。前两层是你拥有的资产，第三层是你自由的选择。
+    </p>
+    <div class="capability-grid">
+      <div class="capability-card">
+        <svg class="muse"><use href="#m-bars"/></svg>
+        <div class="cap-title" data-i18n="concept.c1.t">Context · 你的归档</div>
+        <div class="cap-desc" data-i18n="concept.c1.d">archive 是你机器上一个普通目录，里面的原文件直接就是 Muse 的一等上下文——不向量化、不上云、不切片，你随时能用文件管理器直接打开。而且它只增不减——档案越厚，Muse 每次回答的起点越高：这是会复利的上下文，不是每次清零的会话。</div>
+      </div>
+      <div class="capability-card">
+        <svg class="muse"><use href="#m-hex"/></svg>
+        <div class="cap-title" data-i18n="concept.c2.t">Harness · muselab 本身</div>
+        <div class="cap-desc" data-i18n="concept.c2.d">由 Claude Agent SDK 驱动的 agent loop：工具调用、多会话、Skills、MCP、Subagent 都在这一层。它跑在你自己的机器上，是你能读源码、能改的开源代码。</div>
+      </div>
+      <div class="capability-card">
+        <svg class="muse"><use href="#m-trio"/></svg>
+        <div class="cap-title" data-i18n="concept.c3.t">foundation model · 可换的底座</div>
+        <div class="cap-desc" data-i18n="concept.c3.d">内置八家，也能自己加任何 Anthropic 兼容端点。换模型时 Context 和 Harness 原样不动——底座是插拔件，不是锁定项。</div>
       </div>
     </div>
   </div>
@@ -1877,58 +2014,109 @@
   <div class="container">
     <svg class="muse idea-muse"><use href="#m-bars"/></svg>
     <div class="section-label" style="justify-content:center">CORE IDEA</div>
-    <h2>不是 RAG，不是云端拷贝，<br>就是<span class="hl">磁盘上的原文件</span>。</h2>
-    <p class="lead">
+    <h2 data-i18n="idea.h2">不是 RAG，不是云端拷贝，<br>就是<span class="hl">磁盘上的原文件</span>。</h2>
+    <p class="lead" data-i18n="idea.lead">
       muselab 不预先向量化你的档案。Muse 通过 Read / Grep / Edit 工具按需访问——和你自己在 IDE 里翻文件一样直接。文件改了立即生效，没有索引同步，没有 embedding 漂移。你的档案始终是你能直接打开、修改、删除的原文件，不是某个服务里的黑盒索引。
     </p>
   </div>
 </section>
 
-<!-- PRIVACY / DATA SOVEREIGNTY -->
-<section class="privacy reveal" id="privacy">
-  <div class="container">
-    <div class="section-label" style="justify-content:center">
-      <svg class="muse"><use href="#m-hex"/></svg>
-      PRIVACY · 隐私与数据主权
-    </div>
-    <h2 style="text-align:center">私密性不是开关，<br>是<span class="hl">架构默认</span>。</h2>
-    <p class="lead" style="margin:0 auto 3.5rem; text-align:center">
-      muselab 是单用户、自托管的。没有遥测、没有云端副本、没有第三方账号——文件在你的磁盘上，密钥在你的 <span class="kbd">.env</span> 里，连 Muse 自己都被禁止读取凭证文件。
-    </p>
-    <div class="privacy-grid">
-      <div class="privacy-card">
-        <svg class="muse"><use href="#m-crescent"/></svg>
-        <div class="pc-title">零遥测</div>
-        <div class="pc-desc">不接任何 analytics，不回传使用数据。除了你主动发起的模型 API 调用，muselab 不与任何第三方服务器通信。</div>
-      </div>
-      <div class="privacy-card">
-        <svg class="muse"><use href="#m-hex"/></svg>
-        <div class="pc-title">连密钥都对 Muse 不可见</div>
-        <div class="pc-desc"><span class="kbd">.env</span> · SSH 私钥 · <span class="kbd">*.pem</span> · credentials.json——这类凭证文件即便持有有效 token 也被拒绝读写。</div>
-      </div>
-      <div class="privacy-card">
+<!-- COMPOUNDING ARCHIVE: temporal comparison -->
+<section class="spotlight reveal" id="compounding">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
         <svg class="muse"><use href="#m-bars"/></svg>
-        <div class="pc-title">文件就在你的磁盘上</div>
-        <div class="pc-desc">archive 是你机器上一个普通目录。没有向量库、没有云端镜像、没有数据搬运——随时能用文件管理器或终端直接打开。</div>
+        <span data-i18n="comp.label">ARCHIVE · 会复利的上下文</span>
       </div>
-      <div class="privacy-card">
-        <svg class="muse"><use href="#m-lens"/></svg>
-        <div class="pc-title">越权即拒</div>
-        <div class="pc-desc">所有读写被锁在 archive 根目录内；指向 <span class="kbd">/</span>、<span class="kbd">/etc</span> 等系统路径会在启动时直接拒绝。</div>
-      </div>
-      <div class="privacy-card">
-        <svg class="muse"><use href="#m-wave"/></svg>
-        <div class="pc-title">不被搜索引擎收录</div>
-        <div class="pc-desc">默认 <span class="kbd">noindex</span> + robots.txt，万一误暴露也不会被爬；token 用 constant-time 比较，过短拒绝启动。</div>
-      </div>
-      <div class="privacy-card">
-        <svg class="muse"><use href="#m-spark"/></svg>
-        <div class="pc-title">MIT 开源，可审计</div>
-        <div class="pc-desc">全部代码公开。每一条数据流向哪里，你都能自己读源码确认，而不是信一句"我们很安全"。</div>
+      <h2 data-i18n="comp.h2">这份和上一份比，<br><span class="hl">哪些数字变了</span>。</h2>
+      <p class="lead" data-i18n="comp.lead">
+        归档只增不减——你不用翻历史，Muse 自己 Grep 出上一份，逐项对比。存得越多、聊得越久，每次回答的起点越高。这是会复利的上下文，不是每次清零的会话。
+      </p>
+      <div class="micro" data-i18n="comp.micro">
+        历史文件随用随取 · 不靠你手动喂上下文 · 档案越厚，Muse 越懂全局
       </div>
     </div>
-    <div class="micro" style="text-align:center; margin-top:2.5rem">
-      威胁模型 · 防护清单 · 反代加固建议 → <a href="https://github.com/hesorchen/muselab/blob/main/SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a>
+    <div class="spot-mock" aria-hidden="true">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title" data-i18n="comp.mock.title">chat · 季度复盘对比</div>
+        </div>
+        <div class="chat-area">
+          <div class="msg-user" data-i18n="comp.mock.user">这季度复盘和上一季比，哪些指标变了？</div>
+          <div class="thinking-head" style="margin-bottom:0.5em"><span class="chevron">▾</span>thinking · 9s</div>
+          <div class="exec-phase">
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Grep</span>
+              <span class="exec-arg" data-i18n="comp.mock.grep">投资/ · “季度复盘”</span>
+              <span class="exec-meta" data-i18n="comp.mock.grepmeta">命中 2 份</span>
+            </div>
+            <div class="exec-item exec-done exec-batch">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read × 2</span>
+              <span class="exec-arg" data-i18n="comp.mock.read">复盘-2026Q1.md · 复盘-2025Q4.md</span>
+            </div>
+          </div>
+          <div class="exec-result">
+            <div class="exec-result-head" data-i18n="comp.mock.rhead">复盘对比.md · 预览 · 示例数据</div>
+            <div class="exec-result-body">
+              <span class="exec-md-h2" data-i18n="comp.mock.rh2">## 本季 vs 上季</span>
+              <span data-i18n="comp.mock.rbody">净值 <strong>+3.2%</strong> · 最大回撤收窄 <strong>1.1pct</strong> · 仓位新增 1 个标的</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CROSS-DOMAIN: synthesize across folders -->
+<section class="spotlight reverse reveal" id="cross">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-trio"/></svg>
+        <span data-i18n="cross.label">CROSS-DOMAIN · 跨目录综合</span>
+      </div>
+      <h2 data-i18n="cross.h2">一句话，<br>同时调动<span class="hl">好几个目录</span>。</h2>
+      <p class="lead" data-i18n="cross.lead">
+        投资、旅行、笔记……都在同一个归档里。问一句“这次旅行预算从现金仓里出够不够”，Muse 自己跨目录把数据凑齐再回答。一个 agent 跨你生活的多个维度，不是各开一个互不相通的对话。
+      </p>
+      <div class="micro" data-i18n="cross.micro">
+        一次提问跨多个文件夹 · 数据自己找齐 · 跨维度推理，不用你来回复制粘贴
+      </div>
+    </div>
+    <div class="spot-mock" aria-hidden="true">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title" data-i18n="cross.mock.title">chat · 跨目录</div>
+        </div>
+        <div class="chat-area">
+          <div class="msg-user" data-i18n="cross.mock.user">下个月关西旅行预算 2 万，从现金仓里出够吗？</div>
+          <div class="thinking-head" style="margin-bottom:0.5em"><span class="chevron">▾</span>thinking · 7s</div>
+          <div class="exec-phase">
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read</span>
+              <span class="exec-arg" data-i18n="cross.mock.r1">关西旅行/行程预算.md</span>
+            </div>
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read</span>
+              <span class="exec-arg" data-i18n="cross.mock.r2">投资/持仓.csv</span>
+            </div>
+          </div>
+          <div class="exec-result">
+            <div class="exec-result-head" data-i18n="cross.mock.rhead">回答 · 示例数据</div>
+            <div class="exec-result-body">
+              <span data-i18n="cross.mock.rbody">现金仓 <strong>¥100,000</strong>，旅行预算 <strong>¥20,000</strong> 占 20%，覆盖充足；建议从货币基金赎回，不动股票仓。</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </section>
@@ -1939,18 +2127,17 @@
     <div class="spot-text">
       <div class="section-label">
         <svg class="muse"><use href="#m-halo"/></svg>
-        FILES · 文件工作流
+        <span data-i18n="files.label">FILES · 文件工作流</span>
       </div>
-      <h2>多种常见格式，<br>浏览器里<span class="hl">直接渲染</span>。</h2>
-      <p class="lead">
+      <h2 data-i18n="files.h2">多种常见格式，<br>在 muselab 里<span class="hl">直接渲染</span>。</h2>
+      <p class="lead" data-i18n="files.lead">
         XLSX 看表格、HTML 看图表、PDF 看页面、Markdown 看格式化、图片直接预览——不用为了"看个文件"再开 Numbers / Preview / VSCode。所有渲染在三栏 workspace 中间那一栏完成，右边随时让 Muse 对它做事。
       </p>
       <div class="micro">
-        <span class="tag">.md</span><span class="tag">.html</span><span class="tag">.xlsx</span><span class="tag">.csv</span><span class="tag">.pdf</span><span class="tag">.png/.jpg</span><span class="tag">.txt</span><br>
-        软删除 30 天可还原 · <span class="kbd">.gitignore</span> 自动屏蔽 · 拖到底部即删
+        <span class="tag">.md</span><span class="tag">.html</span><span class="tag">.xlsx</span><span class="tag">.csv</span><span class="tag">.pdf</span><span class="tag">.png/.jpg</span><span class="tag">.txt</span>
       </div>
     </div>
-    <div class="spot-mock">
+    <div class="spot-mock" aria-hidden="true">
       <div class="mock">
         <div class="mock-bar">
           <div class="dot"></div><div class="dot"></div><div class="dot"></div>
@@ -1958,131 +2145,375 @@
         </div>
         <div class="ws">
           <div class="ws-files">
-            <div class="ws-head">▣ 文件</div>
-            <div class="ws-search">🔍 <span class="placeholder">搜索文件名 / 内容…</span></div>
+            <div class="ws-head"><span data-i18n="ws.files">▣ 文件</span></div>
+            <div class="ws-search">🔍 <span class="placeholder" data-i18n="ws.search">搜索文件名 / 内容…</span></div>
             <div class="openfiles">
-              <div class="openfiles-head">▼ 已打开 (3)</div>
+              <div class="openfiles-head" data-i18n="ws.opened">▼ 已打开 (3)</div>
               <div class="openfiles-row">
-                <span class="ico xlsx">▣</span><span>预算明细.xlsx</span><span class="x">×</span>
+                <span class="ico xlsx">▣</span><span data-i18n="ws.f.holdings">持仓.csv</span><span class="x">×</span>
               </div>
               <div class="openfiles-row sel">
-                <span class="ico html">▣</span><span>关西行程.html</span><span class="x">×</span>
+                <span class="ico html">▣</span><span data-i18n="ws.f.alloc">资产配置.html</span><span class="x">×</span>
               </div>
               <div class="openfiles-row">
-                <span class="ico md">▣</span><span>攻略笔记.md</span><span class="x">×</span>
+                <span class="ico md">▣</span><span data-i18n="ws.f.rebal">调仓记录.md</span><span class="x">×</span>
               </div>
             </div>
             <div class="tree">
               <div class="tree-root">▾ muselab-archive</div>
-              <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>关西旅行</span></div>
-              <div class="tree-row sel lv2"><span class="caret"></span><span class="ico html">▣</span><span>关西行程.html</span><span class="size">16 KB</span></div>
-              <div class="tree-row lv2"><span class="caret"></span><span class="ico xlsx">▣</span><span>预算明细.xlsx</span><span class="size">32 KB</span></div>
-              <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>攻略笔记.md</span><span class="size">11 KB</span></div>
-              <div class="tree-row lv2"><span class="caret"></span><span class="ico pdf">▣</span><span>机票行程单.pdf</span><span class="size">1.4 MB</span></div>
+              <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span data-i18n="ws.d.invest">投资</span></div>
+              <div class="tree-row sel lv2"><span class="caret"></span><span class="ico html">▣</span><span data-i18n="ws.f.alloc">资产配置.html</span><span class="size">18 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico xlsx">▣</span><span data-i18n="ws.f.holdings">持仓.csv</span><span class="size">24 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span data-i18n="ws.f.rebal">调仓记录.md</span><span class="size">9 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico pdf">▣</span><span data-i18n="ws.f.review">季度复盘.pdf</span><span class="size">1.2 MB</span></div>
+              <div class="tree-row dir lv1"><span class="caret">▸</span><span class="ico folder">▣</span><span data-i18n="ws.d.travel">关西旅行</span></div>
               <div class="tree-row dir lv1"><span class="caret">▾</span><span class="ico folder">▣</span><span>notes</span></div>
-              <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span>想去的地方.md</span><span class="size">3 KB</span></div>
-              <div class="tree-row lv2"><span class="caret"></span><span class="ico png">▣</span><span>地图截图.png</span><span class="size">820 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico md">▣</span><span data-i18n="ws.f.reading">读书摘录.md</span><span class="size">5 KB</span></div>
+              <div class="tree-row lv2"><span class="caret"></span><span class="ico png">▣</span><span data-i18n="ws.f.idea">灵感.png</span><span class="size">640 KB</span></div>
               <div class="tree-row dir lv1"><span class="caret">▸</span><span class="ico folder">▣</span><span>archives</span></div>
             </div>
           </div>
           <div class="ws-preview">
-            <div class="ws-preview-head">关西旅行/关西行程.html · HTML 渲染</div>
+            <div class="ws-preview-head"><span data-i18n="pf.head">投资/资产配置.html · HTML 渲染</span></div>
             <div class="ws-preview-body portfolio-preview">
               <!-- dashboard header -->
-              <div class="pf-title">关西 9 天自由行 · 2026 年 4 月</div>
+              <div class="pf-title"><span data-i18n="pf.title">资产配置总览</span> <span class="pf-card-sub" data-i18n="pf.sub">· 示例数据 · 2026 Q1</span></div>
               <div class="pf-metrics">
                 <div class="pf-metric">
-                  <div class="pf-metric-lbl">天数</div>
-                  <div class="pf-metric-val">9</div>
+                  <div class="pf-metric-lbl" data-i18n="pf.m.total">总资产</div>
+                  <div class="pf-metric-val">¥1,000,000</div>
                 </div>
                 <div class="pf-metric">
-                  <div class="pf-metric-lbl">总预算</div>
-                  <div class="pf-metric-val">¥18,400</div>
+                  <div class="pf-metric-lbl" data-i18n="pf.m.vol">年化波动</div>
+                  <div class="pf-metric-val">9.8%</div>
                 </div>
                 <div class="pf-metric">
-                  <div class="pf-metric-lbl">景点</div>
-                  <div class="pf-metric-val gr">14</div>
+                  <div class="pf-metric-lbl" data-i18n="pf.m.dd">最大回撤</div>
+                  <div class="pf-metric-val" style="color:var(--red)">−14.2%</div>
                 </div>
                 <div class="pf-metric">
-                  <div class="pf-metric-lbl">酒店</div>
-                  <div class="pf-metric-val">4</div>
+                  <div class="pf-metric-lbl" data-i18n="pf.m.n">标的数</div>
+                  <div class="pf-metric-val gr">5</div>
                 </div>
               </div>
 
-              <!-- budget breakdown bars -->
+              <!-- asset allocation bars -->
               <div class="pf-card">
-                <div class="pf-card-title">预算构成 <span class="pf-card-sub">by 类别</span></div>
+                <div class="pf-card-title"><span data-i18n="pf.alloc.t">资产配置</span> <span class="pf-card-sub" data-i18n="pf.alloc.by">by 类别</span></div>
                 <div class="alloc-list">
                   <div class="alloc-row">
-                    <span class="alloc-tic">住宿</span>
-                    <span class="alloc-desc">¥6,200</span>
-                    <div class="alloc-track"><div class="alloc-fill c1" style="width:34%"></div></div>
-                    <span class="alloc-pct">34%</span>
+                    <span class="alloc-tic" data-i18n="pf.cls.eq">股票</span>
+                    <span class="alloc-desc">¥550,000</span>
+                    <div class="alloc-track"><div class="alloc-fill c1" style="width:55%"></div></div>
+                    <span class="alloc-pct">55%</span>
                   </div>
                   <div class="alloc-row">
-                    <span class="alloc-tic">交通</span>
-                    <span class="alloc-desc">¥4,800</span>
-                    <div class="alloc-track"><div class="alloc-fill c2" style="width:26%"></div></div>
-                    <span class="alloc-pct">26%</span>
+                    <span class="alloc-tic" data-i18n="pf.cls.bond">债券</span>
+                    <span class="alloc-desc">¥250,000</span>
+                    <div class="alloc-track"><div class="alloc-fill c2" style="width:25%"></div></div>
+                    <span class="alloc-pct">25%</span>
                   </div>
                   <div class="alloc-row">
-                    <span class="alloc-tic">餐饮</span>
-                    <span class="alloc-desc">¥3,500</span>
-                    <div class="alloc-track"><div class="alloc-fill c3" style="width:19%"></div></div>
-                    <span class="alloc-pct">19%</span>
+                    <span class="alloc-tic" data-i18n="pf.cls.gold">黄金</span>
+                    <span class="alloc-desc">¥100,000</span>
+                    <div class="alloc-track"><div class="alloc-fill c4" style="width:10%"></div></div>
+                    <span class="alloc-pct">10%</span>
                   </div>
                   <div class="alloc-row">
-                    <span class="alloc-tic">门票</span>
-                    <span class="alloc-desc">¥2,300</span>
-                    <div class="alloc-track"><div class="alloc-fill c4" style="width:13%"></div></div>
-                    <span class="alloc-pct">13%</span>
-                  </div>
-                  <div class="alloc-row">
-                    <span class="alloc-tic">购物</span>
-                    <span class="alloc-desc">¥1,600</span>
-                    <div class="alloc-track"><div class="alloc-fill c5" style="width:8%"></div></div>
-                    <span class="alloc-pct">8%</span>
+                    <span class="alloc-tic" data-i18n="pf.cls.cash">现金</span>
+                    <span class="alloc-desc">¥100,000</span>
+                    <div class="alloc-track"><div class="alloc-fill c3" style="width:10%"></div></div>
+                    <span class="alloc-pct">10%</span>
                   </div>
                 </div>
               </div>
 
-              <!-- daily cumulative spend sparkline -->
+              <!-- 12-month NAV curve (with a drawdown) -->
               <div class="pf-card">
-                <div class="pf-card-title">每日累计花费 <span class="pf-card-sub">¥0 → ¥18.4k</span></div>
+                <div class="pf-card-title"><span data-i18n="pf.nav.t">组合净值 · 近 12 个月</span> <span class="pf-card-sub" data-i18n="pf.nav.sub">已含一次回撤</span></div>
                 <svg class="sparkline" viewBox="0 0 240 60" preserveAspectRatio="none">
                   <defs>
                     <linearGradient id="spk" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stop-color="#6093ff" stop-opacity="0.45"/>
-                      <stop offset="100%" stop-color="#6093ff" stop-opacity="0"/>
+                      <stop offset="0%" stop-color="#e0a458" stop-opacity="0.45"/>
+                      <stop offset="100%" stop-color="#e0a458" stop-opacity="0"/>
                     </linearGradient>
                   </defs>
                   <polygon fill="url(#spk)"
-                    points="0,52 10,50 20,48 30,46 40,44 50,42 60,40 70,36 80,34 90,32 100,30 110,26 120,24 130,22 140,20 150,18 160,16 170,14 180,12 190,10 200,9 210,8 220,7 230,6 240,5 240,60 0,60"/>
-                  <polyline fill="none" stroke="#6093ff" stroke-width="1.8"
-                    points="0,52 10,50 20,48 30,46 40,44 50,42 60,40 70,36 80,34 90,32 100,30 110,26 120,24 130,22 140,20 150,18 160,16 170,14 180,12 190,10 200,9 210,8 220,7 230,6 240,5"/>
-                  <circle cx="240" cy="5" r="3" fill="#6093ff"/>
-                  <circle cx="60" cy="40" r="2.5" fill="#fbbf24" opacity="0.85"/>
-                  <circle cx="150" cy="18" r="2.5" fill="#fbbf24" opacity="0.85"/>
+                    points="0,40 20,37 40,41 60,34 80,29 100,33 120,27 140,38 160,46 180,39 200,31 220,26 240,22 240,60 0,60"/>
+                  <polyline fill="none" stroke="#e0a458" stroke-width="1.8"
+                    points="0,40 20,37 40,41 60,34 80,29 100,33 120,27 140,38 160,46 180,39 200,31 220,26 240,22"/>
+                  <circle cx="240" cy="22" r="3" fill="#e0a458"/>
+                  <circle cx="160" cy="46" r="2.6" fill="#d9685b" opacity="0.9"/>
+                  <circle cx="100" cy="33" r="2.5" fill="#fbbf24" opacity="0.85"/>
                 </svg>
                 <div class="spark-axis">
-                  <span>Day1</span><span>Day3</span><span>Day5</span><span>Day7</span><span>Day9</span>
+                  <span>M1</span><span>M3</span><span>M6</span><span>M9</span><span>M12</span>
                 </div>
               </div>
 
-              <!-- daily itinerary -->
+              <!-- holdings detail -->
               <div class="pf-card">
-                <div class="pf-card-title">每日行程 <span class="pf-card-sub">by 城市</span></div>
+                <div class="pf-card-title"><span data-i18n="pf.hold.t">持仓明细</span> <span class="pf-card-sub" data-i18n="pf.hold.by">by 标的</span></div>
                 <table class="holdings">
-                  <thead><tr><th>Day</th><th>城市</th><th>主行程</th><th>住宿</th></tr></thead>
+                  <thead><tr><th data-i18n="pf.col.name">标的</th><th data-i18n="pf.col.cls">类别</th><th data-i18n="pf.col.pct">占比</th><th data-i18n="pf.col.vol">近1年波动</th></tr></thead>
                   <tbody>
-                    <tr><td><span class="hd-tic c1">D1–2</span></td><td>大阪</td><td>道顿堀 · 环球影城</td><td class="num">难波 ×2</td></tr>
-                    <tr><td><span class="hd-tic c2">D3–4</span></td><td>京都</td><td>伏见稻荷 · 清水寺</td><td class="num">祇园 ×2</td></tr>
-                    <tr><td><span class="hd-tic c3">D5–6</span></td><td>奈良</td><td>东大寺 · 喂鹿</td><td class="num">京都 ×2</td></tr>
-                    <tr><td><span class="hd-tic c4">D7–9</span></td><td>神户</td><td>异人馆 · 摩耶山夜景</td><td class="num">三宫 ×3</td></tr>
+                    <tr><td data-i18n="pf.h.glob">全球大盘股指</td><td><span class="hd-tic c1" data-i18n="pf.cls.eq">股票</span></td><td class="num">40%</td><td class="num" data-i18n="pf.v.mid">中</td></tr>
+                    <tr><td data-i18n="pf.h.em">新兴市场股指</td><td><span class="hd-tic c1" data-i18n="pf.cls.eq">股票</span></td><td class="num">15%</td><td class="num" data-i18n="pf.v.high">高</td></tr>
+                    <tr><td data-i18n="pf.h.agg">综合债券指数</td><td><span class="hd-tic c2" data-i18n="pf.cls.bond">债券</span></td><td class="num">25%</td><td class="num" data-i18n="pf.v.low">低</td></tr>
+                    <tr><td data-i18n="pf.h.gold">实物黄金</td><td><span class="hd-tic c4" data-i18n="pf.cls.gold">黄金</span></td><td class="num">10%</td><td class="num" data-i18n="pf.v.mid">中</td></tr>
+                    <tr><td data-i18n="pf.h.mm">货币基金</td><td><span class="hd-tic c3" data-i18n="pf.cls.cash">现金</span></td><td class="num">10%</td><td class="num" data-i18n="pf.v.vlow">极低</td></tr>
                   </tbody>
                 </table>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CREATE: Muse generates a shareable artifact -->
+<section class="spotlight reverse reveal" id="create">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-spark"/></svg>
+        <span data-i18n="gen.label">CREATE · 消费之外，还会生产</span>
+      </div>
+      <h2 data-i18n="gen.h2">Muse 不只<span class="hl">消费</span>归档，<br>还往里<span class="hl">生产</span>新内容。</h2>
+      <p class="lead" data-i18n="gen.lead">
+        翻看前面几屏，Muse 都在<strong style="color:var(--fg-1)">读</strong>你的归档；这一屏反过来——把原始数据交给它，它直接写出一份 HTML 看板或报告，在中栏当场渲染。你拿到的是能导出、能转发的真文件；产物再落回归档，成为明天的上下文。消费与生产在这里合成一个闭环，排版重活自动调 tufte-report 这类内置 skill。
+      </p>
+      <div class="micro" data-i18n="gen.micro">
+        读资料 → 出产物 → 再沉淀回归档 · 不满意让 Muse 改 · 所见即所得 · 不依赖在线编辑器
+      </div>
+    </div>
+    <div class="spot-mock" aria-hidden="true">
+      <div class="mock">
+        <div class="mock-bar">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <div class="title" data-i18n="gen.mock.title">chat · 生成看板</div>
+        </div>
+        <div class="chat-area">
+          <div class="msg-user" data-i18n="gen.mock.user">把这季度开销做成一页能发出去的看板</div>
+          <div class="thinking-head" style="margin-bottom:0.5em"><span class="chevron">▾</span>thinking · 11s</div>
+          <div class="exec-phase">
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Read</span>
+              <span class="exec-arg" data-i18n="gen.mock.read">账本.csv</span>
+              <span class="exec-meta" data-i18n="gen.mock.readmeta">~1,200 行</span>
+            </div>
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool">Skill</span>
+              <span class="exec-arg">tufte-report</span>
+            </div>
+            <div class="exec-item exec-done">
+              <span class="exec-icon">▾</span>
+              <span class="exec-tool exec-tool-write">Write</span>
+              <span class="exec-arg" data-i18n="gen.mock.write">开销看板.html</span>
+              <span class="exec-badge plus">+86</span>
+            </div>
+          </div>
+          <div class="exec-result">
+            <div class="exec-result-head" data-i18n="gen.mock.rhead">开销看板.html · 中栏已渲染 · 示例数据</div>
+            <div class="portfolio-preview" style="padding:0.7em 0.85em">
+              <div class="pf-title" style="font-size:0.92em"><span data-i18n="gen.mock.pf">本季开销</span> <span class="pf-card-sub" data-i18n="gen.mock.by">· by 类别 · 示例</span></div>
+              <div class="alloc-list">
+                <div class="alloc-row"><span class="alloc-tic" data-i18n="gen.cat.food">餐饮</span><span class="alloc-desc">¥6,200</span><div class="alloc-track"><div class="alloc-fill c1" style="width:42%"></div></div><span class="alloc-pct">42%</span></div>
+                <div class="alloc-row"><span class="alloc-tic" data-i18n="gen.cat.house">居住</span><span class="alloc-desc">¥4,600</span><div class="alloc-track"><div class="alloc-fill c2" style="width:31%"></div></div><span class="alloc-pct">31%</span></div>
+                <div class="alloc-row"><span class="alloc-tic" data-i18n="gen.cat.move">出行</span><span class="alloc-desc">¥2,700</span><div class="alloc-track"><div class="alloc-fill c4" style="width:18%"></div></div><span class="alloc-pct">18%</span></div>
+                <div class="alloc-row"><span class="alloc-tic" data-i18n="gen.cat.other">其他</span><span class="alloc-desc">¥1,300</span><div class="alloc-track"><div class="alloc-fill c3" style="width:9%"></div></div><span class="alloc-pct">9%</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CAPTURE: photo / screenshot → archive note -->
+<section class="spotlight reveal" id="capture">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-lens"/></svg>
+        <span data-i18n="shot.label">CAPTURE · 拍照落档</span>
+      </div>
+      <h2 data-i18n="shot.h2">拍张照丢进来，<br>Muse 转成<span class="hl">归档里的笔记</span>。</h2>
+      <p class="lead" data-i18n="shot.lead">
+        白板、收据、报告截图——拍下来发给 Muse，它读图、提要点，按你的目录结构写成文件存好。这正是归档越长越厚的入口：随手拍的一张图，明天就是 Muse 回答时的上下文。
+      </p>
+      <div class="micro" data-i18n="shot.micro">
+        手机随手拍随手存 · 图片 / 截图 / 文档照都能读 · 存进归档即成为长期上下文
+      </div>
+    </div>
+    <div class="spot-mock" aria-hidden="true">
+      <div class="phone">
+        <div class="phone-statbar">
+          <span class="t">9:41</span>
+          <span class="ic"><i class="sig"></i><i class="bat"></i></span>
+        </div>
+        <div class="phone-app">
+          <div class="phone-head">
+            <svg class="muse"><use href="#m-bars"/></svg>
+            <span data-i18n="shot.head">速记</span>
+          </div>
+          <div class="phone-body">
+            <div class="phone-daysep" data-i18n="shot.sep">刚刚 · 拍下白板</div>
+            <div class="phone-shot"><span class="tag" data-i18n="shot.tag">📷 白板.jpg</span><i></i><i></i><i></i></div>
+            <div class="phone-msg user" data-i18n="shot.user">帮我把这白板存成会议纪要</div>
+            <div class="phone-msg ai" data-i18n="shot.ai">读出 6 个要点 · 3 个待办，已结构化</div>
+            <div class="phone-file"><span class="ico" style="color:var(--accent)">▣</span><span data-i18n="shot.file">notes/会议纪要-0529.md</span><span class="plus">+14</span></div>
+          </div>
+          <div class="phone-tabbar">
+            <div class="phone-tab" data-i18n="ph.tab.files">文件</div>
+            <div class="phone-tab" data-i18n="ph.tab.preview">预览</div>
+            <div class="phone-tab active">Muse</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- MULTI-DEVICE: desktop + phone showing same session -->
+<section class="device-spotlight reveal" id="mobile">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-wave"/></svg>
+      <span data-i18n="device.label">MULTI-DEVICE · 一台服务器，多端同步</span>
+    </div>
+    <h2 style="text-align:center" data-i18n="device.h2">桌面起的话题，<br>手机<span class="hl">接着聊</span>。</h2>
+    <p class="lead" style="margin: 0 auto 3.5rem; text-align: center" data-i18n="device.lead">
+      手机和桌面访问的是<strong style="color:var(--fg-1)">同一台服务器、同一个会话、同一份归档</strong>。没有云端同步、没有第三方账号、没有数据搬运——切设备就接着。
+    </p>
+
+    <div class="device-pair">
+      <!-- MacBook -->
+      <div class="macbook">
+        <div class="macbook-screen">
+          <div class="mock-bar">
+            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+            <div class="title">localhost:8765 · <span data-i18n="dev.session">统计学复习</span></div>
+          </div>
+          <div class="desktop-content">
+            <div class="dt-files">
+              <div class="dt-files-head"><span data-i18n="ws.files">▣ 文件</span></div>
+              <div class="dt-files-row dir"><span>▾</span><span data-i18n="dev.f.stat">统计学</span></div>
+              <div class="dt-files-row"><span class="ico pdf">▣</span><span data-i18n="dev.f.problems">习题集.pdf</span></div>
+              <div class="dt-files-row sel"><span class="ico md">▣</span><span data-i18n="dev.f.notes">讲义-假设检验.md</span></div>
+              <div class="dt-files-row"><span class="ico md">▣</span><span data-i18n="dev.f.formula">公式速查.md</span></div>
+              <div class="dt-files-row dir"><span>▸</span><span>notes</span></div>
+            </div>
+            <div class="dt-preview">
+              <div class="dt-preview-head" data-i18n="dev.f.notes">讲义-假设检验.md</div>
+              <div class="dt-preview-body">
+                <div class="dt-md-h2" data-i18n="dev.md.h2a">## 假设检验 · 要点</div>
+                <div class="dt-md-li"><span class="dt-md-bullet">①</span> <span data-i18n="dev.md.l1">原假设 H₀ vs 备择 H₁</span></div>
+                <div class="dt-md-li"><span class="dt-md-bullet">②</span> <span data-i18n="dev.md.l2">p 值：H₀ 为真时观测到该结果的概率</span></div>
+                <div class="dt-md-li"><span class="dt-md-bullet">③</span> <span data-i18n="dev.md.l3">显著性水平 α 常取 <strong>0.05</strong></span></div>
+                <div class="dt-md-li"><span class="dt-md-bullet">④</span> <span data-i18n="dev.md.l4">p &lt; α 则拒绝 H₀</span></div>
+                <div class="dt-md-h2" style="margin-top:0.5em" data-i18n="dev.md.h2b">## 易错</div>
+                <div class="dt-md-text" data-i18n="dev.md.text">p 值不是"H₀ 为真的概率"…</div>
+              </div>
+            </div>
+            <div class="dt-chat">
+              <div class="dt-chat-head">
+                <svg class="muse"><use href="#m-bars"/></svg>
+                <span data-i18n="dev.session">统计学复习</span>
+              </div>
+              <div class="dt-chat-body">
+                <div class="dt-msg user" data-i18n="dev.chat.user">把这章整理成一页 anki 卡片，正反两面</div>
+                <div class="dt-thinking">▾ thinking · 14s</div>
+                <div class="dt-plan">
+                  <div class="dt-plan-head">
+                    <svg class="muse" style="width:11px;height:11px"><use href="#m-orbit"/></svg>
+                    Write · <span data-i18n="dev.plan.path">统计学/cards.md</span>
+                  </div>
+                  <div class="dt-plan-body" data-i18n="dev.plan.body">
+                    ① 提取 5 个核心概念<br>
+                    ② 每个写 问题 → 答案<br>
+                    ③ 已写入 12 张卡片 ✓
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- iPhone -->
+      <div class="phone">
+        <div class="phone-statbar">
+          <span class="t">9:41</span>
+          <span class="ic"><i class="sig"></i><i class="bat"></i></span>
+        </div>
+        <div class="phone-app">
+          <div class="phone-head">
+            <svg class="muse"><use href="#m-bars"/></svg>
+            <span data-i18n="dev.session">统计学复习</span>
+          </div>
+          <div class="phone-body">
+            <!-- older history, clipped + faded at top to read as scroll-back -->
+            <div class="phone-daysep" data-i18n="ph.sep0">前天 · 课后</div>
+            <div class="phone-msg user" data-i18n="ph.m0a">这学期统计学的讲义都丢 archive 里了</div>
+            <div class="phone-msg ai" data-i18n="ph.m0b">收到——假设检验这章我先过一遍</div>
+            <div class="phone-daysep" data-i18n="ph.sep1">昨晚 · 在桌面</div>
+            <div class="phone-msg ai" data-i18n="ph.m1">已生成 12 张 anki 卡片 · 假设检验 ✓</div>
+            <div class="phone-daysep" data-i18n="ph.sep2">今早 · 通勤路上</div>
+            <div class="phone-msg user" data-i18n="ph.m2">抽两张考我，我答你判对错</div>
+            <div class="phone-msg ai" data-i18n="ph.m3">第 1 张 · 正面<br><strong>p 值的正确定义是？</strong><br><span class="phone-hint">想好了回「翻面」看答案</span></div>
+            <div class="phone-msg user" data-i18n="ph.m4">翻面</div>
+            <div class="phone-msg ai phone-typing"><span></span><span></span><span></span></div>
+          </div>
+          <div class="phone-tabbar">
+            <div class="phone-tab" data-i18n="ph.tab.files">文件</div>
+            <div class="phone-tab" data-i18n="ph.tab.preview">预览</div>
+            <div class="phone-tab active">Muse</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SCHEDULED TASKS SPOTLIGHT -->
+<section class="spotlight reveal" id="scheduled">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-crescent"/></svg>
+        <span data-i18n="sched.label">SCHEDULED · 定时任务</span>
+      </div>
+      <h2 data-i18n="sched.h2">存一个 prompt，<br>让它<span class="hl">按点自己跑</span>。</h2>
+      <p class="lead" data-i18n="sched.lead">
+        把常用的 prompt 存成定时任务——每天 / 每周 / 每月 / 一次性，到点 Muse 自己读你的归档、跑工具、生成结果。完成后落进右上角铃铛抽屉，还能推送到手机锁屏。夜里跑完，清晨已就绪——你醒来前，今天就理好了。
+      </p>
+      <div class="micro" data-i18n="sched.micro">
+        装成 PWA 收 Web Push · 结果进铃铛抽屉留存 · 一次性提醒也行 · 跑在你自己的机器上，不靠任何云端定时服务
+      </div>
+    </div>
+    <div class="spot-mock" aria-hidden="true">
+      <div class="phone">
+        <div class="phone-statbar">
+          <span class="t">7:31</span>
+          <span class="ic"><i class="sig"></i><i class="bat"></i></span>
+        </div>
+        <div class="lock">
+          <div class="lock-time">7:31</div>
+          <div class="lock-date" data-i18n="sched.lock.date">5 月 29 日 周五</div>
+          <div class="lock-push">
+            <div class="lock-push-head">
+              <svg class="muse"><use href="#m-hex"/></svg>
+              <span class="lock-push-app">muselab</span>
+              <span class="lock-push-time" data-i18n="sched.push.time">刚刚</span>
+            </div>
+            <div class="lock-push-title" data-i18n="sched.push.title">晨间简报已就绪</div>
+            <div class="lock-push-body" data-i18n="sched.push.body">今日 3 项待办 · 最近 deadline 18:00 · 昨日记账已自动归类，点开查看</div>
           </div>
         </div>
       </div>
@@ -2096,17 +2527,17 @@
     <div class="spot-text">
       <div class="section-label">
         <svg class="muse"><use href="#m-spark"/></svg>
-        SESSIONS · 多会话
+        <span data-i18n="sessions.label">SESSIONS · 多会话</span>
       </div>
-      <h2>每个对话独立 tab，<br><span class="hl">几十条同时开着</span>不串线。</h2>
-      <p class="lead">
+      <h2 data-i18n="sessions.h2">每个对话独立 tab，<br><span class="hl">几十条同时开着</span>不串线。</h2>
+      <p class="lead" data-i18n="sessions.lead">
         顶部横向 tab strip 切换；左侧文件夹图标点开 picker，按时间分组、置顶常用、双击改名、搜索过滤。每个会话记得自己的模型 / reasoning effort / 上下文窗口。流式 tab 有跳动小点，未读有橙点提示。
       </p>
-      <div class="micro">
+      <div class="micro" data-i18n="sessions.micro">
         支持从任意历史消息处分叉新会话 · 50 个 session 同开无压力
       </div>
     </div>
-    <div class="spot-mock">
+    <div class="spot-mock" aria-hidden="true">
       <div class="mock">
         <div class="mock-bar">
           <div class="dot"></div><div class="dot"></div><div class="dot"></div>
@@ -2114,34 +2545,34 @@
         </div>
         <div class="chat-tabs">
           <div class="chat-tab-history-btn">▣</div>
-          <div class="chat-tab"><span>日常对话</span><span class="x">×</span></div>
-          <div class="chat-tab active"><span class="stream"></span><span>周报汇总</span><span class="x">×</span></div>
-          <div class="chat-tab"><span class="unread"></span><span>读论文 · 系外行星</span><span class="x">×</span></div>
-          <div class="chat-tab"><span>旅行预算</span><span class="x">×</span></div>
+          <div class="chat-tab"><span data-i18n="sess.t.daily">日常对话</span><span class="x">×</span></div>
+          <div class="chat-tab active"><span class="stream"></span><span data-i18n="sess.t.weekly">周报汇总</span><span class="x">×</span></div>
+          <div class="chat-tab"><span class="unread"></span><span data-i18n="sess.t.paper">读论文 · 系外行星</span><span class="x">×</span></div>
+          <div class="chat-tab"><span data-i18n="sess.t.travel">旅行预算</span><span class="x">×</span></div>
         </div>
         <div class="picker-pop">
-          <div class="picker-search">🔍 搜索会话…</div>
-          <div class="picker-group-label">📌 置顶</div>
+          <div class="picker-search" data-i18n="sess.search">🔍 搜索会话…</div>
+          <div class="picker-group-label" data-i18n="sess.pinned">📌 置顶</div>
           <div class="picker-row active">
             <span class="pin">📌</span>
-            <span class="name">周报汇总</span>
+            <span class="name" data-i18n="sess.t.weekly">周报汇总</span>
             <span class="stream"></span>
             <span class="actions">✎ ⋯ ×</span>
           </div>
           <div class="picker-row">
             <span class="pin">📌</span>
-            <span class="name">日常对话</span>
+            <span class="name" data-i18n="sess.t.daily">日常对话</span>
             <span class="actions">✎ ⋯ ×</span>
           </div>
-          <div class="picker-group-label" style="margin-top:0.4em">今天</div>
+          <div class="picker-group-label" style="margin-top:0.4em" data-i18n="sess.today">今天</div>
           <div class="picker-row">
             <span class="pin off">◌</span>
-            <span class="name">读论文 · 系外行星</span>
+            <span class="name" data-i18n="sess.t.paper">读论文 · 系外行星</span>
             <span class="actions">✎ ⋯ ×</span>
           </div>
           <div class="picker-row">
             <span class="pin off">◌</span>
-            <span class="name">整理会议纪要</span>
+            <span class="name" data-i18n="sess.t.meeting">整理会议纪要</span>
             <span class="actions">✎ ⋯ ×</span>
           </div>
         </div>
@@ -2156,17 +2587,17 @@
     <div class="spot-text">
       <div class="section-label">
         <svg class="muse"><use href="#m-trio"/></svg>
-        MODELS · 多模型
+        <span data-i18n="models.label">MODELS · 多模型</span>
       </div>
-      <h2>八家模型，<br><span class="hl">一套 agent loop</span>。</h2>
-      <p class="lead">
-        底部 toolbar 一个 select 切换：Claude · DeepSeek · GLM · MiniMax · Kimi · Qwen · 小米 MiMo · 百度 ERNIE。MCP / Skills / Subagent / plan 模式在每家行为一致——Claude Agent SDK 直接驱动，不是协议翻译。
+      <h2 data-i18n="models.h2">内置八家，<br>还能<span class="hl">自己加一家</span>。</h2>
+      <p class="lead" data-i18n="models.lead">
+        底部 toolbar 一个 select 切换：Claude · DeepSeek · GLM · MiniMax · Kimi · Qwen · 小米 MiMo · 百度 ERNIE。设置里有完整的 provider 编辑器，能改内置厂商的端点 / 模型 / key，也能新建任何 Anthropic 兼容端点的自定义 provider。MCP / Skills / Subagent 在每家行为一致——Claude Agent SDK 直接驱动，不是协议翻译。
       </p>
-      <div class="micro">
-        复用 <span class="kbd">Claude Pro / Max</span> 订阅（OAuth）· 其他厂商 vendor anthropic-compat · 切模型 fork 新会话保留原上下文
+      <div class="micro" data-i18n="models.micro">
+        复用 <span class="kbd">Claude Pro / Max</span> 订阅（OAuth）· 其他厂商填各自 API key · 自定义 provider 即建即用 · 切模型 fork 新会话保留原上下文
       </div>
     </div>
-    <div class="spot-mock">
+    <div class="spot-mock" aria-hidden="true">
       <div class="mock">
         <div class="mock-bar">
           <div class="dot"></div><div class="dot"></div><div class="dot"></div>
@@ -2177,7 +2608,7 @@
           <span class="toolbar-btn" title="Skills">🧩</span>
           <span class="toolbar-btn" title="MCP">🔌</span>
           <span class="toolbar-select model">Opus 4.8 <span class="v">▾</span></span>
-          <span class="toolbar-select perm">plan <span class="v">▾</span></span>
+          <span class="toolbar-select perm">default <span class="v">▾</span></span>
           <span class="toolbar-select">high <span class="v">▾</span></span>
           <span class="spacer"></span>
           <span class="ctx-pill">ctx <span class="num">38%</span></span>
@@ -2198,6 +2629,8 @@
           <div class="opt">qwen3-max · alibaba</div>
           <div class="opt">mimo-v2.5-pro · xiaomi</div>
           <div class="opt">ernie-5.0 · baidu</div>
+          <div class="optgroup-label" data-i18n="models.custom">自定义</div>
+          <div class="opt" data-i18n="models.new">+ 新建 provider…</div>
         </div>
       </div>
     </div>
@@ -2209,161 +2642,97 @@
   <div class="container">
     <div class="section-label" style="justify-content:center">
       <svg class="muse"><use href="#m-spark"/></svg>
-      AGENT SDK · 完整能力面
+      <span data-i18n="caps.label">AGENT SDK · 完整能力面</span>
     </div>
-    <h2 style="text-align:center">不只是聊天框，<br>是<span class="hl">完整的 agent</span>。</h2>
-    <p class="lead" style="margin:0 auto 3.5rem; text-align:center">
+    <h2 style="text-align:center" data-i18n="caps.h2">不只是聊天框，<br>是<span class="hl">完整的 agent</span>。</h2>
+    <p class="lead" style="margin:0 auto 3.5rem; text-align:center" data-i18n="caps.lead">
       muselab 由 Claude Agent SDK 直接驱动——Skills、MCP、Subagent、plan 模式都是原生能力，且在八家模型上行为一致。不是套壳聊天，是能调工具、能拆任务、能扩展的工作 agent。
     </p>
     <div class="capability-grid">
       <div class="capability-card">
         <svg class="muse"><use href="#m-halo"/></svg>
-        <div class="cap-title">Skills · 11 个预置技能包</div>
-        <div class="cap-desc">模型按任务自动选用——web-search、code-reviewer、mermaid-helper、csv-analyzer、pptx、translate、meeting-notes…… 放一个 <span class="kbd">SKILL.md</span> 进目录，就能加你自己的。</div>
+        <div class="cap-title" data-i18n="caps.c1.t">Skills · 11 个预置技能包</div>
+        <div class="cap-desc" data-i18n="caps.c1.d">模型按任务自动选用——web-search、code-reviewer、mermaid-helper、csv-analyzer、pptx、translate、meeting-notes…… 放一个 <span class="kbd">SKILL.md</span> 进目录，就能加你自己的。</div>
       </div>
       <div class="capability-card">
         <svg class="muse"><use href="#m-orbit"/></svg>
-        <div class="cap-title">MCP · 接外部工具与数据源</div>
-        <div class="cap-desc">通过 Model Context Protocol 接入 filesystem、git、fetch、memory、time、sequential-thinking 等 server，能力随开放生态持续扩展。</div>
+        <div class="cap-title" data-i18n="caps.c2.t">MCP · 接外部工具与数据源</div>
+        <div class="cap-desc" data-i18n="caps.c2.d">通过 Model Context Protocol 接入 filesystem、git、fetch、memory、time、sequential-thinking 等 server，能力随开放生态持续扩展。</div>
       </div>
       <div class="capability-card">
         <svg class="muse"><use href="#m-trio"/></svg>
-        <div class="cap-title">Subagent · 拆分子任务并行</div>
-        <div class="cap-desc">复杂任务派生出独立上下文的子 agent 并行处理，各自跑工具链再汇总——主线程不被一次性塞满。</div>
+        <div class="cap-title" data-i18n="caps.c3.t">Subagent · 拆分子任务并行</div>
+        <div class="cap-desc" data-i18n="caps.c3.d">复杂任务派生出独立上下文的子 agent 并行处理，各自跑工具链再汇总——主线程不被一次性塞满。</div>
       </div>
     </div>
-    <div class="micro" style="text-align:center; margin-top:2.5rem">
-      <span class="kbd">skills="all"</span> 启动时自动发现 · MCP server 配置见 <span class="kbd">mcp.json</span> · plan 模式见下一节
+    <div class="micro" style="text-align:center; margin-top:2.5rem" data-i18n="caps.foot">
+      Skills / MCP / Subagent 在八家模型上行为一致
     </div>
   </div>
 </section>
 
-<!-- PLAN MODE SPOTLIGHT -->
-<section class="plan-spotlight reveal" id="plan-mode">
-  <div class="container">
-    <div class="section-label" style="justify-content:center">
-      <svg class="muse"><use href="#m-orbit"/></svg>
-      PLAN MODE · 计划模式
+<!-- QUEUE SPOTLIGHT -->
+<section class="spotlight reveal" id="queue">
+  <div class="spotlight-inner">
+    <div class="spot-text">
+      <div class="section-label">
+        <svg class="muse"><use href="#m-spark"/></svg>
+        <span data-i18n="queue.label">QUEUE · 消息队列</span>
+      </div>
+      <h2 data-i18n="queue.h2">回答还在跑，<br>下一条<span class="hl">先排上</span>。</h2>
+      <p class="lead" data-i18n="queue.lead">
+        Muse 正在流式输出时不用干等——继续打字直接回车，消息排成队列；当前 turn 一结束，队列自动依次发出。想法来了随手记，不被「还在生成」打断节奏。每条排队消息都还能在发出前提回输入框改了再发。
+      </p>
+      <div class="micro" data-i18n="queue.micro">
+        刷新不丢 · 多标签页实时同步 · 排队项可改可删可重排 · 出错自动暂停，给「继续 / 丢弃」
+      </div>
     </div>
-    <h2>看着 Muse <span class="hl">想清楚</span>再动手。</h2>
-    <p class="lead">
-      复杂任务先进 plan 模式——thinking 块实时显示推理；最后输出 plan card 列出每一步 + 依据 + 范围约束。**你点 ✓ 通过才会真正执行**，写工具在 plan 模式下被禁用，没有审批前不会动你任何文件。
-    </p>
-    <div class="plan-demo">
+    <div class="spot-mock" aria-hidden="true">
       <div class="mock">
         <div class="mock-bar">
           <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-          <div class="title">chat pane · plan mode</div>
+          <div class="title">chat pane · <span data-i18n="queue.mock.title">消息队列</span></div>
         </div>
         <div class="chat-area">
 
-          <!-- User question -->
-          <div class="msg-user">把我收藏的 12 篇城市交通文章整理成一份主题综述，按议题归类，每条标注共识 / 争议 + 原文出处</div>
-
-          <!-- Thinking chain -->
-          <div class="thinking-head collapsed"><span class="chevron">▸</span>thinking · 12s <span class="thinking-peek">先看 12 篇文章存在哪…</span></div>
-
-          <div class="thinking-head"><span class="chevron">▾</span>thinking · 24s</div>
-          <div class="thinking-body">
-            每个观点要打 2 维分：<strong>提及频次</strong>（多少篇文章讨论）× <strong>证据强度</strong>（有数据 / 案例 vs 仅观点）。
-            <br>规则：频次 ≥ 6 且证据强 → 核心议题；频次 3–5 → 次要；频次 ≤ 2 → 边缘（仅记录）。
-            <br>需要交叉读：articles/ 提观点 + 给每条标 <code>file:line</code> 出处。
-          </div>
-
-          <div class="thinking-head collapsed"><span class="chevron">▸</span>thinking · 8s <span class="thinking-peek">输出格式：分主题 + 每条附原文引用…</span></div>
-
-          <!-- Plan card -->
-          <div class="plan-card plan-card-rich">
-            <div class="plan-head">
-              <svg class="muse" style="width:14px;height:14px"><use href="#m-orbit"/></svg>
-              <span>Plan · 待你确认</span>
-              <span class="plan-meta">est. 4 工具调用 · ~26k token</span>
-            </div>
-            <div class="plan-body">
-              <ol>
-                <li>
-                  <span class="plan-step">读 <code>archives/articles/*.md</code> （12 篇）</span>
-                  <span class="plan-why">↳ 提取所有观点 mention，记录 <code>file:line</code></span>
-                </li>
-                <li>
-                  <span class="plan-step">按议题聚类，去重合并相近观点</span>
-                  <span class="plan-why">↳ 同一议题下不同文章的说法归到一组</span>
-                </li>
-                <li>
-                  <span class="plan-step">按二维矩阵分级 核心 / 次要 / 边缘</span>
-                  <span class="plan-why">↳ 频次 × 证据强度打分，按上面规则归档</span>
-                </li>
-                <li>
-                  <span class="plan-step">写入 <code>notes/城市交通-综述.md</code></span>
-                  <span class="plan-why">↳ 分主题 + 每条附 2 句原文引用 + 共识/争议标记</span>
-                </li>
-              </ol>
-              <div class="plan-scope">
-                <span class="plan-scope-lbl">范围</span>
-                <span class="plan-scope-text">只读 12 篇文章；新建 1 个 md 文件；不修改任何现有材料</span>
-              </div>
-            </div>
-            <div class="plan-actions">
-              <button class="btn-plan btn-plan-deny">✗ 让我改改</button>
-              <button class="btn-plan btn-plan-allow">✓ 通过执行</button>
-            </div>
-          </div>
-
-          <!-- User approved divider -->
-          <div class="approval-bar">
-            <span class="approval-tick">✓</span>
-            <span class="approval-text">用户已批准 · 11s 前</span>
-            <span class="approval-meta">permission: plan → default</span>
-          </div>
-
-          <!-- Execution phase: tool chain -->
+          <!-- in-flight turn -->
+          <div class="msg-user" data-i18n="queue.mock.user">把这份 38 页行业报告 PDF 提炼成一页摘要</div>
+          <div class="thinking-head"><span class="chevron">▾</span>thinking · 6s</div>
           <div class="exec-phase">
             <div class="exec-item exec-done">
               <span class="exec-icon">▾</span>
               <span class="exec-tool">Read</span>
-              <span class="exec-arg">archives/articles/article-01.md</span>
-              <span class="exec-meta">312 行</span>
+              <span class="exec-arg" data-i18n="queue.mock.readarg">行业报告.pdf</span>
+              <span class="exec-meta" data-i18n="queue.mock.readmeta">~38 页</span>
             </div>
-            <div class="exec-item exec-done">
-              <span class="exec-icon">▾</span>
-              <span class="exec-tool">Read</span>
-              <span class="exec-arg">archives/articles/article-02.md</span>
-              <span class="exec-meta">280 行</span>
-            </div>
-            <div class="exec-item exec-done exec-batch">
-              <span class="exec-icon">▾</span>
-              <span class="exec-tool">Read × 10</span>
-              <span class="exec-arg">article-03…12.md</span>
-              <span class="exec-meta">~3.2k 行</span>
-            </div>
-            <div class="exec-item exec-done">
-              <span class="exec-icon">▾</span>
+            <div class="exec-item">
+              <span class="exec-icon">▸</span>
               <span class="exec-tool exec-tool-write">Write</span>
-              <span class="exec-arg">notes/城市交通-综述.md</span>
-              <span class="exec-badge plus">+127</span>
-            </div>
-
-            <!-- mini diff preview of what was written -->
-            <div class="exec-result">
-              <div class="exec-result-head">城市交通-综述.md · preview</div>
-              <div class="exec-result-body">
-                <span class="exec-md-h2">## 核心议题 · 高频 + 强证据</span><br>
-                <span class="pri pri-1">核心</span> 公交专用道提速 — <strong>9/12</strong> 篇 · 多城实测数据<br>
-                <span class="pri pri-1">核心</span> 票价一体化降换乘成本 — <strong>7/12</strong> 篇 · 3 个案例<br>
-                <span class="pri pri-1">核心</span> 自行车道连通性 — <strong>6/12</strong> 篇 · top 诉求<br>
-                <span class="exec-md-h2" style="margin-top:0.4em">## 次要议题 · 本季关注</span><br>
-                <span class="pri pri-2">次要</span> 夜间公交覆盖 — <strong>5/12</strong> 篇<br>
-                <span class="pri pri-2">次要</span> 无障碍站台改造 — <strong>4/12</strong> 篇<br>
-                <span class="exec-md-text" style="margin-top:0.4em">…还有 边缘议题 · 仅记录（6 项）</span>
-              </div>
+              <span class="exec-arg" data-i18n="queue.mock.writearg">报告摘要.md</span>
+              <span class="exec-meta"><span class="q-dot"></span><span data-i18n="queue.mock.gen">生成中</span></span>
             </div>
           </div>
 
+          <!-- queued user messages -->
+          <div class="q-divider" data-i18n="queue.mock.qdiv">排队中 · 2 条</div>
+          <div class="q-item">
+            <div class="q-item-head">
+              <span class="q-num">1</span><span data-i18n="queue.mock.next">下一条发出</span>
+              <span class="q-act" data-i18n="queue.mock.act">✎ 改 · ×</span>
+            </div>
+            <div class="q-text" data-i18n="queue.mock.q1">再出一版给非技术同事看的，去掉术语</div>
+          </div>
+          <div class="q-item">
+            <div class="q-item-head">
+              <span class="q-num">2</span><span data-i18n="queue.mock.queued">排队</span>
+              <span class="q-act" data-i18n="queue.mock.act">✎ 改 · ×</span>
+            </div>
+            <div class="q-text" data-i18n="queue.mock.q2">把里面的关键数据列成一张表</div>
+          </div>
+          <div class="q-foot"><span class="q-dot"></span><span data-i18n="queue.mock.foot">当前回答结束后自动依次发出</span></div>
+
         </div>
       </div>
-    </div>
-    <div class="micro" style="text-align:center; margin-top: 2.5rem">
-      <span class="kbd">permission: plan</span> 禁用一切写工具 · MCP sequential-thinking 加持 · 长任务全程透明可中断
     </div>
   </div>
 </section>
@@ -2374,17 +2743,17 @@
     <div class="spot-text">
       <div class="section-label">
         <svg class="muse"><use href="#m-lens"/></svg>
-        EDITS · 改了什么
+        <span data-i18n="diff.label">EDITS · 改了什么</span>
       </div>
-      <h2>改文件就出<br><span class="hl">红绿 diff</span>，看完再决定。</h2>
-      <p class="lead">
+      <h2 data-i18n="diff.h2">改文件就出<br><span class="hl">红绿 diff</span>，看完再决定。</h2>
+      <p class="lead" data-i18n="diff.lead">
         Muse 每次 Edit / Write / MultiEdit，气泡里直接渲染 inline diff——绿加红减、带 +N −M 计数。一眼看出动了哪里，不用切到 git。点击 head 折叠，长对话不挡视线。
       </p>
-      <div class="micro">
+      <div class="micro" data-i18n="diff.micro">
         默认展开当前 turn 的 diff · 历史 turn 自动折叠 · git-blame 风格
       </div>
     </div>
-    <div class="spot-mock">
+    <div class="spot-mock" aria-hidden="true">
       <div class="mock">
         <div class="mock-bar">
           <div class="dot"></div><div class="dot"></div><div class="dot"></div>
@@ -2395,127 +2764,31 @@
             <div class="diff-head">
               <span class="chevron">▾</span>
               <span class="tool">Edit</span>
-              <span class="path">读书笔记/思考快与慢.md</span>
-              <span class="badge-plus">+4</span>
+              <span class="path">src/utils/retry.ts</span>
+              <span class="badge-plus">+6</span>
               <span class="badge-minus">−2</span>
             </div>
             <div class="diff-body">
-<div class="diff-line"><span class="pre"> </span>## 第 3 章 · 锚定效应</div>
-<div class="diff-line del"><span class="pre">−</span>这章大概讲判断会受先看到的数影响</div>
-<div class="diff-line del"><span class="pre">−</span>后面再补充细节</div>
-<div class="diff-line ins"><span class="pre">+</span>① 锚定：先接触的数值会拉偏后续估计</div>
-<div class="diff-line ins"><span class="pre">+</span>② 实验：随机转盘数显著影响联合国席位猜测</div>
-<div class="diff-line ins"><span class="pre">+</span>③ 调整不足：从锚点出发的修正常停得太早</div>
-<div class="diff-line ins"><span class="pre">+</span>④ 应用：谈判先开价者常占锚定优势</div>
+<div class="diff-line"><span class="pre"> </span>export async function withRetry(fn, times = 3) {</div>
+<div class="diff-line del"><span class="pre">−</span>  for (let i = 0; i &lt; times; i++) {</div>
+<div class="diff-line del"><span class="pre">−</span>    return await fn();          <span data-i18n="diff.cmt">// 只跑一次就 return，重试没生效</span></div>
+<div class="diff-line ins"><span class="pre">+</span>  let lastErr;</div>
+<div class="diff-line ins"><span class="pre">+</span>  for (let i = 0; i &lt; times; i++) {</div>
+<div class="diff-line ins"><span class="pre">+</span>    try { return await fn(); }</div>
+<div class="diff-line ins"><span class="pre">+</span>    catch (e) { lastErr = e; await sleep(2 ** i * 100); }</div>
+<div class="diff-line ins"><span class="pre">+</span>  }</div>
+<div class="diff-line ins"><span class="pre">+</span>  throw lastErr;</div>
+<div class="diff-line"><span class="pre"> </span>}</div>
             </div>
           </div>
           <div class="diff-strip" style="margin-top: 0.6em">
             <div class="diff-head">
               <span class="chevron">▸</span>
               <span class="tool">Write</span>
-              <span class="path">notes/书摘卡片.md</span>
+              <span class="path">src/utils/retry.test.ts</span>
               <span style="margin-left:auto"></span>
-              <span class="badge-plus">+47</span>
+              <span class="badge-plus">+23</span>
             </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- MULTI-DEVICE: desktop + phone showing same session -->
-<section class="device-spotlight reveal" id="mobile">
-  <div class="container">
-    <div class="section-label" style="justify-content:center">
-      <svg class="muse"><use href="#m-wave"/></svg>
-      MULTI-DEVICE · 一台服务器，多端同步
-    </div>
-    <h2 style="text-align:center">桌面起的话题，<br>手机<span class="hl">接着聊</span>。</h2>
-    <p class="lead" style="margin: 0 auto 3.5rem; text-align: center">
-      手机和桌面访问的是<strong style="color:var(--fg-1)">同一台服务器、同一个会话、同一份归档</strong>。没有云端同步、没有第三方账号、没有数据搬运——切设备就接着。
-    </p>
-
-    <div class="device-pair">
-      <!-- MacBook -->
-      <div class="macbook">
-        <div class="macbook-screen">
-          <div class="mock-bar">
-            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <div class="title">localhost:8765 · 统计学复习</div>
-          </div>
-          <div class="desktop-content">
-            <div class="dt-files">
-              <div class="dt-files-head">▣ 文件</div>
-              <div class="dt-files-row dir"><span>▾</span><span>统计学</span></div>
-              <div class="dt-files-row"><span class="ico pdf">▣</span><span>习题集.pdf</span></div>
-              <div class="dt-files-row sel"><span class="ico md">▣</span><span>讲义-假设检验.md</span></div>
-              <div class="dt-files-row"><span class="ico md">▣</span><span>公式速查.md</span></div>
-              <div class="dt-files-row dir"><span>▸</span><span>notes</span></div>
-            </div>
-            <div class="dt-preview">
-              <div class="dt-preview-head">讲义-假设检验.md</div>
-              <div class="dt-preview-body">
-                <div class="dt-md-h2">## 假设检验 · 要点</div>
-                <div class="dt-md-li"><span class="dt-md-bullet">①</span> 原假设 H₀ vs 备择 H₁</div>
-                <div class="dt-md-li"><span class="dt-md-bullet">②</span> p 值：H₀ 为真时观测到该结果的概率</div>
-                <div class="dt-md-li"><span class="dt-md-bullet">③</span> 显著性水平 α 常取 <strong>0.05</strong></div>
-                <div class="dt-md-li"><span class="dt-md-bullet">④</span> p &lt; α 则拒绝 H₀</div>
-                <div class="dt-md-h2" style="margin-top:0.5em">## 易错</div>
-                <div class="dt-md-text">p 值不是"H₀ 为真的概率"…</div>
-              </div>
-            </div>
-            <div class="dt-chat">
-              <div class="dt-chat-head">
-                <svg class="muse"><use href="#m-orbit"/></svg>
-                <span>统计学复习</span>
-              </div>
-              <div class="dt-chat-body">
-                <div class="dt-msg user">把这章整理成一页 anki 卡片，正反两面</div>
-                <div class="dt-thinking">▾ thinking · 14s</div>
-                <div class="dt-plan">
-                  <div class="dt-plan-head">
-                    <svg class="muse" style="width:11px;height:11px"><use href="#m-orbit"/></svg>
-                    Plan · 待确认
-                  </div>
-                  <div class="dt-plan-body">
-                    ① 提 5 个核心概念<br>
-                    ② 每个写 问题 → 答案<br>
-                    ③ 导出 cards.md
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="macbook-hinge"></div>
-        <div class="macbook-base"></div>
-      </div>
-
-      <!-- iPhone -->
-      <div class="phone">
-        <div class="phone-statbar"><span>8:12</span><span>4G · 95%</span></div>
-        <div class="phone-app">
-          <div class="phone-head">
-            <svg class="muse"><use href="#m-orbit"/></svg>
-            <span>统计学复习</span>
-          </div>
-          <div class="phone-body">
-            <div class="phone-msg ai" style="opacity:0.55; font-size: 0.92em">
-              <span style="color:var(--fg-4); font-size:0.85em">↑ 昨晚在桌面</span><br>
-              已生成 12 张 anki 卡片 · 假设检验
-            </div>
-            <div class="phone-msg user">通勤抽两张考我，我答你判对错</div>
-            <div class="phone-msg ai">
-              第 1 张正面：<br>
-              「p 值的正确定义是？」<br>
-              想好了说"翻面"…
-            </div>
-          </div>
-          <div class="phone-tabbar">
-            <div class="phone-tab">文件</div>
-            <div class="phone-tab">预览</div>
-            <div class="phone-tab active">Muse</div>
           </div>
         </div>
       </div>
@@ -2531,17 +2804,20 @@
         <svg class="muse"><use href="#m-crescent"/></svg>
         INSTALL
       </div>
-      <h2>一行命令，<br>装在<span class="hl">你自己的机器</span>上。</h2>
-      <p class="lead">
+      <h2 data-i18n="install.h2">一行命令，<br>装在<span class="hl">你自己的机器</span>上。</h2>
+      <p class="lead" data-i18n="install.lead">
         Linux · macOS · WSL2。安装器自动装 uv / Node LTS / Anthropic claude CLI，并注册服务。
       </p>
       <div class="install-cmd">
-        <span class="cmt"># 一行装上</span><br>
+        <!-- KEEP IN SYNC: full URL is also in the JS `INSTALL_CMD` const (source
+             of truth for the Copy button) and abbreviated in the hero block.
+             Static (no-JS) on purpose so the command always renders. -->
+        <span class="cmt" data-i18n="install.cmt1"># 一行装上</span><br>
         <span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/<br>
         &nbsp;&nbsp;&nbsp;&nbsp;hesorchen/muselab/main/scripts/quick-install.sh | bash
         <div class="copy-row">
-          <span class="cmt"># 装完打开 localhost:8765</span>
-          <button class="copy-btn" onclick="copyInstall(this)">Copy command</button>
+          <span class="cmt" data-i18n="install.cmt2"># 装完打开 localhost:8765</span>
+          <button class="copy-btn" onclick="copyInstall(this)" data-i18n="install.copy">Copy command</button>
         </div>
       </div>
     </div>
@@ -2550,20 +2826,20 @@
         <svg class="muse"><use href="#m-hex"/></svg>
         ARCHITECTURE
       </div>
-      <h2 style="font-size:clamp(1.5rem,2.4vw,2rem); margin-bottom:1.5rem">无构建步骤。<br>改文件，刷新浏览器。</h2>
+      <h2 style="font-size:clamp(1.5rem,2.4vw,2rem); margin-bottom:1.5rem" data-i18n="arch.h2">无构建步骤。<br>改文件，刷新浏览器。</h2>
       <div class="arch-diagram">
         <div class="arch-row">
           <div class="arch-node">Browser · HTML + Alpine</div>
         </div>
-        <div class="arch-row"><span class="arch-arrow">↓</span></div>
+        <div class="arch-row"><span class="arch-arrow" aria-hidden="true">↓</span></div>
         <div class="arch-row">
           <div class="arch-node">FastAPI · /api/files · /api/chat</div>
         </div>
-        <div class="arch-row"><span class="arch-arrow">↓</span></div>
+        <div class="arch-row"><span class="arch-arrow" aria-hidden="true">↓</span></div>
         <div class="arch-row">
           <div class="arch-node primary">Claude Agent SDK</div>
         </div>
-        <div class="arch-row"><span class="arch-arrow">↓</span></div>
+        <div class="arch-row"><span class="arch-arrow" aria-hidden="true">↓</span></div>
         <div class="arch-fan">
           <span class="tag">Anthropic</span>
           <span class="tag">DeepSeek</span>
@@ -2584,10 +2860,11 @@
       <svg class="muse"><use href="#m-lens"/></svg>
       HOW IT COMPARES
     </div>
-    <h2>归档之于 muselab，<br>犹如<span class="hl">代码库</span>之于 Claude Code。</h2>
-    <p class="lead">
+    <h2 data-i18n="compare.h2">归档之于 muselab，<br>犹如<span class="hl">代码库</span>之于 Claude Code。</h2>
+    <p class="lead" data-i18n="compare.lead">
       不是 IDE，不是 RAG，不是插件市场——而是把私人档案当一等上下文的 AI 工作台。
     </p>
+    <div class="compare-table-wrap">
     <table class="compare-table">
       <thead>
         <tr>
@@ -2608,6 +2885,56 @@
         <tr><td>Mobile PWA</td><td class="us yes">✓</td><td class="yes">✓</td><td class="no">—</td><td class="partial">resp</td><td class="no">—</td></tr>
       </tbody>
     </table>
+    </div>
+  </div>
+</section>
+
+<!-- PRIVACY / DATA SOVEREIGNTY -->
+<section class="privacy reveal" id="privacy">
+  <div class="container">
+    <div class="section-label" style="justify-content:center">
+      <svg class="muse"><use href="#m-hex"/></svg>
+      <span data-i18n="privacy.label">PRIVACY · 隐私与数据主权</span>
+    </div>
+    <h2 style="text-align:center" data-i18n="privacy.h2">私密性不是开关，<br>是<span class="hl">架构默认</span>。</h2>
+    <p class="lead" style="margin:0 auto 3.5rem; text-align:center" data-i18n="privacy.lead">
+      muselab 是单用户、自托管的。没有遥测、没有云端副本、没有第三方账号——文件在你的磁盘上，密钥在你的 <span class="kbd">.env</span> 里，连 Muse 自己都被禁止读取凭证文件。
+    </p>
+    <div class="privacy-grid">
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-crescent"/></svg>
+        <div class="pc-title" data-i18n="privacy.c1.t">零遥测</div>
+        <div class="pc-desc" data-i18n="privacy.c1.d">不接任何 analytics，不回传使用数据。除了你主动发起的模型 API 调用，muselab 不与任何第三方服务器通信。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-hex"/></svg>
+        <div class="pc-title" data-i18n="privacy.c2.t">连密钥都对 Muse 不可见</div>
+        <div class="pc-desc" data-i18n="privacy.c2.d"><span class="kbd">.env</span> · SSH 私钥 · <span class="kbd">*.pem</span> · credentials.json——这类凭证文件即便持有有效 token 也被拒绝读写。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-bars"/></svg>
+        <div class="pc-title" data-i18n="privacy.c3.t">文件就在你的磁盘上</div>
+        <div class="pc-desc" data-i18n="privacy.c3.d">archive 是你机器上一个普通目录。没有向量库、没有云端镜像、没有数据搬运——随时能用文件管理器或终端直接打开。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-lens"/></svg>
+        <div class="pc-title" data-i18n="privacy.c4.t">越权即拒</div>
+        <div class="pc-desc" data-i18n="privacy.c4.d">所有读写被锁在 archive 根目录内；指向 <span class="kbd">/</span>、<span class="kbd">/etc</span> 等系统路径会在启动时直接拒绝。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-wave"/></svg>
+        <div class="pc-title" data-i18n="privacy.c5.t">不被搜索引擎收录</div>
+        <div class="pc-desc" data-i18n="privacy.c5.d">默认 <span class="kbd">noindex</span> + robots.txt，万一误暴露也不会被爬；token 用 constant-time 比较，过短拒绝启动。</div>
+      </div>
+      <div class="privacy-card">
+        <svg class="muse"><use href="#m-spark"/></svg>
+        <div class="pc-title" data-i18n="privacy.c6.t">MIT 开源，可审计</div>
+        <div class="pc-desc" data-i18n="privacy.c6.d">全部代码公开。每一条数据流向哪里，你都能自己读源码确认，而不是信一句"我们很安全"。</div>
+      </div>
+    </div>
+    <div class="micro" style="text-align:center; margin-top:2.5rem" data-i18n="privacy.foot">
+      威胁模型 · 防护清单 · 反代加固建议 → <a href="https://github.com/hesorchen/muselab/blob/main/SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a>
+    </div>
   </div>
 </section>
 
@@ -2616,33 +2943,33 @@
   <div class="container">
     <div class="section-label" style="justify-content:center">
       <svg class="muse"><use href="#m-trio"/></svg>
-      FAQ · 常见问题
+      <span data-i18n="faq.label">FAQ · 常见问题</span>
     </div>
-    <h2 style="text-align:center; margin-bottom:3rem">开工前，<br>你可能想问的<span class="hl">几件事</span>。</h2>
+    <h2 style="text-align:center; margin-bottom:3rem" data-i18n="faq.h2">开工前，<br>你可能想问的<span class="hl">几件事</span>。</h2>
     <div class="faq-grid">
       <div class="faq-item">
-        <div class="faq-q">需要 API key 吗？</div>
-        <div class="faq-a">Claude 走一次 <span class="kbd">claude login</span> 的 OAuth，复用你的 Pro / Max 订阅——不需要 API key，也不按 token 另计费。其他七家各填自己的 API key，在设置里粘贴即可。</div>
+        <div class="faq-q" data-i18n="faq.q1">需要 API key 吗？</div>
+        <div class="faq-a" data-i18n="faq.a1">Claude 走一次 <span class="kbd">claude login</span> 的 OAuth，复用你的 Pro / Max 订阅——不需要 API key，也不按 token 另计费。其他七家各填自己的 API key，在设置里粘贴即可。想接清单外的厂商？provider 编辑器能新建自定义 provider，填好 Anthropic 兼容端点 / 模型 / key 即建即用。</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">muselab 自己收费吗？</div>
-        <div class="faq-a">不收。MIT 开源，完全免费。模型调用直连各厂商、走你自己的订阅或 key——muselab 不中转、不加价（后端无代理层）。</div>
+        <div class="faq-q" data-i18n="faq.q2">muselab 自己收费吗？</div>
+        <div class="faq-a" data-i18n="faq.a2">不收。MIT 开源，完全免费。模型调用直连各厂商、走你自己的订阅或 key——muselab 不中转、不加价（后端无代理层）。</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">我的数据存在哪？</div>
-        <div class="faq-a">全部在你的机器上：archive 是一个本地目录，对话记录是本地 JSONL 文件。没有云端副本，没有第三方账号，没有数据搬运。</div>
+        <div class="faq-q" data-i18n="faq.q3">我的数据存在哪？</div>
+        <div class="faq-a" data-i18n="faq.a3">全部在你的机器上：archive 是一个本地目录，对话记录是本地 JSONL 文件。没有云端副本，没有第三方账号，没有数据搬运。</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">能接本地模型 / 完全离线吗？</div>
-        <div class="faq-a">后端是 Claude Agent SDK，需要 Anthropic 兼容端点。目前不内置 Ollama 等纯本地推理；但模型 base_url 可在会话级覆盖，能指向任何兼容 Anthropic 协议的端点，包括你自建的代理。</div>
+        <div class="faq-q" data-i18n="faq.q4">能接本地模型 / 完全离线吗？</div>
+        <div class="faq-a" data-i18n="faq.a4">后端是 Claude Agent SDK，需要 Anthropic 兼容端点。目前不内置 Ollama 等纯本地推理；但模型 base_url 可在会话级覆盖，能指向任何兼容 Anthropic 协议的端点，包括你自建的代理。</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">怎么升级和卸载？</div>
-        <div class="faq-a">升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和 archive 文件原样保留。</div>
+        <div class="faq-q" data-i18n="faq.q5">怎么升级和卸载？</div>
+        <div class="faq-a" data-i18n="faq.a5">升级跑 <span class="kbd">upgrade.sh</span>，卸载跑 <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>。卸载只移除系统服务——你的 <span class="kbd">.env</span>、对话记录和 archive 文件原样保留。</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">手机上怎么用？</div>
-        <div class="faq-a">和桌面访问同一台服务器、同一个会话。窄屏自动折叠成「文件 / 预览 / Muse」三 tab 单栏，还能作为 PWA 添加到主屏。</div>
+        <div class="faq-q" data-i18n="faq.q6">手机上怎么用？</div>
+        <div class="faq-a" data-i18n="faq.a6">和桌面访问同一台服务器、同一个会话。窄屏自动折叠成「文件 / 预览 / Muse」三 tab 单栏，还能作为 PWA 添加到主屏。</div>
       </div>
     </div>
   </div>
@@ -2662,7 +2989,7 @@
       <div class="one"><svg class="muse"><use href="#m-spark"/></svg><span class="nm">Thalia</span></div>
       <div class="one"><svg class="muse"><use href="#m-orbit"/></svg><span class="nm">Urania</span></div>
     </div>
-    <div class="footer-tag">9 位缪斯 · 1 个 Muse · 你自己的 muselab</div>
+    <div class="footer-tag" data-i18n="footer.tag">9 位缪斯 · 1 个 Muse · 你自己的 muselab</div>
     <div class="footer-meta">
       <a href="https://github.com/hesorchen/muselab" target="_blank" rel="noopener">★ GitHub</a>
       <span>·</span>
@@ -2689,7 +3016,9 @@
   }, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
   document.querySelectorAll('.reveal').forEach(el => io.observe(el));
 
-  // Copy install
+  // Copy install — SOURCE OF TRUTH for the install command. If you change the
+  // script URL here, also update the two display copies (#install section + hero
+  // block, both static HTML so they render without JS).
   const INSTALL_CMD = 'curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash';
   function copyInstall(btn) {
     navigator.clipboard.writeText(INSTALL_CMD).then(() => {
@@ -2701,9 +3030,305 @@
         btn.style.color = '';
       }, 1800);
     }).catch(() => {
+      const orig = btn.textContent;
       btn.textContent = 'Copy failed';
+      // Without this reset the button stayed stuck on "Copy failed" forever.
+      setTimeout(() => { btn.textContent = orig; }, 1800);
     });
   }
+
+  // ── i18n ──────────────────────────────────────────────────────────────
+  // Chinese is the default and lives in the HTML. The dict below holds the
+  // English innerHTML for every [data-i18n] node; the original (zh) is
+  // captured lazily on first apply so toggling back is lossless.
+  const I18N_EN = {
+    'doc.title': 'muselab · self-hosted multi-model AI workspace',
+
+    'nav.install': 'Install',
+
+    'hero.h1': 'Context <span class="hl">×</span> Harness<br><span class="hl">×</span> foundation model',
+    'hero.claim': 'Your private archive is the AI’s <span class="hl">working set</span>.',
+    'hero.sub': 'To make AI understand your files you normally have to upload them to the cloud and chop them into vectors. muselab flips it — point at a directory you own, and the raw files inside <em>are</em> Muse’s first-class context. Eight model families share one agent loop, reuse your Claude Pro subscription, and run on your own machine.',
+    'hero.cta': '→ Install in one line',
+    'hero.copy': 'Copy',
+    'hero.mock.title': 'localhost:8765 · Weekly report',
+    'hero.mock.user': 'Roll this week’s 5 daily logs into a weekly report — progress / blockers / next week',
+    'hero.mock.lines': '~640 lines',
+    'hero.mock.file': 'weekly-W22.md',
+
+    'concept.label': 'CONCEPT · muselab’s three layers',
+    'concept.h2': 'An agent’s ceiling is set by<br>these <span class="hl">three layers</span> together.',
+    'concept.lead': 'Most products hand you only the top layer — the chat box; muselab puts all three in your hands: context is the raw files on your disk, the harness is open-source code you can read and edit running on your own machine, and even the foundation model is never locked in — eight built in, swappable in a click, add your own anytime. The first two are assets you own; the third is a choice that stays yours.',
+    'concept.c1.t': 'Context · your archive',
+    'concept.c1.d': 'The archive is an ordinary directory on your machine; the raw files inside are Muse’s first-class context — not vectorized, not uploaded, not chunked. Open them in your file manager anytime. And it only grows: the thicker the archive, the higher the starting point of every answer — context that compounds, not a session that resets each time.',
+    'concept.c2.t': 'Harness · muselab itself',
+    'concept.c2.d': 'An agent loop driven by the Claude Agent SDK: tool calls, multi-session, Skills, MCP, Subagents all live here. It runs on your own machine — open-source code you can read and change.',
+    'concept.c3.t': 'foundation model · the swappable base',
+    'concept.c3.d': 'Eight built in, plus any Anthropic-compatible endpoint you add. Swap models and Context and Harness stay untouched — the base is a plug-in part, not a lock-in.',
+
+    'idea.h2': 'Not RAG, not a cloud copy —<br>just <span class="hl">the raw files on disk</span>.',
+    'idea.lead': 'muselab doesn’t pre-vectorize your archive. Muse reaches files on demand through Read / Grep / Edit — as directly as flipping through them in your IDE. Edit a file and it takes effect instantly: no index sync, no embedding drift. Your archive is always raw files you can open, edit and delete — not a black-box index inside some service.',
+
+    'comp.label': 'ARCHIVE · context that compounds',
+    'comp.h2': 'What numbers changed<br>since <span class="hl">the last one</span>?',
+    'comp.lead': 'The archive only grows — you don’t dig through history, Muse greps out the previous one and compares item by item. The more you store and the longer you talk, the higher the starting point of every answer. Context that compounds, not a session that resets each time.',
+    'comp.micro': 'Past files pulled on demand · no manual context feeding · the thicker the archive, the more Muse sees the whole picture',
+    'comp.mock.title': 'chat · quarterly review diff',
+    'comp.mock.user': 'How does this quarter’s review differ from last quarter’s?',
+    'comp.mock.grep': 'Investing/ · “quarterly review”',
+    'comp.mock.grepmeta': '2 hits',
+    'comp.mock.read': 'review-2026Q1.md · review-2025Q4.md',
+    'comp.mock.rhead': 'review-diff.md · preview · sample data',
+    'comp.mock.rh2': '## This quarter vs last',
+    'comp.mock.rbody': 'NAV <strong>+3.2%</strong> · max drawdown narrowed <strong>1.1pt</strong> · one new holding added',
+
+    'cross.label': 'CROSS-DOMAIN · synthesize across folders',
+    'cross.h2': 'One sentence,<br>and it spans <span class="hl">several folders</span>.',
+    'cross.lead': 'Investing, travel, notes… all in one archive. Ask “is there enough in my cash position to cover this trip’s budget?” and Muse gathers the data across folders on its own before answering. One agent across the many dimensions of your life — not a separate, disconnected chat for each.',
+    'cross.micro': 'One question across many folders · finds the data itself · cross-domain reasoning, no copy-pasting back and forth',
+    'cross.mock.title': 'chat · cross-folder',
+    'cross.mock.user': 'Next month’s Kansai trip budget is ¥20k — enough from my cash position?',
+    'cross.mock.r1': 'Kansai-trip/itinerary-budget.md',
+    'cross.mock.r2': 'Investing/holdings.csv',
+    'cross.mock.rhead': 'answer · sample data',
+    'cross.mock.rbody': 'Cash position <strong>¥100,000</strong>, trip budget <strong>¥20,000</strong> = 20%, comfortably covered; suggest redeeming from the money-market fund, leaving equities untouched.',
+
+    'privacy.label': 'PRIVACY · privacy & data sovereignty',
+    'privacy.h2': 'Privacy isn’t a switch —<br>it’s the <span class="hl">architectural default</span>.',
+    'privacy.lead': 'muselab is single-user and self-hosted. No telemetry, no cloud copy, no third-party account — files stay on your disk, keys stay in your <span class="kbd">.env</span>, and even Muse itself is barred from reading credential files.',
+    'privacy.c1.t': 'Zero telemetry',
+    'privacy.c1.d': 'No analytics, no usage data sent back. Apart from the model API calls you initiate, muselab talks to no third-party server.',
+    'privacy.c2.t': 'Even keys are invisible to Muse',
+    'privacy.c2.d': '<span class="kbd">.env</span> · SSH private keys · <span class="kbd">*.pem</span> · credentials.json — these are refused for read/write even with a valid token.',
+    'privacy.c3.t': 'Files stay on your disk',
+    'privacy.c3.d': 'The archive is an ordinary directory on your machine. No vector store, no cloud mirror, no data shipping — open it in your file manager or terminal anytime.',
+    'privacy.c4.t': 'Out-of-bounds is denied',
+    'privacy.c4.d': 'All reads and writes are locked inside the archive root; pointing at <span class="kbd">/</span>, <span class="kbd">/etc</span> and other system paths is refused at startup.',
+    'privacy.c5.t': 'Not indexed by search engines',
+    'privacy.c5.d': '<span class="kbd">noindex</span> + robots.txt by default, so an accidental exposure won’t be crawled; the token uses constant-time comparison and a too-short one refuses to start.',
+    'privacy.c6.t': 'MIT open source, auditable',
+    'privacy.c6.d': 'All code is public. You can read the source to confirm where every byte of data goes, instead of trusting a “we’re secure”.',
+    'privacy.foot': 'Threat model · hardening checklist · reverse-proxy tips → <a href="https://github.com/hesorchen/muselab/blob/main/SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a>',
+
+    'files.label': 'FILES · file workflow',
+    'files.h2': 'Many common formats,<br><span class="hl">rendered right</span> in muselab.',
+    'files.lead': 'Tables for XLSX, charts for HTML, pages for PDF, formatted Markdown, instant image preview — no opening Numbers / Preview / VSCode just to “look at a file”. All rendering happens in the middle column of the three-pane workspace, with Muse on the right ready to act on it.',
+
+    'ws.files': '▣ Files',
+    'ws.search': 'Search names / contents…',
+    'ws.opened': '▼ Open (3)',
+    'ws.f.holdings': 'holdings.csv',
+    'ws.f.alloc': 'allocation.html',
+    'ws.f.rebal': 'rebalance-log.md',
+    'ws.d.invest': 'Investing',
+    'ws.f.review': 'quarterly-review.pdf',
+    'ws.d.travel': 'Kansai trip',
+    'ws.f.reading': 'reading-notes.md',
+    'ws.f.idea': 'idea.png',
+
+    'pf.head': 'Investing/allocation.html · HTML render',
+    'pf.title': 'Allocation overview',
+    'pf.sub': '· sample data · 2026 Q1',
+    'pf.m.total': 'Total assets',
+    'pf.m.vol': 'Annualized vol',
+    'pf.m.dd': 'Max drawdown',
+    'pf.m.n': 'Holdings',
+    'pf.alloc.t': 'Allocation',
+    'pf.alloc.by': 'by class',
+    'pf.cls.eq': 'Equity',
+    'pf.cls.bond': 'Bonds',
+    'pf.cls.gold': 'Gold',
+    'pf.cls.cash': 'Cash',
+    'pf.nav.t': 'Portfolio NAV · last 12 months',
+    'pf.nav.sub': 'incl. one drawdown',
+    'pf.hold.t': 'Holdings detail',
+    'pf.hold.by': 'by instrument',
+    'pf.col.name': 'Instrument',
+    'pf.col.cls': 'Class',
+    'pf.col.pct': 'Weight',
+    'pf.col.vol': '1-yr vol',
+    'pf.h.glob': 'Global large-cap equity index',
+    'pf.h.em': 'Emerging-markets equity index',
+    'pf.h.agg': 'Aggregate bond index',
+    'pf.h.gold': 'Physical gold',
+    'pf.h.mm': 'Money-market fund',
+    'pf.v.mid': 'Mid',
+    'pf.v.high': 'High',
+    'pf.v.low': 'Low',
+    'pf.v.vlow': 'Very low',
+
+    'sessions.label': 'SESSIONS · multi-session',
+    'sessions.h2': 'Each chat its own tab —<br><span class="hl">dozens open at once</span>, no cross-talk.',
+    'sessions.lead': 'Switch via the horizontal tab strip up top; click the folder icon on the left to open the picker — grouped by time, pin favorites, double-click to rename, search to filter. Each session remembers its own model / reasoning effort / context window. Streaming tabs get a pulsing dot, unread ones an amber dot.',
+    'sessions.micro': 'Fork a new session from any past message · 50 sessions open with no strain',
+    'sess.t.daily': 'Everyday chat',
+    'sess.t.weekly': 'Weekly report',
+    'sess.t.paper': 'Paper reading · exoplanets',
+    'sess.t.travel': 'Travel budget',
+    'sess.search': '🔍 Search sessions…',
+    'sess.pinned': '📌 Pinned',
+    'sess.today': 'Today',
+    'sess.t.meeting': 'Meeting-notes cleanup',
+
+    'models.label': 'MODELS · multi-model',
+    'models.h2': 'Eight built in,<br>and you can <span class="hl">add your own</span>.',
+    'models.lead': 'One select in the bottom toolbar switches between Claude · DeepSeek · GLM · MiniMax · Kimi · Qwen · Xiaomi MiMo · Baidu ERNIE. Settings has a full provider editor to change a built-in vendor’s endpoint / model / key, or create a custom provider for any Anthropic-compatible endpoint. MCP / Skills / Subagents behave the same on every one — driven directly by the Claude Agent SDK, not a protocol shim.',
+    'models.micro': 'Reuse your <span class="kbd">Claude Pro / Max</span> subscription (OAuth) · other vendors take their own API key · custom providers work the moment you add them · switching models forks a new session keeping the original context',
+    'models.custom': 'Custom',
+    'models.new': '+ New provider…',
+
+    'caps.label': 'AGENT SDK · the full capability surface',
+    'caps.h2': 'Not just a chat box —<br>a <span class="hl">complete agent</span>.',
+    'caps.lead': 'muselab is driven directly by the Claude Agent SDK — Skills, MCP, Subagents and plan mode are native, and behave the same across all eight model families. Not a chat wrapper, but a working agent that calls tools, splits tasks and extends.',
+    'caps.c1.t': 'Skills · 11 preset skill packs',
+    'caps.c1.d': 'The model picks them per task — web-search, code-reviewer, mermaid-helper, csv-analyzer, pptx, translate, meeting-notes… drop a <span class="kbd">SKILL.md</span> into a folder to add your own.',
+    'caps.c2.t': 'MCP · connect external tools & data',
+    'caps.c2.d': 'Through the Model Context Protocol, plug in filesystem, git, fetch, memory, time, sequential-thinking and other servers — capabilities grow with the open ecosystem.',
+    'caps.c3.t': 'Subagent · split & parallelize subtasks',
+    'caps.c3.d': 'Complex tasks spawn subagents with their own context to run in parallel, each running its own tool chain and reporting back — so the main thread isn’t flooded at once.',
+    'caps.foot': 'Skills / MCP / Subagents behave the same across all eight models',
+
+    'queue.label': 'QUEUE · message queue',
+    'queue.h2': 'Answer still running?<br><span class="hl">Queue the next one</span>.',
+    'queue.lead': 'No idle waiting while Muse streams — keep typing and hit enter, and messages line up in a queue; the moment the current turn ends, the queue fires off in order. Jot ideas as they come without breaking rhythm on “still generating”. Each queued message can be pulled back into the input box and edited before it sends.',
+    'queue.micro': 'Survives a refresh · synced live across tabs · queued items can be edited, deleted, reordered · errors auto-pause with “continue / discard”',
+    'queue.mock.title': 'message queue',
+    'queue.mock.user': 'Distill this 38-page industry report PDF into a one-page summary',
+    'queue.mock.readarg': 'industry-report.pdf',
+    'queue.mock.readmeta': '~38 pages',
+    'queue.mock.writearg': 'report-summary.md',
+    'queue.mock.gen': 'generating',
+    'queue.mock.qdiv': 'Queued · 2',
+    'queue.mock.next': 'sends next',
+    'queue.mock.act': '✎ edit · ×',
+    'queue.mock.q1': 'Now a version for non-technical readers — drop the jargon',
+    'queue.mock.queued': 'queued',
+    'queue.mock.q2': 'Pull the key figures into a single table',
+    'queue.mock.foot': 'Auto-sends in order after the current answer finishes',
+
+    'diff.label': 'EDITS · what changed',
+    'diff.h2': 'Edit a file and get a<br><span class="hl">red/green diff</span> — decide after you see it.',
+    'diff.lead': 'Every Edit / Write / MultiEdit from Muse renders an inline diff right in the bubble — green adds, red removes, with +N −M counts. See what moved at a glance without switching to git. Click the head to collapse; long chats stay clear.',
+    'diff.micro': 'Current turn’s diff expanded by default · past turns auto-collapse · git-blame style',
+    'diff.cmt': '// returns on the first pass, so retry never kicks in',
+
+    'device.label': 'MULTI-DEVICE · one server, synced everywhere',
+    'device.h2': 'Start on desktop,<br><span class="hl">keep going</span> on your phone.',
+    'device.lead': 'Phone and desktop hit the <strong style="color:var(--fg-1)">same server, same session, same archive</strong>. No cloud sync, no third-party account, no data shipping — switch devices and pick up where you left off.',
+    'dev.session': 'Stats review',
+    'dev.f.stat': 'Statistics',
+    'dev.f.problems': 'problem-set.pdf',
+    'dev.f.notes': 'notes-hypothesis-testing.md',
+    'dev.f.formula': 'formula-sheet.md',
+    'dev.md.h2a': '## Hypothesis testing · key points',
+    'dev.md.l1': 'Null H₀ vs alternative H₁',
+    'dev.md.l2': 'p-value: probability of observing this result when H₀ is true',
+    'dev.md.l3': 'Significance level α is usually <strong>0.05</strong>',
+    'dev.md.l4': 'Reject H₀ when p &lt; α',
+    'dev.md.h2b': '## Common mistakes',
+    'dev.md.text': 'The p-value is not “the probability that H₀ is true”…',
+    'dev.chat.user': 'Turn this chapter into a one-page set of Anki cards, front and back',
+    'dev.plan.path': 'Statistics/cards.md',
+    'dev.plan.body': '① Extract 5 core concepts<br>② Write each as question → answer<br>③ Wrote 12 cards ✓',
+    'ph.sep0': 'Two days ago · after class',
+    'ph.m0a': 'Dropped all the stats lecture notes into the archive',
+    'ph.m0b': 'Got it — I’ll start with the hypothesis-testing chapter',
+    'ph.sep1': 'Last night · on desktop',
+    'ph.m1': 'Generated 12 Anki cards · hypothesis testing ✓',
+    'ph.sep2': 'This morning · commuting',
+    'ph.m2': 'Quiz me on two — I answer, you grade',
+    'ph.m3': 'Card 1 · front<br><strong>What’s the correct definition of a p-value?</strong><br><span class="phone-hint">reply “flip” when ready for the answer</span>',
+    'ph.m4': 'flip',
+    'ph.tab.files': 'Files',
+    'ph.tab.preview': 'Preview',
+
+    'sched.label': 'SCHEDULED · scheduled tasks',
+    'sched.h2': 'Save a prompt,<br>let it <span class="hl">run on schedule</span>.',
+    'sched.lead': 'Save a go-to prompt as a scheduled task — daily / weekly / monthly / one-off. At the set time Muse reads your archive, runs its tools and produces the result on its own. When it’s done it lands in the bell drawer up top, and can push to your phone’s lock screen. It runs overnight and is ready by morning — today is sorted before you wake up.',
+    'sched.micro': 'Install as a PWA for Web Push · results kept in the bell drawer · one-off reminders too · runs on your own machine, no cloud cron service',
+    'sched.lock.date': 'Friday, May 29',
+    'sched.push.time': 'now',
+    'sched.push.title': 'Morning brief ready',
+    'sched.push.body': '3 tasks today · nearest deadline 18:00 · yesterday’s expenses auto-categorized — tap to view',
+
+    'gen.label': 'CREATE · it produces, not just consumes',
+    'gen.h2': 'Muse doesn\'t just <span class="hl">consume</span> your archive —<br>it <span class="hl">produces</span> new things in it.',
+    'gen.lead': 'Everywhere above, Muse was <strong style="color:var(--fg-1)">reading</strong> your archive; here it flips — hand it raw data and it writes a full HTML dashboard or report, rendered right in the middle pane. You get a real file you can export and forward; the artifact then lands back in your archive as context for tomorrow. Consuming and producing close the loop, and heavy layout work auto-invokes built-in skills like tufte-report.',
+    'gen.micro': 'read → produce → settles back into the archive · ask Muse to revise · what-you-see-is-what-you-get · no online editor required',
+    'gen.mock.title': 'chat · build a dashboard',
+    'gen.mock.user': 'Turn this quarter’s spending into a one-page dashboard I can share',
+    'gen.mock.read': 'ledger.csv',
+    'gen.mock.readmeta': '~1,200 rows',
+    'gen.mock.write': 'spending-dashboard.html',
+    'gen.mock.rhead': 'spending-dashboard.html · rendered in middle pane · sample data',
+    'gen.mock.pf': 'Spending this quarter',
+    'gen.mock.by': '· by category · sample',
+    'gen.cat.food': 'Dining',
+    'gen.cat.house': 'Housing',
+    'gen.cat.move': 'Transport',
+    'gen.cat.other': 'Other',
+
+    'shot.label': 'CAPTURE · snap it into the archive',
+    'shot.h2': 'Snap a photo,<br>Muse turns it into <span class="hl">a note in your archive</span>.',
+    'shot.lead': 'Whiteboards, receipts, report screenshots — snap them and send to Muse; it reads the image, pulls the key points, and writes a file into your folder structure. This is how the archive keeps growing: a photo you snap today is context for Muse’s answer tomorrow.',
+    'shot.micro': 'Snap and save on the go · reads photos / screenshots / document shots · once in the archive it becomes long-term context',
+    'shot.head': 'Quick capture',
+    'shot.sep': 'just now · snapped the whiteboard',
+    'shot.tag': '📷 whiteboard.jpg',
+    'shot.user': 'Save this whiteboard as meeting notes for me',
+    'shot.ai': 'Pulled 6 key points · 3 to-dos, structured',
+    'shot.file': 'notes/meeting-notes-0529.md',
+
+    'install.h2': 'One command,<br>installed on <span class="hl">your own machine</span>.',
+    'install.lead': 'Linux · macOS · WSL2. The installer pulls in uv / Node LTS / the Anthropic claude CLI and registers the service.',
+    'install.cmt1': '# install in one line',
+    'install.cmt2': '# then open localhost:8765',
+    'install.copy': 'Copy command',
+    'arch.h2': 'No build step.<br>Edit a file, refresh the browser.',
+
+    'compare.h2': 'The archive is to muselab<br>what the <span class="hl">codebase</span> is to Claude Code.',
+    'compare.lead': 'Not an IDE, not RAG, not a plugin marketplace — an AI workbench that treats your private archive as first-class context.',
+
+    'faq.label': 'FAQ · common questions',
+    'faq.h2': 'Before you start,<br>a <span class="hl">few things</span> you might ask.',
+    'faq.q1': 'Do I need an API key?',
+    'faq.a1': 'Claude uses a one-time <span class="kbd">claude login</span> OAuth and reuses your Pro / Max subscription — no API key, no per-token billing. The other seven each take their own API key, pasted in settings. Want a vendor not on the list? The provider editor lets you create a custom provider — fill in an Anthropic-compatible endpoint / model / key and it works right away.',
+    'faq.q2': 'Does muselab charge anything?',
+    'faq.a2': 'No. MIT open source, completely free. Model calls go straight to each vendor on your own subscription or key — muselab doesn’t relay or mark up (no proxy layer in the backend).',
+    'faq.q3': 'Where is my data stored?',
+    'faq.a3': 'All on your machine: the archive is a local directory, chat history is local JSONL files. No cloud copy, no third-party account, no data shipping.',
+    'faq.q4': 'Can I use local models / go fully offline?',
+    'faq.a4': 'The backend is the Claude Agent SDK and needs an Anthropic-compatible endpoint. Pure-local inference like Ollama isn’t built in yet; but the model base_url can be overridden per session to point at any Anthropic-protocol-compatible endpoint, including a proxy you run yourself.',
+    'faq.q5': 'How do I upgrade and uninstall?',
+    'faq.a5': 'Upgrade with <span class="kbd">upgrade.sh</span>, uninstall with <span class="kbd">uninstall-linux.sh</span> / <span class="kbd">uninstall-macos.sh</span>. Uninstall only removes the system service — your <span class="kbd">.env</span>, chat history and archive files stay as-is.',
+    'faq.q6': 'How do I use it on a phone?',
+    'faq.a6': 'It hits the same server and same session as the desktop. On a narrow screen it folds into a single column with three tabs — Files / Preview / Muse — and can be added to your home screen as a PWA.',
+
+    'footer.tag': '9 Muses · 1 Muse · your own muselab'
+  };
+
+  const _i18nOrig = new Map();
+  function applyLang(lang) {
+    const en = lang === 'en';
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const k = el.getAttribute('data-i18n');
+      if (!_i18nOrig.has(el)) _i18nOrig.set(el, el.innerHTML);
+      if (en && I18N_EN[k] != null) el.innerHTML = I18N_EN[k];
+      else el.innerHTML = _i18nOrig.get(el);
+    });
+    document.documentElement.setAttribute('data-lang', en ? 'en' : 'zh');
+    document.documentElement.lang = en ? 'en' : 'zh-CN';
+    document.title = en ? I18N_EN['doc.title'] : 'muselab · 自部署的多模型 AI 工作台';
+  }
+  function toggleLang() {
+    const next = (localStorage.getItem('muselab_lang') === 'en') ? 'zh' : 'en';
+    localStorage.setItem('muselab_lang', next);
+    applyLang(next);
+  }
+  applyLang(
+    localStorage.getItem('muselab_lang') ||
+    (navigator.language && navigator.language.startsWith('zh') ? 'zh' : 'en')
+  );
 </script>
 
 </body>

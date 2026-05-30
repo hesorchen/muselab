@@ -123,6 +123,10 @@ if command -v uv >/dev/null 2>&1; then
   ok "uv already installed: $(uv --version 2>&1)"
 else
   bold "Installing uv (Python project manager — the only Python dep needed)…"
+  # Supply-chain note: this pipes Astral's official upstream installer to a
+  # shell without a hash/signature check (their documented install method).
+  # We trust the vendor over HTTPS; full pinning of the installer is out of
+  # scope. To audit first: curl -LsSf https://astral.sh/uv/install.sh | less
   curl -LsSf https://astral.sh/uv/install.sh | sh
   # uv's installer adds ~/.local/bin to PATH via shell rc, but we're in a
   # fresh `sh` subshell that won't re-read rc. Add it for the rest of this
@@ -169,7 +173,11 @@ if [[ -d "$DEST" ]]; then
   fi
 else
   bold "Cloning $REPO_URL → $DEST"
-  git clone --depth 1 "$REPO_URL" "$DEST"
+  # Full clone (not --depth 1): a shallow clone leaves the repo without full
+  # history, which breaks the `git pull` upgrade path on some git versions
+  # ("fatal: refusing to merge unrelated histories" / shallow-fetch quirks).
+  # This repo is small, so the extra clone time is negligible.
+  git clone "$REPO_URL" "$DEST"
   ok "Cloned"
 fi
 

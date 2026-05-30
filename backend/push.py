@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import threading
 
 from .settings import ROOT, atomic_write_text
 
@@ -38,6 +39,13 @@ _SUBS_FILE = (_DIR / "push_subs.json") if _DIR else None
 
 _vapid: dict[str, str] | None = None
 _subs: dict[str, dict] = {}  # endpoint -> subscription dict
+# Guards every load→mutate→save of _subs. send_to_all runs in a worker
+# thread (offloaded via asyncio.to_thread), while add/remove_subscription
+# run on the event-loop thread; without this lock a subscription added
+# mid-fan-out could be clobbered when send_to_all writes back its stale
+# snapshot minus the dead subs. The network loop itself is kept OUTSIDE
+# the lock so a slow push endpoint can't block subscribe/unsubscribe.
+_subs_lock = threading.Lock()
 
 
 def _gen_vapid_keypair() -> dict[str, str]:
@@ -117,7 +125,19 @@ def _ensure_vapid() -> dict[str, str]:
                     "existing subscriptions still valid\n")
             return _vapid
         except Exception as e:
-            sys.stderr.write(f"[push] vapid.json unreadable, regenerating: {e}\n")
+            # Fail LOUDLY instead of silently regenerating. A transient read
+            # error / corrupted-but-recoverable file would otherwise trigger
+            # a fresh keypair, which permanently invalidates EVERY existing
+            # browser subscription (they were signed against the old public
+            # key) — a silent, hard-to-diagnose "push just stopped working
+            # for everyone" failure. The operator should inspect / restore /
+            # delete the file deliberately; deleting vapid.json is the
+            # explicit, documented "I accept everyone re-subscribes" action.
+            raise RuntimeError(
+                f"vapid.json exists but is unreadable ({e}). Refusing to "
+                f"regenerate (would invalidate all push subscriptions). "
+                f"Inspect or delete {_VAPID_FILE} to force a new keypair."
+            ) from e
     _vapid = _gen_vapid_keypair()
     if _VAPID_FILE:
         atomic_write_text(_VAPID_FILE, json.dumps(_vapid, indent=2))
@@ -157,26 +177,51 @@ def add_subscription(sub: dict) -> None:
     Reload from disk before mutating so we don't overwrite changes a
     parallel worker / out-of-band edit made between our last load and
     this save. _subs is purely a cache of the on-disk file — disk wins."""
-    _load_subs()
     endpoint = sub.get("endpoint")
     if not endpoint:
         raise ValueError("subscription missing endpoint")
-    _subs[endpoint] = sub
-    _save_subs()
+    with _subs_lock:
+        _load_subs()
+        _subs[endpoint] = sub
+        _save_subs()
+
+
+def add_subscription_capped(sub: dict, max_subs: int) -> None:
+    """add_subscription with an atomic cap check.
+
+    The cap check + insert must happen under a single lock acquisition,
+    otherwise two concurrent subscribe() calls both read count == cap-1,
+    both pass, and the file grows past the cap. Re-subscribing an
+    existing endpoint (same device, e.g. a tab re-subscribing on focus)
+    is always allowed — it's an update, not growth. Raises ValueError
+    on a missing endpoint, RuntimeError when the cap is exceeded."""
+    endpoint = sub.get("endpoint")
+    if not endpoint:
+        raise ValueError("subscription missing endpoint")
+    with _subs_lock:
+        _load_subs()
+        if endpoint not in _subs and len(_subs) >= max_subs:
+            raise RuntimeError(
+                f"too many subscriptions (cap {max_subs}); "
+                f"unsubscribe an older device first")
+        _subs[endpoint] = sub
+        _save_subs()
 
 
 def remove_subscription(endpoint: str) -> bool:
-    _load_subs()
-    if endpoint in _subs:
-        del _subs[endpoint]
-        _save_subs()
-        return True
+    with _subs_lock:
+        _load_subs()
+        if endpoint in _subs:
+            del _subs[endpoint]
+            _save_subs()
+            return True
     return False
 
 
 def list_subscriptions() -> list[dict]:
-    _load_subs()
-    return list(_subs.values())
+    with _subs_lock:
+        _load_subs()
+        return list(_subs.values())
 
 
 def send_to_all(title: str, body: str, *, url: str = "/",
@@ -196,13 +241,17 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     # and skips from_string entirely.
     vapid_obj = Vapid.from_pem(vapid["private_pem"].encode("ascii"))
     payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag})
-    # Reload from disk before iterating — another worker may have added /
-    # removed subscriptions since our last touch. _subs is just a cache.
-    _load_subs()
+    # Snapshot the current subs under the lock, then run the (slow, network)
+    # fan-out WITHOUT holding it so subscribe/unsubscribe stay responsive.
+    # Dead-sub removals are collected and applied back under the lock at the
+    # end, re-reading disk first so we don't clobber a concurrent add.
+    with _subs_lock:
+        _load_subs()
+        targets = list(_subs.items())
     sent = 0
     dropped: list[str] = []
     errors: list[str] = []
-    for endpoint, sub in list(_subs.items()):
+    for endpoint, sub in targets:
         try:
             webpush(
                 subscription_info=sub,
@@ -234,15 +283,19 @@ def send_to_all(title: str, body: str, *, url: str = "/",
                 if m:
                     code = int(m.group(1))
             if code in (404, 410):
-                # Subscription is dead (user uninstalled / cleared) — drop it.
-                del _subs[endpoint]
+                # Subscription is dead (user uninstalled / cleared) — mark for
+                # removal; applied at the end under the lock.
                 dropped.append(endpoint)
             else:
                 errors.append(f"{code}: {e}")
         except Exception as e:
             errors.append(f"{type(e).__name__}: {e}")
     if dropped:
-        _save_subs()
+        with _subs_lock:
+            _load_subs()
+            for endpoint in dropped:
+                _subs.pop(endpoint, None)
+            _save_subs()
     return {"sent": sent, "dropped": len(dropped), "errors": errors}
 
 

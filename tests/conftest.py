@@ -51,6 +51,19 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("XIAOMI_MIMO_API_KEY", raising=False)
     monkeypatch.delenv("QIANFAN_API_KEY", raising=False)
 
+    # NOTE (audit I/312 — fragility, intentionally left as-is for now):
+    # Deleting every `backend.*` module forces a full re-import of the whole
+    # tree on each test, which re-runs module-level init (e.g. backend.chat
+    # snapshots SESS_DIR/active_turns at import) so the monkeypatched ROOT /
+    # SESS_DIR / env take effect. The downside is that any module-level mutable
+    # global (chat._clients, scheduler._state, …) is recreated per test — which
+    # mostly isolates state, but couples correctness to import order and means a
+    # module that caches a path/handle BEFORE the relevant monkeypatch silently
+    # leaks (see the SESS_DIR ordering dance below; test_scheduler.py:20 also
+    # resets _state by hand). The proper fix is to move that global state into
+    # injectable objects (e.g. an app-scoped registry) so tests construct a
+    # fresh instance instead of nuking sys.modules — that's a larger refactor
+    # touching backend/, out of scope for this CI/test-hardening pass.
     for name in [n for n in list(sys.modules) if n.startswith("backend")]:
         del sys.modules[name]
 

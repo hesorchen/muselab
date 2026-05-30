@@ -28,3 +28,27 @@ async def require_token_query(token: str | None = Query(default=None)) -> None:
     """For endpoints where header injection is hard (file download, SSE in <iframe>)."""
     if not _token_ok(token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="bad token")
+
+
+async def require_token_header_or_query(
+    x_auth_token: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> None:
+    """Accept the token from EITHER the `X-Auth-Token` header OR the `token`
+    query param.
+
+    Endpoints hit by `fetch()` (interrupt / reset / export / file download &
+    raw) historically only read the query param (`require_token_query`), which
+    forced the frontend to put the token in the URL — where it leaks into
+    uvicorn access logs, any reverse-proxy (nginx/Caddy/Cloudflare) access log,
+    browser history and the Referer header. fetch() *can* send custom headers,
+    so the frontend now passes the token via header and the URL stays clean.
+
+    The query param is still accepted as a fallback so that (a) old clients and
+    (b) genuinely header-less contexts (an <iframe> download, a copied link)
+    keep working unchanged. Header is preferred: if it's valid we accept even
+    when no query token is present, and vice-versa.
+    """
+    if _token_ok(x_auth_token) or _token_ok(token):
+        return
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="bad token")

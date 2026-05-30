@@ -13,6 +13,34 @@ from pathlib import Path
 import pytest
 
 
+# Fixed mid-day UTC instant used to freeze the clock for the time-bucketing
+# tests. Anchored at 12:00 UTC (well away from either midnight boundary) so a
+# test run that straddles 00:00 UTC can't make the endpoint's `now()` and the
+# assertions' `now()` land on different calendar days (the old flaky
+# off-by-one: endpoint bucketed under day N, assert recomputed day N+1).
+_FROZEN_NOW = dt.datetime(2026, 5, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+@pytest.fixture()
+def frozen_now(monkeypatch):
+    """Freeze `datetime.datetime.now()` to a fixed mid-day UTC instant.
+
+    `cost_dashboard` does `import datetime as _dt; _dt.datetime.now(tz)`, so
+    patching the `datetime.datetime` class on the stdlib module is seen by the
+    endpoint's re-import as well as by the test body. Returns the frozen
+    instant so tests can stage timestamps relative to it deterministically.
+    """
+    real = dt.datetime
+
+    class _Frozen(real):  # type: ignore[misc, valid-type]
+        @classmethod
+        def now(cls, tz=None):
+            return _FROZEN_NOW.astimezone(tz) if tz is not None else _FROZEN_NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(dt, "datetime", _Frozen)
+    return _FROZEN_NOW
+
+
 def _projects_dir_for(root: Path) -> Path:
     # Must match Claude CLI's actual encoding (non-alnum → "-"). A naive
     # `str(root).replace("/", "-")` worked by coincidence as long as test
@@ -25,7 +53,7 @@ def _projects_dir_for(root: Path) -> Path:
 
 
 @pytest.fixture()
-def _staged(temp_root, request, app_module):
+def _staged(temp_root, request, app_module, frozen_now):
     """Drop one sidecar (cost) + one JSONL (usage + ts) with 4 assistant
     turns under the per-cwd CLI dir + the monkeypatched test SESS_DIR.
     Includes a GLM turn with cost-side $0 to verify third-party tokens
@@ -154,7 +182,7 @@ def test_cost_dashboard_validates_days(client, auth):
 
 
 def test_cost_dashboard_discovers_vendor_config_dir_jsonl(
-    client, auth, app_module, temp_root, tmp_path, monkeypatch, request,
+    client, auth, app_module, temp_root, tmp_path, monkeypatch, request, frozen_now,
 ):
     """Third-party providers (DeepSeek / GLM / MiniMax) run the CLI with
     CLAUDE_CONFIG_DIR pointed at a per-uid temp dir so Pro OAuth never

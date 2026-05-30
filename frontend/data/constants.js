@@ -17,8 +17,16 @@ window.MUSELAB_ACCENT_PRESETS = [
   // still pick it via the custom color picker if they really want.
 ];
 
-// Editable file extensions (matches backend TEXT_EXT). A Set so Alpine
-// doesn't try to wrap it in a reactive Proxy when read from component state.
+// Editable file extensions — an intentionally-conservative frontend
+// whitelist. NOTE: this does NOT mirror the backend, which has no TEXT_EXT
+// whitelist at all: backend/files.py gates reads/writes with a BINARY_EXT
+// blacklist + a NUL-byte sniff ("not blacklisted and no NUL → editable"),
+// so it will happily edit any non-binary text file (.proto/.dart/.gradle/…).
+// This list is the stricter of the two: a file shows an "Edit" button in the
+// UI only if its extension is here, even though the backend would accept more.
+// Trade-off is deliberate — the FE stays predictable and avoids offering Edit
+// on exotic extensions we haven't visually verified render well in the editor.
+// A Set so Alpine doesn't wrap it in a reactive Proxy when read from state.
 window.MUSELAB_EDITABLE_EXT = new Set([
   "md", "markdown", "txt", "html", "htm", "json", "yaml", "yml",
   "py", "js", "ts", "tsx", "jsx", "mjs", "css", "scss", "less",
@@ -138,7 +146,7 @@ window.MUSELAB_INSPIRE_PROMPTS = [
 // chat-input slash autocomplete; descriptions show in the bilingual hint row.
 window.MUSELAB_SLASH_CMDS = [
   { name: "help",    desc: { zh: "查看所有可用斜杠命令", en: "List all slash commands" } },
-  { name: "clear",   desc: { zh: "清空当前会话", en: "Reset / clear current session" } },
+  { name: "clear",   desc: { zh: "删除当前会话并新建一个（不可恢复）", en: "Delete current session and start fresh (cannot be undone)" } },
   { name: "compact", desc: { zh: "压缩历史 — 把上下文摘要成新会话", en: "Compact: summarize history into a new session" } },
   { name: "model",   desc: { zh: "/model <id> 切换模型，留空看可选项", en: "/model <id> — switch model (no arg = list)" } },
   { name: "resume",  desc: { zh: "/resume <名字> 跳到名字匹配的旧会话", en: "/resume <name> — jump to a session by name" } },

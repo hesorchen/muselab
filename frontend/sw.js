@@ -63,6 +63,12 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const target = (event.notification.data && event.notification.data.url) || "/";
+  // Parse the session id out of the target url (`/?session=<id>`) so we can
+  // deep-link the right conversation. New-window navigation carries it in the
+  // URL automatically; the focus-existing-tab path needs it postMessage'd
+  // since focus() alone doesn't change the tab's location.
+  let sessionId = "";
+  try { sessionId = new URL(target, self.registration.scope).searchParams.get("session") || ""; } catch (_) {}
   event.waitUntil((async () => {
     const all = await self.clients.matchAll({
       type: "window", includeUncontrolled: true,
@@ -73,9 +79,13 @@ self.addEventListener("notificationclick", (event) => {
     for (const c of all) {
       try { c.postMessage({ type: "muselab/notification-clicked" }); } catch {}
     }
-    // If muselab is already open in a tab, focus it. Otherwise spawn one.
+    // If muselab is already open in a tab, focus it. focus() can't navigate,
+    // so also postMessage the target session id and let the app open it.
     for (const c of all) {
       if (c.url.includes(self.registration.scope) && "focus" in c) {
+        if (sessionId) {
+          try { c.postMessage({ type: "muselab/open-session", id: sessionId }); } catch {}
+        }
         return c.focus();
       }
     }

@@ -82,8 +82,9 @@ quality of every future reply. For each blank section worth filling:
 - For §5 people, redacted names are fine ("partner" / "mom" / "M")
 
 After each user reply, use Edit to save into CLAUDE.md:
-- Locate the field by its line label (e.g. `- 现在住在：` in zh template
-  or `- Where you currently live:` in en template)
+- Locate the field by its ACTUAL line label as it appears in the file you
+  just Read (e.g. `- Lives in:` under `## 1. Who I am`). Don't guess the
+  label text — match what's really there, or the surgical Edit will fail.
 - Append the answer after the colon, keep the rest intact — DO NOT
   rewrite the whole file, surgical Edits only
 - For multi-line answers, put the answer on a new line below the field
@@ -176,7 +177,7 @@ blank. Don't re-ask sections that are already meaningful.
 
 ## 2. Ask in conversational batches
 
-The template has 9 sections (1. Who I am … 9. What I maintain).
+The template has 6 sections (1. Who I am … 6. What's on my mind).
 Walk through them in order, but DON'T paste the raw template at the
 user. Instead, ask the questions in your own friendly voice, in
 batches of 2-3 closely related questions per turn. For each empty
@@ -197,8 +198,10 @@ field you want to fill:
 After each user reply, use Edit to update CLAUDE.md with what they
 said. Be careful with the patch:
 
-- Locate the exact field by its line label (e.g. `- 现在住在：` in zh
-  template or `- Where you currently live:` in en template)
+- Locate the exact field by its ACTUAL line label as it appears in the
+  file you just Read (e.g. `- 现在住在：` in the zh template or
+  `- Lives in:` in the en template). Don't guess the label text — match
+  what's really there, or the surgical Edit will fail.
 - Append the user's answer after the colon, keeping the rest of the
   template intact
 - DO NOT rewrite the whole file — surgical Edits only

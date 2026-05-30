@@ -56,7 +56,7 @@ def locate_executable(name: str) -> str | None:
     Why: when muselab runs as a systemd user service, the inherited PATH is
     minimal (usually /usr/local/bin:/usr/bin) and excludes ~/.local/bin
     (where `uv` installs by default), ~/.npm-global/bin (where the Claude
-    CLI lands after `npm install -g claude-code`), and per-user node
+    CLI lands after `npm install -g @anthropic-ai/claude-code`), and per-user node
     version-manager directories. shutil.which() only consults the current
     PATH so calls like `shutil.which("claude")` return None and the
     upgrade endpoint reports "CLI not installed" even when it is.

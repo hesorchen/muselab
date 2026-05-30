@@ -47,18 +47,18 @@ def vapid_public() -> dict:
 @router.post("/subscribe", dependencies=[Depends(require_token)])
 def subscribe(sub: _SubscribeIn) -> dict:
     # Cap total subs to prevent a stale tab calling subscribe() on every
-    # focus from growing push_subs.json without bound.
-    if len(push.list_subscriptions()) >= _MAX_SUBS \
-            and not any(s.get("endpoint") == sub.endpoint
-                         for s in push.list_subscriptions()):
-        raise HTTPException(
-            429, f"too many subscriptions (cap {_MAX_SUBS}); "
-                 f"unsubscribe an older device first")
+    # focus from growing push_subs.json without bound. The cap check +
+    # insert happen atomically inside add_subscription_capped (under the
+    # subs lock) — doing it here with two list_subscriptions() reads was
+    # both racy (two concurrent subscribes could both slip past the cap)
+    # and wasteful (each list_subscriptions reloads the file from disk).
     try:
-        push.add_subscription({
+        push.add_subscription_capped({
             "endpoint": sub.endpoint,
             "keys": {"p256dh": sub.keys.p256dh, "auth": sub.keys.auth},
-        })
+        }, _MAX_SUBS)
+    except RuntimeError as e:
+        raise HTTPException(429, str(e)) from None
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
     return {"ok": True}

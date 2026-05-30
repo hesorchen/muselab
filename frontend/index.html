@@ -195,8 +195,6 @@
   <!-- ===== Image annotation editor tools (added 2026-05-28) ===== -->
   <!-- Pen — freedraw stroke tool. -->
   <symbol id="i-pen" viewBox="0 0 24 24"><path d="M12 19l7-7 3 3-7 7-3-3z"/><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"/><path d="M2 2l7.586 7.586"/><circle cx="11" cy="11" r="2"/></symbol>
-  <!-- Square — rectangle tool (outline). -->
-  <symbol id="i-square" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
   <!-- Arrow up-right — arrow tool. -->
   <symbol id="i-arrow-ur" viewBox="0 0 24 24"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></symbol>
   <!-- Eraser. -->
@@ -285,7 +283,7 @@
           <svg><use href="#i-eye"/></svg>
         </button>
         <button @click="reloadTree()" class="icon-btn" :title="t('btn.refresh')"><svg><use href="#i-refresh"/></svg></button>
-        <button @click="toggleTheme()" class="icon-btn"
+        <button @click="toggleTheme()" class="icon-btn files-keep-mobile"
                 :title="theme==='light' ? t('btn.theme_dark') : theme==='dark' ? t('btn.theme_eyecare') : t('btn.theme_light')">
           <svg x-show="theme==='light'"><use href="#i-moon"/></svg>
           <svg x-show="theme==='dark'"><use href="#i-leaf"/></svg>
@@ -331,6 +329,8 @@
                 :title="t.path">
               <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
               <span class="name" x-text="t.name"></span>
+              <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
+                    :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
               <button class="open-files-x"
                       @click.stop="closeTab(t.path)"
                       :title="lang==='zh'?'关闭':'Close'">×</button>
@@ -361,10 +361,14 @@
               :data-path="n.path"
               :data-depth="n.depth"
               :data-ext="fileExtClass(n)"
-              draggable="true"
+              :draggable="isPointerDevice"
               @dragstart="onTreeNodeDragStart($event, n)"
               @dragend="dragOver=''"
               @click="onNodeClick(n)"
+              @touchstart="onTreeTouchStart($event, n)"
+              @touchmove="onTreeTouchMove($event)"
+              @touchend="onTreeTouchEnd($event)"
+              @touchcancel="onTreeTouchEnd($event)"
               @contextmenu.prevent="openCtxMenu($event, n)"
               @dragover.prevent="onTreeNodeDragOver($event, n)"
               @dragleave="dragOver=''"
@@ -486,7 +490,7 @@
           <svg x-show="!editing"><use href="#i-edit"/></svg>
           <svg x-show="editing"><use href="#i-eye"/></svg>
         </button>
-        <button x-show="editing" @click="saveEdit()" class="btn-primary" style="padding:4px 12px;font-size:12px" x-text="t('btn.save')"></button>
+        <button x-show="editing" @click="saveEdit()" class="btn-primary btn-compact" x-text="t('btn.save')"></button>
         <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
         <a x-show="selected" :href="downloadUrl(selected)" :download="selected.split('/').pop()" class="icon-btn preview-keep-mobile" :title="t('btn.download')"><svg><use href="#i-download"/></svg></a>
         <!-- Desktop fullscreen toggle (hidden on mobile via .pane-fullscreen-btn
@@ -498,16 +502,22 @@
           <svg x-show="desktopFullPane!=='preview'"><use href="#i-maximize"/></svg>
           <svg x-show="desktopFullPane==='preview'"><use href="#i-minimize"/></svg>
         </button>
-        <button @click="rightOpen=!rightOpen; savePrefs()" class="icon-btn" :title="rightOpen?t('btn.hide_right'):t('btn.show_right')">
-          <svg x-show="rightOpen"><use href="#i-chevron-right"/></svg>
-          <svg x-show="!rightOpen"><use href="#i-chevron-left"/></svg>
+        <button @click="toggleChatPane()" class="icon-btn"
+                :title="desktopFullPane === 'preview'
+                  ? (lang==='zh' ? '退出全屏并显示 Muse' : 'Exit fullscreen & show Muse')
+                  : (rightOpen ? t('btn.hide_right') : t('btn.show_right'))">
+          <!-- In preview-fullscreen the chevron always reads as "show Muse"
+               (chevron-left) since the Muse pane is hidden by the fullscreen
+               layout — tapping it exits fullscreen + un-hides the pane. -->
+          <svg x-show="rightOpen && desktopFullPane !== 'preview'"><use href="#i-chevron-right"/></svg>
+          <svg x-show="!rightOpen || desktopFullPane === 'preview'"><use href="#i-chevron-left"/></svg>
         </button>
       </header>
       <!-- Tab bar (VSCode-style multi-file) -->
       <div class="tab-bar" x-show="tabs.length">
         <template x-for="t in tabs" :key="t.path">
           <div :class="'tab' + (selected===t.path ? ' active' : '') + (previewDragOverPath===t.path ? ' drag-over' : '')"
-               draggable="true"
+               :draggable="isPointerDevice"
                :data-path="t.path"
                @dragstart="onPreviewTabDragStart($event, t.path)"
                @dragover.prevent="onPreviewTabDragOver($event, t.path)"
@@ -520,6 +530,11 @@
                :title="t.path">
             <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
             <span class="tab-name" x-text="t.name"></span>
+            <!-- Unsaved-edits dot: only the currently-open file can be edited
+                 (single editing buffer keyed by `selected`), so the dot tracks
+                 selected===t.path && dirty. -->
+            <span class="tab-dirty" x-show="selected===t.path && _editorDirty()"
+                  :title="lang==='zh'?'有未保存的改动':'Unsaved changes'"></span>
             <button class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
           </div>
         </template>
@@ -730,7 +745,7 @@
           <div class="empty-title" x-text="lang==='zh' ? '不支持预览' : 'Preview not supported'"></div>
           <div class="empty-hint">
             <span x-text="lang==='zh' ? '该文件类型无法在浏览器中预览。' : 'This file type cannot be previewed in browser. '"></span>
-            <a :href="downloadUrl(selected)" x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a>。
+            <a :href="downloadUrl(selected)" x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a><span x-show="lang==='zh'">。</span>
           </div>
         </div>
         <div x-show="!selected" class="brand-empty">
@@ -784,11 +799,21 @@
           <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
           <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
         </span>
-        <!-- 2026-05-23: 顶 bar 的 MCP 数量 badge 已移除。原来只是一个数字
-             气泡（hover 才看得到详情），跟旁边的功能按钮信息密度不一致，
-             在移动端把 toolbar 挤窄。改成在 chat-input 底 bar 加一个独立
-             MCP drawer 按钮（toggleMcpDrawer），点开能完整看每条来源 +
-             状态，比顶 bar 一个干巴巴的数字有用。 -->
+        <!-- Skills + MCP drawer toggles. 2026-05-29: 从 chat-input 底 bar 移到
+             顶 bar，与其它「能力 / 会话」入口（整理档案、定时任务、命令面板）
+             并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
+             与「这一轮怎么发」直接相关的控件。两者都回答「这个会话有哪些能力
+             可用」，放顶 bar 更符合其全局属性，也给移动端底 bar 腾出空间。-->
+        <button @click="toggleSkillsDrawer()" class="icon-btn"
+                :title="t('set.skills.drawer_open')"
+                aria-label="Open skills list">
+          <svg><use href="#i-puzzle"/></svg>
+        </button>
+        <button @click="toggleMcpDrawer()" class="icon-btn"
+                :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
+                aria-label="Open MCP servers">
+          <svg><use href="#i-plug"/></svg>
+        </button>
 
         <!-- Set up / refresh profile — opens a dedicated chat session
              where Muse walks the user through CLAUDE.md interactively,
@@ -1141,11 +1166,11 @@
            moved to the chat-input toolbar at the bottom (VSCode-style). -->
 
       <div class="chat-scroll-wrap">
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @click="onChatClick($event)">
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
                brand-empty onboarding cards as if it were a new session. -->
-          <div x-show="messagesLoading && !messages.length" class="chat-skeleton" aria-hidden="true">
+          <div x-show="(messagesLoading && !messages.length) || (!messagesReady && messages.length)" class="chat-skeleton" aria-hidden="true">
             <template x-for="i in 3" :key="i">
               <div class="chat-skeleton-msg">
                 <div class="chat-skeleton-avatar"></div>
@@ -1426,7 +1451,7 @@
               <!-- assistant text bubble — has avatar; subsequent
                    non-user msgs in the same run hide theirs via CSS. -->
               <template x-if="m.role === 'assistant' && !m._is_compact_summary">
-                <div>
+                <div class="asst-msg-wrap">
                   <div class="msg-row">
                     <span class="msg-avatar assistant-avatar"
                           :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
@@ -1517,8 +1542,8 @@
                 </div>
               </template>
 
-              <!-- Task subagent -->
-              <template x-if="m.role === 'tool_use' && m.name === 'Task'">
+              <!-- Task subagent ("Agent" is the SDK's current tool name, "Task" the legacy one) -->
+              <template x-if="m.role === 'tool_use' && (m.name === 'Task' || m.name === 'Agent')">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
                         :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
@@ -1575,7 +1600,7 @@
               </template>
 
               <!-- default tool bubble -->
-              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
+              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
                         :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
@@ -1614,10 +1639,10 @@
                     <template x-if="['Edit','MultiEdit','Write'].includes(m.name) && editDiffStats(m)">
                       <span class="diff-badge"
                             :title="lang==='zh' ? '本次改动行数(+插入 / −删除)' : 'lines changed (+insert / −delete)'">
-                        <span class="diff-badge-plus" x-show="editDiffStats(m).plus > 0"
-                              x-text="'+' + editDiffStats(m).plus"></span>
-                        <span class="diff-badge-minus" x-show="editDiffStats(m).minus > 0"
-                              x-text="'−' + editDiffStats(m).minus"></span>
+                        <span class="diff-badge-plus" x-show="(editDiffStats(m)?.plus ?? 0) > 0"
+                              x-text="'+' + (editDiffStats(m)?.plus ?? 0)"></span>
+                        <span class="diff-badge-minus" x-show="(editDiffStats(m)?.minus ?? 0) > 0"
+                              x-text="'−' + (editDiffStats(m)?.minus ?? 0)"></span>
                       </span>
                     </template>
                     <!-- MCP input preview: compact key:val · key:val list -->
@@ -1654,10 +1679,10 @@
                     <span class="diff-strip-label" x-text="lang==='zh' ? '改动预览' : 'diff'"></span>
                     <template x-if="editDiffStats(m)">
                       <span class="diff-strip-stats">
-                        <span x-show="editDiffStats(m).plus > 0"
-                              class="diff-strip-plus" x-text="'+' + editDiffStats(m).plus"></span>
-                        <span x-show="editDiffStats(m).minus > 0"
-                              class="diff-strip-minus" x-text="'−' + editDiffStats(m).minus"></span>
+                        <span x-show="(editDiffStats(m)?.plus ?? 0) > 0"
+                              class="diff-strip-plus" x-text="'+' + (editDiffStats(m)?.plus ?? 0)"></span>
+                        <span x-show="(editDiffStats(m)?.minus ?? 0) > 0"
+                              class="diff-strip-minus" x-text="'−' + (editDiffStats(m)?.minus ?? 0)"></span>
                       </span>
                     </template>
                   </div>
@@ -1851,7 +1876,7 @@
                       <span class="ask-title" x-text="t('ask.title')"></span>
                       <span x-show="m.submitted" class="ask-submitted-tag" x-text="t('ask.submitted')"></span>
                     </div>
-                    <template x-for="(q, qIdx) in m.questions" :key="qIdx">
+                    <template x-for="(q, qIdx) in (m.questions || [])" :key="qIdx">
                       <div class="ask-question-block">
                         <div class="ask-question-head">
                           <span x-show="q.header" class="ask-question-chip" x-text="q.header"></span>
@@ -2101,43 +2126,68 @@
                     </button>
                   </div>
                   <div class="queued-text" x-show="q.text" x-text="q.text"></div>
-                  <div class="queued-attach"
-                       x-show="(q.pendingImages && q.pendingImages.length)
-                                || (q.pendingDocs && q.pendingDocs.length)">
-                    <template x-for="(img, ii) in (q.pendingImages || [])" :key="'qi-'+ii">
-                      <!-- guard against empty src → browser would resolve to current
-                           URL and fire a spurious resource-load-failed error -->
-                      <img class="queued-img" :src="img.preview || 'data:image/gif;base64,R0lGODlhAQABAAAAACw='"
-                           alt="" :style="img.preview ? '' : 'opacity:0.3'" />
+                  <!-- FIX ③: the server resolves queued upload IDs against its
+                       in-memory store, so we can render real image thumbnails
+                       and named doc chips here — matching how a SENT message
+                       looks, instead of the old neutral "含附件" marker.
+                       Expired uploads (TTL) show a muted "附件已过期" chip. -->
+                  <div class="queued-attach" x-show="q.hasAttach">
+                    <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
+                      <img class="queued-thumb" :src="im.src" loading="lazy" alt=""
+                           @error="$el.style.display='none'" />
                     </template>
-                    <template x-for="(doc, di) in (q.pendingDocs || [])" :key="'qd-'+di">
-                      <span class="queued-doc-chip">
+                    <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
+                      <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
                         <svg><use href="#i-file-text"/></svg>
-                        <span x-text="doc.name"></span>
+                        <span x-text="d.name"></span>
                       </span>
                     </template>
+                    <span class="queued-doc-chip queued-attach-expired"
+                          x-show="q.expiredCount > 0">
+                      <svg><use href="#i-alert-triangle"/></svg>
+                      <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
+                    </span>
+                    <!-- Fallback: ids present but metadata not yet resolved
+                         (e.g. mid tab-switch before the queue sync lands). -->
+                    <span class="queued-doc-chip"
+                          x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
+                      <svg><use href="#i-paperclip"/></svg>
+                      <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
+                    </span>
                   </div>
                 </div>
               </div>
             </div>
           </template>
 
-          <!-- Queue paused: an error during a queued chain stops auto-drain
-               so the user can fix the root cause (quota / auth / cross-
-               vendor) before continuing. Resume / Discard are explicit. -->
-          <div x-show="tabState[currentId] && tabState[currentId]._queuePaused
+          <!-- Idle-with-items banner. Shows whenever the queue has items but
+               nothing is running on this session (not streaming, not
+               compacting, not mid-reattach). Two reasons this happens:
+                 1. An error / interrupt paused the queue server-side
+                    (_queuePaused) — the user fixes the root cause then resumes.
+                 2. Items left dormant after a process restart — the server
+                    intentionally does NOT auto-resume draining on boot, so
+                    they wait here for an explicit Resume.
+               While a turn is running, items just auto-drain server-side and
+               this banner stays hidden. -->
+          <div x-show="tabState[currentId]
                         && tabState[currentId].pendingQueue
-                        && tabState[currentId].pendingQueue.length"
+                        && tabState[currentId].pendingQueue.length
+                        && !streaming
+                        && !(tabState[currentId].compacting)
+                        && !(tabState[currentId]._draining)"
                class="queue-paused-banner">
             <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
             <span class="queue-paused-text"
-                  x-text="(lang==='zh' ? '上一条出错，队列已暂停（' : 'Queue paused after error (')
+                  x-text="((tabState[currentId] && tabState[currentId]._queuePaused)
+                            ? (lang==='zh' ? '上一条中断，队列已暂停（' : 'Queue paused (')
+                            : (lang==='zh' ? '队列等待中（' : 'Queue waiting (' ))
                           + ((tabState[currentId] && tabState[currentId].pendingQueue
                               && tabState[currentId].pendingQueue.length) || 0)
-                          + (lang==='zh' ? ' 条等待）' : ' waiting)')"></span>
+                          + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
             <button class="queue-paused-btn primary"
                     @click="resumeQueueDrain(currentId)"
-                    x-text="lang==='zh' ? '续发' : 'Resume'"></button>
+                    x-text="lang==='zh' ? '继续执行' : 'Resume'"></button>
             <button class="queue-paused-btn"
                     @click="discardQueue(currentId)"
                     x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
@@ -2292,10 +2342,12 @@
                     inputmode="text"
                     autocomplete="off" autocorrect="off"
                     autocapitalize="sentences" spellcheck="false"
-                    enterkeyhint="send"
+                    enterkeyhint="enter"
                     data-1p-ignore="" data-lpignore="true" data-form-type="other"
                     @keydown.enter.prevent.stop="onEnter($event)"
                     @keydown.escape="mentionShow=false; slashShow=false"
+                    @keydown.ctrl.x="onCutLine($event)"
+                    @keydown.meta.x="onCutLine($event)"
                     @keydown.up="onChatArrowUp($event)"
                     @keydown.down="(mentionShow || slashShow) && _navPop(1) && $event.preventDefault()"
                     @input="onChatInput($event); autoGrow($event.target)"
@@ -2306,37 +2358,23 @@
                     :placeholder="t('chat.placeholder')"></textarea>
           </form>
           <div class="chat-toolbar">
-            <!-- Attach button -->
+            <!-- Attach button — enabled while streaming too, so attachments
+                 can be added to a queued message (upload is independent of
+                 the running turn). -->
             <button @click="$refs.attachInput.click()"
                     class="chat-toolbar-btn"
-                    :disabled="streaming" :title="t('attach.title')">
+                    :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
             </button>
-            <!-- Skills drawer toggle — always reachable from chat (not just
-                 the empty-chat ready card). Opens a card grid of every
-                 discoverable skill across project / user / plugin scopes.
-                 Uses the line-SVG puzzle (i-puzzle) so it matches the
-                 paperclip / send / stop sibling buttons; emoji 🧩 was
-                 visually jarring next to monochrome SVGs. -->
-            <button @click="toggleSkillsDrawer()"
-                    class="chat-toolbar-btn"
-                    :title="t('set.skills.drawer_open')"
-                    aria-label="Open skills list">
-              <svg><use href="#i-puzzle"/></svg>
-            </button>
-            <!-- MCP drawer toggle — sits next to skills (both are "what
-                 capabilities does this turn have available"). Reuses the
-                 i-plug icon that used to live in the top bar. Replaces
-                 the read-only top-bar mcp-badge (2026-05-23). No count
-                 badge: a raw number adds visual noise without telling
-                 the user anything actionable — they open the drawer to
-                 see which MCPs anyway. -->
-            <button @click="toggleMcpDrawer()"
-                    class="chat-toolbar-btn"
-                    :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
-                    aria-label="Open MCP servers">
-              <svg><use href="#i-plug"/></svg>
-            </button>
+            <!-- Command-palette opener lives in the chat pane's TOP bar
+                 (global "files / sessions / actions" entry), not here.
+                 This bottom toolbar is reserved for per-turn controls
+                 (attach / model / permission / effort / context ring).
+                 The header button shows on touch too, so mobile still
+                 reaches the palette. (2026-05-29: removed the duplicate
+                 mobile-only magnifier that doubled the header one.) -->
+            <!-- Skills / MCP drawer toggles moved to the top bar (2026-05-29).
+                 See the header near the organize / scheduler buttons. -->
             <!-- Model selector -->
             <select x-model="model" @change="onModelChange()"
                     class="chat-toolbar-select"
@@ -2591,64 +2629,78 @@
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body settings-modal-body">
-        <!-- Mobile-only iOS-style menu. On desktop (isWideScreen=true)
-             everything below renders as one long scroll, like before.
-             On phone (isWideScreen=false): if activePage is null, show
-             this menu; if set, show only the corresponding section +
-             a back button. Per-section x-show conditions below switch
-             on this same activePage. -->
+        <!-- Settings nav. Desktop (isWideScreen=true): a persistent left
+             sidebar of tabs — only the section matching activePage renders
+             in the content pane to the right. Mobile (isWideScreen=false):
+             iOS-style drill-down — when activePage is null this menu fills
+             the screen; tapping a row sets activePage to show only that
+             section + a Back button. The `.active` class highlights the
+             current tab on desktop. -->
         <ul class="settings-menu"
-            x-show="!isWideScreen && !settings.activePage">
-          <li class="settings-menu-item" @click="settings.activePage='lang'">
+            x-show="isWideScreen || !settings.activePage">
+          <li class="settings-menu-item" @click="settings.activePage='lang'"
+              :class="{ active: settings.activePage==='lang' }">
             <span class="settings-menu-icon"><svg><use href="#i-globe"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='provider'">
+          <li class="settings-menu-item" @click="settings.activePage='provider'"
+              :class="{ active: settings.activePage==='provider' }">
             <span class="settings-menu-icon"><svg><use href="#i-key"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='appearance'">
+          <li class="settings-menu-item" @click="settings.activePage='appearance'"
+              :class="{ active: settings.activePage==='appearance' }">
             <span class="settings-menu-icon"><svg><use href="#i-palette"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.appearance')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='notification'">
+          <li class="settings-menu-item" @click="settings.activePage='notification'"
+              :class="{ active: settings.activePage==='notification' }">
             <span class="settings-menu-icon"><svg><use href="#i-bell"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='defaults'">
+          <li class="settings-menu-item" @click="settings.activePage='defaults'"
+              :class="{ active: settings.activePage==='defaults' }">
             <span class="settings-menu-icon"><svg><use href="#i-cog"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='skills'">
+          <li class="settings-menu-item" @click="settings.activePage='skills'"
+              :class="{ active: settings.activePage==='skills' }">
             <span class="settings-menu-icon"><svg><use href="#i-puzzle"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='mcp'">
+          <li class="settings-menu-item" @click="settings.activePage='mcp'"
+              :class="{ active: settings.activePage==='mcp' }">
             <span class="settings-menu-icon"><svg><use href="#i-plug"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.mcp')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='versions'">
+          <li class="settings-menu-item" @click="settings.activePage='versions'"
+              :class="{ active: settings.activePage==='versions' }">
             <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
           <li class="settings-menu-item"
-              @click="settings.activePage='cost'; loadCostDashboard();">
+              @click="settings.activePage='cost'; loadCostDashboard();"
+              :class="{ active: settings.activePage==='cost' }">
             <span class="settings-menu-icon"><svg><use href="#i-dollar"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.cost')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
         </ul>
 
+        <!-- Content pane: holds the back button (mobile) + every section.
+             On desktop this is the right-hand flex column; only the section
+             whose data-page === activePage is shown. -->
+        <div class="settings-content">
         <!-- Mobile-only back button — shown on detail pages. -->
         <button class="settings-back"
                 x-show="!isWideScreen && settings.activePage"
@@ -2658,7 +2710,7 @@
         </button>
 
         <div class="settings-section" data-page="lang"
-             x-show="isWideScreen || settings.activePage === 'lang'">
+             x-show="settings.activePage === 'lang'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.lang')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -2673,7 +2725,7 @@
         </div>
 
         <div class="settings-section" data-page="provider"
-             x-show="isWideScreen || settings.activePage === 'provider'">
+             x-show="settings.activePage === 'provider'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.provider')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -2799,6 +2851,34 @@
                     <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
                     <span x-text="settings.probeResults[p.probe_model]?.text"></span>
                   </div>
+
+                  <!-- Claude model list — the one editable knob on the
+                       otherwise special-auth Anthropic row. Auth (above)
+                       stays OAuth/key; this just curates the picker list. -->
+                  <label x-show="p.models_editable" style="grid-column:1;align-self:center"
+                         x-text="lang==='zh' ? 'Claude 模型' : 'Claude models'"></label>
+                  <div x-show="p.models_editable" class="settings-input-wrap" style="grid-column:2;margin-top:0">
+                    <button class="btn-ghost sm" @click="toggleAnthropicModels(p)"
+                            x-text="settings.providerDrafts[p.id]?.open ? t('btn.cancel') : (lang==='zh' ? '编辑模型列表' : 'Edit models')"></button>
+                    <span x-show="p.is_overridden" class="provider-meta-tag edited"
+                          x-text="lang==='zh' ? '已改' : 'edited'"></span>
+                  </div>
+                  <div x-show="p.models_editable && settings.providerDrafts[p.id]?.open" class="provider-editor">
+                    <div class="settings-row">
+                      <label x-text="t('set.prov.models')"></label>
+                      <textarea class="settings-input mono" rows="4"
+                                x-model="settings.providerDrafts[p.id].models"
+                                :placeholder="t('set.prov.models_ph')"></textarea>
+                    </div>
+                    <div class="settings-hint"
+                         x-text="lang==='zh' ? '每行一个 Claude 模型 id（如 claude-opus-4-8）。认证沿用上方的 OAuth / API key，端点固定为 Anthropic。' : 'One Claude model id per line (e.g. claude-opus-4-8). Auth uses the OAuth / API key above; endpoint is fixed to Anthropic.'"></div>
+                    <div class="settings-row provider-editor-actions">
+                      <button class="btn-primary sm" @click="saveAnthropicModels(p)" x-text="t('btn.save')"></button>
+                      <button class="btn-ghost sm" @click="toggleAnthropicModels(p)" x-text="t('btn.cancel')"></button>
+                      <button x-show="p.is_overridden" class="btn-ghost sm"
+                              @click="restoreProvider(p)" x-text="t('set.prov.restore')"></button>
+                    </div>
+                  </div>
                 </div>
               </template>
 
@@ -2807,8 +2887,6 @@
                 <div>
                   <label>
                     <span x-text="localizeProviderDisplay(p.display)"></span>
-                    <span class="provider-meta-tag mono" x-text="p.prefix"></span>
-                    <span class="provider-meta-tag" x-text="(p.models?.length || 0) + (lang==='zh' ? ' 个模型' : ' models')"></span>
                     <span x-show="p.is_builtin && p.is_overridden" class="provider-meta-tag edited"
                           x-text="lang==='zh' ? '已改' : 'edited'"></span>
                     <span x-show="!p.is_builtin" class="provider-meta-tag custom"
@@ -2915,10 +2993,18 @@
         </div>
 
         <div class="settings-section" data-page="appearance"
-             x-show="isWideScreen || settings.activePage === 'appearance'">
+             x-show="settings.activePage === 'appearance'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.appearance')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+          </div>
+          <div class="settings-row">
+            <label x-text="t('set.label.theme')"></label>
+            <div class="theme-picker">
+              <button class="btn-ghost" :class="{active: theme==='light'}" @click="setTheme('light')" x-text="t('set.theme.light')"></button>
+              <button class="btn-ghost" :class="{active: theme==='dark'}" @click="setTheme('dark')" x-text="t('set.theme.dark')"></button>
+              <button class="btn-ghost" :class="{active: theme==='eyecare'}" @click="setTheme('eyecare')" x-text="t('set.theme.eyecare')"></button>
+            </div>
           </div>
           <div class="settings-row">
             <label x-text="t('set.label.accent')"></label>
@@ -2938,7 +3024,7 @@
 
         <!-- Versions + upgrade — shows current vs latest SDK / CLI, one-click bump. -->
         <div class="settings-section" data-page="versions"
-             x-show="isWideScreen || settings.activePage === 'versions'">
+             x-show="settings.activePage === 'versions'">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
             <button class="btn-ghost sm" @click="loadVersions()"
@@ -3091,7 +3177,7 @@
              section (loadCostDashboard called on menu click + on first
              desktop open via openSettings). -->
         <div class="settings-section" data-page="cost"
-             x-show="isWideScreen || settings.activePage === 'cost'">
+             x-show="settings.activePage === 'cost'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.cost')"></span>
             <button class="btn-ghost sm" @click="loadCostDashboard(true)"
@@ -3198,7 +3284,7 @@
         </div>
 
         <div class="settings-section" data-page="defaults"
-             x-show="isWideScreen || settings.activePage === 'defaults'">
+             x-show="settings.activePage === 'defaults'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.defaults')"></span>
             <span class="settings-save-mode batch" x-text="t('set.mode.batch')"></span>
@@ -3236,7 +3322,7 @@
              notified while actively at a device — no per-class server-
              side mute needed. -->
         <div class="settings-section" data-page="notification"
-             x-show="isWideScreen || settings.activePage === 'notification'">
+             x-show="settings.activePage === 'notification'">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
             <span class="settings-save-mode instant" x-text="t('set.mode.instant')"></span>
@@ -3256,7 +3342,7 @@
         </div>
 
         <div class="settings-section" data-page="skills"
-             x-show="isWideScreen || settings.activePage === 'skills'">
+             x-show="settings.activePage === 'skills'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.skills')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -3301,7 +3387,7 @@
         </div>
 
         <div class="settings-section" data-page="mcp"
-             x-show="isWideScreen || settings.activePage === 'mcp'">
+             x-show="settings.activePage === 'mcp'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.mcp')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
@@ -3371,6 +3457,7 @@
             </div>
           </div>
         </div>
+        </div><!-- /.settings-content -->
 
       </div>
       <div class="modal-foot">
@@ -3645,11 +3732,12 @@
       <div class="modal-body">
         <div x-text="modal.body"></div>
         <input x-show="modal.input !== null" x-model="modal.input"
+               :placeholder="modal.placeholder || ''"
                x-ref="modalInput" @keydown.enter="modal.confirm?.()" />
       </div>
       <div class="modal-foot">
-        <button @click="modal.cancel && modal.cancel()" class="btn-ghost" x-text="modal.cancelText || '取消'"></button>
-        <button @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || '确认'"></button>
+        <button @click="modal.cancel && modal.cancel()" class="btn-ghost" x-text="modal.cancelText || t('btn.cancel')"></button>
+        <button @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || t('btn.confirm')"></button>
       </div>
     </div>
   </div>
@@ -3947,7 +4035,8 @@
                   <div class="sched-row-meta">
                     <span x-show="t.last_run"
                           x-text="(lang==='zh' ? '上次: ' : 'last: ') + fmtSchedTime(t.last_run)"></span>
-                    <span x-show="t.next_run && t.enabled"
+                    <span x-show="t.next_run"
+                          :class="{ 'sched-time-muted': !t.enabled }"
                           x-text="(lang==='zh' ? '下次: ' : 'next: ') + fmtSchedTime(t.next_run)"></span>
                   </div>
                 </div>
@@ -4085,16 +4174,18 @@
        Save flow: canvas.toBlob → new File → swap entry.file → re-upload via
        the same /api/chat/upload-image endpoint the original used.
        Cancel just closes; no destructive ops on the original chip. -->
-  <!-- Cmd/Ctrl+Z bound on the backdrop (x-show keeps the element in DOM
-       so the listener exists only while the editor is open). `.prevent`
-       stops Safari's swipe-back gesture on iPad with magic keyboard.
-       Shift+Cmd/Ctrl+Z reserved for future redo — currently no-op since
-       redo isn't surfaced yet. -->
+  <!-- Cmd/Ctrl+Z bound on the backdrop. NOTE: x-show keeps the element in
+       the DOM even when the editor is closed, so this window listener is
+       ALWAYS attached. We must NOT use Alpine's `.prevent` modifier here —
+       it calls preventDefault() unconditionally (before the expression),
+       which would swallow Cmd/Ctrl+Z everywhere and break the chat
+       textarea's native undo. Instead we preventDefault() inside the
+       handler only while the editor is actually open. -->
   <div class="img-editor-backdrop" x-show="imageEditor.show"
        x-transition.opacity.duration.120ms
        @keydown.escape.window="closeImageEditor(false)"
-       @keydown.window.ctrl.z.prevent="imageEditor.show && !imageEditor._drawing && undoImageEdit()"
-       @keydown.window.meta.z.prevent="imageEditor.show && !imageEditor._drawing && undoImageEdit()"
+       @keydown.window.ctrl.z="if (imageEditor.show) { $event.preventDefault(); if (!imageEditor._drawing) undoImageEdit(); }"
+       @keydown.window.meta.z="if (imageEditor.show) { $event.preventDefault(); if (!imageEditor._drawing) undoImageEdit(); }"
        @click.self="closeImageEditor(false)">
     <div class="img-editor" @click.stop>
       <div class="img-editor-head">

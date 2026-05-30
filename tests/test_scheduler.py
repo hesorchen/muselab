@@ -297,3 +297,174 @@ def test_api_task_history_404_for_unknown_task(client, auth, app_module):
     r = client.get("/api/scheduler/tasks/never-existed/history",
                    headers=auth)
     assert r.status_code == 404
+
+
+# ---- _compute_next_run: schedule math ----------------------------------
+# Every case injects a fixed `ref_ts` (the function's test seam) so the
+# assertions are deterministic regardless of when the suite runs. Exact
+# epoch checks for the deterministic kinds (daily / once); property checks
+# (weekday-in-set, hour==slot, soonest within window) for weekly/monthly so
+# we don't reimplement the SUT's calendar walk in the assertion.
+
+import pytest  # noqa: E402  (kept local to this section's needs)
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+# UTC+8, the same offset the rest of this file passes as tz_offset_minutes=480.
+_BJ = timezone(timedelta(minutes=480))
+
+
+def _bj(y, mo, d, h, mi):
+    return datetime(y, mo, d, h, mi, tzinfo=_BJ)
+
+
+@pytest.mark.parametrize("ref, expected", [
+    # well before today's 09:00 → fires today 09:00
+    (_bj(2026, 3, 10, 8, 0), _bj(2026, 3, 10, 9, 0)),
+    # exactly 09:00 → the strictly-after rule pushes to tomorrow
+    (_bj(2026, 3, 10, 9, 0), _bj(2026, 3, 11, 9, 0)),
+    # past today's slot → tomorrow 09:00
+    (_bj(2026, 3, 10, 9, 30), _bj(2026, 3, 11, 9, 0)),
+])
+def test_compute_next_run_daily_single(app_module, ref, expected):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "daily", "hour": 9, "minute": 0, "tz_offset_minutes": 480}
+    got = sched._compute_next_run(sch, ref_ts=ref.timestamp())
+    assert got == pytest.approx(expected.timestamp())
+
+
+@pytest.mark.parametrize("ref, expected", [
+    (_bj(2026, 3, 10, 7, 0), _bj(2026, 3, 10, 8, 0)),    # before first slot
+    (_bj(2026, 3, 10, 15, 0), _bj(2026, 3, 10, 22, 0)),  # mid-day → later slot today
+    (_bj(2026, 3, 10, 23, 0), _bj(2026, 3, 11, 8, 0)),   # after last → tomorrow's first
+])
+def test_compute_next_run_daily_multi_time(app_module, ref, expected):
+    """schedule['times'] non-empty → fire at EACH slot per day; the next fire
+    can still be later TODAY even if the first slot already passed."""
+    sched = _sched_mod(app_module)
+    sch = {"kind": "daily", "hour": 0, "minute": 0, "tz_offset_minutes": 480,
+           "times": [{"hour": 8, "minute": 0}, {"hour": 14, "minute": 0},
+                     {"hour": 22, "minute": 0}]}
+    got = sched._compute_next_run(sch, ref_ts=ref.timestamp())
+    assert got == pytest.approx(expected.timestamp())
+
+
+def test_compute_next_run_weekly_picks_soonest_listed_day(app_module):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "weekly", "weekdays": [0, 3], "hour": 9, "minute": 0,
+           "tz_offset_minutes": 480}   # Mon & Thu at 09:00
+    ref = _bj(2026, 3, 10, 12, 0)
+    res = datetime.fromtimestamp(
+        sched._compute_next_run(sch, ref_ts=ref.timestamp()), tz=_BJ)
+    assert res.weekday() in (0, 3)
+    assert (res.hour, res.minute) == (9, 0)
+    assert res > ref
+    assert (res - ref) <= timedelta(days=7)
+
+
+def test_compute_next_run_weekly_empty_returns_none(app_module):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "weekly", "weekdays": [], "hour": 9, "minute": 0,
+           "tz_offset_minutes": 480}
+    assert sched._compute_next_run(
+        sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp()) is None
+
+
+def test_compute_next_run_monthly_same_month(app_module):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "monthly", "day": 15, "hour": 9, "minute": 0,
+           "tz_offset_minutes": 480}
+    got = datetime.fromtimestamp(
+        sched._compute_next_run(sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp()),
+        tz=_BJ)
+    assert (got.year, got.month, got.day, got.hour) == (2026, 3, 15, 9)
+
+
+def test_compute_next_run_monthly_rolls_to_next_month(app_module):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "monthly", "day": 5, "hour": 9, "minute": 0,
+           "tz_offset_minutes": 480}
+    # Day 5 already passed in March → next valid fire is April 5.
+    got = datetime.fromtimestamp(
+        sched._compute_next_run(sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp()),
+        tz=_BJ)
+    assert (got.month, got.day) == (4, 5)
+
+
+@pytest.mark.parametrize("ref_year, exp_day", [
+    (2027, 28),   # non-leap → Feb caps at 28
+    (2028, 29),   # leap     → Feb 29 exists
+])
+def test_compute_next_run_monthly_day31_feb_fallback(app_module, ref_year, exp_day):
+    """day=31 in February falls back to that month's last valid day."""
+    sched = _sched_mod(app_module)
+    sch = {"kind": "monthly", "day": 31, "hour": 9, "minute": 0,
+           "tz_offset_minutes": 480}
+    got = datetime.fromtimestamp(
+        sched._compute_next_run(
+            sch, ref_ts=_bj(ref_year, 2, 1, 8, 0).timestamp()),
+        tz=_BJ)
+    assert (got.month, got.day) == (2, exp_day)
+
+
+def test_compute_next_run_once_future(app_module):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "once", "year": 2026, "month": 12, "day": 25,
+           "hour": 9, "minute": 0, "tz_offset_minutes": 480}
+    got = sched._compute_next_run(
+        sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp())
+    assert got == pytest.approx(_bj(2026, 12, 25, 9, 0).timestamp())
+
+
+def test_compute_next_run_once_past_returns_none(app_module):
+    """A `once` whose datetime is already behind ref returns None so the
+    loop stops retrying it."""
+    sched = _sched_mod(app_module)
+    sch = {"kind": "once", "year": 2020, "month": 1, "day": 1,
+           "hour": 9, "minute": 0, "tz_offset_minutes": 480}
+    assert sched._compute_next_run(
+        sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp()) is None
+
+
+@pytest.mark.parametrize("h, m", [(24, 0), (-1, 0), (0, 60), (9, -1)])
+def test_compute_next_run_invalid_time_returns_none(app_module, h, m):
+    sched = _sched_mod(app_module)
+    sch = {"kind": "daily", "hour": h, "minute": m, "tz_offset_minutes": 480}
+    assert sched._compute_next_run(
+        sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp()) is None
+
+
+def test_compute_next_run_unknown_kind_returns_none(app_module):
+    sched = _sched_mod(app_module)
+    assert sched._compute_next_run(
+        {"kind": "hourly", "hour": 9, "minute": 0,
+         "tz_offset_minutes": 480}) is None
+
+
+def test_compute_next_run_dst_keeps_wall_clock_iana(app_module):
+    """IANA tz: a 09:00 daily fires at 09:00 LOCAL on both sides of the US
+    spring-forward, instead of drifting by the DST hour."""
+    from zoneinfo import ZoneInfo
+    sched = _sched_mod(app_module)
+    ny = ZoneInfo("America/New_York")
+    sch = {"kind": "daily", "hour": 9, "minute": 0, "tz": "America/New_York"}
+    # US DST 2026 begins Sun 2026-03-08. Ref the day before (EST, UTC-5).
+    ref = datetime(2026, 3, 7, 8, 0, tzinfo=ny)
+    got = datetime.fromtimestamp(
+        sched._compute_next_run(sch, ref_ts=ref.timestamp()), tz=ny)
+    assert (got.month, got.day, got.hour, got.minute) == (3, 7, 9, 0)
+    # Ref after spring-forward (EDT, UTC-4): still 09:00 wall-clock.
+    ref2 = datetime(2026, 3, 9, 8, 0, tzinfo=ny)
+    got2 = datetime.fromtimestamp(
+        sched._compute_next_run(sch, ref_ts=ref2.timestamp()), tz=ny)
+    assert (got2.month, got2.day, got2.hour, got2.minute) == (3, 9, 9, 0)
+
+
+def test_compute_next_run_unknown_iana_falls_back_to_offset(app_module):
+    """A garbage IANA name falls through to tz_offset_minutes (legacy), not
+    a crash."""
+    sched = _sched_mod(app_module)
+    sch = {"kind": "daily", "hour": 9, "minute": 0,
+           "tz": "Mars/Olympus", "tz_offset_minutes": 480}
+    got = sched._compute_next_run(
+        sch, ref_ts=_bj(2026, 3, 10, 8, 0).timestamp())
+    assert got == pytest.approx(_bj(2026, 3, 10, 9, 0).timestamp())

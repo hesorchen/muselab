@@ -18,11 +18,15 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from .settings import ROOT, atomic_write_text, is_chinese_locale
 
@@ -41,6 +45,49 @@ def _server_tz_offset_minutes() -> int:
     off = datetime.now().astimezone().utcoffset()
     return int(off.total_seconds() / 60) if off else 0
 
+
+def _resolve_tz(schedule: dict) -> Any:
+    """Resolve a schedule's timezone to a tzinfo.
+
+    Priority:
+      1. schedule["tz"] — IANA name (e.g. "America/New_York"), supplied by
+         the browser via `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+         Resolved with ZoneInfo so the fire time tracks DST: a task set for
+         09:00 local keeps firing at 09:00 wall-clock across spring-forward /
+         fall-back, instead of drifting by an hour.
+      2. schedule["tz_offset_minutes"] — fixed UTC offset (east-positive).
+         Legacy field for tasks created before `tz` existed; NOT DST-aware,
+         but preserves the exact pre-upgrade behavior so nobody's windows
+         shift on the day they upgrade.
+      3. server-local TZ — last resort when neither field is usable.
+    """
+    name = schedule.get("tz")
+    if name:
+        try:
+            return ZoneInfo(str(name))
+        except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
+            sys.stderr.write(
+                f"[scheduler] unknown IANA tz {name!r}; "
+                f"falling back to tz_offset_minutes\n")
+    # Fixed-offset fallback (east-positive minutes; Beijing=+480, NYC=-240).
+    tz_off = schedule.get("tz_offset_minutes")
+    if tz_off is None:
+        tz_off = _server_tz_offset_minutes()
+    try:
+        tz_off = int(tz_off)
+    except (ValueError, TypeError):
+        tz_off = _server_tz_offset_minutes()
+    # API pydantic limits to [-1440, 1440] but a hand-edited scheduler.json
+    # can persist anything. Real-world TZ range is [-720 (UTC-12),
+    # +840 (UTC+14)]; values past that produce OverflowError in
+    # fromtimestamp on some platforms and crash the whole tick. Clamp + log.
+    if not (-720 <= tz_off <= 840):
+        sys.stderr.write(
+            f"[scheduler] tz_offset_minutes={tz_off} out of range "
+            f"[-720, 840]; using server-local instead\n")
+        tz_off = _server_tz_offset_minutes()
+    return timezone(timedelta(minutes=tz_off))
+
 # Lazy import target — set at module load
 _STATE_FILE: Path | None = (ROOT / ".muselab" / "scheduler.json") if ROOT else None
 
@@ -51,6 +98,30 @@ _state: dict[str, Any] = {
 }
 
 _scheduler_task: asyncio.Task | None = None
+# Strong references to fire-and-forget execution tasks (tick-loop fires,
+# run-now clicks, startup catch-up). asyncio holds only a weak reference to
+# a task, so a bare `create_task(...)` whose handle goes out of scope can be
+# garbage-collected mid-run, silently cancelling a scheduled run. Each task
+# is added here and removed by its done-callback so the set stays bounded.
+_RUN_TASKS: set[asyncio.Task] = set()
+
+
+def _track_task(t: asyncio.Task) -> asyncio.Task:
+    """Hold a strong ref to a fire-and-forget task until it completes."""
+    _RUN_TASKS.add(t)
+    t.add_done_callback(_RUN_TASKS.discard)
+    return t
+# Serializes every read/write of the module-global _state. The scheduler
+# loop + _execute_task run on the event-loop thread, but the CRUD endpoints
+# in api_scheduler.py are plain `def` handlers → FastAPI runs them in its
+# threadpool. So `ack_unread()` (=0) can race `_execute_task`'s
+# `unread_count += 1`, and a create/delete that restructures `_state["tasks"]`
+# can race `_save_state()`'s `json.dumps(_state)` → "dictionary changed size
+# during iteration". This coarse lock guards both the compound mutations and
+# the serialization snapshot. RULE: never call _save_state() (or iterate a
+# _state collection) without holding it; _save_state itself stays lock-free so
+# lock-holders don't deadlock (threading.Lock is non-reentrant).
+_STATE_LOCK = threading.Lock()
 # Per-task execution lock. Prevents the same scheduled task from running
 # twice concurrently — e.g. user clicks "run now" while the scheduler
 # loop also fires it, or a long-running task overlaps its own next tick.
@@ -135,29 +206,9 @@ def _compute_next_run(schedule: dict, ref_ts: float | None = None) -> float | No
         return None
     if not (0 <= h <= 23 and 0 <= m <= 59):
         return None
-    # Resolve target TZ. tz_offset_minutes is east-positive minutes (Beijing
-    # = +480, NYC = -240); 0 is UTC. When the field is missing on a legacy
-    # schedule, mirror the previous behavior (server-local, via
-    # _server_tz_offset_minutes()) so existing users don't see fire times
-    # silently shift.
-    tz_off = schedule.get("tz_offset_minutes")
-    if tz_off is None:
-        tz_off = _server_tz_offset_minutes()
-    try:
-        tz_off = int(tz_off)
-    except (ValueError, TypeError):
-        tz_off = _server_tz_offset_minutes()
-    # API layer pydantic limits to [-1440, 1440] but a hand-edited
-    # scheduler.json can persist anything. Real-world TZ range is
-    # [-720 (UTC-12), +840 (UTC+14)]; values past that produce
-    # OverflowError in fromtimestamp on some platforms and crash the
-    # whole scheduler tick. Clamp + log silently.
-    if not (-720 <= tz_off <= 840):
-        sys.stderr.write(
-            f"[scheduler] tz_offset_minutes={tz_off} out of range "
-            f"[-720, 840]; using server-local instead\n")
-        tz_off = _server_tz_offset_minutes()
-    tz = timezone(timedelta(minutes=tz_off))
+    # Resolve target TZ — prefer the DST-aware IANA name, fall back to the
+    # fixed offset (legacy) then server-local. See _resolve_tz().
+    tz = _resolve_tz(schedule)
     base = datetime.fromtimestamp(
         ref_ts if ref_ts is not None else time.time(), tz=tz)
 
@@ -259,14 +310,16 @@ def _month_max_day(year: int, month: int) -> int:
 # ---------- public CRUD ----------
 
 def list_tasks() -> list[dict]:
-    return sorted(
-        _state["tasks"].values(),
-        key=lambda t: (not t.get("enabled", True), t.get("created_at", 0)),
-    )
+    with _STATE_LOCK:
+        return sorted(
+            _state["tasks"].values(),
+            key=lambda t: (not t.get("enabled", True), t.get("created_at", 0)),
+        )
 
 
 def get_task(tid: str) -> dict | None:
-    return _state["tasks"].get(tid)
+    with _STATE_LOCK:
+        return _state["tasks"].get(tid)
 
 
 def create_task(name: str, prompt: str, schedule: dict,
@@ -321,72 +374,74 @@ def create_task(name: str, prompt: str, schedule: dict,
         "next_run": next_run,
         "created_at": time.time(),
     }
-    _state["tasks"][tid] = task
-    _save_state()
+    with _STATE_LOCK:
+        _state["tasks"][tid] = task
+        _save_state()
     return task
 
 
 def update_task(tid: str, **changes: Any) -> dict | None:
-    t = _state["tasks"].get(tid)
-    if not t:
-        return None
-    # Capture the old name BEFORE applying the change — used to detect a
-    # rename so we can keep the bound session's name in sync. Without
-    # this the history picker kept showing the old `[定时] xxx` label
-    # while the scheduler list showed the new task name.
-    old_name = t.get("name")
-    for k in ("name", "prompt", "model"):
-        if k in changes and changes[k] is not None:
-            t[k] = str(changes[k])
-    if "enabled" in changes and changes["enabled"] is not None:
-        t["enabled"] = bool(changes["enabled"])
-    if "schedule" in changes and changes["schedule"] is not None:
-        t["schedule"] = changes["schedule"]
-        t["next_run"] = _compute_next_run(t["schedule"])
-    if "session_mode" in changes and changes["session_mode"] is not None:
-        new_mode = changes["session_mode"]
-        if new_mode not in ("reuse", "fresh"):
-            raise ValueError(
-                f"session_mode must be 'reuse' or 'fresh', got {new_mode!r}")
-        old_mode = _effective_session_mode(t)
-        t["session_mode"] = new_mode
-        # Transitioning fresh → reuse: future runs need a bound session
-        # to append to. The most-recent fresh run's session (if any) is
-        # a reasonable seed — Muse already has its prior reply in there.
-        # If no run yet (session_id empty), create one now so the next
-        # run has somewhere to land.
-        if old_mode == "fresh" and new_mode == "reuse" and not t.get("session_id"):
+    with _STATE_LOCK:
+        t = _state["tasks"].get(tid)
+        if not t:
+            return None
+        # Capture the old name BEFORE applying the change — used to detect a
+        # rename so we can keep the bound session's name in sync. Without
+        # this the history picker kept showing the old `[定时] xxx` label
+        # while the scheduler list showed the new task name.
+        old_name = t.get("name")
+        for k in ("name", "prompt", "model"):
+            if k in changes and changes[k] is not None:
+                t[k] = str(changes[k])
+        if "enabled" in changes and changes["enabled"] is not None:
+            t["enabled"] = bool(changes["enabled"])
+        if "schedule" in changes and changes["schedule"] is not None:
+            t["schedule"] = changes["schedule"]
+            t["next_run"] = _compute_next_run(t["schedule"])
+        if "session_mode" in changes and changes["session_mode"] is not None:
+            new_mode = changes["session_mode"]
+            if new_mode not in ("reuse", "fresh"):
+                raise ValueError(
+                    f"session_mode must be 'reuse' or 'fresh', got {new_mode!r}")
+            old_mode = _effective_session_mode(t)
+            t["session_mode"] = new_mode
+            # Transitioning fresh → reuse: future runs need a bound session
+            # to append to. The most-recent fresh run's session (if any) is
+            # a reasonable seed — Muse already has its prior reply in there.
+            # If no run yet (session_id empty), create one now so the next
+            # run has somewhere to land.
+            if old_mode == "fresh" and new_mode == "reuse" and not t.get("session_id"):
+                try:
+                    from . import sessions as sess
+                    sess_meta = sess.create_session(
+                        name=f"{_scheduled_label_prefix()}{t.get('name', '')}",
+                        model=t.get("model", ""))
+                    t["session_id"] = sess_meta["id"]
+                except Exception as e:
+                    sys.stderr.write(
+                        f"[scheduler] update_task({tid}): seed session for "
+                        f"reuse mode failed: {e}\n")
+            # reuse → fresh: keep the existing session_id around (becomes the
+            # "most recent run" pointer); future runs will spin up new ones.
+            # The old bound session is NOT deleted — it has the user's prior
+            # conversation in it and may be wanted as history.
+        # Sync bound session name if the task was renamed — only meaningful
+        # for reuse mode (fresh mode's session_id points at a timestamped
+        # historical run, renaming it to a generic name would lose info).
+        new_name = t.get("name")
+        sid = t.get("session_id")
+        if (sid and new_name and new_name != old_name
+                and _effective_session_mode(t) == "reuse"):
             try:
                 from . import sessions as sess
-                sess_meta = sess.create_session(
-                    name=f"{_scheduled_label_prefix()}{t.get('name', '')}",
-                    model=t.get("model", ""))
-                t["session_id"] = sess_meta["id"]
+                sess.rename_session(
+                    sid, f"{_scheduled_label_prefix()}{new_name}")
             except Exception as e:
                 sys.stderr.write(
-                    f"[scheduler] update_task({tid}): seed session for "
-                    f"reuse mode failed: {e}\n")
-        # reuse → fresh: keep the existing session_id around (becomes the
-        # "most recent run" pointer); future runs will spin up new ones.
-        # The old bound session is NOT deleted — it has the user's prior
-        # conversation in it and may be wanted as history.
-    # Sync bound session name if the task was renamed — only meaningful
-    # for reuse mode (fresh mode's session_id points at a timestamped
-    # historical run, renaming it to a generic name would lose info).
-    new_name = t.get("name")
-    sid = t.get("session_id")
-    if (sid and new_name and new_name != old_name
-            and _effective_session_mode(t) == "reuse"):
-        try:
-            from . import sessions as sess
-            sess.rename_session(
-                sid, f"{_scheduled_label_prefix()}{new_name}")
-        except Exception as e:
-            sys.stderr.write(
-                f"[scheduler] update_task({tid}): bound session {sid} "
-                f"rename failed: {e}\n")
-    _save_state()
-    return t
+                    f"[scheduler] update_task({tid}): bound session {sid} "
+                    f"rename failed: {e}\n")
+        _save_state()
+        return t
 
 
 def _effective_session_mode(task: dict) -> str:
@@ -404,7 +459,8 @@ def list_task_history(tid: str, limit: int = 100) -> list[dict]:
 
     No new state — filters _state["history"] in place. The history list
     is already capped at _HISTORY_CAP globally, so this is bounded too."""
-    out = [e for e in _state["history"] if e.get("task_id") == tid]
+    with _STATE_LOCK:
+        out = [e for e in _state["history"] if e.get("task_id") == tid]
     out.sort(key=lambda e: e.get("ts", 0), reverse=True)
     if limit > 0:
         out = out[:limit]
@@ -425,27 +481,29 @@ def delete_task(tid: str) -> bool:
         select and delete in the regular sessions list if they want.
 
     Returns True if the task existed and got removed."""
-    t = _state["tasks"].pop(tid, None)
-    if not t:
-        return False
-    mode = _effective_session_mode(t)
-    sid = t.get("session_id")
-    if mode == "reuse" and sid:
-        try:
-            from . import sessions as sess
-            sess.delete_session(sid)
-        except Exception as e:
-            sys.stderr.write(
-                f"[scheduler] delete_task({tid}): bound session {sid} "
-                f"cleanup failed: {e}\n")
-    _save_state()
-    return True
+    with _STATE_LOCK:
+        t = _state["tasks"].pop(tid, None)
+        if not t:
+            return False
+        mode = _effective_session_mode(t)
+        sid = t.get("session_id")
+        if mode == "reuse" and sid:
+            try:
+                from . import sessions as sess
+                sess.delete_session(sid)
+            except Exception as e:
+                sys.stderr.write(
+                    f"[scheduler] delete_task({tid}): bound session {sid} "
+                    f"cleanup failed: {e}\n")
+        _save_state()
+        return True
 
 
 def list_history(limit: int = 50) -> list[dict]:
     """Most-recent first, capped at `limit`."""
-    h = _state.get("history", [])
-    return h[-limit:][::-1]
+    with _STATE_LOCK:
+        h = _state.get("history", [])
+        return h[-limit:][::-1]
 
 
 def delete_history_entry(ts: float, task_id: str = "") -> bool:
@@ -460,12 +518,13 @@ def delete_history_entry(ts: float, task_id: str = "") -> bool:
     history may have been pruned by _HISTORY_CAP between display and
     click).
     """
-    h = _state.get("history", [])
-    for i, entry in enumerate(h):
-        if entry.get("ts") == ts and (not task_id or entry.get("task_id") == task_id):
-            h.pop(i)
-            _save_state()
-            return True
+    with _STATE_LOCK:
+        h = _state.get("history", [])
+        for i, entry in enumerate(h):
+            if entry.get("ts") == ts and (not task_id or entry.get("task_id") == task_id):
+                h.pop(i)
+                _save_state()
+                return True
     return False
 
 
@@ -476,19 +535,22 @@ def clear_history() -> int:
     runs that arrived after their last drawer-open). If you want both
     cleared, also call ack_unread() at the call site.
     """
-    n = len(_state.get("history", []))
-    _state["history"] = []
-    _save_state()
+    with _STATE_LOCK:
+        n = len(_state.get("history", []))
+        _state["history"] = []
+        _save_state()
     return n
 
 
 def get_unread() -> int:
-    return _state.get("unread_count", 0)
+    with _STATE_LOCK:
+        return _state.get("unread_count", 0)
 
 
 def ack_unread() -> int:
-    _state["unread_count"] = 0
-    _save_state()
+    with _STATE_LOCK:
+        _state["unread_count"] = 0
+        _save_state()
     return 0
 
 
@@ -501,10 +563,12 @@ async def run_task_now(tid: str) -> bool:
 
     Useful as a "retry" affordance after a failure, and as a smoke test
     after editing a task without having to wait for the next fire window."""
-    task = _state["tasks"].get(tid)
+    with _STATE_LOCK:
+        task = _state["tasks"].get(tid)
     if not task:
         return False
-    asyncio.create_task(_execute_task(task))
+    t = _track_task(asyncio.create_task(_execute_task(task)))
+    t.add_done_callback(_make_task_done(tid))
     return True
 
 
@@ -546,8 +610,9 @@ async def _execute_task(task: dict) -> None:
                     name=f"{_scheduled_label_prefix()}{task['name']} · {ts_label}",
                     model=task.get("model", ""))
                 sid = sess_meta["id"]
-                task["session_id"] = sid   # "most recent run" pointer
-                _save_state()
+                with _STATE_LOCK:
+                    task["session_id"] = sid   # "most recent run" pointer
+                    _save_state()
             except Exception as e:
                 # If session minting itself fails (disk full, etc.), record
                 # the failure as a history entry rather than crashing the
@@ -556,17 +621,18 @@ async def _execute_task(task: dict) -> None:
                     f"[scheduler] task {tid} fresh-session mint failed: "
                     f"{type(e).__name__}: {e}\n")
                 now = time.time()
-                _state["history"].append({
-                    "task_id": tid,
-                    "task_name": task["name"],
-                    "session_id": "",
-                    "ts": now,
-                    "ok": False,
-                    "error": f"session mint failed: {type(e).__name__}: {e}",
-                    "reply_preview": None,
-                })
-                _state["unread_count"] = _state.get("unread_count", 0) + 1
-                _save_state()
+                with _STATE_LOCK:
+                    _state["history"].append({
+                        "task_id": tid,
+                        "task_name": task["name"],
+                        "session_id": "",
+                        "ts": now,
+                        "ok": False,
+                        "error": f"session mint failed: {type(e).__name__}: {e}",
+                        "reply_preview": None,
+                    })
+                    _state["unread_count"] = _state.get("unread_count", 0) + 1
+                    _save_state()
                 return
         else:
             sid = task["session_id"]
@@ -579,6 +645,22 @@ async def _execute_task(task: dict) -> None:
             # default when task.model is empty.
             from .settings import MODEL as _DEFAULT_MODEL
             model = task.get("model") or _DEFAULT_MODEL
+            # SECURITY — unattended runs use bypassPermissions BY DESIGN.
+            # A scheduled task fires with no human present, so there is no
+            # one to answer a permission prompt; any mode that can block on
+            # can_use_tool would hang the run forever. The cost is that the
+            # agent can run arbitrary Bash (mv / rm / write files) with no
+            # confirmation. The real escalation path is PROMPT INJECTION:
+            # if a scheduled prompt pulls in external content (e.g.
+            # "summarize my latest email / fetch this page"), injected
+            # instructions in that content execute unchecked. Mitigations
+            # already in place: the SDK disallowed_tools blocklist (chat.py)
+            # and the archive-root sandbox. Self-hosters who schedule tasks
+            # that read untrusted external content should keep those prompts
+            # narrow. Do NOT "fix" this by switching to default/acceptEdits
+            # without also giving unattended runs a non-interactive
+            # permission resolver — otherwise scheduled tasks will silently
+            # hang. (See audit E/247.)
             client = await get_client(
                 session_id=sid,
                 model=model,
@@ -591,8 +673,6 @@ async def _execute_task(task: dict) -> None:
             # never matching, which left reply_text empty and made every
             # push notification say "(no reply)". isinstance check is what
             # chat.py uses too — mirror it here.
-            from claude_agent_sdk import (
-                AssistantMessage, ResultMessage, TextBlock)
             await client.query(task["prompt"])
             async for msg in client.receive_response():
                 if isinstance(msg, AssistantMessage):
@@ -622,13 +702,14 @@ async def _execute_task(task: dict) -> None:
                 "error": error,
                 "reply_preview": preview if error is None else None,
             }
-            _state["history"].append(entry)
-            # Successful runs bump unread; errors also bump so the user
-            # notices them — but they show as red in the UI.
-            _state["unread_count"] = _state.get("unread_count", 0) + 1
-            if len(_state["history"]) > _HISTORY_CAP:
-                _state["history"] = _state["history"][-_HISTORY_CAP:]
-            _save_state()
+            with _STATE_LOCK:
+                _state["history"].append(entry)
+                # Successful runs bump unread; errors also bump so the user
+                # notices them — but they show as red in the UI.
+                _state["unread_count"] = _state.get("unread_count", 0) + 1
+                if len(_state["history"]) > _HISTORY_CAP:
+                    _state["history"] = _state["history"][-_HISTORY_CAP:]
+                _save_state()
             # Fire Web Push to every subscribed device — but skip when the
             # user is actively at one of their devices (presence heartbeat
             # within GRACE_SECONDS). In-app the UI already flashes the bell
@@ -674,6 +755,35 @@ async def _execute_task(task: dict) -> None:
 
 # ---------- daemon loop ----------
 
+# Stagger interval for startup catch-up. After an overnight outage, N daily
+# tasks can all be "missed"; firing them simultaneously spawns N CLI
+# subprocesses + N model API calls in the same instant (memory + rate-limit
+# spike). Spacing them out a few seconds apart keeps the catch-up gentle.
+_CATCHUP_STAGGER_S = 5
+
+
+def _make_task_done(tid: str):
+    """Build a done-callback that surfaces an otherwise-swallowed unhandled
+    exception from a fire-and-forget task. Shared by the tick loop and the
+    startup catch-up path so neither runs blind."""
+    def _cb(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception():
+            import traceback
+            exc = t.exception()
+            sys.stderr.write(
+                f"[scheduler] unhandled exception in task {tid}: "
+                f"{traceback.format_exception(type(exc), exc, exc.__traceback__)[-1]}\n"
+            )
+    return _cb
+
+
+async def _delayed_execute(task: dict, delay: float) -> None:
+    """Run _execute_task after `delay` seconds — used to stagger catch-up."""
+    if delay > 0:
+        await asyncio.sleep(delay)
+    await _execute_task(task)
+
+
 async def _scheduler_loop() -> None:
     """Tick every 60 seconds. Any enabled task whose next_run is in the
     past gets fired (concurrently via asyncio.create_task so a slow one
@@ -682,7 +792,9 @@ async def _scheduler_loop() -> None:
     while True:
         try:
             now = time.time()
-            for task in list(_state["tasks"].values()):
+            with _STATE_LOCK:
+                snapshot = list(_state["tasks"].values())
+            for task in snapshot:
                 if not task.get("enabled", True):
                     continue
                 nr = task.get("next_run")
@@ -690,18 +802,11 @@ async def _scheduler_loop() -> None:
                     # Advance next_run optimistically so a long-running
                     # task doesn't fire twice if we tick again before it
                     # finishes.
-                    task["next_run"] = _compute_next_run(task["schedule"])
-                    _save_state()
-                    task_obj = asyncio.create_task(_execute_task(task))
-
-                    def _task_done(t, _tid=task.get("id", "?")):
-                        if not t.cancelled() and t.exception():
-                            import traceback
-                            sys.stderr.write(
-                                f"[scheduler] unhandled exception in task {_tid}: "
-                                f"{traceback.format_exception(type(t.exception()), t.exception(), t.exception().__traceback__)[-1]}\n"
-                            )
-                    task_obj.add_done_callback(_task_done)
+                    with _STATE_LOCK:
+                        task["next_run"] = _compute_next_run(task["schedule"])
+                        _save_state()
+                    task_obj = _track_task(asyncio.create_task(_execute_task(task)))
+                    task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
         except Exception as e:
             sys.stderr.write(f"[scheduler] loop error: {e}\n")
         await asyncio.sleep(60)
@@ -721,7 +826,6 @@ async def start_scheduler() -> None:
     global _scheduler_task
     if _scheduler_task and not _scheduler_task.done():
         return
-    _load_state()
     now = time.time()
     missed: list[dict] = []
     # Cap catch-up window at 24 h. Without this, a task whose next_run
@@ -732,28 +836,35 @@ async def start_scheduler() -> None:
     # generous enough to cover overnight outages while filtering
     # actually-stale entries.
     _CATCHUP_MAX_AGE_S = 24 * 3600
-    for task in _state["tasks"].values():
-        sched = task.get("schedule")
-        if not sched:
-            continue
-        nr = task.get("next_run")
-        # If next_run is in the past AND the task is enabled, the window was
-        # missed while we were down. Disabled tasks just get next_run rolled
-        # forward (no catch-up), matching their "don't fire" intent.
-        if (nr and nr <= now and task.get("enabled", True)
-                and (now - nr) < _CATCHUP_MAX_AGE_S):
-            missed.append(task)
-        elif nr and nr <= now and task.get("enabled", True):
-            sys.stderr.write(
-                f"[scheduler] skipping stale catch-up for task "
-                f"{task.get('id','?')} ({task.get('name','?')}): "
-                f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
-        task["next_run"] = _compute_next_run(sched)
-    _save_state()
-    # Kick off catch-up runs concurrently — same path as scheduler_loop uses.
-    for task in missed:
+    with _STATE_LOCK:
+        _load_state()
+        for task in _state["tasks"].values():
+            sched = task.get("schedule")
+            if not sched:
+                continue
+            nr = task.get("next_run")
+            # If next_run is in the past AND the task is enabled, the window
+            # was missed while we were down. Disabled tasks just get next_run
+            # rolled forward (no catch-up), matching their "don't fire" intent.
+            if (nr and nr <= now and task.get("enabled", True)
+                    and (now - nr) < _CATCHUP_MAX_AGE_S):
+                missed.append(task)
+            elif nr and nr <= now and task.get("enabled", True):
+                sys.stderr.write(
+                    f"[scheduler] skipping stale catch-up for task "
+                    f"{task.get('id','?')} ({task.get('name','?')}): "
+                    f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
+            task["next_run"] = _compute_next_run(sched)
+        _save_state()
+    # Kick off catch-up runs — staggered so an overnight outage with many
+    # daily tasks doesn't spawn every CLI subprocess at once (thundering
+    # herd). Each carries the same done-callback the tick loop uses, so a
+    # catch-up that crashes isn't silently swallowed.
+    for i, task in enumerate(missed):
         sys.stderr.write(
             f"[scheduler] catching up missed window for task "
             f"{task['id']} ({task.get('name','?')})\n")
-        asyncio.create_task(_execute_task(task))
+        t = _track_task(asyncio.create_task(
+            _delayed_execute(task, i * _CATCHUP_STAGGER_S)))
+        t.add_done_callback(_make_task_done(task.get("id", "?")))
     _scheduler_task = asyncio.create_task(_scheduler_loop())

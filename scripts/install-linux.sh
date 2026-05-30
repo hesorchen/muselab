@@ -6,6 +6,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# Pinned external tool versions (claude CLI etc.) — single source shared
+# with install-macos.sh. Keep in lockstep with Dockerfile.
+# shellcheck source=scripts/versions.env
+. "$REPO/scripts/versions.env"
+
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
@@ -142,9 +147,14 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
     if (( INSTALL_NODE )); then
       bold "Installing fnm + Node LTS…"
       # fnm installer touches ~/.bashrc / ~/.zshrc so future shells pick it up.
+      # Supply-chain note: pipes fnm's official upstream installer to bash with
+      # no hash check (their documented method). Trusted over HTTPS; full
+      # pinning is out of scope.
       curl -fsSL https://fnm.vercel.app/install | bash
       # Source for THIS shell so the npm install below works immediately.
-      export PATH="$HOME/.local/share/fnm:$PATH"
+      # fnm's install dir varies by version/XDG config — cover the known
+      # candidates (matching the breadth of the macOS installer).
+      export PATH="${XDG_DATA_HOME:-$HOME/.local/share}/fnm:$HOME/.local/share/fnm:$HOME/.fnm:$PATH"
       if command -v fnm >/dev/null 2>&1; then
         eval "$(fnm env --shell bash)"
         fnm install --lts
@@ -162,8 +172,8 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
     fi
 
     if (( INSTALL_CLAUDE )) && command -v npm >/dev/null 2>&1; then
-      bold "Installing @anthropic-ai/claude-code via npm…"
-      npm install -g @anthropic-ai/claude-code
+      bold "Installing @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION} via npm…"
+      npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}"
       if command -v claude >/dev/null 2>&1; then
         ok "claude CLI: $(command -v claude)"
         NEED_CLAUDE_LOGIN=1
@@ -188,7 +198,7 @@ ok "systemctl present"
 
 # ----- 2. Python deps ----------------------------------------------------
 bold "2/5  Installing Python dependencies / 安装 Python 依赖 (uv sync, may take a few minutes first time)"
-uv sync                              # no --quiet: user wants to see progress
+uv sync --frozen                     # --frozen: install exactly uv.lock (matches Docker); no implicit re-resolve
 ok "deps installed"
 
 # ----- 3. .env -----------------------------------------------------------
@@ -445,9 +455,11 @@ else
 
   # ----- 5. Linger (so service runs even when you're not logged in) --------
   bold "5/5  Enable user lingering / 启用用户级常驻 (so service survives logout / reboot)"
+  LINGER_OK=1
   if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
     ok "linger already enabled for $USER"
   else
+    LINGER_OK=0
     warn "linger NOT enabled — service will stop when you log out / reboot without login"
     warn "  To enable (requires sudo):"
     warn "    sudo loginctl enable-linger $USER"
@@ -457,6 +469,14 @@ fi
 echo
 bold "✓ muselab installed / 安装完成"
 echo  "  Open / 打开:   http://localhost:$PORT"
+# Surface the linger gap in the summary too — VPS users who log out would
+# otherwise see "installed" and assume the service keeps running. It won't.
+if [[ "${LINGER_OK:-1}" == "0" ]]; then
+  echo
+  warn "Heads-up: user lingering is NOT enabled."
+  warn "  On a VPS the service STOPS when you log out / reboot. Enable it with:"
+  warn "    sudo loginctl enable-linger $USER"
+fi
 echo
 # Read token back from .env (works whether we just wrote it or reused existing)
 TOKEN_NOW="$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"

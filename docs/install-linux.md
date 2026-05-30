@@ -17,7 +17,7 @@ systemd service** — no root, no system-wide config, easy to undo.
   claude login
   ```
   Non-Claude providers (DeepSeek / GLM / MiniMax / Kimi / Qwen /
-  Xiaomi MiMo / Baidu ERNIE) only need API keys — paste them in the
+  Xiaomi MiMo / Baidu Qianfan (ERNIE)) only need API keys — paste them in the
   Settings UI after install, no CLI needed.
 
 ## Install

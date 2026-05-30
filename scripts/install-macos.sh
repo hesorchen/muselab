@@ -6,6 +6,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# Pinned external tool versions (claude CLI etc.) — single source shared
+# with install-linux.sh. Keep in lockstep with Dockerfile.
+# shellcheck source=scripts/versions.env
+. "$REPO/scripts/versions.env"
+
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
@@ -152,6 +157,9 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
         brew install node
       else
         bold "Installing fnm + Node LTS (no brew detected)…"
+        # Supply-chain note: pipes fnm's official upstream installer to bash
+        # with no hash check (their documented method). Trusted over HTTPS;
+        # full pinning is out of scope.
         curl -fsSL https://fnm.vercel.app/install | bash
         export PATH="$HOME/Library/Application Support/fnm:$HOME/.local/share/fnm:$PATH"
         if command -v fnm >/dev/null 2>&1; then
@@ -170,8 +178,8 @@ if (( INSTALL_NODE )) || (( INSTALL_CLAUDE )); then
     fi
 
     if (( INSTALL_CLAUDE )) && command -v npm >/dev/null 2>&1; then
-      bold "Installing @anthropic-ai/claude-code via npm…"
-      npm install -g @anthropic-ai/claude-code
+      bold "Installing @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION} via npm…"
+      npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}"
       if command -v claude >/dev/null 2>&1; then
         ok "claude CLI: $(command -v claude)"
         NEED_CLAUDE_LOGIN=1
@@ -190,7 +198,7 @@ fi
 
 # ----- 2. Python deps ----------------------------------------------------
 bold "2/5  Installing Python dependencies / 安装 Python 依赖 (uv sync, may take a few minutes first time)"
-uv sync                              # no --quiet: user wants to see progress
+uv sync --frozen                     # --frozen: install exactly uv.lock (matches Docker); no implicit re-resolve
 ok "deps installed"
 
 # ----- 3. .env -----------------------------------------------------------
@@ -212,7 +220,11 @@ else
       read -r -p "  Token (Enter for random / 回车随机): " TOKEN_INPUT
     fi
     if [[ -z "$TOKEN_INPUT" ]]; then
-      TOKEN="$(openssl rand -hex 32)"
+      if command -v openssl >/dev/null 2>&1; then
+        TOKEN="$(openssl rand -hex 32)"
+      else
+        TOKEN="$(head -c 32 /dev/urandom | xxd -p -c 999)"
+      fi
       ok "auto-generated 64-char random token / 已生成 64 位随机口令"
       break
     elif (( ${#TOKEN_INPUT} < 16 )); then
@@ -251,7 +263,16 @@ else
     HAS_OLD_AGENT=""
     if launchctl list 2>/dev/null | grep -q com.muselab; then HAS_OLD_AGENT=1; fi
 
-    if [[ "$HOLDER_NAME" =~ ^(python|python3|uv)$ ]] && [[ -n "$HAS_OLD_AGENT" ]]; then
+    # Holder-name match is best-effort: macOS reports framework Python as
+    # "Python"/"python3.12" etc., so match case-insensitively by prefix.
+    # But the decisive signal is a loaded com.muselab agent — if that's
+    # present the port holder IS our stale instance regardless of comm name.
+    HOLDER_IS_PY=""
+    shopt -s nocasematch
+    [[ "$HOLDER_NAME" =~ ^(python|uv) ]] && HOLDER_IS_PY=1
+    shopt -u nocasematch
+
+    if [[ -n "$HAS_OLD_AGENT" ]] && { [[ -n "$HOLDER_IS_PY" ]] || [[ -n "$HOLDER_PID" ]]; }; then
       warn "Port $PORT is held by an existing muselab install (PID $HOLDER_PID, $HOLDER_NAME)"
       warn "  端口被已有的 muselab 占着 — 可以一键清理后继续"
       REPLY="$(ask 'Clean it up and continue / 清理后继续? [Y/n]:' 'Y')"
