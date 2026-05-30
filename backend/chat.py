@@ -986,50 +986,98 @@ async def _build_and_connect_client(
 _MCP_PENDING_STATES = {"pending", "connecting", "authenticating", "starting"}
 
 
-def _mcp_states_from_status(status: object) -> list[str]:
-    """Normalise the CLI's mcp_status control response into a flat list of
-    lowercased state strings, tolerating both dict-keyed and list shapes."""
+def _mcp_servers_from_status(status: object) -> list[tuple[str, str]]:
+    """Normalise the CLI's mcp_status control response into a list of
+    (name, lowercased-state) pairs, tolerating every shape we've seen:
+
+      - top-level key is `mcpServers` (current CLI), `servers`, or `mcp_servers`
+      - value is a list of {name, status, …} dicts, OR
+      - value is a dict keyed by server name → {status: …} | "<state>"
+
+    Returning NAMES (not just bare states) is what lets the gate notice when a
+    server set is still GROWING — claude.ai proxy connectors enumerate a beat
+    after the local ones, and a name-less state list can't tell "two servers,
+    both connected" from "the same two servers we saw last poll." Unnamed
+    entries fall back to a positional synthetic key so they still count toward
+    set stability."""
     if not isinstance(status, dict):
         return []
-    servers = status.get("servers")
+    servers = status.get("mcpServers")
+    if servers is None:
+        servers = status.get("servers")
     if servers is None:
         servers = status.get("mcp_servers")
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
+
+    def _emit(name: object, state: object, idx: int) -> None:
+        nm = str(name) if name else f"__idx{idx}"
+        out.append((nm, str(state).lower()))
+
     if isinstance(servers, dict):
-        for v in servers.values():
-            if isinstance(v, dict) and "status" in v:
-                out.append(str(v["status"]).lower())
-            elif isinstance(v, str):
-                out.append(v.lower())
+        for k, v in servers.items():
+            if isinstance(v, dict):
+                _emit(v.get("name", k), v.get("status", ""), len(out))
+            else:
+                _emit(k, v, len(out))
     elif isinstance(servers, list):
-        for v in servers:
-            if isinstance(v, dict) and "status" in v:
-                out.append(str(v["status"]).lower())
+        for i, v in enumerate(servers):
+            if isinstance(v, dict):
+                _emit(v.get("name", f"__idx{i}"), v.get("status", ""), i)
             elif isinstance(v, str):
-                out.append(v.lower())
+                _emit(f"__idx{i}", v, i)
     return out
+
+
+def _mcp_states_from_status(status: object) -> list[str]:
+    """Back-compat shim: just the state strings (drops names). Retained for
+    any caller that only cares about pending-ness."""
+    return [state for _name, state in _mcp_servers_from_status(status)]
 
 
 async def _await_mcp_ready(client: ClaudeSDKClient, *,
                            timeout: float = 30.0, poll: float = 0.25) -> None:
-    """Block until no MCP server is still settling, or until `timeout`.
+    """Block until the MCP tool-set has STABILISED, or until `timeout`.
+
+    "Stabilised" = two consecutive polls return the SAME non-empty set of
+    (name, state) pairs AND none of them is still settling. We require the set
+    to be identical across two polls — not merely "nothing pending right now" —
+    because that older, weaker check is exactly how the wedge bug came back:
+
+      claude.ai proxy connectors (Gmail / Calendar / Drive / IBKR) enumerate a
+      beat AFTER the local stdio servers. At the first poll the status response
+      lists only {gmail, muselab} — neither pending — so the old gate declared
+      "all terminal" and let the turn start. The proxies then connected and
+      registered their tools MID-FIRST-TURN, changing the tool-set the model's
+      in-flight thinking block was signed against → 400 "thinking blocks …
+      cannot be modified". Waiting for the set to stop GROWING closes that race
+      without needing to predict how many connectors will show up.
+
+    `needs-auth` / `failed` count as terminal (settled) states — a connector
+    that needs OAuth or has crashed won't register tools on its own, so its
+    presence doesn't keep us waiting. Only `_MCP_PENDING_STATES` block.
 
     Best-effort: any failure to read status, or an unrecognised shape, just
-    returns (we don't block the turn on our own inability to introspect).
-    """
+    returns (we don't block the turn on our own inability to introspect)."""
     deadline = time.monotonic() + timeout
+    prev: frozenset[tuple[str, str]] | None = None
     while True:
         try:
             status = await client.get_mcp_status()
         except Exception:
             return   # status unavailable — don't hold the turn hostage
-        states = _mcp_states_from_status(status)
-        if not any(s in _MCP_PENDING_STATES for s in states):
-            return   # all servers terminal (or none configured)
+        servers = _mcp_servers_from_status(status)
+        snapshot = frozenset(servers)
+        pending = any(state in _MCP_PENDING_STATES for _n, state in servers)
+        # Ready iff: something is configured (non-empty), nothing is still
+        # settling, AND the exact set matched the previous poll (so a
+        # late-arriving connector can't have slipped in between snapshots).
+        if servers and not pending and snapshot == prev:
+            return
+        prev = snapshot
         if time.monotonic() >= deadline:
             sys.stderr.write(
                 f"[mcp-gate] readiness timeout after {timeout}s; "
-                f"states={states} — proceeding anyway\n")
+                f"servers={sorted(servers)} — proceeding anyway\n")
             sys.stderr.flush()
             return
         await asyncio.sleep(poll)
@@ -1038,14 +1086,26 @@ async def _await_mcp_ready(client: ClaudeSDKClient, *,
 def _has_enabled_external_mcp() -> bool:
     """True if at least one user/external MCP server is configured and not
     disabled — i.e. the next fresh client will spend time connecting tools.
-    Used to decide whether to show the frontend 'connecting tools…' hint.
-    The internal 'muselab' server is added separately and isn't in this view.
+    Used to decide whether to arm the wedge-readiness gate / show the frontend
+    'connecting tools…' hint. The internal 'muselab' server is added separately
+    and isn't in this view.
+
+    Covers TWO classes of external MCP:
+      1. `mcpServers` entries (local stdio / remote http) — visible via
+         _load_mcp_merged().
+      2. claude.ai-managed connectors (Gmail / Calendar / Drive / IBKR) — a
+         separate `claudeai-proxy` transport that never lands under any
+         `mcpServers` key. Without (2) the gate was SKIPPED on claude.ai-only
+         installs, which is exactly how the wedge bug came back (the connector
+         connected mid-first-turn). See api_settings.has_claude_ai_connectors.
     """
     try:
-        from .api_settings import _load_mcp_merged
+        from .api_settings import _load_mcp_merged, has_claude_ai_connectors
         for spec in _load_mcp_merged().values():
             if not spec.get("disabled"):
                 return True
+        if has_claude_ai_connectors():
+            return True
     except Exception:
         pass
     return False

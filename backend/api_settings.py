@@ -659,6 +659,33 @@ def _load_external_mcp_sources() -> dict[str, dict]:
     return out
 
 
+def has_claude_ai_connectors() -> bool:
+    """True if Claude Code has any claude.ai-managed remote connector
+    (Gmail / Calendar / Drive / IBKR / …) registered.
+
+    These connectors are a DIFFERENT class from `mcpServers` entries: the CLI
+    brings them up over its own `claudeai-proxy` transport and they never
+    appear under any `mcpServers` key — so `_load_external_mcp_sources()`
+    (which only scans `mcpServers`) is blind to them. We detect them via the
+    `claudeAiMcpEverConnected` marker Claude Code writes into ~/.claude.json.
+
+    Why it matters: the wedge-readiness gate (`chat._await_mcp_ready`) is
+    skipped entirely when `_has_enabled_external_mcp()` is False. On an install
+    whose ONLY external MCP is a claude.ai connector, the old scanner returned
+    False → the gate never ran → the connector connected mid-first-turn and
+    wedged the thinking block. Treating "ever connected a claude.ai connector"
+    as "external MCP present" keeps the gate armed for these users.
+    """
+    try:
+        if not _CLAUDE_USER_JSON.exists():
+            return False
+        cc = json.loads(_CLAUDE_USER_JSON.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    ever = cc.get("claudeAiMcpEverConnected") if isinstance(cc, dict) else None
+    return isinstance(ever, list) and len(ever) > 0
+
+
 def _load_mcp_merged() -> dict[str, dict]:
     """Final {name: spec} mapping after merging muselab's own mcp.json with
     every Claude Code MCP source. muselab's entries override external ones
