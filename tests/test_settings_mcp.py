@@ -121,3 +121,74 @@ def test_examples_from_mcp_example_file(monkeypatch, tmp_path, client, auth, app
 def test_unauthorized_get_returns_401(temp_mcp, client):
     r = client.get("/api/settings/mcp")
     assert r.status_code == 401
+
+
+# --- Remote (http/sse) connectors (2026-05-30) ---
+
+def test_upsert_remote_connector(temp_mcp, client, auth):
+    body = {"name": "gmail", "type": "http",
+            "url": "https://mcp.example.com/sse",
+            "headers": {"Authorization": "Bearer secret-token-xyz"}}
+    r = client.put("/api/settings/mcp/gmail", json=body, headers=auth)
+    assert r.status_code == 200
+    cfg = json.loads(temp_mcp.read_text())
+    entry = cfg["mcpServers"]["gmail"]
+    assert entry["type"] == "http"
+    assert entry["url"] == "https://mcp.example.com/sse"
+    assert entry["headers"]["Authorization"] == "Bearer secret-token-xyz"
+    assert "command" not in entry
+
+
+def test_remote_connector_listed_with_masked_headers(temp_mcp, client, auth):
+    client.put("/api/settings/mcp/gmail", json={
+        "name": "gmail", "url": "https://mcp.example.com/sse",
+        "headers": {"Authorization": "Bearer secret-token-xyz"}}, headers=auth)
+    server = client.get("/api/settings/mcp", headers=auth).json()["servers"][0]
+    assert server["type"] == "http"
+    assert server["url"] == "https://mcp.example.com/sse"
+    assert "•" in server["headers"]["Authorization"]
+
+
+def test_remote_connector_not_treated_as_stub(temp_mcp, client, auth):
+    """A remote spec has no `command`; it must NOT be mistaken for a pure
+    {disabled} override stub (regression: it'd be dropped in favour of an
+    external entry). Round-tripping it back through GET must preserve url."""
+    client.put("/api/settings/mcp/notion", json={
+        "name": "notion", "type": "sse",
+        "url": "https://notion.example.com/mcp"}, headers=auth)
+    server = client.get("/api/settings/mcp", headers=auth).json()["servers"][0]
+    assert server["name"] == "notion"
+    assert server["type"] == "sse"
+    assert server["url"] == "https://notion.example.com/mcp"
+    assert server["source"] == "muselab"
+
+
+def test_upsert_rejects_both_transports(temp_mcp, client, auth):
+    r = client.put("/api/settings/mcp/bad", json={
+        "name": "bad", "command": "uvx",
+        "url": "https://x.example.com"}, headers=auth)
+    assert r.status_code == 422
+
+
+def test_upsert_rejects_no_transport(temp_mcp, client, auth):
+    r = client.put("/api/settings/mcp/empty",
+                    json={"name": "empty"}, headers=auth)
+    assert r.status_code == 422
+
+
+def test_remote_header_mask_recovery(temp_mcp, client, auth):
+    """PUTting back a masked header value must recover the stored secret,
+    not persist bullets (mirror of the env-mask guard)."""
+    client.put("/api/settings/mcp/gmail", json={
+        "name": "gmail", "url": "https://mcp.example.com/sse",
+        "headers": {"Authorization": "Bearer secret-token-xyz"}}, headers=auth)
+    masked = client.get("/api/settings/mcp", headers=auth).json()[
+        "servers"][0]["headers"]["Authorization"]
+    assert "•" in masked
+    # Echo the masked value back (what a FE save-without-edit would do).
+    client.put("/api/settings/mcp/gmail", json={
+        "name": "gmail", "url": "https://mcp.example.com/sse",
+        "headers": {"Authorization": masked}}, headers=auth)
+    cfg = json.loads(temp_mcp.read_text())
+    assert cfg["mcpServers"]["gmail"]["headers"]["Authorization"] \
+        == "Bearer secret-token-xyz"

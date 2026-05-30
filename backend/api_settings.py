@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
 # _locate_executable used to live in this module but is now also needed
@@ -504,19 +504,55 @@ def set_anthropic_models(req: AnthropicModelsIn) -> dict:
 
 # ====== MCP server management ======
 #
-# Storage shape on disk (mcp.json):
-#   {"mcpServers": {"name": {"command": "...", "args": [...], "env": {...},
-#                              "disabled": false}, ...}}
+# Storage shape on disk (mcp.json) — two transports:
+#   stdio (local subprocess):
+#     {"name": {"command": "...", "args": [...], "env": {...},
+#                "disabled": false}}
+#   http/sse (remote connector, à la Claude app's account-level connectors):
+#     {"name": {"type": "http", "url": "https://...",
+#                "headers": {...}, "disabled": false}}
 # `disabled` is a muselab-local field — when true, the server is omitted from
 # the dict we hand to ClaudeAgentOptions so the SDK doesn't connect to it.
+# The SDK passes `url`-shaped specs straight through to a remote MCP endpoint
+# (see chat.py mcp_dict build, which keys on `command` OR `url`).
 
 
 class MCPServerSpec(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
-    command: str = Field(..., min_length=1)
+    # Transport. Inferred when omitted: a `url` ⇒ "http", else "stdio".
+    type: str | None = None
+    # --- stdio (local subprocess) ---
+    command: str | None = Field(default=None)
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    # --- http / sse (remote connector) ---
+    url: str | None = Field(default=None)
+    headers: dict[str, str] = Field(default_factory=dict)
     disabled: bool = False
+
+    @model_validator(mode="after")
+    def _check_transport(self) -> "MCPServerSpec":
+        """Exactly one transport must be specified. A `url` means remote
+        (http/sse); a `command` means local stdio. Normalise `type` so the
+        on-disk entry and the SDK both see an explicit transport tag."""
+        has_url = bool((self.url or "").strip())
+        has_cmd = bool((self.command or "").strip())
+        if has_url and has_cmd:
+            raise ValueError(
+                "specify either `command` (stdio) or `url` (remote), not both")
+        if has_url:
+            self.type = self.type or "http"
+            if self.type not in ("http", "sse"):
+                raise ValueError(
+                    f"remote MCP `type` must be 'http' or 'sse', got {self.type!r}")
+        elif has_cmd:
+            self.type = self.type or "stdio"
+            if self.type != "stdio":
+                raise ValueError(
+                    f"stdio MCP must have type 'stdio', got {self.type!r}")
+        else:
+            raise ValueError("either `command` (stdio) or `url` (remote) is required")
+        return self
 
 
 def _load_mcp() -> dict:
@@ -645,9 +681,15 @@ def _load_mcp_merged() -> dict[str, dict]:
     for name, spec in own.items():
         if not isinstance(spec, dict):
             continue
-        # Override-only entry: pure {disabled: true|false} with no command.
-        # Layer on top of the existing external spec.
-        if "command" not in spec and "disabled" in spec and name in merged:
+        # Override-only entry: a pure {disabled: true|false} stub with NO
+        # transport of its own (neither `command` for stdio nor `url` for
+        # remote). Layer it on top of the existing external spec. A full
+        # muselab entry — including a remote one, which also lacks `command`
+        # — must NOT be mistaken for a stub, or it'd be discarded in favour
+        # of the external entry (regression caught 2026-05-30).
+        is_stub = ("command" not in spec and "url" not in spec
+                   and "disabled" in spec)
+        if is_stub and name in merged:
             merged[name] = {**merged[name], "disabled": bool(spec["disabled"])}
             # Note: keeps `_source` from the external entry so UI shows
             # original source + an "(overridden)" tag if it wants.
@@ -682,11 +724,15 @@ def _load_examples() -> list[dict]:
         d = json.loads(MCP_EXAMPLE_PATH.read_text(encoding="utf-8"))
         items = []
         for name, spec in (d.get("mcpServers") or {}).items():
+            url = spec.get("url", "")
             items.append({
                 "name": name,
+                "type": spec.get("type") or ("http" if url else "stdio"),
                 "command": spec.get("command", ""),
                 "args": spec.get("args", []),
                 "env": spec.get("env", {}),
+                "url": url,
+                "headers": spec.get("headers", {}),
                 "description": spec.get("description", ""),
             })
         return items
@@ -704,11 +750,19 @@ def get_mcp_servers() -> dict:
     merged = _load_mcp_merged()
     servers = []
     for name, spec in merged.items():
+        # Transport: explicit `type`, else inferred from shape (url ⇒ remote).
+        url = spec.get("url", "")
+        transport = spec.get("type") or ("http" if url else "stdio")
         servers.append({
             "name": name,
+            "type": transport,
             "command": spec.get("command", ""),
             "args": spec.get("args", []),
             "env": {k: _mask(v) for k, v in (spec.get("env") or {}).items()},
+            # Remote connector fields. URL is not a secret (shown plain); header
+            # values are masked like env (often carry bearer tokens).
+            "url": url,
+            "headers": {k: _mask(v) for k, v in (spec.get("headers") or {}).items()},
             "disabled": bool(spec.get("disabled", False)),
             # Source tag for UI badge. "muselab" = explicit muselab entry;
             # everything else came from a Claude Code config file.
@@ -742,27 +796,41 @@ def upsert_mcp_server(name: str, spec: MCPServerSpec) -> dict:
             f"body name {spec.name!r} does not match URL name {name!r}",
         )
     cfg = _load_mcp()
-    # Defence (mirror of put_settings' "•" guard): GET /mcp masks env values
-    # via _mask() (U+2022 BULLET). A FE that PUTs an unchanged entry back would
-    # otherwise overwrite the real secret with bullets — unrecoverable. For any
-    # env value that still looks masked, recover the real value from the current
-    # merged view (the same source the mask was derived from); if none exists,
-    # drop the key rather than persist bullets.
-    new_env = dict(spec.env or {})
-    if any(isinstance(v, str) and "•" in v for v in new_env.values()):
-        existing_env = (_load_mcp_merged().get(name) or {}).get("env") or {}
-        for k, v in list(new_env.items()):
-            if isinstance(v, str) and "•" in v:
-                if k in existing_env:
-                    new_env[k] = existing_env[k]
-                else:
-                    new_env.pop(k)
-    cfg["mcpServers"][name] = {
-        "command": spec.command,
-        "args": spec.args,
-        "env": new_env,
-        "disabled": spec.disabled,
-    }
+
+    # Defence (mirror of put_settings' "•" guard): GET /mcp masks secret values
+    # (env values, header values) via _mask() (U+2022 BULLET). A FE that PUTs an
+    # unchanged entry back would otherwise overwrite the real secret with bullets
+    # — unrecoverable. For any value that still looks masked, recover the real
+    # value from the current merged view (the same source the mask was derived
+    # from); if none exists, drop the key rather than persist bullets.
+    def _unmask(new_map: dict, field: str) -> dict:
+        out = dict(new_map or {})
+        if any(isinstance(v, str) and "•" in v for v in out.values()):
+            existing = (_load_mcp_merged().get(name) or {}).get(field) or {}
+            for k, v in list(out.items()):
+                if isinstance(v, str) and "•" in v:
+                    if k in existing:
+                        out[k] = existing[k]
+                    else:
+                        out.pop(k)
+        return out
+
+    if spec.url:
+        # Remote connector (http/sse). No command/args/env on disk.
+        cfg["mcpServers"][name] = {
+            "type": spec.type or "http",
+            "url": spec.url.strip(),
+            "headers": _unmask(spec.headers, "headers"),
+            "disabled": spec.disabled,
+        }
+    else:
+        # Local stdio subprocess.
+        cfg["mcpServers"][name] = {
+            "command": spec.command,
+            "args": spec.args,
+            "env": _unmask(spec.env, "env"),
+            "disabled": spec.disabled,
+        }
     _save_mcp(cfg)
     return {"ok": True, "name": name}
 

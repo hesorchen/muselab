@@ -25,9 +25,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------- runtime ----------
 FROM python:3.12-slim
 
-# Install Node.js (for claude CLI + npm-based MCP), claude CLI, and the most
-# common MCP servers up front so users can opt in via mcp.json. Also keep git
-# (needed by mcp-server-git) and curl (used by HEALTHCHECK in some setups).
+# Install Node.js (for the claude CLI + any npm-based MCP a user opts into)
+# and the claude CLI itself. We deliberately DO NOT pre-bake MCP servers:
+# the built-in tools (Read/Edit/Write/Grep/Glob/Bash/WebFetch + native
+# extended thinking) already cover what the old presets did, and pre-baking
+# unused servers bloats the image. Users add external connectors via the UI;
+# those resolve at add-time, not in the image. Keep curl (HEALTHCHECK) and
+# git (common in archives / user-added git MCP).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
@@ -35,15 +39,13 @@ RUN apt-get update && \
     # claude-code pin — keep in lockstep with CLAUDE_CLI_VERSION in
     # scripts/versions.env (the native installers read it from there).
     npm install -g \
-        @anthropic-ai/claude-code@2.1.156 \
-        @modelcontextprotocol/server-filesystem@2026.1.14 \
-        @modelcontextprotocol/server-memory@2026.1.26 && \
+        @anthropic-ai/claude-code@2.1.156 && \
     apt-get purge -y --auto-remove gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
 
-# uv binary (for `uvx mcp-server-fetch` / `uvx mcp-server-git`). Pinned — keep
-# in lockstep with the builder-stage uv above.
+# uv binary (for any `uvx`-based MCP a user opts into, e.g. mcp-server-fetch).
+# Pinned — keep in lockstep with the builder-stage uv above.
 COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /usr/local/bin/
 
 WORKDIR /app

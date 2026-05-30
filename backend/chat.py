@@ -964,6 +964,93 @@ async def _build_and_connect_client(
         raise RuntimeError("unreachable")   # for type checker
 
 
+# ── MCP readiness gate ──────────────────────────────────────────────────
+# The wedge bug: extended thinking requires the thinking block in the latest
+# assistant message to be returned to the API *unmodified*. MCP servers
+# connect lazily in the background AFTER client.connect() returns, so the
+# available tool-set can change PARTWAY THROUGH the first turn. When that
+# happens while a thinking block is in flight, its signature no longer
+# validates → permanent `400 ... thinking blocks ... cannot be modified`
+# that no further prompt can recover.
+#
+# Fix: after connect, block until every MCP server has reached a *terminal*
+# connection state (connected / failed / needs-auth) BEFORE we let the first
+# turn run. Then the tool-set is frozen before any thinking block exists.
+# A timeout backstops the wait so a hung server can't hang the user forever.
+#
+# Only "still settling" states keep us waiting. needs-auth is terminal: the
+# server's tools won't register until the user does OAuth, so the tool-set is
+# already stable (just smaller). Unknown/odd states are treated as terminal —
+# combined with the timeout, we never block indefinitely on a shape we don't
+# recognise.
+_MCP_PENDING_STATES = {"pending", "connecting", "authenticating", "starting"}
+
+
+def _mcp_states_from_status(status: object) -> list[str]:
+    """Normalise the CLI's mcp_status control response into a flat list of
+    lowercased state strings, tolerating both dict-keyed and list shapes."""
+    if not isinstance(status, dict):
+        return []
+    servers = status.get("servers")
+    if servers is None:
+        servers = status.get("mcp_servers")
+    out: list[str] = []
+    if isinstance(servers, dict):
+        for v in servers.values():
+            if isinstance(v, dict) and "status" in v:
+                out.append(str(v["status"]).lower())
+            elif isinstance(v, str):
+                out.append(v.lower())
+    elif isinstance(servers, list):
+        for v in servers:
+            if isinstance(v, dict) and "status" in v:
+                out.append(str(v["status"]).lower())
+            elif isinstance(v, str):
+                out.append(v.lower())
+    return out
+
+
+async def _await_mcp_ready(client: ClaudeSDKClient, *,
+                           timeout: float = 30.0, poll: float = 0.25) -> None:
+    """Block until no MCP server is still settling, or until `timeout`.
+
+    Best-effort: any failure to read status, or an unrecognised shape, just
+    returns (we don't block the turn on our own inability to introspect).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            status = await client.get_mcp_status()
+        except Exception:
+            return   # status unavailable — don't hold the turn hostage
+        states = _mcp_states_from_status(status)
+        if not any(s in _MCP_PENDING_STATES for s in states):
+            return   # all servers terminal (or none configured)
+        if time.monotonic() >= deadline:
+            sys.stderr.write(
+                f"[mcp-gate] readiness timeout after {timeout}s; "
+                f"states={states} — proceeding anyway\n")
+            sys.stderr.flush()
+            return
+        await asyncio.sleep(poll)
+
+
+def _has_enabled_external_mcp() -> bool:
+    """True if at least one user/external MCP server is configured and not
+    disabled — i.e. the next fresh client will spend time connecting tools.
+    Used to decide whether to show the frontend 'connecting tools…' hint.
+    The internal 'muselab' server is added separately and isn't in this view.
+    """
+    try:
+        from .api_settings import _load_mcp_merged
+        for spec in _load_mcp_merged().values():
+            if not spec.get("disabled"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
                      effort: str = "") -> ClaudeSDKClient:
     """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
@@ -1028,6 +1115,17 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
 
         # Slow path — no awaits hold _lock.
         client = await _build_and_connect_client(session_id, model, permission, effort)
+
+        # Wedge gate: freeze the tool-set before anyone can run a turn on this
+        # client. Runs under the per-key creation lock (blocks only same-key
+        # callers, never siblings) and BEFORE the pool commit, so no other
+        # request can grab this client and start a turn mid-connection. See
+        # _await_mcp_ready for the full rationale. Skip the status round-trip
+        # entirely when no external MCP server is configured (the default):
+        # the in-process 'muselab' server connects synchronously during
+        # connect(), so there's nothing left to settle.
+        if _has_enabled_external_mcp():
+            await _await_mcp_ready(client)
 
         # Commit + LRU eviction. Eviction's await disconnect() runs
         # OUTSIDE _lock (the disconnect can take up to 5 s). Eviction
@@ -1783,7 +1881,13 @@ def _compact_summary_uuids(sid: str) -> set[str]:
 
 
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
-def get_session_api(sid: str, full: bool = Query(False)) -> dict:
+def get_session_api(
+    sid: str,
+    full: bool = Query(False),
+    tail: int = Query(0, ge=0),
+    offset: int = Query(-1),
+    limit: int = Query(0, ge=0),
+) -> dict:
     """Read session: metadata from muselab sidecar + transcript from CLI JSONL
     via SDK. Merges per-message annotations (cost, model, images) into the
     transcript so the UI gets one flat list of bubbles.
@@ -1792,6 +1896,19 @@ def get_session_api(sid: str, full: bool = Query(False)) -> dict:
     ENTIRE conversation (incl. pre-compact turns) via _full_session_msgs.
     Used by the outline (to list every user prompt) and by the "jump to a
     pre-compact prompt" path. Defaults to the normal post-compact view.
+
+    Windowing (perf): a long session can shape into thousands of UI bubbles
+    and several MB of JSON — transferring + JSON.parse-ing the whole thing on
+    every session entry froze the browser (the user only ever sees the last
+    ~30). So the client pages:
+      - `?tail=N`            → only the last N bubbles (initial load)
+      - `?offset=A&limit=L`  → bubbles [A, A+L) (the "Load earlier" button)
+    The response always carries `total` (full bubble count), `offset` (index
+    of the first returned bubble in the full chain) and `has_more` (whether
+    older bubbles exist before `offset`) so the client can page backwards.
+    `full=1` and the no-param call still return everything (offset=0) for
+    outline / export / jump-to-pre-compact back-compat — those need the whole
+    list. Windowing is ignored when `full` is set.
 
     Mid-turn fallback: SDK CLI only writes the JSONL on turn completion,
     so a reload while a reply is streaming would otherwise return an
@@ -1837,7 +1954,72 @@ def get_session_api(sid: str, full: bool = Query(False)) -> dict:
     # Keeping this path SDK-only lets reconnect be the sole live-tail
     # mechanism. The user briefly sees just the user msg, then SSE
     # fills in everything via replay → live.
-    return {**meta, "messages": messages}
+    total = len(messages)
+    # Slice the requested window. full / no-param → whole list (offset 0).
+    if full or (tail <= 0 and offset < 0):
+        win_offset = 0
+        window = messages
+    elif offset >= 0:
+        # Explicit range (Load-earlier paging). Clamp into [0, total].
+        start = max(0, min(offset, total))
+        end = total if limit <= 0 else min(total, start + limit)
+        win_offset = start
+        window = messages[start:end]
+    else:
+        # tail > 0 → last N bubbles (initial load).
+        win_offset = max(0, total - tail)
+        window = messages[win_offset:]
+    return {
+        **meta,
+        "messages": window,
+        "total": total,
+        "offset": win_offset,
+        "has_more": win_offset > 0,
+    }
+
+
+def _outline_preview(text: str) -> str:
+    """First meaningful line of a user prompt, trimmed to 80 chars. Mirrors
+    the old client-side preview logic so the outline reads the same after we
+    moved extraction server-side. Skips blockquote (>) lines and strips a
+    leading markdown heading marker."""
+    raw = (text or "").strip()
+    if not raw:
+        return "(empty)"
+    lines = raw.split("\n")
+    one_line = next(
+        (ln for ln in lines if ln.strip() and not ln.strip().startswith(">")),
+        lines[0] if lines else raw,
+    )
+    cleaned = re.sub(r"^#+\s*", "", one_line).strip()
+    return cleaned[:77] + "…" if len(cleaned) > 80 else cleaned
+
+
+@router.get("/sessions/{sid}/outline", dependencies=[Depends(require_token)])
+def get_session_outline_api(sid: str) -> dict:
+    """Lightweight session outline: just the user-prompt previews + UUIDs,
+    extracted server-side. The outline used to fetch the session with
+    `?full=1` (the ENTIRE raw JSONL — several MB on a long session) and filter
+    for user messages in the browser, which froze the page when opening the
+    outline on a big session. This returns only what the outline renders:
+    a small `[{preview, uuid}]` list spanning the WHOLE conversation (incl.
+    pre-compact prompts, since it reads the full JSONL)."""
+    meta = sess.get_session_meta(sid)
+    if meta is None:
+        raise HTTPException(404, "session not found")
+    try:
+        sdk_msgs = _full_session_msgs(sid)
+        annotations = sess.get_message_annotations(sid)
+        compact_uuids = _compact_summary_uuids(sid)
+        messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    except Exception:
+        messages = []
+    items = [
+        {"preview": _outline_preview(m.get("text", "")), "uuid": m.get("uuid")}
+        for m in messages
+        if m.get("role") == "user" and not m.get("_is_compact_summary")
+    ]
+    return {"outline": items}
 
 
 def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
@@ -5022,6 +5204,14 @@ def session_active_status(sid: str) -> dict:
         "model": b.model,
         "started_at": b.started_at,
         "events_so_far": len(b.events),
+        # The turn's user prompt + attachments. The browser needs these to
+        # render the user bubble when it LIVE-reconnects to a turn the server
+        # drained from the queue headlessly (the browser never "sent" it, so
+        # the bubble isn't in `messages`). Same fields _broadcast_to_ui_messages
+        # injects on a reload-rebuild — keeps the two reconnect paths in sync.
+        "user_text": b.user_text or "",
+        "user_images": b.user_images or [],
+        "user_docs": b.user_docs or [],
     }
 
 

@@ -597,7 +597,11 @@ function portal() {
       // MCP server list (loaded from /api/settings/mcp)
       mcpServers: [],
       mcpExamples: [],
-      mcpDraft: { show: false, name: "", command: "", argsStr: "" },
+      // MCP add-form draft. `transport` picks the shape: "stdio" (local
+      // subprocess → command/args) or "remote" (http/sse connector → url +
+      // optional Authorization header), mirroring Claude app's local-vs-remote
+      // connector split.
+      mcpDraft: { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" },
       // Provider editor drafts — keyed by stable provider id. Each holds the
       // in-flight edit of a provider's endpoint / prefix / model-list / key,
       // plus an `open` flag toggling the inline editor. Separate from the
@@ -2643,12 +2647,25 @@ function portal() {
         const earlier = (st && st._earlierMessages) || [];
         const idx = earlier.findIndex(em => em && em.uuid === uuid);
         if (idx < 0) {
-          // Not in DOM and not in the lazy stash. This is the PRE-compaction
-          // case: the normal load starts at the compact summary, so the
-          // target prompt was never fetched. Reload in full mode (raw JSONL,
-          // includes pre-compact history) and retry once. _fullLoaded guards
-          // against an infinite reload loop if the uuid genuinely isn't on
-          // disk.
+          // Not in DOM and not in the in-memory stash. Two possibilities:
+          //  1) Older post-compact history still on the server — page a
+          //     window back from the backend, then retry (cheap, repeats
+          //     until the target lands in the stash or we exhaust offset).
+          //  2) PRE-compaction (absent from the post-compact chain entirely)
+          //     — reload in full raw-JSONL mode once. _fullLoaded guards
+          //     against an infinite reload loop if the uuid isn't on disk.
+          if (st && st._loadedOffset > 0 && !st._fetchingOlder) {
+            (async () => {
+              const pulled = await this._fetchOlderWindow(sid);
+              if (pulled > 0) {
+                this.$nextTick(() => this._scrollToUserMsg(m));
+              } else if (!st._fullLoaded) {
+                await this.loadSession(sid, { full: true });
+                this.$nextTick(() => this._scrollToUserMsg(m));
+              }
+            })();
+            return;
+          }
           if (st && !st._fullLoaded) {
             (async () => {
               await this.loadSession(sid, { full: true });
@@ -2668,13 +2685,18 @@ function portal() {
         const oldScrollTop = oldScrollEl ? oldScrollEl.scrollTop : 0;
         st.messages.unshift(...batch);
         this.messages = st.messages;
-        st._hasMoreHistory = (st._earlierMessages || []).length > 0;
+        st._hasMoreHistory =
+          (st._earlierMessages || []).length > 0 || st._loadedOffset > 0;
         this.$nextTick(() => {
           if (oldScrollEl) {
             const newScrollHeight = oldScrollEl.scrollHeight;
             oldScrollEl.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
           }
-          this.highlightCode(".chat-body");
+          // Scope highlight to the bubbles we just unshifted (the first
+          // batch.length `.msg` children) rather than rescanning the whole
+          // chat body.
+          const newEls = this._leadingMsgEls(batch.length);
+          this.highlightCode(".chat-body", newEls.length ? newEls : null);
           setTimeout(tryScroll, 50);
         });
       });
@@ -3618,6 +3640,11 @@ function portal() {
         if (typeof p.desktopFullPane === "string"
             && ["", "preview", "chat"].includes(p.desktopFullPane)) {
           this.desktopFullPane = p.desktopFullPane;
+          // Mirror toggleDesktopFull's invariant: fullscreen chat needs the
+          // right pane open or it restores to a blank screen (chat is hidden
+          // by .pane-hidden when rightOpen is false). rightOpen is restored
+          // just above, but guard against a persisted false slipping through.
+          if (p.desktopFullPane === "chat") this.rightOpen = true;
         }
         if (typeof p.openFilesCollapsed === "boolean") this.openFilesCollapsed = p.openFilesCollapsed;
         // null = auto-fit; only restore an explicit user override.
@@ -3923,6 +3950,21 @@ function portal() {
         // (sessions with thousands of messages). Shows a hint that not
         // every message is reachable from the UI, full history is in JSONL.
         _truncatedFromTop: false,
+        // Backend windowing cursor: index (in the full server-side bubble
+        // chain) of the OLDEST bubble currently held in memory — i.e. the
+        // first bubble of the in-memory contiguous block (messages[] is the
+        // tail of that block; _earlierMessages is its head). After a
+        // `?tail=N` load this is the server's reported `offset`. >0 means
+        // older bubbles still live on the server and can be paged in via
+        // _fetchOlderWindow. 0 means we hold history back to the start.
+        _loadedOffset: 0,
+        // Total bubble count in the full server-side chain (server `total`),
+        // so earlierMessageCount() can show how many older messages exist
+        // beyond what's in memory.
+        _total: 0,
+        // True while an async backend older-window fetch is in flight, so
+        // rapid "Load earlier" clicks don't fire duplicate requests.
+        _fetchingOlder: false,
       };
     },
     _ensureTabState(id) {
@@ -4087,14 +4129,46 @@ function portal() {
       await this._syncQueueFromServer(sid);
       const st = this.tabState[sid];
       const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
-      let active = false, startedAt = 0;
+      let active = false, startedAt = 0, uText = "", uImages = [], uDocs = [];
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/active",
                                { headers: this.hdr() });
-        if (r.ok) { const d = await r.json(); active = !!d.active; startedAt = d.started_at; }
+        if (r.ok) {
+          const d = await r.json();
+          active = !!d.active; startedAt = d.started_at;
+          uText = d.user_text || "";
+          uImages = d.user_images || [];
+          uDocs = d.user_docs || [];
+        }
       } catch (_e) {}
       if (active && !this.streaming && this.currentId === sid) {
         if (st) st._draining = false;
+        // FIX (queue live-render): when the SERVER drained a queued item and
+        // started its turn headlessly, the browser never pushed a user bubble
+        // for it — so a live reconnect would replay the assistant stream under
+        // the PREVIOUS user msg, and the drained item's prompt would vanish
+        // until a manual refresh (which rebuilds it from bc.user_text). User
+        // symptom: "发了四条，只剩一条" — only the first send's bubble showed.
+        // Push the bubble here, before send({reconnect}) truncates+replays, so
+        // the freshly-drained prompt renders live. Guard against the reload
+        // case (loadSession already rebuilt this bubble): skip if the last
+        // user message already matches this turn's prompt.
+        const msgs = (st && st.messages) || [];
+        let lastUserText = null;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === "user") { lastUserText = msgs[i].text || ""; break; }
+        }
+        if ((uText || uImages.length || uDocs.length) && lastUserText !== uText) {
+          this._capLiveMessages(st);
+          msgs.push({
+            role: "user",
+            text: uText,
+            images: uImages,
+            docs: uDocs,
+          });
+          this.atBottom = true;
+          this.scrollToBottom(true);
+        }
         this.send({ reconnect: true, startedAt });
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
@@ -4537,8 +4611,17 @@ function portal() {
       // clears the flag), but we double-check here to keep the template
       // logic-light.
       if (tid === this.currentId) return false;
+      // Streaming has priority over unread — they must be mutually exclusive.
+      // Guard against the FULL streaming check (isTabStreaming), not just the
+      // local `st.streaming` flag: a turn can be live via the server-side
+      // `s.active` flag (cross-device sync, or the next queued turn draining
+      // the instant turn N finishes) while THIS browser's st.streaming has
+      // already flipped false. The old `!st.streaming`-only guard let the
+      // green "done" dot light up alongside the accent "in-progress" dot in
+      // exactly those windows (2026-05-30 both-dots bug report).
+      if (this.isTabStreaming(tid)) return false;
       const st = this.tabState[tid];
-      return !!(st && st.unread && !st.streaming);
+      return !!(st && st.unread);
     },
     tabCtxMenuStyle() {
       const m = this.tabCtxMenu;
@@ -4916,18 +4999,46 @@ function portal() {
     // — its diff should fold to keep the scroll history clean. Only the
     // truly latest action gets the auto-expanded diff.)
     // User-explicit toggles (via toggleMsgExpanded) still override.
-    isLatestEditTool(i, m) {
-      if (!m || !["Edit", "Write", "MultiEdit"].includes(m.name)) return false;
+    // There is AT MOST one "latest edit tool" in the whole conversation, so
+    // compute its index once per render and cache it — the template calls
+    // isLatestEditTool() once per rendered message, and the old per-call
+    // forward scan made that O(n²), a real freeze contributor on long
+    // sessions. Cache key is currentId:length (same scheme as
+    // _taskSubjectMapForMessages): the only events that move the latest-edit
+    // index are appends / evictions (length changes) and tab switches
+    // (currentId changes); in-place streaming text mutations don't. Writing
+    // the cache only on key change keeps it loop-safe under Alpine.
+    _latestEditToolIdx() {
       const msgs = this.messages || [];
-      for (let j = i + 1; j < msgs.length; j++) {
-        const c = msgs[j];
-        // Any later tool_use or tool_result means this Edit is no longer
-        // Muse's most recent action — fold its diff.
-        if (c && (c.role === "tool_use" || c.role === "tool_result")) {
-          return false;
+      const key = (this.currentId || "_") + ":" + msgs.length;
+      const cached = this._cachedLatestEditIdx;
+      if (cached && cached.key === key) return cached.idx;
+      // Last Edit/Write/MultiEdit tool_use in the list…
+      let e = -1;
+      for (let k = msgs.length - 1; k >= 0; k--) {
+        const mm = msgs[k];
+        if (mm && (mm.name === "Edit" || mm.name === "Write" || mm.name === "MultiEdit")) {
+          e = k; break;
         }
       }
-      return true;
+      // …is "latest" only if nothing tool-ish follows it (a later Bash/Read
+      // tool_use or any tool_result means the Edit is done and moved past →
+      // its diff folds). At most one index satisfies this.
+      let idx = -1;
+      if (e >= 0) {
+        let laterTool = false;
+        for (let j = e + 1; j < msgs.length; j++) {
+          const c = msgs[j];
+          if (c && (c.role === "tool_use" || c.role === "tool_result")) { laterTool = true; break; }
+        }
+        idx = laterTool ? -1 : e;
+      }
+      this._cachedLatestEditIdx = { key, idx };
+      return idx;
+    },
+    isLatestEditTool(i, m) {
+      if (!m || !(m.name === "Edit" || m.name === "Write" || m.name === "MultiEdit")) return false;
+      return i === this._latestEditToolIdx();
     },
 
     // Public hook for plugins / extensions. Adds an entry to the registry
@@ -6082,7 +6193,23 @@ function portal() {
       // finally so error / empty-result paths don't leave the skeleton stuck.
       let scheduledReveal = false;
       try {
-        const r = await fetch("/api/chat/sessions/" + sid + (full ? "?full=1" : ""), { headers: this.hdr() });
+        // Backend windowing (perf): a long / un-compacted session can shape
+        // into thousands of bubbles and many MB of JSON. Shipping + parsing
+        // the whole thing on every entry was the dominant freeze ("卡死").
+        // So unless full mode is requested, ask the server for only the TAIL
+        // we'll actually paint up front. The tail must be wide enough that
+        // pickVisibleStart's "at least 2 user turns" guarantee still holds
+        // (it can rewind up to INITIAL_LOAD*5), so we request that much; we
+        // still render only ~INITIAL_LOAD and stash the rest. Older history
+        // pages in from the server via _fetchOlderWindow on "Load earlier".
+        const _coldEarly = !this.appReady;
+        const _mobileEarly = this._isMobileLayout();
+        const _initialLoadEarly = _mobileEarly
+          ? (_coldEarly ? 8 : 15)
+          : (_coldEarly ? 12 : 30);
+        const FETCH_TAIL = _initialLoadEarly * 5;
+        const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
+        const r = await fetch("/api/chat/sessions/" + sid + qs, { headers: this.hdr() });
         if (!r.ok) {
           st.messages.length = 0;
           if (sid === this.currentId) this.messages = st.messages;
@@ -6143,10 +6270,7 @@ function portal() {
         // page ("卡死"). Render far fewer bubbles up front in that window; the
         // rest page in via "Load earlier" once the app is warm. After boot the
         // normal thresholds apply, so warm tab-switches are unchanged.
-        const _cold = !this.appReady;
-        const INITIAL_LOAD = this._isMobileLayout()
-          ? (_cold ? 8 : 15)
-          : (_cold ? 12 : 30);
+        const INITIAL_LOAD = _initialLoadEarly;
         const renderMarkdown = (m) => {
           if (m.role === "assistant" && m.text && !m.html) {
             m.html = this.mdRender(m.text);
@@ -6194,24 +6318,21 @@ function portal() {
         // Stash older messages on the per-tab state; the "Load earlier"
         // button reads from here.
         st._earlierMessages = earlier;
-        st._hasMoreHistory = earlier.length > 0;
+        // Backend windowing cursor. The server told us the index of the
+        // first bubble it returned (`s.offset`); everything before that
+        // still lives on disk and pages in via _fetchOlderWindow. full /
+        // no-window responses report offset 0 (whole chain in hand).
+        st._loadedOffset = Number.isInteger(s.offset) ? s.offset : 0;
+        st._total = Number.isInteger(s.total) ? s.total : all.length;
+        // More history exists if either the in-memory stash has older
+        // bubbles OR the server holds bubbles before our window.
+        st._hasMoreHistory = earlier.length > 0 || st._loadedOffset > 0;
         // Remember whether this load pulled the full raw-JSONL history, so
         // _scrollToUserMsg knows it can stop retrying after one full reload.
         st._fullLoaded = full;
+        st._truncatedFromTop = false;
         // (The session outline is sourced from the backend via
-        // refreshOutlineFromBackend, which reads the full raw JSONL — see
-        // outlineMessages(). No client-side outline cache is built here.)
-        // Absolute cap: if even the deferred stash is enormous (e.g. 2000+
-        // messages), truncate from the front so we don't keep arbitrarily
-        // large arrays in memory. Full history is always in the JSONL file.
-        const MAX_TOTAL = 2000;
-        if (st._earlierMessages.length + st.messages.length > MAX_TOTAL) {
-          const overflow = (st._earlierMessages.length + st.messages.length) - MAX_TOTAL;
-          st._earlierMessages = st._earlierMessages.slice(overflow);
-          st._truncatedFromTop = true;
-        } else {
-          st._truncatedFromTop = false;
-        }
+        // refreshOutlineFromBackend (GET …/outline), not built here.)
         if (sid === this.currentId) {
           this.messages = st.messages;
           // Background-completion: if there's an in-flight turn on this
@@ -6262,7 +6383,18 @@ function portal() {
     // position so the user's current viewport doesn't jump when older
     // content unfolds above.
     LOAD_MORE_BATCH: 50,
-    // Live-session DOM ceiling. loadSession's INITIAL_LOAD / MAX_TOTAL caps
+    // How many older bubbles to pull from the server in one backend page
+    // when the in-memory stash runs dry (see _fetchOlderWindow). Larger
+    // than LOAD_MORE_BATCH so several "Load earlier" clicks are served from
+    // memory between network round-trips.
+    HISTORY_PAGE: 200,
+    // Absolute in-memory ceiling across messages[] + _earlierMessages. Once
+    // hit we stop paging older windows from the server (full history stays
+    // in the JSONL); historyTruncated() then surfaces the "not everything is
+    // reachable" hint. Bounds memory on pathological thousands-of-bubbles
+    // sessions even if the user keeps clicking "Load earlier".
+    MAX_IN_MEMORY: 2000,
+    // Live-session DOM ceiling. loadSession's INITIAL_LOAD / MAX caps
     // only apply when (re)entering a session — NOTHING trims messages[] while
     // a session is actively chatted in, so a long coding session grows DOM
     // nodes without bound and OOM-crashes mobile WebViews (desktop has the
@@ -6294,26 +6426,19 @@ function portal() {
       if (st._outlineFetching) return;
       st._outlineFetching = true;
       try {
-        // full=1 → backend reads the raw JSONL in file order, so the outline
-        // includes PRE-compaction prompts the SDK's active-chain view drops.
-        const r = await fetch("/api/chat/sessions/" + sid + "?full=1", { headers: this.hdr() });
+        // Dedicated outline endpoint: the server reads the raw JSONL (so the
+        // outline includes PRE-compaction prompts) and returns ONLY the
+        // user-prompt previews + uuids — a tiny payload. Previously this
+        // fetched ?full=1 (the ENTIRE transcript, several MB) and filtered
+        // client-side, which froze the page when opening the outline on a
+        // big session. Now the heavy extraction happens server-side once.
+        const r = await fetch("/api/chat/sessions/" + sid + "/outline", { headers: this.hdr() });
         if (!r.ok) return;
         const data = await r.json();
-        const users = (data.messages || []).filter(
-          m => m && m.role === "user" && !m._is_compact_summary);
-        const fresh = users.map(m => {
-          const raw = ((m.text || "") + "").trim();
-          let preview = "(empty)";
-          if (raw) {
-            const oneLine = raw.split("\n").find(l => {
-              const s = l.trim();
-              return s && !s.startsWith(">");
-            }) || raw.split("\n")[0] || raw;
-            const cleaned = oneLine.replace(/^#+\s*/, "").trim();
-            preview = cleaned.length > 80 ? cleaned.slice(0, 77) + "…" : cleaned;
-          }
-          return { preview, uuid: m.uuid || null };
-        });
+        const fresh = (data.outline || []).map(it => ({
+          preview: it.preview || "(empty)",
+          uuid: it.uuid || null,
+        }));
         st._backendOutline = fresh;
         st._outlineFetchedAt = now;
         // Bump the reactivity ping so outlineMessages() re-runs and
@@ -6329,11 +6454,63 @@ function portal() {
       }
     },
 
-    loadEarlierMessages(sid) {
+    // Pull the next older window of bubbles from the server into the FRONT
+    // of the in-memory stash and rewind _loadedOffset. Used when the stash
+    // is exhausted but the server still holds older history (the backend-
+    // paging counterpart to the in-memory stash drain). Idempotent under
+    // concurrent calls via the _fetchingOlder guard. Returns the number of
+    // bubbles actually pulled in (0 if nothing more / capped / error).
+    async _fetchOlderWindow(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return 0;
+      const st = this._ensureTabState(sid);
+      if (st._fetchingOlder) return 0;
+      if (!(st._loadedOffset > 0)) return 0;
+      // Respect the in-memory ceiling — stop paging once we hold too much.
+      const held = (st.messages ? st.messages.length : 0)
+                 + (st._earlierMessages ? st._earlierMessages.length : 0);
+      if (held >= this.MAX_IN_MEMORY) return 0;
+      const newOffset = Math.max(0, st._loadedOffset - this.HISTORY_PAGE);
+      const limit = st._loadedOffset - newOffset;
+      st._fetchingOlder = true;
+      try {
+        const r = await fetch(
+          "/api/chat/sessions/" + sid + "?offset=" + newOffset + "&limit=" + limit,
+          { headers: this.hdr() });
+        if (!r.ok) return 0;
+        const data = await r.json();
+        const win = (data.messages || []).map((m, idx) => ({
+          ...m, _k: sid + "-o" + newOffset + "-" + idx,
+        }));
+        // Prepend (older bubbles go to the front of the stash). mdRender is
+        // still deferred until a bubble is paged into messages[].
+        st._earlierMessages = win.concat(st._earlierMessages || []);
+        st._loadedOffset = Number.isInteger(data.offset) ? data.offset : newOffset;
+        if (Number.isInteger(data.total)) st._total = data.total;
+        st._hasMoreHistory =
+          (st._earlierMessages.length > 0) || st._loadedOffset > 0;
+        return win.length;
+      } catch (_) {
+        return 0;
+      } finally {
+        st._fetchingOlder = false;
+      }
+    },
+    async loadEarlierMessages(sid) {
       sid = sid || this.currentId;
       if (!sid) return;
       const st = this._ensureTabState(sid);
-      if (!st._earlierMessages || !st._earlierMessages.length) return;
+      // Stash empty but server holds older history → page a window in first.
+      if ((!st._earlierMessages || !st._earlierMessages.length)
+          && st._loadedOffset > 0) {
+        await this._fetchOlderWindow(sid);
+      }
+      if (!st._earlierMessages || !st._earlierMessages.length) {
+        // Nothing local and nothing (more) on the server: recompute flags
+        // so the button hides itself.
+        st._hasMoreHistory = st._loadedOffset > 0;
+        return;
+      }
       // Take from the END of the earlier stash (those are the messages
       // immediately preceding what's currently shown — "closest in time").
       const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
@@ -6352,15 +6529,20 @@ function portal() {
       const oldScrollTop = scrollEl ? scrollEl.scrollTop : 0;
       st.messages.unshift(...batch);
       if (isCurrent) this.messages = st.messages;
-      st._hasMoreHistory = st._earlierMessages.length > 0;
+      st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       // Restore scroll position so the message the user was looking at
       // stays in place. Without this the viewport snaps to the new top.
       if (scrollEl) {
         this.$nextTick(() => {
           const newScrollHeight = scrollEl.scrollHeight;
           scrollEl.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
-          // Re-run code highlighting on the newly prepended content.
-          this.highlightCode(".chat-body");
+          // Re-run code highlighting ONLY on the newly prepended bubbles
+          // (the first batch.length `.msg` children). Rescanning the whole
+          // chat body each click is O(total) — wasteful once a long history
+          // has been paged in. Falls back to a full scan if the elements
+          // can't be resolved.
+          const newEls = this._leadingMsgEls(batch.length);
+          this.highlightCode(".chat-body", newEls.length ? newEls : null);
         });
       }
     },
@@ -6383,25 +6565,42 @@ function portal() {
       // everything already stashed but older than what stays visible, so
       // they're the "closest in time" batch loadEarlierMessages pops first.
       st._earlierMessages = (st._earlierMessages || []).concat(evicted);
-      st._hasMoreHistory = st._earlierMessages.length > 0;
+      st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
     },
     hasMoreHistory(sid) {
       sid = sid || this.currentId;
       if (!sid) return false;
       const st = this.tabState[sid];
-      return !!(st && st._hasMoreHistory);
+      if (!st) return false;
+      // More to show if the in-memory stash has older bubbles OR the server
+      // still holds bubbles before our window — but not once we've hit the
+      // in-memory ceiling (then historyTruncated() takes over).
+      const held = (st.messages ? st.messages.length : 0)
+                 + (st._earlierMessages ? st._earlierMessages.length : 0);
+      if (st._earlierMessages && st._earlierMessages.length) return true;
+      return st._loadedOffset > 0 && held < this.MAX_IN_MEMORY;
     },
     earlierMessageCount(sid) {
       sid = sid || this.currentId;
       if (!sid) return 0;
       const st = this.tabState[sid];
-      return st && st._earlierMessages ? st._earlierMessages.length : 0;
+      if (!st) return 0;
+      // Older messages = those still on the server (before our window) plus
+      // those held in the in-memory stash.
+      const stash = st._earlierMessages ? st._earlierMessages.length : 0;
+      return (st._loadedOffset || 0) + stash;
     },
     historyTruncated(sid) {
       sid = sid || this.currentId;
       if (!sid) return false;
       const st = this.tabState[sid];
-      return !!(st && st._truncatedFromTop);
+      if (!st) return false;
+      // Hit the in-memory ceiling while older history still exists on the
+      // server: "Load earlier" stops here, the rest stays in the JSONL.
+      const held = (st.messages ? st.messages.length : 0)
+                 + (st._earlierMessages ? st._earlierMessages.length : 0);
+      return st._loadedOffset > 0 && held >= this.MAX_IN_MEMORY
+             && !(st._earlierMessages && st._earlierMessages.length);
     },
 
     async renameSession() {
@@ -6782,20 +6981,37 @@ function portal() {
     async addMcpFromDraft() {
       const d = this.settings.mcpDraft;
       const name = (d.name || "").trim();
-      const command = (d.command || "").trim();
-      if (!name || !command) {
-        this.toast(this.t("set.mcp.name_command_required"), "warn", 2500);
-        return;
+      const remote = d.transport === "remote";
+      // Build the request body per transport. Remote → {type:http, url,
+      // headers}; local → {command, args, env}. Validation differs too.
+      let body;
+      if (remote) {
+        const url = (d.url || "").trim();
+        if (!name || !url) {
+          this.toast(this.t("set.mcp.name_url_required"), "warn", 2500);
+          return;
+        }
+        const headers = {};
+        const auth = (d.authHeader || "").trim();
+        if (auth) headers["Authorization"] = auth;
+        body = { name, type: "http", url, headers, disabled: false };
+      } else {
+        const command = (d.command || "").trim();
+        if (!name || !command) {
+          this.toast(this.t("set.mcp.name_command_required"), "warn", 2500);
+          return;
+        }
+        const args = (d.argsStr || "").trim().split(/\s+/).filter(Boolean);
+        body = { name, command, args, env: {}, disabled: false };
       }
-      const args = (d.argsStr || "").trim().split(/\s+/).filter(Boolean);
       const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}`, {
         method: "PUT",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ name, command, args, env: {}, disabled: false }),
+        body: JSON.stringify(body),
       });
       if (r.ok) {
         this.toast(this.t("set.mcp.added"), "success", 1500);
-        this.settings.mcpDraft = { show: false, name: "", command: "", argsStr: "" };
+        this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
         this.refreshMcpList();
       } else {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
@@ -7122,13 +7338,16 @@ function portal() {
     },
 
     async installMcpPreset(ex) {
+      // Presets may be either stdio (command/args) or remote (url/headers).
+      const body = (ex.type === "http" || ex.type === "sse" || ex.url)
+        ? { name: ex.name, type: ex.type || "http", url: ex.url,
+            headers: ex.headers || {}, disabled: false }
+        : { name: ex.name, command: ex.command, args: ex.args || [],
+            env: ex.env || {}, disabled: false };
       const r = await fetch(`/api/settings/mcp/${encodeURIComponent(ex.name)}`, {
         method: "PUT",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: ex.name, command: ex.command, args: ex.args || [],
-          env: ex.env || {}, disabled: false,
-        }),
+        body: JSON.stringify(body),
       });
       if (r.ok) {
         this.toast(this.t("set.mcp.installed"), "success", 1500);
@@ -8408,14 +8627,14 @@ function portal() {
     // Returns a Promise that resolves once every block in `root` is
     // highlighted AND artifacts (mermaid/HTML) are rendered. Most callers
     // fire-and-forget; loadSession awaits it to know when to reveal the view.
-    highlightCode(root) {
+    highlightCode(root, scopeEls = null) {
       if (!window.hljs) {
         // Lazy-load hljs on first need, then re-call. Without this guard
         // a chat with no code blocks never pays the 124 KB download cost.
         // Re-call returns immediately if the root has no <code> children,
         // and idempotently highlights any blocks that appeared since the
         // last paint (data-hl="1" sentinel prevents double work).
-        return this._loadHljs().then(() => this.highlightCode(root))
+        return this._loadHljs().then(() => this.highlightCode(root, scopeEls))
           .catch(e => console.warn("[muselab] hljs lazy-load failed:", e));
       }
       // Snapshot the not-yet-highlighted blocks. We DON'T highlight them all
@@ -8425,15 +8644,24 @@ function portal() {
       // on boot. Instead process in small batches, yielding to the event loop
       // between them so the UI stays responsive (a brief flash of
       // unhighlighted code is acceptable; a frozen page is not).
-      const nodes = Array.from(document.querySelectorAll(root + " code"))
-        .filter(el => el.dataset.hl !== "1");
+      //
+      // scopeEls (optional): when the caller knows the new content is confined
+      // to a freshly-inserted subtree (e.g. a "Load earlier" batch prepended
+      // to a long, paged-in history), it passes those element(s) so we query
+      // only within them — O(new blocks) instead of rescanning the whole chat
+      // body's O(total blocks) each click. The data-hl sentinel still makes a
+      // too-broad scope merely redundant, never wrong.
+      const nodes = scopeEls
+        ? this._collectCodeNodes(scopeEls, "code").filter(el => el.dataset.hl !== "1")
+        : Array.from(document.querySelectorAll(root + " code"))
+            .filter(el => el.dataset.hl !== "1");
       const runArtifacts = () => {
         // After hljs finishes, scan for Artifact-eligible code blocks (mermaid
         // diagrams, HTML previews). Limited to chat messages and markdown
         // previews — file previews (.text) are raw read-only views where
         // auto-rendering embedded HTML / running Mermaid would be unexpected.
         if (root === ".chat-body" || root === ".markdown") {
-          return this._renderArtifacts(root).catch(e =>
+          return this._renderArtifacts(root, scopeEls).catch(e =>
             console.warn("[muselab] artifacts render failed:", e));
         }
         return Promise.resolve();
@@ -8453,6 +8681,39 @@ function portal() {
         };
         pump();
       });
+    },
+    // Gather matching descendant (and self) elements within a scope that may
+    // be a single Element, a NodeList, or an Array of Elements. Used to scope
+    // highlightCode / _renderArtifacts to a freshly-inserted subtree instead
+    // of rescanning the whole chat body.
+    _collectCodeNodes(scopeEls, selector) {
+      const els = (Array.isArray(scopeEls) || scopeEls instanceof NodeList)
+        ? Array.from(scopeEls)
+        : [scopeEls];
+      const out = [];
+      for (const el of els) {
+        if (!el || !el.querySelectorAll) continue;
+        if (el.matches && el.matches(selector)) out.push(el);
+        el.querySelectorAll(selector).forEach(n => out.push(n));
+      }
+      return out;
+    },
+    // Walk the FIRST `n` `.msg` element children of the chat body — the
+    // bubbles just prepended by a "Load earlier" / jump-into-history batch
+    // (unshift puts them at the front). Stops as soon as it has n, so it's
+    // O(n) regardless of how much history is already rendered. The
+    // load-earlier-wrap is the chat body's first child but isn't a `.msg`,
+    // so it's skipped naturally.
+    _leadingMsgEls(n) {
+      const body = this.$refs.chatBody;
+      if (!body || n <= 0) return [];
+      const out = [];
+      let node = body.firstElementChild;
+      while (node && out.length < n) {
+        if (node.classList && node.classList.contains("msg")) out.push(node);
+        node = node.nextElementSibling;
+      }
+      return out;
     },
     // Highlight a single <code> block (extracted from highlightCode so the
     // chunked pump can call it per element). Idempotent via the data-hl
@@ -8797,8 +9058,15 @@ function portal() {
       return this._mermaidLoadPromise;
     },
 
-    async _renderArtifacts(rootSelector) {
-      const pres = document.querySelectorAll(rootSelector + " pre > code");
+    async _renderArtifacts(rootSelector, scopeEls = null) {
+      // scopeEls: when given, only scan the freshly-inserted subtree for
+      // artifact-eligible blocks instead of the whole chat body. Per-block
+      // dataset guards already make a full rescan idempotent, but on a deeply
+      // paged-in history the full `querySelectorAll` itself is the cost; the
+      // scope keeps "Load earlier" O(new blocks).
+      const pres = scopeEls
+        ? this._collectCodeNodes(scopeEls, "pre > code")
+        : document.querySelectorAll(rootSelector + " pre > code");
       for (const codeEl of pres) {
         const pre = codeEl.parentElement;
         // Skip <pre> nested INSIDE an existing artifact's source viewer
@@ -9373,6 +9641,12 @@ function portal() {
       // chat side needs rightOpen forced. Skipped on exit (next === "")
       // to preserve the user's prior leftOpen/rightOpen layout.
       if (next === "chat") this.rightOpen = true;
+      // FIX ⑥ (2026-05-30 follow-up): persist the fullscreen state so a
+      // refresh restores it. There's no $watch("desktopFullPane"), and the
+      // sibling exit paths (toggleFilesPane / toggleChatPane) already call
+      // savePrefs — this entry/exit path was the one gap, so toggling
+      // fullscreen via the maximize button never stuck across a reload.
+      this.savePrefs();
     },
     // computedOpenFilesHeight() removed — auto-fit now relies on CSS
     // (.open-files-list max-height + .open-files height: auto). Splitter
@@ -9847,15 +10121,27 @@ function portal() {
     // chatted yet. Tailored a bit to what data they've dropped in.
     // Skill chips for the onboarding card — give a short, friendly example
     // prompt that triggers each known skill (matches the 7 presets in skills/).
+    // The 7 preset skills shipped under skills/. Only labels are bespoke; the
+    // inserted prompt comes from _skillSeed() so every skill reads identically.
     SKILL_TRIGGERS: [
-      { name: "web-search",         label_zh: "查时效数据",  label_en: "live web fact",     prompt_zh: "查一下今天 USD 兑 CNY 的汇率，给出处" },
-      { name: "markdown-formatter", label_zh: "整理 markdown", label_en: "clean markdown",   prompt_zh: "帮我把这段 markdown 整理一下" },
-      { name: "mermaid-helper",     label_zh: "画架构图",    label_en: "draw a diagram",   prompt_zh: "画一张三栏 web 应用的架构图" },
-      { name: "code-reviewer",      label_zh: "code review", label_en: "code review",      prompt_zh: "帮我 review 这段代码：" },
-      { name: "citation-formatter", label_zh: "格式化引用",  label_en: "format a citation", prompt_zh: "把 DOI 10.1038/nature12345 格式化为 APA" },
-      { name: "task-decomposer",    label_zh: "拆任务",      label_en: "decompose a goal", prompt_zh: "帮我把「6 个月内换工作」拆成可执行任务" },
-      { name: "summary-distiller",  label_zh: "长文摘要",    label_en: "summarize",         prompt_zh: "总结这篇文章的要点" },
+      { name: "web-search",         label_zh: "查时效数据",   label_en: "live web fact" },
+      { name: "markdown-formatter", label_zh: "整理 markdown", label_en: "clean markdown" },
+      { name: "mermaid-helper",     label_zh: "画架构图",     label_en: "draw a diagram" },
+      { name: "code-reviewer",      label_zh: "code review",  label_en: "code review" },
+      { name: "citation-formatter", label_zh: "格式化引用",   label_en: "format a citation" },
+      { name: "task-decomposer",    label_zh: "拆任务",       label_en: "decompose a goal" },
+      { name: "summary-distiller",  label_zh: "长文摘要",     label_en: "summarize" },
     ],
+
+    // Single source of truth for the prompt we seed when a user picks a skill
+    // (onboarding chip OR a skill card's "Try this"). Naming the skill
+    // explicitly ("用 X skill 帮我" / "Use the X skill to") makes the model read
+    // it as an instruction to INVOKE that skill; the bare "用 X 帮我" form
+    // triggered less reliably. Kept identical across every entry point so the
+    // wording stays consistent everywhere.
+    _skillSeed(name) {
+      return this.lang === "zh" ? `用 ${name} skill 帮我：` : `Use the ${name} skill to: `;
+    },
 
     skillSuggestions() {
       const loaded = new Set(this.settings.skills.map(s => s.name));
@@ -9865,7 +10151,7 @@ function portal() {
         .map(t => ({
           name: t.name,
           label: lang === "zh" ? t.label_zh : t.label_en,
-          prompt: t.prompt_zh,   // prompt always Chinese (Muse responds in user's lang)
+          prompt: this._skillSeed(t.name),   // uniform seed across all skills
           description: lang === "zh" ? "触发 skill: " + t.name : "Triggers skill: " + t.name,
         }))
         .slice(0, 6);
@@ -9883,18 +10169,11 @@ function portal() {
       });
     },
 
-    // "Try this" button on a skill card. For the 7 hand-crafted skills
-    // (see SKILL_TRIGGERS), uses the concrete demo prompt. For other
-    // skills (user-installed Claude Code skills + plugin skills), generates
-    // a generic seed and focuses the chat input so the user can fill in
-    // the rest. Closes the Settings modal first so the chat is visible.
+    // "Try this" button on a skill card. Seeds the chat input with a uniform
+    // skill-invocation prompt (see _skillSeed) and focuses it so the user can
+    // fill in the rest. Closes the Settings modal first so the chat is visible.
     trySkill(sk) {
-      const zh = this.lang === "zh";
-      // Look up hand-crafted prompt by name; fall back to generic seed.
-      const hand = (this.SKILL_TRIGGERS || []).find(t => t.name === sk.name);
-      const prompt = hand
-        ? hand.prompt_zh
-        : (zh ? `用 ${sk.name} 帮我：` : `Use ${sk.name} to: `);
+      const prompt = this._skillSeed(sk.name);
       // Close settings modal if open
       if (this.settings && this.settings.show) this.settings.show = false;
       // Close skills drawer if open
@@ -9966,18 +10245,8 @@ function portal() {
       const handcrafted = {
         gmail: zh ? "用 gmail MCP 帮我看下最近 10 封未读邮件，简要列出标题和发件人。"
                   : "Use the gmail MCP to list my 10 most recent unread emails — just subject + sender.",
-        filesystem: zh ? "用 filesystem MCP 列出 archive 里所有 markdown 文件。"
-                       : "Use the filesystem MCP to list every markdown file under the archive.",
-        memory: zh ? "用 memory MCP 看看现在记录了哪些关于我的事实。"
-                   : "Use the memory MCP to show what facts you've recorded about me.",
         fetch: zh ? "用 fetch MCP 抓一下 https://news.ycombinator.com 首页标题。"
                   : "Use the fetch MCP to grab the front-page titles from https://news.ycombinator.com.",
-        git: zh ? "用 git MCP 看看当前仓库的最近 5 条 commit。"
-                : "Use the git MCP to show the last 5 commits on the current repo.",
-        time: zh ? "用 time MCP 告诉我现在北京时间几点。"
-                 : "Use the time MCP to tell me the current Beijing time.",
-        "sequential-thinking": zh ? "用 sequential-thinking MCP 帮我把这个问题拆解一下："
-                                  : "Use the sequential-thinking MCP to break down this problem step by step: ",
       };
       const prompt = handcrafted[s.name]
         || (zh ? `用 ${s.name} MCP 帮我：` : `Use the ${s.name} MCP to: `);
@@ -10159,7 +10428,7 @@ function portal() {
     // copy / use as basis. The "true" compact is a feature of the underlying
     // CLI we don't have direct API for, so we implement it as a synthesized
     // summarize-and-fork workflow.
-    async runCompact(targetSid) {
+    async runCompact(targetSid, opts = {}) {
       // Default to the active session — the manual ctx-ring click + the
       // command palette both want "compact what I'm looking at". The
       // auto-compact path (done event when ctx >= 95%) passes streamSid
@@ -10186,6 +10455,25 @@ function portal() {
       if (!hasFrontendContent && backendCount < 2) {
         this.toast(this.t("ctx.compact_empty"), "warn", 2500);
         return;
+      }
+
+      // Confirmation gate — compaction is a 20–60s, history-rewriting
+      // action, so a misfired ctx-ring click shouldn't kick it off.
+      // Only manual triggers (ctx ring / command palette / error CTA)
+      // prompt; the automatic ≥95% safety compact and the 85–94% toast
+      // button pass { skipConfirm:true } since they're already user-
+      // intended (or deliberately silent to avoid the hard limit).
+      if (!opts.skipConfirm) {
+        const zh = this.lang === "zh";
+        const ok = await this.confirm({
+          title: zh ? "压缩对话？" : "Compact session?",
+          body: zh
+            ? "把当前对话历史归纳成摘要以释放上下文窗口，原始消息仍保留在会话记录里。耗时约 20–60 秒。"
+            : "Summarize the conversation so far into a compact summary to free up the context window. Your original messages stay in the session file. Takes about 20–60s.",
+          okText: zh ? "压缩" : "Compact",
+          cancelText: zh ? "取消" : "Cancel",
+        });
+        if (!ok) return;
       }
 
       // Native compact: send "/compact" to CLI via SDK, which writes
@@ -10435,10 +10723,123 @@ function portal() {
       // this guard, once the user is meaningfully scrolled up the
       // viewport stays put until they manually scroll back to the bottom.
       if (!force && !this.atBottom) return;
+      if (force) {
+        // Explicit jump (the ↓ FAB). `.msg` uses content-visibility:auto,
+        // so off-screen bubbles report an ESTIMATED height (the 200px
+        // contain-intrinsic-size placeholder). A one-shot scrollTop =
+        // scrollHeight therefore lands short — as bottom content scrolls
+        // into view and realizes its (taller) real height, scrollHeight
+        // keeps growing. Re-slam to the bottom each frame until scrollHeight
+        // stops growing. See _settleScrollToBottom.
+        this._settleScrollToBottom();
+        this.atBottom = true;
+        return;
+      }
+      // Streaming auto-follow path: bottom region is already realized,
+      // so the cheap single-shot is accurate and avoids per-chunk rAF.
       this.$nextTick(() => {
         el.scrollTop = el.scrollHeight;
         this.atBottom = true;
       });
+    },
+
+    // Re-slam the viewport to the very bottom each frame until the
+    // document height stops growing. Needed because `.msg {
+    // content-visibility: auto }` reports off-screen bubbles at their
+    // estimated (200px placeholder) height; as the bottom content scrolls
+    // into view its real, usually taller, height realizes and scrollHeight
+    // keeps growing. A single `scrollTop = scrollHeight` therefore lands
+    // short. Converge: keep pinning to the bottom until scrollHeight has
+    // been stable for two consecutive frames (heights realized) or the
+    // frame budget is spent.
+    _settleScrollToBottom({ maxFrames = 40 } = {}) {
+      const el = this.$refs.chatBody;
+      if (!el) return;
+      let frames = 0;
+      let lastH = -1;
+      let stable = 0;
+      const step = () => {
+        el.scrollTop = el.scrollHeight; // browser clamps to valid range
+        frames++;
+        const h = el.scrollHeight;
+        if (Math.abs(h - lastH) < 1) {
+          // Height held steady this frame; require two in a row so a
+          // mid-realization plateau doesn't end the loop prematurely.
+          if (++stable >= 2) return;
+        } else {
+          stable = 0;
+        }
+        lastH = h;
+        if (frames >= maxFrames) return;
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    },
+
+    // Scroll chatBody so the element returned by getEl() sits desiredRelTop
+    // px below the viewport's top edge, converging across a handful of
+    // frames. Needed because `.msg { content-visibility: auto }` makes
+    // off-screen bubble heights mere estimates — an off-screen element's
+    // getBoundingClientRect shifts as we scroll through siblings and their
+    // real heights realize. Each frame we measure the element's CURRENT
+    // distance from the top and nudge scrollTop by the residual, so the
+    // landing stays accurate even as upstream heights change underfoot.
+    _settleScrollToEl(getEl, desiredRelTop = 0, { maxFrames = 40 } = {}) {
+      const el = this.$refs.chatBody;
+      if (!el) return;
+      let frames = 0;
+      let onTarget = 0;
+      const step = () => {
+        const target = getEl();
+        if (!target) return;
+        const bodyTop = el.getBoundingClientRect().top;
+        const cur = target.getBoundingClientRect().top - bodyTop;
+        const delta = cur - desiredRelTop;
+        frames++;
+        if (Math.abs(delta) < 1) {
+          // On target; require two consecutive on-target frames so a
+          // transient match mid-realization doesn't stop us early.
+          if (++onTarget >= 2) return;
+        } else {
+          onTarget = 0;
+          el.scrollTop += delta; // browser clamps to valid range
+        }
+        if (frames >= maxFrames) return;
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    },
+
+    // Step the viewport up to the previous user message — the nearest
+    // `.msg.user` whose top sits above the current viewport top. Repeated
+    // clicks walk back through the conversation one user turn at a time.
+    // If nothing is above (already at/above the first question) we snap to
+    // the very first user message.
+    jumpToPrevUser() {
+      const el = this.$refs.chatBody;
+      if (!el) return;
+      const users = Array.from(el.querySelectorAll(".msg.user"));
+      if (!users.length) return;
+      const contTop = el.getBoundingClientRect().top;
+      const threshold = 4; // px; element must be meaningfully above the top
+      let target = null;
+      for (const u of users) {
+        // Position of this user msg's top relative to the scroll viewport.
+        if (u.getBoundingClientRect().top - contTop < -threshold) {
+          target = u; // keep the LAST one above → nearest above the fold
+        } else {
+          break; // DOM order is top→bottom; rest are below the fold
+        }
+      }
+      if (!target) target = users[0];
+      // Don't use scrollIntoView: with content-visibility:auto the target's
+      // estimated position is wrong until its real height realizes, so a
+      // single smooth scroll lands off. Converge on the measured position
+      // each frame (12px breathing room above the top edge). See
+      // _settleScrollToEl for the content-visibility rationale.
+      this._settleScrollToEl(() => target, 12);
+      target.classList.add("msg-highlight");
+      setTimeout(() => target.classList.remove("msg-highlight"), 2400);
     },
 
     async send(opts = {}) {
@@ -11130,14 +11531,14 @@ function portal() {
             this.toast(zh ? `上下文 ${Math.round(ctxPct)}%，自动压缩中…`
                           : `Context ${Math.round(ctxPct)}% — auto-compacting…`,
                        "info", 3000);
-            this.runCompact(streamSid);
+            this.runCompact(streamSid, { skipConfirm: true });
           });
         } else if (ctxPct >= 85 && ctxPct < 95 && !this._ctxWarned[streamSid]) {
           this._ctxWarned[streamSid] = true;
           this.toast(
             this.t("ctx.window_warn", { pct: Math.round(ctxPct) }),
             "warn", 6000,
-            { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact(streamSid) },
+            { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact(streamSid, { skipConfirm: true }) },
           );
         }
         // Pass the backend's `cancelled` flag through to _markDone so it
