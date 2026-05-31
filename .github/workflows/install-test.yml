@@ -1,0 +1,247 @@
+# Cross-OS install-script regression. Runs the platform installers in
+# non-interactive mode on clean runners and verifies the backend actually
+# starts + answers /api/health. Catches issues that pytest can't — Node
+# auto-install failures, fnm/brew path quirks, Docker image regressions, etc.
+#
+# `MUSELAB_SKIP_SERVICE=1` is set so we don't try to register systemd /
+# launchd on the runner (no logind session on Linux GHA). The test then
+# launches the backend manually and probes /api/health to confirm the
+# install plumbing works.
+
+name: install-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/install-*'
+      - 'scripts/quick-install.sh'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/install-test.yml'
+  pull_request:
+    paths:
+      - 'scripts/install-*'
+      - 'scripts/quick-install.sh'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/install-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: 22.04 + 24.04 (both LTS releases users actually run). The runner
+  # comes with Node pre-installed, so the auto-install path skips — but uv
+  # and claude CLI are NOT pre-installed, exercising both fallbacks.
+  # ---------------------------------------------------------------------------
+  linux:
+    name: linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    env:
+      MUSELAB_NONINTERACTIVE: "1"
+      MUSELAB_SKIP_SERVICE:   "1"
+      MUSELAB_NO_BROWSER:     "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Run install-linux.sh
+        run: bash scripts/install-linux.sh
+
+      - name: Launch backend in background
+        run: |
+          set -a; source .env; set +a
+          nohup uv run python -m backend.main > backend.log 2>&1 &
+          echo $! > backend.pid
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8765/api/health; then echo " — up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::backend never answered /api/health"
+          cat backend.log || true
+          exit 1
+
+      - name: Stop backend
+        if: always()
+        run: kill "$(cat backend.pid)" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.os }}-logs
+          # NOTE: do NOT upload .env — it holds MUSELAB_TOKEN (a secret) and
+          # any provider API keys the install wrote. Artifacts are downloadable
+          # by anyone with repo read access, so uploading .env leaks creds.
+          # backend.log is enough to debug a failed boot.
+          path: |
+            backend.log
+
+  # ---------------------------------------------------------------------------
+  # macOS: 13 (Intel) + 14 (Apple Silicon). Runner has brew pre-installed
+  # AND Node, so the auto-install path takes the brew branch (or no-op).
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macos (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # macos-13 (Intel) routinely queues for 20+ hours on the free GHA
+    # runner pool — but we don't want to drop Intel coverage entirely.
+    # Flag the Intel matrix entry as best-effort: failure or runner
+    # starvation timeout doesn't cascade into an install-test workflow
+    # failure. macos-14 (Apple Silicon) is the required signal.
+    continue-on-error: ${{ matrix.os == 'macos-13' }}
+    # Cap per-job wall time so install-test as a whole returns in
+    # ~20 min worst case (the default is 360 min = 6h, and stuck
+    # queues can sit on top of that pushing total to 24h).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14]
+    env:
+      MUSELAB_NONINTERACTIVE: "1"
+      MUSELAB_SKIP_SERVICE:   "1"
+      MUSELAB_NO_BROWSER:     "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Run install-macos.sh
+        run: bash scripts/install-macos.sh
+
+      - name: Launch backend in background
+        run: |
+          set -a; source .env; set +a
+          nohup uv run python -m backend.main > backend.log 2>&1 &
+          echo $! > backend.pid
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8765/api/health; then echo " — up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::backend never answered /api/health"
+          cat backend.log || true
+          exit 1
+
+      - name: Stop backend
+        if: always()
+        run: kill "$(cat backend.pid)" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.os }}-logs
+          # NOTE: do NOT upload .env — it holds MUSELAB_TOKEN (a secret) and
+          # any provider API keys. Artifacts are downloadable by anyone with
+          # repo read access. backend.log is enough to debug a failed boot.
+          path: |
+            backend.log
+
+  # ---------------------------------------------------------------------------
+  # Docker: build the image AND actually run it. Existing ci.yml docker
+  # job only builds — that misses runtime regressions (missing dep,
+  # bad CMD args, healthcheck broken). This job complements it.
+  # ---------------------------------------------------------------------------
+  docker-run:
+    name: docker (build + run + probe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (single-arch, cache-from gha)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true             # makes the image available to docker run
+          tags: muselab:itest
+          cache-from: type=gha
+
+      - name: Prepare archive + token
+        run: |
+          mkdir -p test-archive
+          # Container runs as `muse` (uid 1000); the runner creates the
+          # bind-mount source as a different uid. Without this chown, the
+          # backend's push subsystem hits PermissionError trying to mkdir
+          # <ROOT>/.muselab/ for VAPID key storage. (Push gracefully
+          # degrades — but other features that mkdir under ROOT would
+          # have the same problem, so fix it at the mount layer.)
+          sudo chown -R 1000:1000 test-archive
+          echo "MUSELAB_TOKEN=$(openssl rand -hex 32)" > test.env
+
+      - name: Run container
+        run: |
+          docker run -d --name muselab-itest \
+            --env-file test.env \
+            -e MUSELAB_ROOT=/data \
+            -p 127.0.0.1:8765:8765 \
+            -v $PWD/test-archive:/data \
+            muselab:itest
+
+      - name: Wait for /api/health (up to 60s — first-boot includes uvicorn cold start)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fs http://127.0.0.1:8765/api/health; then echo " — up after ${i}s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::container never answered /api/health"
+          docker logs muselab-itest || true
+          exit 1
+
+      - name: Verify HEALTHCHECK passing
+        run: |
+          # The Dockerfile's HEALTHCHECK is start_period=15s + interval=30s,
+          # so the FIRST scheduled probe doesn't run until ~45s into the
+          # container's life and Docker reports "starting" the whole time
+          # before that — even though /api/health is already answering.
+          # Poll docker inspect for up to 90 more seconds so the test passes
+          # as soon as the first real probe completes, instead of failing
+          # because we asked too early.
+          for i in $(seq 1 90); do
+            status="$(docker inspect --format='{{.State.Health.Status}}' muselab-itest)"
+            if [[ "$status" == "healthy" ]]; then
+              echo "container health: healthy (after ${i}s of polling)"
+              exit 0
+            fi
+            if [[ "$status" == "unhealthy" ]]; then
+              echo "::error::container reported unhealthy"
+              docker logs muselab-itest
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::healthcheck never transitioned to healthy (last status: $status)"
+          docker logs muselab-itest
+          exit 1
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f muselab-itest 2>/dev/null || true
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs muselab-itest 2>&1 || true

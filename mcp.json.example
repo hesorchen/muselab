@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "description": "Optional. Fetch a web page as markdown. Muse's built-in WebFetch already covers most pages — add this only if you need it (e.g. some auth'd pages). Requires: uv. This entry is just an example of the config shape; delete or replace it."
+    }
+  }
+}

@@ -1,0 +1,95 @@
+[project]
+name = "muselab"
+version = "1.0.0"
+description = "Self-hosted web UI for the Claude Agent SDK — talk to your own files with Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "hesorchen", email = "hesorchen@gmail.com" },
+]
+keywords = [
+    "claude",
+    "anthropic",
+    "claude-agent-sdk",
+    "mcp",
+    "self-hosted",
+    "llm",
+    "ai-assistant",
+    "personal-archive",
+    "deepseek",
+    "pwa",
+]
+classifiers = [
+    # PyPI Trove classifiers — surface project status / audience / license /
+    # platform / Python version so PyPI search and dependency-graph tools
+    # can categorise muselab even though it's not meant to be `pip install`-able
+    # (it's a server you self-host, not a library).
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Office/Business",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.2.82",
+    "fastapi>=0.136.3",
+    # Pin starlette above the fastapi-transitive 1.0.0, which carries
+    # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
+    # CVE-scan CI job stays green.
+    "starlette>=1.0.1",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.28",
+    "uvicorn[standard]>=0.48.0",
+    # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
+    # native deps; safe to ship in the muselab Docker image.
+    "openpyxl>=3.1.5",
+    # Web Push: VAPID-signed pushes to browsers / PWAs subscribed to
+    # /api/push/subscribe. Has a transitive cryptography dep but no
+    # external binaries.
+    "pywebpush>=2.0.0",
+    "pillow>=12.2.0",
+]
+
+[project.urls]
+Homepage      = "https://github.com/hesorchen/muselab"
+Source        = "https://github.com/hesorchen/muselab"
+Issues        = "https://github.com/hesorchen/muselab/issues"
+Documentation = "https://github.com/hesorchen/muselab/blob/main/docs/quickstart.md"
+Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    # Pinned alongside dev deps so `scripts/lint.sh` and CI both have a
+    # deterministic ruff version. Without this each dev / CI run pulled
+    # latest via `uv run --with ruff`, occasionally causing rule churn.
+    "ruff>=0.15.14",
+]
+
+# Ruff config — keep targeted, not aggressive. Goal: catch real bugs
+# (unused imports / variables, broken syntax-adjacent patterns) without
+# fighting a project that values terse multi-statement-on-one-line where
+# it reads naturally. Style enforcement is left to human review.
+[tool.ruff]
+target-version = "py312"
+line-length = 100   # informational; we don't auto-format
+
+[tool.ruff.lint]
+# Default ruleset (E, F, W) — pyflakes + pycodestyle errors only.
+# Explicitly NO opinionated rule families (B, I, N, UP) — they'd churn
+# 6k LOC of working code for marginal gain.
+select = ["E", "F", "W"]
+# Project-specific tolerances:
+# - E501 line-too-long: many existing lines are 100-120 chars by deliberate
+#   choice (one full sentence per comment line). Not worth the churn.
+ignore = ["E501"]

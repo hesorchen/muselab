@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python >=3.12 — test both supported minors. macOS is cheap
+        # to add (one entry) and catches POSIX-but-not-Linux path / fs quirks;
+        # pin it to the primary Python to keep the matrix to 3 jobs.
+        os: [ubuntu-latest]
+        python-version: ["3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # Cache the uv download/resolve so each run reuses the previous
+          # wheel set instead of a full pull. Keyed on uv.lock.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install deps
+        run: uv sync --frozen
+      - name: Run tests
+        env:
+          # Use a minimal env so backend.settings doesn't refuse to import.
+          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
+          MUSELAB_ROOT: ${{ github.workspace }}/.ci-archive
+        run: |
+          mkdir -p $MUSELAB_ROOT
+          uv run pytest tests/ -v
+
+      - name: Coverage report (non-blocking, informational)
+        # Best-effort coverage. pytest-cov is pulled ephemerally via
+        # `uv run --with` so it does NOT touch the frozen lockfile (adding it
+        # to dev deps would require regenerating uv.lock). No fail-under gate —
+        # this surfaces coverage in the run log without turning a dip into a
+        # red build. Only run once (primary py on Linux) to avoid matrix noise.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        continue-on-error: true
+        env:
+          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
+          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-archive
+        run: |
+          mkdir -p $MUSELAB_ROOT
+          uv run --with pytest-cov pytest tests/ -q \
+            --cov=backend --cov-report=term-missing
+
+  lint:
+    name: ruff + muselab-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install deps
+        # Sync dev group so the pinned ruff version from pyproject.toml is
+        # used (matches `scripts/lint.sh` local dev). Replaces the previous
+        # `uv tool install ruff` which pulled latest non-reproducibly.
+        run: uv sync --frozen
+      - name: ruff check
+        # Blocking now that the backend is clean — regressions fail CI
+        # instead of accumulating silently.
+        run: uv run ruff check backend/ tests/
+      - name: muselab lint (encoding / class collisions)
+        # Catches the bug classes we've shipped historically — Python file
+        # I/O without encoding, etc. See scripts/lint.sh for the rule list.
+        run: bash scripts/lint.sh
+
+  # Lightweight frontend gate. The frontend is plain (non-module) browser JS
+  # loaded via <script defer> — no build step, no bundler, no TS. So we keep
+  # the toolchain to zero: `node --check` is a syntax-only parse (catches the
+  # broken-paren / stray-comma class that would white-screen the app), plus a
+  # JSON sanity check on the web manifest.
+  frontend-lint:
+    name: frontend syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: node --check all frontend JS
+        run: |
+          set -e
+          for f in frontend/app.js frontend/sw.js \
+                   frontend/data/constants.js frontend/i18n/index.js; do
+            echo "node --check $f"
+            node --check "$f"
+          done
+      - name: Validate web manifest JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('frontend/assets/manifest.webmanifest','utf8')); console.log('manifest JSON OK')"
+
+  # Dependency vulnerability scan. dependabot keeps deps current, but doesn't
+  # surface KNOWN CVEs in the currently-pinned set — pip-audit does. Runs
+  # against the frozen lockfile so it reflects what actually ships. Non-blocking
+  # for now (informational) so a freshly-disclosed advisory doesn't wedge all
+  # PRs before maintainers can triage; flip to blocking once the baseline is clean.
+  security:
+    name: pip-audit (dependency CVE scan)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install deps (frozen)
+        run: uv sync --frozen
+      - name: pip-audit
+        # Audit the resolved environment. pip-audit is pulled ephemerally via
+        # `uv run --with` so it doesn't touch the frozen lockfile.
+        run: uv run --with pip-audit pip-audit
+
+  # End-to-end Playwright browser tests. Gated behind RUN_E2E=1 (default-skip
+  # locally so contributors don't need Chromium). This job installs the browser
+  # and runs them. Marked continue-on-error to start: browser tests are
+  # inherently flakier than unit tests, and we don't want a transient timeout
+  # to block merges before the suite has proven stable. Promote to required
+  # once it's reliably green.
+  e2e:
+    name: e2e (playwright, allow-failure)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install deps + playwright
+        # pytest-playwright pulled ephemerally (not in the frozen dev lock).
+        run: uv run --with pytest-playwright playwright install --with-deps chromium
+      - name: Run e2e tests
+        env:
+          RUN_E2E: "1"
+          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
+          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-archive
+        run: |
+          mkdir -p $MUSELAB_ROOT
+          uv run --with pytest-playwright pytest tests/e2e/ -v
+
+  # Builds the Dockerfile on every PR (smoke), and on push to main / tags it
+  # publishes a multi-arch image to GitHub Container Registry.
+  #   ghcr.io/<owner>/muselab:latest       — main branch HEAD
+  #   ghcr.io/<owner>/muselab:1.2.3        — git tag v1.2.3
+  #   ghcr.io/<owner>/muselab:1.2          — major.minor of latest tag
+  #   ghcr.io/<owner>/muselab:sha-<short>  — every commit on main
+  docker:
+    name: docker build + publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # required for ghcr.io push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+        if: github.event_name != 'pull_request'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Image name lowercased — ghcr is case-sensitive on /<owner>
+          images: ghcr.io/${{ github.repository_owner }}/muselab
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # PR: build only (single arch) for smoke test — no push, no QEMU cost.
+      - name: Build (PR smoke test, no push)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: muselab:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # main / tags: multi-arch build + push.
+      - name: Build + push (multi-arch)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

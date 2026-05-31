@@ -1,0 +1,58 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node (none, but defensive)
+node_modules/
+
+# Dev-only vendor bundle: index.html loads alpine.min.js in production; the
+# unminified alpine.dev.js (~108KB) is only used for local debugging and would
+# otherwise add dead weight to every (multi-arch) image layer.
+frontend/vendor/alpine.dev.js
+
+# Data — sessions persisted via volume mount; archive lives outside
+sessions/
+data/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Local config + secrets (each user supplies their own at runtime). These
+# must NEVER end up baked into the image layer — anyone who pulls the image
+# could extract them. NOTE: .dockerignore only treats `#` as a comment at the
+# START of a line, so keep patterns and comments on separate lines.
+.env
+.env.local
+# .env.bak-portal and any other local env snapshots
+.env.*
+# router auth token
+.router-token
+# may contain MCP server API keys / secrets
+mcp.json
+# timestamped backup dirs/files (sessions.bak-*, .env.bak-*)
+*.bak-*
+*.bak
+.credentials.json
+
+# Docs / project meta
+README.md
+TODO.md
+*.md
+LICENSE
+
+# CI / build cruft
+dist/
+build/
+*.egg-info/

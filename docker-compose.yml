@@ -1,0 +1,73 @@
+services:
+  muselab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: muselab:latest
+    container_name: muselab
+    restart: unless-stopped
+    ports:
+      # Bind to loopback by default — Docker's short syntax otherwise exposes
+      # the port on 0.0.0.0 (all interfaces), which on a public VPS leaves the
+      # service reachable from the internet with only the token as a barrier.
+      # To open it up (e.g. for phone access on the LAN), set MUSELAB_BIND=0.0.0.0
+      # in .env AND put a reverse proxy / firewall in front. See docs/quickstart.
+      - "${MUSELAB_BIND:-127.0.0.1}:${MUSELAB_PORT:-8765}:8765"
+    env_file:
+      - .env
+    environment:
+      # Force the Agent SDK to use OAuth (subscription), not console API key.
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_AUTH_TOKEN: ""
+      # Inside the container the archive is always /data; the host path is
+      # configured via ARCHIVE_DIR below.
+      MUSELAB_ROOT: /data
+    volumes:
+      # The directory the portal exposes for browsing / editing.
+      # Set ARCHIVE_DIR in .env (defaults to ./data).
+      - ${ARCHIVE_DIR:-./data}:/data
+      # Reuse the host's claude CLI OAuth credentials.
+      # Default: ~/.claude. Override CLAUDE_HOME in .env for non-standard locations.
+      #
+      # SECURITY NOTE — this mount is read-WRITE on purpose, and that has a real
+      # blast radius: ~/.claude/.credentials.json holds your Pro/Max OAuth
+      # tokens, and the container (which runs an LLM agent that can execute
+      # tools) can read them. A read-only (`:ro`) mount is NOT a drop-in fix —
+      # the CLI needs write access to (a) refresh the OAuth token when it
+      # expires and (b) write session history under ~/.claude/projects/. Making
+      # the whole dir `:ro` breaks token refresh and session persistence.
+      #
+      # To reduce exposure on a shared/hostile host, mount ONLY the subpaths the
+      # CLI actually needs instead of the whole home dir, e.g.:
+      #   - ${CLAUDE_HOME:-${HOME}/.claude}/.credentials.json:/home/muse/.claude/.credentials.json
+      #   - ${CLAUDE_HOME:-${HOME}/.claude}/projects:/home/muse/.claude/projects
+      # That keeps the rest of ~/.claude (settings, other secrets) off the
+      # container. See SECURITY.md.
+      - ${CLAUDE_HOME:-${HOME}/.claude}:/home/muse/.claude
+      # Persist chat sessions across container recreations.
+      - ./sessions:/app/sessions
+    # Resource ceilings mirror the systemd unit (see
+    # ~/.config/systemd/user/muselab.service): both deployment paths get the
+    # same "long-running but bounded" envelope. SDK subprocess + token
+    # buffering + cache usually sits well under 1 GiB; 4 GiB is the hard
+    # OOM-kill ceiling that protects the host from a memory leak.
+    mem_limit: 4g
+    mem_reservation: 1g
+    # Cap process / thread count to prevent fork-bomb-style runaway from a
+    # misbehaving MCP server or skill.
+    pids_limit: 4096
+    healthcheck:
+      # Use the dedicated /api/health endpoint — cheaper than rendering the
+      # full index.html on every probe (every 30s × 24h = 2880 probes/day).
+      # `curl` ships with the image and avoids the ~150ms Python startup cost.
+      test:
+        - CMD
+        - curl
+        - -fsS
+        - --max-time
+        - "3"
+        - http://127.0.0.1:8765/api/health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

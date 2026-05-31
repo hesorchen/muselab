@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="muselab">
+  <!-- Brand mark: pure "M" zigzag (Candidate F, user-selected 2026-05-25).
+       Single rounded-stroke letterform — high recognition at any size,
+       no compositional risk of being misread as a notification badge
+       (which was the issue with the prior orbit+dot variant). -->
+  <rect width="200" height="200" rx="44" ry="44" fill="#6093ff"/>
+  <path d="M 56 144 L 56 56 L 100 100 L 144 56 L 144 144"
+        fill="none" stroke="#ffffff" stroke-width="20"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

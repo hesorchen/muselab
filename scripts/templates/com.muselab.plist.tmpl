@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.muselab</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{UV_PATH}}</string>
+    <string>run</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>backend.main</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{REPO_PATH}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PATH_DIRS}}</string>
+    <key>HOME</key>
+    <string>{{HOME_DIR}}</string>
+  </dict>
+
+  <!-- Launch at user login and keep alive on crash -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <!-- Don't churn if it keeps crashing. ThrottleInterval is the minimum
+       seconds between (re)launches — launchd's closest analog to the
+       systemd unit's StartLimit* combo. launchd has no "give up after N
+       attempts" knob, so a misconfigured process will retry forever; the
+       throttle just prevents log floods. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- Soft/hard resource ceilings — mirror what the Linux systemd unit
+       gets via MemoryMax / TasksMax. macOS launchd has no cgroup-style
+       memory enforcement, so RSS limits here are advisory rather than
+       hard kills; the process / fd caps below ARE enforced. A real OOM
+       on macOS will fall through to the kernel's jetsam pressure system. -->
+  <key>HardResourceLimits</key>
+  <dict>
+    <!-- Match the Linux LimitNOFILE=8192. -->
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+    <!-- Cap subprocess / thread count to defend against runaway fork from
+         a misbehaving MCP server or skill (mirrors systemd TasksMax=4096). -->
+    <key>NumberOfProcesses</key>
+    <integer>4096</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>{{HOME_DIR}}/Library/Logs/muselab/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{HOME_DIR}}/Library/Logs/muselab/stderr.log</string>
+</dict>
+</plist>

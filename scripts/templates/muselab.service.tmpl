@@ -1,0 +1,40 @@
+[Unit]
+Description=muselab — your archive + Muse, the AI inside
+Documentation=https://github.com/hesorchen/muselab
+After=network-online.target
+Wants=network-online.target
+# Restart rate limit: at most 5 restarts inside any 5-minute window. Past
+# the threshold systemd gives up so a crash loop doesn't burn CPU and
+# flood the journal. Recover with `systemctl --user reset-failed`.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory={{REPO_PATH}}
+EnvironmentFile={{REPO_PATH}}/.env
+ExecStart={{UV_PATH}} run python -m backend.main
+Restart=on-failure
+RestartSec=10
+# Hardening: forbid the service (or any subprocess: MCP servers, skills, the
+# SDK-spawned claude CLI) from gaining new privileges via setuid/setgid/caps.
+# Zero-cost — muselab never needs to escalate. (ProtectHome is intentionally
+# omitted: the service must read/write your archive ROOT under $HOME.)
+NoNewPrivileges=true
+# Resource limits — generous but bounded
+LimitNOFILE=8192
+# Memory: MemoryHigh is the soft throttle ceiling, MemoryMax is the hard
+# OOM-kill ceiling. Long-running sessions with token cache + subprocess
+# SDK can drift up; 4 GiB protects the host from a memory leak without
+# clipping normal use (typical RSS sits well under 1 GiB).
+MemoryHigh=2G
+MemoryMax=4G
+# Cap process / thread count to defend against runaway fork from a
+# misbehaving MCP server or skill. 4096 is far above normal (< 200).
+TasksMax=4096
+# Logs go to the user journal: journalctl --user -u muselab -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,35 @@
+# Dependabot keeps claude-agent-sdk + other Python deps current.
+# Weekly cadence: enough to track upstream releases without PR noise.
+# Group all SDK-adjacent deps so one PR == one upgrade to review.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      claude-sdk:
+        patterns:
+          - "claude-agent-sdk"
+          - "anthropic*"
+      framework:
+        patterns:
+          - "fastapi"
+          - "uvicorn*"
+          - "starlette*"
+          - "pydantic*"
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "ci"
