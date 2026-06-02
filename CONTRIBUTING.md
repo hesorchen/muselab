@@ -40,7 +40,7 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
 
 - [ ] `uv run pytest tests/` passes
 - [ ] `uv run ruff check backend/ tests/` passes (CI blocks merge on lint failures)
-- [ ] `bash scripts/lint.sh` passes (catches encoding / BOM / class-collision issues)
+- [ ] `bash scripts/lint.sh` passes (encoding / class-collision + personal-data leak scan)
 - [ ] Backend changes: added or updated a test in `tests/`
 - [ ] Frontend visual changes: described in the PR with a before/after note
       (visual regression tests are not yet in place)
@@ -58,6 +58,20 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
   browsers understand. Match the semicolon style of neighbouring code.
 - CSS: per-component sections with a comment header (see `frontend/styles.css`).
   Use CSS variables (`--c-*`, `--sp-*`) for theming; do not hardcode colors.
+
+## Keeping personal data out (leak scan)
+
+`scripts/lint.sh` runs a personal-data leak scan over tracked files
+(constitution P6 — no real personal data in shipped artifacts):
+
+- **Generic PII** (phone / national-ID patterns) — always on, runs in CI.
+- **Maintainer identity** — your OS login and home-dir name are derived at
+  runtime (nothing private is stored in the script), so a stray `/home/<you>/`
+  path or username is caught automatically.
+- **Optional private blacklist** — for names a regex can't know (real name,
+  employer, target companies), create `scripts/.leak-blacklist` (gitignored,
+  one literal per line) or point `MUSELAB_LEAK_BLACKLIST` at a file outside the
+  repo. The scan hard-fails if that blacklist ever becomes git-tracked.
 
 ## Filing an issue
 
