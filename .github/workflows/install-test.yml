@@ -83,7 +83,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.os }}-logs
           # NOTE: do NOT upload .env — it holds MUSELAB_TOKEN (a secret) and
@@ -149,7 +149,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.os }}-logs
           # NOTE: do NOT upload .env — it holds MUSELAB_TOKEN (a secret) and
