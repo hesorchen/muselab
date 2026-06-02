@@ -5,6 +5,12 @@ __pycache__/
 .env.*
 !.env.example
 .router-token
+# Private personal-data blacklist for scripts/lint.sh leak-scan (Check 4).
+# Holds the maintainer's own identifying literals (real name, employer, home
+# city, target-company names) so the leak-scan can refuse to commit them. It is
+# private by definition and MUST NEVER be committed — see SECURITY note in
+# scripts/lint.sh. lint.sh hard-fails if this file is ever git-tracked.
+scripts/.leak-blacklist
 .DS_Store
 sessions/
 sessions.bak-*/
