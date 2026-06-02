@@ -1486,7 +1486,7 @@
                 <div class="asst-msg-wrap">
                   <div class="msg-row">
                     <span class="msg-avatar assistant-avatar"
-                          :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                          :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                           :title="mascotLabel()">
                       <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                     </span>
@@ -1520,7 +1520,7 @@
               <template x-if="m.role === 'thinking'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1546,7 +1546,7 @@
               <template x-if="m.role === 'tool_use' && m.name === 'TodoWrite'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1578,7 +1578,7 @@
               <template x-if="m.role === 'tool_use' && (m.name === 'Task' || m.name === 'Agent')">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1601,7 +1601,7 @@
               <template x-if="m.role === 'tool_use' && m.name === 'ExitPlanMode'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1635,7 +1635,7 @@
               <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1739,7 +1739,7 @@
               <template x-if="m.role === 'tool_result' && !shouldHideToolResult(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1899,7 +1899,7 @@
               <template x-if="m.role === 'ask_user_question'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -2002,7 +2002,7 @@
               <template x-if="m.role === 'permission_request'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': streaming && (i === 0 || (messages[i-1] && messages[i-1].role === 'user')) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>

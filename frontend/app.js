@@ -1919,6 +1919,22 @@ function portal() {
     // identity layer (single-user, token-auth), so we just stamp "我" / "U"
     // by language. Cheap, requires no extra SVG asset.
     userAvatarText() { return this.lang === "zh" ? "我" : "U"; },
+    // 是否给第 i 条消息的头像加流式动效。
+    // 之前的内联条件 `streaming && (i===0 || messages[i-1].role==='user')`
+    // 命中的是「每一个 assistant 轮次的首条」——历史里每个轮次都满足，
+    // 于是流式时所有轮次的头像一起动。正确语义是「仅当前（最新）轮」：
+    // 既是轮首（前一条是 user 或开头），又是最后一轮（自此往后不再有 user）。
+    isStreamingTurnAvatar(i) {
+      if (!this.streaming) return false;
+      const msgs = this.messages;
+      if (!msgs || !msgs[i] || msgs[i].role === "user") return false; // 仅 assistant 侧头像
+      const isTurnStart = i === 0 || (msgs[i - 1] && msgs[i - 1].role === "user");
+      if (!isTurnStart) return false;
+      for (let j = i + 1; j < msgs.length; j++) {
+        if (msgs[j] && msgs[j].role === "user") return false; // 后面还有用户消息 → 不是最新轮
+      }
+      return true;
+    },
     // 显示文案：英文界面 "Muse · Urania · Astronomy"；中文界面 "Muse · 乌拉尼亚 · 天文"（保留希腊名作 hint）
     mascotLabel() {
       const m = this.mascot();
