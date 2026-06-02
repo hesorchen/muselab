@@ -3186,7 +3186,17 @@ function portal() {
         if (a.classList.contains("file-link")) continue;
         let href = a.getAttribute("href") || "";
         if (!href || href.startsWith("#")) continue;
-        if (/^[a-z]+:/i.test(href)) continue;          // http: / https: / mailto: / etc.
+        if (/^[a-z]+:/i.test(href)) {                  // http: / https: / mailto: / etc.
+          // External web links open in a NEW tab so a click never unloads the
+          // chat SPA (the default same-tab navigation threw the user out of
+          // the conversation). rel guards against tab-nabbing + referrer leak.
+          // Non-web schemes (mailto:/tel:/…) are left untouched.
+          if (/^https?:/i.test(href)) {
+            a.setAttribute("target", "_blank");
+            a.setAttribute("rel", "noopener noreferrer");
+          }
+          continue;
+        }
         // marked / the model may URL-encode the href (e.g. Chinese filenames
         // come through as %E8%B5%84...). Decode so the regex + backend list
         // lookup operate on the raw UTF-8 form.
@@ -3219,7 +3229,16 @@ function portal() {
       // it as a file path; fall back to a toast if we can't parse.
       let href = a.getAttribute("href") || "";
       if (!href || href.startsWith("#")) return;
-      if (/^[a-z]+:/i.test(href)) return;             // real protocol → let browser handle
+      // External web link: force a NEW browsing context explicitly. In a
+      // standalone PWA a plain target=_blank anchor often navigates the app
+      // window itself (no tab concept), throwing the user out of the chat.
+      // window.open breaks out to the system browser reliably across PWA/web.
+      if (/^https?:/i.test(href)) {
+        ev.preventDefault();
+        window.open(href, "_blank", "noopener,noreferrer");
+        return;
+      }
+      if (/^[a-z]+:/i.test(href)) return;             // mailto:/tel:/… → let browser handle
       try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
       ev.preventDefault();
       // Try ROOT-relative normalization first (absolute under ROOT, or ROOT
