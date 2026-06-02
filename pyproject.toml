@@ -45,7 +45,7 @@ dependencies = [
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
     # CVE-scan CI job stays green.
-    "starlette>=1.0.1",
+    "starlette>=1.2.1",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.28",
     "uvicorn[standard]>=0.48.0",
