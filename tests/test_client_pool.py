@@ -41,12 +41,14 @@ def chat_mod(app_module):
     chat_mod._bypass_state.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._sessions_with_inflight_tasks.clear()
     yield chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
     chat_mod._bypass_state.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._sessions_with_inflight_tasks.clear()
 
 
 def _patch_builder(monkeypatch, chat_mod):
@@ -182,4 +184,33 @@ def test_eviction_at_pool_cap_drops_oldest_and_its_side_dicts(chat_mod, monkeypa
     assert key_a not in chat_mod._client_lru
     # B and C survive.
     assert ("B", "claude-sonnet-4-6", "") in chat_mod._clients
+    assert ("C", "claude-sonnet-4-6", "") in chat_mod._clients
+
+
+def test_eviction_skips_session_with_inflight_background_task(chat_mod, monkeypatch):
+    """A client whose session has an in-flight SDK background task is PINNED:
+    LRU eviction must skip it (disconnect() kills the CLI subprocess, which
+    would abort the running task + the watcher draining its notification). The
+    next-oldest evictable client is dropped instead."""
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_CLIENT_POOL_CAP", 2)
+
+    async def run():
+        a = await chat_mod.get_client("A", "claude-sonnet-4-6", "bypassPermissions")
+        b = await chat_mod.get_client("B", "claude-sonnet-4-6", "bypassPermissions")
+        # Pin the OLDEST (A) as if it has a background task still running.
+        chat_mod._sessions_with_inflight_tasks["A"] = {"task_x"}
+        # Third miss exceeds cap=2. Oldest is A but it's pinned → B evicted.
+        c = await chat_mod.get_client("C", "claude-sonnet-4-6", "bypassPermissions")
+        return a, b, c
+
+    a, b, c = asyncio.run(run())
+    key_a = ("A", "claude-sonnet-4-6", "")
+    key_b = ("B", "claude-sonnet-4-6", "")
+    # A survives despite being oldest — the pin protected it.
+    assert a.disconnected is False, "pinned client was wrongly disconnected"
+    assert key_a in chat_mod._clients
+    # B (next-oldest, unpinned) took the eviction instead.
+    assert b.disconnected is True, "non-pinned oldest not evicted"
+    assert key_b not in chat_mod._clients
     assert ("C", "claude-sonnet-4-6", "") in chat_mod._clients

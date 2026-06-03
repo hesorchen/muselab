@@ -503,6 +503,14 @@
         </button>
         <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
         <span class="spacer"></span>
+        <button x-show="selected && !editing && (previewMode==='md' || previewMode==='text')"
+                @click="togglePreviewFind()" class="icon-btn preview-keep-mobile"
+                :class="{ active: previewFind.open }"
+                :title="lang==='zh' ? '搜索内容' : 'Find in file'"
+                :aria-label="lang==='zh' ? '搜索内容' : 'Find in file'"
+                :aria-pressed="previewFind.open">
+          <svg><use href="#i-search"/></svg>
+        </button>
         <button x-show="selected" @click="reloadPreview()" class="icon-btn preview-keep-mobile"
                 :title="lang==='zh' ? '刷新预览' : 'Reload preview'"
                 :aria-label="lang==='zh' ? '刷新预览' : 'Reload preview'">
@@ -635,6 +643,48 @@
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
             </svg>
             <div x-text="lang==='zh' ? '放下以上传 / 打开' : 'Drop to upload / open'"></div>
+          </div>
+        </div>
+        <!-- Find-in-preview bar (magnifier). Floats top-right over the
+             scrolling content. Only ever mounted for md/text modes since the
+             toggle button is hidden elsewhere. Case-insensitive keyword search;
+             ↑/↓ cycle hits, the ≣ button reveals a context-snippet results
+             list, Esc closes. -->
+        <div class="preview-find" x-show="previewFind.open && !editing" x-cloak
+             @keydown.escape.stop="closePreviewFind()">
+          <div class="preview-find-bar">
+            <svg class="preview-find-icon" viewBox="0 0 24 24" width="14" height="14"
+                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input class="preview-find-input" type="text"
+                   x-model="previewFind.query"
+                   @input.debounce.150ms="runPreviewFind()"
+                   @keydown.enter.prevent="previewFind.query && (previewFind.matches.length ? previewFindNext() : runPreviewFind())"
+                   @keydown.shift.enter.prevent="previewFindPrev()"
+                   :placeholder="lang==='zh' ? '搜索内容' : 'Find'" />
+            <span class="preview-find-count"
+                  x-text="previewFind.query
+                    ? (previewFind.count ? (previewFind.active + 1) + '/' + previewFind.count : (lang==='zh' ? '无结果' : 'No results'))
+                    : ''"></span>
+            <button class="preview-find-btn" @click="previewFindPrev()" :disabled="!previewFind.count"
+                    :title="lang==='zh' ? '上一个' : 'Previous'">↑</button>
+            <button class="preview-find-btn" @click="previewFindNext()" :disabled="!previewFind.count"
+                    :title="lang==='zh' ? '下一个' : 'Next'">↓</button>
+            <button class="preview-find-btn" @click="previewFind.listOpen = !previewFind.listOpen"
+                    :class="{ active: previewFind.listOpen }" :disabled="!previewFind.count"
+                    :title="lang==='zh' ? '结果列表' : 'Results list'">☰</button>
+            <button class="preview-find-btn" @click="closePreviewFind()"
+                    :title="lang==='zh' ? '关闭' : 'Close'">×</button>
+          </div>
+          <div class="preview-find-list" x-show="previewFind.listOpen && previewFind.count">
+            <template x-for="(m, i) in previewFind.matches" :key="i">
+              <div class="preview-find-item" :class="{ active: i === previewFind.active }"
+                   @click="previewFindGoto(i)">
+                <span class="preview-find-item-idx" x-text="(i + 1)"></span>
+                <span class="preview-find-item-snip" x-html="m.snippet"></span>
+              </div>
+            </template>
           </div>
         </div>
         <div x-show="editing" class="editor-wrap">
@@ -1593,6 +1643,25 @@
                       <summary x-text="t('subagent.prompt_toggle')"></summary>
                       <pre x-text="m.task && m.task.prompt"></pre>
                     </details>
+                    <!-- SDK-native background-task status (run_in_background=
+                         true). The task_started/progress/notification SSE
+                         handlers stamp m.task_status via tool_use_id. Renders
+                         ⏳ running → ✅/❌, with the SDK summary + an open-result
+                         link (best-effort openByPathToasted on output_file). -->
+                    <template x-if="m.task_status">
+                      <div class="subagent-task"
+                           :class="'is-' + (m.task_status.state || 'running')">
+                        <span class="subagent-task-badge"
+                              x-text="taskStatusLabel(m.task_status.state)"></span>
+                        <span class="subagent-task-summary"
+                              x-show="m.task_status.summary"
+                              x-text="m.task_status.summary"></span>
+                        <a class="subagent-task-open" href="#"
+                           x-show="m.task_status.output_file"
+                           @click.prevent="openTaskOutput(m.task_status)"
+                           x-text="t('subagent.open_result')"></a>
+                      </div>
+                    </template>
                   </div>
                 </div>
               </template>
@@ -1621,13 +1690,13 @@
                    lines visually fuse into a "plan panel" via CSS sibling
                    selectors (see .task-log-line + .task-log-line). -->
               <template x-if="m.role === 'tool_use' && isTaskTool(m) && shouldRenderTaskLine(m)">
-                <div class="task-log-line" :class="taskLogLine(m).colorClass">
-                  <span class="task-log-icon" x-text="taskLogLine(m).icon"></span>
-                  <span class="task-log-verb" x-text="taskLogLine(m).verb"></span>
-                  <span class="task-log-ref" x-show="taskLogLine(m).ref"
-                        x-text="taskLogLine(m).ref"></span>
-                  <span class="task-log-subject" x-show="taskLogLine(m).subject"
-                        x-text="taskLogLine(m).subject"></span>
+                <div class="task-log-line" :class="taskLogLine(m)?.colorClass">
+                  <span class="task-log-icon" x-text="taskLogLine(m)?.icon"></span>
+                  <span class="task-log-verb" x-text="taskLogLine(m)?.verb"></span>
+                  <span class="task-log-ref" x-show="taskLogLine(m)?.ref"
+                        x-text="taskLogLine(m)?.ref"></span>
+                  <span class="task-log-subject" x-show="taskLogLine(m)?.subject"
+                        x-text="taskLogLine(m)?.subject"></span>
                 </div>
               </template>
 
@@ -1683,6 +1752,27 @@
                     </template>
                     <template x-if="!toolFilePath(m) && !(m.name && m.name.startsWith('mcp__'))">
                       <span class="tool-arg" x-text="m.summary"></span>
+                    </template>
+                    <!-- SDK-native background-task status for non-subagent
+                         tools (Bash run_in_background=true). Same task_status
+                         contract as the subagent card: task_started/progress/
+                         notification SSE handlers stamp m.task_status via
+                         tool_use_id; renders ⏳ running → ✅/❌ + summary +
+                         open-result link. Without this, a background Bash card
+                         never flips (only the Task/Agent template had it). -->
+                    <template x-if="m.task_status">
+                      <span class="tool-task"
+                            :class="'is-' + (m.task_status.state || 'running')">
+                        <span class="tool-task-badge"
+                              x-text="taskStatusLabel(m.task_status.state)"></span>
+                        <span class="tool-task-summary"
+                              x-show="m.task_status.summary"
+                              x-text="m.task_status.summary"></span>
+                        <a class="tool-task-open" href="#"
+                           x-show="m.task_status.output_file"
+                           @click.prevent="openTaskOutput(m.task_status)"
+                           x-text="t('subagent.open_result')"></a>
+                      </span>
                     </template>
                   </div>
                 </div>

@@ -51,3 +51,4 @@ demo/
 # internal design notes — kept local, not published
 docs/mcp-architecture.md
 docs/mcp-architecture_zh.md
+docs/background-tasks-spec.md

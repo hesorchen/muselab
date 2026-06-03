@@ -19,6 +19,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
+    TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
     ClaudeSDKError,
     ThinkingConfigEnabled, ThinkingConfigDisabled,
     get_session_messages,
@@ -280,6 +281,22 @@ class TurnBroadcast:
         self.user_text: str = ""
         self.user_images: list[dict] = []
         self.user_docs: list[dict] = []
+        # True for a HEADLESS CONTINUATION turn: the cross-turn task watcher
+        # opens one of these (no user prompt) when an SDK background task
+        # finishes after its originating turn ended. It carries the task's
+        # terminal TaskNotification (card → ✅done) plus the CLI's auto-continue
+        # model reaction. The frontend attaches in "continuation" mode — same
+        # reconnect plumbing as a queue-drain, but it must NOT truncate the
+        # in-flight portion (the launching tool_use card lives there and the
+        # task_notification needs to flip it). See `/active` + send({continuation}).
+        self.is_continuation: bool = False
+        # Once a reconnect subscriber has attached to a CONTINUATION broadcast
+        # (live or grace-kept), flip this. `/active` then stops advertising it
+        # so the frontend's 8s poller can't re-reconnect to the same finished
+        # continuation every tick (which replayed the reaction → duplicate
+        # bubbles). One continuation ⇒ at most one reconnect ⇒ one replay,
+        # regardless of frontend version. No effect on normal turns.
+        self.continuation_consumed: bool = False
 
     def publish(self, event: dict) -> None:
         self.events.append(event)
@@ -374,6 +391,42 @@ def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
 _client_lru: list[tuple[str, str, str]] = []   # (session_id, model, effort)
 _CLIENT_POOL_CAP = env_int("MUSELAB_CLIENT_POOL_CAP", 3, min_value=1)
 _lock = asyncio.Lock()
+
+# ---------------------------------------------------------------------------
+# Cross-turn background tasks (SDK-native run_in_background)
+# ---------------------------------------------------------------------------
+# Phase 0 probe (2026-06-03) proved that a TaskNotification (terminal status)
+# for an SDK background task usually arrives AFTER the turn's ResultMessage —
+# i.e. cross-turn. The in-turn dispatch (Phase 1) handles the case where the
+# notification happens to land before ResultMessage; for everything else we
+# need to (a) keep the originating CLI client ALIVE past the turn (disconnect()
+# kills the subprocess and would abort the running task), and (b) keep a single
+# detached reader draining receive_messages() so the buffered notification gets
+# delivered. These two maps coordinate that:
+#   _sessions_with_inflight_tasks: session_id -> set of task_id still running.
+#       Presence here exempts the session's clients from LRU eviction.
+#   _task_watchers: session_id -> the detached asyncio.Task doing the reading.
+# Single-reader invariant: a watcher and a live turn must never read the same
+# client stream concurrently. A new turn cancels the watcher (handoff) before
+# it starts reading; the watcher only runs in the gap between turns.
+_sessions_with_inflight_tasks: dict[str, set[str]] = {}
+_task_watchers: dict[str, asyncio.Task] = {}
+_TASK_WATCH_TIMEOUT = env_int("MUSELAB_TASK_WATCH_TIMEOUT", 1800, min_value=60)
+# After the LAST in-flight task delivers its terminal notification, the CLI
+# auto-continues a short turn (model reacts to the result). The probe (§3.4)
+# measured it landing ~1.3s later, but it's not strictly guaranteed for every
+# task type / status. So once all tasks have settled and a continuation
+# broadcast is open, the watcher waits at most this long for the auto-continue's
+# AssistantMessage + ResultMessage before closing the continuation and
+# unpinning — bounding the worst case (no auto-continue ever comes) instead of
+# holding the client + the _active_turns slot for the full _TASK_WATCH_TIMEOUT.
+_CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 60, min_value=5)
+# task_id -> description, surviving across the turn that started the task. The
+# per-turn inflight_tasks dict is local to a turn; if a NEW turn happens to
+# drain a buffered terminal notification (handoff race), it has no description
+# for that task_id. This module-level cache keeps the label correct across the
+# handoff. Populated on TaskStarted, consumed+removed on settle.
+_bg_task_descriptions: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1268,11 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                         continue
                     if k[0] in _active_turns and not _active_turns[k[0]].done:
                         continue
+                    # Pin clients with in-flight background tasks: disconnect()
+                    # kills the CLI subprocess, which would abort the running
+                    # task and the watcher draining its notification stream.
+                    if k[0] in _sessions_with_inflight_tasks:
+                        continue
                     candidate_idx = i
                     break
                 if candidate_idx is None:
@@ -1711,6 +1769,97 @@ def _strip_cli_slash_wrapper(text: str) -> str:
     return _CLI_SLASH_TAGS_RE.sub("", text).strip()
 
 
+# A run_in_background task's completion round-trips through the conversation log
+# as a plain user-role message whose ENTIRE content is a <task-notification> XML
+# block (the SDK injects it when the task settles — see docs/background-tasks-
+# spec.md). The launching tool_use card and this record share the <tool-use-id>.
+# On history rebuild we parse it and stamp the card's terminal task_status so a
+# completed bg task shows ✅ DURABLY (survives reload — matches Claude Code),
+# instead of rendering the raw XML as a confusing user bubble. NOTE: this is the
+# ONLY reliable completion signal in muselab's flow — in practice the terminal
+# notification arrives as this user-text record, NOT as a typed
+# TaskNotificationMessage, so the in-turn / cross-turn dispatch never sees it.
+_TASK_NOTIFICATION_RE = re.compile(
+    r"<task-notification>(.*?)</task-notification>", re.DOTALL)
+
+
+def _parse_task_notifications(text: str) -> list[dict]:
+    """Extract task-notification records from a user-message string. Returns a
+    list of {tool_use_id, task_id, status, summary, output_file}. Returns []
+    unless the message STARTS with <task-notification> — so prose that merely
+    mentions the tag (e.g. a context-summary message describing the protocol) is
+    never mistaken for an actual completion record."""
+    if not text or not text.lstrip().startswith("<task-notification>"):
+        return []
+    recs: list[dict] = []
+    for m in _TASK_NOTIFICATION_RE.finditer(text):
+        body = m.group(1)
+
+        def _f(tag: str) -> str:
+            mm = re.search(rf"<{tag}>(.*?)</{tag}>", body, re.DOTALL)
+            return mm.group(1).strip() if mm else ""
+        recs.append({
+            "tool_use_id": _f("tool-use-id"),
+            "task_id": _f("task-id"),
+            "status": _f("status"),
+            "summary": _f("summary"),
+            "output_file": _f("output-file"),
+        })
+    return recs
+
+
+# A Bash run_in_background=true LAUNCH does NOT emit a typed TaskStartedMessage
+# (only the SDK's Agent-style tasks do). It surfaces solely as a tool_result body
+# of the form: "Command running in background with ID: <tid>. Output is being
+# written to: <file>. You will be notified when it completes. ...". muselab must
+# sniff this text to learn that a background task started — otherwise
+# inflight_tasks stays empty, the turn-end cross-turn watcher never spawns, and
+# the post-completion auto-continue never streams live (the card still flips ✅ on
+# reload because history rebuild parses the raw <task-notification> record
+# directly, masking the missing live path). See docs/background-tasks-spec.md.
+_BG_LAUNCH_RE = re.compile(
+    r"Command running in background with ID:\s*([A-Za-z0-9._-]+)\."
+    r"\s*Output is being written to:\s*(\S+?\.output)\b")
+
+
+def _parse_bg_launch(text: str) -> dict | None:
+    """Detect a Bash background-task launch from a tool_result body. Returns
+    {task_id, output_file} on match, else None."""
+    if not text:
+        return None
+    m = _BG_LAUNCH_RE.search(text)
+    if not m:
+        return None
+    return {"task_id": m.group(1), "output_file": m.group(2)}
+
+
+def _usermsg_task_notification_text(msg) -> str:
+    """If `msg` is a UserMessage carrying a <task-notification>, return its
+    textual content; else return "".
+
+    The CLI delivers a background task's terminal completion as a normal
+    UserMessage whose content is the <task-notification> XML (NOT a typed
+    TaskNotificationMessage — that shape only ever showed up to standalone
+    probe scripts, never in muselab's live turn/watcher stream). Content may
+    be a plain string or a list of content blocks; flatten both to text."""
+    if not isinstance(msg, UserMessage):
+        return ""
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, TextBlock):
+                parts.append(getattr(block, "text", "") or "")
+            elif isinstance(block, str):
+                parts.append(block)
+        text = "".join(parts)
+    else:
+        return ""
+    return text if "<task-notification>" in text else ""
+
+
 def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
                           compact_uuids: set[str] | None = None) -> list[dict]:
     """Convert SDK SessionMessage list into muselab's flat UI message list.
@@ -1734,6 +1883,30 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
 
         # Simple shape: content is a single string.
         if isinstance(content, str):
+            # Background-task completion record → stamp the launching tool_use
+            # card's terminal task_status (durable ✅ across reloads) and DROP
+            # the raw XML bubble. The card was emitted by an earlier assistant
+            # SessionMessage, so it's already in `out`; match it by tool_use id.
+            notifs = _parse_task_notifications(content)
+            if notifs:
+                for n in notifs:
+                    tuid = n.get("tool_use_id")
+                    if not tuid:
+                        continue
+                    raw_st = n.get("status") or ""
+                    state = (raw_st if raw_st in ("completed", "failed",
+                                                   "stopped") else "done")
+                    for prev in reversed(out):
+                        if (prev.get("role") == "tool_use"
+                                and prev.get("id") == tuid):
+                            prev["task_status"] = {
+                                "task_id": n.get("task_id") or "",
+                                "state": state,
+                                "summary": n.get("summary") or "",
+                                "output_file": n.get("output_file") or "",
+                            }
+                            break
+                continue
             text = _strip_cli_slash_wrapper(content)
             # CLI's slash-command wrapper (<command-name>/compact</command-name>
             # …) round-trips through the conversation log as a "user" turn;
@@ -4130,6 +4303,39 @@ def get_queued_image(aid: str):
     )
 
 
+@router.get("/task-output", dependencies=[Depends(require_token)])
+def get_task_output(session_id: str = Query(...), path: str = Query(...)):
+    """Read a run_in_background task's `.output` file (the bash stdout/stderr
+    the SDK writes per task). These live in the SDK's per-session temp tasks
+    dir — `/tmp/claude-<uid>/<project>/<session>/tasks/<task_id>.output` —
+    OUTSIDE the archive root, so the normal /api/files reader (archive-scoped)
+    can't reach them and the card's "open result" link 404s.
+
+    Security: single-user token-gated app, but defense-in-depth anyway — the
+    path must match the exact tasks-dir shape AND embed THIS session_id, and we
+    reject any `..` so the `.+` project segment can't traverse out. We read the
+    literal path (not realpath) so a future local_agent `.output` symlink can't
+    redirect us to an arbitrary target."""
+    import re as _re
+    sid_safe = _re.escape(session_id)
+    if (".." in path or not _re.fullmatch(
+            rf"/tmp/claude-\d+/.+/{sid_safe}/tasks/[A-Za-z0-9._-]+\.output",
+            path)):
+        raise HTTPException(400, "bad task-output path")
+    p = Path(path)
+    if not p.is_file():
+        raise HTTPException(404, "task output not found (expired or cleaned up)")
+    try:
+        data = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        raise HTTPException(404, "task output unreadable")
+    CAP = 200_000
+    if len(data) > CAP:
+        data = data[:CAP] + "\n\n… (truncated at 200000 chars)"
+    from fastapi.responses import PlainTextResponse as _PlainText
+    return _PlainText(data, headers={"Cache-Control": "private, max-age=60"})
+
+
 @router.get("/attachments/{session_id}/{filename}",
             dependencies=[Depends(require_token_query)])
 def get_attachment(session_id: str, filename: str):
@@ -4372,6 +4578,366 @@ class _TurnStartError(Exception):
         self.status = status
 
 
+# ---------------------------------------------------------------------------
+# Cross-turn background-task settlement + watcher (Phase 2)
+# ---------------------------------------------------------------------------
+
+def _release_task_pins(session_id: str, task_ids) -> None:
+    """Drop the given task_ids from the session's pin set (unpinning the
+    client once nothing keeps it alive). Safe to call with already-removed
+    ids. No await → atomic on the event loop."""
+    ids = _sessions_with_inflight_tasks.get(session_id)
+    if ids is None:
+        return
+    for tid in list(task_ids):
+        ids.discard(tid)
+    if not ids:
+        _sessions_with_inflight_tasks.pop(session_id, None)
+
+
+def _settle_background_task(session_id: str, task_id: str) -> bool:
+    """Unpin a background task ONCE, from whichever path observes its terminal
+    TaskNotification first — the in-turn dispatch or the cross-turn watcher.
+
+    Returns True if THIS call is the one that settled it (so the caller may
+    surface the completion), False if the other path already did.
+
+    Dedup is via _sessions_with_inflight_tasks: the check-and-discard below has
+    no await (it's sync) so on the single-threaded event loop the two observer
+    paths can never both pass the gate. The loser sees the task_id already gone
+    and no-ops. Consumes the cross-turn description cache so it can't leak.
+
+    NOTE: this used to ALSO record into the scheduler bell + fire a Web Push.
+    That delivery was removed (2026-06-03) — a finishing background task now
+    surfaces as a live continuation turn in the originating session (card flips
+    to ✅done + the model's auto-continue reaction streams in), matching Claude
+    Code's native UX, not as a separate bell notification."""
+    settled = True
+    if task_id:
+        ids = _sessions_with_inflight_tasks.get(session_id)
+        if ids is None or task_id not in ids:
+            settled = False   # already settled by the other path
+        else:
+            ids.discard(task_id)
+            if not ids:
+                _sessions_with_inflight_tasks.pop(session_id, None)
+        _bg_task_descriptions.pop(task_id, None)
+    return settled
+
+
+def _render_continuation_message(msg, state: dict):
+    """Yield SSE event dicts for one buffered SDK message read during a
+    cross-turn continuation (the CLI auto-continue after a bg task finishes).
+
+    This is the watcher's standalone mirror of event_gen's per-message handlers
+    — deliberately NOT reusing those closures (they're nested in _start_turn and
+    carry per-turn bookkeeping we don't want to re-run: usage stats, sidecar
+    annotations, push, jsonl cleanup). Kept minimal: text + tool round-trips,
+    which is all an auto-continue reaction produces.
+
+    `state` carries per-continuation mutables:
+      - "tool_use_names": tool_use_id -> name, so a later tool_result picks the
+        right per-tool renderer.
+      - "streamed": list of text chunks already emitted via text_delta, so the
+        AssistantMessage TextBlock only tail-emits the suffix the stream skipped
+        (mirrors event_gen's streamed_in_bubble dedup)."""
+    if isinstance(msg, StreamEvent):
+        ev = getattr(msg, "event", None) or {}
+        if ev.get("type") != "content_block_delta":
+            return
+        delta = ev.get("delta") or {}
+        dt = delta.get("type")
+        if dt == "text_delta":
+            chunk = delta.get("text", "")
+            if chunk:
+                state["streamed"].append(chunk)
+                yield {"event": "text", "data": json.dumps({"text": chunk})}
+        elif dt == "thinking_delta":
+            chunk = delta.get("thinking", "")
+            if chunk:
+                yield {"event": "thinking", "data": json.dumps({"text": chunk})}
+    elif isinstance(msg, AssistantMessage):
+        for block in msg.content:
+            if isinstance(block, TextBlock):
+                full = getattr(block, "text", "") or ""
+                streamed_str = "".join(state["streamed"])
+                if full and full != streamed_str:
+                    tail = (full[len(streamed_str):]
+                            if full.startswith(streamed_str) else full)
+                    if tail:
+                        state["streamed"].append(tail)
+                        yield {"event": "text",
+                               "data": json.dumps({"text": tail})}
+            elif isinstance(block, ThinkingBlock):
+                pass  # already streamed via thinking_delta
+            elif isinstance(block, ToolUseBlock):
+                if block.id:
+                    state["tool_use_names"][block.id] = block.name or ""
+                yield {"event": "tool_use",
+                       "data": json.dumps(_render_tool_use(block))}
+                state["streamed"] = []   # FE closeAsst()'s the bubble
+            elif isinstance(block, ToolResultBlock):
+                tu_id = getattr(block, "tool_use_id", "") or ""
+                tname = state["tool_use_names"].get(tu_id, "")
+                yield {"event": "tool_result",
+                       "data": json.dumps(
+                           _render_tool_result(block, tool_name=tname))}
+    elif isinstance(msg, UserMessage):
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, ToolResultBlock):
+                    tu_id = getattr(block, "tool_use_id", "") or ""
+                    tname = state["tool_use_names"].get(tu_id, "")
+                    yield {"event": "tool_result",
+                           "data": json.dumps(
+                               _render_tool_result(block, tool_name=tname))}
+
+
+async def _watch_inflight_tasks(
+    session_id: str,
+    client: ClaudeSDKClient,
+    pending: dict[str, str | None],
+) -> None:
+    """Detached reader keeping an originating CLI client alive past its turn so
+    SDK background tasks started in that turn can deliver their terminal
+    TaskNotification (the probe showed it lands AFTER ResultMessage) AND so the
+    completion surfaces LIVE in the originating session.
+
+    Delivery model (2026-06-03 redesign — matches Claude Code): each terminal
+    TaskNotification opens a HEADLESS CONTINUATION turn (a TurnBroadcast
+    registered in _active_turns[sid] with is_continuation=True, empty user
+    prompt). We publish into it:
+      1. the task_notification event (the FE flips the launching card → ✅done),
+      2. the CLI's auto-continue model reaction (text + any tool round-trips),
+    then a `done` event + finish(). The frontend, while a 'running' bg-task card
+    is visible, polls /active and attaches in continuation mode (replay + live
+    tail), so the reaction streams in as a new assistant bubble with no user
+    action. The CLI also persists the auto-continue to the session JSONL, so a
+    user who isn't looking still sees it on next load.
+
+    `pending` maps task_id -> description for tasks still in flight at turn end.
+    Drains client.receive_messages() until every pending task settles + its
+    continuation closes, or the watch times out.
+
+    SINGLE-READER INVARIANT: this runs only in the gap between turns. A new turn
+    on the same session cancels this watcher (see _start_turn handoff) BEFORE
+    its own receive_response() reads the same stream, so the two never race. A
+    new turn's busy-check ALSO rejects while a continuation broadcast occupies
+    _active_turns[sid] — so the handoff cancel only happens when no continuation
+    is open (cont is None). On cancellation we KEEP the pins; the new turn
+    drains the buffered notification and settles it via the in-turn dispatch."""
+    cont: TurnBroadcast | None = None
+    cont_state: dict | None = None
+
+    async def _open_continuation() -> None:
+        """Register a fresh continuation broadcast in _active_turns[sid] under
+        the lock. If a live turn somehow holds the slot, leave cont None and
+        let that turn's in-turn dispatch surface the notification instead."""
+        nonlocal cont, cont_state
+        b = TurnBroadcast(session_id=session_id, model="")
+        b.is_continuation = True
+        async with _lock:
+            existing = _active_turns.get(session_id)
+            if existing is not None and not existing.done:
+                return   # a live turn raced in — defer to it
+            _active_turns[session_id] = b
+        cont = b
+        cont_state = {"tool_use_names": {}, "streamed": []}
+
+    async def _close_continuation(cancelled: bool = False) -> None:
+        """Emit a terminal `done`, finish the broadcast, drop it from
+        _active_turns (identity-checked so we never pop a newer turn's slot),
+        and grace-keep it for a slightly-late FE reconnect."""
+        nonlocal cont, cont_state
+        b = cont
+        cont = None
+        cont_state = None
+        if b is None:
+            return
+        b.publish({"event": "done", "data": json.dumps({
+            "cancelled": cancelled,
+            "model": b.model,
+            "continuation": True,
+        })})
+        b.finish()
+        async with _lock:
+            if _active_turns.get(session_id) is b:
+                _active_turns.pop(session_id, None)
+        _remember_recent_turn(session_id, b)
+
+    msg_iter = client.receive_messages().__aiter__()
+    try:
+        async with asyncio.timeout(_TASK_WATCH_TIMEOUT):
+            while True:
+                # Once every task has settled and we're only waiting on the
+                # auto-continue, cap the read so a task that produces no
+                # continuation can't pin the client for the full watch timeout.
+                read_to = (_CONTINUATION_GRACE
+                           if (not pending and cont is not None) else None)
+                try:
+                    if read_to is not None:
+                        msg = await asyncio.wait_for(
+                            msg_iter.__anext__(), read_to)
+                    else:
+                        msg = await msg_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    # Grace elapsed with no auto-continue (rare). Close the
+                    # open continuation and stop — all tasks already settled.
+                    break
+
+                notif_text = _usermsg_task_notification_text(msg)
+                notifs = _parse_task_notifications(notif_text) if notif_text else []
+                if notifs:
+                    # IDLE completion path: the user launched a bg task then
+                    # went quiet, so its terminal <task-notification> arrives
+                    # in the gap between turns (no live turn to catch it). Open
+                    # a continuation and publish task_notification per record
+                    # (the FE flips the launching card → ✅ AND, via the /active
+                    # belt, reconnects to stream the auto-continue that follows).
+                    # Gate each emit on _settle_background_task so a task the
+                    # in-turn dispatch already surfaced isn't double-fired here.
+                    # Suppress the raw XML by NOT falling through to
+                    # _render_continuation_message (this branch consumes it).
+                    won = [n for n in notifs
+                           if _settle_background_task(
+                               session_id, n.get("task_id") or "")]
+                    for n in notifs:
+                        pending.pop(n.get("task_id") or "", None)
+                    if won and cont is None:
+                        await _open_continuation()
+                    for n in won:
+                        if cont is not None:
+                            cont.publish({"event": "task_notification",
+                                          "data": json.dumps({
+                                "task_id": n.get("task_id") or "",
+                                "tool_use_id": n.get("tool_use_id") or None,
+                                "status": n.get("status") or None,
+                                "summary": n.get("summary") or None,
+                                "output_file": n.get("output_file") or None,
+                            })})
+                elif isinstance(msg, TaskNotificationMessage):
+                    # Typed-message path — kept for a future SDK that delivers
+                    # TaskNotificationMessage directly. Dead in today's stream.
+                    tid = getattr(msg, "task_id", "") or ""
+                    if cont is None:
+                        await _open_continuation()
+                    status = getattr(msg, "status", None)
+                    if cont is not None:
+                        cont.publish({"event": "task_notification",
+                                      "data": json.dumps({
+                            "task_id": tid,
+                            "tool_use_id": getattr(msg, "tool_use_id", None),
+                            "status": status,
+                            "summary": getattr(msg, "summary", None),
+                            "output_file": getattr(msg, "output_file", None),
+                            "usage": dict(getattr(msg, "usage", None) or {}),
+                        })})
+                    _settle_background_task(session_id, tid)
+                    pending.pop(tid, None)
+                elif isinstance(msg, ResultMessage):
+                    # End of the CLI's auto-continue reaction — close the
+                    # continuation. If tasks remain in flight, keep reading for
+                    # their (later) notifications; otherwise we're done.
+                    await _close_continuation()
+                    if not pending:
+                        break
+                else:
+                    if cont is not None and cont_state is not None:
+                        for ev in _render_continuation_message(msg, cont_state):
+                            cont.publish(ev)
+    except asyncio.CancelledError:
+        # Handoff to a new turn (or shutdown). By the busy-check invariant cont
+        # is None here (a continuation in _active_turns would have rejected the
+        # new turn before it reached the handoff). Keep the pins; the new turn
+        # settles the still-pending tasks. Don't await during cancellation.
+        raise
+    except asyncio.TimeoutError:
+        sys.stderr.write(
+            f"[chat] task watcher sid={session_id} timed out after "
+            f"{_TASK_WATCH_TIMEOUT}s, {len(pending)} task(s) still pending; "
+            f"unpinning client\n")
+        _release_task_pins(session_id, pending)
+    except Exception as e:
+        sys.stderr.write(
+            f"[chat] task watcher sid={session_id} err: "
+            f"{type(e).__name__}: {e}; unpinning client\n")
+        _release_task_pins(session_id, pending)
+    finally:
+        # Close any continuation still open (e.g. grace timeout / outer
+        # timeout / StopAsyncIteration with no ResultMessage). No-op on the
+        # cancellation path (cont is None by the invariant), so we never await
+        # while cancelled.
+        if cont is not None:
+            try:
+                await _close_continuation()
+            except Exception:
+                pass
+        # Only clear the registry slot if it still points at us (a fresh
+        # watcher may have replaced it after a handoff).
+        if _task_watchers.get(session_id) is asyncio.current_task():
+            _task_watchers.pop(session_id, None)
+
+
+def _merge_session_inflight(
+    session_id: str, turn_inflight: dict[str, dict],
+) -> dict[str, dict]:
+    """Union THIS turn's launches with EVERY unsettled task pinned for the
+    session, so the cross-turn watcher re-covers tasks orphaned by an
+    intervening turn (spec §13 orphan bug).
+
+    A task launched in a prior turn had its watcher cancelled by a later turn's
+    _handoff_task_watcher; if that later turn never re-registered it in its
+    turn-local inflight_tasks, no watcher would cover the next idle gap. Merging
+    the session-level pin set (`_sessions_with_inflight_tasks`) re-covers them —
+    descriptions for prior-turn tasks come from the cross-turn cache. Already
+    settled tasks aren't in the pin set, so this never resurrects a finished one.
+    """
+    merged = dict(turn_inflight)
+    for tid in _sessions_with_inflight_tasks.get(session_id, ()):
+        if tid not in merged:
+            merged[tid] = {
+                "tool_use_id": None,
+                "description": _bg_task_descriptions.get(tid),
+            }
+    return merged
+
+
+def _spawn_task_watcher(
+    session_id: str,
+    client: ClaudeSDKClient,
+    inflight: dict[str, dict],
+) -> None:
+    """Start (or replace) the cross-turn watcher for a session whose just-ended
+    turn left background tasks in flight."""
+    pending = {
+        tid: (info or {}).get("description")
+        for tid, info in inflight.items()
+    }
+    old = _task_watchers.get(session_id)
+    if old is not None and not old.done():
+        old.cancel()
+    _task_watchers[session_id] = asyncio.create_task(
+        _watch_inflight_tasks(session_id, client, pending))
+
+
+async def _handoff_task_watcher(session_id: str) -> None:
+    """A new turn is about to read this session's client stream. Cancel any
+    cross-turn watcher first so the two aren't single-reader on the same stream
+    at once, and wait for it to fully stop. The pins stay (the watcher's
+    CancelledError path keeps them) so the client isn't evicted in the gap; the
+    new turn's in-turn dispatch settles the buffered notification."""
+    watcher = _task_watchers.pop(session_id, None)
+    if watcher is not None and not watcher.done():
+        watcher.cancel()
+        # gather(return_exceptions=True) absorbs the watcher's CancelledError
+        # without raising it here, while still propagating cancellation of THIS
+        # task if we ourselves get cancelled mid-await.
+        await asyncio.gather(watcher, return_exceptions=True)
+
+
 async def _start_turn(
     session_id: str,
     prompt: str,
@@ -4488,6 +5054,12 @@ async def _start_turn(
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
         raise _TurnStartError(err_msg)
+
+    # Cross-turn background-task handoff: if a prior turn on this session left
+    # a watcher draining the (now shared) client stream, cancel it before we
+    # read so we don't double-read. Buffered TaskNotifications it hadn't drained
+    # are delivered to this turn's receive_response() and settled in-turn.
+    await _handoff_task_watcher(session_id)
 
     # Pull attachments from the in-memory store; build content blocks for the
     # SDK. Consume them — same attachment won't be re-sent on retry.
@@ -4629,6 +5201,18 @@ async def _start_turn(
     # Read with line gutter, etc.) without re-scanning its own message
     # list. Cleared per turn (lives in event_gen closure).
     tool_use_names: dict[str, str] = {}
+    # tool_use_id → description for Bash tool_uses, captured when the ToolUseBlock
+    # streams so a later bg-launch tool_result can label the inflight task with a
+    # human-readable description (the Bash `description` input). Per-turn closure.
+    bg_launch_desc: dict[str, str] = {}
+    # task_id → {tool_use_id, description} for SDK background tasks (Agent /
+    # Bash run_in_background=true) that emitted a TaskStartedMessage but no
+    # terminal TaskNotificationMessage yet. The probe (docs/background-tasks-
+    # spec.md §3.4) confirmed the terminal notification lands AFTER this turn's
+    # ResultMessage, so anything still in here when the turn ends is in-flight
+    # and Phase 2's cross-turn watcher takes over. Lives in event_gen closure,
+    # cleared per turn.
+    inflight_tasks: dict[str, dict] = {}
 
     async def event_gen():
         nonlocal assistant_acc, streamed_in_bubble
@@ -4811,6 +5395,15 @@ async def _start_turn(
                 elif isinstance(block, ToolUseBlock):
                     if block.id:
                         tool_use_names[block.id] = block.name or ""
+                        # Stash the Bash `description` so a following bg-launch
+                        # tool_result (run_in_background=true) can label the
+                        # inflight task. Harmless for non-bg Bash calls.
+                        if block.name == "Bash":
+                            _bi = getattr(block, "input", None) or {}
+                            _bdesc = (_bi.get("description")
+                                      if isinstance(_bi, dict) else None)
+                            if _bdesc:
+                                bg_launch_desc[block.id] = _bdesc
                     yield {"event": "tool_use",
                            "data": json.dumps(_render_tool_use(block))}
                     # FE closeAsst()'s the bubble on tool_use; reset mirror.
@@ -4832,15 +5425,148 @@ async def _start_turn(
             tool_use_id matches the prior ToolUseBlock; we look up its
             name from `tool_use_names` so the FE renderer (Bash terminal,
             Read gutter, …) can pick the right per-tool view."""
+            # PRIMARY background-task completion path. When the user keeps
+            # working while a bg task runs, its terminal <task-notification>
+            # arrives MID-TURN as a UserMessage (not a typed message, not a
+            # ToolResultBlock) inside this same turn's stream. Surface it live
+            # here: flip the launching card → ✅ and settle the task. The
+            # model's auto-continue reaction then streams as normal
+            # AssistantMessages later in this very turn — no waiting, no idle
+            # watcher needed. (The cross-turn watcher only covers the case
+            # where the user went idle after launching.)
+            _notif_text = _usermsg_task_notification_text(msg)
+            _notifs = _parse_task_notifications(_notif_text) if _notif_text else []
+            if _notifs:
+                for n in _notifs:
+                    tid = n.get("task_id") or ""
+                    # Dedup against the cross-turn watcher: only the path that
+                    # settles first surfaces the completion (sync check, no
+                    # await between gate and emit → no double-fire).
+                    if tid and not _settle_background_task(session_id, tid):
+                        continue
+                    inflight_tasks.pop(tid, None)
+                    yield {"event": "task_notification", "data": json.dumps({
+                        "task_id": tid,
+                        "tool_use_id": n.get("tool_use_id") or None,
+                        "status": n.get("status") or None,
+                        "summary": n.get("summary") or None,
+                        "output_file": n.get("output_file") or None,
+                    })}
+                return
             content = getattr(msg, "content", None)
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, ToolResultBlock):
                         tu_id = getattr(block, "tool_use_id", "") or ""
                         tname = tool_use_names.get(tu_id, "")
+                        rendered = _render_tool_result(block, tool_name=tname)
                         yield {"event": "tool_result",
-                               "data": json.dumps(
-                                   _render_tool_result(block, tool_name=tname))}
+                               "data": json.dumps(rendered)}
+                        # Bash run_in_background=true launches carry no typed
+                        # TaskStartedMessage — only this tool_result text. Sniff
+                        # it so the task lands in inflight_tasks; otherwise the
+                        # turn-end watcher never spawns and the post-completion
+                        # auto-continue never streams live (see _parse_bg_launch).
+                        launch = _parse_bg_launch(rendered.get("text") or "")
+                        if launch and tu_id:
+                            tid = launch["task_id"]
+                            if tid and tid not in inflight_tasks:
+                                desc = bg_launch_desc.get(tu_id)
+                                inflight_tasks[tid] = {
+                                    "tool_use_id": tu_id,
+                                    "description": desc,
+                                }
+                                _sessions_with_inflight_tasks.setdefault(
+                                    session_id, set()).add(tid)
+                                if desc:
+                                    _bg_task_descriptions[tid] = desc
+                                # Stamp the launching card ⏳ running live, the
+                                # same shape _handle_task_message emits for a
+                                # typed TaskStartedMessage.
+                                yield {"event": "task_started",
+                                       "data": json.dumps({
+                                    "task_id": tid,
+                                    "tool_use_id": tu_id,
+                                    "description": desc,
+                                    "task_type": "bash_background",
+                                })}
+
+        async def _handle_task_message(msg):
+            """SDK-native background-task lifecycle (Agent / Bash with
+            run_in_background=true). We CONSUME the SDK's existing Task*
+            protocol verbatim — no shadow turn, no polling, no parsing of
+            output_file. Every field is read with getattr defaults so a
+            future SDK adding/renaming fields degrades gracefully instead
+            of crashing the turn (see docs/background-tasks-spec.md §"长期
+            跟上 SDK 的三条硬纪律").
+
+            TaskStarted  → card flips to ⏳ running, recorded in inflight_tasks
+            TaskProgress → periodic usage tick
+            TaskNotification (status completed/failed/stopped) → terminal;
+                clears inflight_tasks, carries summary + output_file so the FE
+                can offer an "open result" link via the existing openFile path.
+
+            Note: the probe (§3.4) showed the terminal TaskNotification
+            usually arrives AFTER this turn's ResultMessage, so within a turn
+            this handler mostly emits task_started/progress; the cross-turn
+            watcher (Phase 2) delivers the terminal notification. A task that
+            finishes fast enough to terminate in-turn is handled right here.
+            """
+            if isinstance(msg, TaskStartedMessage):
+                tid = getattr(msg, "task_id", "") or ""
+                info = {
+                    "tool_use_id": getattr(msg, "tool_use_id", None),
+                    "description": getattr(msg, "description", None),
+                }
+                if tid:
+                    inflight_tasks[tid] = info
+                    # Pin the originating client from the moment the task
+                    # starts: disconnect() kills the CLI subprocess and would
+                    # abort the running task. The pin stays until the terminal
+                    # notification settles (in-turn here, or the cross-turn
+                    # watcher). Mid-turn this is redundant with _active_turns'
+                    # eviction exemption, but it's what survives past turn end.
+                    _sessions_with_inflight_tasks.setdefault(
+                        session_id, set()).add(tid)
+                    if info["description"]:
+                        _bg_task_descriptions[tid] = info["description"]
+                yield {"event": "task_started", "data": json.dumps({
+                    "task_id": tid,
+                    "tool_use_id": info["tool_use_id"],
+                    "description": info["description"],
+                    "task_type": getattr(msg, "task_type", None),
+                })}
+            elif isinstance(msg, TaskProgressMessage):
+                yield {"event": "task_progress", "data": json.dumps({
+                    "task_id": getattr(msg, "task_id", "") or "",
+                    "tool_use_id": getattr(msg, "tool_use_id", None),
+                    "last_tool_name": getattr(msg, "last_tool_name", None),
+                    # TaskUsage is a TypedDict (plain dict) → JSON-safe as-is.
+                    "usage": dict(getattr(msg, "usage", None) or {}),
+                })}
+            elif isinstance(msg, TaskNotificationMessage):
+                tid = getattr(msg, "task_id", "") or ""
+                # Drop from the per-turn in-flight set so it isn't handed to the
+                # cross-turn watcher (it settled in-turn).
+                inflight_tasks.pop(tid, None)
+                status = getattr(msg, "status", None)
+                summary = getattr(msg, "summary", None)
+                output_file = getattr(msg, "output_file", None)
+                yield {"event": "task_notification", "data": json.dumps({
+                    "task_id": tid,
+                    "tool_use_id": getattr(msg, "tool_use_id", None),
+                    "status": status,
+                    "summary": summary,
+                    "output_file": output_file,
+                    "usage": dict(getattr(msg, "usage", None) or {}),
+                })}
+                # In-turn settle (the rare case where a background task finishes
+                # before this turn's ResultMessage). The card already flipped via
+                # the task_notification event above — here we just unpin. _settle
+                # dedups via _sessions_with_inflight_tasks so the in-turn and
+                # cross-turn paths never double-unpin the same task_id. No bell:
+                # an in-turn completion is already visible live in this stream.
+                _settle_background_task(session_id, tid)
 
         async def _handle_result_message(msg):
             """ResultMessage = turn complete. Update cumulative cost / stats,
@@ -5187,9 +5913,29 @@ async def _start_turn(
                     # the tool_use half of the round trip.
                     async for ev in _handle_user_message(msg):
                         yield ev
+                elif isinstance(msg, (TaskStartedMessage, TaskProgressMessage,
+                                      TaskNotificationMessage)):
+                    # SDK-native background-task lifecycle. These are
+                    # SystemMessage subclasses muselab used to silently drop;
+                    # check them BEFORE any generic SystemMessage branch (none
+                    # exists today) so they reach the task handler.
+                    async for ev in _handle_task_message(msg):
+                        yield ev
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):
                         yield ev
+            # Turn loop ended (done / in-band error). Hand any still-in-flight
+            # background task to a detached cross-turn watcher that keeps the
+            # client alive and drains its terminal notification after the turn
+            # (probe §3.4: it lands after ResultMessage). On hard cancel we jump
+            # to the except below and skip this — a cancelled turn doesn't spawn.
+            #
+            # Cover not just THIS turn's launches (inflight_tasks) but EVERY
+            # unsettled task for the session (_merge_session_inflight); see its
+            # docstring for the spec §13 orphan-bug rationale.
+            merged_inflight = _merge_session_inflight(session_id, inflight_tasks)
+            if merged_inflight:
+                _spawn_task_watcher(session_id, client, merged_inflight)
         except asyncio.CancelledError:
             # Hard cancel (task cancelled / 30-min timeout cancel) — mark so
             # the queue drain pauses rather than charging ahead.
@@ -5400,6 +6146,13 @@ async def _subscribe_broadcast(broadcast: TurnBroadcast):
     Slicing the buffer up to `snap_len` gives us exactly the "before"
     set, and the queue gives us exactly the "after" set, with no
     duplication and no missed events."""
+    # A subscriber is now attached. For a CONTINUATION broadcast this is the
+    # one-and-only reconnect that replays the finished task's card flip +
+    # reaction; mark it consumed so `/active` stops advertising it (else the
+    # 8s poller re-reconnects every tick within the 60s grace TTL → duplicate
+    # reaction bubbles). Harmless no-op for normal turns.
+    if getattr(broadcast, "is_continuation", False):
+        broadcast.continuation_consumed = True
     q = broadcast.subscribe()
     snap_len = len(broadcast.events)
     try:
@@ -5428,13 +6181,46 @@ def session_active_status(sid: str) -> dict:
     turn. Used on session load to decide between "render JSONL history"
     and "open a reconnect SSE stream to follow the live tail."""
     b = _active_turns.get(sid)
+    if b is not None and getattr(b, "is_continuation", False) \
+            and getattr(b, "continuation_consumed", False):
+        # A continuation already handed to a reconnect subscriber — don't
+        # re-advertise even if it briefly lingers in _active_turns (reaction
+        # still streaming). Prevents a second poll within the same window from
+        # firing a duplicate reconnect. Falls through to the recent-fallback
+        # (also consumed-gated) which returns inactive.
+        b = None
     if not b:
-        return {"active": False}
+        # Grace-keep fallback for HEADLESS CONTINUATION turns. The bg-task
+        # watcher's continuation broadcast is short-lived in _active_turns —
+        # it only sits there while its auto-continue reaction streams (~2s),
+        # then _close_continuation pops it into _recent_turns. The frontend's
+        # 8s poller almost always misses that ~2s window, so the card never
+        # flips live. Surface a still-fresh continuation from _recent_turns
+        # (within its TTL) so the poller catches it and reconnects in
+        # continuation mode; GET /stream then grace-replays the buffered
+        # events (task_notification flips the running card → ✅done, plus the
+        # reaction bubble). Only continuations are surfaced — a plain
+        # just-finished turn must NOT report active (it would trigger spurious
+        # reconnects + duplicate replays). The frontend poller self-stops once
+        # the card flips, so the 60s-TTL window yields exactly one replay.
+        recent = _get_recent_turn(sid)
+        if (recent is not None
+                and getattr(recent, "is_continuation", False)
+                and not getattr(recent, "continuation_consumed", False)):
+            b = recent
+        else:
+            return {"active": False}
     return {
         "active": True,
         "model": b.model,
         "started_at": b.started_at,
         "events_so_far": len(b.events),
+        # True when this is a HEADLESS CONTINUATION turn opened by the bg-task
+        # watcher (no user prompt). The frontend attaches in "continuation"
+        # mode — same reconnect SSE, but it must NOT truncate the in-flight
+        # portion (the launching tool_use card lives there; the replayed
+        # task_notification flips it to ✅done).
+        "continuation": getattr(b, "is_continuation", False),
         # The turn's user prompt + attachments. The browser needs these to
         # render the user bubble when it LIVE-reconnects to a turn the server
         # drained from the queue headlessly (the browser never "sent" it, so
