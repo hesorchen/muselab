@@ -57,6 +57,10 @@ dependencies = [
     # external binaries.
     "pywebpush>=2.0.0",
     "pillow>=12.2.0",
+    # Pin pyjwt above the mcp-transitive 2.12.1, which carries
+    # PYSEC-2026-175/177/178/179 (all fixed in 2.13.0). Direct constraint
+    # so the pip-audit CVE-scan CI job stays green.
+    "pyjwt[crypto]>=2.13.0",
 ]
 
 [project.urls]
