@@ -215,7 +215,7 @@ jobs:
       # PR: build only (single arch) for smoke test — no push, no QEMU cost.
       - name: Build (PR smoke test, no push)
         if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -226,7 +226,7 @@ jobs:
       # main / tags: multi-arch build + push.
       - name: Build + push (multi-arch)
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
