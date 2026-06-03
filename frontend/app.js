@@ -207,6 +207,9 @@ function portal() {
     visible: [], expanded: new Set(), childCache: {},
     selected: "",
     dragOver: "",
+    // Highlight flag for the sticky root bar while a tree node / OS file is
+    // dragged over it (drop = move/upload to archive root).
+    dragOverRoot: false,
     searchQ: "", searchMode: false, searching: false,
     searchHits: [], searchTruncated: false,
     grepHits: [], grepTruncated: false,
@@ -10261,10 +10264,17 @@ function portal() {
       }
 
       // OS file upload — dropping onto a file uploads into that file's
-      // parent dir (same dir-resolution as internal moves). Same
-      // parallel-upload + batched-refresh pattern as onPreviewDrop so
-      // a multi-file drop onto a tree node doesn't serialize.
+      // parent dir (same dir-resolution as internal moves).
       const files = Array.from(ev.dataTransfer?.files || []);
+      await this._uploadFilesToDir(targetDir, files);
+    },
+    // Parallel-upload a set of OS files into `targetDir` (empty string =
+    // archive root), then refresh the tree once and surface a single
+    // result toast. Shared by onDrop (drop onto a node) and onTreeRootDrop
+    // (drop onto the sticky root bar) so the two stay behaviorally in sync.
+    // Same parallel-upload + batched-refresh pattern as onPreviewDrop so a
+    // multi-file drop doesn't serialize.
+    async _uploadFilesToDir(targetDir, files) {
       if (!files.length) return;
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet(targetDir, f))
@@ -10290,6 +10300,36 @@ function portal() {
           ? `已上传 ${ok} 个文件到 ${intoLabel}`
           : `Uploaded ${ok} files to ${intoLabel}`, "success", 2200);
       }
+    },
+    // Drag-over / drop on the sticky root bar = target the archive root
+    // (targetDir = ""). This is the ONLY way to reach root when the top
+    // level has no plain files to drop onto (e.g. only folders) — dropping
+    // onto a folder lands INSIDE it, never at root.
+    onTreeRootDragOver(ev) {
+      const src = this._dragSrcPath || "";
+      // No-op if the dragged tree item already lives at root.
+      if (src && src.split("/").slice(0, -1).join("/") === "") {
+        ev.dataTransfer.dropEffect = "none";
+        return;
+      }
+      this.dragOverRoot = true;
+      const types = Array.from(ev.dataTransfer?.types || []);
+      ev.dataTransfer.dropEffect =
+        types.includes(this._DRAG_MIME_INTERNAL) ? "move" : "copy";
+    },
+    async onTreeRootDrop(ev) {
+      this.dragOverRoot = false;
+      const wasSrc = this._dragSrcPath;
+      this._dragSrcPath = null;
+      const types = Array.from(ev.dataTransfer?.types || []);
+      if (types.includes(this._DRAG_MIME_INTERNAL)) {
+        const src = ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL) || wasSrc;
+        await this.moveTreeItem(src, "");
+        return;
+      }
+      // OS file upload → archive root.
+      const files = Array.from(ev.dataTransfer?.files || []);
+      await this._uploadFilesToDir("", files);
     },
     async moveTreeItem(srcPath, targetDir) {
       if (!srcPath) return;

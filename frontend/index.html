@@ -372,7 +372,11 @@
            "Open files" section above. -->
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
-             :title="contextInfo.archive_root || ''">
+             :class="{ 'drag-over': dragOverRoot }"
+             :title="contextInfo.archive_root || ''"
+             @dragover.prevent="onTreeRootDragOver($event)"
+             @dragleave="dragOverRoot = false"
+             @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
           <span class="path" x-text="contextInfo.archive_root || '—'"></span>
         </div>
@@ -385,7 +389,7 @@
               :data-ext="fileExtClass(n)"
               :draggable="isPointerDevice"
               @dragstart="onTreeNodeDragStart($event, n)"
-              @dragend="dragOver=''"
+              @dragend="dragOver=''; dragOverRoot=false"
               @click="onNodeClick(n)"
               @touchstart="onTreeTouchStart($event, n)"
               @touchmove="onTreeTouchMove($event)"

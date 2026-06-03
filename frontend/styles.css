@@ -1444,6 +1444,15 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 .filelist-sticky-root .icon { display: inline-flex; color: var(--c-accent); flex-shrink: 0; }
 .filelist-sticky-root .path { overflow: hidden; text-overflow: ellipsis; }
+/* Drop target highlight — drag a tree node / OS file onto the root bar to
+   move / upload it to the archive root. Mirrors `li.drag-over` (accent fill
+   + inset ring) so the affordance reads the same as dropping onto a node. */
+.filelist-sticky-root.drag-over {
+  background: var(--c-accent);
+  box-shadow: inset 0 0 0 2px white;
+}
+.filelist-sticky-root.drag-over .icon,
+.filelist-sticky-root.drag-over .path { color: white; }
 
 /* "Open files" section — list shrink-wraps content by default (1 file = 1
    row tall, 2 = 2 rows, ...). max-height kicks in at 5 rows + enables
