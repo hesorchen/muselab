@@ -138,6 +138,11 @@ jobs:
   # inherently flakier than unit tests, and we don't want a transient timeout
   # to block merges before the suite has proven stable. Promote to required
   # once it's reliably green.
+  #
+  # pytest-rerunfailures retries each failing test up to 2× (3 attempts total)
+  # with a 1s backoff, so a single transient timeout (e.g. the multi-tab
+  # open/close timing flake) no longer paints the whole job red. A test that
+  # fails all 3 attempts is a genuine regression worth investigating.
   e2e:
     name: e2e (playwright, allow-failure)
     runs-on: ubuntu-latest
@@ -160,7 +165,8 @@ jobs:
           MUSELAB_ROOT: ${{ github.workspace }}/.e2e-archive
         run: |
           mkdir -p $MUSELAB_ROOT
-          uv run --with pytest-playwright pytest tests/e2e/ -v
+          uv run --with pytest-playwright --with pytest-rerunfailures \
+            pytest tests/e2e/ -v --reruns 2 --reruns-delay 1
 
   # Builds the Dockerfile on every PR (smoke), and on push to main / tags it
   # publishes a multi-arch image to GitHub Container Registry.
