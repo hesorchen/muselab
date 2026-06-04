@@ -3118,6 +3118,15 @@ function portal() {
       if (tripleCount % 2 === 1) parseInput += "\n```";
       const tildeCount = (text.match(/~~~/g) || []).length;
       if (tildeCount % 2 === 1) parseInput += "\n~~~";
+      // Protect math spans ($$..$$, $..$, \(..\), \[..\]) from marked BEFORE
+      // parsing. marked treats LaTeX underscores/asterisks as markdown
+      // emphasis and silently eats them — e.g. `\sum_{i=1}` becomes
+      // `\sum{i=1}` and `\mathcal{L}_{\text{NTP}}` loses its `_`, so KaTeX
+      // later renders wrong math (or the raw `$$` shows through). We swap each
+      // span for an opaque alphanumeric placeholder, run markdown, then
+      // restore the original LaTeX (HTML-escaped) for KaTeX to typeset.
+      const _mathStore = [];
+      parseInput = this._maskMath(parseInput, _mathStore);
       // marked occasionally throws on partial markdown mid-stream (unclosed
       // fenced block, half-typed table row, etc). Catch and fall through to
       // escaped raw text so the bubble keeps showing SOMETHING instead of
@@ -3128,13 +3137,17 @@ function portal() {
       } catch (e) {
         raw = "<pre>" + this.escape(text) + "</pre>";
       }
-      if (!window.DOMPurify) return raw;
-      const safe = window.DOMPurify.sanitize(raw, {
+      if (!window.DOMPurify) return this._unmaskMath(raw, _mathStore);
+      let safe = window.DOMPurify.sanitize(raw, {
         USE_PROFILES: { html: true, mathMl: true },          // KaTeX may emit MathML
         FORBID_TAGS: ["style", "iframe", "form", "object", "embed"],
         FORBID_ATTR: ["style", "formaction"],
         ADD_ATTR: ["aria-hidden"],                            // KaTeX uses these
       });
+      // Restore protected math (HTML-escaped) now that markdown can no longer
+      // mangle it. Done before the length-loss heuristic so short placeholders
+      // don't undercount against the original math-heavy text.
+      safe = this._unmaskMath(safe, _mathStore);
       // If sanitize returned a string MUCH shorter than the input text (e.g.
       // partial code-block syntax tripped the parser and everything past it
       // got stripped), fall back to a plain-pre rendering so we don't display
@@ -3158,12 +3171,13 @@ function portal() {
       const looksLikeMath = /\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(text);
       if (!window.renderMathInElement && looksLikeMath) {
         this._loadKatex().then(() => {
-          // Reactive re-render: bump a counter that downstream renderedMd
-          // computations depend on so Alpine re-walks affected bindings.
-          // Cheaper than re-running mdRender on every static message — only
-          // future renders pick up KaTeX support; existing rendered HTML
-          // stays unchanged (worst case: math shows as raw $...$ in older
-          // bubbles until the user reloads, which is acceptable).
+          // KaTeX just finished loading. The bubble that triggered this load
+          // (and any rendered before the fetch resolved) fell through with raw
+          // `$$` delimiters because chat bubbles render once into a stored
+          // `m.html` — they are NOT live mdRender bindings, so nothing
+          // recomputes them on its own. Recompute the math-bearing ones now
+          // that KaTeX is available; subsequent renders typeset inline.
+          this._rerenderMathMessages();
         }).catch((e) => console.warn("[muselab] katex lazy load failed:", e));
       }
       if (window.renderMathInElement && window.katex) {
@@ -3182,6 +3196,70 @@ function portal() {
       }
       this._linkifyFilePaths(tmp);
       return tmp.innerHTML;
+    },
+
+    // Swap math spans out for opaque alphanumeric placeholders so marked.parse
+    // can't reinterpret LaTeX punctuation as markdown. Returns the masked
+    // string; original spans are pushed onto `store` (index = placeholder id).
+    // Code regions are stashed first so a `$` inside `code` isn't mistaken for
+    // a math delimiter (KaTeX also skips pre/code at typeset time as a second
+    // net). Only inline $...$ containing a math-ish char (\ ^ _ { }) is pulled
+    // out — bare `$5 ... $10` currency in prose is left for the existing DOM
+    // pass to deal with, matching prior behavior.
+    _maskMath(src, store) {
+      if (!src || (src.indexOf("$") < 0 && src.indexOf("\\(") < 0 && src.indexOf("\\[") < 0)) {
+        return src;
+      }
+      // 1) Temporarily hide code so the math scan skips it. Restored before
+      //    marked runs, so code is parsed normally.
+      const code = [];
+      const hideCode = (s) => `xMUSECODEx${code.push(s) - 1}x`;
+      let t = src
+        .replace(/(`{3,}|~{3,})[^\n]*\n[\s\S]*?\1/g, hideCode)  // fenced blocks
+        .replace(/`[^`\n]+`/g, hideCode);                       // inline code
+      // 2) Extract math → placeholder. Placeholder is bare alphanumerics that
+      //    survive marked + DOMPurify untouched.
+      const ph = (full) => `xMUSEMATHx${store.push(full) - 1}x`;
+      t = t
+        .replace(/\$\$[\s\S]+?\$\$/g, (m) => ph(m))             // display $$..$$
+        .replace(/\\\[[\s\S]+?\\\]/g, (m) => ph(m))             // display \[..\]
+        .replace(/\\\([\s\S]+?\\\)/g, (m) => ph(m))             // inline \(..\)
+        .replace(/\$(?!\s)[^\n$]*?[\\^_{}][^\n$]*?\$/g, (m) => ph(m)); // inline $..$
+      // 3) Put code back for marked to render.
+      t = t.replace(/xMUSECODEx(\d+)x/g, (_, i) => code[+i]);
+      return t;
+    },
+
+    // Restore placeholders left by _maskMath. Math is HTML-escaped so a span
+    // containing < > & survives being assigned via innerHTML; KaTeX reads the
+    // node's textContent (entities decoded) and typesets the true LaTeX.
+    _unmaskMath(html, store) {
+      if (!store || !store.length) return html;
+      return html.replace(/xMUSEMATHx(\d+)x/g,
+        (m, i) => (store[+i] != null ? this.escape(store[+i]) : m));
+    },
+
+    // KaTeX is lazy-loaded on first sight of math. Chat bubbles render once
+    // into a stored `m.html` (not a live mdRender binding), so the bubbles
+    // that rendered before the load resolved keep raw `$$` forever. Once KaTeX
+    // is present, recompute the math-bearing bubbles (and the markdown preview
+    // pane) so they typeset. Runs at most once per session.
+    _rerenderMathMessages() {
+      if (!window.renderMathInElement) return;
+      const RE = /\$\$|\\\(|\\\[|\$[^$\n]+\$/;
+      if (Array.isArray(this.messages)) {
+        for (const m of this.messages) {
+          if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
+            if (this._mdCache) this._mdCache.delete(m.text);  // drop stale (raw-$$) cache entry
+            m.html = this.mdRender(m.text);
+          }
+        }
+      }
+      // Markdown file-preview pane keeps its own rendered string.
+      if (typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
+        this._mdCache && this._mdCache.delete(this.rawText);
+        this.renderedMd = this.mdRender(this.rawText);
+      }
     },
 
     // Path-shaped strings inside inline <code> become clickable `.file-link`
