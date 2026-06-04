@@ -8314,7 +8314,14 @@ function portal() {
       }
     },
     async expand(n) {
+      // Idempotency guard (both sides of the await): two concurrent reveals
+      // — e.g. a fire-and-forget revealInTree racing an awaited one after a
+      // search — can both pass a single pre-await check and double-splice the
+      // same children, corrupting the flat `visible` array. Re-check after the
+      // async fetch so the loser bails out instead of inserting duplicates.
+      if (this.expanded.has(n.path)) return;
       const children = await this.fetchChildren(n.path);
+      if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
       const items = children.map(c => ({ ...c, depth: n.depth + 1 }));
