@@ -8759,16 +8759,58 @@ function portal() {
       this.dragOverTrash = false;
       const types = Array.from(ev.dataTransfer?.types || []);
       if (!types.includes(this._DRAG_MIME_INTERNAL)) return;
-      const path = ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL)
-                    || this._dragSrcPath || "";
+      // A multi-selection drag carries a newline-joined payload (see
+      // onTreeNodeDragStart). Parse it the same way onDrop does so dropping a
+      // batch onto the trash trashes each item — the previous code fed the
+      // whole "a\nb\nc" blob to _sendToTrash as one path, which 404'd.
+      const paths = this._pruneDescendants(
+        this._parseDragPaths(ev, this._dragSrcPath));
       this._dragSrcPath = null;
-      if (!path) return;
+      this._dragSrcPaths = null;
+      if (!paths.length) return;
       // Drag-to-trash skips the confirm modal — the drag itself is the
       // commitment, matching Finder / Files behavior. The Undo toast
       // covers accidental drops (6s window). We DO still want the same
       // tab-cleanup and tree-refresh side effects as doDelete(), so
-      // hand off to a shared helper.
-      await this._sendToTrash(path);
+      // hand off to shared helpers.
+      if (paths.length === 1) {
+        await this._sendToTrash(paths[0]);
+      } else {
+        await this._trashManyPaths(paths);
+      }
+    },
+    // Batch drag-to-trash: trash N paths in parallel (no confirm — the drag
+    // committed), then sync tabs / trash count / tree once. Mirrors
+    // deleteSelected's batch arm but without the modal.
+    async _trashManyPaths(paths) {
+      const zh = this.lang === "zh";
+      const results = await Promise.allSettled(paths.map(p =>
+        fetch("/api/files/delete", {
+          method: "DELETE",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: p }),
+          // 404 = already gone — count as done, not a failure.
+        }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
+      ));
+      const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
+      const failed = results.length - okPaths.length;
+      for (const p of okPaths) {
+        this.tabs = this.tabs.filter(t => t.path !== p);
+        this._previewCacheDel(p);
+        if (this.selected === p) { this.selected = ""; this.previewMode = ""; }
+      }
+      this.trash.count += okPaths.length;
+      this.clearTreeSelection();
+      await this.reloadTree();
+      if (failed && !okPaths.length) {
+        this.toast(zh ? `${failed} 项删除失败` : `${failed} item(s) failed to delete`, "error", 4000);
+      } else if (failed) {
+        this.toast(zh ? `已移到垃圾桶 ${okPaths.length} 项，${failed} 项失败`
+                      : `Trashed ${okPaths.length}, ${failed} failed`, "warn", 4000);
+      } else {
+        this.toast(zh ? `已移到垃圾桶 ${okPaths.length} 项`
+                      : `Moved ${okPaths.length} items to trash`, "success", 3000);
+      }
     },
     async _sendToTrash(path) {
       const name = path.split("/").pop() || path;
