@@ -1487,66 +1487,11 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
         return result
 
 
-# ---------------------------------------------------------------------------
-# UI state — lightweight cross-device state that doesn't belong in .env
-# (e.g. last active session ID). Stored in sessions/.ui-state.json.
-# ---------------------------------------------------------------------------
-_UI_STATE_PATH = Path(__file__).resolve().parent.parent / "sessions" / ".ui-state.json"
-
-
-def _read_ui_state() -> dict:
-    try:
-        return json.loads(_UI_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _write_ui_state(data: dict) -> None:
-    from .settings import atomic_write_text
-    _UI_STATE_PATH.parent.mkdir(exist_ok=True)
-    atomic_write_text(_UI_STATE_PATH, json.dumps(data, ensure_ascii=False))
-
-
-@router.get("/ui-state", dependencies=[Depends(require_token)])
-def get_ui_state() -> dict:
-    """Lightweight cross-device UI state (last active session, etc.)."""
-    return _read_ui_state()
-
-
-class PreviewTabIn(BaseModel):
-    path: str
-    name: str | None = None
-
-
-class UIStateIn(BaseModel):
-    last_session_id: str | None = None
-    # Tab strip — the list of chat session IDs currently open across all
-    # devices. Synced so opening a session on one device makes it appear on
-    # the others' tab strip too. `currentId` (which tab is active) is
-    # intentionally NOT synced — each device keeps its own focus.
-    open_tab_ids: list[str] | None = None
-    # File preview tab strip — same semantics as open_tab_ids but for the
-    # file viewer panel. Only path + name are persisted; content is fetched
-    # lazily on first switch.
-    preview_tabs: list[PreviewTabIn] | None = None
-
-
-@router.put("/ui-state", dependencies=[Depends(require_token)])
-def put_ui_state(req: UIStateIn) -> dict:
-    """Persist UI state fields. Only provided (non-None) fields are updated.
-
-    None means "leave alone" — empty list ([]) is a meaningful value (the
-    user closed all tabs) and IS persisted.
-    """
-    state = _read_ui_state()
-    if req.last_session_id is not None:
-        state["last_session_id"] = req.last_session_id
-    if req.open_tab_ids is not None:
-        state["open_tab_ids"] = list(req.open_tab_ids)
-    if req.preview_tabs is not None:
-        state["preview_tabs"] = [t.model_dump() for t in req.preview_tabs]
-    _write_ui_state(state)
-    return state
+# NOTE: The cross-device UI-state endpoints (GET/PUT /ui-state, backed by
+# sessions/.ui-state.json) were removed. The chat tab strip, active tab, and
+# preview tab strip are now device-local (persisted in each browser's
+# localStorage) — syncing them across devices yanked the active tab out from
+# under the user and hurt the experience.
 
 
 @router.post("/restart", dependencies=[Depends(require_token)])

@@ -1008,11 +1008,6 @@ function portal() {
       this.$watch("currentId", (tid) => {
         if (!tid) return;
         this.$nextTick(() => this._scrollTabIntoView(tid));
-        // Persist the current tab to server so other devices follow.
-        // Goes through the same debounced ui-state push that openTabIds /
-        // previewTabs use (last_session_id carries currentId) — keeps
-        // payload coherent and avoids two PUT races overwriting each other.
-        this._pushUIStateSoon();
       });
       // Leaving preview tab on mobile cancels immersive mode so the next
       // tab is rendered with its bars visible. Also persists the choice so
@@ -1488,12 +1483,9 @@ function portal() {
     // caches it on a short TTL), so this is far lighter than a full SSE
     // broadcast subsystem while delivering the live blue/green dot feel.
     //
-    // Deliberately does NOT call _pullUIStateAndMerge here: that force-syncs
-    // currentId via activateTab(), which on a 10s cadence would make two
-    // open+visible devices fight over the active tab and yank the user
-    // mid-read. Tab-strip / currentId reconciliation stays on visibilitychange
-    // (and manual refresh), where the user expects a catch-up — not while
-    // they're actively looking at the screen.
+    // Only the session list (active-dot state) is synced here — the tab
+    // strip / current tab / preview tabs are device-local and never pulled
+    // from the server, so two open devices never fight over the active tab.
     _startSessionsSync() {
       if (this._sessionsSyncTimer) clearInterval(this._sessionsSyncTimer);
       this._sessionsSyncTimer = setInterval(async () => {
@@ -1612,14 +1604,11 @@ function portal() {
         if (document.visibilityState !== "visible") return;
         ping();                  // presence: re-arm push suppression
         this._pingHealth();      // health: refresh conn state immediately
-        // Cross-device tab sync — refresh sessions first (in case another
-        // device created/deleted sessions while this tab was hidden), then
-        // flush any pending local push so the GET sees our latest writes
-        // BEFORE pulling, then merge remote state into the tab strip.
+        // Refresh the session list in case another device created/deleted
+        // sessions while this tab was hidden (drives the active-dot state).
+        // The tab strip itself is device-local — no cross-device merge.
         try {
           await this.refreshSessions();
-          await this._flushUIStatePush();
-          await this._pullUIStateAndMerge();
         } catch (_) {}
       });
     },
@@ -3693,19 +3682,14 @@ function portal() {
     // browser state (scroll position, open file tabs, typed draft, etc.).
     async refreshChat() {
       this.toast(this.lang === "zh" ? "刷新中…" : "Refreshing…", "info", 1500);
-      // Manual refresh is the user's "pull updates from other devices"
-      // intent — same flush→pull dance as visibilitychange. Flush any
-      // pending local ui-state PUT first so the subsequent GET doesn't
-      // overwrite changes we haven't pushed yet; then refresh sessions
-      // (pullUIStateAndMerge filters openTabIds by this.sessions, so
-      // session list must land first); then merge remote ui-state.
-      try { await this._flushUIStatePush(); } catch (_) {}
+      // Manual refresh re-pulls server-side data (context, session list,
+      // stats) and reloads the current session. The tab strip is
+      // device-local, so there's no cross-device tab state to merge.
       await Promise.all([
         this.fetchContextInfo(),
         this.refreshSessions(),
         this.fetchStats(),
       ]);
-      try { await this._pullUIStateAndMerge(); } catch (_) {}
       if (this.currentId) await this.loadSession(this.currentId);
     },
 
@@ -3737,133 +3721,10 @@ function portal() {
         // survives a refresh.
         desktopFullPane: this.desktopFullPane,
       }));
-      // Fire-and-forget cross-device sync. Debounced inside.
-      this._pushUIStateSoon();
-    },
-    // Cross-device sync of the tab strip, preview tab strip, AND currentId
-    // via /api/settings/ui-state. Debounced because savePrefs() fires on
-    // every tab open/close/reorder/preview-select — un-debounced we'd PUT
-    // 5+ times for a single drag-reorder gesture. 300ms is short enough
-    // that a tab change on device A shows up on device B as soon as B's
-    // visibilitychange GET runs, but long enough to collapse bursts.
-    //
-    // currentId rides as last_session_id (the existing field — it always
-    // meant "most recently active session ID"; we now treat it as the
-    // cross-device authoritative current tab, not just a new-device boot
-    // fallback). $watch("currentId") routes through this same path so
-    // tab switches sync without a separate PUT race.
-    _uiStatePayload() {
-      return {
-        last_session_id: this.currentId || null,
-        open_tab_ids: Array.isArray(this.openTabIds) ? this.openTabIds : [],
-        preview_tabs: (this.tabs || []).map(t => ({
-          path: t.path, name: t.name || "", preview: !!t.preview,
-        })),
-      };
-    },
-    _pushUIStateSoon() {
-      if (!this.token) return;                          // pre-login: no-op
-      if (this._uiStatePushTimer) clearTimeout(this._uiStatePushTimer);
-      this._uiStatePushTimer = setTimeout(() => {
-        this._uiStatePushTimer = null;
-        this._uiStatePushInflight = this.api("/api/settings/ui-state", {
-          method: "PUT", json: this._uiStatePayload(),
-        }).catch(() => {}).finally(() => { this._uiStatePushInflight = null; });
-      }, 300);
-    },
-    // Force any pending PUT to flush + complete BEFORE the next GET so
-    // visibilitychange doesn't pull stale remote state that overwrites
-    // local changes we haven't pushed yet.
-    async _flushUIStatePush() {
-      if (this._uiStatePushTimer) {
-        clearTimeout(this._uiStatePushTimer);
-        this._uiStatePushTimer = null;
-        try {
-          await this.api("/api/settings/ui-state", {
-            method: "PUT", json: this._uiStatePayload(),
-          });
-        } catch (_) {}
-      }
-      if (this._uiStatePushInflight) {
-        try { await this._uiStatePushInflight; } catch (_) {}
-      }
-    },
-    // Pull remote ui-state and merge into local openTabIds, preview tabs,
-    // and currentId. Merge rules:
-    //   - remote field undefined / not present → leave local alone (avoids
-    //     wiping local state on a fresh install where remote has no record
-    //     of these fields yet).
-    //   - remote field is an array (incl. empty) → REPLACE local. Empty is
-    //     a meaningful "user closed everything elsewhere" state.
-    //   - openTabIds: filter to sessions that still exist server-side.
-    //   - last_session_id: if remote says a different (valid + open) tab
-    //     is current, ACTIVATE it via activateTab(). The other device is
-    //     authoritative because it pushed more recently. No healing —
-    //     currentId being cross-synced means the local view follows the
-    //     last device that switched tabs.
-    //   - previewTabs: replace wholesale. Content is lazy-fetched on click.
-    //
-    // To avoid yanking the user mid-conversation, we suppress the currentId
-    // sync when the local tab is actively streaming (a turn would visually
-    // jump away from the user). Local will catch up next visibilitychange.
-    async _pullUIStateAndMerge() {
-      if (!this.token) return false;
-      let data;
-      try {
-        const r = await this.api("/api/settings/ui-state");
-        if (!r.ok) return false;
-        data = r.data || {};
-      } catch (_) { return false; }
-      let changed = false;
-      const validIds = new Set((this.sessions || []).map(s => s.id));
-      if (Array.isArray(data.open_tab_ids)) {
-        const remote = data.open_tab_ids.filter(id => validIds.has(id));
-        const before = JSON.stringify(this.openTabIds || []);
-        if (JSON.stringify(remote) !== before) {
-          this.openTabIds = remote;
-          changed = true;
-        }
-      }
-      // currentId sync via last_session_id. Only switch if (a) remote is
-      // different from local, (b) the target session still exists, (c) it's
-      // in the open tab strip, and (d) the local tab isn't streaming (don't
-      // interrupt an in-flight turn the user is reading).
-      const remoteCur = typeof data.last_session_id === "string"
-        ? data.last_session_id : null;
-      const localStreaming = !!(this.tabState && this.tabState[this.currentId]
-                                 && this.tabState[this.currentId].streaming);
-      if (remoteCur && remoteCur !== this.currentId
-          && validIds.has(remoteCur)
-          && (this.openTabIds || []).includes(remoteCur)
-          && !localStreaming) {
-        this.activateTab(remoteCur);
-        changed = true;
-      } else if (this.currentId && !(this.openTabIds || []).includes(this.currentId)
-                 && (this.openTabIds || []).length) {
-        // currentId got dropped by the openTabIds replacement above and
-        // we couldn't (or didn't) jump to the remote current → fall back
-        // to the first surviving tab so we don't end up on a closed one.
-        this.activateTab(this.openTabIds[0]);
-        changed = true;
-      }
-      if (Array.isArray(data.preview_tabs)) {
-        const remote = data.preview_tabs
-          .filter(t => t && typeof t.path === "string")
-          .map(t => ({ path: t.path, name: t.name || t.path.split("/").pop(), preview: !!t.preview }));
-        const before = JSON.stringify((this.tabs || []).map(t => ({ path: t.path, name: t.name, preview: !!t.preview })));
-        const after = JSON.stringify(remote);
-        if (before !== after) {
-          this.tabs = remote;
-          changed = true;
-        }
-      }
-      // Persist the merged view to localStorage so a reload reflects what
-      // we just synced. savePrefs() also re-pushes to server, but the
-      // payload will match what's already there → server is a no-op.
-      if (changed) {
-        try { this.savePrefs(); } catch (_) {}
-      }
-      return changed;
+      // Tab strip / preview tab strip / current tab are now device-local
+      // only (persisted in localStorage above). The cross-device ui-state
+      // sync was removed — it yanked the active tab out from under the user
+      // when another device pushed a different state.
     },
 
     loadPrefs() {
@@ -4708,20 +4569,9 @@ function portal() {
         this.currentId = s.id;
       } else if (!this.sessions.find(x => x.id === this.currentId)) {
         // localStorage had no saved session (new device / cleared storage).
-        // Try to restore the last active session from the server so the user
-        // continues where they left off on their other device.
-        let restored = false;
-        try {
-          const { ok, data } = await this.api("/api/settings/ui-state");
-          if (ok && data && data.last_session_id) {
-            const sid = data.last_session_id;
-            if (this.sessions.find(s => s.id === sid)) {
-              this.currentId = sid;
-              restored = true;
-            }
-          }
-        } catch (_) {}
-        if (!restored) this.currentId = this.sessions[0].id;
+        // Tab state is device-local now, so just land on the most recent
+        // session rather than restoring a cross-device last-active pointer.
+        this.currentId = this.sessions[0].id;
       }
       // Reconcile openTabIds (restored from prefs) with what still exists on
       // the server: drop tabs whose session was deleted, then ensure currentId
@@ -4731,11 +4581,6 @@ function portal() {
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
-      // Cross-device merge: pull the tab strip + preview tabs that other
-      // devices last pushed. Happens AFTER local reconciliation so the
-      // merge sees a clean local baseline. currentId is preserved by the
-      // healing logic inside _pullUIStateAndMerge.
-      try { await this._pullUIStateAndMerge(); } catch (_) {}
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
@@ -4754,9 +4599,9 @@ function portal() {
     },
     // FIX ⑪: quiet variant for the 10s foreground poll. Identical list-merge
     // (incl. the FIX ⑩ active-flag dots + green-dot transition) but WITHOUT
-    // _rebindSelect — that toggles currentId to "" and back, which re-fires
-    // the currentId watcher → a ui-state PUT every 10s on every device. The
-    // tickle is only needed when currentId itself must be re-displayed (login /
+    // _rebindSelect — that toggles currentId to "" and back, re-firing the
+    // currentId watcher on every poll for no benefit. The tickle is only
+    // needed when currentId itself must be re-displayed (login /
     // visibilitychange / explicit refresh), not on a background list poll.
     async _syncSessionListQuiet() {
       const { ok, data } = await this.api("/api/chat/sessions");
