@@ -1421,7 +1421,19 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <template x-for="(m, i) in messages" :key="m._k || m.uuid || ('m-' + i)">
+          <!-- P1 (chat-perf-redesign): per-tab DOM persistence. One message
+               list is rendered per OPEN tab; switching toggles x-show instead
+               of swapping the array backing a single x-for (which forced a
+               full Alpine teardown+rebuild of the whole subtree on every
+               switch). The single message template below is UNCHANGED — it's
+               just wrapped in a per-tab pane and bound to paneMessages(tid).
+               For the visible pane paneMessages(currentId) === this.messages
+               by identity, so every `messages`-reading binding inside stays
+               correct; hidden panes are display:none so their (stale)
+               result is never seen. -->
+          <template x-for="tid in openTabIds" :key="tid">
+          <div class="msg-pane" x-show="tid === currentId">
+          <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
             <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden')"
                  :data-uuid="m.uuid || ''">
               <!-- compact-summary pill -->
@@ -2185,6 +2197,12 @@
               </div>
             </div>
           </template>
+          </div>
+          </template>
+          <!-- /P1 per-tab message panes. Siblings below (pending bubble,
+               pending queue, banners) stay single-instance with active-tab
+               semantics — they read currentId / this.messages / streaming,
+               which already track the active tab. -->
           <!-- Pending "Muse 正在思考" bubble — only while we're waiting for
                the very first chunk. Once a streaming assistant message has
                started accumulating text (its bubble is already rendered

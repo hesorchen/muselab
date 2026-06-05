@@ -2644,6 +2644,18 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
      with the message column visually. */
   padding-inline: max(var(--sp-3), calc(50% - 440px));
 }
+/* P1 (chat-perf-redesign): per-tab message pane. The message list used to
+   be a single x-for whose items were DIRECT flex children of .chat-body
+   (inheriting its column layout + gap). Now each open tab gets its own pane
+   and the messages live one level deeper, so the pane itself must reproduce
+   .chat-body's `display:flex; flex-direction:column; gap` to keep the exact
+   same inter-message spacing. Only the current tab's pane is shown
+   (x-show); hidden panes are display:none and cost no layout. */
+.msg-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
 .msg {
   display: flex;
   flex-direction: column;

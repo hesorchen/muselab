@@ -4657,6 +4657,23 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
+    // P1 (chat-perf-redesign): per-tab DOM persistence. The chat message
+    // list is rendered once PER OPEN TAB (outer x-for over openTabIds), each
+    // pane bound to ITS OWN message array via this method. Switching tabs
+    // then only toggles x-show on the panes instead of swapping the array
+    // backing a single x-for — which used to force Alpine to teardown +
+    // rebuild the entire message subtree (measured: ~88% of switch time was
+    // that JS rebuild, scaling O(messages) and making long/agentic sessions
+    // the worst case). The active tab's
+    // array is still mirrored to this.messages by _activateTabState, so
+    // every existing `messages`-reading binding stays correct for the
+    // VISIBLE pane (paneMessages(currentId) === this.messages by identity).
+    // Hidden panes' bindings still evaluate against this.messages but are
+    // display:none, so the (possibly stale) result is never seen.
+    paneMessages(tid) {
+      return this._ensureTabState(tid).messages;
+    },
+
     async initSessions() {
       await this.refreshSessions();
       if (!this.sessions.length) {
