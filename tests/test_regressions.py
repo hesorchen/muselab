@@ -139,6 +139,59 @@ def test_context_used_fallback_when_sdk_value_missing(client, auth):
 
 
 # ============================================================================
+# Bug 3b (2026-06-06): context ring read ~5x too low. The Claude entries in
+# MODEL_CONTEXT_LIMITS claimed a 1M window, but the bundled CLI's
+# get_context_usage reports 200K — so /usage divided by 1M and showed e.g.
+# 8.8% when the breakdown popup (SDK truth) showed 44%. Two-part fix:
+#   1. Claude table fallback corrected to 200K.
+#   2. The real per-account window (SDK maxTokens) is persisted per-session so
+#      it survives restart and overrides the table (incl. genuine-1M accounts).
+# ============================================================================
+
+def test_claude_ctx_limit_fallback_is_200k_not_1m(client, auth):
+    """Never-measured Claude session → /usage denominator is the corrected
+    200K fallback, not the old 1M that made the meter read ~5x low."""
+    r = client.get("/api/chat/usage/no-such-claude-sid?model=claude-opus-4-8",
+                    headers=auth)
+    assert r.status_code == 200
+    assert r.json()["context_limit"] == 200_000
+
+
+def test_persisted_sdk_window_overrides_table(client, auth):
+    """A per-session SDK-measured window (persisted via set_session_ctx_window)
+    must win over the hardcoded table — this is how genuine-1M accounts get the
+    right denominator after their first turn, and how the meter stays correct
+    across a muselab restart with no live client."""
+    r = client.post("/api/chat/sessions",
+                     headers={**auth, "Content-Type": "application/json"},
+                     json={"name": "ctx persist", "model": "claude-opus-4-8"})
+    sid = r.json()["id"]
+
+    from backend import chat as chat_mod
+    from backend import sessions as sess_mod
+    # Simulate a turn having measured a real 1M window on this account.
+    sess_mod.set_session_ctx_window(sid, 1_000_000)
+    chat_mod._session_usage[sid] = {
+        "input_tokens": 2, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "total_cost_usd": 0.0, "last_turn_at": 0.0,
+        "context_used": 250_000, "context_used_pct": 0.0,
+        "context_limit": 200_000,   # stale table-shaped value, must lose
+    }
+    r = client.get(f"/api/chat/usage/{sid}?model=claude-opus-4-8", headers=auth)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["context_limit"] == 1_000_000, \
+        f"persisted SDK window must win, got {body['context_limit']}"
+    assert body["context_used_pct"] == round(250_000 / 1_000_000 * 100, 1)
+    # Persistence must survive a cold cache (the restart case): drop the
+    # in-memory snapshot and the limit still resolves from the sidecar.
+    chat_mod._session_usage.pop(sid, None)
+    r = client.get(f"/api/chat/usage/{sid}?model=claude-opus-4-8", headers=auth)
+    assert r.json()["context_limit"] == 1_000_000
+
+
+# ============================================================================
 # Bug 4: Settings PUT didn't refresh contextInfo on the frontend so
 # has_any_provider stayed false after adding a key. Backend test: putting a
 # DeepSeek key updates os.environ in-process AND context-info reflects it.

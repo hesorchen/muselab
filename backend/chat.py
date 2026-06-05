@@ -604,11 +604,18 @@ _session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
 #   - MiniMax:     platform.minimax.io (M2.5 / M2.7 both 204_800, cline #10007
 #                  PR fixed the prior 192K/245K misinformation)
 MODEL_CONTEXT_LIMITS = {
-    # Anthropic — 1M on Pro/Max plans (auto-upgrade, no flag needed). Haiku
-    # stayed at the older 200K since it's the speed/cost tier.
-    "claude-opus-4-8":            1_000_000,
-    "claude-opus-4-7":            1_000_000,
-    "claude-sonnet-4-6":          1_000_000,
+    # Anthropic — the bundled Claude Code CLI reports a 200K effective window
+    # for these models (verified via get_context_usage: maxTokens=200000). The
+    # 1M context is a beta tier (context-1m-2025-08-07 header / higher API
+    # tier), NOT a silent Pro/Max auto-upgrade — the earlier 1M values here
+    # made the meter read ~5x too low. This table is only the FALLBACK
+    # denominator for sessions muselab hasn't measured yet; once a turn runs,
+    # the SDK-reported maxTokens is persisted per-session
+    # (sessions.set_session_ctx_window) and overrides this — so accounts that
+    # genuinely have the 1M window auto-upgrade after their first turn.
+    "claude-opus-4-8":              200_000,
+    "claude-opus-4-7":              200_000,
+    "claude-sonnet-4-6":            200_000,
     "claude-haiku-4-5-20251001":    200_000,
     # DeepSeek V4 series — 1M native, all SKUs.
     "deepseek-v4-pro":            1_000_000,
@@ -3008,7 +3015,16 @@ def _session_usage_from_jsonl(sid: str) -> dict | None:
     cc_t = int(last_usage.get("cache_creation_input_tokens", 0)
                 or last_usage.get("cache_creation_tokens", 0) or 0)
     ctx_used = in_t + cr_t + cc_t
-    limit = MODEL_CONTEXT_LIMITS.get(last_model, 0)
+    # Prefer the SDK-authoritative window persisted from a prior turn's
+    # get_context_usage() (survives restart). Only fall back to the hardcoded
+    # table when this session has never been measured — that guess was the
+    # source of the "meter reads too low after restart" bug.
+    sdk_window = None
+    try:
+        sdk_window = sess.get_session_ctx_window(sid)
+    except Exception:
+        sdk_window = None
+    limit = sdk_window or MODEL_CONTEXT_LIMITS.get(last_model, 0)
     pct = round(ctx_used / limit * 100, 1) if limit else 0.0
     return {
         "input_tokens": in_t, "output_tokens": out_t,
@@ -3045,14 +3061,23 @@ def session_usage(session_id: str, model: str = "") -> dict:
                 "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
             }
     m = model or MODEL
-    # Take the MAX of (stored sess_u value, hardcoded table). This way when
-    # MODEL_CONTEXT_LIMITS gets bumped (e.g. Opus 200K → 1M), an existing
-    # session that stored the old 200K still picks up the new ceiling on the
-    # next /usage poll — no need to wait for the user to send a new message.
-    # SDK truth (from ResultMessage handler) overrides on next stream done.
+    # Denominator precedence: the SDK-authoritative window measured for THIS
+    # session (persisted across restarts, Claude only) wins outright; otherwise
+    # take max(in-memory stored, hardcoded table). The max() keeps the
+    # documented "table bump picks up the new ceiling" behavior for third-party
+    # models (where the table is the only truth — the CLI can't measure their
+    # windows). It no longer over-states Claude: the real bug was the Claude
+    # table entries claiming 1M when the CLI reports 200K, which made the meter
+    # read ~5x too low. With the table corrected to 200K and the SDK value
+    # persisted, max() can't inflate, and genuine-1M accounts win via sdk_window.
+    sdk_window = None
+    try:
+        sdk_window = sess.get_session_ctx_window(session_id)
+    except Exception:
+        sdk_window = None
     stored = int(u.get("context_limit", 0) or 0)
     hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
-    limit = max(stored, hardcoded)
+    limit = sdk_window or max(stored, hardcoded)
     # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
     # handler. Fall back to the legacy estimate only if no turn has completed
     # yet (in which case `context_used` is 0 anyway → 0% display, correct).
@@ -5830,6 +5855,13 @@ async def _start_turn(
                     real_total = int(cu.get("totalTokens") or 0)
                     if real_max:
                         sess_u["context_limit"] = real_max
+                        # Persist so the meter shows the correct denominator
+                        # after a restart / on cold tab switches without
+                        # needing a live client (see get_session_ctx_window).
+                        try:
+                            sess.set_session_ctx_window(session_id, real_max)
+                        except Exception:
+                            pass
                     if real_total:
                         sess_u["context_used"] = real_total
                     if real_max and real_total:

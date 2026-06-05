@@ -130,11 +130,14 @@ def test_session_usage_endpoint_returns_meter_data(client, auth, app_module):
                     headers=auth)
     assert r.status_code == 200
     d = r.json()
-    # 2026-05-18: Claude Opus 4.7 ships with 1M context on Pro/Max/Enterprise
-    # plans (verified at anthropic.com / Claude Code docs). Test value
-    # follows MODEL_CONTEXT_LIMITS — bump together if Anthropic changes
-    # default tier.
-    assert d["context_limit"] == 1_000_000
+    # 2026-06-06: corrected to 200K. The bundled Claude Code CLI reports a
+    # 200K effective window for Claude models (verified via get_context_usage:
+    # maxTokens=200000); the earlier 1M assumption made the context meter read
+    # ~5x too low. The hardcoded table is only the never-measured FALLBACK —
+    # accounts that genuinely have the 1M beta window auto-upgrade once a turn
+    # runs (the SDK maxTokens is then persisted per-session and overrides this).
+    # Test value follows MODEL_CONTEXT_LIMITS — bump together if it changes.
+    assert d["context_limit"] == 200_000
     assert d["context_used_pct"] == 0
     assert d["input_tokens"] == 0
 

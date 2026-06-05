@@ -555,6 +555,40 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
         _save_sidecar(sid, data)
 
 
+def get_session_ctx_window(sid: str) -> int | None:
+    """SDK-authoritative context window (maxTokens) last measured for this
+    session via ClaudeSDKClient.get_context_usage(), persisted in the sidecar.
+
+    Why this exists: the live `maxTokens` is only known while a turn streams
+    and was kept in-memory only — lost on every muselab restart. After a
+    restart the context meter fell back to the hardcoded MODEL_CONTEXT_LIMITS
+    guess (e.g. 1M) which mismatched the CLI's real 200K window, making the
+    ring read ~5x too low. Persisting the measured value lets the meter show
+    the correct denominator immediately, no live client needed.
+
+    Returns None when never measured so the caller falls back to the table."""
+    v = _load_sidecar(sid).get("context_max_tokens")
+    try:
+        v = int(v or 0)
+    except (TypeError, ValueError):
+        return None
+    return v or None
+
+
+def set_session_ctx_window(sid: str, max_tokens: int) -> None:
+    """Persist the SDK-measured context window for this session. No-op for
+    non-positive values (never clobber a good value with 0) and when unchanged
+    (avoids a sidecar rewrite on every turn)."""
+    if not max_tokens or max_tokens <= 0:
+        return
+    with _SIDECAR_LOCK:
+        data = _load_sidecar(sid)
+        if int(data.get("context_max_tokens") or 0) == int(max_tokens):
+            return
+        data["context_max_tokens"] = int(max_tokens)
+        _save_sidecar(sid, data)
+
+
 # Hard cap on pending_attachments to prevent unbounded sidecar growth.
 # Without this, "upload image → cancel/refresh before send" silently
 # accretes entries forever (consume only fires when a real user message
