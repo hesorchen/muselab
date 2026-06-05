@@ -141,6 +141,44 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     assert "sid-boom" in chat_mod._pending_interrupts
 
 
+# ====== force-stop watchdog (interrupt that the SDK refuses to honor) ======
+
+@pytest.mark.asyncio
+async def test_force_stop_tears_down_stuck_turn(chat_mod):
+    """The SDK's client.interrupt() is best-effort; for an agentic turn the CLI
+    may keep running, pinning the slot in _active_turns and bouncing every
+    subsequent send with 'previous turn still running'. The force-stop watchdog
+    must, after the grace window, kill the client and free the slot itself."""
+    sid = "sid-stuck"
+    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", ""))
+    bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
+    chat_mod._active_turns[sid] = bc
+    try:
+        # Tiny grace; the (absent) pump never frees the slot, so the watchdog
+        # must force teardown: disconnect the client + free the slot by hand.
+        await chat_mod._force_stop_after_grace(sid, bc, grace=0.01)
+        assert c.disconnected is True            # CLI killed
+        assert sid not in chat_mod._active_turns  # slot freed → next send works
+        assert bc.cancelled is True
+        assert bc.done is True                    # subscribers get the sentinel
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_force_stop_noop_when_turn_drained_naturally(chat_mod):
+    """If the SDK interrupt DID drain the turn within the grace window, the
+    watchdog must not tear down the (now warm) client — that would needlessly
+    drop the CLI subprocess on every successful interrupt."""
+    sid = "sid-drained"
+    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", ""))
+    bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
+    bc.finish()   # turn ended naturally before grace elapsed
+    # _active_turns no longer holds it (the pump's finally popped it).
+    await chat_mod._force_stop_after_grace(sid, bc, grace=0.01)
+    assert c.disconnected is False
+
+
 # ====== probe_provider ======
 
 def test_probe_unknown_model(client, auth):

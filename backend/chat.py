@@ -297,6 +297,11 @@ class TurnBroadcast:
         # bubbles). One continuation ⇒ at most one reconnect ⇒ one replay,
         # regardless of frontend version. No effect on normal turns.
         self.continuation_consumed: bool = False
+        # Handle to the detached `_pump_gen_to_broadcast` task driving this
+        # turn. Stored so the force-stop watchdog (_force_stop_after_grace) can
+        # cancel a pump that an interrupt + client teardown failed to unblock.
+        # None until _start_turn finishes wiring the pump.
+        self.task: "asyncio.Task | None" = None
 
     def publish(self, event: dict) -> None:
         self.events.append(event)
@@ -3793,6 +3798,24 @@ def mcp_status() -> dict:
 # cross-user race to worry about.
 _pending_interrupts: set[str] = set()
 
+# How long the force-stop watchdog waits for the SDK's control-protocol
+# interrupt to drain the turn on its own before tearing the client down.
+# The SDK `client.interrupt()` is best-effort: for an agentic turn the bundled
+# CLI does not always abort promptly (observed: turn keeps running, the slot
+# stays in `_active_turns`, every subsequent send bounces with "previous turn
+# still running" until the 30-min outer timeout). If the turn hasn't ended
+# within this grace window we kill the CLI subprocess to guarantee the slot
+# frees. Kept short so the user can resend quickly, but long enough that a
+# legitimately-fast interrupt completes naturally (warm-client preserved).
+_INTERRUPT_FORCE_GRACE_S = 2.5
+
+# How long a NEW turn waits for an already-interrupted (cancelled) turn to
+# finish draining before it gives up with _TurnBusy. Must comfortably exceed
+# _INTERRUPT_FORCE_GRACE_S + teardown time so the force-stop watchdog always
+# wins the race and the user's resend transparently succeeds instead of seeing
+# "previous turn still running" during the teardown window.
+_INTERRUPT_DRAIN_WAIT_S = 6.0
+
 
 @router.post("/interrupt", dependencies=[Depends(require_token_header_or_query)])
 async def interrupt(session_id: str) -> dict:
@@ -3801,12 +3824,23 @@ async def interrupt(session_id: str) -> dict:
     re-spawning the CLI / re-loading CLAUDE.md / re-initializing MCP."""
     async with _lock:
         targets = [(k, c) for k, c in _clients.items() if k[0] == session_id]
+    # Mark the active turn user-cancelled up front (BEFORE calling SDK's
+    # interrupt — the ResultMessage handler races with us, and we'd rather flag
+    # too early than too late). This also lets the force-stop watchdog and the
+    # event_gen error branch convert a teardown-induced transport error into a
+    # clean `cancelled` event instead of a red error toast.
+    bc = _active_turns.get(session_id)
+    if bc is not None and not bc.done:
+        bc.cancelled = True
     if not targets:
+        # No live client in the pool, but a detached pump task may still be
+        # holding the _active_turns slot. Schedule the watchdog anyway so the
+        # session can't get wedged. Don't set the pending-interrupt flag: with
+        # no turn to suppress a push for, leaving it set would wrongly mute the
+        # NEXT turn's done-push.
+        if bc is not None and not bc.done:
+            asyncio.create_task(_force_stop_after_grace(session_id, bc))
         return {"ok": True, "interrupted": [], "note": "no live client"}
-    # Mark BEFORE calling SDK's interrupt — the handler races with us, and
-    # we'd rather flag too early (one extra "not really cancelled"
-    # suppression that no-ops) than too late (push fires for a turn the
-    # user just cancelled).
     _pending_interrupts.add(session_id)
     interrupted: list[str] = []
     for k, c in targets:
@@ -3816,7 +3850,68 @@ async def interrupt(session_id: str) -> dict:
         except Exception as e:
             sys.stderr.write(
                 f"[chat-interrupt] {k} failed: {type(e).__name__}: {e}\n")
+    # The SDK interrupt is best-effort (see _INTERRUPT_FORCE_GRACE_S). Arm a
+    # watchdog that force-tears-down the client if the turn doesn't drain on
+    # its own — otherwise a turn the CLI refuses to abort would pin the slot
+    # until the 30-min outer timeout.
+    if bc is not None and not bc.done:
+        asyncio.create_task(_force_stop_after_grace(session_id, bc))
     return {"ok": True, "interrupted": interrupted}
+
+
+async def _force_stop_after_grace(
+    session_id: str,
+    bc: "TurnBroadcast",
+    grace: float = _INTERRUPT_FORCE_GRACE_S,
+) -> None:
+    """Guarantee an interrupted turn actually stops.
+
+    `client.interrupt()` only asks the CLI nicely; for agentic turns it doesn't
+    always abort. This watchdog waits `grace` seconds and, if the SAME turn is
+    still pinned in `_active_turns`, kills the CLI subprocess so the pump's
+    `receive_response()` unblocks — its error→break→finally path then frees the
+    slot. Because `bc.cancelled` was set in `interrupt()`, event_gen renders
+    that teardown as a `cancelled` event rather than a red error. As a last
+    resort (pump never unwinds) it cancels the pump task directly and frees the
+    slot by hand."""
+    try:
+        await asyncio.sleep(grace)
+        # SDK interrupt drained it naturally — nothing to force.
+        if _active_turns.get(session_id) is not bc or bc.done:
+            return
+        sys.stderr.write(
+            f"[chat-interrupt] sid={session_id} did not drain after {grace:.1f}s; "
+            f"forcing client teardown\n")
+        sys.stderr.flush()
+        bc.cancelled = True
+        # Kill the CLI subprocess(es) for this session. The detached pump's
+        # receive_response() then errors out and its finally pops _active_turns.
+        try:
+            await disconnect_client(session_id)
+        except Exception:
+            pass
+        # Give the pump a moment to unwind on its own.
+        for _ in range(20):   # up to ~2s
+            if bc.done or _active_turns.get(session_id) is not bc:
+                return
+            await asyncio.sleep(0.1)
+        # Last resort: the pump never unblocked. Cancel it (its finally still
+        # frees the slot) and clean up by hand so the session can't stay wedged.
+        t = getattr(bc, "task", None)
+        if t is not None and not t.done():
+            t.cancel()
+        async with _lock:
+            if _active_turns.get(session_id) is bc:
+                _active_turns.pop(session_id, None)
+        if not bc.done:
+            bc.publish({"event": "cancelled", "data": "{}"})
+            bc.finish()
+        _delete_active_turn_sidecar(session_id)
+    except Exception as e:
+        sys.stderr.write(
+            f"[chat-interrupt] force-stop watchdog failed sid={session_id}: "
+            f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
 
 
 @router.post("/reset", dependencies=[Depends(require_token_header_or_query)])
@@ -4984,11 +5079,36 @@ async def _start_turn(
     # `_active_turns[sid]` — making the first turn's reply silently vanish
     # from the UI. Reserve a placeholder broadcast under the lock; we'll
     # fill its `user_text` / images / etc. below once we've parsed them.
+    draining = None
     async with _lock:
-        if session_id in _active_turns and not _active_turns[session_id].done:
-            raise _TurnBusy()
-        broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
-        _active_turns[session_id] = broadcast
+        cur = _active_turns.get(session_id)
+        if cur is not None and not cur.done:
+            if not cur.cancelled:
+                # A legitimate concurrent turn (not user-interrupted) — refuse.
+                raise _TurnBusy()
+            # The current turn is being interrupted (its force-stop watchdog is
+            # tearing it down). Rather than bounce the user's resend with
+            # "previous turn still running", wait below for the slot to free.
+            draining = cur
+        else:
+            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+            _active_turns[session_id] = broadcast
+    if draining is not None:
+        # Outside the lock: poll for the interrupted turn to drain. The
+        # force-stop watchdog guarantees this happens within
+        # _INTERRUPT_FORCE_GRACE_S + teardown, comfortably inside the deadline.
+        deadline = time.monotonic() + _INTERRUPT_DRAIN_WAIT_S
+        while time.monotonic() < deadline:
+            if draining.done or _active_turns.get(session_id) is not draining:
+                break
+            await asyncio.sleep(0.1)
+        async with _lock:
+            cur = _active_turns.get(session_id)
+            if cur is not None and not cur.done:
+                # Teardown still hasn't completed — give up cleanly.
+                raise _TurnBusy()
+            broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
+            _active_turns[session_id] = broadcast
     # Defensive: clear any stale "user cancelled" flag carried over from
     # a previous turn on this session. Normally consumed by the prior
     # turn's ResultMessage handler, but if that handler never reached
@@ -5891,7 +6011,16 @@ async def _start_turn(
                     yield payload
                     continue
                 if kind == "error":
-                    yield _error_event(payload)
+                    # If the user interrupted this turn and the force-stop
+                    # watchdog tore the CLI down, receive_response() raises a
+                    # transport error that lands here. That's an expected
+                    # consequence of the stop, not a real failure — surface it
+                    # as a clean `cancelled` event so the FE doesn't flash a red
+                    # error toast for a turn the user deliberately stopped.
+                    if broadcast.cancelled:
+                        yield {"event": "cancelled", "data": "{}"}
+                    else:
+                        yield _error_event(payload)
                     break
                 if kind == "done":
                     break
@@ -6047,7 +6176,9 @@ async def _start_turn(
                 sys.stderr.write(
                     f"[chat] queue drain trigger failed sid={session_id}: {e}\n")
 
-    asyncio.create_task(_pump_gen_to_broadcast())
+    # Keep a handle to the detached pump so the force-stop watchdog can cancel
+    # it if an interrupt + client teardown ever fails to unblock receive_response.
+    broadcast.task = asyncio.create_task(_pump_gen_to_broadcast())
 
     return broadcast
 
