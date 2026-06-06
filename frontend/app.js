@@ -9903,6 +9903,14 @@ function portal() {
       // (3 sites) when their underlying content changes, so cache
       // invalidation is still correct.
       if (!el || el.dataset.hl === "1") return;
+      // Skip inline code that _linkifyFilePaths already turned into a clickable
+      // file link. hljs rewrites el.innerHTML wholesale, which would wipe the
+      // injected <a class="file-link"> and make the path un-clickable. Inline
+      // code paths shouldn't be syntax-highlighted anyway, so just mark done.
+      if (el.classList.contains("has-file-link") || el.querySelector("a.file-link")) {
+        el.dataset.hl = "1";
+        return;
+      }
       const text = el.textContent;
       // Skip expensive syntax highlighting for large files. hljs JavaScript /
       // TypeScript parsers can block the main thread for several seconds on
