@@ -3518,6 +3518,48 @@ async def native_compact_session_api(sid: str) -> dict:
                     f"[chat] restore permission {prior_perm} after compact "
                     f"failed for sid={sid[:8]}: {type(e).__name__}: {e}\n")
                 sys.stderr.flush()
+    # Refresh the cached context-usage snapshot from the now-compacted live
+    # client so the meter drops immediately and STAYS dropped. /usage reads
+    # _session_usage first; on a miss it falls back to
+    # _session_usage_from_jsonl, which takes the LAST assistant turn's
+    # cumulative usage. But /compact writes an isCompactSummary record, NOT a
+    # fresh low-usage assistant turn — so that JSONL path keeps reporting the
+    # PRE-compact (large) number until the next real message, leaving the ring
+    # stuck at its pre-compact %. Mirror the stream done-handler (chat.py
+    # ~5851): pull SDK totalTokens/maxTokens off the same client we just ran
+    # /compact on (its in-memory context is the compacted one) and write them
+    # back into _session_usage so every subsequent /usage poll is correct.
+    try:
+        cu = await client.get_context_usage()
+        real_max = int(cu.get("maxTokens") or 0)
+        real_total = int(cu.get("totalTokens") or 0)
+        sess_u = _session_usage.setdefault(sid, {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "total_cost_usd": 0.0, "last_turn_at": 0.0,
+            "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
+        })
+        if real_total:
+            sess_u["context_used"] = real_total
+        if endpoints.is_third_party(model):
+            # CLI tokenizer doesn't know third-party windows — trust the table
+            # for the denominator (matches the stream done-handler logic).
+            sess_u["context_limit"] = MODEL_CONTEXT_LIMITS.get(
+                model, DEFAULT_CONTEXT_LIMIT)
+        elif real_max:
+            sess_u["context_limit"] = real_max
+            try:
+                sess.set_session_ctx_window(sid, real_max)
+            except Exception:
+                pass
+        lim = int(sess_u.get("context_limit", 0) or 0)
+        if lim and real_total:
+            sess_u["context_used_pct"] = round(real_total / lim * 100, 1)
+    except Exception as _e:
+        sys.stderr.write(
+            f"[chat] post-compact ctx refresh skipped for sid={sid[:8]}: "
+            f"{type(_e).__name__}\n")
+        sys.stderr.flush()
     # Refresh message_count + turn_count so the sidebar reflects the
     # compacted size. turn_count uses the real-prompt filter — see the
     # comment on _is_real_user_prompt for why bare `type == "user"` over-
