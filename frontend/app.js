@@ -6916,8 +6916,66 @@ function portal() {
           // No reveal scheduled (error / early return) → don't trap the
           // skeleton: show whatever we have.
           if (!scheduledReveal) this.messagesReady = true;
+          // The active tab is now warm — opportunistically warm the OTHER
+          // open tabs during idle time so switching to them is instant
+          // (no fetch + parse + render on click). Self-chaining + idle-gated,
+          // so it never competes with foreground work.
+          this._scheduleIdlePreload();
         }
       }
+    },
+
+    // Warm OPEN-but-inactive tabs in the background during idle time so a
+    // later switch is instant. Each step loads ONE unloaded tab, then
+    // re-schedules itself until every open tab is warm. Gated on
+    // requestIdleCallback (falls back to a short timeout) so it yields to
+    // any foreground work; skipped entirely while the visible tab is
+    // streaming so it can't steal main-thread time from a live reply.
+    // loadSession is per-session safe (only touches this.messages when
+    // sid === currentId), so preloading an off-screen tab can't disturb the
+    // active view; the backend parse it triggers is now cached by
+    // (mtime, size), making repeat/preload loads cheap.
+    _scheduleIdlePreload() {
+      // Background preload runs on ALL layouts (desktop + mobile). It was
+      // previously desktop-only to avoid iOS dropping the keyboard on the
+      // first composer tap (an off-screen loadSession landing mid-tap); that
+      // gate was removed by request so mobile tab switches are instant too.
+      if (this._idlePreloadScheduled) return;
+      this._idlePreloadScheduled = true;
+      const run = () => { this._idlePreloadScheduled = false; this._idlePreloadStep(); };
+      if (typeof window !== "undefined" && window.requestIdleCallback) {
+        window.requestIdleCallback(run, { timeout: 4000 });
+      } else {
+        setTimeout(run, 800);
+      }
+    },
+    _idlePreloadStep() {
+      const ids = this.openTabIds || [];
+      const next = ids.find(id => {
+        if (!id || id === this.currentId) return false;
+        const st = this.tabState && this.tabState[id];
+        if (st && (st._loaded || st._preloadFailed)) return false;
+        return !(this._prefetching && this._prefetching[id]);
+      });
+      if (!next) return;                       // all open tabs warm — done
+      if (this.streaming) {                    // don't fight a live reply
+        this._scheduleIdlePreload();
+        return;
+      }
+      if (!this._prefetching) this._prefetching = {};
+      this._prefetching[next] = true;
+      this.loadSession(next)
+        .then(() => { this._ensureTabState(next)._loaded = true; })
+        .catch(() => {
+          // Mark so a persistently-failing tab isn't retried every idle
+          // cycle; the real click still loads it via switchSession (which
+          // ignores this flag).
+          this._ensureTabState(next)._preloadFailed = true;
+        })
+        .finally(() => {
+          delete this._prefetching[next];
+          this._scheduleIdlePreload();         // chain to the next unloaded tab
+        });
     },
 
     // ===== Lazy-loaded history controls =====
