@@ -738,7 +738,7 @@
              when not active — :src="" would otherwise resolve to the page URL
              and fire a spurious resource-load-failed error in console. -->
         <template x-if="!editing && previewMode==='img' && selected">
-          <img :src="rawUrl(selected)" class="preview-img" />
+          <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''" class="preview-img" />
         </template>
         <iframe x-show="!editing && previewMode==='pdf'"
                 :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
@@ -829,7 +829,7 @@
                 <template x-for="(row, ri) in (csvData && csvData.rows || [])" :key="ri">
                   <tr>
                     <td class="xlsx-rownum"
-                        x-text="csvOffset + ri + 1 + (csvData && csvData.has_header ? 1 : 0)"></td>
+                        x-text="csvOffset + ri + 1"></td>
                     <template x-for="(cell, ci) in row" :key="ci">
                       <td x-text="cell" :title="cell"></td>
                     </template>
@@ -3475,6 +3475,28 @@
           </div>
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
+          </template>
+          <!-- Skeleton while the (uncached / cold) dashboard scan runs — the
+               first load on a large archive reads every session JSONL and can
+               take several seconds. Showing the layout's shape beats a blank
+               pane with only the button reading "Loading…". -->
+          <template x-if="cost.loading && !cost.data">
+            <div class="cost-skeleton" aria-busy="true"
+                 :aria-label="lang==='zh' ? '用量看板加载中' : 'Loading usage dashboard'">
+              <div class="cost-skeleton-chips">
+                <div class="sk-chip"></div><div class="sk-chip"></div><div class="sk-chip"></div>
+              </div>
+              <div class="cost-skeleton-kpis">
+                <div class="sk-kpi"></div><div class="sk-kpi"></div>
+                <div class="sk-kpi"></div><div class="sk-kpi"></div>
+              </div>
+              <div class="cost-skeleton-bars">
+                <template x-for="i in 14" :key="i"><div class="sk-bar"></div></template>
+              </div>
+              <div class="cost-skeleton-rows">
+                <div class="sk-row"></div><div class="sk-row"></div><div class="sk-row"></div>
+              </div>
+            </div>
           </template>
           <template x-if="cost.data">
             <div>

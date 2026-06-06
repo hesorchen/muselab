@@ -804,6 +804,13 @@ async def _scheduler_loop() -> None:
                     # finishes.
                     with _STATE_LOCK:
                         task["next_run"] = _compute_next_run(task["schedule"])
+                        # A `once` task fires exactly once — after firing it
+                        # has no future next_run, so disable it too. This
+                        # flips the UI toggle off so the user sees it's spent,
+                        # instead of a dead-enabled task that can never fire
+                        # again.
+                        if (task.get("schedule") or {}).get("kind") == "once":
+                            task["enabled"] = False
                         _save_state()
                     task_obj = _track_task(asyncio.create_task(_execute_task(task)))
                     task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
@@ -855,6 +862,14 @@ async def start_scheduler() -> None:
                     f"{task.get('id','?')} ({task.get('name','?')}): "
                     f"missed {(now - nr) / 3600:.1f}h ago, beyond 24h window\n")
             task["next_run"] = _compute_next_run(sched)
+            # A spent `once` task (date in the past → no future next_run)
+            # should be disabled, not left dead-enabled. Covers both tasks
+            # that just missed their window (already queued for catch-up
+            # above, so they still fire one final time) and ones that fired
+            # in a previous run but stayed enabled. Future-dated `once` tasks
+            # keep next_run set, so they stay enabled until they fire.
+            if sched.get("kind") == "once" and task["next_run"] is None:
+                task["enabled"] = False
         _save_state()
     # Kick off catch-up runs — staggered so an overnight outage with many
     # daily tasks doesn't spawn every CLI subprocess at once (thundering

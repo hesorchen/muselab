@@ -3274,6 +3274,20 @@ def _add_bucket(dst: dict, src: dict) -> None:
             dst[k] += v
 
 
+# Cost-dashboard response cache. The handler re-reads every session JSONL +
+# sidecar on each call (token truth lives only on disk) — O(hundreds of files),
+# measured ~8s on a large archive with no caching. The inputs only change when
+# a turn is written (new / grown JSONL) or a sidecar cost updates, so we cache
+# the full response keyed by (days, tz, today) and invalidate on a cheap
+# fingerprint of the input file set. A fingerprint match returns the cached
+# dict; a mismatch recomputes. Guarded by a plain threading.Lock because
+# cost_dashboard is a sync FastAPI endpoint (runs in the threadpool, can be hit
+# concurrently). today is in the key (not the fingerprint) so a midnight
+# rollover with no new data still recomputes the date-bucketed window.
+_dashboard_cache: dict[tuple, tuple] = {}   # (days, tz, today) -> (fingerprint, response)
+_dashboard_cache_lock = threading.Lock()
+
+
 @router.get("/cost-dashboard", dependencies=[Depends(require_token)])
 def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
                     tz_offset_minutes: int = Query(default=0, ge=-1440, le=1440)
@@ -3302,43 +3316,14 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     import datetime as _dt
     from collections import defaultdict
 
-    # 1) Sidecar costs by (sid, uuid) — optional overlay, may be sparse
-    # or empty for third-party vendors. Walk it once so the JSONL scan
-    # can do a cheap dict lookup per turn.
-    cost_by_uuid: dict[str, dict[str, float]] = {}
-    for sidecar in sess.SESS_DIR.glob("*.sidecar.json"):
-        sid = sidecar.name.split(".sidecar.json")[0]
-        try:
-            data = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            continue
-        msgs = data.get("messages") or {}
-        per_sess: dict[str, float] = {}
-        for uuid_key, ann in msgs.items():
-            if not isinstance(ann, dict):
-                continue
-            cost_val = _parse_cost(ann.get("cost"))
-            if cost_val > 0:
-                per_sess[uuid_key] = cost_val
-        if per_sess:
-            cost_by_uuid[sid] = per_sess
-
-    # 2) Walk JSONL — the universal token source. Every vendor writes
-    # message.usage on assistant turns in Anthropic-compatible shape
-    # (CLI normalizes OpenAI-compatible vendors transparently).
     tz = _dt.timezone(_dt.timedelta(minutes=tz_offset_minutes))
     now = _dt.datetime.now(tz)
     today_str = now.date().isoformat()
-    cutoff_day = (now.date() - _dt.timedelta(days=days - 1)).isoformat()
-    cutoff_7d  = (now.date() - _dt.timedelta(days=6)).isoformat()
 
-    all_total   = _empty_bucket()
-    today_total = _empty_bucket()
-    last_7d     = _empty_bucket()
-    last_30d    = _empty_bucket()
-    by_day:   dict[str, dict] = defaultdict(_empty_bucket)
-    by_model: dict[str, dict] = defaultdict(_empty_bucket)
-    by_vendor: dict[str, dict] = defaultdict(_empty_bucket)
+    # Discover the input file set first (cheap: glob + the project-root walk,
+    # no file reads yet). We fingerprint these paths before deciding whether
+    # the expensive read+parse is even needed (see cache note above).
+    sidecar_paths = list(sess.SESS_DIR.glob("*.sidecar.json"))
 
     # Discover all JSONLs for muselab-tracked sessions. SDK CLI keys
     # the projects dir by the cwd that ran the session, so a single
@@ -3380,6 +3365,65 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
                     jsonl_paths.append(jsonl)
         except OSError:
             continue
+
+    # Cheap fingerprint of the input set. Any change that affects the numbers
+    # — a new turn (grown / added JSONL), a sidecar cost update, a deleted
+    # session — shifts (file count, newest mtime, total size). stat() is
+    # microseconds per file; the full read + json.loads of every line is the
+    # ~8s cost we skip on a cache hit.
+    fp_count = fp_size = 0
+    fp_mtime = 0
+    for p in (*sidecar_paths, *jsonl_paths):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        fp_count += 1
+        fp_size += st.st_size
+        if st.st_mtime_ns > fp_mtime:
+            fp_mtime = st.st_mtime_ns
+    fingerprint = (fp_count, fp_mtime, fp_size)
+    cache_key = (days, tz_offset_minutes, today_str)
+    with _dashboard_cache_lock:
+        cached = _dashboard_cache.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
+    # ── Cache miss → do the full read + scan. ──
+    # 1) Sidecar costs by (sid, uuid) — optional overlay, may be sparse
+    # or empty for third-party vendors. Walk it once so the JSONL scan
+    # can do a cheap dict lookup per turn.
+    cost_by_uuid: dict[str, dict[str, float]] = {}
+    for sidecar in sidecar_paths:
+        sid = sidecar.name.split(".sidecar.json")[0]
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        msgs = data.get("messages") or {}
+        per_sess: dict[str, float] = {}
+        for uuid_key, ann in msgs.items():
+            if not isinstance(ann, dict):
+                continue
+            cost_val = _parse_cost(ann.get("cost"))
+            if cost_val > 0:
+                per_sess[uuid_key] = cost_val
+        if per_sess:
+            cost_by_uuid[sid] = per_sess
+
+    # 2) Walk JSONL — the universal token source. Every vendor writes
+    # message.usage on assistant turns in Anthropic-compatible shape
+    # (CLI normalizes OpenAI-compatible vendors transparently).
+    cutoff_day = (now.date() - _dt.timedelta(days=days - 1)).isoformat()
+    cutoff_7d  = (now.date() - _dt.timedelta(days=6)).isoformat()
+
+    all_total   = _empty_bucket()
+    today_total = _empty_bucket()
+    last_7d     = _empty_bucket()
+    last_30d    = _empty_bucket()
+    by_day:   dict[str, dict] = defaultdict(_empty_bucket)
+    by_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_vendor: dict[str, dict] = defaultdict(_empty_bucket)
 
     for jsonl in jsonl_paths:
         sid = jsonl.stem
@@ -3503,7 +3547,7 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
                         + x["cache_read_tokens"] + x["cache_creation_tokens"]),
         reverse=True)
 
-    return {
+    response = {
         "window_days": days,
         "tz_offset_minutes": tz_offset_minutes,
         "today":    _round_bucket(today_total),
@@ -3514,6 +3558,13 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
         "by_model": by_model_list,
         "by_vendor": by_vendor_list,
     }
+    with _dashboard_cache_lock:
+        # Drop stale-day entries so the cache can't grow unbounded across
+        # midnight rollovers (old keys differ only by today_str).
+        for k in [k for k in _dashboard_cache if k[2] != today_str]:
+            _dashboard_cache.pop(k, None)
+        _dashboard_cache[cache_key] = (fingerprint, response)
+    return response
 
 
 def _round_bucket(b: dict) -> dict:

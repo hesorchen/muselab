@@ -3150,6 +3150,37 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   50%      { opacity: 0.85; }
 }
 
+/* Cost-dashboard skeleton — mirrors the chips + 4 KPI cards + bar chart +
+   per-model rows layout so the slow first load (the cold cost-dashboard scan
+   reads every session JSONL and can take several seconds on a large archive)
+   shows structure instead of a blank pane. Reuses skeleton-shimmer. */
+.cost-skeleton { display: flex; flex-direction: column; gap: 16px; padding: 4px 0; }
+.cost-skeleton .sk-chip,
+.cost-skeleton .sk-kpi,
+.cost-skeleton .sk-bar,
+.cost-skeleton .sk-row {
+  background: var(--c-bg-2);
+  border-radius: var(--r-sm);
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+.cost-skeleton-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.cost-skeleton-chips .sk-chip { width: 120px; height: 26px; border-radius: 999px; }
+.cost-skeleton-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.cost-skeleton-kpis .sk-kpi { height: 64px; }
+.cost-skeleton-bars { display: flex; align-items: flex-end; gap: 6px; height: 120px; }
+.cost-skeleton-bars .sk-bar { flex: 1; border-radius: var(--r-sm) var(--r-sm) 0 0; }
+.cost-skeleton-bars .sk-bar:nth-child(odd)  { height: 60%; }
+.cost-skeleton-bars .sk-bar:nth-child(even) { height: 85%; }
+.cost-skeleton-bars .sk-bar:nth-child(3n)   { height: 40%; }
+.cost-skeleton-rows { display: flex; flex-direction: column; gap: 8px; }
+.cost-skeleton-rows .sk-row { height: 20px; }
+.cost-skeleton-rows .sk-row:nth-child(1) { width: 100%; }
+.cost-skeleton-rows .sk-row:nth-child(2) { width: 80%; }
+.cost-skeleton-rows .sk-row:nth-child(3) { width: 60%; }
+@media (max-width: 900px) {
+  .cost-skeleton-kpis { grid-template-columns: repeat(2, 1fr); }
+}
+
 /* Per-bubble streaming caret retired — the new .streaming-tail row at
    the bottom of the chat body (see index.html, after the pending
    bubble) handles "muse is still generating" universally, including

@@ -3383,6 +3383,23 @@ function portal() {
       this.openByPathToasted(p);
     },
 
+    // Fallback resolver for chat-link clicks whose path doesn't resolve
+    // ROOT-relative. Searches the archive by basename and returns the unique
+    // ROOT-relative path whose full path ends with the clicked path. Returns
+    // "" when there's no match or more than one (ambiguous → don't guess).
+    async _resolveBySuffix(path, name) {
+      try {
+        const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
+          { headers: this.hdr() });
+        if (!r.ok) return "";
+        const d = await r.json();
+        const suffix = "/" + path.replace(/^\/+/, "");
+        const matches = (d.entries || []).filter(e =>
+          !e.is_dir && e.name === name && ("/" + e.path).endsWith(suffix));
+        return matches.length === 1 ? matches[0].path : "";
+      } catch (_) { return ""; }
+    },
+
     // openFile silently no-ops on 404 (designed for tree clicks where the
     // entry came from the API). For chat-link clicks the path comes from
     // model output and may not exist — surface the failure as a toast.
@@ -3397,13 +3414,22 @@ function portal() {
       try {
         const r = await fetch("/api/files/list?path=" + encodeURIComponent(parent),
           { headers: this.hdr() });
-        if (!r.ok) {
-          this.toast(this.lang === "zh" ? `文件不存在：${path}` : `Not found: ${path}`, "warn");
-          return;
-        }
-        const d = await r.json();
-        const hit = (d.entries || []).find(e => e.name === name);
+        const hit = r.ok
+          ? ((await r.json()).entries || []).find(e => e.name === name)
+          : null;
+        // Direct ROOT-relative lookup missed. The model commonly emits a path
+        // relative to a SUBDIR of the archive root (e.g. "learning/x.html"
+        // when the file actually lives at "claude_space/learning/x.html").
+        // Search the archive by basename and accept a UNIQUE hit whose full
+        // path ends with the clicked path — same file, just a missing prefix.
+        // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
         if (!hit) {
+          const resolved = await this._resolveBySuffix(path, name);
+          if (resolved) {
+            await this.openFile({ path: resolved, name });
+            this.revealInTree(resolved, { mode: "background" }).catch(() => {});
+            return;
+          }
           this.toast(this.lang === "zh" ? `文件不存在：${path}` : `Not found: ${path}`, "warn");
           return;
         }
