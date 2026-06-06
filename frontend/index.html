@@ -720,8 +720,15 @@
           <span class="preview-loading-text"
                 x-text="lang==='zh' ? '加载中…' : 'Loading…'"></span>
         </div>
-        <div x-show="!editing && previewMode==='md'" class="markdown" x-html="renderedMd"></div>
-        <pre x-show="!editing && previewMode==='text'" class="text"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
+        <div x-show="!editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd"></div>
+        <pre x-show="!editing && previewMode==='text' && rawText" class="text"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
+        <!-- 0-byte / empty file: a blank md/text pane is indistinguishable from
+             "still loading" or "render broke". Show an explicit placeholder. -->
+        <div x-show="!editing && (previewMode==='md' || previewMode==='text') && selected && !rawText" class="empty">
+          <span class="icon"><svg><use href="#i-file"/></svg></span>
+          <div class="empty-title" x-text="lang==='zh' ? '空文件' : 'Empty file'"></div>
+          <div class="empty-hint" x-text="lang==='zh' ? '该文件没有内容。' : 'This file has no content.'"></div>
+        </div>
         <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，
              避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
         <iframe x-show="!editing && previewMode==='html'"
@@ -837,11 +844,25 @@
 
         <div x-show="!editing && previewMode==='unsupported'" class="empty">
           <span class="icon"><svg><use href="#i-file"/></svg></span>
-          <div class="empty-title" x-text="lang==='zh' ? '不支持预览' : 'Preview not supported'"></div>
-          <div class="empty-hint">
-            <span x-text="lang==='zh' ? '该文件类型无法在浏览器中预览。' : 'This file type cannot be previewed in browser. '"></span>
-            <a :href="downloadUrl(selected)" x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a><span x-show="lang==='zh'">。</span>
-          </div>
+          <!-- previewError set ⇒ a READ failed (404/413/403/…): show the real
+               reason. null ⇒ genuinely-unsupported file type: keep the original
+               "download it instead" copy. -->
+          <div class="empty-title"
+               x-text="previewError ? previewError.title : (lang==='zh' ? '不支持预览' : 'Preview not supported')"></div>
+          <template x-if="previewError">
+            <div class="empty-hint">
+              <span x-text="previewError.hint"></span>
+              <template x-if="previewError.status === 413">
+                <a :href="downloadUrl(selected)" x-text="lang==='zh' ? ' 点这里下载' : ' Download instead'"></a>
+              </template>
+            </div>
+          </template>
+          <template x-if="!previewError">
+            <div class="empty-hint">
+              <span x-text="lang==='zh' ? '该文件类型无法在浏览器中预览。' : 'This file type cannot be previewed in browser. '"></span>
+              <a :href="downloadUrl(selected)" x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a><span x-show="lang==='zh'">。</span>
+            </div>
+          </template>
         </div>
         <div x-show="!selected" class="brand-empty">
           <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
@@ -3593,7 +3614,7 @@
              x-show="settings.activePage === 'notification'">
           <div class="settings-section-title">
             <span x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
-            <span class="settings-save-mode instant" x-text="t('set.mode.instant')"></span>
+            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
           </div>
           <div class="settings-row">
             <label x-text="lang==='zh' ? '任务完成时通知我' : 'Notify me when tasks finish'"></label>

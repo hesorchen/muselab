@@ -252,6 +252,10 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // Set when a preview READ fails (404/413/403/…), so the unsupported empty
+    // state can show a status-aware reason instead of always blaming the file
+    // type. null = no error (genuine "unsupported type" or normal preview).
+    previewError: null,
     // Find-in-preview (magnifier). Searches the rendered DOM text of the
     // md/text preview modes only (html/pdf live in a sandboxed iframe we
     // can't reach; img has no text; xlsx/csv paginate). Case-insensitive,
@@ -1732,6 +1736,11 @@ function portal() {
         const host = this.$refs.cmHost;
         if (!host) { console.warn("[muselab] no cmHost ref"); return; }
         host.innerHTML = "";
+        // Reset the live-editor ref BEFORE (re)mounting. saveEdit/_editorDirty
+        // read this._cm as the source of truth when a CM instance is active;
+        // if init fails and we fall back to a <textarea>, it must stay null so
+        // those paths use the editText buffer instead.
+        this._cm = null;
         const modeStr = this.cmMode(this.selected);
         try {
           const cm = window.CodeMirror(host, {
@@ -1760,34 +1769,41 @@ function portal() {
             mode: this.shortMode(modeStr),
             dirty: false,
           };
-          // Status is derived from ONE getValue() snapshot. The change
-          // handler used to trigger three full-document reads per keystroke
-          // (editText mirror + `chars` length + `dirty` compare), each O(n)
-          // on a big file. We now read once and thread the value through.
-          // NOTE: CM invokes cursorActivity handlers with the instance as the
-          // first arg, so updateStatus must be CALLED (not passed directly) or
-          // `val` would receive the CM object — hence the () => wrappers.
-          // (perf: RED — app.js CM getValue 3×/keystroke)
-          const updateStatus = (val) => {
-            if (val === undefined) val = cm.getValue();
+          // Expose the live instance and capture a "clean" generation marker.
+          // dirty is then O(1) via cm.isClean(gen) instead of an O(doc) string
+          // compare against rawText on every keystroke.
+          this._cm = cm;
+          const cleanGen = cm.changeGeneration();
+          // Per-keystroke status refresh, kept off the O(doc) hot path:
+          //   • dirty   → cm.isClean(gen), O(1)
+          //   • line/col/lines/sel → CM-internal, cheap
+          //   • chars   → only changes on content edits, so we recompute it
+          //               with ONE getValue() in the `change` handler and reuse
+          //               the cached count on pure cursor moves.
+          // We deliberately no longer mirror the whole buffer into the reactive
+          // `editText` on every keystroke (was O(doc) + triggered Alpine effects
+          // and a second O(doc) dirty compare). saveEdit() pulls cm.getValue()
+          // on demand instead — a big file now costs ~1 full read per *edit*,
+          // not 3+ per keystroke. NOTE: CM passes the instance as the first arg
+          // to cursorActivity handlers, so refreshStatus must be CALLED, not
+          // passed directly — hence the () => wrappers.
+          const refreshStatus = (charCount) => {
             const c = cm.getCursor();
-            const sel = cm.getSelection().length;
             this.cmStatus = {
-              line: c.line + 1, col: c.ch + 1, sel,
+              line: c.line + 1, col: c.ch + 1,
+              sel: cm.getSelection().length,
               lines: cm.lineCount(),
-              chars: val.length,
+              chars: charCount === undefined
+                ? (this.cmStatus ? this.cmStatus.chars : 0)
+                : charCount,
               mode: this.shortMode(modeStr),
-              dirty: val !== String(this.rawText || ""),
+              dirty: !cm.isClean(cleanGen),
             };
           };
-          cm.on("change", () => {
-            const v = cm.getValue();
-            this.editText = v;
-            updateStatus(v);
-          });
-          cm.on("cursorActivity", () => updateStatus());
+          cm.on("change", () => refreshStatus(cm.getValue().length));
+          cm.on("cursorActivity", () => refreshStatus());
           window.__muselab_cm = cm;
-          setTimeout(() => { cm.refresh(); updateStatus(); }, 50);
+          setTimeout(() => { cm.refresh(); refreshStatus(cm.getValue().length); }, 50);
         } catch (e) {
           console.error("[muselab] CodeMirror init failed:", e);
           this.toast(
@@ -8970,6 +8986,7 @@ function portal() {
     // Restore preview-pane reactive state from a cache entry; mirrors the
     // post-fetch assignments in openFile's per-mode branches.
     _applyPreviewCache(e) {
+      this.previewError = null;   // cache hits are always successful previews
       this.rawText = e.rawText || "";
       this.renderedMd = e.renderedMd || "";
       this.xlsxSheets = e.xlsxSheets || [];
@@ -8988,6 +9005,47 @@ function portal() {
         this.xlsxLimits = e.xlsxLimits || null;
         this.xlsxSheetsTruncated = !!e.xlsxSheetsTruncated;
       }
+    },
+    // Classify a failed /api/files/* read Response into human-readable copy.
+    // Backend errors arrive as FastAPI JSON {"detail": "..."} or plain text;
+    // parse ONCE (a Response body can only be read once) and map status →
+    // friendly title/hint, so the preview pane never blames "unsupported file
+    // type" for what is really a 404 / oversize / permission failure.
+    async _readFailReason(r) {
+      let detail = "";
+      try {
+        const raw = await r.text();
+        try { detail = ((JSON.parse(raw) || {}).detail) || raw; }
+        catch { detail = raw; }
+      } catch { /* body unavailable (already consumed / network) */ }
+      const zh = this.lang === "zh";
+      const map = {
+        404: { title: zh ? "文件不存在" : "File not found",
+               hint:  zh ? "该文件可能已被删除或移动。" : "It may have been deleted or moved." },
+        413: { title: zh ? "文件过大" : "File too large",
+               hint:  zh ? "超出在线预览上限，请下载后查看。"
+                        : "Exceeds the inline preview limit — download to view." },
+        403: { title: zh ? "无权限" : "Permission denied",
+               hint:  zh ? "没有读取该文件的权限。"
+                        : "You don't have permission to read this file." },
+      };
+      const m = map[r.status] || {
+        title: zh ? "无法读取" : "Cannot read file",
+        hint:  detail || (zh ? "读取文件时出错。" : "Something went wrong reading this file."),
+      };
+      return { status: r.status, title: m.title, hint: m.hint, detail };
+    },
+    // Centralised handler for a failed preview read: a status-aware toast +
+    // empty-state message instead of the misleading blank "unsupported type".
+    // A 404 means the file is gone, so we also drop the phantom tab openFile
+    // optimistically created (otherwise a dead, un-openable tab lingers and
+    // the user has to × it by hand). closeTab() re-selects an adjacent tab.
+    async _previewFail(r, path) {
+      const reason = await this._readFailReason(r);
+      this.errToast("read", reason.hint || reason.title);
+      if (reason.status === 404) { this.closeTab(path); return; }
+      this.previewError = reason;
+      this.previewMode = "unsupported";
     },
     // ----- Find in preview (magnifier) ----------------------------------
     // The live container whose DOM text we search/highlight. Only the two
@@ -9180,10 +9238,14 @@ function portal() {
       this.renderedMd = "";
       this.xlsxSheets = [];
       this.csvData = null;
+      this.previewError = null;
       this.previewMode = "loading";
       const ext = name.split(".").pop().toLowerCase();
       if (["md", "markdown"].includes(ext)) {
-        this.previewMode = "md";
+        // Stay in "loading" until content actually arrives — renderMd() flips
+        // it to "md" once rawText is set. Setting it early would briefly show
+        // the empty-file placeholder (previewMode==='md' && !rawText) during
+        // the in-flight fetch. Failures route through _previewFail().
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
         if (r.ok) {
           this.rawText = await r.text();
@@ -9209,11 +9271,9 @@ function portal() {
             renderMd();
           }
         } else {
-          // Without this branch a failed read left previewMode="md" with empty
-          // rawText/renderedMd → blank white pane, no error. Mirror the text
-          // branch: surface the error and fall back to unsupported.
-          this.errToast("read", await r.text());
-          this.previewMode = "unsupported";
+          // Failed read left previewMode="md" with empty rawText → blank white
+          // pane. Surface a status-aware reason (404 drops the phantom tab).
+          await this._previewFail(r, n.path);
         }
       } else if (["html", "htm"].includes(ext)) {
         // Render via sandboxed iframe (backend sends strict CSP + sandbox token).
@@ -9239,7 +9299,7 @@ function portal() {
             xlsxLimits: this.xlsxLimits, xlsxSheetsTruncated: this.xlsxSheetsTruncated,
           });
         } else {
-          this.previewMode = "unsupported";
+          await this._previewFail(r, n.path);
         }
       }
       else if (["csv", "tsv"].includes(ext)) {
@@ -9252,6 +9312,13 @@ function portal() {
         if (this.csvData) {
           this.previewMode = "csv";
         } else {
+          // csvLoadPage() already toasted the failure; give the empty state a
+          // sensible reason instead of blaming the file type.
+          this.previewError = {
+            status: 0,
+            title: this.lang === "zh" ? "CSV 解析失败" : "CSV parse failed",
+            hint:  this.lang === "zh" ? "无法解析该 CSV 文件。" : "Could not parse this CSV file.",
+          };
           this.previewMode = "unsupported";
         }
       }
@@ -9262,8 +9329,11 @@ function portal() {
         const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
         const r = await fetch(readUrl, { headers: this.hdr() });
         if (r.ok) {
-          this.previewMode = "text";
+          // Read body BEFORE flipping previewMode → text, otherwise the
+          // empty-file placeholder (previewMode==='text' && !rawText) flashes
+          // during the await on a non-empty file.
           this.rawText = await r.text();
+          this.previewMode = "text";
           this.previewLang = this.hljsLang(n.path);
           if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
             this._previewCacheSet(n.path, { mode: "text", rawText: this.rawText, previewLang: this.previewLang });
@@ -9274,7 +9344,7 @@ function portal() {
             this.highlightCode(".text");
           });
         }
-        else this.previewMode = "unsupported";
+        else await this._previewFail(r, n.path);
       }
     },
     async csvLoadPage() {
@@ -9457,6 +9527,7 @@ function portal() {
     _clearPreviewState() {
       this.selected = "";
       this.previewMode = "";
+      this.previewError = null;
       this.rawText = "";
       this.renderedMd = "";
       this.editing = false;
@@ -11117,6 +11188,12 @@ function portal() {
       this.pinTab(this.selected);
     },
     async saveEdit() {
+      // Pull the current buffer once, here, instead of mirroring it into the
+      // reactive editText on every keystroke. CM is the source of truth when
+      // active; the textarea fallback (this._cm === null) keeps editText synced
+      // via its input listener. Everything below (write body, post-save
+      // rawText sync) reads this.editText, so refresh it first.
+      if (this._cm) this.editText = this._cm.getValue();
       let r;
       try {
         r = await fetch("/api/files/write", {
