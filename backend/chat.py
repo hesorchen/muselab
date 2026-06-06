@@ -218,6 +218,72 @@ def _full_session_msgs(sid: str) -> list:
     return out
 
 
+def _read_tail_lines(path: Path, n: int, block: int = 65536) -> list[str]:
+    """Return the last ~n non-empty lines of a file, reading from the end so
+    cost is O(tail) instead of O(file). Used to find the just-appended turn's
+    UUIDs without parsing a multi-thousand-line transcript."""
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        data = b""
+        # Read backwards a block at a time until we've captured > n newlines
+        # (or hit the start of the file).
+        while pos > 0 and data.count(b"\n") <= n:
+            read = min(block, pos)
+            pos -= read
+            f.seek(pos)
+            data = f.read(read) + data
+        lines = data.split(b"\n")
+        return [ln.decode("utf-8", "replace")
+                for ln in lines[-n:] if ln.strip()]
+
+
+def _recent_turn_uuids(sid: str, want_image_user: bool,
+                       tail_lines: int = 400) -> tuple[str | None, str | None]:
+    """Find the most recent assistant UUID and most recent user UUID by
+    reading only the TAIL of the JSONL (the turn that just finished is at the
+    very end). Replaces a full _get_session_msgs() parse whose sole purpose
+    was to grab these two UUIDs for sidecar annotation. Returns (None, None)
+    on any failure so the caller can fall back to the full parse.
+
+    want_image_user: when the turn carried image attachments, match the last
+    user entry that actually contains an image block (not just any last user
+    msg) — mirrors the full-parse path's image-matching guard."""
+    path = _find_session_jsonl(sid)
+    if path is None:
+        return (None, None)
+    try:
+        lines = _read_tail_lines(path, tail_lines)
+    except Exception:
+        return (None, None)
+    asst_uuid: str | None = None
+    user_uuid: str | None = None
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        t = e.get("type")
+        u = e.get("uuid")
+        if not u:
+            continue
+        if t == "assistant" and asst_uuid is None:
+            asst_uuid = u
+        elif t == "user" and user_uuid is None:
+            if want_image_user:
+                content = (e.get("message") or {}).get("content") or []
+                has_img = isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "image"
+                    for b in content)
+                if has_img:
+                    user_uuid = u
+            else:
+                user_uuid = u
+        if asst_uuid and user_uuid:
+            break
+    return (asst_uuid, user_uuid)
+
+
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
@@ -2262,6 +2328,55 @@ def _compact_summary_uuids(sid: str) -> set[str]:
         return set()
 
 
+# Cache of PARSED session-message lists keyed by (sid, full) → (mtime, size,
+# msgs). get_session_api re-parses the ENTIRE JSONL (SDK get_session_messages
+# + the full-history reader) on EVERY call, and the client makes several calls
+# per session open via windowing (?tail for the initial paint, then
+# ?offset&limit per "load earlier" click) — all against the same unchanged
+# file. For a multi-thousand-message session that full parse is the dominant
+# multi-second cost (it holds the GIL while it runs, so it also stalls every
+# other concurrent request → the "整个卡住" on open/switch). Keying on
+# (mtime, size) lets paging / re-opens / idle-preloads reuse one parse; any
+# appended turn changes the size (and usually mtime), invalidating the entry.
+# The annotation merge + compact-UUID scan + windowing slice still run live on
+# top of the cached parse, so cost / compact freshness is unaffected. Parsed
+# lists can be several MB each, so the cap is deliberately small.
+_SESSION_MSGS_CACHE: dict[tuple[str, bool], tuple[float, int, list]] = {}
+_SESSION_MSGS_CACHE_MAX = 16
+
+
+def _cached_session_msgs(sid: str, model: str, full: bool) -> list:
+    """Parse session messages with a (mtime, size)-keyed cache so repeated
+    reads of an UNCHANGED JSONL (windowed paging, re-opens, idle preload) skip
+    the expensive full parse. Returns the same SDK/_RawMsg objects the
+    uncached path would — they're consumed read-only by _sdk_messages_to_ui,
+    so sharing a cached list across callers is safe. Falls back to a live
+    parse whenever the file can't be stat'd (so correctness never depends on
+    the cache)."""
+    jsonl_path = _find_session_jsonl(sid)
+    sig: tuple[float, int] | None = None
+    if jsonl_path is not None:
+        try:
+            _st = jsonl_path.stat()
+            sig = (_st.st_mtime, _st.st_size)
+        except OSError:
+            sig = None
+    key = (sid, full)
+    if sig is not None:
+        _cached = _SESSION_MSGS_CACHE.get(key)
+        if _cached is not None and _cached[0] == sig[0] and _cached[1] == sig[1]:
+            return _cached[2]
+    msgs = _full_session_msgs(sid) if full else _get_session_msgs(sid, model)
+    if sig is not None:
+        # Bound the cache: drop the oldest insertion (dicts preserve insertion
+        # order) when a NEW key would overflow the cap.
+        if (len(_SESSION_MSGS_CACHE) >= _SESSION_MSGS_CACHE_MAX
+                and key not in _SESSION_MSGS_CACHE):
+            _SESSION_MSGS_CACHE.pop(next(iter(_SESSION_MSGS_CACHE)), None)
+        _SESSION_MSGS_CACHE[key] = (sig[0], sig[1], msgs)
+    return msgs
+
+
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
 def get_session_api(
     sid: str,
@@ -2303,7 +2418,7 @@ def get_session_api(
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
     try:
-        sdk_msgs = _full_session_msgs(sid) if full else _get_session_msgs(sid, model)
+        sdk_msgs = _cached_session_msgs(sid, model, full)
     except Exception:
         sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
@@ -5914,38 +6029,52 @@ async def _start_turn(
                         f"[chat-stream] get_context_usage skipped for "
                         f"sid={session_id}: {type(_e).__name__}\n")
 
-            # Sidecar annotations: pull latest transcript from SDK to find
-            # new user/assistant UUIDs, then write cost / model / images /
-            # docs against those rows in muselab's per-session sidecar.
-            try:
-                all_msgs = await asyncio.to_thread(
-                    _get_session_msgs, session_id, model_to_use)
-            except Exception:
-                all_msgs = []
-            new_asst_uuid = None
-            new_user_uuid = None
-            for sm in reversed(all_msgs):
-                if sm.type == "assistant" and not new_asst_uuid:
-                    new_asst_uuid = sm.uuid
-                elif sm.type == "user" and not new_user_uuid:
-                    if persisted_imgs:
-                        # When images were sent, match the user message that
-                        # actually contains image blocks — not just any last
-                        # user message. Without this, if the user sends more
-                        # messages while the stream is running, reversed()
-                        # finds a later (non-image) user UUID and the image
-                        # annotation ends up on the wrong message.
-                        content = (sm.message or {}).get("content") or []
-                        has_img_block = isinstance(content, list) and any(
-                            isinstance(b, dict) and b.get("type") == "image"
-                            for b in content
-                        )
-                        if has_img_block:
+            # Sidecar annotations: find the just-appended turn's user/assistant
+            # UUIDs, then write cost / model / images / docs against those rows
+            # in muselab's per-session sidecar. The turn that just finished is
+            # at the very END of the JSONL, so read only the tail rather than
+            # parsing the whole transcript — on a long session that full parse
+            # was a multi-second, GIL-holding hitch at every turn's end ("发消息
+            # /流式回复时卡"). Fall back to the full parse if the tail read can't
+            # resolve both UUIDs (e.g. a turn with >tail_lines tool entries).
+            # all_msgs holds the full transcript parse. The fast UUID path
+            # below may skip the parse, but the count/auto-rename block further
+            # down (message_count, turn_count, first_user_text) still needs the
+            # full list — so it's lazily loaded once and reused there. Starts as
+            # None ("not yet parsed") rather than being scoped inside the
+            # fallback branch, which previously left it unbound on the fast path
+            # → UnboundLocalError at every turn's end.
+            all_msgs: list | None = None
+            new_asst_uuid, new_user_uuid = await asyncio.to_thread(
+                _recent_turn_uuids, session_id, bool(persisted_imgs))
+            if not (new_asst_uuid and new_user_uuid):
+                try:
+                    all_msgs = await asyncio.to_thread(
+                        _get_session_msgs, session_id, model_to_use)
+                except Exception:
+                    all_msgs = []
+                for sm in reversed(all_msgs):
+                    if sm.type == "assistant" and not new_asst_uuid:
+                        new_asst_uuid = sm.uuid
+                    elif sm.type == "user" and not new_user_uuid:
+                        if persisted_imgs:
+                            # When images were sent, match the user message that
+                            # actually contains image blocks — not just any last
+                            # user message. Without this, if the user sends more
+                            # messages while the stream is running, reversed()
+                            # finds a later (non-image) user UUID and the image
+                            # annotation ends up on the wrong message.
+                            content = (sm.message or {}).get("content") or []
+                            has_img_block = isinstance(content, list) and any(
+                                isinstance(b, dict) and b.get("type") == "image"
+                                for b in content
+                            )
+                            if has_img_block:
+                                new_user_uuid = sm.uuid
+                        else:
                             new_user_uuid = sm.uuid
-                    else:
-                        new_user_uuid = sm.uuid
-                if new_asst_uuid and new_user_uuid:
-                    break
+                    if new_asst_uuid and new_user_uuid:
+                        break
             if new_asst_uuid and assistant_acc:
                 # ts (ms epoch) stamps the turn's completion time. The
                 # frontend's turn-footer (.turn-footer in index.html)
@@ -5973,7 +6102,15 @@ async def _start_turn(
                     images=persisted_imgs or None,
                     docs=persisted_docs or None)
             # message_count = total transcript size; auto-rename from first
-            # user message text if session is still auto-named.
+            # user message text if session is still auto-named. These counts
+            # need the full transcript, so parse it now if the fast UUID path
+            # above already resolved both UUIDs and skipped the parse.
+            if all_msgs is None:
+                try:
+                    all_msgs = await asyncio.to_thread(
+                        _get_session_msgs, session_id, model_to_use)
+                except Exception:
+                    all_msgs = []
             first_user_text = ""
             for sm in all_msgs:
                 if sm.type == "user":
