@@ -6911,7 +6911,16 @@ function portal() {
         const startIdx = pickVisibleStart(all);
         const visible = all.slice(startIdx);
         const earlier = all.slice(0, startIdx);
-        visible.forEach(renderMarkdown);
+        if (sid === this.currentId) {
+          // Foreground tab: render synchronously so html is ready before the
+          // skeleton reveals (highlight + scroll measure the final layout).
+          visible.forEach(renderMarkdown);
+        } else {
+          // Off-screen idle-preload: chunk + yield so warming a big background
+          // tab never freezes the page. Awaited, so _loaded (set by the
+          // preload's .then) only flips once every bubble has html.
+          await this._renderMessagesChunked(visible, renderMarkdown);
+        }
         // Mutate in place — preserves the Array reference Alpine is watching.
         st.messages.length = 0;
         st.messages.push(...visible);
@@ -7007,6 +7016,30 @@ function portal() {
       } else {
         setTimeout(run, 800);
       }
+    },
+    // Render markdown for a list of message envelopes WITHOUT blocking the
+    // main thread. Used for OFF-SCREEN tab preload only: a big background
+    // session's visible.forEach(mdRender) ran synchronously (marked +
+    // DOMPurify + KaTeX + linkify over ~30 bubbles) and froze the page for
+    // seconds while merely warming an inactive tab (user report 2026-06-06).
+    // Chunk it and yield to the event loop between batches so foreground
+    // interaction stays smooth. The tab is only marked _loaded after this
+    // resolves, so a later switch never lands on un-rendered (empty) bubbles.
+    _renderMessagesChunked(list, renderFn, chunk = 5) {
+      return new Promise((resolve) => {
+        if (!list || !list.length) { resolve(); return; }
+        const yieldToLoop = (typeof window !== "undefined" && window.requestIdleCallback)
+          ? (fn) => window.requestIdleCallback(fn, { timeout: 200 })
+          : (fn) => setTimeout(fn, 0);
+        let i = 0;
+        const pump = () => {
+          const end = Math.min(i + chunk, list.length);
+          for (; i < end; i++) renderFn(list[i]);
+          if (i < list.length) yieldToLoop(pump);
+          else resolve();
+        };
+        pump();
+      });
     },
     _idlePreloadStep() {
       const ids = this.openTabIds || [];
