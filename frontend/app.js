@@ -3384,20 +3384,39 @@ function portal() {
     },
 
     // Fallback resolver for chat-link clicks whose path doesn't resolve
-    // ROOT-relative. Searches the archive by basename and returns the unique
-    // ROOT-relative path whose full path ends with the clicked path. Returns
-    // "" when there's no match or more than one (ambiguous → don't guess).
-    async _resolveBySuffix(path, name) {
+    // ROOT-relative. Searches the archive by basename and returns every
+    // ROOT-relative path whose full path ends with the clicked path (same
+    // file, just a missing prefix). Caller decides: 0 → not-found toast,
+    // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
+    async _findBySuffix(path, name) {
       try {
         const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
           { headers: this.hdr() });
-        if (!r.ok) return "";
+        if (!r.ok) return [];
         const d = await r.json();
         const suffix = "/" + path.replace(/^\/+/, "");
-        const matches = (d.entries || []).filter(e =>
+        return (d.entries || []).filter(e =>
           !e.is_dir && e.name === name && ("/" + e.path).endsWith(suffix));
-        return matches.length === 1 ? matches[0].path : "";
-      } catch (_) { return ""; }
+      } catch (_) { return []; }
+    },
+
+    // List-choice variant of confirm()/prompt(): render `choices` as a column
+    // of buttons and resolve with the picked value (null on cancel/ESC/backdrop).
+    // Reuses the generic `modal` machinery — choice mode is keyed off
+    // `modal.choices` being a non-empty array (index.html hides the OK button
+    // and the text input in that mode). choices: [{label, sub?, value}].
+    chooseOne({ title, body = "", choices }) {
+      const zh = this.lang === "zh";
+      if (!title) title = zh ? "请选择" : "Choose";
+      return new Promise((resolve) => {
+        this.modal = {
+          show: true, title, body, input: null, choices,
+          okText: "", cancelText: zh ? "取消" : "Cancel", danger: false,
+          confirm: null,
+          pick: (v) => { this.modal.show = false; resolve(v); },
+          cancel: () => { this.modal.show = false; resolve(null); },
+        };
+      });
     },
 
     // openFile silently no-ops on 404 (designed for tree clicks where the
@@ -3424,7 +3443,21 @@ function portal() {
         // path ends with the clicked path — same file, just a missing prefix.
         // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
         if (!hit) {
-          const resolved = await this._resolveBySuffix(path, name);
+          const matches = await this._findBySuffix(path, name);
+          let resolved = "";
+          if (matches.length === 1) {
+            resolved = matches[0].path;
+          } else if (matches.length > 1) {
+            // Ambiguous prefix — don't guess; let the user pick.
+            resolved = await this.chooseOne({
+              title: this.lang === "zh" ? "找到多个同名文件" : "Multiple files match",
+              body: this.lang === "zh"
+                ? `“${path}” 匹配到 ${matches.length} 个文件，选择要打开的：`
+                : `"${path}" matches ${matches.length} files. Pick one to open:`,
+              choices: matches.map(m => ({ label: m.path, value: m.path })),
+            });
+            if (!resolved) return;   // cancelled
+          }
           if (resolved) {
             await this.openFile({ path: resolved, name });
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});

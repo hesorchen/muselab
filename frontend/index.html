@@ -4082,10 +4082,19 @@
         <input x-show="modal.input !== null" x-model="modal.input"
                :placeholder="modal.placeholder || ''"
                x-ref="modalInput" @keydown.enter="modal.confirm?.()" />
+        <div x-show="modal.choices && modal.choices.length" class="modal-choices">
+          <template x-for="(c, ci) in (modal.choices || [])" :key="ci">
+            <button type="button" class="modal-choice" @click="modal.pick && modal.pick(c.value)">
+              <span class="modal-choice-label" x-text="c.label"></span>
+              <span class="modal-choice-sub" x-show="c.sub" x-text="c.sub"></span>
+            </button>
+          </template>
+        </div>
       </div>
       <div class="modal-foot">
         <button @click="modal.cancel && modal.cancel()" class="btn-ghost" x-text="modal.cancelText || t('btn.cancel')"></button>
-        <button @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || t('btn.confirm')"></button>
+        <button x-show="!(modal.choices && modal.choices.length)"
+                @click="modal.confirm && modal.confirm()" :class="modal.danger ? 'btn-danger' : 'btn-primary'" x-text="modal.okText || t('btn.confirm')"></button>
       </div>
     </div>
   </div>

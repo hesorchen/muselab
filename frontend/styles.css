@@ -5705,6 +5705,19 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: transparent; border-radius: 0 0 var(--r-lg) var(--r-lg);
 }
 
+/* ---- Modal choice list (disambiguation picker) ---- */
+.modal-choices { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }
+.modal-choice {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; text-align: left; padding: var(--sp-2) 12px;
+  background: var(--c-bg-2); border: 1px solid var(--c-border);
+  border-radius: var(--r-sm); color: var(--c-fg-1); cursor: pointer;
+  font-size: var(--fs-sm); line-height: 1.4; transition: background .12s, border-color .12s;
+}
+.modal-choice:hover { background: var(--c-bg-3); border-color: var(--c-accent); }
+.modal-choice-label { font-family: var(--font-mono, monospace); word-break: break-all; }
+.modal-choice-sub { font-size: var(--fs-xs); color: var(--c-fg-3); }
+
 /* ---- Cheat-sheet modal ---- */
 .cheatsheet-modal { min-width: 460px; max-width: 560px; }
 @media (max-width: 480px) {
