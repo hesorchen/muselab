@@ -1314,7 +1314,7 @@
            moved to the chat-input toolbar at the bottom (VSCode-style). -->
 
       <div class="chat-scroll-wrap">
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
                brand-empty onboarding cards as if it were a new session. -->

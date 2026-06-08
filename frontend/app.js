@@ -523,6 +523,10 @@ function portal() {
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
     atBottom: true,
+    // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
+    // onChatScroll uses it to disengage auto-follow ONLY on user-driven
+    // scroll-up, never on layout-induced scroll events. See _userScrollIntent.
+    _userScrollAt: 0,
     theme: "dark",
     accent: "#6093ff",
     ACCENT_PRESETS,
@@ -5034,10 +5038,28 @@ function portal() {
     async _rebindSelect(field) {
       const cur = this[field];
       if (!cur) return;
+      // Scroll-preservation (currentId only): blanking currentId makes every
+      // .msg-pane (x-show="tid === currentId") display:none, which collapses
+      // the shared .chat-body scroller — the browser then clamps scrollTop to
+      // 0. Restoring currentId re-shows the pane but the scroll position is
+      // already lost, so the chat "jumps to the top". This bit every caller of
+      // refreshSessions(), most visibly the stream `done` handler: finishing a
+      // reply yanked the user back to the very first message. Snapshot the
+      // scroller here and re-pin it after the tickle. The `model` tickle
+      // doesn't touch the panes, so it skips this.
+      const chatEl = field === "currentId" ? this.$refs.chatBody : null;
+      const savedTop = chatEl ? chatEl.scrollTop : 0;
+      const wasAtBottom = this.atBottom;
       await this.$nextTick();
       this[field] = "";
       await this.$nextTick();
       this[field] = cur;
+      if (chatEl) {
+        // Wait for the pane to re-show + layout to settle before restoring.
+        await this.$nextTick();
+        if (wasAtBottom) this.scrollToBottom(true);
+        else chatEl.scrollTop = savedTop;
+      }
     },
     // Mint a v4 UUID for a client-created session. crypto.randomUUID is the
     // happy path, but it's ONLY exposed in *secure* contexts — when muselab is
@@ -12887,13 +12909,36 @@ function portal() {
       // Strict "at bottom": 2px tolerance only — just enough to absorb
       // sub-pixel geometry (browser zoom / high-DPI displays can report
       // distance as 0.4–1.x even when visually at bottom; pure ==0 would
-      // mis-classify and never re-engage auto-follow). Any user-driven
-      // scroll-up of even a few pixels immediately disables mid-stream
-      // auto-follow until they scroll all the way back down.
-      // Layout jitter (pending bubble grows, queue badge inflates, etc.)
-      // doesn't fire scroll events — only scrollTop changes do — so this
-      // tight threshold is safe against false negatives from those.
-      this.atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
+      // mis-classify and never re-engage auto-follow).
+      const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
+      if (nearBottom) {
+        // Reaching the bottom always (re-)engages auto-follow, regardless of
+        // what moved us there — that's the unambiguous "I want to follow" state.
+        this.atBottom = true;
+        return;
+      }
+      // Not at the bottom. ONLY a genuine user gesture (wheel / touch / scrollbar
+      // drag) may disengage follow. The previous code flipped atBottom=false on
+      // ANY scroll event whose geometry read > 2px — but several NON-user events
+      // fire scroll with a transiently-wrong distance and silently broke
+      // mid-stream follow ("某些 block 导致停止追随"):
+      //   1. _capLiveMessages evicting top bubbles on a long agentic turn shifts
+      //      content up; content-visibility:auto height estimates make the
+      //      distance read briefly > 2px.
+      //   2. A late-realizing block (image / iframe / mermaid / highlighted code)
+      //      growing height triggers the browser's scroll-anchoring, which moves
+      //      scrollTop without any user input.
+      // Both must NOT stop following. Gate disengagement on a recent real
+      // pointer/wheel gesture; layout-induced scrolls leave atBottom untouched
+      // so the next streaming tick re-pins to the bottom.
+      const userDriven = (Date.now() - (this._userScrollAt || 0)) < 400;
+      if (userDriven) this.atBottom = false;
+    },
+    // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
+    // pointerdown on the chat body (see index.html) so onChatScroll can tell a
+    // user scroll-up apart from a layout-induced scroll event.
+    _userScrollIntent() {
+      this._userScrollAt = Date.now();
     },
     scrollToBottom(force) {
       const el = this.$refs.chatBody;
@@ -13328,6 +13373,26 @@ function portal() {
       const streamState = sendState;
 
       streamState.streaming = true; this.streaming = true;
+      // A live turn renders DIRECTLY into the visible pane, so it must never be
+      // hidden by the bulk-reveal gate. `messagesReady=false` drives
+      // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
+      // a mechanism that exists ONLY for loadSession's chunked reveal of
+      // historical bubbles. But messagesReady is GLOBAL root state and only
+      // flips back to true inside switchSession / loadSession reveal callbacks
+      // that are guarded `if (this.currentId !== target) return`. If that reveal
+      // is skipped — rapid tab switch, or hitting "+" (newSession) right after a
+      // session started loading — messagesReady is left STUCK at false. On the
+      // next send, the moment messages.length goes >0 the msgs-hidden class
+      // engages and the ENTIRE reply (and the user's own bubble) renders
+      // display:none. The data still streams + persists to JSONL, so a full PWA
+      // restart re-runs loadSession's reveal and the reply "appears" — exactly
+      // the "new session, first reply invisible until restart" report. Force the
+      // reveal whenever we stream into the ACTIVE tab; there is nothing to
+      // lazy-reveal once the user is actively sending into the pane they see.
+      if (streamSid === this.currentId) {
+        this.messagesReady = true;
+        this.messagesLoading = false;
+      }
       // [resident-panes] A tab with a live stream must stay mounted even if the
       // user tabs away — its bubbles are being written by the SSE handlers below.
       // Promote it now (streamState.streaming is already true, so the LRU's
@@ -13878,7 +13943,16 @@ function portal() {
         es.close(); _markDone(!!d.cancelled); _stopTimer();
         this.refreshSessions();
         if (this.currentId === streamSid) {
-          this.$nextTick(() => this.highlightCode(".chat-body"));
+          // highlightCode resolves AFTER syntax highlight + artifact render
+          // (mermaid / HTML preview iframes), which can grow the tail block's
+          // height seconds past the last text chunk. The streaming auto-follow
+          // already re-pinned on every chunk, but nothing follows that late
+          // async growth — so if the user is still at the bottom, re-pin once
+          // the final layout settles. Gated on atBottom so a user who scrolled
+          // up to read history isn't yanked back down.
+          this.$nextTick(() => this.highlightCode(".chat-body").then(() => {
+            if (this.currentId === streamSid && this.atBottom) this.scrollToBottom(true);
+          }));
         }
         // Auto-drain the next queued message, if any. nextTick lets
         // _markDone's streaming=false propagate before _isBusy() reads it.
