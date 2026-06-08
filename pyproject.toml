@@ -48,7 +48,7 @@ dependencies = [
     # JSONL parsing with zero signal. <0.3 makes upgrades an explicit action that
     # runs the SDK-bump checklist (docs/sdk-bump-checklist.md). Path/effort drift
     # is already auto-eliminated via project_key_for_directory() + EffortLevel.
-    "claude-agent-sdk>=0.2.82,<0.3",
+    "claude-agent-sdk>=0.2.93,<0.3",
     "fastapi>=0.136.3",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
