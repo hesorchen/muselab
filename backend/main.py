@@ -27,11 +27,30 @@ class _TokenFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         # uvicorn's access logger calls info("%s - \"%s %s HTTP/%s\" %d", ...)
         # so the token-bearing URL lives in record.args, NOT record.msg (which
-        # is just the format template). Mutating record.msg alone never
-        # redacts anything. Render the final message, scrub it, then replace
-        # msg with the scrubbed string and drop args so logging emits it
-        # verbatim. (2026-05-29 audit: the original record.msg-only filter was
-        # a no-op for uvicorn access logs → token leaked to journald/docker.)
+        # is just the format template). The token sits in the URL/path, i.e.
+        # args[2].
+        #
+        # 2026-06-08 fix: the previous version rendered the message, scrubbed
+        # it, then set `record.args = ()`. That blanked the 5-tuple uvicorn's
+        # AccessFormatter unpacks — `(client_addr, method, full_path,
+        # http_version, status) = record.args` — so EVERY authed request
+        # (token= is in nearly all of them) spammed journald with
+        # "--- Logging error --- ValueError: not enough values to unpack
+        # (expected 5, got 0)". Redact INSIDE the args tuple instead, leaving
+        # the 5-tuple shape intact so the formatter still works.
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            full_path = args[2]
+            if isinstance(full_path, str) and "token=" in full_path:
+                record.args = (
+                    args[0], args[1],
+                    self._re.sub("token=***", full_path),
+                    args[3], args[4],
+                )
+            return True
+        # Fallback for any non-access-log record routed through this filter
+        # (different arg shape → not consumed by AccessFormatter's 5-tuple
+        # unpack, so collapsing to a scrubbed literal is safe here).
         try:
             message = record.getMessage()
         except Exception:
