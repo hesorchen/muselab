@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
-from sse_starlette.sse import EventSourceResponse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
@@ -5014,6 +5014,26 @@ _SSE_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+
+def _sse_ping_event() -> ServerSentEvent:
+    """Heartbeat as a NAMED ``ping`` SSE event instead of sse_starlette's
+    default bare comment (``: ping ...``).
+
+    A comment-only ping keeps the TCP socket warm but is INVISIBLE to the
+    browser's EventSource — comments fire no JS event. So a connection that
+    silently stalls (public-internet proxy/CDN buffering, laptop sleep-wake,
+    a dead-but-not-RST socket) hangs forever: the server finishes the turn
+    and persists the reply, yet the client never receives ``done`` and spins
+    indefinitely, with neither the browser's ``onerror`` nor our own
+    disconnect detection ever firing.
+
+    A named event fires ``es.addEventListener("ping")`` on the frontend,
+    giving it a heartbeat to watch. The frontend's stall-watchdog reconnects
+    when the heartbeat goes missing past ~2× the interval. Emitted every 15s
+    (sse_starlette's DEFAULT_PING_INTERVAL — we don't override the cadence,
+    only the message shape)."""
+    return ServerSentEvent(data="", event="ping")
+
 # Placeholder prompt injected for image-only turns (image attached, no
 # caption). Must NOT be used as an auto-generated session name — see the
 # auto-rename guard in _handle_result_message.
@@ -5061,6 +5081,7 @@ async def stream(
                 return EventSourceResponse(
                     _subscribe_broadcast(recent),
                     headers=_SSE_HEADERS,
+                    ping_message_factory=_sse_ping_event,
                 )
             async def _no_active_gen():
                 yield _error_event("no active turn")
@@ -5068,6 +5089,7 @@ async def stream(
         return EventSourceResponse(
             _subscribe_broadcast(existing),
             headers=_SSE_HEADERS,
+            ping_message_factory=_sse_ping_event,
         )
     # Image-only path: inject a neutral placeholder prompt so the SDK
     # gets non-empty text alongside the attachment. "(image)" is short
@@ -5099,6 +5121,7 @@ async def stream(
     return EventSourceResponse(
         _subscribe_broadcast(broadcast),
         headers=_SSE_HEADERS,
+        ping_message_factory=_sse_ping_event,
     )
 
 
