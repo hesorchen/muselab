@@ -13466,7 +13466,42 @@ function portal() {
       // visibly reset the displayed elapsed back to zero.
       es.onopen = () => {
         streamState._reconnectAttempts = 0;
+        streamState._lastSseActivity = Date.now();
       };
+
+      // ── Silent-stall watchdog ──────────────────────────────────────────
+      // A stalled-but-open SSE connection — public-internet proxy/CDN
+      // buffering, laptop sleep-wake, a dead-but-not-RST socket — never
+      // fires `error` on the browser's EventSource AND never delivers
+      // `done`. The turn then spins forever even though the server finished
+      // and persisted the full reply (confirmed 2026-06-08: JSONL had the
+      // complete answer; the client only ever rendered the thinking block).
+      // The server now heartbeats a NAMED `ping` every 15s; we bump
+      // _lastSseActivity on EVERY inbound event (incl. ping) and, if the
+      // stream goes fully silent past 2× the ping interval, synthesize an
+      // `error` event to reuse the transport-level reconnect path below
+      // (close → /active probe → re-subscribe or load the finished reply
+      // from disk). Reconnect is idempotent (broadcast replay), so a false
+      // trigger only costs a reconnect, never data.
+      streamState._lastSseActivity = Date.now();
+      const _bumpSse = () => { streamState._lastSseActivity = Date.now(); };
+      ["text", "thinking", "tool_use", "tool_result", "task_started",
+       "task_progress", "task_notification", "rate_limit", "ping",
+       "done", "error", "cancelled"].forEach(
+        t => es.addEventListener(t, _bumpSse));
+      if (streamState._stallWatch) clearInterval(streamState._stallWatch);
+      streamState._stallWatch = setInterval(() => {
+        if (!streamState.streaming) return;
+        if (Date.now() - (streamState._lastSseActivity || 0) > 40000) {
+          // 40s of total silence (server pings every 15s → ≥2 missed) means
+          // the connection is dead in a way onerror never caught. Tear down
+          // the watchdog and drive the existing reconnect logic via a
+          // synthetic error (no ev.data → JSON.parse throws → transport path).
+          clearInterval(streamState._stallWatch);
+          streamState._stallWatch = null;
+          try { es.dispatchEvent(new Event("error")); } catch (_) {}
+        }
+      }, 10000);
 
       // Active assistant bubble pointer. Text events open / extend it; tool /
       // thinking events close it so subsequent text starts a fresh bubble.
@@ -13814,6 +13849,12 @@ function portal() {
         if (streamState._streamTimer) {
           clearInterval(streamState._streamTimer);
           streamState._streamTimer = null;
+        }
+        // Stall-watchdog shares the stream lifecycle — kill it on every
+        // terminal path so it can't fire against a finished/closed turn.
+        if (streamState._stallWatch) {
+          clearInterval(streamState._stallWatch);
+          streamState._stallWatch = null;
         }
         streamState.streamElapsed = 0;
         if (this.currentId === streamSid) {
@@ -15110,37 +15151,37 @@ function portal() {
     // history once and again after a short delay so the new entry shows
     // up without waiting for the next periodic refresh.
     async runSchedTaskNow(t) {
-      if (!t || !t.id || this.schedRunning[t.id]) return;
+      if (!t || !t.id) return;
+      // Double-tap guard is a TIMESTAMP, not a boolean flag. The button is no
+      // longer `:disabled` (see index.html): a stuck `schedRunning[t.id]=true`
+      // used to keep the native disabled attribute on forever, so hovering it
+      // showed `not-allowed` and the click did nothing — reported twice as
+      // "鼠标一挪上去就是禁用的标志，点不了" (2026-06-09). A timestamp can't
+      // wedge: even if anything below throws, the next click >1.2s later still
+      // fires. `schedRunning` now only drives the cosmetic spinner.
+      const now = Date.now();
+      this._lastSchedRun = this._lastSchedRun || {};
+      if (now - (this._lastSchedRun[t.id] || 0) < 1200) return;
+      this._lastSchedRun[t.id] = now;
+      // Cosmetic only: spin the glyph for ~900ms so the click is perceptible.
       this.schedRunning[t.id] = true;
+      setTimeout(() => { this.schedRunning[t.id] = false; }, 900);
       try {
         const r = await fetch(
           "/api/scheduler/tasks/" + encodeURIComponent(t.id) + "/run",
           { method: "POST", headers: this.hdr() });
         if (!r.ok) throw new Error(await r.text());
-        this.toast(this.lang === "zh" ? "已触发，等待结果…" : "Triggered — awaiting result…",
-                    "info", 2000);
-        // Poll history a couple of times to surface the new entry; backend
-        // appends synchronously in _execute_task's finally so a few-second
-        // delay catches even slow LLM turns.
-        // IMPORTANT: each poll MUST swallow its own error AND the final one
-        // MUST clear schedRunning in a `finally` — a throwing
-        // loadSchedulerHistory used to skip the `= false` line, wedging the
-        // button :disabled forever (every later click then hit the
-        // `schedRunning[t.id]` guard and silently no-op'd).
+        this.toast(this.lang === "zh"
+                     ? "已触发，结果稍后出现在下方运行记录"
+                     : "Triggered — result will appear in the run log below",
+                    "success", 3000);
+        // Surface the new history entry as the background run lands. Cheap,
+        // swallow their own errors.
         setTimeout(() => this.loadSchedulerHistory().catch(() => {}), 1500);
-        setTimeout(async () => {
-          try {
-            await this.loadSchedulerHistory();
-          } catch (_) {
-            /* history refresh failed — still release the button below */
-          } finally {
-            this.schedRunning[t.id] = false;
-          }
-        }, 8000);
+        setTimeout(() => this.loadSchedulerHistory().catch(() => {}), 8000);
       } catch (e) {
         this.toast((this.lang === "zh" ? "触发失败: " : "Trigger failed: ")
                     + ((e && e.message) || e), "error", 4000);
-        this.schedRunning[t.id] = false;
       }
     },
     retrySchedHistory(h) {

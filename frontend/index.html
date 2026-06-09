@@ -4443,13 +4443,19 @@
                           :title="lang==='zh' ? '历史运行' : 'Past runs'">
                     <svg><use href="#i-history"/></svg>
                   </button>
+                  <!-- NO :disabled here. A stuck schedRunning[t.id] used to
+                       leave the native disabled attribute on, so the button
+                       showed `not-allowed` and ate the click ("鼠标一挪上去就是
+                       禁用的标志，点不了", 2026-06-09). Double-fire is now
+                       guarded by a timestamp in runSchedTaskNow; schedRunning
+                       only drives the cosmetic spinner (paper-plane → spinning
+                       refresh glyph, see .icon-btn.is-running in styles.css). -->
                   <button class="icon-btn sm" @click.stop="runSchedTaskNow(t)"
-                          :disabled="schedRunning[t.id]"
                           :class="{ 'is-running': schedRunning[t.id] }"
                           :title="schedRunning[t.id]
                                     ? (lang==='zh' ? '运行中…' : 'Running…')
                                     : (lang==='zh' ? '立即运行一次' : 'Run now')">
-                    <svg><use href="#i-send"/></svg>
+                    <svg><use :href="schedRunning[t.id] ? '#i-refresh' : '#i-send'"/></svg>
                   </button>
                   <button class="icon-btn sm" @click.stop="editSchedTask(t)"
                           :class="{ active: scheduler.draft.editingId === t.id }"
