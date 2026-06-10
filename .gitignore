@@ -15,6 +15,10 @@ scripts/.leak-blacklist
 sessions/
 sessions.bak-*/
 mcp.json
+# Runtime user config persisted by Settings → model editor (endpoints.py
+# OVERRIDES_PATH, "next to mcp.json") — per-instance state, same class as
+# mcp.json above; never ship a maintainer's copy in the repo.
+provider_overrides.json
 data/
 # frontend/data/ ships tracked static JS modules (i18n alternatives, slash
 # commands, etc.); carve out from the generic data/ rule above.
