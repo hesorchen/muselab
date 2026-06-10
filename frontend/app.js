@@ -421,6 +421,13 @@ function portal() {
     tabState: {},
     messages: [],
     model: "claude-sonnet-4-6",
+    // The configured "new-session default" model (Settings → 新会话). Kept
+    // SEPARATE from `model`, which tracks the CURRENTLY-VIEWED session and is
+    // overwritten to that session's locked model whenever you open an old tab.
+    // newSession() seeds from this so a fresh chat always starts on the default,
+    // not whatever old session you were just looking at. Loaded from the
+    // /providers response at boot (and persisted in prefs for instant restore).
+    defaultModel: "",
     permission: "bypassPermissions",
     // Mobile-only: collapses the per-session settings (permission / effort)
     // behind a gear in the composer toolbar so the row stays single-line on
@@ -3841,7 +3848,7 @@ function portal() {
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
         schema: 2,          // bump when prefs format changes incompatibly
-        model: this.model, permission: this.permission,
+        model: this.model, defaultModel: this.defaultModel, permission: this.permission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
         previewTabs: this.tabs.map(t => ({ path: t.path, name: t.name, preview: !!t.preview })),
@@ -3877,6 +3884,7 @@ function portal() {
           return;
         }
         if (p.model) this.model = p.model;
+        if (p.defaultModel) this.defaultModel = p.defaultModel;
         if (p.permission) this.permission = p.permission;
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
         if (typeof p.rightOpen === "boolean") this.rightOpen = p.rightOpen;
@@ -3951,7 +3959,9 @@ function portal() {
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
-          this.availableModels = (await r.json()).models || [];
+          const d = await r.json();
+          this.availableModels = d.models || [];
+          if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           this._ensureValidModel();
           this._rebindModelSelect();
         }
@@ -5117,10 +5127,18 @@ function portal() {
       const prefix = this.lang === "zh" ? "新会话 " : "New chat ";
       const id = this._uuid();
       const ts = now.getTime() / 1000;
+      // Seed from the configured default, NOT this.model (which mirrors the
+      // old session you were just viewing). Fall back to this.model only when
+      // the default isn't known yet (very first load before /providers lands).
+      const seedModel = this.defaultModel || this.model || "";
+      // Reflect it in the dropdown immediately — _activateTabState doesn't touch
+      // this.model, so without this the selector would still show the old
+      // session's model even though the new session is seeded with the default.
+      this.model = seedModel;
       const meta = {
         id,
         name: prefix + stamp,
-        model: this.model || "",
+        model: seedModel,
         system_prompt: "",
         created_at: ts,
         updated_at: ts,
@@ -5154,7 +5172,7 @@ function portal() {
         // open_ids: protect THIS browser's open tabs from the backend's
         // empty-session recycler (prune_empty_sessions keep_ids) — an open but
         // still-empty scratch tab must not be swept when a new one is created.
-        body: JSON.stringify({ id, name: meta.name, model: this.model, open_ids: this.openTabIds || [] }),
+        body: JSON.stringify({ id, name: meta.name, model: seedModel, open_ids: this.openTabIds || [] }),
       }).then(r => (r && r.ok ? r.json() : null)).then(srv => {
         // Confirmed: drop the optimistic guard and reconcile any server-side
         // normalisation (e.g. provider model fallback) into the local row.
@@ -8639,7 +8657,9 @@ function portal() {
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
-          this.availableModels = (await r.json()).models || [];
+          const d = await r.json();
+          this.availableModels = d.models || [];
+          if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           this._ensureValidModel();
         }
       } catch (e) {
@@ -8923,8 +8943,13 @@ function portal() {
         // 老值 → 用户看不到任何变化。同步前端 + localStorage 让"我改了它生效"
         // 的预期成立。已建会话有自己 locked model，不受影响。
         const newDefaultModel = this.settings.draftDefaults.model;
-        if (newDefaultModel && newDefaultModel !== this.model) {
-          this.model = newDefaultModel;
+        if (newDefaultModel) {
+          // newSession() seeds from defaultModel — update it so the change
+          // takes effect on the very next new chat without a providers refetch.
+          this.defaultModel = newDefaultModel;
+          // Also move the active dropdown to the new default (the original
+          // behavior) so "I changed it" is immediately visible.
+          if (newDefaultModel !== this.model) this.model = newDefaultModel;
           this.savePrefs();
         }
         const newDefaultPerm = this.settings.draftDefaults.permission;

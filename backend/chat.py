@@ -6965,4 +6965,9 @@ def providers_list() -> dict:
     flat = [{"group": g["group"], "label": i["label"], "model": i["model"],
              "supports_thinking": g.get("supports_thinking", True)}
             for g in groups for i in g["items"]]
-    return {"models": flat}
+    # default_model: the configured "new-session default" (MUSELAB_MODEL),
+    # already narrowed to a reachable model by _resolve_default_model. The
+    # frontend seeds each new chat from this instead of the currently-viewed
+    # session's locked model — without it, a new session inherited whatever
+    # old tab you happened to be on.
+    return {"models": flat, "default_model": _resolve_default_model("")}
