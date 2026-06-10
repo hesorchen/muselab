@@ -8806,15 +8806,26 @@ function portal() {
     async restartService() {
       if (this.settings.restarting) return;
       // Confirm before restarting — a stray tap on a phone would otherwise
-      // drop every active chat session for ~10s with no recourse. Native
-      // confirm() is intentional: this is a destructive action and the
-      // OS-level dialog forces deliberate user attention better than an
-      // in-app modal that may blend into the settings drawer chrome.
-      const msg = this.lang === "zh"
-        ? "重启 muselab 服务？所有正在跑的对话会中断约 10 秒。"
-        : "Restart muselab? All running chats will pause for ~10 seconds.";
-      if (!window.confirm(msg)) return;
+      // drop every active chat session for ~10s with no recourse. Use the
+      // in-app modal (this.confirm), NOT native window.confirm: mobile
+      // webviews silently suppress window.confirm() so it returns false →
+      // the restart short-circuited with no dialog AND no feedback
+      // (2026-06-10 user report: tapped 重启, nothing happened). The in-app
+      // modal renders reliably on mobile and matches the rest of the app.
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "重启服务" : "Restart service",
+        body: this.lang === "zh"
+          ? "重启 muselab 服务？所有正在跑的对话会中断约 10 秒。"
+          : "Restart muselab? All running chats will pause for ~10 seconds.",
+        okText: this.lang === "zh" ? "重启" : "Restart",
+        danger: true,
+      });
+      if (!ok) return;
       this.settings.restarting = true;
+      // Immediate feedback: the button also flips to "重启中…" via
+      // settings.restarting, but an explicit toast confirms the tap landed
+      // even before the health-poll loop reports success.
+      this.toast(this.lang === "zh" ? "正在重启服务…" : "Restarting service…", "info", 2500);
       try {
         // Fire the restart request — the server responds before it restarts
         await fetch("/api/settings/restart", {
