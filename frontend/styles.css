@@ -671,6 +671,16 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
     height: calc(100vh - 48px);
     height: calc(100dvh - 48px - env(safe-area-inset-bottom));
   }
+  /* On mobile the bottom tab bar (grid row 2 = 48px + safe-area) sits BELOW
+     the chat pane and already clears the notch / home-bar. The pane height
+     above also subtracts safe-area-inset-bottom. So the global
+     `.chat-input { padding-bottom: 8px + safe-area }` rule double-counts the
+     inset and leaves a blank strip between the input and the tab bar. Drop
+     the inset here — the tab bar owns it. (kb-open already zeroes this; in
+     landscape the tab bar is hidden but iPhone's bottom inset is ~0 there.)
+     Uses `.layout .chat-input` (specificity 0,2,0) so it beats the global
+     `@supports .chat-input` rule below regardless of source order. */
+  .layout .chat-input { padding-bottom: 8px; }
   /* Chat textarea / context meter / session bar sometimes overflow on tiny
      screens — trim padding so they fit. Font sizes here intentionally
      larger than the desktop --fs-sm (12px) so labels next to inputs
