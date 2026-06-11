@@ -381,6 +381,24 @@
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
           <span class="path" x-text="contextInfo.archive_root || '—'"></span>
+          <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
+               "+" and ctx menu use — both already handle path:'' (root), so
+               these are pure entry points, no new write paths. @click.stop
+               keeps the bar's drag/drop handlers out of the click. -->
+          <span class="root-actions">
+            <button class="root-action" type="button"
+                    @click.stop="doNewFile({ path: '', is_dir: true })"
+                    :title="lang==='zh' ? '在根目录新建文件' : 'New file at root'"
+                    aria-label="New file at root">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-plus"/></svg>
+            </button>
+            <button class="root-action" type="button"
+                    @click.stop="doNewDir({ path: '', is_dir: true })"
+                    :title="lang==='zh' ? '在根目录新建目录' : 'New folder at root'"
+                    aria-label="New folder at root">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-folder-plus"/></svg>
+            </button>
+          </span>
         </div>
       <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())"
           @mousedown="onMarqueeStart($event)">
