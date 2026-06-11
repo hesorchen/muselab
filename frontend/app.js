@@ -9373,7 +9373,11 @@ function portal() {
       const zh = this.lang === "zh";
       const name = await this.prompt({
         title: zh ? "新建文件" : "New file",
-        body: (zh ? "在 " : "Inside ") + `/${dirNode.path}`,
+        // Root has no meaningful path to show ("在 /" reads broken); a
+        // subdirectory prompt keeps the location line — the hover "+" can
+        // be clicked on any row, so WHICH dir matters there.
+        body: dirNode.path
+          ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "new.md",
       });
       if (!name) return;
@@ -9398,8 +9402,12 @@ function portal() {
     async doNewDir(dirNode) {
       const zh = this.lang === "zh";
       const name = await this.prompt({
-        title: zh ? "新建子目录" : "New subdirectory",
-        body: (zh ? "在 " : "Inside ") + `/${dirNode.path}`,
+        title: dirNode.path
+          ? (zh ? "新建子目录" : "New subdirectory")
+          : (zh ? "新建目录" : "New folder"),
+        // Same rule as doNewFile: no location line at root.
+        body: dirNode.path
+          ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "",
       });
       if (!name) return;
