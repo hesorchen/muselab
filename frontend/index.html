@@ -4158,7 +4158,10 @@
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body">
-        <div x-text="modal.body"></div>
+        <!-- x-show: an empty body still rendered an empty <div> whose line
+             box left a blank band above the input (visible in prompts that
+             pass body:""). -->
+        <div x-show="modal.body" x-text="modal.body"></div>
         <input x-show="modal.input !== null" x-model="modal.input"
                :placeholder="modal.placeholder || ''"
                x-ref="modalInput" @keydown.enter="modal.confirm?.()" />
