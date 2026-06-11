@@ -12,9 +12,12 @@
 Two classes of assumption have **no auto-diff** and must be eyeballed on each bump:
 
 1. **Harness-tool denylist** — `backend/chat.py` `disallowed_tools` is a hand-kept
-   blacklist. The SDK exposes no programmatic tool catalog (`builtin_types` is the
-   stdlib `types` module, not a tool list), so a newly-added harness tool is
-   **silently exposed** to the model until someone notices.
+   blacklist, so a newly-added harness tool is **silently exposed** to the model
+   until someone notices. ~~The SDK exposes no programmatic tool catalog~~ —
+   **2026-06-11 update**: the CLI announces its full tool list in every session's
+   `init` SystemMessage; `scripts/dump-tool-catalog.py` captures it and
+   `docs/tool-catalog.txt` is the committed baseline, so this drift class is now
+   mechanically diffable (see checklist item 1).
 2. **CLI JSONL transcript format** — `backend/jsonl_cleanup.py`,
    `_full_session_msgs`, `_find_session_jsonl`, `_compact_summary_uuids` parse the
    CLI's private `*.jsonl` (`type` / `uuid` / `message` / `content[]` /
@@ -31,11 +34,25 @@ Two **other** drift classes are already auto-eliminated (don't re-check manually
 
 Run from repo root in the project venv (`.venv/bin/python`).
 
-- [ ] **1. Denylist vs current harness tools.** Diff the SDK's bundled CLI tool
-  set against `disallowed_tools` in `backend/chat.py`. There's no programmatic
-  catalog, so check the SDK release notes / CLI `--help` for newly-added tools and
-  decide allow-vs-deny for each. A new tool defaults to **exposed** — treat any
-  unrecognized one as deny-until-reviewed.
+- [ ] **1. Denylist vs current harness tools.** Mechanical diff:
+
+  ```bash
+  .venv/bin/python scripts/dump-tool-catalog.py | diff docs/tool-catalog.txt -
+  ```
+
+  For each NEW tool decide allow-vs-deny (a new tool defaults to **exposed** —
+  treat any unrecognized harness primitive as deny-until-reviewed, add it to
+  `disallowed_tools` in `backend/chat.py`), then refresh the baseline:
+  `.venv/bin/python scripts/dump-tool-catalog.py > docs/tool-catalog.txt`.
+  A REMOVED tool that's still in the denylist is harmless — keep it one cycle
+  for users on older CLIs, then prune.
+
+  Note (2026-06-11 evaluation): `tools={"type": "preset", "preset":
+  "claude_code"}` was considered as a denylist replacement and rejected — the
+  SDK maps it to `--tools default` (subprocess_cli.py), i.e. exactly the
+  behavior muselab already gets by not passing `tools`, so it does NOT protect
+  against new-tool exposure. An explicit allowlist inverts the failure mode
+  (new/renamed useful tools silently missing) — worse for a fast-moving CLI.
 
 - [ ] **2. JSONL field assumptions still hold.** Confirm the CLI still writes
   `type` / `uuid` / `message.content[]` / `isCompactSummary` as parsed in

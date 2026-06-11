@@ -931,13 +931,17 @@ async def _build_and_connect_client(
         # version is left enabled too as a fallback if the model forgets the
         # MCP name; the frontend renders both shapes.
         #
-        # MAINTENANCE NOTE (audit E/253): this is a hand-maintained DENYLIST.
-        # It only blocks tool names known at the time of writing — if a future
-        # SDK release adds a new harness-only tool (another plan-mode / cron /
-        # worktree / notification primitive), it will be silently EXPOSED to
-        # the model until someone adds it here. There is no allowlist fallback.
-        # When bumping the claude_agent_sdk version, diff the SDK's default
-        # tool catalog against this list and add any new harness-only tools.
+        # MAINTENANCE NOTE (audit E/253, updated 2026-06-11): this is a
+        # hand-maintained DENYLIST — a future harness-only tool is silently
+        # EXPOSED until added here. Drift is now mechanically checkable: the
+        # CLI announces its tool catalog in the init SystemMessage;
+        #   .venv/bin/python scripts/dump-tool-catalog.py \
+        #       | diff docs/tool-catalog.txt -
+        # on every SDK bump (sdk-bump-checklist.md item 1). Alternatives were
+        # evaluated and rejected: tools={"type":"preset","preset":"claude_code"}
+        # maps to `--tools default` — identical to not passing tools at all, so
+        # it adds no protection; an explicit allowlist inverts the failure mode
+        # (new/renamed useful tools silently MISSING after a CLI bump).
         disallowed_tools=[
             "ExitPlanMode",           # plan-mode handshake — no UI yet
             "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
