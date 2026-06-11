@@ -5644,6 +5644,10 @@ async def _watch_inflight_tasks(
                     tid = getattr(msg, "task_id", "") or ""
                     won_typed = _on_task_settled(
                         session_id, tid, status=getattr(msg, "status", None))
+                    sys.stderr.write(
+                        f"[chat] task watcher: typed notification "
+                        f"sid={session_id[:8]} task={tid} "
+                        f"status={getattr(msg, 'status', None)} won={won_typed}\n")
                     pending.pop(tid, None)
                     if won_typed:
                         if cont is None:
@@ -5658,6 +5662,45 @@ async def _watch_inflight_tasks(
                                 "output_file": getattr(msg, "output_file", None),
                                 "usage": dict(getattr(msg, "usage", None) or {}),
                             })})
+                elif isinstance(msg, TaskStartedMessage):
+                    # A task launched DURING the auto-continue reaction (the
+                    # model can run tools in that turn, including Bash
+                    # run_in_background). Register it exactly like the
+                    # in-turn dispatch would — pending + pin + description —
+                    # so THIS watcher keeps covering it after the
+                    # continuation closes. Without this, the launch was
+                    # invisible (no card, no pin, no watcher) and its
+                    # terminal notification buffered unread until the next
+                    # user turn (2026-06-11 sleep-300 bug).
+                    tid = getattr(msg, "task_id", "") or ""
+                    desc = getattr(msg, "description", None)
+                    if tid:
+                        pending[tid] = desc
+                        _sessions_with_inflight_tasks.setdefault(
+                            session_id, set()).add(tid)
+                        if desc:
+                            _bg_task_descriptions[tid] = desc
+                        sys.stderr.write(
+                            f"[chat] task watcher: typed start "
+                            f"sid={session_id[:8]} task={tid}\n")
+                    if cont is not None:
+                        cont.publish({"event": "task_started",
+                                      "data": json.dumps({
+                            "task_id": tid,
+                            "tool_use_id": getattr(msg, "tool_use_id", None),
+                            "description": desc,
+                            "task_type": getattr(msg, "task_type", None),
+                        })})
+                elif isinstance(msg, TaskProgressMessage):
+                    if cont is not None:
+                        cont.publish({"event": "task_progress",
+                                      "data": json.dumps({
+                            "task_id": getattr(msg, "task_id", "") or "",
+                            "tool_use_id": getattr(msg, "tool_use_id", None),
+                            "last_tool_name": getattr(
+                                msg, "last_tool_name", None),
+                            "usage": dict(getattr(msg, "usage", None) or {}),
+                        })})
                 elif (notifs := _parse_task_notifications(
                         _usermsg_task_notification_text(msg))):
                     # FALLBACK text path: terminal completion arrived as a
@@ -5725,6 +5768,9 @@ async def _watch_inflight_tasks(
                 await _close_continuation()
             except Exception:
                 pass
+        sys.stderr.write(
+            f"[chat] task watcher exit sid={session_id[:8]} "
+            f"pending_left={sorted(pending)}\n")
         # Only clear the registry slot if it still points at us (a fresh
         # watcher may have replaced it after a handoff).
         if _task_watchers.get(session_id) is asyncio.current_task():
@@ -5769,6 +5815,9 @@ def _spawn_task_watcher(
     old = _task_watchers.get(session_id)
     if old is not None and not old.done():
         old.cancel()
+    sys.stderr.write(
+        f"[chat] task watcher spawned sid={session_id[:8]} "
+        f"pending={sorted(pending)}\n")
     _task_watchers[session_id] = asyncio.create_task(
         _watch_inflight_tasks(session_id, client, pending))
 
@@ -6433,6 +6482,9 @@ async def _start_turn(
                 })}
             elif isinstance(msg, TaskNotificationMessage):
                 tid = getattr(msg, "task_id", "") or ""
+                sys.stderr.write(
+                    f"[chat] in-turn typed notification sid={session_id[:8]} "
+                    f"task={tid} status={getattr(msg, 'status', None)}\n")
                 # Drop from the per-turn in-flight set so it isn't handed to the
                 # cross-turn watcher (it settled in-turn).
                 inflight_tasks.pop(tid, None)

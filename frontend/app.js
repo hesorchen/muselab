@@ -3591,8 +3591,9 @@ function portal() {
         if (r.ok) {
           this.toast(zh ? "已请求停止任务" : "Stop requested", "info");
         } else if (r.status === 409) {
-          // No live client — the task is dead-or-settled; reconcile the
-          // card so the user isn't stuck looking at a phantom ⏳.
+          // No live client — the task is dead-or-settled. Just inform; the
+          // poller's history-tail fallback reconciles a phantom ⏳ card
+          // within ~32s (no optimistic flip here either, same contract).
           this.toast(zh ? "任务已不在运行" : "Task no longer running", "warn");
         } else {
           this.toast(zh ? "停止任务失败" : "Failed to stop task", "error");
@@ -13861,7 +13862,15 @@ function portal() {
         if (!toolUseId) return;
         const msgs = streamState.messages;
         for (let k = msgs.length - 1; k >= 0; k--) {
-          if (msgs[k] && msgs[k].id === toolUseId) {
+          // role check is LOAD-BEARING: the tool_result bubble carries the
+          // SAME toolu_xxx id as its tool_use card and sits AFTER it, so a
+          // reverse scan on id alone hits the tool_result and stamps
+          // task_status where no template renders it. task_started slipped
+          // through only because the typed message arrives BEFORE the
+          // tool_result; every TERMINAL notification arrived after and was
+          // silently swallowed — the ⏳ card never flipped live (2026-06-11).
+          if (msgs[k] && msgs[k].id === toolUseId
+              && msgs[k].role === "tool_use") {
             const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
             msgs[k].task_status = Object.assign({}, prev, patch);
             return;
