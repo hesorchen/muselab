@@ -2041,10 +2041,15 @@ def _strip_cli_slash_wrapper(text: str) -> str:
 # spec.md). The launching tool_use card and this record share the <tool-use-id>.
 # On history rebuild we parse it and stamp the card's terminal task_status so a
 # completed bg task shows ✅ DURABLY (survives reload — matches Claude Code),
-# instead of rendering the raw XML as a confusing user bubble. NOTE: this is the
-# ONLY reliable completion signal in muselab's flow — in practice the terminal
-# notification arrives as this user-text record, NOT as a typed
-# TaskNotificationMessage, so the in-turn / cross-turn dispatch never sees it.
+# instead of rendering the raw XML as a confusing user bubble.
+#
+# LIVE-PATH ROLE (updated 2026-06-11, Phase-0 probe on CLI 2.1.141 + SDK
+# 0.2.95): the live stream DOES deliver a typed TaskNotificationMessage
+# (out-of-band, after the turn's ResultMessage) — typed dispatch is the
+# PRIMARY live truth. This regex remains authoritative ONLY for JSONL history
+# rebuild (the transcript stores the XML record, never the typed message) and
+# as a live fallback for older CLIs; a fallback hit logs a
+# "[chat] task fallback" warning.
 _TASK_NOTIFICATION_RE = re.compile(
     r"<task-notification>(.*?)</task-notification>", re.DOTALL)
 
@@ -2074,15 +2079,18 @@ def _parse_task_notifications(text: str) -> list[dict]:
     return recs
 
 
-# A Bash run_in_background=true LAUNCH does NOT emit a typed TaskStartedMessage
-# (only the SDK's Agent-style tasks do). It surfaces solely as a tool_result body
-# of the form: "Command running in background with ID: <tid>. Output is being
-# written to: <file>. You will be notified when it completes. ...". muselab must
-# sniff this text to learn that a background task started — otherwise
-# inflight_tasks stays empty, the turn-end cross-turn watcher never spawns, and
-# the post-completion auto-continue never streams live (the card still flips ✅ on
-# reload because history rebuild parses the raw <task-notification> record
-# directly, masking the missing live path). See docs/background-tasks-spec.md.
+# FALLBACK launch sniff (updated 2026-06-11): on CLI 2.1.141 + SDK 0.2.95 a
+# Bash run_in_background=true launch DOES emit a typed TaskStartedMessage
+# (Phase-0 probe), which arrives BEFORE the tool_result — typed dispatch is the
+# primary truth and this sniff normally no-ops. It remains as a fallback for
+# older CLIs whose launches surface solely as a tool_result body of the form:
+# "Command running in background with ID: <tid>. Output is being written to:
+# <file>. ...". If the sniff ever wins (logs a "[chat] task fallback" warning),
+# the typed contract regressed — without the fallback, inflight_tasks would
+# stay empty, the turn-end cross-turn watcher would never spawn, and the
+# post-completion auto-continue would never stream live. NOTE: the English
+# wording below is CLI-version-coupled; that brittleness is exactly why typed
+# messages are now the primary path. See docs/background-tasks-spec.md.
 _BG_LAUNCH_RE = re.compile(
     r"Command running in background with ID:\s*([A-Za-z0-9._-]+)\."
     r"\s*Output is being written to:\s*(\S+?\.output)\b")
@@ -2103,11 +2111,13 @@ def _usermsg_task_notification_text(msg) -> str:
     """If `msg` is a UserMessage carrying a <task-notification>, return its
     textual content; else return "".
 
-    The CLI delivers a background task's terminal completion as a normal
-    UserMessage whose content is the <task-notification> XML (NOT a typed
-    TaskNotificationMessage — that shape only ever showed up to standalone
-    probe scripts, never in muselab's live turn/watcher stream). Content may
-    be a plain string or a list of content blocks; flatten both to text."""
+    Fallback-path helper (updated 2026-06-11): the typed
+    TaskNotificationMessage is the primary live completion signal on CLI
+    2.1.141 + SDK 0.2.95. Some CLI builds additionally/instead deliver the
+    terminal completion as a normal UserMessage whose content is the raw
+    <task-notification> XML; this helper lets the fallback branches consume
+    that shape. Content may be a plain string or a list of content blocks;
+    flatten both to text."""
     if not isinstance(msg, UserMessage):
         return ""
     content = getattr(msg, "content", None)
@@ -5514,19 +5524,41 @@ async def _watch_inflight_tasks(
                     # open continuation and stop — all tasks already settled.
                     break
 
-                notif_text = _usermsg_task_notification_text(msg)
-                notifs = _parse_task_notifications(notif_text) if notif_text else []
-                if notifs:
-                    # IDLE completion path: the user launched a bg task then
-                    # went quiet, so its terminal <task-notification> arrives
-                    # in the gap between turns (no live turn to catch it). Open
-                    # a continuation and publish task_notification per record
-                    # (the FE flips the launching card → ✅ AND, via the /active
-                    # belt, reconnects to stream the auto-continue that follows).
-                    # Gate each emit on _settle_background_task so a task the
-                    # in-turn dispatch already surfaced isn't double-fired here.
-                    # Suppress the raw XML by NOT falling through to
-                    # _render_continuation_message (this branch consumes it).
+                if isinstance(msg, TaskNotificationMessage):
+                    # PRIMARY typed path. Phase-0 probe (2026-06-11, CLI
+                    # 2.1.141 + SDK 0.2.95) confirmed the terminal
+                    # TaskNotificationMessage IS delivered typed, out-of-band
+                    # after the turn's ResultMessage — exactly what this
+                    # watcher drains. Gate on _settle_background_task so a
+                    # task the in-turn dispatch already surfaced isn't
+                    # double-fired here.
+                    tid = getattr(msg, "task_id", "") or ""
+                    won_typed = _settle_background_task(session_id, tid)
+                    pending.pop(tid, None)
+                    if won_typed:
+                        if cont is None:
+                            await _open_continuation()
+                        if cont is not None:
+                            cont.publish({"event": "task_notification",
+                                          "data": json.dumps({
+                                "task_id": tid,
+                                "tool_use_id": getattr(msg, "tool_use_id", None),
+                                "status": getattr(msg, "status", None),
+                                "summary": getattr(msg, "summary", None),
+                                "output_file": getattr(msg, "output_file", None),
+                                "usage": dict(getattr(msg, "usage", None) or {}),
+                            })})
+                elif (notifs := _parse_task_notifications(
+                        _usermsg_task_notification_text(msg))):
+                    # FALLBACK text path: terminal completion arrived as a
+                    # user-text <task-notification> XML record instead of the
+                    # typed message (older CLI, or a CLI regression). Warn so
+                    # we notice fallback traffic — the typed branch above is
+                    # the supported contract.
+                    sys.stderr.write(
+                        f"[chat] task fallback: watcher settled via "
+                        f"<task-notification> XML, typed message missed "
+                        f"sid={session_id}\n")
                     won = [n for n in notifs
                            if _settle_background_task(
                                session_id, n.get("task_id") or "")]
@@ -5544,25 +5576,6 @@ async def _watch_inflight_tasks(
                                 "summary": n.get("summary") or None,
                                 "output_file": n.get("output_file") or None,
                             })})
-                elif isinstance(msg, TaskNotificationMessage):
-                    # Typed-message path — kept for a future SDK that delivers
-                    # TaskNotificationMessage directly. Dead in today's stream.
-                    tid = getattr(msg, "task_id", "") or ""
-                    if cont is None:
-                        await _open_continuation()
-                    status = getattr(msg, "status", None)
-                    if cont is not None:
-                        cont.publish({"event": "task_notification",
-                                      "data": json.dumps({
-                            "task_id": tid,
-                            "tool_use_id": getattr(msg, "tool_use_id", None),
-                            "status": status,
-                            "summary": getattr(msg, "summary", None),
-                            "output_file": getattr(msg, "output_file", None),
-                            "usage": dict(getattr(msg, "usage", None) or {}),
-                        })})
-                    _settle_background_task(session_id, tid)
-                    pending.pop(tid, None)
                 elif isinstance(msg, ResultMessage):
                     # End of the CLI's auto-continue reaction — close the
                     # continuation. If tasks remain in flight, keep reading for
@@ -6176,25 +6189,30 @@ async def _start_turn(
             tool_use_id matches the prior ToolUseBlock; we look up its
             name from `tool_use_names` so the FE renderer (Bash terminal,
             Read gutter, …) can pick the right per-tool view."""
-            # PRIMARY background-task completion path. When the user keeps
-            # working while a bg task runs, its terminal <task-notification>
-            # arrives MID-TURN as a UserMessage (not a typed message, not a
-            # ToolResultBlock) inside this same turn's stream. Surface it live
-            # here: flip the launching card → ✅ and settle the task. The
-            # model's auto-continue reaction then streams as normal
-            # AssistantMessages later in this very turn — no waiting, no idle
-            # watcher needed. (The cross-turn watcher only covers the case
-            # where the user went idle after launching.)
+            # FALLBACK background-task completion path. The supported
+            # contract is the typed TaskNotificationMessage (handled by
+            # _handle_task_message — Phase-0 probe 2026-06-11 confirmed CLI
+            # 2.1.141 delivers it). Some CLI builds additionally/instead
+            # round-trip the terminal completion as a UserMessage whose
+            # content is the raw <task-notification> XML; consume it here so
+            # the card still flips and the bubble never renders raw XML.
+            # _settle_background_task dedups the two paths — whichever
+            # observes the terminal signal first wins, the loser no-ops.
             _notif_text = _usermsg_task_notification_text(msg)
             _notifs = _parse_task_notifications(_notif_text) if _notif_text else []
             if _notifs:
                 for n in _notifs:
                     tid = n.get("task_id") or ""
-                    # Dedup against the cross-turn watcher: only the path that
-                    # settles first surfaces the completion (sync check, no
-                    # await between gate and emit → no double-fire).
+                    # Dedup against the typed path / cross-turn watcher: only
+                    # the path that settles first surfaces the completion
+                    # (sync check, no await between gate and emit → no
+                    # double-fire).
                     if tid and not _settle_background_task(session_id, tid):
                         continue
+                    sys.stderr.write(
+                        f"[chat] task fallback: in-turn settle via "
+                        f"<task-notification> XML, typed message missed "
+                        f"sid={session_id} task={tid}\n")
                     inflight_tasks.pop(tid, None)
                     yield {"event": "task_notification", "data": json.dumps({
                         "task_id": tid,
@@ -6213,15 +6231,21 @@ async def _start_turn(
                         rendered = _render_tool_result(block, tool_name=tname)
                         yield {"event": "tool_result",
                                "data": json.dumps(rendered)}
-                        # Bash run_in_background=true launches carry no typed
-                        # TaskStartedMessage — only this tool_result text. Sniff
-                        # it so the task lands in inflight_tasks; otherwise the
-                        # turn-end watcher never spawns and the post-completion
-                        # auto-continue never streams live (see _parse_bg_launch).
+                        # FALLBACK launch detection. The supported contract is
+                        # the typed TaskStartedMessage (Phase-0 probe
+                        # 2026-06-11: CLI 2.1.141 emits it BEFORE this
+                        # tool_result, so `tid in inflight_tasks` already holds
+                        # and this sniff no-ops). Kept for older CLIs / a CLI
+                        # that changes ordering: without it the turn-end
+                        # watcher never spawns (see _parse_bg_launch).
                         launch = _parse_bg_launch(rendered.get("text") or "")
                         if launch and tu_id:
                             tid = launch["task_id"]
                             if tid and tid not in inflight_tasks:
+                                sys.stderr.write(
+                                    f"[chat] task fallback: bg launch detected "
+                                    f"via tool_result sniff, TaskStartedMessage "
+                                    f"missed sid={session_id} task={tid}\n")
                                 desc = bg_launch_desc.get(tu_id)
                                 inflight_tasks[tid] = {
                                     "tool_use_id": tu_id,
