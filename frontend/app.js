@@ -4676,14 +4676,54 @@ function portal() {
             && document.visibilityState !== "visible") return;
         // Not viewing this session, or already streaming → retry next tick.
         if (this.currentId !== sid || this.streaming) return;
-        // PRIMARY completion path: a run_in_background task's terminal status
-        // round-trips through the session JSONL as a <task-notification> record
-        // (NOT a typed TaskNotificationMessage, so the cross-turn watcher's
-        // continuation never opens in practice). The backend history rebuild
-        // stamps the launching card's terminal task_status from that record;
-        // here we poll the history tail and reconcile it onto the live running
-        // cards so the badge flips ✅ in-place without a manual reload — then
-        // the next tick's _bgHasRunningCard check self-stops the poller.
+        // PRIMARY completion path (since the 2026-06-11 typed-message
+        // alignment): the cross-turn watcher reliably receives the typed
+        // TaskNotificationMessage and opens a continuation broadcast, so
+        // /active — a cheap, tiny JSON probe — discovers it on the next
+        // tick and reconnects in continuation mode; the replayed
+        // task_notification flips the card and streams the auto-continue.
+        // (The browser has no persistent SSE channel in the turn gap — the
+        // per-turn EventSource closes on done — so SOME polling is the only
+        // discovery mechanism; this probe is the lightest one.)
+        let contFound = false;
+        try {
+          const r = await fetch("/api/chat/sessions/" + sid + "/active",
+                                 { headers: this.hdr() });
+          if (r.ok) {
+            const d = await r.json();
+            if (d.active && d.continuation && !this.streaming
+                && this.currentId === sid) {
+              // Dedup: /active surfaces a finished continuation from the
+              // server's _recent_turns for the full 60s TTL, so if ANOTHER
+              // bg task keeps this poller alive the same continuation would
+              // be re-reconnected every 8s → duplicate reaction bubbles. Key
+              // on the continuation's started_at (unique epoch per broadcast)
+              // and replay each one at most once. The normal single-task case
+              // self-stops on the card flip and never reaches a second tick,
+              // but this makes the multi-task case safe too.
+              this._consumedConts = this._consumedConts || {};
+              const ckey = sid + ":" + d.started_at;
+              if (!this._consumedConts[ckey]) {
+                this._consumedConts[ckey] = true;
+                contFound = true;
+                this.send({ reconnect: true, continuation: true,
+                             startedAt: d.started_at });
+              }
+            }
+          }
+        } catch (_e) {}
+        if (contFound) return;   // continuation replay will flip the card
+        // FALLBACK reconciliation, every 4th tick (~32s): pull the history
+        // tail and stamp terminal task_status onto still-running cards. This
+        // covers the cases the /active probe can't see — the watcher died
+        // (server restart), the continuation's 60s TTL expired before a
+        // hidden tab came back, or an older CLI that only round-trips the
+        // <task-notification> JSONL record. Demoted from every-tick PRIMARY
+        // (it fetches an 80-message tail vs /active's ~100 bytes) on
+        // 2026-06-11 when the typed-message path made the continuation
+        // broadcast reliable.
+        this._bgContTickN = (this._bgContTickN || 0) + 1;
+        if (this._bgContTickN % 4 !== 0) return;
         try {
           const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
                                   { headers: this.hdr() });
@@ -4706,32 +4746,6 @@ function portal() {
                   m.task_status = Object.assign({}, m.task_status, settled[m.id]);
                 }
               });
-            }
-          }
-        } catch (_e) {}
-        // BELT: the cross-turn continuation broadcast (works if a future SDK
-        // delivers a typed TaskNotificationMessage). Harmless no-op otherwise.
-        try {
-          const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                                 { headers: this.hdr() });
-          if (!r.ok) return;
-          const d = await r.json();
-          if (d.active && d.continuation && !this.streaming
-              && this.currentId === sid) {
-            // Dedup: /active surfaces a finished continuation from the
-            // server's _recent_turns for the full 60s TTL, so if ANOTHER
-            // bg task keeps this poller alive the same continuation would be
-            // re-reconnected every 8s → duplicate reaction bubbles. Key on
-            // the continuation's started_at (unique epoch per broadcast) and
-            // replay each one at most once. The normal single-task case
-            // self-stops on the card flip and never reaches a second tick,
-            // but this makes the multi-task case safe too.
-            this._consumedConts = this._consumedConts || {};
-            const ckey = sid + ":" + d.started_at;
-            if (!this._consumedConts[ckey]) {
-              this._consumedConts[ckey] = true;
-              this.send({ reconnect: true, continuation: true,
-                           startedAt: d.started_at });
             }
           }
         } catch (_e) {}
