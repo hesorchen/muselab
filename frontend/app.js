@@ -13965,6 +13965,24 @@ function portal() {
           summary: d.summary || "",
           output_file: d.output_file || "",
         });
+        // User-perceivable settle feedback (mirrors the server's
+        // _on_task_settled which handles the away-from-screen case via
+        // presence-gated Web Push; this branch covers the at-screen case):
+        //   - toast, so a completion is noticed even when the card has
+        //     scrolled far off-screen;
+        //   - green unread dot when the launching session isn't the tab
+        //     being viewed (same affordance as a turn finishing elsewhere).
+        const zh = this.lang === "zh";
+        const label = st === "failed"
+          ? (zh ? "后台任务失败" : "Background task failed")
+          : st === "stopped"
+            ? (zh ? "后台任务已停止" : "Background task stopped")
+            : (zh ? "后台任务已完成" : "Background task finished");
+        this.toast(label, st === "failed" ? "error" : "info");
+        if (streamSid !== this.currentId) {
+          const ts = this.tabState[streamSid];
+          if (ts && !ts.streaming) ts.unread = true;
+        }
         _scrollIfActive();
       });
       es.addEventListener("rate_limit", ev => {

@@ -5353,6 +5353,72 @@ def _settle_background_task(session_id: str, task_id: str) -> bool:
     return settled
 
 
+def _on_task_settled(
+    session_id: str,
+    task_id: str,
+    *,
+    status: str | None = None,
+) -> bool:
+    """SINGLE settlement entry for a background task's terminal signal.
+
+    Every observer path (in-turn typed / in-turn XML fallback / cross-turn
+    watcher typed / cross-turn watcher XML fallback) funnels through here, so
+    settlement side-effects live in exactly one place:
+
+      1. dedup + unpin via _settle_background_task (returns False when the
+         other path already won — caller must then NOT surface the event);
+      2. presence-gated Web Push, so a user who is AWAY from every device
+         hears about the completion. This reinstates the push that was
+         removed on 2026-06-03 — the removal rationale ("the completion
+         surfaces as a live continuation turn") only holds when someone is
+         watching; the presence gate covers exactly the complement. A user
+         at any screen gets the in-app card flip / SSE event, no push.
+
+    Push body carries NO task summary — same lock-screen privacy rule as the
+    turn-done push (a personal-archive task summary can contain health/money
+    details). Fire-and-forget: push failure never blocks the stream.
+    """
+    settled = _settle_background_task(session_id, task_id)
+    if not settled:
+        return False
+
+    async def _go():
+        try:
+            from . import presence as _presence
+            if _presence.recently_active():
+                return   # user is at a screen — in-app surfacing suffices
+            from . import push as _push
+            sname = ""
+            try:
+                for s in sess.list_sessions():
+                    if s.get("id") == session_id:
+                        sname = s.get("name", "")
+                        break
+            except Exception:
+                pass
+            body = {
+                "completed": "后台任务已完成",
+                "failed": "后台任务失败",
+                "stopped": "后台任务已停止",
+            }.get(status or "", "后台任务已结束")
+            await asyncio.to_thread(
+                _push.send_to_all,
+                title=sname or "muselab",
+                body=body,
+                url=f"/?session={session_id}",
+                tag=f"task-{task_id}",
+            )
+        except Exception as e:
+            sys.stderr.write(
+                f"[chat] task-settled push failed sid={session_id} "
+                f"task={task_id}: {e}\n")
+    try:
+        asyncio.create_task(_go())
+    except RuntimeError:
+        pass   # no running loop (only in exotic teardown paths)
+    return True
+
+
 def _render_continuation_message(msg, state: dict):
     """Yield SSE event dicts for one buffered SDK message read during a
     cross-turn continuation (the CLI auto-continue after a bg task finishes).
@@ -5533,7 +5599,8 @@ async def _watch_inflight_tasks(
                     # task the in-turn dispatch already surfaced isn't
                     # double-fired here.
                     tid = getattr(msg, "task_id", "") or ""
-                    won_typed = _settle_background_task(session_id, tid)
+                    won_typed = _on_task_settled(
+                        session_id, tid, status=getattr(msg, "status", None))
                     pending.pop(tid, None)
                     if won_typed:
                         if cont is None:
@@ -5560,8 +5627,9 @@ async def _watch_inflight_tasks(
                         f"<task-notification> XML, typed message missed "
                         f"sid={session_id}\n")
                     won = [n for n in notifs
-                           if _settle_background_task(
-                               session_id, n.get("task_id") or "")]
+                           if _on_task_settled(
+                               session_id, n.get("task_id") or "",
+                               status=n.get("status") or None)]
                     for n in notifs:
                         pending.pop(n.get("task_id") or "", None)
                     if won and cont is None:
@@ -6207,7 +6275,8 @@ async def _start_turn(
                     # the path that settles first surfaces the completion
                     # (sync check, no await between gate and emit → no
                     # double-fire).
-                    if tid and not _settle_background_task(session_id, tid):
+                    if tid and not _on_task_settled(
+                            session_id, tid, status=n.get("status") or None):
                         continue
                     sys.stderr.write(
                         f"[chat] task fallback: in-turn settle via "
@@ -6337,11 +6406,14 @@ async def _start_turn(
                 })}
                 # In-turn settle (the rare case where a background task finishes
                 # before this turn's ResultMessage). The card already flipped via
-                # the task_notification event above — here we just unpin. _settle
-                # dedups via _sessions_with_inflight_tasks so the in-turn and
-                # cross-turn paths never double-unpin the same task_id. No bell:
-                # an in-turn completion is already visible live in this stream.
-                _settle_background_task(session_id, tid)
+                # the task_notification event above — here we just unpin +
+                # notify. _on_task_settled dedups via
+                # _sessions_with_inflight_tasks so the in-turn and cross-turn
+                # paths never double-unpin the same task_id, and its push is
+                # presence-gated: a user watching this live stream never gets
+                # buzzed, a user away from every screen does (e.g. a queued
+                # turn running headless).
+                _on_task_settled(session_id, tid, status=status)
 
         async def _handle_rate_limit(msg):
             """SDK RateLimitEvent → record the window's RateLimitInfo and emit a
