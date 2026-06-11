@@ -3576,6 +3576,32 @@ function portal() {
       }
     },
 
+    // Stop a running background task via the SDK-native stop_task control
+    // request. No optimistic card flip here: the CLI acks the stop by
+    // emitting a task_notification with status='stopped' on the stream,
+    // which flows through the normal settle path (card → ⏹, unpin, toast)
+    // — single source of truth, no FE/BE state divergence.
+    async stopBackgroundTask(ts) {
+      if (!ts || !ts.task_id) return;
+      const zh = this.lang === "zh";
+      try {
+        const r = await fetch("/api/chat/sessions/" + this.currentId
+          + "/tasks/" + encodeURIComponent(ts.task_id) + "/stop",
+          { method: "POST", headers: this.hdr() });
+        if (r.ok) {
+          this.toast(zh ? "已请求停止任务" : "Stop requested", "info");
+        } else if (r.status === 409) {
+          // No live client — the task is dead-or-settled; reconcile the
+          // card so the user isn't stuck looking at a phantom ⏳.
+          this.toast(zh ? "任务已不在运行" : "Task no longer running", "warn");
+        } else {
+          this.toast(zh ? "停止任务失败" : "Failed to stop task", "error");
+        }
+      } catch (e) {
+        this.toast(zh ? "停止任务失败" : "Failed to stop task", "error");
+      }
+    },
+
     async login() {
       this.loginErr = "";
       this.token = this.tokenInput.trim();

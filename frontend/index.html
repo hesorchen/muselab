@@ -1753,6 +1753,14 @@
                            x-show="m.task_status.output_file"
                            @click.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
+                        <!-- Stop button — only while running. Backed by the
+                             SDK-native stop_task control request; the card
+                             flips to ⏹ when the CLI's status='stopped'
+                             notification round-trips the settle path. -->
+                        <a class="subagent-task-stop" href="#"
+                           x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
+                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </div>
                     </template>
                   </div>
@@ -1865,6 +1873,13 @@
                            x-show="m.task_status.output_file"
                            @click.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
+                        <!-- Stop button — same contract as the subagent
+                             card's: visible only while running, settles via
+                             the CLI's status='stopped' notification. -->
+                        <a class="tool-task-stop" href="#"
+                           x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
+                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </span>
                     </template>
                   </div>

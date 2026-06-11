@@ -4987,6 +4987,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-decoration: none;
 }
 .subagent-task-open:hover { text-decoration: underline; }
+.subagent-task-stop {
+  color: var(--c-danger, #d33); cursor: pointer; white-space: nowrap;
+  text-decoration: none;
+}
+.subagent-task-stop:hover { text-decoration: underline; }
 
 /* Background-task status pill for non-subagent tool cards (Bash
    run_in_background). The .tool card is a compact one-liner, so this sits
@@ -5007,6 +5012,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-decoration: none;
 }
 .tool-task-open:hover { text-decoration: underline; }
+.tool-task-stop {
+  color: var(--c-danger, #d33); cursor: pointer; white-space: nowrap;
+  text-decoration: none;
+}
+.tool-task-stop:hover { text-decoration: underline; }
 
 /* ===== ExitPlanMode plan card ===== */
 .plan-card {

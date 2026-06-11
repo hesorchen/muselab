@@ -4405,6 +4405,45 @@ async def interrupt(session_id: str) -> dict:
     return {"ok": True, "interrupted": interrupted}
 
 
+@router.post("/sessions/{sid}/tasks/{task_id}/stop",
+             dependencies=[Depends(require_token)])
+async def stop_background_task(sid: str, task_id: str) -> dict:
+    """Stop a running background task via the SDK's native stop_task()
+    control request (client.py:450) — the user's only handle on a runaway
+    run_in_background task short of killing the whole turn.
+
+    SINGLE-READER SAFETY: stop_task only WRITES a control request; the
+    control RESPONSE is consumed by the SDK's internal control-protocol
+    reader (not receive_messages), so calling it from this HTTP coroutine
+    never races the turn pump / cross-turn watcher on the message stream —
+    same invariant as interrupt() above.
+
+    After the CLI acks, it emits a task_notification with status='stopped'
+    on the message stream, which flows through the normal settle paths
+    (_on_task_settled → card flip + unpin + presence-gated push), so this
+    endpoint needs no settlement logic of its own."""
+    async with _lock:
+        targets = [(k, c) for k, c in _clients.items() if k[0] == sid]
+    if not targets:
+        # No live client → the CLI that owned the task is gone; the task is
+        # dead-or-settled already. 409 (not 404) so the FE can distinguish
+        # "nothing to stop" from a bad route.
+        raise HTTPException(
+            status_code=409,
+            detail="no live client for session — task already settled?")
+    errors: list[str] = []
+    for k, c in targets:
+        try:
+            await c.stop_task(task_id)
+            return {"ok": True, "task_id": task_id}
+        except Exception as e:
+            errors.append(f"{k[0]}@{k[1]}: {type(e).__name__}: {e}")
+            sys.stderr.write(
+                f"[chat] stop_task failed sid={sid} task={task_id}: "
+                f"{errors[-1]}\n")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
 async def _force_stop_after_grace(
     session_id: str,
     bc: "TurnBroadcast",
