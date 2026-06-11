@@ -521,6 +521,11 @@ _TASK_WATCH_TIMEOUT = env_int("MUSELAB_TASK_WATCH_TIMEOUT", 1800, min_value=60)
 # unpinning — bounding the worst case (no auto-continue ever comes) instead of
 # holding the client + the _active_turns slot for the full _TASK_WATCH_TIMEOUT.
 _CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 60, min_value=5)
+# Short grace for USER-STOPPED tasks: the CLI doesn't auto-continue after a
+# deliberate stop, so the watcher only needs a token window before closing
+# the continuation (frees the attached FE from an idle "streaming…" footer).
+_STOPPED_CONTINUATION_GRACE = env_int(
+    "MUSELAB_STOPPED_CONTINUATION_GRACE", 5, min_value=1)
 # task_id -> description, surviving across the turn that started the task. The
 # per-turn inflight_tasks dict is local to a turn; if a NEW turn happens to
 # drain a buffered terminal notification (handoff race), it has no description
@@ -5612,14 +5617,26 @@ async def _watch_inflight_tasks(
         _remember_recent_turn(session_id, b)
 
     msg_iter = client.receive_messages().__aiter__()
+    # Status of the most recent settle. A USER-STOPPED task almost never
+    # produces an auto-continue reaction (the CLI treats the stop as user
+    # intent), so waiting the full _CONTINUATION_GRACE leaves the attached
+    # frontend spinning "streaming…" for 60 idle seconds after the card
+    # already flipped ⏹ (2026-06-11 footer complaint). Use a short grace
+    # for stopped settles; a reaction that somehow arrives later is not
+    # lost — it buffers in the SDK queue and the next turn's in-turn
+    # dispatch drains it.
+    last_settle_status: str | None = None
     try:
         async with asyncio.timeout(_TASK_WATCH_TIMEOUT):
             while True:
                 # Once every task has settled and we're only waiting on the
                 # auto-continue, cap the read so a task that produces no
                 # continuation can't pin the client for the full watch timeout.
-                read_to = (_CONTINUATION_GRACE
-                           if (not pending and cont is not None) else None)
+                read_to = None
+                if not pending and cont is not None:
+                    read_to = (_STOPPED_CONTINUATION_GRACE
+                               if last_settle_status == "stopped"
+                               else _CONTINUATION_GRACE)
                 try:
                     if read_to is not None:
                         msg = await asyncio.wait_for(
@@ -5644,10 +5661,11 @@ async def _watch_inflight_tasks(
                     tid = getattr(msg, "task_id", "") or ""
                     won_typed = _on_task_settled(
                         session_id, tid, status=getattr(msg, "status", None))
+                    last_settle_status = getattr(msg, "status", None)
                     sys.stderr.write(
                         f"[chat] task watcher: typed notification "
                         f"sid={session_id[:8]} task={tid} "
-                        f"status={getattr(msg, 'status', None)} won={won_typed}\n")
+                        f"status={last_settle_status} won={won_typed}\n")
                     pending.pop(tid, None)
                     if won_typed:
                         if cont is None:
@@ -5718,6 +5736,7 @@ async def _watch_inflight_tasks(
                                status=n.get("status") or None)]
                     for n in notifs:
                         pending.pop(n.get("task_id") or "", None)
+                        last_settle_status = n.get("status") or None
                     if won and cont is None:
                         await _open_continuation()
                     for n in won:
