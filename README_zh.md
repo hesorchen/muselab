@@ -7,15 +7,17 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hesorchen/muselab)
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
-**muselab 是一个自托管 AI 工作台：跑在你自己机器上的私人档案库，加上一位直接在档案上干活的 Claude Agent SDK 助手——Muse。**
+**muselab 之于你的人生档案，犹如 Claude Code 之于你的代码库。**
 
-体检 PDF、预算表格、家庭信息、资产配置、职业规划——Muse 同时读取这一切，帮你完成那些跨领域的决策。档案只存在你自己的硬盘上：没有 SaaS 账号、没有云端副本，离开你机器的，只有发给你所选模型的那次请求。
+模型每个月都在换代，但 context 只属于你——而且它在复利。那些你不敢交给 SaaS 的文件——体检报告、记账表格、读过的论文、写了一半的笔记——恰恰是 AI 最该看到的。muselab 是一个自托管 AI 工作台：档案留在你自己的硬盘上，由 Muse——基于驱动 Claude Code 的同一套 agent loop——直接在上面干活。离开你机器的，只有发给你所选模型的那一次请求。
 
-- 🧠 **整文件输入，语义零损耗。** 不向量化、不切块、不建检索索引——PDF、表格、Markdown、HTML 以原始全文进入上下文。资料越丰富，任务完成质量越高。
+- 🔐 **私有，所以放得全；放得全，所以看得深。** 没有 SaaS 账号、没有云端副本——健康、财务、工作才敢放进同一个档案库。Muse 同时读到它们，给出任何单一领域都给不出的跨领域建议。
 
-- 🤖 **Claude Agent SDK × 八家模型。** MCP 工具、Skills、Subagent、plan 模式全部保留——不止聊天，真正交付。Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE，一键切换。
+- 📈 **你的 context 在复利。** 整文件原样进入上下文——不向量化、不切块、不建检索索引。每一代更强的模型，都是你的助理的免费升级——因为它接手的档案早已在那里，并且越积越厚。八家模型一键切换：Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE——引擎随便换，资产永远是你的。可以复用已有的 Claude 订阅，也可以跑在 DeepSeek、MiMo 这些便宜到忽略不计的国产模型上。
 
-- 🖥️ **实时渲染，多端同步。** Muse 写出的 HTML 报告、Markdown 文档在预览区即写即渲染；会话从桌面无缝接续到手机，支持 PWA 安装与推送通知。
+- 📄 **产出是交付物，不是聊天气泡。** Muse 写 HTML 报告、Markdown 文档，预览区即写即渲染——零插件、零配置。一篇论文变成一页精读，一摞流水变成一份带图表的报告。
+
+- 📱 **口袋里的 agent。** Claude Code 困在终端里；muselab 在电脑上开的任务，出门路上用手机接着指挥——PWA 安装到桌面，长任务跑完锁屏推送叫你。
 
 <p align="center">
   <img src="promo/media/screenshot-desktop.png" height="340"
@@ -26,10 +28,38 @@
 </p>
 <p align="center"><em>桌面三栏布局——档案树、与 Muse 的对话、实时预览；右侧是同一会话在手机上接着聊。</em></p>
 
-## 看效果
+## 一次会话长什么样
 
-🌐 [muselab 介绍页](https://hesorchen.github.io/muselab/promo/) —
-   场景演示、能力一览、对比与 FAQ，快速了解 muselab 能做什么。
+> 「对比这份新体检报告和去年那份，把指标变化做成一页 HTML 趋势报告。」
+
+Muse 在 `health/` 里找到两份 PDF，整文件读入，提出指标，写出带图表的单文件 HTML——右侧预览区直接渲染。你接着补一句：
+
+> 「再结合 `money/` 里的保单，看看这些变化有没有该补的保障缺口。」
+
+这就是交叉：两个领域的档案在同一个 context 里，答案才会指向具体行动。出门路上，手机打开同一个会话，接着聊。
+
+🌐 更多场景演示见 [muselab 介绍页](https://hesorchen.github.io/muselab/promo/)。
+
+## 为什么不直接用 ChatGPT？
+
+| 你现在用的 | 卡在哪 | muselab |
+|---|---|---|
+| ChatGPT / Claude.ai | 文件逐次上传、记忆是黑盒，敏感档案不敢放全 | 档案常驻你的硬盘，全量可读 |
+| Claude Code | 最强的 agent loop——但生在终端、为代码而生 | 同一套 loop，面向生活档案，浏览器 + 手机可用 |
+| RAG 文档问答 | 切块 + 检索，跨文档语义有损 | 整文件进 context，零损耗 |
+
+完整对比（含 Open WebUI / LobeChat / AnythingLLM / claudecodeui 等）见[同类对比](docs/comparison_zh.md)。
+
+## 小心思
+
+- **排队不丢话**——Muse 干活时尽管继续发，服务端 FIFO 队列依次执行
+- **定时任务**——daily / weekly / monthly / once 四种节奏，宕机漏跑自动补跑，结果进铃铛抽屉、推送到手机
+- **会话分叉**——从任意一条消息开分支、改写重跑
+- **重启不断线**——后端重启后，会话与排队中的消息原样恢复
+- **现代文件树**——拖拽上传、搜索、行内重命名、拖进回收站
+- **三主题 × 自选强调色**——亮色 / 暗色 / 护眼，外加 accent 色板
+- **中英双语界面**——一键切换
+- **无构建步骤**——改前端文件，刷新浏览器就生效
 
 ## 安装
 
@@ -91,6 +121,6 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 
 ## 状态
 
-v1.0——首个稳定版。欢迎提交 PR——参见 [CONTRIBUTING.md](CONTRIBUTING.md)。路线图与已知问题见 [GitHub Issues](https://github.com/hesorchen/muselab/issues)。
+v1.0——首个稳定版。如果「context 复利」这个理念打动了你——⭐ 能帮更多人看到它，而你的档案，今天就是最好的开始日。欢迎提交 PR——参见 [CONTRIBUTING.md](CONTRIBUTING.md)。路线图与已知问题见 [GitHub Issues](https://github.com/hesorchen/muselab/issues)。
 
 [MIT](LICENSE)

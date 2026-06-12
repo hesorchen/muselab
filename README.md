@@ -7,25 +7,37 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hesorchen/muselab)
 [![中文](https://img.shields.io/badge/lang-中文-red)](README_zh.md)
 
-**muselab is a self-hosted AI workspace: a private file archive on your own machine,
-plus Muse — a Claude Agent SDK assistant that works directly on it.**
+**muselab is to your life's files what Claude Code is to your codebase.**
 
-Checkup PDFs, budget spreadsheets, family info, asset allocations, career plans —
-Muse reads across all of it to help with the decisions that cut across domains.
-The archive lives on your own disk: no SaaS account, no cloud copy — the only thing
-that ever leaves your machine is the request sent to the model you picked.
+Models get replaced every month. Your context doesn't — it compounds.
+The files you'd never hand to a SaaS — checkup PDFs, budget spreadsheets,
+papers you've read, half-written notes — are exactly what AI should be
+reading. muselab is a self-hosted AI workspace: the archive stays on your
+own disk, and Muse — built on the same agent loop that powers Claude Code —
+works on it directly. The only thing that ever leaves your machine is the
+request sent to the model you picked.
 
-- 🧠 **Whole files, zero loss.** No vectorizing, no chunking, no retrieval index —
-  PDFs, spreadsheets, Markdown and HTML enter the context exactly as written.
-  The richer your material, the better the outcome.
+- 🔐 **Private, so you hold nothing back.** No SaaS account, no cloud copy —
+  which is why health, money and work can finally live in one archive.
+  Muse reads across all of it at once, and gives the kind of advice no
+  single-domain view can produce.
 
-- 🤖 **Claude Agent SDK × eight providers.** MCP tools, Skills, Subagents, plan mode —
-  all carried over. Not just chat, real deliverables. Claude / DeepSeek / GLM /
-  MiniMax / Kimi / Qwen / MiMo / ERNIE — switch in one click.
+- 📈 **Your context compounds.** Whole files enter the context exactly as
+  written — no vectorizing, no chunking, no retrieval index. Every new model
+  generation is a free upgrade to *your* assistant, because the archive it
+  lands on is already there, and growing. Eight providers, one click apart:
+  Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE — swap the
+  engine anytime, the asset stays yours. Reuse the Claude subscription you
+  already pay for, or run on dirt-cheap API models.
 
-- 🖥️ **Live rendering, every device.** HTML reports and Markdown docs render in the
-  preview pane as Muse writes them. Sessions follow you from desktop to phone, with
-  PWA install and push notifications.
+- 📄 **Deliverables, not chat bubbles.** Muse writes HTML reports and
+  Markdown docs that render live in the preview pane as it types — no
+  plugins, no setup. A paper becomes an annotated reading page; a folder
+  of statements becomes a charted report.
+
+- 📱 **An agent in your pocket.** Claude Code lives in a terminal. A muselab
+  task started at your desk can be steered from your phone on the way out —
+  install as a PWA, get a push when a long run finishes.
 
 <p align="center">
   <img src="promo/media/screenshot-desktop.png" height="340"
@@ -36,10 +48,50 @@ that ever leaves your machine is the request sent to the model you picked.
 </p>
 <p align="center"><em>The desktop three-pane layout — archive tree, conversation with Muse, live preview — and the same session picked up on a phone.</em></p>
 
-## See it in action
+## What a session looks like
 
-🌐 [muselab promo page](https://hesorchen.github.io/muselab/promo/) —
-   scene demos, capabilities overview, comparisons & FAQ — a quick look at what muselab can do.
+> "Compare this new checkup PDF with last year's, and turn the changes
+> into a one-page HTML trend report."
+
+Muse greps `health/` for both PDFs, reads them whole, extracts the numbers,
+and writes a single-file HTML report with charts — rendered live in the
+preview pane. Then you follow up:
+
+> "Now check the insurance policies in `money/` — do any of these changes
+> leave a gap?"
+
+That's the crossing: two domains in one context is what turns answers into
+actions. And on your way out, open the same session on your phone and keep
+going.
+
+🌐 More scene demos on the [muselab promo page](https://hesorchen.github.io/muselab/promo/).
+
+## Why not just ChatGPT?
+
+| What you use today | Where it stops | muselab |
+|---|---|---|
+| ChatGPT / Claude.ai | Files re-uploaded per chat, memory is a black box, sensitive archives stay out | The archive lives on your disk, readable in full |
+| Claude Code | The strongest agent loop — but born in a terminal, built for code | The same loop, pointed at your life's files, in a browser and on your phone |
+| RAG document chat | Chunk-and-retrieve loses meaning across documents | Whole files in context, zero loss |
+
+Full comparison (Open WebUI, LobeChat, AnythingLLM, claudecodeui …):
+[How it compares](docs/comparison.md).
+
+## Small things, done right
+
+- **Queue without losing a word** — keep typing while Muse works; a
+  server-side FIFO queue runs each message in turn
+- **Scheduled tasks** — daily / weekly / monthly / once; missed runs catch
+  up after downtime; results land in a bell drawer and push to your phone
+- **Session forking** — branch from any message, rewrite and re-run
+- **Restart recovery** — sessions and queued messages come back exactly as
+  they were
+- **A real file tree** — drag-and-drop upload, search, inline rename,
+  drag-to-trash
+- **Three themes × accent picker** — light / dark / eye-care, with your
+  choice of accent color
+- **Bilingual UI** — English / 中文, one click
+- **No build step** — edit a frontend file, refresh the browser
 
 ## Install
 
@@ -107,7 +159,10 @@ For prerequisites, Docker, dev mode and per-OS detail, see
 
 ## Status
 
-v1.0 — first stable release. PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
-The roadmap and known issues are tracked on [GitHub Issues](https://github.com/hesorchen/muselab/issues).
+v1.0 — first stable release. If compounding context resonates with you,
+a ⭐ helps more people find it — and the best day to start your archive
+is today. PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+The roadmap and known issues are tracked on
+[GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
 [MIT](LICENSE)
