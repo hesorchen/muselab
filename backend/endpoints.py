@@ -350,6 +350,31 @@ OVERRIDES_PATH = Path(__file__).resolve().parent.parent / "provider_overrides.js
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,99}$")
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,39}$")
 
+# Custom-provider env keys must live in this reserved namespace. Without the
+# allowlist, the user-supplied env_key flows straight into .env writes
+# (api_settings._write_env), so a typo'd or malicious value could overwrite
+# MUSELAB_TOKEN, PATH, or another provider's credential.
+_CUSTOM_ENV_KEY_RE = re.compile(r"^MUSELAB_PROVIDER_[A-Z0-9_]{1,64}_API_KEY$")
+
+
+def _allowed_env_keys() -> set[str]:
+    """env keys that are legitimate targets for a provider's api-key write:
+    every built-in catalog key plus anything in the custom namespace."""
+    return {p.env_key for p in CATALOG}
+
+
+def validate_env_key(env_key: str) -> None:
+    """Raise ValueError unless env_key is a built-in provider key or matches
+    the MUSELAB_PROVIDER_*_API_KEY custom namespace."""
+    k = (env_key or "").strip()
+    if k in _allowed_env_keys():
+        return
+    if _CUSTOM_ENV_KEY_RE.match(k):
+        return
+    raise ValueError(
+        "env_key must be a built-in provider key or match "
+        "MUSELAB_PROVIDER_<NAME>_API_KEY")
+
 
 def _builtin_id(p: Provider) -> str:
     """Stable id for a built-in provider, derived from its (code-fixed)
@@ -592,6 +617,10 @@ def upsert_provider(*, pid: str | None, base_url: str, prefix: str,
             pid = f"{base_pid}-{n}"
     if not env_key:
         env_key = "MUSELAB_PROVIDER_" + _slug(base_url).upper().replace("-", "_") + "_API_KEY"
+    # User-supplied env_key flows into .env writes (api_settings._write_env) —
+    # without this gate a crafted value could overwrite MUSELAB_TOKEN, PATH,
+    # or another provider's credential.
+    validate_env_key(env_key)
     entry = {
         "base_url": base_url.strip(),
         "prefix": prefix.strip(),

@@ -4496,7 +4496,11 @@ function portal() {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          body: JSON.stringify({ text: item.text || "", image_ids }),
+          // Snapshot the CURRENT permission mode with the item — the server
+          // drain replays the turn under this mode (fixes queued messages
+          // bypassing tool approval the UI said was required).
+          body: JSON.stringify({ text: item.text || "", image_ids,
+                                 permission: this.permission || "" }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -10096,6 +10100,13 @@ function portal() {
       this.csvData = null;
       this.previewError = null;
       this.previewMode = "loading";
+      // Late-response guard: every fetch below is awaited with no token, so
+      // rapid A→B clicks could let A's slower response land AFTER B's and
+      // overwrite the visible preview with the wrong file's content. Capture
+      // the target now; `_stale()` checks it after every await — a stale
+      // response is silently dropped (B's own open owns the pane).
+      const targetPath = n.path;
+      const _stale = () => this.selected !== targetPath;
       const ext = name.split(".").pop().toLowerCase();
       if (["md", "markdown"].includes(ext)) {
         // Stay in "loading" until content actually arrives — renderMd() flips
@@ -10103,14 +10114,16 @@ function portal() {
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
+        if (_stale()) return;
         if (r.ok) {
-          this.rawText = await r.text();
+          const body = await r.text();
+          if (_stale()) return;
+          this.rawText = body;
           // For large markdown the synchronous markdown-it + sanitize pass can
           // block the main thread long enough to make the click feel frozen
           // ("点开即卡"). Paint the loading spinner first, then render on the
           // next animation frame. The `selected` guard aborts the deferred
           // render if the user switched tabs while it was pending.
-          const targetPath = n.path;
           const renderMd = () => {
             if (this.selected !== targetPath) return;   // switched away mid-defer
             this.renderedMd = this.mdRender(this.rawText);
@@ -10143,8 +10156,10 @@ function portal() {
         // evaluation; cells show the last-cached value.
         const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
                               { headers: this.hdr() });
+        if (_stale()) return;
         if (r.ok) {
           const data = await r.json();
+          if (_stale()) return;
           this.previewMode = "xlsx";
           this.xlsxSheets = data.sheets || [];
           this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
@@ -10165,6 +10180,7 @@ function portal() {
         this.csvPath = n.path;
         this.csvOffset = 0;
         await this.csvLoadPage();
+        if (_stale()) return;
         if (this.csvData) {
           this.previewMode = "csv";
         } else {
@@ -10184,11 +10200,14 @@ function portal() {
         // that the archive-scoped /api/files/read can't reach.
         const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
         const r = await fetch(readUrl, { headers: this.hdr() });
+        if (_stale()) return;
         if (r.ok) {
           // Read body BEFORE flipping previewMode → text, otherwise the
           // empty-file placeholder (previewMode==='text' && !rawText) flashes
           // during the await on a non-empty file.
-          this.rawText = await r.text();
+          const body = await r.text();
+          if (_stale()) return;
+          this.rawText = body;
           this.previewMode = "text";
           this.previewLang = this.hljsLang(n.path);
           if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
@@ -10206,12 +10225,23 @@ function portal() {
     async csvLoadPage() {
       if (!this.csvPath || this.csvLoading) return;
       this.csvLoading = true;
+      // Snapshot the request identity — by the time the response lands the
+      // user may have opened a DIFFERENT csv (openFile resets csvPath) or
+      // paged again. Writing a stale response into csvData would show the
+      // old file / old offset's rows under the new header.
+      const reqPath = this.csvPath;
+      const reqOffset = this.csvOffset;
+      const _csvStale = () =>
+        this.csvPath !== reqPath || this.csvOffset !== reqOffset;
       try {
-        const url = `/api/files/csv?path=${encodeURIComponent(this.csvPath)}`
-                    + `&offset=${this.csvOffset}&limit=${this.csvLimit}`;
+        const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
+                    + `&offset=${reqOffset}&limit=${this.csvLimit}`;
         const r = await fetch(url, { headers: this.hdr() });
+        if (_csvStale()) return;
         if (r.ok) {
-          this.csvData = await r.json();
+          const data = await r.json();
+          if (_csvStale()) return;
+          this.csvData = data;
         } else {
           this.csvData = null;
           this.toast(this.lang === "zh" ? "CSV 解析失败" : "CSV parse failed",
@@ -13289,6 +13319,13 @@ function portal() {
       // back — which is the contract `streamSid` was supposed to enforce
       // all along.
       const sendSid = this.currentId;
+      // Snapshot model/permission alongside sendSid — the attachment-upload
+      // awaits below can span a tab switch, after which this.model /
+      // this.permission belong to the NEWLY focused session. Without the
+      // snapshot, session A's send could fire under session B's model and
+      // permission mode (D4 audit).
+      const sendModel = this.model;
+      const sendPermission = this.permission;
       // Reconnect mode: skip user-input validation + user-msg push.
       // Used by _reconnectActiveTurn() when loadSession discovers an
       // in-flight background turn on the current session — we just want
@@ -13553,8 +13590,10 @@ function portal() {
       // streaming guard will refuse to evict it). When streamSid === currentId
       // (the common case) this is a harmless re-promote of the front entry.
       this._promoteResident(streamSid);
-      streamState.streamingModel = this.model;
-      this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
+      streamState.streamingModel = sendModel;
+      // 锁定 — pending bubble 用它，不跟着 dropdown。只在 streamSid 仍是当前
+      // tab 时写 root 状态，否则只污染后台 tab 的显示。
+      if (streamSid === this.currentId) this.streamingModel = sendModel;
       // Start the wall-clock NOW, at submit-time — not later in es.onopen.
       // The previous setup waited for the SSE handshake (which can take
       // 1-3s on slow networks / cold backends) before the counter began
@@ -13607,32 +13646,54 @@ function portal() {
       // one-time ticket, open the SSE with ONLY the ticket in the URL.
       // Keeps the user's prompt and the auth token out of access logs /
       // browser history (EventSource can't send headers or a body).
-      // Falls back to the legacy query-param URL if the ticket POST
-      // fails (old backend / transient error) so sending never breaks.
+      // Legacy query-param fallback ONLY when the endpoint doesn't exist
+      // (old backend → 404/405). A 5xx or network blip must NOT silently
+      // downgrade to putting the prompt + token back into the URL — retry
+      // the ticket once, then surface the failure instead.
       let url;
-      try {
+      const _mintTicket = async () => {
         const tr = await fetch("/api/chat/stream/start", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
           body: JSON.stringify({
             prompt: text,
             session_id: streamSid,
-            model: this.model,
-            permission: this.permission,
+            model: sendModel,
+            permission: sendPermission,
             image_ids: attachIds.length ? attachIds.join(",") : "",
           }),
         });
-        if (!tr.ok) throw new Error("ticket " + tr.status);
-        const td = await tr.json();
-        url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
-      } catch (_) {
-        url = "/api/chat/stream"
-          + "?prompt=" + encodeURIComponent(text)
-          + "&session_id=" + encodeURIComponent(streamSid)
-          + "&model=" + encodeURIComponent(this.model)
-          + "&permission=" + encodeURIComponent(this.permission)
-          + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-          + "&token=" + encodeURIComponent(this.token);
+        return tr;
+      };
+      try {
+        let tr = await _mintTicket();
+        if (tr.status === 404 || tr.status === 405) {
+          // Old backend without /stream/start — legacy URL is the contract.
+          url = "/api/chat/stream"
+            + "?prompt=" + encodeURIComponent(text)
+            + "&session_id=" + encodeURIComponent(streamSid)
+            + "&model=" + encodeURIComponent(sendModel)
+            + "&permission=" + encodeURIComponent(sendPermission)
+            + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+            + "&token=" + encodeURIComponent(this.token);
+        } else {
+          if (!tr.ok) {
+            // Transient 5xx — one retry before giving up.
+            tr = await _mintTicket();
+          }
+          if (!tr.ok) throw new Error("ticket " + tr.status);
+          const td = await tr.json();
+          url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+        }
+      } catch (_e) {
+        // Could not mint a ticket (server error / network) — fail the send
+        // visibly rather than leaking prompt+token into the URL.
+        this._markDone(streamSid);
+        this.toast(this.lang === "zh"
+          ? "发送失败：无法建立流式连接，请重试"
+          : "Send failed: could not start the stream — please retry",
+          "error", 4000);
+        return;
       }
       const es = new EventSource(url);
       streamState.es = es; this.es = es;
@@ -13688,7 +13749,7 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
-      const modelForBubble = this.model;
+      const modelForBubble = sendModel;
       // Scroll only if the active tab is the one receiving the stream;
       // otherwise we'd yank the user away from whatever they're reading.
       const _scrollIfActive = () => {
@@ -14152,6 +14213,18 @@ function portal() {
             { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact(streamSid, { skipConfirm: true }) },
           );
         }
+        // SDK-level turn failure (max turns / budget / permission denied /
+        // API error) arrives as a NORMAL done event with is_error=true —
+        // previously rendered identically to success. Surface it.
+        if (d.is_error) {
+          const _detail = (Array.isArray(d.errors) && d.errors.length)
+            ? d.errors.join("; ")
+            : (d.result_subtype || "unknown");
+          this.toast(this.lang === "zh"
+            ? "本轮回复出错：" + _detail
+            : "Turn failed: " + _detail, "error", 6000);
+          if (curBubble) curBubble.error = _detail;
+        }
         // Pass the backend's `cancelled` flag through to _markDone so it
         // can skip the green-dot unread cue for user-cancelled turns.
         // The on-screen `done` handler runs only when the FE is still
@@ -14298,9 +14371,20 @@ function portal() {
         // bubble that never resolves.
         const delay = 800 * Math.pow(2, attempts - 1);
         setTimeout(async () => {
-          // User switched tabs / cancelled / page already navigated away?
-          // Don't surprise them by re-opening a stream they no longer want.
-          if (this.currentId !== streamSid) { _markDone(); _stopTimer(); this.streaming = false; return; }
+          // User switched to another tab mid-backoff. The ORIGIN tab's turn
+          // is still running on the server — don't _markDone() it (that
+          // abandons the transparent reconnect AND, via `this.streaming`,
+          // wrongly unlocks/locks the CURRENT tab's composer which belongs
+          // to a different session). Keep tabState[streamSid].streaming
+          // true; when the user switches back, loadSession's
+          // _checkActiveTurn(streamSid) re-attaches (or loads the finished
+          // reply from disk). Only the timer is stopped — it writes
+          // root-level streamElapsed which is now another tab's display.
+          if (this.currentId !== streamSid) {
+            _stopTimer();
+            streamState._reconnectAttempts = 0;
+            return;
+          }
           // streamState.streaming is still true from initial send(); use
           // it as the in-flight gate _checkActiveTurn checks internally.
           try {

@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,13 @@ class SettingsIn(BaseModel):
     provider_disabled: dict[str, bool] | None = None
 
 
+# Serializes the whole read-merge-replace cycle below. The os.replace alone
+# is atomic, but two concurrent writers (e.g. two browser tabs saving
+# different settings) would each read the same baseline and the second
+# replace would silently drop the first writer's keys.
+_ENV_WRITE_LOCK = threading.Lock()
+
+
 def _write_env(updates: dict[str, str]) -> None:
     """Atomically merge updates into .env. Keys with empty-string value get
     written as `KEY=` (allowed); to actually remove a key, pass None and we
@@ -131,53 +139,54 @@ def _write_env(updates: dict[str, str]) -> None:
         k: (v if v is None else v.replace("\r", "").replace("\n", ""))
         for k, v in updates.items()
     }
-    lines: list[str] = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+    with _ENV_WRITE_LOCK:
+        lines: list[str] = []
+        if ENV_PATH.exists():
+            lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
 
-    out: list[str] = []
-    written: set[str] = set()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            out.append(line)
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in updates:
-            new_v = updates[key]
-            if new_v is None:
-                # drop line entirely
+        out: list[str] = []
+        written: set[str] = set()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                out.append(line)
                 continue
-            out.append(f"{key}={new_v}")
-            written.add(key)
-        else:
-            out.append(line)
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                new_v = updates[key]
+                if new_v is None:
+                    # drop line entirely
+                    continue
+                out.append(f"{key}={new_v}")
+                written.add(key)
+            else:
+                out.append(line)
 
-    # Append new keys not seen above.
-    for k, v in updates.items():
-        if v is None or k in written:
-            continue
-        out.append(f"{k}={v}")
+        # Append new keys not seen above.
+        for k, v in updates.items():
+            if v is None or k in written:
+                continue
+            out.append(f"{k}={v}")
 
-    # Atomic write via temp + rename.
-    fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(ENV_PATH.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("\n".join(out).rstrip("\n") + "\n")
-        os.replace(tmp, ENV_PATH)
-    except Exception:
+        # Atomic write via temp + rename.
+        fd, tmp = tempfile.mkstemp(prefix=".env.", dir=str(ENV_PATH.parent))
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(out).rstrip("\n") + "\n")
+            os.replace(tmp, ENV_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
-    # Refresh in-process env so the change takes effect immediately.
-    for k, v in updates.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
+        # Refresh in-process env so the change takes effect immediately.
+        for k, v in updates.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # Single source of truth for setting defaults — keys = env var name, values

@@ -32,6 +32,7 @@ from claude_agent_sdk import (
     tag_session as sdk_tag_session,
     fork_session as sdk_fork_session,
 )
+from claude_agent_sdk.types import PermissionMode
 from .auth import require_token_query, require_token, require_token_header_or_query
 from .settings import ROOT, MODEL, atomic_write_text, env_float, env_int, is_chinese_locale
 from . import sessions as sess
@@ -41,6 +42,29 @@ from .ask_user_question import (
     unregister_session_queue, submit_answer,
 )
 from . import permission_request as perm
+
+# Valid permission modes, derived from the SDK's PermissionMode literal so
+# the whitelist tracks SDK upgrades automatically. External strings (query
+# params, queue items, tickets) flow into ClaudeAgentOptions / client
+# .set_permission_mode() — a typo'd or stale value would fail the SDK
+# connect (or worse, silently diverge UI state from the real gate), so
+# entry points must normalize through _validate_permission().
+_VALID_PERMISSION_MODES: frozenset = frozenset(get_args(PermissionMode))
+
+
+def _validate_permission(permission: str) -> str:
+    """Return `permission` if it's a valid SDK PermissionMode, else raise
+    HTTPException(400). Empty string falls back to bypassPermissions (the
+    historical default for callers that never sent the param)."""
+    p = (permission or "").strip()
+    if not p:
+        return "bypassPermissions"
+    if p not in _VALID_PERMISSION_MODES:
+        raise HTTPException(
+            400, f"invalid permission mode: {p!r} "
+                 f"(expected one of {sorted(_VALID_PERMISSION_MODES)})")
+    return p
+
 
 # Serialises CLAUDE_CONFIG_DIR overrides. The SDK's get_session_messages()
 # has no explicit config-dir parameter — it reads the PROCESS-GLOBAL
@@ -2872,16 +2896,26 @@ def export_session_markdown(sid: str) -> Response:
                     headers=headers)
 
 
-@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
-async def delete_session_api(sid: str) -> dict:
-    await disconnect_client(sid)
-    # SDK delete first (removes CLI JSONL); then muselab sidecar.
+def purge_session_storage(sid: str) -> bool:
+    """Remove EVERY per-session artifact: SDK JSONL, muselab sidecar/index/
+    queue, attachments dir, and in-memory state. Returns True if any layer
+    existed (SDK transcript OR sidecar) — callers treat that as "the session
+    was real and is now gone".
+
+    Shared by the HTTP delete endpoint and the scheduler's reuse-mode task
+    cascade so both delete the same set of artifacts. Deliberately tolerant:
+    a session may exist in only ONE layer (SDK-only when the sidecar was
+    lost; sidecar-only when the session never streamed), and local cleanup
+    (attachments / usage / active-turn sidecar) runs regardless so nothing
+    is orphaned by a partial state."""
+    removed = False
     try:
         sdk_delete_session(sid, directory=str(ROOT))
+        removed = True
     except (FileNotFoundError, ValueError):
         pass   # JSONL never existed (session never streamed) — that's fine
-    if not sess.delete_session(sid):
-        raise HTTPException(404, "session not found")
+    if sess.delete_session(sid):
+        removed = True
     # Sweep per-session attachments dir (uploaded image full-res originals
     # persisted by upload-image → send pipeline). Without this, deleting
     # a session would orphan its image files on disk forever.
@@ -2898,6 +2932,18 @@ async def delete_session_api(sid: str) -> dict:
     _session_usage.pop(sid, None)
     _interrupted_at_startup.pop(sid, None)
     _delete_active_turn_sidecar(sid)
+    return removed
+
+
+@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
+async def delete_session_api(sid: str) -> dict:
+    await disconnect_client(sid)
+    # 404 only when NEITHER layer existed. Previously the sidecar was
+    # authoritative: an SDK-only session (sidecar lost / never written) got
+    # its JSONL deleted and THEN returned 404 — the user saw a failure while
+    # the transcript was already gone, and local cleanup was skipped.
+    if not purge_session_storage(sid):
+        raise HTTPException(404, "session not found")
     return {"ok": True}
 
 
@@ -2913,6 +2959,10 @@ async def delete_session_api(sid: str) -> dict:
 class QueueEnqueueReq(BaseModel):
     text: str = ""
     image_ids: str = ""
+    # Sender's permission mode at enqueue time. Persisted with the item so
+    # the headless drain replays the turn under the same mode instead of
+    # falling back to the server default (see _maybe_drain_queue).
+    permission: str = ""
 
 
 class QueuePauseReq(BaseModel):
@@ -2957,7 +3007,12 @@ def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
     text = (req.text or "").strip()
     if not text and not (req.image_ids or "").strip():
         raise HTTPException(400, "empty message")
-    res = sess.enqueue_message(sid, text, req.image_ids or "")
+    # Validate at enqueue so a bad mode is a visible 400 NOW, not a silent
+    # headless failure when the drain replays the item later.
+    if (req.permission or "").strip():
+        _validate_permission(req.permission)
+    res = sess.enqueue_message(sid, text, req.image_ids or "",
+                               permission=req.permission or "")
     if not res.get("ok"):
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
@@ -5143,6 +5198,10 @@ _IMAGE_ONLY_PLACEHOLDER = "(image)"
 _STREAM_TICKETS: dict[str, tuple[float, dict]] = {}
 _STREAM_TICKET_TTL_S = 60.0
 _STREAM_TICKETS_MAX = 64
+# stream_start is a SYNC route (runs in Starlette's threadpool) while the
+# redeeming GET /stream is async (event-loop thread) — mint and redeem touch
+# the dict from different threads, so all access goes through this lock.
+_STREAM_TICKETS_LOCK = threading.Lock()
 
 
 class StreamStartReq(BaseModel):
@@ -5158,20 +5217,24 @@ def stream_start(req: StreamStartReq) -> dict:
     """Mint a one-time ticket for GET /stream. Auth via header; the prompt
     travels in the POST body instead of the SSE URL."""
     import secrets as _secrets
+    # Reject malformed permission at mint time (400 with a clear message)
+    # instead of letting it fail deep inside SDK connect during the SSE.
+    permission = _validate_permission(req.permission)
     now = time.time()
-    # Sweep expired tickets (tiny dict; O(n) is fine).
-    for k in [k for k, (exp, _) in _STREAM_TICKETS.items() if exp < now]:
-        _STREAM_TICKETS.pop(k, None)
-    while len(_STREAM_TICKETS) >= _STREAM_TICKETS_MAX:
-        _STREAM_TICKETS.pop(next(iter(_STREAM_TICKETS)), None)
     ticket = _secrets.token_urlsafe(32)
-    _STREAM_TICKETS[ticket] = (now + _STREAM_TICKET_TTL_S, {
-        "prompt": req.prompt,
-        "session_id": req.session_id,
-        "model": req.model,
-        "permission": req.permission,
-        "image_ids": req.image_ids,
-    })
+    with _STREAM_TICKETS_LOCK:
+        # Sweep expired tickets (tiny dict; O(n) is fine).
+        for k in [k for k, (exp, _) in _STREAM_TICKETS.items() if exp < now]:
+            _STREAM_TICKETS.pop(k, None)
+        while len(_STREAM_TICKETS) >= _STREAM_TICKETS_MAX:
+            _STREAM_TICKETS.pop(next(iter(_STREAM_TICKETS)), None)
+        _STREAM_TICKETS[ticket] = (now + _STREAM_TICKET_TTL_S, {
+            "prompt": req.prompt,
+            "session_id": req.session_id,
+            "model": req.model,
+            "permission": permission,
+            "image_ids": req.image_ids,
+        })
     return {"ticket": ticket}
 
 
@@ -5190,7 +5253,8 @@ async def stream(
     # header-authed POST) and supplies the real params. Single-use: popped
     # on first redemption so a leaked URL from a log replay is inert.
     if ticket:
-        entry = _STREAM_TICKETS.pop(ticket, None)
+        with _STREAM_TICKETS_LOCK:
+            entry = _STREAM_TICKETS.pop(ticket, None)
         if entry is None or entry[0] < time.time():
             raise HTTPException(401, "invalid or expired stream ticket")
         params = entry[1]
@@ -5206,6 +5270,9 @@ async def stream(
             raise HTTPException(401, "bad token")
         if not session_id:
             raise HTTPException(422, "session_id required")
+        # Ticketed path already validated at mint; the legacy query-param
+        # path takes a raw external string — same gate.
+        permission = _validate_permission(permission)
     # TTL sweep of the in-memory attachment store on EVERY stream request
     # (not just when this turn carries image_ids). Without this, a user who
     # uploads then never uploads/sends again would leave a 10MB-class base64
@@ -6639,6 +6706,16 @@ async def _start_turn(
                     await asyncio.to_thread(_jc.clean_session, session_id)
                 except Exception as e:
                     sys.stderr.write(f"[chat] jsonl cleanup failed: {e}\n")
+            # SDK reports turn-level failures THROUGH ResultMessage, not as
+            # exceptions: max-turns / budget exceeded, permission denied,
+            # API errors all arrive as a normal ResultMessage with
+            # is_error=True (+ subtype / errors detail). Surface them in the
+            # done payload so the FE can render a failure state — previously
+            # these turns looked identical to successes in UI and history.
+            _is_error = bool(getattr(msg, "is_error", False))
+            _subtype = getattr(msg, "subtype", None)
+            _errors = getattr(msg, "errors", None) or []
+            _api_error_status = getattr(msg, "api_error_status", None)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,
@@ -6648,6 +6725,10 @@ async def _start_turn(
                 # green-dot tab unread badge would be wrong for a user-
                 # cancelled turn — they clicked stop, they know).
                 "cancelled": was_cancelled,
+                "is_error": _is_error,
+                "result_subtype": _subtype,
+                "errors": [str(e) for e in _errors],
+                "api_error_status": _api_error_status,
                 # turn_usage: cumulative (ResultMessage.usage). FE should
                 # prefer session_usage.context_* for window display. Will be
                 # removed once FE is fully migrated.
@@ -6797,6 +6878,17 @@ async def _start_turn(
                     # must pause on these exactly like an exception-path error.
                     if isinstance(ev, dict) and ev.get("event") == "error":
                         turn_errored = True
+                    # SDK-level failures arrive as a NORMAL done event with
+                    # is_error=True (max turns / budget / permission denied /
+                    # API error — see _handle_result_message). Treat them as
+                    # errors too so the queue pauses instead of headlessly
+                    # cascading the next item onto a failing session.
+                    elif isinstance(ev, dict) and ev.get("event") == "done":
+                        try:
+                            if json.loads(ev.get("data") or "{}").get("is_error"):
+                                turn_errored = True
+                        except (ValueError, TypeError):
+                            pass
                     broadcast.publish(ev)
         except asyncio.TimeoutError:
             turn_errored = True
@@ -6910,10 +7002,22 @@ async def _maybe_drain_queue(session_id: str) -> None:
     item = sess.dequeue_message(session_id)
     if item is None:
         return
+    # Replay under the permission mode snapshotted at enqueue time. Items
+    # from before the snapshot existed (or enqueued without one) fail CLOSED
+    # to "default" — requiring tool approval is the safe direction; the old
+    # behavior (falling through to bypassPermissions) let queued messages
+    # skip approval the user's UI said was required.
+    perm = (item.get("permission") or "").strip() or "default"
+    if perm not in _VALID_PERMISSION_MODES:
+        # Headless context — can't 400. An unknown persisted value (pre-
+        # validation enqueue, hand-edited queue file) fails CLOSED to
+        # "default" rather than crashing the drain or reaching the SDK.
+        perm = "default"
     try:
         await _start_turn(
             session_id,
             item.get("text", ""),
+            permission=perm,
             image_ids=item.get("image_ids", ""),
         )
     except _TurnBusy:

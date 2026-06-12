@@ -927,10 +927,16 @@ def get_queue(sid: str) -> dict:
         return _load_queue(sid)
 
 
-def enqueue_message(sid: str, text: str, image_ids: str = "") -> dict:
+def enqueue_message(sid: str, text: str, image_ids: str = "",
+                    permission: str = "") -> dict:
     """Append a message to the session's queue. Returns
     {'ok': bool, 'item'?: dict, 'queue': dict, 'error'?: str}. Rejects past
-    _QUEUE_MAX (mirrors frontend cap)."""
+    _QUEUE_MAX (mirrors frontend cap).
+
+    `permission` snapshots the sender's permission mode at enqueue time so
+    the headless drain starts the turn under the SAME mode the user had
+    selected — without it, drained turns silently fell back to the server
+    default (bypassPermissions), skipping tool approval the user expected."""
     with _QUEUE_LOCK:
         data = _load_queue(sid)
         if len(data["items"]) >= _QUEUE_MAX:
@@ -939,6 +945,7 @@ def enqueue_message(sid: str, text: str, image_ids: str = "") -> dict:
             "id": "q-" + uuid.uuid4().hex[:8],
             "text": text or "",
             "image_ids": image_ids or "",
+            "permission": permission or "",
             "enqueued_at": int(time.time() * 1000),
         }
         data["items"].append(item)

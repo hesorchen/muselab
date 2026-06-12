@@ -31,6 +31,15 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 # ============================================================
 TRASH_DIR_NAME = ".muselab-dustbin"
 
+# Serializes every "check destination then rename into place" sequence
+# (upload finalize / rename / trash-restore). Each of those does an
+# exists() probe followed by a rename() — two concurrent requests against
+# the same destination could both pass the probe and the later rename
+# silently clobbers the earlier file (TOCTOU). One process-wide lock is
+# enough: the guarded section is pure metadata ops (exists + rename),
+# microseconds each — slow streaming IO stays OUTSIDE the lock.
+_DEST_WRITE_LOCK = threading.Lock()
+
 
 def _trash_dir() -> Path:
     return ROOT / TRASH_DIR_NAME
@@ -685,14 +694,18 @@ def raw_file(path: str = Query(...)) -> FileResponse:
     if suffix in SANDBOXED_INLINE_SUFFIX:
         # CSP relaxed enough for academic HTML reports (MathJax / KaTeX / highlight.js
         # from CDN, inline <script>window.MathJax = {...}</script> config blocks).
-        # The iframe `sandbox="allow-scripts"` attribute (set in frontend/index.html)
-        # still puts JS in a unique opaque origin: it cannot read MUSELAB_TOKEN, cannot
-        # fetch /api/* (CORS blocks), cannot use cookies. The CSP `sandbox` directive
-        # is intentionally omitted — iframe's sandbox attribute is the source of truth.
+        # The server-side `sandbox allow-scripts` DIRECTIVE puts JS in a unique
+        # opaque origin even when the file is opened TOP-LEVEL (URL pasted into
+        # the address bar): scripts still run, but cannot act as our origin —
+        # /api/* fetches become cross-origin (CORS-blocked), cookies/storage
+        # are unavailable, so the query token can't be replayed against the API.
+        # Previously only the frontend iframe's sandbox attribute provided this
+        # isolation, which a top-level open silently bypassed.
         return FileResponse(target, headers={
             **base_headers,
             "Content-Disposition": f"inline; {disp_filename}",
             "Content-Security-Policy": (
+                "sandbox allow-scripts; "
                 "default-src 'none'; "
                 "script-src 'self' 'unsafe-inline' https:; "
                 "style-src 'self' 'unsafe-inline' https:; "
@@ -823,16 +836,23 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
         # upload fully streamed to tmp, so a failed/aborted upload never
         # destroys the existing file. A name colliding with a directory can't
         # be auto-resolved → 409.
-        trashed = None
-        if dest.exists():
-            if dest.is_dir():
-                tmp_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"a directory named {safe_name!r} already exists here",
-                )
-            trashed = await asyncio.to_thread(_move_to_trash, dest)
-        await asyncio.to_thread(tmp_path.rename, dest)
+        # The check + trash + rename runs as ONE unit under _DEST_WRITE_LOCK
+        # in a thread (lock is sync; never hold it on the event loop). Two
+        # concurrent same-name uploads previously both passed exists() and
+        # the later rename clobbered the earlier file with no trash entry.
+        def _finalize():
+            with _DEST_WRITE_LOCK:
+                trashed = None
+                if dest.exists():
+                    if dest.is_dir():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"a directory named {safe_name!r} already exists here",
+                        )
+                    trashed = _move_to_trash(dest)
+                tmp_path.rename(dest)
+                return trashed
+        trashed = await asyncio.to_thread(_finalize)
     except HTTPException:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -934,13 +954,17 @@ def trash_restore(req: TrashIdReq) -> dict:
     # because the user already had this file in-place before deletion;
     # blocking restore would leave their data stranded in trash.
     orig = safe_resolve(orig_rel, allow_sensitive=True)
-    if orig.exists():
-        raise HTTPException(
-            status_code=409,
-            detail="original path is occupied; rename or clear it first",
-        )
-    orig.parent.mkdir(parents=True, exist_ok=True)
-    payload.rename(orig)
+    # Atomic check+rename — same TOCTOU shape as /rename: a concurrent
+    # write landing at `orig` between the probe and the rename would be
+    # silently replaced by the restored payload.
+    with _DEST_WRITE_LOCK:
+        if orig.exists():
+            raise HTTPException(
+                status_code=409,
+                detail="original path is occupied; rename or clear it first",
+            )
+        orig.parent.mkdir(parents=True, exist_ok=True)
+        payload.rename(orig)
     mf = _trash_dir() / f"{req.trash_id}.json"
     if mf.exists():
         try:
@@ -999,12 +1023,16 @@ def rename(req: RenameReq) -> dict:
     dst = safe_resolve(req.dst)
     _guard_not_trash(src)
     _guard_not_trash(dst)
-    if not src.exists():
-        raise HTTPException(status_code=404, detail="source not found")
-    if dst.exists():
-        raise HTTPException(status_code=409, detail="destination already exists")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
+    # Atomic check+rename under the destination lock — without it, two
+    # concurrent renames onto the same dst both pass the exists() probe
+    # and the later rename silently replaces the earlier file (TOCTOU).
+    with _DEST_WRITE_LOCK:
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="source not found")
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="destination already exists")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
     return {"ok": True, "path": str(dst.relative_to(ROOT))}
 
 
