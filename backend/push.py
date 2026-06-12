@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import threading
+import time
 
 from .settings import ROOT, atomic_write_text
 
@@ -191,7 +192,7 @@ def add_subscription(sub: dict) -> None:
         _save_subs()
 
 
-def add_subscription_capped(sub: dict, max_subs: int) -> None:
+def add_subscription_capped(sub: dict, max_subs: int, *, ua: str = "") -> None:
     """add_subscription with an atomic cap check.
 
     The cap check + insert must happen under a single lock acquisition,
@@ -199,16 +200,33 @@ def add_subscription_capped(sub: dict, max_subs: int) -> None:
     both pass, and the file grows past the cap. Re-subscribing an
     existing endpoint (same device, e.g. a tab re-subscribing on focus)
     is always allowed — it's an update, not growth. Raises ValueError
-    on a missing endpoint, RuntimeError when the cap is exceeded."""
+    on a missing endpoint, RuntimeError when the cap is exceeded.
+
+    Diagnostic metadata rides along in the stored record (NOT sent to the
+    push service — send_to_all strips to endpoint+keys):
+      created_at — first time this endpoint was seen (preserved on
+                   re-subscribe, so it dates the device, not the tab)
+      updated_at — last re-subscribe
+      ua         — User-Agent at last subscribe, to tell devices apart.
+    Motivated by the 2026-06-12 zombie-subscription hunt: push_subs.json
+    held 3 dead iPhone-PWA subs and there was NO way to tell which entry
+    was which device or how stale it was."""
     endpoint = sub.get("endpoint")
     if not endpoint:
         raise ValueError("subscription missing endpoint")
+    now = time.time()
     with _subs_lock:
         _load_subs()
         if endpoint not in _subs and len(_subs) >= max_subs:
             raise RuntimeError(
                 f"too many subscriptions (cap {max_subs}); "
                 f"unsubscribe an older device first")
+        prev = _subs.get(endpoint) or {}
+        sub = dict(sub)
+        sub["created_at"] = prev.get("created_at") or now
+        sub["updated_at"] = now
+        if ua:
+            sub["ua"] = ua[:200]
         _subs[endpoint] = sub
         _save_subs()
 
@@ -230,10 +248,22 @@ def list_subscriptions() -> list[dict]:
 
 
 def send_to_all(title: str, body: str, *, url: str = "/",
-                 tag: str = "muselab-task") -> dict:
+                 tag: str = "muselab-task", force: bool = False,
+                 context: str = "") -> dict:
     """Fire a push payload at every subscription. Dead subs (410/404
     from the push service) are dropped from the store. Returns
-    {sent, dropped, errors}."""
+    {sent, dropped, errors}.
+
+    force   — payload flag for sw.js: show the notification even when a
+              muselab window is visible on the device. Used by the
+              settings-page "send test push" button, where suppressing
+              the notification on the very device that pressed the
+              button would make the feature look broken.
+    context — short label for the result log line (e.g. "turn-done
+              abc123"), so the journal shows WHICH event produced which
+              fan-out. The 2026-06-12 debugging session had to correlate
+              task timestamps against presence heartbeats by hand
+              precisely because nothing here logged."""
     from pywebpush import webpush, WebPushException
     from py_vapid import Vapid
 
@@ -250,7 +280,8 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     if _vapid_obj is None or _vapid_obj[0] != pem:
         _vapid_obj = (pem, Vapid.from_pem(pem.encode("ascii")))
     vapid_obj = _vapid_obj[1]
-    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag})
+    payload = json.dumps({"title": title, "body": body, "url": url,
+                          "tag": tag, "force": bool(force)})
     # Snapshot the current subs under the lock, then run the (slow, network)
     # fan-out WITHOUT holding it so subscribe/unsubscribe stay responsive.
     # Dead-sub removals are collected and applied back under the lock at the
@@ -264,7 +295,10 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     for endpoint, sub in targets:
         try:
             webpush(
-                subscription_info=sub,
+                # Strip diagnostic metadata (created_at / updated_at / ua) —
+                # the push service only understands endpoint + keys.
+                subscription_info={"endpoint": sub["endpoint"],
+                                   "keys": sub.get("keys", {})},
                 data=payload,
                 vapid_private_key=vapid_obj,
                 # subject: py_vapid enforces this MUST be `mailto:<email>`
@@ -306,7 +340,14 @@ def send_to_all(title: str, body: str, *, url: str = "/",
             for endpoint in dropped:
                 _subs.pop(endpoint, None)
             _save_subs()
-    return {"sent": sent, "dropped": len(dropped), "errors": errors}
+    result = {"sent": sent, "dropped": len(dropped), "errors": errors}
+    # One journal line per fan-out — the only place the outcome is visible.
+    # Callers historically discarded this dict, which made "did the push
+    # even go out?" unanswerable from logs.
+    sys.stderr.write(
+        f"[push] {context or tag}: sent={sent} dropped={len(dropped)}"
+        + (f" errors={errors}" if errors else "") + "\n")
+    return result
 
 
 def init() -> None:

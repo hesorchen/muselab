@@ -4429,7 +4429,8 @@ async def stop_background_task(sid: str, task_id: str) -> dict:
 
     After the CLI acks, it emits a task_notification with status='stopped'
     on the message stream, which flows through the normal settle paths
-    (_on_task_settled → card flip + unpin + presence-gated push), so this
+    (_on_task_settled → card flip + unpin; no push — task settlement is
+    deliberately notification-free, see _on_task_settled), so this
     endpoint needs no settlement logic of its own."""
     async with _lock:
         targets = [(k, c) for k, c in _clients.items() if k[0] == sid]
@@ -5411,59 +5412,28 @@ def _on_task_settled(
 
     Every observer path (in-turn typed / in-turn XML fallback / cross-turn
     watcher typed / cross-turn watcher XML fallback) funnels through here, so
-    settlement side-effects live in exactly one place:
+    settlement side-effects live in exactly one place: dedup + unpin via
+    _settle_background_task (returns False when the other path already won —
+    caller must then NOT surface the event).
 
-      1. dedup + unpin via _settle_background_task (returns False when the
-         other path already won — caller must then NOT surface the event);
-      2. presence-gated Web Push, so a user who is AWAY from every device
-         hears about the completion. This reinstates the push that was
-         removed on 2026-06-03 — the removal rationale ("the completion
-         surfaces as a live continuation turn") only holds when someone is
-         watching; the presence gate covers exactly the complement. A user
-         at any screen gets the in-app card flip / SSE event, no push.
-
-    Push body carries NO task summary — same lock-screen privacy rule as the
-    turn-done push (a personal-archive task summary can contain health/money
-    details). Fire-and-forget: push failure never blocks the stream.
+    Push history of this hook (it keeps flip-flopping; record BOTH rationales
+    so the next change is made knowingly):
+      - 2026-06-03 removed: "completion surfaces as a live continuation turn"
+      - 2026-06-12 reinstated, presence-gated: that rationale only holds when
+        someone is watching
+      - 2026-06-12 removed again (user decision, same day): a task settling is
+        not worth a buzz even when away — its OUTPUT generally feeds the next
+        turn; the turn-done push (chat.py _handle_result_message) is the one
+        notification the user wants, and queue-paused-on-error still pushes
+        because that one means "Muse is stuck waiting for YOU".
+    `status` stays in the signature: callers still report it, and it documents
+    the terminal kinds should the push ever come back.
     """
     settled = _settle_background_task(session_id, task_id)
     if not settled:
         return False
-
-    async def _go():
-        try:
-            from . import presence as _presence
-            if _presence.recently_active():
-                return   # user is at a screen — in-app surfacing suffices
-            from . import push as _push
-            sname = ""
-            try:
-                for s in sess.list_sessions():
-                    if s.get("id") == session_id:
-                        sname = s.get("name", "")
-                        break
-            except Exception:
-                pass
-            body = {
-                "completed": "后台任务已完成",
-                "failed": "后台任务失败",
-                "stopped": "后台任务已停止",
-            }.get(status or "", "后台任务已结束")
-            await asyncio.to_thread(
-                _push.send_to_all,
-                title=sname or "muselab",
-                body=body,
-                url=f"/?session={session_id}",
-                tag=f"task-{task_id}",
-            )
-        except Exception as e:
-            sys.stderr.write(
-                f"[chat] task-settled push failed sid={session_id} "
-                f"task={task_id}: {e}\n")
-    try:
-        asyncio.create_task(_go())
-    except RuntimeError:
-        pass   # no running loop (only in exotic teardown paths)
+    # NO push here — see docstring. `status` intentionally unused.
+    _ = status
     return True
 
 
@@ -6776,8 +6746,16 @@ async def _start_turn(
                 from . import presence as _presence
                 if _presence.recently_active():
                     # User is at one of their devices — they'll see the
-                    # reply in-app. Skip the push fan-out entirely.
-                    pass
+                    # reply in-app. Skip the push fan-out entirely. Log it:
+                    # a silently-skipped push is indistinguishable from a
+                    # broken pipeline without this line (2026-06-12 lesson).
+                    # None-safe: see task-settled site — age can be None
+                    # even when recently_active() returned True.
+                    _age = _presence.last_seen_age()
+                    _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                    sys.stderr.write(
+                        f"[push] turn-done skipped (presence "
+                        f"age={_age_s}) sid={session_id}\n")
                 else:
                     try:
                         from . import push as _push
@@ -6808,6 +6786,7 @@ async def _start_turn(
                             body=_body,
                             url=f"/?session={session_id}",
                             tag=f"turn-{session_id}",
+                            context=f"turn-done {session_id[:8]}",
                         )
                     except Exception as e:
                         sys.stderr.write(f"[chat] turn push failed: {e}\n")
@@ -7078,6 +7057,13 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
         try:
             from . import presence as _presence
             if _presence.recently_active():
+                # None-safe: see task-settled site — age can be None
+                # even when recently_active() returned True.
+                _age = _presence.last_seen_age()
+                _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                sys.stderr.write(
+                    f"[push] queue-paused skipped (presence "
+                    f"age={_age_s}) sid={session_id}\n")
                 return
             from . import push as _push
             sname = ""
@@ -7094,6 +7080,7 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
                 body="队列已暂停（上一条出错），点开查看",
                 url=f"/?session={session_id}",
                 tag=f"queue-paused-{session_id}",
+                context=f"queue-paused {session_id[:8]}",
             )
         except Exception as e:
             sys.stderr.write(f"[chat] queue-paused push failed: {e}\n")

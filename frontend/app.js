@@ -1642,24 +1642,57 @@ function portal() {
     // visibility-change to "visible" (so coming back into focus
     // re-arms the suppression before the next push could fire).
     _startPresence() {
+      // Stable per-device id — only used by the backend to keep one
+      // presence record per device (so the phone reporting "hidden"
+      // doesn't clobber the desktop's "visible"). Random UUID, no auth
+      // meaning. localStorage can throw in private-browsing modes;
+      // fall back to a per-page id (degrades to v1-ish behavior).
+      let deviceId = "";
+      try {
+        deviceId = localStorage.getItem("muselab_device_id") || "";
+        if (!deviceId) {
+          deviceId = (crypto.randomUUID && crypto.randomUUID())
+            || (Date.now().toString(36) + Math.random().toString(36).slice(2));
+          localStorage.setItem("muselab_device_id", deviceId);
+        }
+      } catch (_) {
+        deviceId = "ephemeral-" + Math.random().toString(36).slice(2);
+      }
+      const report = (visible) => {
+        try {
+          fetch("/api/presence", {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ device_id: deviceId, visible }),
+            // The hidden report races the browser freezing this page on
+            // background-switch; keepalive lets it complete after the
+            // page is gone (sendBeacon can't carry our auth header).
+            keepalive: !visible,
+          }).catch(() => {});   // silent — presence is best-effort
+        } catch (_) { /* ignore */ }
+      };
       const ping = () => {
         if (typeof document === "undefined") return;
         if (document.visibilityState !== "visible") return;
-        try {
-          fetch("/api/presence", { method: "POST", headers: this.hdr() })
-            .catch(() => {});   // silent — presence is best-effort
-        } catch (_) { /* ignore */ }
+        report(true);
       };
       // Fire once on init so we don't wait up to 15s for the first ping.
       ping();
       if (this._presenceTimer) clearInterval(this._presenceTimer);
       this._presenceTimer = setInterval(ping, 15_000);
-      // Tab returning to foreground → ping immediately. Without this, a
-      // user who just opened the laptop after a 5-minute lunch break
-      // might still get a phone push for a turn that finishes in the
-      // first 15s of being back.
       document.addEventListener("visibilitychange", async () => {
-        if (document.visibilityState !== "visible") return;
+        if (document.visibilityState !== "visible") {
+          // Page just hid → tell the backend IMMEDIATELY so the next
+          // turn-done push isn't swallowed by a still-warm heartbeat.
+          // (Pre-2026-06-12 the backend could only wait out the 30s
+          // grace window — any turn finishing inside it never pushed.)
+          report(false);
+          return;
+        }
+        // Tab returning to foreground → ping immediately. Without this, a
+        // user who just opened the laptop after a 5-minute lunch break
+        // might still get a phone push for a turn that finishes in the
+        // first 15s of being back.
         ping();                  // presence: re-arm push suppression
         this._pingHealth();      // health: refresh conn state immediately
         // Refresh the session list in case another device created/deleted
@@ -1669,6 +1702,10 @@ function portal() {
           await this.refreshSessions();
         } catch (_) {}
       });
+      // Belt-and-suspenders for navigations / tab close / iOS PWA kills
+      // where visibilitychange→hidden may not fire. Duplicate reports
+      // are harmless (last-writer-wins on the same device record).
+      window.addEventListener("pagehide", () => report(false));
     },
     async _pingHealth() {
       // Skip when tab is hidden — heartbeat purpose is "show user we're
@@ -15603,9 +15640,55 @@ function portal() {
           "success", 2500);
         return true;
       } catch (e) {
+        let msg = (e.message || String(e));
+        // Chromium-family browsers (Chrome / Edge / most Android vendor
+        // browsers) register push through Google's FCM. When FCM is
+        // unreachable (mainland-China network without a proxy, or a ROM
+        // without Google services), subscribe() throws an AbortError with
+        // the opaque "Registration failed - push service error". Append
+        // an actionable explanation instead of leaving the raw string.
+        if (/push service error|registration failed/i.test(
+              msg + " " + (e.name || ""))) {
+          msg += this.lang === "zh"
+            ? "（此浏览器的推送依赖 Google FCM；当前网络连不上 FCM 时无法订阅——挂代理后重试，或改用 iOS PWA / 桌面浏览器）"
+            : " (this browser registers push via Google FCM; it is unreachable on your current network — retry behind a proxy, or use an iOS PWA / desktop browser)";
+        }
         this.toast((this.lang === "zh" ? "开启失败：" : "Push subscribe failed: ")
-          + (e.message || e), "error", 5000);
+          + msg, "error", 6000);
         return false;
+      }
+    },
+    async pushTest() {
+      // End-to-end self-check: backend fans a force-flagged payload out to
+      // every stored subscription (bypasses the presence gate; sw.js skips
+      // its visibility suppression on `force`). Surfaces the raw
+      // {sent, dropped, errors} so a zombie subscription or a push-service
+      // rejection is visible to the user in 10 seconds instead of a
+      // server-side debugging session (2026-06-12).
+      try {
+        const r = await fetch("/api/push/test",
+          { method: "POST", headers: this.hdr() });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const d = await r.json();
+        const errs = (d.errors || []).length;
+        const zh = this.lang === "zh";
+        if (!d.sent && !errs) {
+          this.toast(zh
+            ? "没有任何已订阅设备——先打开上面的通知开关"
+            : "No subscribed devices — enable the switch above first",
+            "warn", 4000);
+          return;
+        }
+        this.toast((zh
+          ? `测试推送已发：${d.sent} 成功`
+            + (d.dropped ? `，清除 ${d.dropped} 条失效订阅` : "")
+          : `Test push sent: ${d.sent} ok`
+            + (d.dropped ? `, ${d.dropped} dead dropped` : ""))
+          + (errs ? (zh ? `，${errs} 个错误` : `, ${errs} errors`) : ""),
+          errs ? "warn" : "success", 4000);
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "测试推送失败：" : "Test push failed: ")
+          + (e.message || e), "error", 4000);
       }
     },
     async pushUnsubscribe() {

@@ -3730,6 +3730,15 @@
                x-text="lang==='zh'
                  ? '覆盖普通会话回复完成 + 定时任务完成。前台震动 + 后台推送通知；正在使用 muselab 时不打扰。iOS 需把 muselab 添加到主屏（PWA）才能在后台收推送。'
                  : 'Covers chat replies AND scheduled tasks. Foreground vibration + background Web Push; suppressed while you are actively using muselab. iOS requires adding muselab to home screen (PWA) for background push.'"></div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '推送链路自检' : 'Push self-check'"></label>
+            <button class="btn-ghost sm" @click="pushTest()"
+                    x-text="lang==='zh' ? '发送测试推送' : 'Send test push'"></button>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '向所有已订阅设备各发一条测试通知，无视「正在使用时不打扰」。设备没收到说明该设备的订阅已失效——在对应设备上把开关关掉重开即可重新订阅。'
+                 : 'Sends one test notification to every subscribed device, ignoring the do-not-disturb-while-active rule. A device that stays silent has a stale subscription — toggle the switch off and on again on that device to re-subscribe.'"></div>
         </div>
 
         <div class="settings-section" data-page="skills"
