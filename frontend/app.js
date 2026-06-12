@@ -1157,6 +1157,14 @@ function portal() {
             // when a fresh window is spawned).
             const id = ev.data && ev.data.id;
             if (id) this._openSessionFromDeeplink(id);
+          } else if (t === "muselab/push-suppressed") {
+            // The SW swallowed a push because a window is visible — but
+            // the underlying event (scheduler run done, queue paused, …)
+            // still happened server-side. Refresh the unread badge and
+            // session list so the in-app state reflects it without
+            // waiting for the next heartbeat tick.
+            this.fetchSchedulerUnread();
+            this.refreshSessions();
           }
         });
       }
@@ -15597,10 +15605,29 @@ function portal() {
         const r = await fetch("/api/push/vapid-public", { headers: this.hdr() });
         if (!r.ok) throw new Error("vapid fetch failed: " + r.status);
         const { public_key } = await r.json();
-        const sub = await reg.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: this._urlsafeB64ToBytes(public_key),
-        });
+        // Reuse an existing subscription when one is already registered —
+        // calling subscribe() again with a (different) key on Chrome throws
+        // InvalidStateError, breaking the "toggle on again" path. If the
+        // existing subscription was minted under a DIFFERENT VAPID key
+        // (server rotated), drop it first so the fresh subscribe succeeds.
+        let sub = await reg.pushManager.getSubscription();
+        if (sub) {
+          const wantKey = this._urlsafeB64ToBytes(public_key);
+          const haveKey = sub.options && sub.options.applicationServerKey
+            ? new Uint8Array(sub.options.applicationServerKey) : null;
+          const sameKey = haveKey && haveKey.length === wantKey.length
+            && haveKey.every((b, i) => b === wantKey[i]);
+          if (!sameKey) {
+            try { await sub.unsubscribe(); } catch (_) {}
+            sub = null;
+          }
+        }
+        if (!sub) {
+          sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: this._urlsafeB64ToBytes(public_key),
+          });
+        }
         const sr = await fetch("/api/push/subscribe", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
@@ -15665,15 +15692,16 @@ function portal() {
     },
     async openSchedTaskSession(t) {
       // Jump straight to the muselab session bound to this scheduled
-      // task. Use openTab — NOT activateTab — because the bound session
-      // may not be in openTabIds yet (user hasn't manually opened it).
-      // activateTab only switches currentId; without push to openTabIds
-      // the tab strip wouldn't show this session and the user would see
-      // messages with no visible tab label.
+      // task. Route through the deeplink helper — NOT a bare openTab —
+      // because an old bound session may sit outside the windowed
+      // `sessions` list (and a since-deleted one shouldn't open at all):
+      // the helper force-pulls it by id and keeps the phantom-tab guard,
+      // while a direct openTab(sid) would mint a ghost tab with no name
+      // and no messages.
       this.closeScheduler();
       const sid = (t && t.session_id) || t;
       if (!sid) return;
-      await this.openTab(sid);
+      await this._openSessionFromDeeplink(sid);
     },
     fmtSchedTime(ts) {
       if (!ts) return "—";
