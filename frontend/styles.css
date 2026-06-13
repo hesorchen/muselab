@@ -1550,6 +1550,21 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 .filelist-sticky-root .icon { display: inline-flex; color: var(--c-accent); flex-shrink: 0; }
 .filelist-sticky-root .path { overflow: hidden; text-overflow: ellipsis; }
+/* Root-level quick actions (new file / new folder), right-aligned in the
+   sticky root bar. Always visible but muted — the bar has no hover-reveal
+   convention (unlike tree rows) and touch devices have no hover at all. */
+.root-actions {
+  display: inline-flex; align-items: center; gap: 2px;
+  margin-left: auto; flex-shrink: 0;
+}
+.root-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0;
+  border: none; border-radius: 4px;
+  background: transparent; color: var(--c-fg-3);
+  cursor: pointer;
+}
+.root-action:hover { background: var(--c-bg-3); color: var(--c-fg-1); }
 /* Drop target highlight — drag a tree node / OS file onto the root bar to
    move / upload it to the archive root. Mirrors `li.drag-over` (accent fill
    + inset ring) so the affordance reads the same as dropping onto a node. */
@@ -4987,6 +5002,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-decoration: none;
 }
 .subagent-task-open:hover { text-decoration: underline; }
+.subagent-task-stop {
+  color: var(--c-danger, #d33); cursor: pointer; white-space: nowrap;
+  text-decoration: none;
+}
+.subagent-task-stop:hover { text-decoration: underline; }
 
 /* Background-task status pill for non-subagent tool cards (Bash
    run_in_background). The .tool card is a compact one-liner, so this sits
@@ -5007,6 +5027,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-decoration: none;
 }
 .tool-task-open:hover { text-decoration: underline; }
+.tool-task-stop {
+  color: var(--c-danger, #d33); cursor: pointer; white-space: nowrap;
+  text-decoration: none;
+}
+.tool-task-stop:hover { text-decoration: underline; }
 
 /* ===== ExitPlanMode plan card ===== */
 .plan-card {

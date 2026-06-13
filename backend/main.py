@@ -7,7 +7,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import Depends, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from .auth import require_token
 from fastapi.responses import HTMLResponse
@@ -593,13 +593,21 @@ def health() -> dict:
 
 
 @app.post("/api/presence", dependencies=[Depends(require_token)])
-def presence_heartbeat() -> dict:
-    """Frontend pings this every ~15s while the page is `visible`. We
-    record a single shared "last_seen" timestamp and use it in
-    chat.py's turn-done push gate to skip pushes when any device is
-    actively at the screen. See backend/presence.py for the rationale."""
+def presence_heartbeat(payload: dict | None = Body(default=None)) -> dict:
+    """Frontend visibility reports. Body (optional, JSON):
+      device_id — stable per-device UUID minted by the frontend into
+                  localStorage; only used to tell devices apart
+      visible   — true on init / 15s keep-alive / refocus,
+                  false the moment the page hides (the "I left" signal
+                  that lets the push gate fire without waiting out the
+                  grace window)
+    No body → legacy v1 client → treated as visible on the shared
+    "default" device. Gate logic lives in backend/presence.py."""
     from . import presence as _presence
-    _presence.mark_seen()
+    p = payload if isinstance(payload, dict) else {}
+    device_id = str(p.get("device_id") or "default")[:64]
+    visible = bool(p.get("visible", True))
+    _presence.mark_seen(device_id, visible)
     age = _presence.last_seen_age()
     return {"ok": True, "last_seen_age_sec": age, "grace_sec": _presence.GRACE_SECONDS}
 

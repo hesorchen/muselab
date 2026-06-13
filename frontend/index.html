@@ -381,6 +381,24 @@
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
           <span class="path" x-text="contextInfo.archive_root || '—'"></span>
+          <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
+               "+" and ctx menu use — both already handle path:'' (root), so
+               these are pure entry points, no new write paths. @click.stop
+               keeps the bar's drag/drop handlers out of the click. -->
+          <span class="root-actions">
+            <button class="root-action" type="button"
+                    @click.stop="doNewFile({ path: '', is_dir: true })"
+                    :title="lang==='zh' ? '在根目录新建文件' : 'New file at root'"
+                    aria-label="New file at root">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-plus"/></svg>
+            </button>
+            <button class="root-action" type="button"
+                    @click.stop="doNewDir({ path: '', is_dir: true })"
+                    :title="lang==='zh' ? '在根目录新建目录' : 'New folder at root'"
+                    aria-label="New folder at root">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-folder-plus"/></svg>
+            </button>
+          </span>
         </div>
       <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())"
           @mousedown="onMarqueeStart($event)">
@@ -1753,6 +1771,14 @@
                            x-show="m.task_status.output_file"
                            @click.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
+                        <!-- Stop button — only while running. Backed by the
+                             SDK-native stop_task control request; the card
+                             flips to ⏹ when the CLI's status='stopped'
+                             notification round-trips the settle path. -->
+                        <a class="subagent-task-stop" href="#"
+                           x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
+                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </div>
                     </template>
                   </div>
@@ -1865,6 +1891,13 @@
                            x-show="m.task_status.output_file"
                            @click.prevent="openTaskOutput(m.task_status)"
                            x-text="t('subagent.open_result')"></a>
+                        <!-- Stop button — same contract as the subagent
+                             card's: visible only while running, settles via
+                             the CLI's status='stopped' notification. -->
+                        <a class="tool-task-stop" href="#"
+                           x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
+                           @click.prevent="stopBackgroundTask(m.task_status)"
+                           x-text="'⏹ ' + t('subagent.stop_task')"></a>
                       </span>
                     </template>
                   </div>
@@ -3697,6 +3730,15 @@
                x-text="lang==='zh'
                  ? '覆盖普通会话回复完成 + 定时任务完成。前台震动 + 后台推送通知；正在使用 muselab 时不打扰。iOS 需把 muselab 添加到主屏（PWA）才能在后台收推送。'
                  : 'Covers chat replies AND scheduled tasks. Foreground vibration + background Web Push; suppressed while you are actively using muselab. iOS requires adding muselab to home screen (PWA) for background push.'"></div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '推送链路自检' : 'Push self-check'"></label>
+            <button class="btn-ghost sm" @click="pushTest()"
+                    x-text="lang==='zh' ? '发送测试推送' : 'Send test push'"></button>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '向所有已订阅设备各发一条测试通知，无视「正在使用时不打扰」。设备没收到说明该设备的订阅已失效——在对应设备上把开关关掉重开即可重新订阅。'
+                 : 'Sends one test notification to every subscribed device, ignoring the do-not-disturb-while-active rule. A device that stays silent has a stale subscription — toggle the switch off and on again on that device to re-subscribe.'"></div>
         </div>
 
         <div class="settings-section" data-page="skills"
@@ -4125,7 +4167,10 @@
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
       <div class="modal-body">
-        <div x-text="modal.body"></div>
+        <!-- x-show: an empty body still rendered an empty <div> whose line
+             box left a blank band above the input (visible in prompts that
+             pass body:""). -->
+        <div x-show="modal.body" x-text="modal.body"></div>
         <input x-show="modal.input !== null" x-model="modal.input"
                :placeholder="modal.placeholder || ''"
                x-ref="modalInput" @keydown.enter="modal.confirm?.()" />

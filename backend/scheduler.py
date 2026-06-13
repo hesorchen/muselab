@@ -745,8 +745,16 @@ async def _execute_task(task: dict) -> None:
                 from . import presence as _presence
                 if _presence.recently_active():
                     # User is at their screen — UI badge + foreground vibrate
-                    # handle the notification. Don't double-buzz.
-                    pass
+                    # handle the notification. Don't double-buzz. Leave a
+                    # journal line so a "scheduler never pushes" report can
+                    # be told apart from an actual delivery failure.
+                    # None-safe: a device can flip to hidden between
+                    # recently_active() and this call (see chat.py sites).
+                    _age = _presence.last_seen_age()
+                    _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                    sys.stderr.write(
+                        f"[push] sched skipped (presence "
+                        f"age={_age_s}) task={tid}\n")
                 else:
                     from . import push as _push
                     # Prefix with ⏰ so the notification banner is universally
@@ -768,7 +776,8 @@ async def _execute_task(task: dict) -> None:
                     # the scheduler fans out task notifications.
                     await asyncio.to_thread(
                         _push.send_to_all, title=title, body=body or "—",
-                        url="/", tag=f"task-{tid}")
+                        url="/", tag=f"task-{tid}",
+                        context=f"sched {tid}")
             except Exception as e:
                 sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 

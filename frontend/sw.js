@@ -45,26 +45,32 @@ self.addEventListener("push", (event) => {
   // multi-device (desktop SSE alive => phone push suppressed too).
   // Moving the decision client-side fixes that.
   event.waitUntil((async () => {
-    try {
-      const clients = await self.clients.matchAll({
-        type: "window",
-        includeUncontrolled: true,
-      });
-      const anyVisible = clients.some(c => c.visibilityState === "visible");
-      if (anyVisible) {
-        // Foreground client renders the reply itself — but it may not know
-        // about it yet (e.g. a scheduler run finishing in the background
-        // server-side). Tell every client to refresh unread/history state
-        // so the bell badge stays live instead of silently swallowing the
-        // event with no in-app trace.
-        for (const c of clients) {
-          try { c.postMessage({ type: "muselab/push-suppressed", url, tag }); } catch (_) {}
+    // `force` payloads (settings-page test push) skip the visibility
+    // check entirely — the user pressing "send test push" necessarily
+    // has a visible muselab window, and suppressing the test on that
+    // very device would make the diagnostic look broken.
+    if (!data.force) {
+      try {
+        const clients = await self.clients.matchAll({
+          type: "window",
+          includeUncontrolled: true,
+        });
+        const anyVisible = clients.some(c => c.visibilityState === "visible");
+        if (anyVisible) {
+          // Foreground client renders the reply itself — but it may not know
+          // about it yet (e.g. a scheduler run finishing in the background
+          // server-side). Tell every client to refresh unread/history state
+          // so the bell badge stays live instead of silently swallowing the
+          // event with no in-app trace.
+          for (const c of clients) {
+            try { c.postMessage({ type: "muselab/push-suppressed", url, tag }); } catch (_) {}
+          }
+          return;
         }
-        return;
+      } catch (_) {
+        // matchAll failure (rare) — fall through and show, so we err on
+        // the side of NOT silently dropping notifications.
       }
-    } catch (_) {
-      // matchAll failure (rare) — fall through and show, so we err on
-      // the side of NOT silently dropping notifications.
     }
     return self.registration.showNotification(title, opts);
   })());
