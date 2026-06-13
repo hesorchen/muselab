@@ -2528,6 +2528,32 @@ pre.text {
   transition: opacity var(--t-base);
 }
 .session-picker-show-more:hover { opacity: 1; }
+/* Footer bulk-clear button — danger-tinted, sticks to the bottom of the list,
+   muted by default so it never competes with normal row clicks; reveals its
+   danger color only on hover. */
+.session-picker-footer {
+  border-top: 1px solid var(--c-border);
+  padding: 4px;
+  /* Pinned to the bottom of the scroll viewport (symmetric with the sticky
+     search bar at top) so the clear action is always reachable without
+     scrolling to the end of a long session list. */
+  position: sticky; bottom: 0;
+  background: var(--c-bg-1);
+  z-index: 1;
+}
+.session-picker-clear-old {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; padding: 6px 8px;
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  background: none; border: none; border-radius: 6px;
+  cursor: pointer; text-align: left;
+  transition: background var(--t-base), color var(--t-base);
+}
+.session-picker-clear-old:hover {
+  color: var(--c-danger);
+  background: var(--c-danger-soft);
+}
+.session-picker-clear-old svg { flex-shrink: 0; }
 .session-picker-row.open:not(.active) {
   /* Visual marker so users can tell which sessions are already open as tabs. */
   background: var(--c-bg-2);

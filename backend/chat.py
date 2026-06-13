@@ -2966,6 +2966,52 @@ async def delete_session_api(sid: str) -> dict:
     return {"ok": True}
 
 
+class PurgeOldReq(BaseModel):
+    # Sessions whose last activity is older than `days` are deleted.
+    days: int = 7
+    # The caller's currently-open session — always exempt regardless of age,
+    # so a bulk-clear never yanks the tab the user is staring at.
+    keep_id: str = ""
+    # When True, count the victims and return WITHOUT deleting anything. The
+    # frontend uses this to show an exact "will delete N" in the confirm
+    # dialog — it can't count locally because its session list is only the
+    # most-recent paginated window (older sessions aren't loaded client-side).
+    dry_run: bool = False
+
+
+@router.post("/sessions/purge-old", dependencies=[Depends(require_token)])
+async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
+    """Bulk-delete history sessions whose last activity is older than `days`
+    days (default 7). Pinned sessions and `keep_id` are always exempt — pin is
+    the user's explicit "keep this" signal, and deleting the currently-open
+    session out from under them is jarring. Reuses purge_session_storage so
+    every deleted session is cleaned to the same depth (SDK JSONL + sidecar +
+    index + queue + attachments + in-memory state) as the single DELETE.
+
+    The server is the source of truth for the victim set: it scans the FULL
+    session list (list_sessions), not the paginated recent window the frontend
+    holds. `dry_run=true` returns the count + ids without touching anything."""
+    days = max(1, int((req.days if req else 7) or 7))
+    keep_id = (req.keep_id if req else "") or ""
+    dry_run = bool(req.dry_run if req else False)
+    cutoff = time.time() - days * 86400
+    victims = [
+        s["id"] for s in sess.list_sessions()
+        if not s.get("pinned")
+        and s["id"] != keep_id
+        and float(s.get("updated_at") or 0) < cutoff
+    ]
+    if dry_run:
+        return {"ok": True, "dry_run": True, "count": len(victims),
+                "ids": victims, "days": days}
+    deleted: list[str] = []
+    for sid in victims:
+        await disconnect_client(sid)
+        if purge_session_storage(sid):
+            deleted.append(sid)
+    return {"ok": True, "deleted": len(deleted), "ids": deleted, "days": days}
+
+
 # --------------------------------------------------------------------------
 # Server-side message queue (Option B "服务端自主执行").
 #

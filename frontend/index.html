@@ -1262,6 +1262,21 @@
             </template>
             <div x-show="filteredSessions().length === 0" class="session-picker-empty"
                  x-text="lang==='zh' ? (sessionPickerSearch ? '没有匹配' : '暂无会话') : (sessionPickerSearch ? 'No match' : 'No sessions')"></div>
+            <!-- Footer: one-click bulk-clear of stale history. Sits at the very
+                 bottom of the list so it's out of the way of normal row clicks.
+                 Hidden during a search (the visible set is filtered, so the
+                 count would mislead). Deletes only sessions older than 7 days;
+                 pinned + currently-open are always kept (see purgeOldSessions). -->
+            <div class="session-picker-footer" x-show="!sessionPickerSearch && filteredSessions().length > 0">
+              <button class="session-picker-clear-old"
+                      @click.stop="purgeOldSessions()"
+                      :title="lang==='zh' ? '删除 7 天前的会话（置顶和当前会话保留）' : 'Delete sessions older than 7 days (pinned & current kept)'">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>
+                </svg>
+                <span x-text="lang==='zh' ? '清理 7 天前的会话' : 'Clear sessions older than 7 days'"></span>
+              </button>
+            </div>
           </div>
         </div>
         <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
@@ -2806,13 +2821,14 @@
               <span class="chat-toolbar-rl-text" x-text="rlBadge ? rlBadge.text : ''"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
-            <!-- Send / Stop. While `_sendWaitingForUpload` is true (rare:
-                 user hit send while a slow attachment upload is still in
-                 flight) the button stays in "send" form but is disabled —
-                 the auto-wait inside sendMessage resolves within 30 s and
-                 the click effectively becomes synchronous from the user's
-                 POV. Without this disabling, double-tap could queue two
-                 sends for the same upload. -->
+            <!-- Send / Stop. The button is disabled while ANY attachment is
+                 still mid-upload (pendingImages/pendingDocs .uploading) — the
+                 user cannot fire a turn until every image/doc finishes, so a
+                 half-uploaded attachment can never be sent. `_sendWaitingForUpload`
+                 stays as a belt-and-suspenders guard for the resumed-queue path
+                 (drained item whose snapshot is still uploading), where the
+                 auto-wait inside sendMessage polls to completion. Together they
+                 also stop a double-tap from queueing two sends for one upload. -->
             <!-- Send button — always visible. send() routes the click:
                  idle → fire SSE; streaming/compacting → enqueue onto
                  tabState[currentId].pendingQueue. A small badge in the
@@ -2822,7 +2838,7 @@
                  shows while streaming. Same shape + size + fill — they
                  read as a sibling pair (blue send / red stop). -->
             <button @click="send()"
-                    :disabled="!availableModels.length || _sendWaitingForUpload || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="!availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
                     :title="streaming ? t('queue.button_hint') : t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>

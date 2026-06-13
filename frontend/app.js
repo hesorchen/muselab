@@ -7061,6 +7061,90 @@ function portal() {
       this.savePrefs();
     },
 
+    // One-click bulk clear of stale history (footer of the session picker).
+    // Deletes every session whose last activity is older than 7 days, EXCEPT
+    // pinned ones and the currently-open session.
+    //
+    // The victim count CANNOT be computed client-side: this.sessions is only
+    // the most-recent paginated window (?limit=100), so old sessions — the
+    // very ones we want to clear — aren't loaded here. We ask the server
+    // (which scans the full list) for the count via dry_run, show it in the
+    // confirm dialog, then issue the real delete. The server stays the single
+    // source of truth for the victim set; the same days/keep_id predicate runs
+    // both passes so the count the user approved matches what gets deleted.
+    async purgeOldSessions() {
+      const zh = this.lang === "zh";
+      const DAYS = 7;
+      const body = { days: DAYS, keep_id: this.currentId || "" };
+      // Close the picker popup first — its z-index (1500) sits ABOVE the global
+      // confirm modal, so leaving it open would bury the confirm dialog behind
+      // the session list. The popup has done its job once the action fires.
+      this.sessionPickerOpen = false;
+      // 1) Ask the server how many would be deleted (no mutation).
+      let preview;
+      try {
+        const r = await fetch("/api/chat/sessions/purge-old", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ ...body, dry_run: true }),
+        });
+        if (!r.ok) { this.errToast("purge-old", await r.text()); return; }
+        preview = await r.json();
+      } catch (e) {
+        this.errToast("purge-old", String((e && e.message) || e));
+        return;
+      }
+      const n = (preview && preview.count) || 0;
+      if (n === 0) {
+        this.toast(zh ? "没有 7 天前的会话可清理" : "No sessions older than 7 days", "info", 2500);
+        return;
+      }
+      // 2) Confirm with the server-authoritative count.
+      const ok = await this.confirm({
+        title: zh ? "清理历史会话" : "Clear old sessions",
+        body: zh
+          ? `将删除 ${n} 个 7 天前的会话，不可恢复。置顶会话和当前会话会保留。`
+          : `Delete ${n} session(s) older than 7 days? This cannot be undone. Pinned sessions and the current session are kept.`,
+        okText: zh ? `删除 ${n} 个` : `Delete ${n}`,
+        danger: true,
+      });
+      if (!ok) return;
+      // 3) Real delete.
+      let resp;
+      try {
+        const r = await fetch("/api/chat/sessions/purge-old", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) { this.errToast("purge-old", await r.text()); return; }
+        resp = await r.json();
+      } catch (e) {
+        this.errToast("purge-old", String((e && e.message) || e));
+        return;
+      }
+      // Tear down any open tabs / live streams for the deleted ids — mirror
+      // deleteSessionById's per-tab cleanup so we don't leak EventSources or
+      // leave phantom tabs pointing at gone sessions. ids come back from the
+      // server (it knows exactly what it removed, including rows we never had
+      // loaded locally).
+      const deletedIds = new Set((resp && resp.ids) || []);
+      for (const sid of deletedIds) {
+        const st = this.tabState[sid];
+        if (st) {
+          if (st.es) { try { st.es.close(); } catch {} }
+          if (st._streamTimer) clearInterval(st._streamTimer);
+          delete this.tabState[sid];
+        }
+        this._clearSessionWarnFlags(sid);
+      }
+      this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
+      await this.refreshSessions();
+      this.savePrefs();
+      const cleared = (resp && resp.deleted) || 0;
+      this.toast(zh ? `已清理 ${cleared} 个历史会话` : `Cleared ${cleared} session(s)`, "success", 2500);
+    },
+
     // Right-click context menu on a tab (or a row in the session picker).
     // Also called by the mobile ⋮ kebab button (which uses normal click).
     // We DEFER the actual menu open by one tick — otherwise the click that
