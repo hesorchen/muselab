@@ -100,20 +100,17 @@ jobs:
   macos:
     name: macos (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # macos-13 (Intel) routinely queues for 20+ hours on the free GHA
-    # runner pool — but we don't want to drop Intel coverage entirely.
-    # Flag the Intel matrix entry as best-effort: failure or runner
-    # starvation timeout doesn't cascade into an install-test workflow
-    # failure. macos-14 (Apple Silicon) is the required signal.
-    continue-on-error: ${{ matrix.os == 'macos-13' }}
-    # Cap per-job wall time so install-test as a whole returns in
-    # ~20 min worst case (the default is 360 min = 6h, and stuck
-    # queues can sit on top of that pushing total to 24h).
+    # Apple Silicon (macos-14) is the required signal. macos-13 (Intel) was
+    # dropped: GitHub's free Intel pool routinely queued 20+ hours and hit the
+    # 24h queue ceiling (timeout-minutes only caps execution, not queue), so it
+    # gave no reliable signal while leaving every PR perpetually "unstable".
+    # Intel macOS is end-of-life on GHA anyway.
+    # Cap per-job wall time so install-test returns quickly (default is 6h).
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, macos-14]
+        os: [macos-14]
     env:
       MUSELAB_NONINTERACTIVE: "1"
       MUSELAB_SKIP_SERVICE:   "1"
