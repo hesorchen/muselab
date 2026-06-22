@@ -299,6 +299,17 @@ function portal() {
     ctxExpanded: {},
     editing: false, editText: "",
     cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, mode: "plaintext", dirty: false },
+    // ===== Live markdown preview (split editor) =====
+    // editorIsMd: the file currently in the editor is markdown → the live
+    //   preview pane is available. Non-md files force editorView back to "edit".
+    // editorView: layout while editing an md file — "edit" | "split" | "preview".
+    //   Persisted in localStorage so it survives reloads. Defaults to split.
+    // livePreviewHtml: mdRender() output of the current buffer, recomputed
+    //   (debounced) on every CM change so the right pane tracks edits live.
+    editorIsMd: false,
+    editorView: "split",
+    livePreviewHtml: "",
+    _livePreviewTimer: null,
     tabs: [],   // open file tabs: [{path, name}]
     editorTabPickerOpen: false,  // open-tabs quick-switch dropdown (left tab bar)
     editorTabPickerStyle: "",    // inline fixed-position style, set on open
@@ -1887,7 +1898,27 @@ function portal() {
               dirty: !cm.isClean(cleanGen),
             };
           };
-          cm.on("change", () => refreshStatus(cm.getValue().length));
+          // Char count is the ONLY O(doc) field (cm.getValue().length). Running
+          // it synchronously on every keystroke is the per-key typing lag on
+          // large files. Update the cheap fields (line/col/sel/lines/dirty)
+          // instantly and debounce just the char count so typing stays smooth.
+          let _charTimer = null;
+          const scheduleCharCount = () => {
+            if (_charTimer) clearTimeout(_charTimer);
+            _charTimer = setTimeout(() => {
+              _charTimer = null;
+              refreshStatus(cm.getValue().length);
+            }, 200);
+          };
+          cm.on("change", () => {
+            refreshStatus();        // cheap fields now, cached char count
+            scheduleCharCount();    // O(doc) char count, debounced off hot path
+            // Live markdown preview: keep the right pane in step with edits.
+            // Debounced + cheap-path render inside _scheduleLivePreview so the
+            // heavy mdRender (KaTeX + DOM walk) never runs on the keystroke hot
+            // path. No-op when the file isn't md or the preview pane is hidden.
+            if (this.editorIsMd && this.editorView !== "edit") this._scheduleLivePreview();
+          });
           cm.on("cursorActivity", () => refreshStatus());
           window.__muselab_cm = cm;
           setTimeout(() => { cm.refresh(); refreshStatus(cm.getValue().length); }, 50);
@@ -1915,6 +1946,65 @@ function portal() {
       const host = this.$refs.cmHost;
       if (host) host.innerHTML = "";
       window.__muselab_cm = null;
+    },
+
+    // ===== Live markdown preview (split editor) =====
+    // True if the path looks like markdown — the only file kind that gets the
+    // split live-preview affordance. Other text/code files edit full-width.
+    _isMdPath(p) {
+      if (!p) return false;
+      const lp = p.toLowerCase();
+      return lp.endsWith(".md") || lp.endsWith(".markdown");
+    },
+    // Debounced render of the current editor buffer into livePreviewHtml.
+    // mdRender is heavy (marked + DOMPurify + KaTeX); 200ms after the last
+    // keystroke is responsive without rendering mid-word on every key. Reads
+    // the live CM value when present, else the editText buffer (CM-init-fail
+    // textarea fallback). Re-highlights code blocks once the DOM settles.
+    _scheduleLivePreview() {
+      if (this._livePreviewTimer) clearTimeout(this._livePreviewTimer);
+      this._livePreviewTimer = setTimeout(() => {
+        this._livePreviewTimer = null;
+        this._renderLivePreview();
+      }, 200);
+    },
+    _renderLivePreview() {
+      if (!this.editorIsMd) return;
+      const src = this._cm ? this._cm.getValue() : String(this.editText || "");
+      // Cheap path: marked + DOMPurify only, skipping the KaTeX typeset and
+      // file-path DOM walk (the documented ~300ms costs) so the preview tracks
+      // typing without jank. Math shows as raw $$…$$ until the deferred full
+      // render below typesets it. This is the same trick chat uses mid-stream.
+      this.livePreviewHtml = this._mdRenderUncached(src, { streaming: true });
+      this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
+      // If the doc carries math, do ONE full render (KaTeX) after a longer
+      // idle so equations fill in once the user truly pauses — not on every
+      // keystroke. mdRender is LRU-cached, so a repeat pause is near-free.
+      if (this._mathTimer) clearTimeout(this._mathTimer);
+      if (/\$\$|\\\(|\\\[|\$[^$\n]+\$/.test(src)) {
+        this._mathTimer = setTimeout(() => {
+          this._mathTimer = null;
+          if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
+          const cur = this._cm ? this._cm.getValue() : String(this.editText || "");
+          this.livePreviewHtml = this.mdRender(cur);
+          this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
+        }, 600);
+      }
+    },
+    // View-mode switch (edit | split | preview) for the markdown editor.
+    // No-op for non-md files (editorIsMd false). Persisted so the choice
+    // sticks across files and reloads. Switching INTO a preview-showing mode
+    // renders immediately so the pane isn't blank until the next keystroke.
+    setEditorView(mode) {
+      if (!this.editorIsMd) return;
+      this.editorView = mode;
+      localStorage.setItem("muselab_editor_view", mode);
+      if (mode !== "edit") this._renderLivePreview();
+      // CM needs a refresh after its container width changes (split ↔ full),
+      // otherwise the gutter/cursor positions go stale until the next click.
+      if (mode !== "preview" && this._cm) {
+        this.$nextTick(() => { try { this._cm.refresh(); } catch (e) {} });
+      }
     },
 
     initTheme() {
@@ -10833,22 +10923,18 @@ function portal() {
     // highlighted AND artifacts (mermaid/HTML) are rendered. Most callers
     // fire-and-forget; loadSession awaits it to know when to reveal the view.
     highlightCode(root, scopeEls = null) {
-      if (!window.hljs) {
-        // Lazy-load hljs on first need, then re-call. Without this guard
-        // a chat with no code blocks never pays the 124 KB download cost.
-        // Re-call returns immediately if the root has no <code> children,
-        // and idempotently highlights any blocks that appeared since the
-        // last paint (data-hl="1" sentinel prevents double work).
-        return this._loadHljs().then(() => this.highlightCode(root, scopeEls))
-          .catch(e => console.warn("[muselab] hljs lazy-load failed:", e));
-      }
-      // Snapshot the not-yet-highlighted blocks. We DON'T highlight them all
-      // in one synchronous forEach: on a long history (re)entered cold this
-      // can be 150+ blocks, and hljs auto-detect on big ones takes many ms
-      // each — the sum locked the main thread for seconds and froze the page
-      // on boot. Instead process in small batches, yielding to the event loop
-      // between them so the UI stays responsive (a brief flash of
-      // unhighlighted code is acceptable; a frozen page is not).
+      // Collect the not-yet-highlighted BLOCK code FIRST, before touching hljs.
+      // Inline `code` spans are never syntax-highlighted (see _highlightOne),
+      // so collecting them just to early-return wastes a full-body
+      // querySelectorAll + per-node walk on every highlight pass (warm tab
+      // switches re-run this over a long body).
+      //
+      // Doing the collection before the hljs guard means a preview/chat with
+      // ZERO fenced blocks (e.g. a prose-only markdown file) pays neither the
+      // 124 KB hljs download nor a highlight pass — it goes straight to
+      // runArtifacts and returns. Previously the unconditional `if (!hljs)`
+      // guard fetched + parsed hljs on the FIRST preview open regardless of
+      // content, which is exactly the kind of cold-load freeze we're killing.
       //
       // scopeEls (optional): when the caller knows the new content is confined
       // to a freshly-inserted subtree (e.g. a "Load earlier" batch prepended
@@ -10856,19 +10942,18 @@ function portal() {
       // only within them — O(new blocks) instead of rescanning the whole chat
       // body's O(total blocks) each click. The data-hl sentinel still makes a
       // too-broad scope merely redundant, never wrong.
-      // Only collect BLOCK code (<pre><code>). Inline `code` spans are never
-      // syntax-highlighted (see _highlightOne), so collecting them just to
-      // early-return wastes a full-body querySelectorAll + per-node walk on
-      // every highlight pass (warm tab switches re-run this over a long body).
       const nodes = scopeEls
         ? this._collectCodeNodes(scopeEls, "pre code").filter(el => el.dataset.hl !== "1")
         : Array.from(document.querySelectorAll(root + " pre code"))
             .filter(el => el.dataset.hl !== "1");
       const runArtifacts = () => {
-        // After hljs finishes, scan for Artifact-eligible code blocks (mermaid
-        // diagrams, HTML previews). Limited to chat messages and markdown
-        // previews — file previews (.text) are raw read-only views where
-        // auto-rendering embedded HTML / running Mermaid would be unexpected.
+        // Scan for Artifact-eligible code blocks (mermaid diagrams, HTML
+        // previews). Limited to chat messages and markdown previews — file
+        // previews (.text) are raw read-only views where auto-rendering
+        // embedded HTML / running Mermaid would be unexpected. Note: mermaid
+        // / html blocks ARE <pre><code> nodes, so when present they're already
+        // in `nodes` above and hljs loads via the guard below; a no-block root
+        // still scans here (cheap querySelectorAll, no vendor load).
         if (root === ".chat-body" || root === ".markdown") {
           return this._renderArtifacts(root, scopeEls).catch(e =>
             console.warn("[muselab] artifacts render failed:", e));
@@ -10876,6 +10961,20 @@ function portal() {
         return Promise.resolve();
       };
       if (!nodes.length) { return Promise.resolve(runArtifacts()); }
+      if (!window.hljs) {
+        // We have blocks to highlight → NOW lazy-load hljs, then re-call.
+        // The re-call re-collects (cheap) and idempotently highlights any
+        // blocks that appeared since the last paint (data-hl="1" sentinel
+        // prevents double work).
+        return this._loadHljs().then(() => this.highlightCode(root, scopeEls))
+          .catch(e => console.warn("[muselab] hljs lazy-load failed:", e));
+      }
+      // We DON'T highlight all blocks in one synchronous forEach: on a long
+      // history (re)entered cold this can be 150+ blocks, and hljs auto-detect
+      // on big ones takes many ms each — the sum locked the main thread for
+      // seconds and froze the page on boot. Process in small batches, yielding
+      // to the event loop between them so the UI stays responsive (a brief
+      // flash of unhighlighted code is acceptable; a frozen page is not).
       const yieldToLoop = window.requestAnimationFrame
         ? (fn) => window.requestAnimationFrame(fn)
         : (fn) => setTimeout(fn, 16);
@@ -11209,28 +11308,51 @@ function portal() {
     _prewarmPreviewLibs() {
       if (this._previewLibsPrewarmed) return;
       this._previewLibsPrewarmed = true;
-      const warm = () => {
+      // Each job below injects + parses a heavy vendor bundle on the main
+      // thread. Firing them all inside ONE idle slice re-creates the freeze
+      // we're trying to avoid: hljs + katex injected back-to-back evaluate in
+      // a tight cluster right when the user opens their first file. Instead
+      // drain the queue ONE job per idle callback, so the browser can service
+      // user interaction between each parse. Order matters — hljs/katex serve
+      // the common read-only markdown preview, so they go first.
+      const queue = [
         // hljs: load the bundle, then force-compile the auto-detect subset
         // with one throwaway pass so the FIRST real highlight is cheap.
-        this._loadHljs().then(() => {
+        () => this._loadHljs().then(() => {
           try { window.hljs && window.hljs.highlightAuto("x", this._hlAutoSubset()); } catch (_) {}
-        }).catch(() => {});
-        // katex: the dominant cost is the script parse at load time,
-        // so simply loading it off the click path is the win.
-        // mermaid is deliberately NOT prewarmed: its 3.3 MB download +
-        // parse costs far more than every other vendor combined, and most
-        // sessions never render a single diagram. _renderArtifacts lazy-
-        // loads it on the first actual ```mermaid block, which is rare
-        // enough that the one-time cold load there is acceptable.
-        this._loadKatex().catch(() => {});
+        }),
+        // katex: the dominant cost is the script parse at load time, so simply
+        // loading it off the click path is the win.
+        () => this._loadKatex(),
+        // mermaid is deliberately NOT prewarmed: its 3.2 MB download + parse
+        // costs far more than every other vendor combined, and most sessions
+        // never render a single diagram. _renderArtifacts lazy-loads it on the
+        // first actual ```mermaid block, which is rare enough that the one-time
+        // cold load there is acceptable.
+        //
+        // CodeMirror (~308 KB, 18 files) is also NOT prewarmed here: it's
+        // editor-only, and read-only preview — the overwhelmingly common path —
+        // never needs it. Bundling it into startup added the biggest chunk to
+        // the idle parse burst. It now warms on edit-button hover/focus instead
+        // (see the toggleEdit button in index.html), so the first click-to-edit
+        // is still near-instant without taxing every preview open.
+      ];
+      const idle = (fn) => {
+        try {
+          if (typeof window !== "undefined" && window.requestIdleCallback) {
+            window.requestIdleCallback(fn, { timeout: 3000 });
+          } else {
+            setTimeout(fn, 300);
+          }
+        } catch (_) { setTimeout(fn, 300); }
       };
-      try {
-        if (typeof window !== "undefined" && window.requestIdleCallback) {
-          window.requestIdleCallback(warm, { timeout: 3000 });
-        } else {
-          setTimeout(warm, 1200);
-        }
-      } catch (_) { setTimeout(warm, 1200); }
+      const drain = () => {
+        const job = queue.shift();
+        if (!job) return;
+        Promise.resolve().then(job).catch(() => {});
+        if (queue.length) idle(drain);
+      };
+      idle(drain);
     },
 
     async _loadHljs() {
@@ -11285,26 +11407,66 @@ function portal() {
     // the user opens edit mode on a file preview. Most read-only browsing
     // never needs it.
     async _loadCodemirror() {
-      return this._loadAssets("_cmLoadPromise", [
-        "/static/vendor/cm/codemirror.min.css",
-        "/static/vendor/cm/theme/material-darker.min.css",
-        "/static/vendor/cm/codemirror.min.js",
-        "/static/vendor/cm/addon/mode/simple.min.js",
-        "/static/vendor/cm/addon/edit/closebrackets.min.js",
-        "/static/vendor/cm/addon/edit/matchbrackets.min.js",
-        "/static/vendor/cm/mode/meta.min.js",
-        "/static/vendor/cm/mode/xml/xml.min.js",
-        "/static/vendor/cm/mode/javascript/javascript.min.js",
-        "/static/vendor/cm/mode/css/css.min.js",
-        "/static/vendor/cm/mode/clike/clike.min.js",
-        "/static/vendor/cm/mode/htmlmixed/htmlmixed.min.js",
-        "/static/vendor/cm/mode/markdown/markdown.min.js",
-        "/static/vendor/cm/mode/python/python.min.js",
-        "/static/vendor/cm/mode/yaml/yaml.min.js",
-        "/static/vendor/cm/mode/shell/shell.min.js",
-        "/static/vendor/cm/mode/go/go.min.js",
-        "/static/vendor/cm/mode/rust/rust.min.js",
-      ], () => window.CodeMirror);
+      if (window.CodeMirror) return;
+      if (this._cmLoadPromise) return this._cmLoadPromise;
+      // Inject one asset (css/js), de-duping against an already-present tag.
+      const inject = (src) => new Promise((resolve, reject) => {
+        const sel = src.endsWith(".css")
+          ? `link[href="${src}"]` : `script[src="${src}"]`;
+        if (document.querySelector(sel)) {
+          // Already in flight/loaded from a prior attempt — give it a beat.
+          const t0 = Date.now();
+          (function wait() {
+            if (src.endsWith(".css") || window.CodeMirror) return resolve();
+            if (Date.now() - t0 > 5000) return resolve(); // don't hang the chain
+            setTimeout(wait, 50);
+          })();
+          return;
+        }
+        const node = src.endsWith(".css")
+          ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
+          : Object.assign(document.createElement("script"), { src });
+        node.onload = resolve;
+        node.onerror = () => reject(new Error("load failed: " + src));
+        document.head.appendChild(node);
+      });
+      // Was: 18 files loaded SEQUENTIALLY (one .then chain). Over a remote /
+      // tunneled link each round-trip stacks — first edit-mode entry took
+      // 5-6 s on a high-latency PWA connection. CodeMirror core is the only
+      // hard dependency for the modes/addons (they call CodeMirror.defineMode
+      // at load), so we load core first, then fan the rest out in parallel.
+      // Theme/base CSS have no JS dependency and ride along concurrently. This
+      // collapses ~18 serial RTTs into ~2.
+      this._cmLoadPromise = (async () => {
+        const cssP = Promise.all([
+          inject("/static/vendor/cm/codemirror.min.css"),
+          inject("/static/vendor/cm/theme/material-darker.min.css"),
+        ]);
+        await inject("/static/vendor/cm/codemirror.min.js");
+        if (!window.CodeMirror) throw new Error("CodeMirror core loaded but global missing");
+        await Promise.all([
+          inject("/static/vendor/cm/addon/mode/simple.min.js"),
+          inject("/static/vendor/cm/addon/edit/closebrackets.min.js"),
+          inject("/static/vendor/cm/addon/edit/matchbrackets.min.js"),
+          inject("/static/vendor/cm/mode/meta.min.js"),
+          inject("/static/vendor/cm/mode/xml/xml.min.js"),
+          inject("/static/vendor/cm/mode/javascript/javascript.min.js"),
+          inject("/static/vendor/cm/mode/css/css.min.js"),
+          inject("/static/vendor/cm/mode/clike/clike.min.js"),
+          inject("/static/vendor/cm/mode/htmlmixed/htmlmixed.min.js"),
+          inject("/static/vendor/cm/mode/markdown/markdown.min.js"),
+          inject("/static/vendor/cm/mode/python/python.min.js"),
+          inject("/static/vendor/cm/mode/yaml/yaml.min.js"),
+          inject("/static/vendor/cm/mode/shell/shell.min.js"),
+          inject("/static/vendor/cm/mode/go/go.min.js"),
+          inject("/static/vendor/cm/mode/rust/rust.min.js"),
+          cssP,
+        ]);
+      })().catch(e => {
+        this._cmLoadPromise = null;   // allow retry next call
+        throw e;
+      });
+      return this._cmLoadPromise;
     },
 
     async _loadMermaid() {
@@ -12404,6 +12566,24 @@ function portal() {
         this.rawText = await r.text();
       }
       this.editText = this.rawText;
+      // Live-preview setup: markdown files get the split pane; others edit
+      // full-width (editorView forced to "edit" so the template hides the
+      // preview + view-switch toolbar). For md, restore the persisted layout
+      // choice and seed the preview HTML so it's there on first paint.
+      this.editorIsMd = this._isMdPath(this.selected);
+      if (this.editorIsMd) {
+        const saved = localStorage.getItem("muselab_editor_view");
+        this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
+          ? saved : "split";
+        this.livePreviewHtml = this.editorView !== "edit"
+          ? this.mdRender(this.editText) : "";
+        if (this.editorView !== "edit") {
+          this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
+        }
+      } else {
+        this.editorView = "edit";
+        this.livePreviewHtml = "";
+      }
       this.editing = true;
       // Editing is a deliberate commitment to the file — pin its tab so it
       // doesn't get recycled out from under the editor by the next preview.

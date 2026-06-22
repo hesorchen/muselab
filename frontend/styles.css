@@ -2080,7 +2080,16 @@ body.kb-open .mobile-tab-bar { display: none; }
 /* ==========================================================================
    Preview pane
    ========================================================================== */
-.preview-body { flex: 1; overflow: auto; position: relative; background: var(--c-bg-0); }
+.preview-body {
+  flex: 1; overflow: auto; position: relative; background: var(--c-bg-0);
+  /* macOS/iOS standalone PWA (WebKit): without this, overscrolling past the
+     bottom of the preview rubber-bands this sub-scroller and repaints on every
+     wheel tick → continuous flicker. `none` suppresses both the local bounce
+     and chaining (root html/body already sets it; sub-scrollers need their
+     own). Applies to the read-mode preview; the split editor preview sets the
+     same on .editor-live-preview. */
+  overscroll-behavior: none;
+}
 .preview-body.drag-hover { outline: 2px dashed var(--c-accent); outline-offset: -8px; }
 
 /* Find-in-preview widget — floats top-right over the scrolling content,
@@ -2189,8 +2198,53 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 
 /* ---- CodeMirror host + status bar ---- */
-.editor-wrap { display: flex; flex-direction: column; height: 100%; }
-.editor-cm { flex: 1; min-height: 0; }
+.editor-wrap { display: flex; flex-direction: column; height: 100%; min-width: 0; }
+/* Split body: CodeMirror | live preview, side by side. The toolbar + status
+   bar sit above/below as fixed-height rows; editor-main takes the rest. */
+.editor-main { flex: 1; min-height: 0; display: flex; min-width: 0; overflow: hidden; }
+/* overflow:hidden + min-width:0 give CodeMirror a stable, definite width inside
+   the flex row so it doesn't re-measure/reflow on every keystroke (CM5-in-flex
+   gotcha — without it, typing in the split editor thrashes layout). */
+.editor-cm { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+/* Live markdown preview pane. Scrolls independently of the editor. The .markdown
+   child reuses the global rendered-markdown styles, so output matches the
+   read-only preview exactly. A divider separates it from the editor in split. */
+.editor-live-preview {
+  flex: 1; min-width: 0; min-height: 0; overflow: auto;
+  background: var(--c-bg-0);
+  /* Reserve the scrollbar gutter so the content width never changes when the
+     vertical scrollbar appears/disappears. Without this, scrolling to the
+     bottom of a doc whose height sits right at the overflow threshold makes
+     the scrollbar oscillate on/off (each toggle reflows the text and re-
+     crosses the threshold) — perceived as continuous flicker at the bottom. */
+  scrollbar-gutter: stable;
+  /* `none` (not just `contain`) so the browser's native overscroll effect at
+     the scroll boundary is fully suppressed — `contain` stops scroll chaining
+     but still lets the local rubber-band/glow repaint on every wheel tick when
+     you keep scrolling past the bottom, which shows as continuous flicker. */
+  overscroll-behavior: none;
+}
+.editor-view-split .editor-live-preview {
+  border-left: 1px solid var(--c-border);
+}
+
+/* View-switch toolbar */
+.editor-toolbar {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4); flex-shrink: 0;
+  background: var(--c-bg-1); border-bottom: 1px solid var(--c-border);
+}
+.editor-view-switch { display: inline-flex; border: 1px solid var(--c-border); border-radius: var(--radius-sm); overflow: hidden; }
+.editor-view-switch button {
+  appearance: none; border: 0; cursor: pointer;
+  padding: 3px var(--sp-3); font-size: var(--fs-xs);
+  font-family: var(--font-ui); line-height: 1.6;
+  background: var(--c-bg-0); color: var(--c-fg-3);
+  border-left: 1px solid var(--c-border);
+}
+.editor-view-switch button:first-child { border-left: 0; }
+.editor-view-switch button:hover { color: var(--c-fg-0); background: var(--c-bg-2); }
+.editor-view-switch button.active { background: var(--c-accent); color: var(--c-accent-fg, #fff); }
 .editor-cm .CodeMirror {
   height: 100%; font-family: var(--font-mono);
   font-size: var(--fs-base); line-height: 1.6;
