@@ -85,7 +85,7 @@ Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
-    "pytest-asyncio>=1.3.0",
+    "pytest-asyncio>=1.4.0",
     # Pinned alongside dev deps so `scripts/lint.sh` and CI both have a
     # deterministic ruff version. Without this each dev / CI run pulled
     # latest via `uv run --with ruff`, occasionally causing rule churn.
