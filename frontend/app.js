@@ -1299,6 +1299,21 @@ function portal() {
       setTimeout(lift, 400);
     },
 
+    // Paired teardown for onChatInputFocus. MUST reset --kb-inset alongside
+    // removing .kb-open — otherwise the inset goes stale. Failure chain:
+    // focus → keyboard up → _initMobileKeyboardWatch.update() sets
+    // --kb-inset to e.g. 336px → blur fires, we drop .kb-open but the inset
+    // lingers at 336px → the NEXT focus re-adds .kb-open before update()
+    // re-fires (or on iOS PWA where visualViewport resize is flaky and never
+    // re-fires) → `body.kb-open .layout { height: calc(100dvh - 336px) }`
+    // shrinks the layout with no keyboard present → a big blank band appears
+    // at the bottom of the chat. Zeroing the inset here keeps the two CSS
+    // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
+    onChatInputBlur() {
+      document.body.classList.remove("kb-open");
+      document.documentElement.style.setProperty("--kb-inset", "0px");
+    },
+
     // Triple-click (or any 3+ rapid click) on the chat input selects all
     // text. Browsers natively give us:
     //   single-click → place cursor
@@ -1353,6 +1368,30 @@ function portal() {
       };
       vv.addEventListener("resize", update);
       vv.addEventListener("scroll", update);
+
+      // Event-independent reconciliation. iOS Safari — and standalone PWA in
+      // particular — frequently FAILS to fire vv `resize` when the keyboard
+      // dismisses: focus is retained via Enter-to-send so no blur path runs,
+      // or the event is simply dropped. update() then never re-runs and
+      // --kb-inset is stranded at the last keyboard height with no keyboard
+      // present → `body.kb-open .layout:focus-within` shrinks the layout to
+      // `100dvh - <stale>` → page rides up with a blank band at the bottom
+      // (the recurring bug). Fix: don't rely on the vv event firing. On any
+      // focus change / foregrounding, re-RUN update() — `vv.height` is a live
+      // property, so re-reading it (after a short settle delay for iOS) yields
+      // the true post-keyboard height and the else-branch zeroes the inset.
+      const reconcile = () => { update(); setTimeout(update, 300); };
+      // focusout bubbles (blur does not), so this catches the composer losing
+      // focus regardless of which element it was — including the
+      // Enter-to-send-then-tap-elsewhere path that onChatInputBlur can miss.
+      document.addEventListener("focusout", reconcile);
+      // Returning to the foreground (PWA re-activation / tab switch) can also
+      // surface a stale inset captured before backgrounding.
+      window.addEventListener("focus", reconcile);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) reconcile();
+      });
+
       update();
     },
 

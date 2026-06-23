@@ -2677,7 +2677,7 @@
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
                     @focus="onChatInputFocus($event)"
-                    @blur="document.body.classList.remove('kb-open')"
+                    @blur="onChatInputBlur()"
                     @click="onChatInputClick($event)"
                     :placeholder="t('chat.placeholder')"></textarea>
           </form>
