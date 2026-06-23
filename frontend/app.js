@@ -2400,8 +2400,18 @@ function portal() {
       // bytes (the main bottleneck on 4G).
       const COMPRESS_THRESHOLD = 256 * 1024;
       if (file.size < COMPRESS_THRESHOLD) return file;
-      const MAX_DIM = 1280;     // pixel count down ~36% vs 1600
-      const QUALITY = 0.72;     // file size down ~30-40% vs 0.85
+      // 2026-06-23 re-loosened for legibility. The 1280/q0.72 era turned
+      // dense screenshots (game settlement screens, spreadsheets, receipts)
+      // with ~10px text into mush. New ceiling tracks the vision API's own
+      // limit: Claude downsamples any attachment to ≤1568px on the long edge
+      // (~1.15 MP) BEFORE the model sees it, so sending more than 1568 is
+      // pure wasted upload for model-reading purposes — 1568 maximizes legible
+      // detail at the smallest bytes that still saturate what the model gets.
+      // Costs ~2-3× the bytes of the 1280/q0.72 era: a deliberate trade of
+      // 4G upload speed for readability (the original 2026-05-21 retune went
+      // the other way for "图片发送很慢"; this is the considered reversal).
+      const MAX_DIM = 1568;
+      const QUALITY = 0.85;
       try {
         let bitmap;
         try {
@@ -2632,10 +2642,10 @@ function portal() {
       } catch (_) {
         bitmap = await createImageBitmap(file);
       }
-      // Cap canvas at 1280px on the long edge — matches our compress ceiling.
-      // Going larger would burn memory on phones and add latency to every
-      // history-snapshot toDataURL call.
-      const MAX = 1280;
+      // Cap canvas at 1568px on the long edge — matches our compress ceiling
+      // (= the vision API's downsample limit). Going larger would burn memory
+      // on phones and add latency to every history-snapshot toDataURL call.
+      const MAX = 1568;
       const ratio = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
       const w = Math.max(1, Math.round(bitmap.width * ratio));
       const h = Math.max(1, Math.round(bitmap.height * ratio));
