@@ -5296,6 +5296,11 @@ function portal() {
       if (_pending.length) {
         next = [...(_pending.map(id => _om[id])), ...next];
       }
+      // Keep the OPEN conversation's messages live too — not just the session
+      // LIST. Runs BEFORE the equality early-return so it fires every pull even
+      // when the picker itself doesn't need a re-render (e.g. a turn still
+      // running on the open session that we lost the SSE to). See method doc.
+      this._reconcileOpenSession(next);
       // Shallow-diff guard (2026-06-07, render 治本): the 10s background poll
       // returns 200 (not 304) whenever ANY display field changed — including a
       // streaming session's `active` dot toggling. Re-assigning this.sessions
@@ -5312,6 +5317,57 @@ function portal() {
           const st = this._ensureTabState(s.id);
           if (st && !st.streaming) st.unread = true;
         }
+      }
+    },
+    // Keep the OPEN conversation's MESSAGES in sync — previously only the
+    // session LIST (dots / unread) was polled; the message body of the session
+    // you were looking at only updated on tab-switch / manual refresh. That's
+    // the root cause of "要手动点刷新才有最新消息": anything that changed the open
+    // session from OUTSIDE this tab's own live stream (a turn running on another
+    // device, a background / scheduled turn, or an SSE that silently dropped
+    // while the PWA was suspended) left the view frozen until a manual reload.
+    //
+    // Driven off the session list we already poll every 10s + on visibility /
+    // reconnect — no new backend endpoint, no extra request on the common
+    // "nothing changed" tick. `_openSeenUpdated` is the updated_at the rendered
+    // messages reflect; a real load / switch / our-own-stream-done re-baselines
+    // it (set to undefined) so we never reload a session we just pulled.
+    _reconcileOpenSession(next) {
+      const sid = this.currentId;
+      if (!sid) return;
+      // Hidden tab: defer — visibilitychange→visible re-pulls the list and we
+      // reconcile then. Avoids churn (and battery) while the user isn't looking.
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return;
+      // Our own live stream already owns the view (renders incrementally).
+      if (this.streaming) return;
+      const cur = (next || []).find(s => s && s.id === sid);
+      if (!cur) return;
+      const newU = Number(cur.updated_at) || 0;
+      const baseline = this._openSeenUpdated;
+      this._openSeenUpdated = newU;
+      // First sight after a fresh load / switch: just baseline. loadSession
+      // already pulled the latest and _checkActiveTurn re-attached any live turn.
+      if (baseline === undefined) return;
+      if (cur.active) {
+        // Server reports a live turn on the OPEN session but this tab isn't
+        // streaming it (PWA resumed with a dropped SSE, or the turn is running
+        // on another device). Quiet-reload pulls the authoritative server view
+        // — including a prompt that was sent on another device, which this tab
+        // never had — and loadSession's internal _checkActiveTurn then reconnects
+        // the SSE so the reply streams in live. (Reconnecting WITHOUT the reload
+        // would let send({reconnect})'s "truncate back to last user msg" eat a
+        // real prior reply when the externally-sent prompt isn't in our view.)
+        // Runs regardless of scroll — reconnect is append-only and honors
+        // atBottom, so a user reading history isn't yanked. Self-limiting: once
+        // the reconnect sets streaming=true the guard above skips repeat ticks.
+        this.loadSession(sid, { quiet: true });
+      } else if (newU > baseline && this.atBottom) {
+        // A turn finished from OUTSIDE this tab (another device / background
+        // task) — its final messages are on disk now. Pull them in place. Gated
+        // on atBottom so a user scrolled up reading history is never yanked down;
+        // they'll get the update on their next scroll-to-bottom / switch / send.
+        this.loadSession(sid, { quiet: true });
       }
     },
     // Field-level equality over the rendered session metadata. Returns true
@@ -6024,8 +6080,19 @@ function portal() {
 
       if (m._is_compact_summary) return true;
       switch (m.role) {
+        case "assistant": {
+          // Empty mid-turn assistant text block (no text, no rendered html) is
+          // noise — typically an empty text block the model emitted between a
+          // thinking block and a tool_use, which on a RELOADED session never
+          // gets html computed (renderMarkdown only fills html when text is
+          // truthy). It used to surface as a literal "undefined" bubble via
+          // x-html. The turn-tail short-circuit above already passes the live
+          // streaming bubble (which legitimately starts empty), so this only
+          // drops genuinely-empty blocks restored from a saved session.
+          if (!(m.text && String(m.text).trim()) && !m.html) return false;
+          return true;
+        }
         case "user":
-        case "assistant":
         case "assistant-turn":
         case "thinking":
         case "permission_request":
@@ -7400,6 +7467,12 @@ function portal() {
       this.savePrefs();
     },
     async switchSession() {
+      // Re-baseline the open-session resync cursor on every switch — incl. the
+      // instant "already-loaded" path below that skips loadSession (which would
+      // otherwise leave the PREVIOUS session's updated_at as the baseline and
+      // mis-fire a quiet reload on the newly-shown tab). The next list poll
+      // records this tab's real updated_at without reloading.
+      this._openSeenUpdated = undefined;
       // Mobile: any session switch implies "I want to see chat" — covers
       // every entry point at once (openTab from picker, activateTab from
       // chat-tabs strip, slash /resume, ctx-menu, programmatic newSession).
@@ -7636,7 +7709,20 @@ function portal() {
       // at the compact summary and can't reach it). Records st._fullLoaded
       // so the jump retry doesn't loop re-requesting full mode.
       const full = !!opts.full;
+      // quiet:true → in-place message refresh with NO skeleton + a scroll-
+      // preserving morph swap. Used by the open-session auto-resync
+      // (_reconcileOpenSession) so a background poll that pulls newly-finished
+      // messages never blanks the conversation or jumps the scroll. Cold opens
+      // and tab switches keep the normal skeleton + chunked-reveal path.
+      const quiet = !!opts.quiet;
       const st = this._ensureTabState(sid);
+      // Hard safety: a quiet refresh must NEVER run while a live stream owns
+      // st.messages — the splice-swap below would wipe the in-flight bubbles
+      // (and orphan the stream's curBubble pointer), blanking the conversation
+      // mid-reply. _reconcileOpenSession already gates on this.streaming, but a
+      // reconnect can flip streaming true during this function's awaits, so we
+      // bail up-front AND re-check right before the swap.
+      if (quiet && (st.streaming || st.es)) return;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -7646,7 +7732,15 @@ function portal() {
       // mid-load corrupts the now-active tab (messages not assigned / skeleton
       // stuck / model/effort overwritten by the old session). See loadSession race.
       const isCurrent = sid === this.currentId;
-      if (isCurrent) { this.messagesLoading = true; this.messagesReady = false; }
+      // Quiet refresh keeps the existing bubbles on screen (morph swap below) —
+      // raising the skeleton would defeat the point, so only cold/switch loads
+      // flip it. Also re-baseline the open-session resync cursor on a real load
+      // so the next list poll doesn't mistake "we just freshly pulled this" for
+      // an external change and reload again.
+      if (isCurrent && !quiet) {
+        this.messagesLoading = true; this.messagesReady = false;
+        this._openSeenUpdated = undefined;
+      }
       // Set true once we've scheduled the reveal (highlight→show). Guards the
       // finally so error / empty-result paths don't leave the skeleton stuck.
       let scheduledReveal = false;
@@ -7780,7 +7874,12 @@ function portal() {
         // scroll-anchored fill (see _fillDeferredHead). Un-rewound windows keep
         // the original one-shot path — zero behaviour change for short sessions.
         let _deferHead = null;
-        if (sid === this.currentId) {
+        if (sid === this.currentId && quiet) {
+          // Quiet refresh: render the whole visible window synchronously (small —
+          // it's a refresh, not a cold open) so the in-place swap below morphs in
+          // fully-rendered bubbles with no deferred-head dance.
+          visible.forEach(renderMarkdown);
+        } else if (sid === this.currentId) {
           if (visible.length > INITIAL_LOAD) {
             const _headCount = visible.length - INITIAL_LOAD;
             for (let j = _headCount; j < visible.length; j++) renderMarkdown(visible[j]);
@@ -7797,13 +7896,24 @@ function portal() {
           await this._renderMessagesChunked(visible, renderMarkdown);
         }
         // Mutate in place — preserves the Array reference Alpine is watching.
-        st.messages.length = 0;
-        // Foreground tab fills st.messages INCREMENTALLY via
-        // _revealMessagesChunked below (spreads Alpine's bubble instantiation
-        // over several frames instead of one multi-second main-thread burst).
-        // Off-screen tabs aren't painted (display:none), so there's no freeze
-        // to spread — push them in one shot.
-        if (sid !== this.currentId) st.messages.push(...visible);
+        if (sid === this.currentId && quiet) {
+          // Re-check after the fetch await: if a stream started meanwhile, abort
+          // the swap so we don't wipe live bubbles (see up-front guard above).
+          if (st.streaming || st.es) return;
+          // One-shot splice swap: Alpine morphs by stable :key (_k = sid+idx), so
+          // already-rendered bubbles stay mounted (no blank flash, scroll kept)
+          // and only the newly-finished tail bubbles get added.
+          this.messages = st.messages;
+          st.messages.splice(0, st.messages.length, ...visible);
+        } else {
+          st.messages.length = 0;
+          // Foreground tab fills st.messages INCREMENTALLY via
+          // _revealMessagesChunked below (spreads Alpine's bubble instantiation
+          // over several frames instead of one multi-second main-thread burst).
+          // Off-screen tabs aren't painted (display:none), so there's no freeze
+          // to spread — push them in one shot.
+          if (sid !== this.currentId) st.messages.push(...visible);
+        }
         // Stash older messages on the per-tab state; the "Load earlier"
         // button reads from here.
         st._earlierMessages = earlier;
@@ -7838,6 +7948,22 @@ function portal() {
           this.effort = s.effort || "";
           // thinking: default true when absent (legacy sessions had no field).
           this.thinkingEnabled = s.thinking !== false;
+          if (quiet) {
+            // Already swapped in place above (no skeleton, no reveal). Just
+            // re-highlight the freshly-added tail and re-pin to the bottom IF the
+            // user was following it — _reconcileOpenSession only quiet-reloads
+            // when atBottom, so this won't yank anyone reading history.
+            const _wasAtBottom = this.atBottom;
+            this.$nextTick(async () => {
+              try { await this.highlightCode(".chat-body"); st._highlighted = true; }
+              catch (_e) { /* highlight best-effort */ }
+              if (sid === this.currentId && _wasAtBottom) {
+                this.atBottom = true; this.scrollToBottom(true);
+              }
+            });
+            await this._fetchTabUsage(sid);
+            return;
+          }
           this.atBottom = true;
           // Hold the skeleton until highlight + artifacts finish, then reveal
           // the whole conversation at once. Without this, a big session paints
@@ -13768,7 +13894,10 @@ function portal() {
     jumpToPrevUser() {
       const el = this.$refs.chatBody;
       if (!el) return;
-      const users = Array.from(el.querySelectorAll(".msg.user"));
+      // Exclude queued (not-yet-sent) bubbles — they render as .msg.user.queued
+      // but jumping to them is meaningless; the FAB should only target real
+      // sent user messages in history. See index.html `.msg.user.queued`.
+      const users = Array.from(el.querySelectorAll(".msg.user:not(.queued)"));
       if (!users.length) return;
       const contTop = el.getBoundingClientRect().top;
       const threshold = 4; // px; element must be meaningfully above the top
@@ -14756,6 +14885,11 @@ function portal() {
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
         es.close(); _markDone(!!d.cancelled); _stopTimer();
+        // We rendered this reply live — re-baseline the open-session resync
+        // cursor so the post-done list poll (updated_at now advanced) doesn't
+        // mistake our own just-finished turn for an external change and quiet-
+        // reload on top of it.
+        if (streamSid === this.currentId) this._openSeenUpdated = undefined;
         this.refreshSessions();
         if (this.currentId === streamSid) {
           // highlightCode resolves AFTER syntax highlight + artifact render

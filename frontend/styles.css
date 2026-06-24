@@ -2928,6 +2928,20 @@ pre.text {
   content-visibility: auto;
   contain-intrinsic-size: auto 200px;
 }
+/* The recent bubbles of an actively-streaming turn must ALWAYS paint (the last
+   ~8 — the whole region the user is watching the agent work in). The tail's
+   turn-footer (the "running" thinking-dots + elapsed counter) lives INSIDE its
+   .msg, so when content-visibility:auto skips it — which happens any time
+   auto-follow hasn't fully pinned the tail into the viewport (slight scroll,
+   fast agentic turn with many tool cards) — the footer silently disappears AND
+   each skipped bubble collapses to its contain-intrinsic-size estimate, leaving
+   blank bands mid-conversation. Forcing `visible` on only the recent streaming
+   region keeps the long-session perf win for all scrolled-away history while
+   guaranteeing the live turn never blanks out or shows the "running" footer. */
+.msg.is-streaming-tail {
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
+}
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 /* Collapse empty message wrappers. Every msg is rendered as
    <div class="msg role"> regardless of whether any inner <template x-if>
