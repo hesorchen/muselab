@@ -22,16 +22,16 @@
 | **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
 
 <p align="center">
-  <img src="promo/media/screenshot-desktop.png" width="100%"
+  <img src="promo/media/screenshot-desktop.png" width="720"
        alt="muselab 桌面三栏：文件树、对话、预览区——黑夜模式下 HTML 实时渲染">
 </p>
-<p align="center"><em>桌面三栏布局——归档文件区、原生预览区、Muse 会话区（黑夜模式 + HTML 实时渲染）</em></p>
+<p align="center"><em>桌面三栏布局——归档文件区、原生预览区、Muse 会话区（黑夜模式 + HTML 实时渲染）· 点击放大</em></p>
 
-<table>
+<table align="center">
 <tr>
-<td><img src="promo/media/screenshot-mobile-files.jpeg" width="100%"></td>
-<td><img src="promo/media/screenshot-mobile-preview.png" width="100%"></td>
-<td><img src="promo/media/screenshot-mobile-chat.png" width="100%"></td>
+<td><img src="promo/media/screenshot-mobile-files.jpeg" width="200"></td>
+<td><img src="promo/media/screenshot-mobile-preview.png" width="200"></td>
+<td><img src="promo/media/screenshot-mobile-chat.png" width="200"></td>
 </tr>
 <tr>
 <td align="center">移动端文件区</td>

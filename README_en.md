@@ -23,16 +23,16 @@
 | **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
 
 <p align="center">
-  <img src="promo/media/screenshot-desktop.png" width="100%"
+  <img src="promo/media/screenshot-desktop.png" width="720"
        alt="muselab desktop three-pane layout: file tree, chat, and live HTML preview in dark mode">
 </p>
-<p align="center"><em>Desktop three-pane layout — archive area, native preview area, and Muse conversation area (dark mode with live HTML rendering).</em></p>
+<p align="center"><em>Desktop three-pane layout — archive area, native preview area, and Muse conversation area (dark mode with live HTML rendering). Click to enlarge.</em></p>
 
-<table>
+<table align="center">
 <tr>
-<td><img src="promo/media/screenshot-mobile-files.jpeg" width="100%"></td>
-<td><img src="promo/media/screenshot-mobile-preview.png" width="100%"></td>
-<td><img src="promo/media/screenshot-mobile-chat.png" width="100%"></td>
+<td><img src="promo/media/screenshot-mobile-files.jpeg" width="200"></td>
+<td><img src="promo/media/screenshot-mobile-preview.png" width="200"></td>
+<td><img src="promo/media/screenshot-mobile-chat.png" width="200"></td>
 </tr>
 <tr>
 <td align="center">Mobile · files</td>
