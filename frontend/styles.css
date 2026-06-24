@@ -996,7 +996,24 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
    tab-bar) naturally lifts. iOS Safari's `interactive-widget=resizes-
    content` meta SHOULD do this automatically on 16.4+ but is unreliable
    in PWA standalone mode; this is the JS-driven fallback. */
-body.kb-open .layout {
+/* `:focus-within` is load-bearing, not cosmetic. The layout-shrink must
+   apply ONLY while the composer actually holds focus. A soft keyboard
+   cannot exist without a focused input, so "input focused" is the true
+   precondition for stealing screen height. The old selector keyed solely
+   on `.kb-open` — a JS class that gets out of sync: it's added on focus
+   and is meant to be cleared on blur / by the visualViewport watcher, but
+   several paths leave it stuck ON with no keyboard present (Enter-to-send
+   keeps focus so no blur fires; iOS PWA's visualViewport `resize` is
+   flaky and sometimes never re-fires to clear it; assorted programmatic
+   re-focuses re-arm it). When it stuck ON together with a stale
+   `--kb-inset` (e.g. 400px from the last keyboard), the WHOLE layout
+   collapsed to `100dvh - 400px` mid-conversation → a huge blank band at
+   the bottom with the composer pushed off-screen (the recurring bug).
+   Gating on `:focus-within` makes a stuck `.kb-open` harmless: the moment
+   focus leaves the composer (tap a message, scroll to read a streaming
+   reply, switch tab) the shrink stops applying regardless of the stale
+   class/inset, so the layout snaps back to full height. */
+body.kb-open .layout:focus-within {
   /* 100dvh on iOS doesn't account for the on-screen keyboard — that's
      what visualViewport tracks. Subtract --kb-inset so the layout box
      ends right at the keyboard's top edge. The 100vh fallback exists
@@ -1007,7 +1024,11 @@ body.kb-open .layout {
   grid-template-rows: calc(100dvh - var(--kb-inset, 0px));
   transition: height var(--t-fast) ease-out;
 }
-body.kb-open .mobile-tab-bar { display: none; }
+/* Same `:focus-within` guard as the layout-shrink above — a stuck
+   `.kb-open` must not leave the bottom tab bar permanently hidden (which
+   would strand the user with no way to switch panes). Hide it only while
+   the composer truly holds focus. */
+body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 /* Safety net: even on browsers where layout shrink fails, scrollIntoView
    on focus (see app.js onTextareaFocus) needs the textarea to have
    actual room below to scroll-stop against. scroll-margin-bottom keeps a
