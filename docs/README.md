@@ -1,6 +1,6 @@
 # muselab docs
 
-> [简体中文](README_zh.md) · [← back to project README](../README.md)
+> [简体中文](README_zh.md) · [← back to project README](../README_en.md)
 
 ## Install & run
 

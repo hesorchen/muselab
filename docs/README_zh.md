@@ -1,6 +1,6 @@
 # muselab 文档
 
-> [English](README.md) · [← 返回项目 README](../README_zh.md)
+> [English](README.md) · [← 返回项目 README](../README.md)
 
 ## 安装与运行
 

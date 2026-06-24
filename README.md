@@ -2,107 +2,106 @@
 
 [![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart.md)
+[![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart_zh.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hesorchen/muselab)
-[![中文](https://img.shields.io/badge/lang-中文-red)](README_zh.md)
+[![English](https://img.shields.io/badge/lang-English-red)](README_en.md)
 
-**muselab is a self-hosted AI personal workspace built on the Claude Agent SDK.**
+**muselab 是一个基于 Claude Agent SDK 构建的自托管 AI 个人工作台**
+> Muse 来自希腊神话中的缪斯女神，象征灵感、艺术与知识。
 
-> Muse comes from the Muses of Greek mythology, goddesses of inspiration, art, and knowledge.
-
-## Core features
+## 核心特性
 
 | | |
 |---|---|
-| **Complete user context** | Your personal archive keeps accumulating; the more you use it, the better Muse understands you, creating compounding context |
-| **Leading Agent Harness** | Built on the Claude Agent SDK, with agent capabilities such as tool use, Skills, and MCP extensions |
-| **Switchable foundation models** | One-click switching across 8 model providers: Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE |
-| **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
-| **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
-| **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
+| **完整的用户上下文** | 不断累积的个人档案，越用越懂你，产生 context 复利 |
+| **领先的 Agent Harness** | 基于 Claude Agent SDK 构建，具备工具调用、Skills、MCP 扩展等 Agent 能力|
+| **灵活切换的基座模型** |Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE 等 8 家模型一键切换 |
+| **跨领域交叉分析** | 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
+| **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
+| **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
 
 <p align="center">
   <img src="promo/media/screenshot-desktop.png" height="340"
-       alt="muselab desktop three-pane layout: file tree, chat, and live preview">
+       alt="muselab 桌面三栏：文件树、对话、预览区实时渲染">
   &nbsp;&nbsp;
   <img src="promo/media/screenshot-mobile.png" height="340"
-       alt="muselab mobile PWA — continue the same session on your phone">
+       alt="muselab 手机端 —— 同一会话接着聊">
 </p>
-<p align="center"><em>Desktop three-pane layout — archive area, native preview area, and Muse conversation area; mobile PWA with synced sessions.</em></p>
+<p align="center"><em>桌面三栏布局——归档文件区、原生预览区、Muse 会话区；移动端 PWA，多端同步</em></p>
 
-## Quick start
+## 快速开始
 
-**One-line install** (Linux + macOS + WSL2):
+**一行命令安装**（Linux + macOS + WSL2）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
 ```
 
-**Manual install**:
+**手动安装**：
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
-bash scripts/install-linux.sh    # or install-macos.sh
+bash scripts/install-linux.sh    # 或 install-macos.sh
 ```
 
-**Verify after installation**:
+**安装后验证**：
 
-1. Open `http://localhost:8765` in your browser
-2. Paste `MUSELAB_TOKEN` to log in
-3. Configure at least one model
-4. Send `hello` and confirm Muse responds
+1. 浏览器打开 `http://localhost:8765`
+2. 粘贴 `MUSELAB_TOKEN` 登录
+3. 配置至少一种模型
+4. 发送 `你好` 确认 Muse 正常响应
 
-Something wrong? Run `bash scripts/doctor.sh` for layered diagnostics and concrete repair suggestions.
+出问题？运行 `bash scripts/doctor.sh`，逐层诊断并给出修复建议。
 
-> **Windows users:** install through WSL2 (see [Quick start](docs/quickstart.md#windows-via-wsl2)).
+> **Windows 用户：** 请通过 WSL2 安装（参见 [快速入门](docs/quickstart_zh.md#windows-用户走-wsl2)）。
 >
-> **Unattended mode** (CI / Docker / demo recording): `MUSELAB_NONINTERACTIVE=1 bash ...`
+> **无人值守**（CI / Docker / 录 demo）：`MUSELAB_NONINTERACTIVE=1 bash ...`
 
-## Session practice
+## 会话实践
 
-> "This is my checkup report from this year. Compare it with last year's report and turn the metric changes into a one-page HTML trend report."
+> 「这是我今年的体检报告，你帮我和去年那份对比一下，把指标变化做成一页 HTML 趋势报告。」
 
-Muse finds both PDFs in `health/`, reads the files, extracts the metrics, and writes a single-file HTML report with charts — rendered directly in the preview pane. Then you say:
+Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带图表的单文件 HTML——预览区直接渲染。你接着说：
 
-> "Now check the insurance policies in `money/`. Do these metric changes reveal any coverage gaps?"
+> 「再结合 `money/` 里的保单，看看这些变化指标有没有保障缺口。」
 
-Archives from two domains are analyzed in the same session, producing concrete guidance.
+两个领域的档案在同一个会话里交叉分析，提供具体指导。
 
-🌐 More scene demos on the [muselab promo page](https://hesorchen.github.io/muselab/promo/).
+🌐 更多场景演示见 [muselab 介绍页](https://hesorchen.github.io/muselab/promo/)。
 
-## Why not existing solutions?
+## 为什么不是现有方案？
 
-| Solution | Limitation | How muselab works |
+| 方案 | 局限 | muselab 怎么做 |
 |---|---|---|
-| ChatGPT / Claude.ai | Files are uploaded temporarily; memory is a black box | Archived files stay local, with a transparent memory mechanism |
-| Claude Code | Born in the terminal, built for code | The same Agent Harness, aimed at life files, usable on desktop and phone |
-| RAG document chat | Chunking + retrieval loses cross-document meaning; better suited for massive document sets | Stores source documents and reads complete files for lossless understanding |
+| ChatGPT / Claude.ai | 文件临时上传、记忆内容黑盒 | 归档文件常驻本地，白盒记忆机制 |
+| Claude Code | 生在终端、为代码而生 | 同一套 Agent Harness，面向生活，电脑手机多端可用 |
+| RAG 文档问答 | 切块 + 检索，跨文档语义有损，适合海量文档 | 保存资料文档，完整文件理解，零语义损耗 |
 
-Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How it compares](docs/comparison.md).
+完整对比（Open WebUI / LobeChat / AnythingLLM / claudecodeui 等）见[同类对比](docs/comparison_zh.md)。
 
-## Practical details
+## 实用细节
 
-- **Modern file tree** — Modern file operations: drag-and-drop upload, fuzzy search, rename, and trash
-- **Multiple modes and themes** — Light / dark / eye-care themes, with your own accent color
-- **Bilingual UI** — Switch between English and Chinese in one click, without refreshing the page
-- **Message queue** — Keep sending messages while Muse thinks; the queue runs them in order so no idea is lost
-- **Scheduled tasks** — Create overnight tasks and check the results when you wake up
+- **现代文件树** —— 现代化的文件操作，拖拽上传、模糊搜索、重命名、回收站
+- **多模式多主题** —— 亮色 / 暗色 / 护眼，自选主题色
+- **中英双语** —— 一键切换，不刷新页面
+- **消息队列** —— Muse 思考时继续发送消息，消息队列依次执行，不错过每一个灵感
+- **定时任务** —— 创建夜晚定时任务，早上醒来查看结果
 
-## Docs
+## 文档
 
-**[📚 Full documentation index](docs/README.md)**
+**[📚 完整文档索引](docs/README_zh.md)**
 
-- **Get started:** [Quick start](docs/quickstart.md) · [Linux install](docs/install-linux.md) · [macOS install](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
-- **Usage:** [Personalize CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
-- **Models:** [Providers](docs/providers.md) · [Add a provider](docs/add-provider.md) · [Model routing](docs/routing.md)
-- **Internals:** [Architecture](docs/architecture.md) · [Sessions](docs/backend-sessions.md) · [Files API](docs/backend-files.md) · [Security model](docs/backend-security.md) · [Frontend](docs/frontend.md) · [Infrastructure](docs/infrastructure.md)
-- **Reference:** [Configuration](docs/configuration.md) · [Data & backup](docs/data-and-backup.md) · [Troubleshooting](docs/troubleshooting.md) · [Glossary](docs/glossary.md)
-- **Concepts:** [How it compares](docs/comparison.md) · [The nine Muses](docs/muses.md)
-- **Project:** [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Third-party licenses](THIRD_PARTY_LICENSES.md)
+- **上手：** [快速入门](docs/quickstart_zh.md) · [Linux 安装](docs/install-linux_zh.md) · [macOS 安装](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
+- **使用：** [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
+- **模型：** [Providers](docs/providers_zh.md) · [接入新 provider](docs/add-provider_zh.md) · [模型路由](docs/routing_zh.md)
+- **内部机制：** [架构](docs/architecture_zh.md) · [会话](docs/backend-sessions_zh.md) · [Files API](docs/backend-files_zh.md) · [安全模型](docs/backend-security_zh.md) · [前端](docs/frontend_zh.md) · [基础设施](docs/infrastructure_zh.md)
+- **参考：** [配置](docs/configuration_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [排错](docs/troubleshooting_zh.md) · [词汇表](docs/glossary_zh.md)
+- **概念：** [同类对比](docs/comparison_zh.md) · [九位缪斯](docs/muses_zh.md)
+- **项目：** [安全](SECURITY.md) · [贡献指南](CONTRIBUTING.md) · [第三方授权](THIRD_PARTY_LICENSES.md)
 
-## Status
+## 状态
 
-v1.1 — first stable enhancement release.
+v1.1 — 首个稳定增强版本。
 
 [MIT](LICENSE)
