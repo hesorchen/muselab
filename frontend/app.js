@@ -2014,7 +2014,7 @@ function portal() {
       // file-path DOM walk (the documented ~300ms costs) so the preview tracks
       // typing without jank. Math shows as raw $$…$$ until the deferred full
       // render below typesets it. This is the same trick chat uses mid-stream.
-      this.livePreviewHtml = this._mdRenderUncached(src, { streaming: true });
+      this.livePreviewHtml = this._resolveMdImages(this._mdRenderUncached(src, { streaming: true }));
       this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
       // If the doc carries math, do ONE full render (KaTeX) after a longer
       // idle so equations fill in once the user truly pauses — not on every
@@ -2025,7 +2025,7 @@ function portal() {
           this._mathTimer = null;
           if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
           const cur = this._cm ? this._cm.getValue() : String(this.editText || "");
-          this.livePreviewHtml = this.mdRender(cur);
+          this.livePreviewHtml = this._resolveMdImages(this.mdRender(cur));
           this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
         }, 600);
       }
@@ -3201,6 +3201,45 @@ function portal() {
       return p;
     },
 
+    // Rewrite author-relative <img src> in rendered-markdown HTML to the backend
+    // raw endpoint. A README's `![](promo/media/x.png)` is relative to the file,
+    // but once injected into the preview pane the browser resolves it against the
+    // SPA origin (http://host:port/promo/media/x.png) — which 404s, since archive
+    // files are only reachable through /api/files/raw. We resolve each relative
+    // src against the directory of the file being previewed (this.selected) and
+    // swap in rawUrl(). Absolute/external/data/blob/root-absolute/anchor srcs —
+    // including our own already-rewritten /api/files/raw — are left untouched, so
+    // the pass is idempotent. No-op when the HTML carries no <img>.
+    _resolveMdImages(html) {
+      if (!html || html.indexOf("<img") < 0) return html;
+      // Directory of the previewed file, ROOT-relative (drop the filename).
+      const baseSegs = this._normalizeArchivePath(this.selected || "")
+        .split("/").slice(0, -1);
+      const tmp = document.createElement("div");
+      tmp.innerHTML = html;
+      let changed = false;
+      for (const img of tmp.querySelectorAll("img[src]")) {
+        let src = img.getAttribute("src") || "";
+        // Skip scheme: (http/https/data/blob/…), protocol-relative //, root-
+        // absolute / (covers /api/files/raw), and #anchors — only relatives left.
+        if (!src || /^([a-z][a-z0-9+.\-]*:|\/\/|\/|#)/i.test(src)) continue;
+        try { src = decodeURIComponent(src); } catch (_) { /* keep raw */ }
+        // Resolve ./ and ../ segments against the previewed file's directory.
+        const segs = baseSegs.slice();
+        for (const part of src.split("/")) {
+          if (part === "" || part === ".") continue;
+          if (part === "..") { if (segs.length) segs.pop(); continue; }
+          segs.push(part);
+        }
+        const resolved = segs.join("/");
+        if (!resolved) continue;
+        img.setAttribute("src", this.rawUrl(resolved));
+        if (!img.getAttribute("loading")) img.setAttribute("loading", "lazy");
+        changed = true;
+      }
+      return changed ? tmp.innerHTML : html;
+    },
+
     // For file-centric tools (Read / Edit / Write / NotebookEdit), extract the
     // file path from the tool input so the bubble can render it as a clickable
     // .file-link instead of plain summary text. Returns "" when the tool is
@@ -3531,7 +3570,7 @@ function portal() {
       // Markdown file-preview pane keeps its own rendered string.
       if (typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
         this._mdCache && this._mdCache.delete(this.rawText);
-        this.renderedMd = this.mdRender(this.rawText);
+        this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
       }
     },
 
@@ -10494,7 +10533,7 @@ function portal() {
           // render if the user switched tabs while it was pending.
           const renderMd = () => {
             if (this.selected !== targetPath) return;   // switched away mid-defer
-            this.renderedMd = this.mdRender(this.rawText);
+            this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
             this.previewMode = "md";
             if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
               this._previewCacheSet(targetPath, { mode: "md", rawText: this.rawText, renderedMd: this.renderedMd });
@@ -10845,7 +10884,7 @@ function portal() {
           if (r.ok) {
             this.rawText = await r.text();
             if (this.previewMode === "md") {
-              this.renderedMd = this.mdRender(this.rawText);
+              this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
               if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
                 this._previewCacheSet(this.selected, {
                   mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
@@ -10900,7 +10939,7 @@ function portal() {
           if (r.ok) {
             this.rawText = await r.text();
             if (this.previewMode === "md") {
-              this.renderedMd = this.mdRender(this.rawText);
+              this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
               if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
                 this._previewCacheSet(this.selected, {
                   mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
@@ -12625,7 +12664,7 @@ function portal() {
         this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
           ? saved : "split";
         this.livePreviewHtml = this.editorView !== "edit"
-          ? this.mdRender(this.editText) : "";
+          ? this._resolveMdImages(this.mdRender(this.editText)) : "";
         if (this.editorView !== "edit") {
           this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
         }
@@ -12664,7 +12703,7 @@ function portal() {
         // the stale entry so the next switch-back re-fetches.
         this._previewCacheDel(this.selected);
         if (this.previewMode === "md") {
-          this.renderedMd = this.mdRender(this.rawText);
+          this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
           if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
             this._previewCacheSet(this.selected, {
               mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
