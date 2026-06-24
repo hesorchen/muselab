@@ -2708,6 +2708,22 @@ def get_session_api(
     # mechanism. The user briefly sees just the user msg, then SSE
     # fills in everything via replay → live.
     total = len(messages)
+    # Self-heal a stale cached message_count. Some sessions carry
+    # message_count=0 in the muselab index despite having a real transcript
+    # (older imports, or turns written outside muselab's bump path), which
+    # made the session list report non-empty sessions as "0 messages" and,
+    # if MUSELAB_PRUNE_EMPTY_SESSIONS is ever enabled, risked pruning them.
+    # `total` is the real shaped count we just computed, so write it back via
+    # the side-effect-free setter (never touches updated_at → no reordering).
+    # Gated on `not full` (full=1 is the larger pre-compact outline/export
+    # count, not the normal view's count) and total>0 (so a transient empty
+    # read can't zero out a real count).
+    if not full and total > 0 and meta.get("message_count", 0) != total:
+        try:
+            _turns = sum(1 for x in messages if x.get("role") == "user")
+            sess.set_message_count(sid, total, turn_count=_turns)
+        except Exception:
+            pass
     # Slice the requested window. full / no-param → whole list (offset 0).
     if full or (tail <= 0 and offset < 0):
         win_offset = 0
