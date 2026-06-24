@@ -549,6 +549,22 @@
             </div>
           </template>
         </div>
+        <!-- Preview zoom (browser-like −/percentage/+). Shown only for the
+             zoomable modes (md/text/img/xlsx/csv/html); pdf has native zoom.
+             Click the percentage to reset to 100%. -->
+        <div class="preview-zoom" x-show="previewZoomable()">
+          <button class="preview-zoom-btn" @click="zoomPreviewOut()"
+                  :disabled="previewZoom <= PREVIEW_ZOOM_MIN"
+                  :title="lang==='zh' ? '缩小' : 'Zoom out'"
+                  :aria-label="lang==='zh' ? '缩小' : 'Zoom out'">−</button>
+          <button class="preview-zoom-pct" @click="resetPreviewZoom()"
+                  :title="lang==='zh' ? '重置为 100%' : 'Reset to 100%'"
+                  x-text="previewZoomPct()"></button>
+          <button class="preview-zoom-btn" @click="zoomPreviewIn()"
+                  :disabled="previewZoom >= PREVIEW_ZOOM_MAX"
+                  :title="lang==='zh' ? '放大' : 'Zoom in'"
+                  :aria-label="lang==='zh' ? '放大' : 'Zoom in'">+</button>
+        </div>
         <button x-show="selected && !editing && (previewMode==='md' || previewMode==='text')"
                 @click="togglePreviewFind()" class="icon-btn preview-keep-mobile"
                 :class="{ active: previewFind.open }"
@@ -570,7 +586,6 @@
         </button>
         <button x-show="editing" @click="saveEdit()" class="btn-primary btn-compact" x-text="t('btn.save')"></button>
         <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
-        <a x-show="selected" :href="downloadUrl(selected)" :download="selected.split('/').pop()" class="icon-btn preview-keep-mobile" :title="t('btn.download')"><svg><use href="#i-download"/></svg></a>
         <!-- Desktop fullscreen toggle (hidden on mobile via .pane-fullscreen-btn
              @media in styles.css). Click → preview pane takes whole viewport;
              click again to restore the 3-column layout. -->
@@ -785,7 +800,7 @@
           <div class="editor-main">
             <div x-ref="cmHost" class="editor-cm" x-show="editorView !== 'preview'"></div>
             <div class="editor-live-preview" x-show="editorIsMd && editorView !== 'edit'">
-              <div class="markdown" x-html="livePreviewHtml"></div>
+              <div class="markdown" x-html="livePreviewHtml" @click="onPreviewImgClick($event)"></div>
             </div>
           </div>
           <div class="editor-status">
@@ -806,8 +821,8 @@
           <span class="preview-loading-text"
                 x-text="lang==='zh' ? '加载中…' : 'Loading…'"></span>
         </div>
-        <div x-show="!editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd"></div>
-        <pre x-show="!editing && previewMode==='text' && rawText" class="text"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
+        <div x-show="!editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd" :style="'zoom:' + previewZoom" @click="onPreviewImgClick($event)"></div>
+        <pre x-show="!editing && previewMode==='text' && rawText" class="text" :style="'zoom:' + previewZoom"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
         <!-- 0-byte / empty file: a blank md/text pane is indistinguishable from
              "still loading" or "render broke". Show an explicit placeholder. -->
         <div x-show="!editing && (previewMode==='md' || previewMode==='text') && selected && !rawText" class="empty">
@@ -818,13 +833,15 @@
         <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，
              避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
         <iframe x-show="!editing && previewMode==='html'"
-                :src="previewMode==='html' ? rawUrl(selected) : 'about:blank'"
+                x-ref="htmlFrame"
+                :src="previewMode==='html' ? rawUrl(selected, {preview:true}) : 'about:blank'"
+                :style="'zoom:' + previewZoom"
                 class="frame" sandbox="allow-scripts"></iframe>
         <!-- Use template x-if (not x-show) so the <img> isn't even in the DOM
              when not active — :src="" would otherwise resolve to the page URL
              and fire a spurious resource-load-failed error in console. -->
         <template x-if="!editing && previewMode==='img' && selected">
-          <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''" class="preview-img" />
+          <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''" class="preview-img" :style="'zoom:' + previewZoom" />
         </template>
         <iframe x-show="!editing && previewMode==='pdf'"
                 :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
@@ -856,7 +873,7 @@
           <template x-for="sh in xlsxSheets.filter(s => s.name === xlsxActive)" :key="sh.name">
             <div class="xlsx-sheet-wrap">
               <div class="xlsx-scroll">
-                <table class="xlsx-table">
+                <table class="xlsx-table" :style="'zoom:' + previewZoom">
                   <tbody>
                     <template x-for="(row, ri) in sh.rows" :key="ri">
                       <tr>
@@ -902,7 +919,7 @@
                   x-text="lang==='zh' ? '（列数已截断）' : '(cols truncated)'"></span>
           </div>
           <div class="xlsx-scroll" x-show="csvData">
-            <table class="xlsx-table">
+            <table class="xlsx-table" :style="'zoom:' + previewZoom">
               <thead x-show="csvData && csvData.has_header && csvData.header && csvData.header.length">
                 <tr>
                   <th class="xlsx-rownum"></th>

@@ -282,6 +282,15 @@ function portal() {
     // buster on iframe / read URLs so the preview reflects the new content
     // without the user needing to manually refresh the page.
     previewVersion: 0,
+    // Browser-like zoom for the preview content (md/text/img/xlsx/csv/html).
+    // Applied as CSS `zoom` on the content nodes only (NOT the .preview-body
+    // container) so the find bar / drop overlay stay at 100%. Sticky across
+    // file switches like real browser zoom; not persisted across reloads.
+    // pdf is excluded — the browser PDF viewer has its own zoom control.
+    previewZoom: 1,
+    PREVIEW_ZOOM_MIN: 0.5,
+    PREVIEW_ZOOM_MAX: 3,
+    PREVIEW_ZOOM_STEP: 0.1,
     // Compact orchestration: the per-tab `compacting` flag (see
     // _blankTabState) marks the window where the CLI is busy summarising
     // *that session's* history. User messages typed during compact go into
@@ -1150,6 +1159,19 @@ function portal() {
         this.osFileDragging = false;
       });
 
+      // Click-to-zoom bridge for HTML previews. The sandboxed (opaque-origin)
+      // preview iframe can't be reached from here to intercept image clicks,
+      // so files.py injects a script that postMessages the clicked image's
+      // src up. Validate the message came from OUR preview iframe (not some
+      // other framed content posting to window) before opening the lightbox.
+      window.addEventListener("message", (e) => {
+        const f = this.$refs.htmlFrame;
+        if (!f || e.source !== f.contentWindow) return;
+        const d = e.data;
+        if (!d || d.__muselab !== "preview-img" || typeof d.src !== "string") return;
+        this.openLightbox(d.src, typeof d.alt === "string" ? d.alt : "");
+      });
+
       // Listen for SW → page messages. The service worker posts
       // `muselab/notification-clicked` when the user taps a push
       // banner; we ack the unread badge immediately so they don't
@@ -1206,6 +1228,13 @@ function portal() {
       // immediately re-renders the chat-body. localStorage flag persists
       // dismissal across reloads / PWA reopens.
       this._welcomeDismissed = localStorage.getItem("muselab_welcome_dismissed") === "1";
+      // Restore the preview zoom level so it sticks across reloads / PWA
+      // reopens, like a browser's per-site zoom. Clamp the stored value in
+      // case the bounds changed between versions.
+      {
+        const z = parseFloat(localStorage.getItem("muselab_preview_zoom"));
+        if (!Number.isNaN(z)) this.previewZoom = this._clampPreviewZoom(z);
+      }
       // Vibration / push prefs come from localStorage (per-device) so a
       // shared muselab between a desktop + phone keeps independent
       // settings — your phone can vibrate; the desktop tab silently
@@ -10858,10 +10887,14 @@ function portal() {
       this.savePrefs();
     },
 
-    rawUrl(p) {
+    rawUrl(p, opts = {}) {
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
+      // preview=1 asks the backend to inject the click-to-zoom bridge into
+      // HTML (see files.py). Only the html preview iframe passes it; images /
+      // pdf / downloads stream untouched.
+      const pv = opts.preview ? "&preview=1" : "";
       return "/api/files/raw?path=" + encodeURIComponent(p)
-              + "&token=" + encodeURIComponent(this.token) + v;
+              + "&token=" + encodeURIComponent(this.token) + v + pv;
     },
     async reloadPreview() {
       // Manual "🗘 reload" button in preview header. Bumps previewVersion
@@ -10912,6 +10945,28 @@ function portal() {
       this.toast(this.lang === "zh" ? "已刷新预览" : "Preview reloaded",
                   "success", 1200);
     },
+
+    // ===== Preview zoom (browser-like ±) =====
+    // Modes that support zoom. pdf/loading/unsupported/empty are excluded.
+    previewZoomable() {
+      return !this.editing && this.selected &&
+        ["md", "text", "img", "xlsx", "csv", "html"].includes(this.previewMode);
+    },
+    _clampPreviewZoom(z) {
+      // Round to the step grid to avoid 0.9999… drift, then clamp.
+      const stepped = Math.round(z / this.PREVIEW_ZOOM_STEP) * this.PREVIEW_ZOOM_STEP;
+      return Math.min(this.PREVIEW_ZOOM_MAX,
+              Math.max(this.PREVIEW_ZOOM_MIN, Math.round(stepped * 100) / 100));
+    },
+    setPreviewZoom(z) {
+      this.previewZoom = this._clampPreviewZoom(z);
+      // Persist (per-device) so the level survives reloads / PWA reopens.
+      try { localStorage.setItem("muselab_preview_zoom", String(this.previewZoom)); } catch {}
+    },
+    zoomPreviewIn()  { this.setPreviewZoom(this.previewZoom + this.PREVIEW_ZOOM_STEP); },
+    zoomPreviewOut() { this.setPreviewZoom(this.previewZoom - this.PREVIEW_ZOOM_STEP); },
+    resetPreviewZoom() { this.setPreviewZoom(1); },
+    previewZoomPct() { return Math.round(this.previewZoom * 100) + "%"; },
 
     async _maybeReloadPreview(toolFilePath) {
       // Called from the tool_use SSE handler when a write-style tool fires.
@@ -15202,6 +15257,20 @@ function portal() {
     openLightbox(src, alt) {
       if (!src) return;
       this.lightbox = { show: true, src, alt: alt || "" };
+    },
+
+    // Click-to-zoom for images inside a rendered markdown preview. Delegated
+    // on the .markdown container (covers both the preview pane and the editor
+    // split live-preview). Images wrapped in a link are left alone so the
+    // link still navigates; broken/empty-src images are ignored.
+    onPreviewImgClick(e) {
+      const img = e.target.closest("img");
+      if (!img) return;
+      if (img.closest("a")) return;
+      const src = img.currentSrc || img.getAttribute("src");
+      if (!src) return;
+      e.preventDefault();
+      this.openLightbox(src, img.alt || "");
     },
 
     retryFailedMessage(m) {

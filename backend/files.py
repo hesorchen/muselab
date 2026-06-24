@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
 from .settings import ROOT, atomic_write_text, env_int
@@ -661,9 +661,49 @@ INLINE_OK_SUFFIX = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
 # same-origin token theft).
 SANDBOXED_INLINE_SUFFIX = {".html", ".htm", ".svg"}
 
+# Click-to-zoom bridge for HTML previews. The preview iframe is sandboxed
+# (opaque origin) so the parent can't reach the framed DOM to intercept image
+# clicks. Instead we inject this tiny script (only when the preview pane asks
+# via ?preview=1) which forwards in-page image clicks to the parent via
+# postMessage — postMessage works fine from a sandboxed origin, so this needs
+# NO sandbox relaxation and leaks nothing (only the clicked image's src/alt).
+# The parent (app.js) validates event.source === the preview iframe before
+# opening its lightbox. Images wrapped in a link are left alone so the link
+# still navigates. CSP allows it: script-src includes 'unsafe-inline'.
+_PREVIEW_IMG_BRIDGE = (
+    "<script>(function(){document.addEventListener('click',function(e){"
+    "var t=e.target;var img=t&&t.closest?t.closest('img'):null;"
+    "if(!img||img.closest('a'))return;var src=img.currentSrc||img.src;"
+    "if(!src)return;e.preventDefault();"
+    "try{parent.postMessage({__muselab:'preview-img',src:src,alt:img.alt||''},'*');}"
+    "catch(_e){}},true);})();</script>"
+)
+# Cap the in-memory read used for injection. Bigger HTML (e.g. reports with
+# megabytes of base64 images) falls back to streaming untouched — it just
+# won't have click-to-zoom, which is an acceptable degradation.
+_PREVIEW_INJECT_MAX_BYTES = 12 * 1024 * 1024
+
+
+def _inject_preview_img_bridge(target: Path) -> str | None:
+    """Return the HTML text with the click-to-zoom bridge injected, or None to
+    signal "fall back to streaming the file untouched" (too big / not utf-8)."""
+    try:
+        if target.stat().st_size > _PREVIEW_INJECT_MAX_BYTES:
+            return None
+        html = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    lower = html.lower()
+    idx = lower.rfind("</body>")
+    if idx == -1:
+        idx = lower.rfind("</html>")
+    if idx == -1:
+        return html + _PREVIEW_IMG_BRIDGE
+    return html[:idx] + _PREVIEW_IMG_BRIDGE + html[idx:]
+
 
 @router.get("/raw", dependencies=[Depends(require_token_query)])
-def raw_file(path: str = Query(...)) -> FileResponse:
+def raw_file(path: str = Query(...), preview: bool = Query(False)):
     """Stream raw file (images, PDF, sandboxed HTML, etc.). Token via query.
     Everything outside the whitelists is forced to download as octet-stream."""
     target = safe_resolve(path)
@@ -701,7 +741,7 @@ def raw_file(path: str = Query(...)) -> FileResponse:
         # are unavailable, so the query token can't be replayed against the API.
         # Previously only the frontend iframe's sandbox attribute provided this
         # isolation, which a top-level open silently bypassed.
-        return FileResponse(target, headers={
+        sandbox_headers = {
             **base_headers,
             "Content-Disposition": f"inline; {disp_filename}",
             "Content-Security-Policy": (
@@ -714,7 +754,15 @@ def raw_file(path: str = Query(...)) -> FileResponse:
                 "connect-src 'self'; "
                 "base-uri 'none'; form-action 'none'"
             ),
-        })
+        }
+        # Preview pane requests ?preview=1 for HTML so we can inject the
+        # click-to-zoom bridge. SVG and the top-level/download paths never
+        # get it (no preview flag) and stream untouched.
+        if preview and suffix in (".html", ".htm"):
+            injected = _inject_preview_img_bridge(target)
+            if injected is not None:
+                return HTMLResponse(content=injected, headers=sandbox_headers)
+        return FileResponse(target, headers=sandbox_headers)
     # FileResponse(filename=) sets Content-Disposition itself; use our safe one.
     return FileResponse(target, media_type="application/octet-stream", headers={
         **base_headers,
