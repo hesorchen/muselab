@@ -1,15 +1,34 @@
-# muselab
+<h1 align="center">muselab</h1>
 
-[![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart.md)
-[![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hesorchen/muselab)
-[![中文](https://img.shields.io/badge/lang-中文-red)](README.md)
+<p align="center">
+  <a href="https://github.com/hesorchen/muselab/actions/workflows/ci.yml"><img src="https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="docs/quickstart.md"><img src="https://img.shields.io/badge/deploy-self--hosted-orange.svg" alt="Self-hosted"></a>
+  <a href="https://github.com/hesorchen/muselab/pkgs/container/muselab"><img src="https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker" alt="Container"></a>
+  <a href="https://deepwiki.com/hesorchen/muselab"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+  <a href="README.md"><img src="https://img.shields.io/badge/lang-中文-red" alt="中文"></a>
+</p>
 
-**muselab is a self-hosted AI personal workspace built on the Claude Agent SDK.**
+<p align="center"><strong>muselab is a self-hosted AI personal workspace built on the Claude Agent SDK.</strong></p>
 
-> Muse comes from the Muses of Greek mythology, goddesses of inspiration, art, and knowledge.
+<p align="center"><em>Muse comes from the Muses of Greek mythology, goddesses of inspiration, art, and knowledge.</em></p>
+
+<table align="center">
+<tr>
+<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
+<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+</tr>
+<tr>
+<td align="center">Mobile · files</td>
+<td align="center">Mobile · preview</td>
+<td align="center">Mobile · chat</td>
+<td align="center">Desktop · dark theme + live HTML</td>
+</tr>
+</table>
+
+<p align="center"><sub>Click any image to enlarge.</sub></p>
 
 ## Core features
 
@@ -21,25 +40,6 @@
 | **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
 | **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
 | **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
-
-<p align="center">
-  <img src="promo/media/screenshot-desktop.png" width="720"
-       alt="muselab desktop three-pane layout: file tree, chat, and live HTML preview in dark mode">
-</p>
-<p align="center"><em>Desktop three-pane layout — archive area, native preview area, and Muse conversation area (dark mode with live HTML rendering). Click to enlarge.</em></p>
-
-<table align="center">
-<tr>
-<td><img src="promo/media/screenshot-mobile-files.jpeg" width="200"></td>
-<td><img src="promo/media/screenshot-mobile-preview.png" width="200"></td>
-<td><img src="promo/media/screenshot-mobile-chat.png" width="200"></td>
-</tr>
-<tr>
-<td align="center">Mobile · files</td>
-<td align="center">Mobile · preview</td>
-<td align="center">Mobile · chat</td>
-</tr>
-</table>
 
 ## Quick start
 

@@ -1,14 +1,34 @@
-# muselab
+<h1 align="center">muselab</h1>
 
-[![CI](https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg)](https://github.com/hesorchen/muselab/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart_zh.md)
-[![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hesorchen/muselab)
-[![English](https://img.shields.io/badge/lang-English-red)](README_en.md)
+<p align="center">
+  <a href="https://github.com/hesorchen/muselab/actions/workflows/ci.yml"><img src="https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="docs/quickstart_zh.md"><img src="https://img.shields.io/badge/deploy-self--hosted-orange.svg" alt="Self-hosted"></a>
+  <a href="https://github.com/hesorchen/muselab/pkgs/container/muselab"><img src="https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker" alt="Container"></a>
+  <a href="https://deepwiki.com/hesorchen/muselab"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+  <a href="README_en.md"><img src="https://img.shields.io/badge/lang-English-red" alt="English"></a>
+</p>
 
-**muselab 是一个基于 Claude Agent SDK 构建的自托管 AI 个人工作台**
-> Muse 来自希腊神话中的缪斯女神，象征灵感、艺术与知识。
+<p align="center"><strong>muselab 是一个基于 Claude Agent SDK 构建的自托管 AI 个人工作台</strong></p>
+
+<p align="center"><em>Muse 来自希腊神话中的缪斯女神，象征灵感、艺术与知识。</em></p>
+
+<table align="center">
+<tr>
+<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
+<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+</tr>
+<tr>
+<td align="center">移动端 · 文件区</td>
+<td align="center">移动端 · 预览区</td>
+<td align="center">移动端 · 对话区</td>
+<td align="center">桌面端 · 黑夜主题 + HTML 渲染效果</td>
+</tr>
+</table>
+
+<p align="center"><sub>点击任意图片放大查看</sub></p>
 
 ## 核心特性
 
@@ -20,25 +40,6 @@
 | **跨领域交叉分析** | 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
 | **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
 | **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
-
-<p align="center">
-  <img src="promo/media/screenshot-desktop.png" width="720"
-       alt="muselab 桌面三栏：文件树、对话、预览区——黑夜模式下 HTML 实时渲染">
-</p>
-<p align="center"><em>桌面三栏布局——归档文件区、原生预览区、Muse 会话区（黑夜模式 + HTML 实时渲染）· 点击放大</em></p>
-
-<table align="center">
-<tr>
-<td><img src="promo/media/screenshot-mobile-files.jpeg" width="200"></td>
-<td><img src="promo/media/screenshot-mobile-preview.png" width="200"></td>
-<td><img src="promo/media/screenshot-mobile-chat.png" width="200"></td>
-</tr>
-<tr>
-<td align="center">移动端文件区</td>
-<td align="center">移动端预览区</td>
-<td align="center">移动端对话区</td>
-</tr>
-</table>
 
 ## 快速开始
 
