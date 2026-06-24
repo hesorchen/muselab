@@ -2115,6 +2115,37 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 
 /* Find-in-preview widget — floats top-right over the scrolling content,
    VSCode-style. Sticky so it stays pinned while the user scrolls hits. */
+/* Preview zoom control (browser-like −/percentage/+) in the preview header */
+.preview-zoom {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 1px;
+  margin-right: var(--sp-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-2);
+  overflow: hidden;
+}
+.preview-zoom-btn, .preview-zoom-pct {
+  border: none; background: transparent; cursor: pointer;
+  color: var(--c-fg-1); font: inherit;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.preview-zoom-btn {
+  width: 22px; height: 22px;
+  font-size: 15px; line-height: 1;
+}
+.preview-zoom-pct {
+  min-width: 3.2em; height: 22px; padding: 0 4px;
+  font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
+  color: var(--c-fg-2);
+}
+.preview-zoom-btn:hover, .preview-zoom-pct:hover {
+  background: var(--c-bg-3); color: var(--c-accent);
+}
+.preview-zoom-btn:disabled {
+  opacity: 0.4; cursor: default; background: transparent; color: var(--c-fg-1);
+}
+
 .preview-find {
   position: sticky; top: var(--sp-2); z-index: 60;
   width: max-content; max-width: calc(100% - var(--sp-4));
@@ -2350,7 +2381,9 @@ html[data-theme="eyecare"] .editor-cm .CodeMirror { background: var(--c-bg-0); }
   width: 3px; background: var(--c-accent); border-radius: 2px; opacity: 0.6;
 }
 .markdown a { color: var(--c-accent-hover); text-decoration: underline; text-decoration-color: var(--c-accent-soft); }
-.markdown img { max-width: 100%; border-radius: var(--r-md); }
+.markdown img { max-width: 100%; border-radius: var(--r-md); cursor: zoom-in; }
+/* Linked images keep the normal link cursor (click follows the link). */
+.markdown a img { cursor: pointer; }
 .markdown hr { border: 0; border-top: 1px solid var(--c-border-strong); margin: 2em 0; }
 .markdown ul, .markdown ol { padding-left: 1.6em; }
 
@@ -2927,6 +2960,20 @@ pre.text {
      collapse to the 200px placeholder and jump the scrollbar. */
   content-visibility: auto;
   contain-intrinsic-size: auto 200px;
+}
+/* The recent bubbles of an actively-streaming turn must ALWAYS paint (the last
+   ~8 — the whole region the user is watching the agent work in). The tail's
+   turn-footer (the "running" thinking-dots + elapsed counter) lives INSIDE its
+   .msg, so when content-visibility:auto skips it — which happens any time
+   auto-follow hasn't fully pinned the tail into the viewport (slight scroll,
+   fast agentic turn with many tool cards) — the footer silently disappears AND
+   each skipped bubble collapses to its contain-intrinsic-size estimate, leaving
+   blank bands mid-conversation. Forcing `visible` on only the recent streaming
+   region keeps the long-session perf win for all scrolled-away history while
+   guaranteeing the live turn never blanks out or shows the "running" footer. */
+.msg.is-streaming-tail {
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
 }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 /* Collapse empty message wrappers. Every msg is rendered as
