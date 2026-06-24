@@ -557,11 +557,27 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
     from claude_agent_sdk import delete_session as sdk_delete_session
     keep = set(keep_ids)
     cutoff = _time.time() - 2 * 3600  # 2 小时
+    # Data-loss guard: never delete a session that has an on-disk transcript,
+    # regardless of its cached message_count. A stale message_count=0 (older
+    # imports, transcripts written outside muselab's turn path) would
+    # otherwise let this prune a session full of real messages. Sessions the
+    # SDK can enumerate HAVE a JSONL → treat as non-empty and skip. Only
+    # truly transcript-less index stubs (created-but-never-sent) are eligible.
+    transcript_ids: set[str] = set()
+    if ROOT is not None:
+        try:
+            transcript_ids = {info.session_id
+                              for info in sdk_list_sessions(directory=str(ROOT))}
+        except Exception:
+            # If we can't confirm which sessions have transcripts, fail SAFE:
+            # delete nothing rather than risk nuking real history.
+            return []
     with _INDEX_LOCK:
         idx = _load_index()
         to_delete = [
             s["id"] for s in idx
             if s.get("message_count", 0) == 0
+            and s["id"] not in transcript_ids  # has a JSONL → real content, keep
             and not s.get("pinned")
             and s.get("auto_named", True)
             and s.get("created_at", 0) > cutoff  # 只删 2 小时内的空会话
@@ -863,6 +879,55 @@ def bump_session(sid: str, message_count: int | None = None,
                         s["auto_named"] = False
                 _save_index(idx)
                 return
+
+
+def set_message_count(sid: str, message_count: int,
+                       turn_count: int | None = None) -> None:
+    """Patch ONLY the cached message_count / turn_count for a session,
+    WITHOUT touching updated_at (so it never reorders the session list).
+
+    Why this exists separately from bump_session: bump_session always
+    stamps updated_at (it's the "a turn just happened" signal), so it
+    can't be used to lazily back-fill a stale count on a plain session
+    OPEN — that would float every session you merely glance at to the
+    top. This setter is the side-effect-free counterpart used by the
+    self-heal in chat.get_session_api: some sessions (older imports,
+    transcripts written outside muselab's turn path) carry a stale
+    message_count=0 in the index despite having a real transcript on
+    disk, which made the session list report "0 messages" for non-empty
+    sessions. Writing the real count back here fixes the display and
+    keeps prune_empty_sessions honest.
+
+    Creates a minimal index stub if the session has no entry yet (an
+    SDK-only session whose JSONL exists but was never registered) — same
+    pattern as toggle_pin — so the corrected count actually persists.
+    Idempotent: a no-op when the stored values already match.
+    """
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                changed = False
+                if s.get("message_count") != message_count:
+                    s["message_count"] = message_count
+                    changed = True
+                if turn_count is not None and s.get("turn_count") != turn_count:
+                    s["turn_count"] = turn_count
+                    changed = True
+                if changed:
+                    _save_index(idx)
+                return
+        # No index entry yet — create a minimal stub carrying the count.
+        now = time.time()
+        stub = {
+            "id": sid, "name": "", "model": "", "system_prompt": "",
+            "created_at": now, "updated_at": now,
+            "message_count": message_count, "auto_named": True,
+        }
+        if turn_count is not None:
+            stub["turn_count"] = turn_count
+        idx.append(stub)
+        _save_index(idx)
 
 
 # ============================================================================
