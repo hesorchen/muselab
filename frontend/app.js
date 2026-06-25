@@ -11211,9 +11211,15 @@ function portal() {
       // only within them — O(new blocks) instead of rescanning the whole chat
       // body's O(total blocks) each click. The data-hl sentinel still makes a
       // too-broad scope merely redundant, never wrong.
+      // `${root} pre code` matches container>pre>code (chat / .markdown).
+      // `pre${root} code` matches the case where root IS the <pre> — the
+      // .text file preview renders `<pre class="text"><code>` directly, so
+      // without this clause the query found 0 nodes and code-file previews
+      // never got highlighted (the reset path already used the broader
+      // ".text code" selector; this realigns collection with it).
       const nodes = scopeEls
         ? this._collectCodeNodes(scopeEls, "pre code").filter(el => el.dataset.hl !== "1")
-        : Array.from(document.querySelectorAll(root + " pre code"))
+        : Array.from(document.querySelectorAll(`${root} pre code, pre${root} code`))
             .filter(el => el.dataset.hl !== "1");
       const runArtifacts = () => {
         // Scan for Artifact-eligible code blocks (mermaid diagrams, HTML
@@ -12735,6 +12741,22 @@ function portal() {
       const SHOW_AT = 220;
       const maxW = Math.floor(window.innerWidth * 2 / 3);
       const isLeft = which === "left";
+      // Resizing a side pane changes the CENTER (editor) pane's width. CM5 does
+      // NOT auto-detect its flex container resizing, so without an explicit
+      // refresh it keeps stale line measurements — with lineWrapping on, the
+      // cached (now-wrong) line heights overlap and the doc renders as a ghost/
+      // duplicate until the next CM interaction. setEditorView() already does
+      // this for split↔full; the divider-drag path was the missing case.
+      // rAF-throttled so a continuous drag stays smooth (one refresh/frame).
+      let _cmRefreshPending = false;
+      const refreshCmSoon = () => {
+        if (!this.editing || !this._cm || _cmRefreshPending) return;
+        _cmRefreshPending = true;
+        requestAnimationFrame(() => {
+          _cmRefreshPending = false;
+          try { this._cm.refresh(); } catch (e) {}
+        });
+      };
       const onMove = (e) => {
         const delta = isLeft ? (e.clientX - startX) : (startX - e.clientX);
         const targetW = startW + delta;
@@ -12759,6 +12781,7 @@ function portal() {
           if (isLeft) this.leftWidth = w;
           else        this.rightWidth = w;
         }
+        refreshCmSoon();   // keep CM in step with the editor pane's new width
       };
       const onUp = () => {
         document.body.style.cursor = "";
@@ -12767,6 +12790,11 @@ function portal() {
         overlay.remove();
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
+        // Final settle: the layout is fully applied now, so one last refresh
+        // clears any stale measurement left from the in-flight drag frames.
+        if (this.editing && this._cm) {
+          this.$nextTick(() => { try { this._cm.refresh(); } catch (e) {} });
+        }
         this.savePrefs();
       };
       document.addEventListener("mousemove", onMove);

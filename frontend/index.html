@@ -285,7 +285,6 @@
                 :title="showHidden ? t('btn.hide_hidden') : t('btn.show_hidden')">
           <svg><use href="#i-eye"/></svg>
         </button>
-        <button @click="reloadTree()" class="icon-btn" :title="t('btn.refresh')"><svg><use href="#i-refresh"/></svg></button>
         <button @click="toggleTheme()" class="icon-btn files-keep-mobile"
                 :title="theme==='light' ? t('btn.theme_dark') : theme==='dark' ? t('btn.theme_eyecare') : t('btn.theme_light')">
           <svg x-show="theme==='light'"><use href="#i-moon"/></svg>
@@ -397,6 +396,12 @@
                     :title="lang==='zh' ? '在根目录新建目录' : 'New folder at root'"
                     aria-label="New folder at root">
               <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-folder-plus"/></svg>
+            </button>
+            <button class="root-action" type="button"
+                    @click.stop="reloadTree()"
+                    :title="t('btn.refresh')"
+                    aria-label="Refresh file tree">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-refresh"/></svg>
             </button>
           </span>
         </div>
