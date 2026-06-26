@@ -285,7 +285,6 @@
                 :title="showHidden ? t('btn.hide_hidden') : t('btn.show_hidden')">
           <svg><use href="#i-eye"/></svg>
         </button>
-        <button @click="reloadTree()" class="icon-btn" :title="t('btn.refresh')"><svg><use href="#i-refresh"/></svg></button>
         <button @click="toggleTheme()" class="icon-btn files-keep-mobile"
                 :title="theme==='light' ? t('btn.theme_dark') : theme==='dark' ? t('btn.theme_eyecare') : t('btn.theme_light')">
           <svg x-show="theme==='light'"><use href="#i-moon"/></svg>
@@ -397,6 +396,12 @@
                     :title="lang==='zh' ? '在根目录新建目录' : 'New folder at root'"
                     aria-label="New folder at root">
               <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-folder-plus"/></svg>
+            </button>
+            <button class="root-action" type="button"
+                    @click.stop="reloadTree()"
+                    :title="t('btn.refresh')"
+                    aria-label="Refresh file tree">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-refresh"/></svg>
             </button>
           </span>
         </div>
@@ -696,11 +701,10 @@
         </div>
       </template>
 
-      <!-- Floating immersive toggle — only shown on mobile via @media in
-           styles.css. Necessary fallback for iframe / pdf / img preview
-           where scroll events don't cross the sandbox boundary, so the
-           scroll-direction auto-toggle in onPreviewScroll can only fire
-           for markdown / text. -->
+      <!-- Floating immersive (fullscreen reading) toggle — only shown on mobile
+           via @media in styles.css. Sole entry point for immersive mode;
+           scroll-direction auto-toggle was removed per user request because
+           reclaiming the bar space mid-scroll drifts the content on touch. -->
       <button class="preview-immersive-toggle"
               @click="toggleImmersive()"
               :title="previewImmersive ? (lang==='zh' ? '退出全屏阅读' : 'Exit immersive') : (lang==='zh' ? '全屏阅读' : 'Immersive reading')">
@@ -714,7 +718,6 @@
 
       <div class="preview-body"
            :class="{ 'drag-hover': previewDragHover || osFileDragging }"
-           @scroll.passive="onPreviewScroll($event.target)"
            @dragover.prevent="previewDragHover = true"
            @dragenter.prevent="previewDragHover = true"
            @dragleave.prevent="previewDragHover = false"
@@ -821,8 +824,15 @@
           <span class="preview-loading-text"
                 x-text="lang==='zh' ? '加载中…' : 'Loading…'"></span>
         </div>
-        <div x-show="!editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd" :style="'zoom:' + previewZoom" @click="onPreviewImgClick($event)"></div>
-        <pre x-show="!editing && previewMode==='text' && rawText" class="text" :style="'zoom:' + previewZoom"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
+        <!-- :style MUST be object form, not a string. A string :style makes
+             Alpine call el.setAttribute("style", ...) on every reactive update,
+             which overwrites the whole inline style attribute — including the
+             display:none that x-show wrote — so the hidden element reappears.
+             That's how the raw <pre> below leaked under the rendered markdown
+             (2026-06-26 user report: md preview dumping its own source). Object
+             form uses style.setProperty per key and leaves display alone. -->
+        <div x-show="!editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd" :style="{ zoom: previewZoom }" @click="onPreviewImgClick($event)"></div>
+        <pre x-show="!editing && previewMode==='text' && rawText" class="text" :style="{ zoom: previewZoom }"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
         <!-- 0-byte / empty file: a blank md/text pane is indistinguishable from
              "still loading" or "render broke". Show an explicit placeholder. -->
         <div x-show="!editing && (previewMode==='md' || previewMode==='text') && selected && !rawText" class="empty">
@@ -832,10 +842,16 @@
         </div>
         <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，
              避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
+        <!-- Zoom via transform:scale (NOT `zoom`): `zoom` is non-standard and
+             Safari scales the iframe box down to the top-left, leaving an empty
+             right/bottom gutter, while Chrome reflows it to fill. transform +
+             inverse width/height (e.g. 0.5 → 200% box scaled to 100%) gives the
+             same "reflow & fill, show more, smaller" result on every engine.
+             (2026-06-26 user report: html preview zoom gutters on mobile.) -->
         <iframe x-show="!editing && previewMode==='html'"
                 x-ref="htmlFrame"
                 :src="previewMode==='html' ? rawUrl(selected, {preview:true}) : 'about:blank'"
-                :style="'zoom:' + previewZoom"
+                :style="previewZoom === 1 ? {} : { transform: 'scale(' + previewZoom + ')', transformOrigin: 'top left', width: 'calc(100% / ' + previewZoom + ')', height: 'calc(100% / ' + previewZoom + ')' }"
                 class="frame" sandbox="allow-scripts"></iframe>
         <!-- Use template x-if (not x-show) so the <img> isn't even in the DOM
              when not active — :src="" would otherwise resolve to the page URL
@@ -1574,7 +1590,7 @@
           <template x-for="tid in residentPaneIds()" :key="tid">
           <div class="msg-pane" x-show="tid === currentId">
           <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + ((streaming && i >= messages.length - 8) ? ' is-streaming-tail' : '')"
+            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
                  :data-uuid="m.uuid || ''"
                  :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
               <!-- compact-summary pill -->
