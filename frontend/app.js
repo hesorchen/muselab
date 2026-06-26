@@ -677,12 +677,10 @@ function portal() {
     // tab. Default "chat" since that's the primary action; auto-switches to
     // "preview" when user opens a file, and "chat" when they @-mention one.
     mobileTab: "chat",
-    // Mobile-only: when user scrolls down in preview, hide top header + tab
-    // bar + bottom-nav for immersive reading. onPreviewScroll updates this
-    // based on direction + threshold. Reset on mobileTab change away from
-    // preview (see init() $watch).
+    // Mobile-only: hide the top header + tab bar + bottom-nav for immersive
+    // reading. Toggled by the floating fullscreen button (toggleImmersive).
+    // Reset on mobileTab change away from preview (see init() $watch).
     previewImmersive: false,
-    _lastPreviewScrollTop: 0,
     // Sidebar "message outline" — opens a collapsible list of user prompts
     // in the current session so you can jump back to a question in a long
     // conversation. Toggled by the outline button in the files pane header.
@@ -2054,7 +2052,7 @@ function portal() {
           this._mathTimer = null;
           if (!this.editing || !this.editorIsMd || this.editorView === "edit") return;
           const cur = this._cm ? this._cm.getValue() : String(this.editText || "");
-          this.livePreviewHtml = this._resolveMdImages(this.mdRender(cur));
+          this.livePreviewHtml = this._renderPreviewMd(cur);
           this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
         }, 600);
       }
@@ -3106,49 +3104,27 @@ function portal() {
       const oneLine = t.replace(/\s+/g, " ").trim();
       return oneLine.slice(0, 60) || (this.lang === "zh" ? "（无文本）" : "(no text)");
     },
-    // Manual toggle — used by the floating button. Necessary fallback for
-    // iframe / pdf / img preview where onPreviewScroll can't fire because
-    // scroll events don't cross the sandbox boundary.
+    // Enter/leave immersive (mobile reading mode) — invoked only by the
+    // floating fullscreen button. Hiding/showing the top bars moves the
+    // preview-body's TOP EDGE by the bar height (~74px), so without
+    // compensation the content jumps. Immersive has NO content reflow — only
+    // the scroller's top edge shifts — so the exact, symmetric fix is to nudge
+    // scrollTop by that shift: scrollTop += (topAfter − topBefore). Enter ≈
+    // −74, exit ≈ +74, so a round-trip nets zero and never accumulates (fixed
+    // the "反复全屏/退出画面不断往上" creep, 2026-06-26). The body class is toggled
+    // directly (not via Alpine), so reading getBoundingClientRect after it
+    // forces the new layout — compensate synchronously, no flash.
+    //   (Scroll-direction auto-toggle was removed 2026-06-26 per user request:
+    // any space-reclaim mid-scroll must move scrollTop, which fights an
+    // in-flight momentum scroll on touch devices and drifts. The button — which
+    // always toggles while stationary — is the only entry point now.)
     toggleImmersive() {
-      this.previewImmersive = !this.previewImmersive;
-      document.body.classList.toggle("preview-immersive",
-                                     this.previewImmersive);
-    },
-    // Mobile preview scroll — toggle immersive mode (hide top header + tab
-    // bar + bottom-nav) based on scroll direction. Desktop: no-op.
-    onPreviewScroll(el) {
-      if (!el || window.innerWidth > 900) return;
-      if (this.mobileTab !== "preview") return;
-      const cur = el.scrollTop;
-      const last = this._lastPreviewScrollTop || 0;
-      const delta = cur - last;
-      // Near the top → always show (so the user can reach the file name /
-      // tab bar without scrolling back up first).
-      if (cur < 50) {
-        if (this.previewImmersive) {
-          this.previewImmersive = false;
-          document.body.classList.remove("preview-immersive");
-        }
-        this._lastPreviewScrollTop = cur;
-        return;
-      }
-      // Scrolling down ≥30px → hide bars.
-      if (delta > 30) {
-        if (!this.previewImmersive) {
-          this.previewImmersive = true;
-          document.body.classList.add("preview-immersive");
-        }
-        this._lastPreviewScrollTop = cur;
-      // Scrolling up ≥10px → show bars (lighter threshold so it feels
-      // responsive when the user wants navigation back).
-      } else if (delta < -10) {
-        if (this.previewImmersive) {
-          this.previewImmersive = false;
-          document.body.classList.remove("preview-immersive");
-        }
-        this._lastPreviewScrollTop = cur;
-      }
-      // Sub-threshold deltas: don't update last — let movement accumulate.
+      const on = !this.previewImmersive;
+      const el = document.querySelector(".pane.preview .preview-body");
+      const topBefore = el ? el.getBoundingClientRect().top : 0;
+      this.previewImmersive = on;
+      document.body.classList.toggle("preview-immersive", on);
+      if (el) el.scrollTop += (el.getBoundingClientRect().top - topBefore);
     },
     // Elapsed-stream formatting used by the streaming dots in both the
     // turn-footer (bottom of every just-finished/in-progress assistant
@@ -3428,6 +3404,28 @@ function portal() {
       return out;
     },
 
+    // YAML frontmatter (`---\n…\n---` at the very top of a file) is metadata,
+    // not body. marked renders it as a stray <hr> plus a giant Setext <h2>
+    // (the closing `---` underlines the preceding paragraph), so SKILL.md /
+    // notes with frontmatter showed their raw `name:/description:/license:`
+    // keys as a huge heading. Strip a leading frontmatter block before
+    // rendering — only for the file PREVIEW / editor preview; rawText (the
+    // raw <pre> view) and the editor buffer keep the full source. Conservative:
+    // the file must open with `---` on line 1 and have a matching closing
+    // `---`; otherwise the text is returned untouched (a doc that merely
+    // starts with a `---` thematic break is left alone unless it also closes).
+    _stripFrontmatter(text) {
+      if (typeof text !== "string") return text;
+      const m = text.match(/^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/);
+      return m ? text.slice(m[0].length) : text;
+    },
+
+    // Single entry point for rendering a markdown FILE (preview pane + editor
+    // live preview): strip frontmatter, render, then resolve relative images.
+    _renderPreviewMd(text) {
+      return this._resolveMdImages(this.mdRender(this._stripFrontmatter(text)));
+    },
+
     // opts.streaming === true → cheap path used on every throttled re-render
     // of an in-flight bubble: parse + sanitize only. The expensive passes
     // (KaTeX math typesetting + the full-DOM _linkifyFilePaths walk) are
@@ -3599,7 +3597,7 @@ function portal() {
       // Markdown file-preview pane keeps its own rendered string.
       if (typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
         this._mdCache && this._mdCache.delete(this.rawText);
-        this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
+        this.renderedMd = this._renderPreviewMd(this.rawText);
       }
     },
 
@@ -10692,7 +10690,7 @@ function portal() {
           // render if the user switched tabs while it was pending.
           const renderMd = () => {
             if (this.selected !== targetPath) return;   // switched away mid-defer
-            this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
+            this.renderedMd = this._renderPreviewMd(this.rawText);
             this.previewMode = "md";
             if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
               this._previewCacheSet(targetPath, { mode: "md", rawText: this.rawText, renderedMd: this.renderedMd });
@@ -11047,7 +11045,7 @@ function portal() {
           if (r.ok) {
             this.rawText = await r.text();
             if (this.previewMode === "md") {
-              this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
+              this.renderedMd = this._renderPreviewMd(this.rawText);
               if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
                 this._previewCacheSet(this.selected, {
                   mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
@@ -11124,7 +11122,7 @@ function portal() {
           if (r.ok) {
             this.rawText = await r.text();
             if (this.previewMode === "md") {
-              this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
+              this.renderedMd = this._renderPreviewMd(this.rawText);
               if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
                 this._previewCacheSet(this.selected, {
                   mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
@@ -12657,6 +12655,15 @@ function portal() {
     // (e.g. fullscreen-preview → click chat-pane maximize → fullscreen-
     // chat). Mobile (single-pane @media) ignores desktopFullPane entirely.
     toggleDesktopFull(pane) {
+      // Entering / leaving fullscreen changes the preview pane's WIDTH, so its
+      // markdown rewraps and images rescale — the content height changes and
+      // the same scrollTop lands on different content, making the page appear
+      // to jump (user report 2026-06-26: "点全屏后画面往上走"). Chrome/Firefox
+      // mostly hide this via overflow-anchor; Safari has no scroll anchoring
+      // at all, so we re-anchor explicitly below (works on every engine).
+      const anchor = (pane === "preview")
+        ? this._capturePreviewScrollAnchor() : null;
+
       const next = (this.desktopFullPane === pane) ? "" : pane;
       this.desktopFullPane = next;
       // Force the target pane open — otherwise "fullscreen chat" with
@@ -12672,6 +12679,47 @@ function portal() {
       // savePrefs — this entry/exit path was the one gap, so toggling
       // fullscreen via the maximize button never stuck across a reload.
       this.savePrefs();
+
+      // Restore the captured anchor after Alpine swaps the layout and the
+      // browser has reflowed at the new width (one rAF past $nextTick).
+      if (anchor) {
+        this.$nextTick(() => requestAnimationFrame(
+          () => this._restorePreviewScrollAnchor(anchor)));
+      }
+    },
+    // Record what content sits at the top of the preview viewport so it can be
+    // pinned back in place across a layout change. Anchors to the deepest
+    // element painted just under the scroller's top edge (a specific
+    // line/word) and remembers its ABSOLUTE viewport Y — so the same line
+    // stays on screen whether the change reflows the content (fullscreen width
+    // change) OR moves the scroller's own top edge (immersive bars collapsing,
+    // which shifts preview-body up by the bar height). Falls back to a scroll
+    // ratio if no element can be resolved.
+    _capturePreviewScrollAnchor() {
+      const el = document.querySelector(".pane.preview .preview-body");
+      if (!el) return null;
+      const c = el.getBoundingClientRect();
+      let node = document.elementFromPoint(
+        Math.round(c.left + c.width / 2), Math.round(c.top + 6));
+      if (node && !el.contains(node)) node = null;   // overlay / outside scroller
+      // cTop is the fallback anchor: cancelling the scroller's own top-edge
+      // shift handles the immersive case (bars collapse, no reflow) even on a
+      // short / empty doc where no content node can be resolved.
+      return { el, cTop: c.top, node, vTop: node ? node.getBoundingClientRect().top : 0 };
+    },
+    _restorePreviewScrollAnchor(a) {
+      if (!a || !a.el || !a.el.isConnected) return;
+      const el = a.el;
+      if (a.node && el.contains(a.node)) {
+        // Pin the anchor line back to the same screen Y. Covers both a content
+        // reflow (fullscreen width change) and a scroller-position shift
+        // (immersive bars). Idempotent: if the engine already kept it put
+        // (Chrome overflow-anchor) the delta is ~0.
+        el.scrollTop += (a.node.getBoundingClientRect().top - a.vTop);
+      } else {
+        // No content node — at least undo the top-edge shift.
+        el.scrollTop += (el.getBoundingClientRect().top - a.cTop);
+      }
     },
     // computedOpenFilesHeight() removed — auto-fit now relies on CSS
     // (.open-files-list max-height + .open-files height: auto). Splitter
@@ -12877,7 +12925,7 @@ function portal() {
         this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
           ? saved : "split";
         this.livePreviewHtml = this.editorView !== "edit"
-          ? this._resolveMdImages(this.mdRender(this.editText)) : "";
+          ? this._renderPreviewMd(this.editText) : "";
         if (this.editorView !== "edit") {
           this.$nextTick(() => this.highlightCode(".editor-live-preview .markdown"));
         }
@@ -12916,7 +12964,7 @@ function portal() {
         // the stale entry so the next switch-back re-fetches.
         this._previewCacheDel(this.selected);
         if (this.previewMode === "md") {
-          this.renderedMd = this._resolveMdImages(this.mdRender(this.rawText));
+          this.renderedMd = this._renderPreviewMd(this.rawText);
           if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
             this._previewCacheSet(this.selected, {
               mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,

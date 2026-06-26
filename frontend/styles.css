@@ -1226,10 +1226,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   }
 }
 
-/* Mobile preview immersive mode — toggled by onPreviewScroll when the user
-   scrolls down ≥30px (markdown / text preview), or by the floating toggle
-   button (iframe / pdf / image, where scroll events don't cross the sandbox
-   boundary). Hides preview pane's top header + file-tab bar, slides the
+/* Mobile preview immersive mode — toggled by the floating fullscreen button
+   (toggleImmersive). Hides preview pane's top header + file-tab bar, slides the
    bottom mobile-tab-bar out of view, AND reclaims the row + pane height the
    bar used to occupy — otherwise the bar disappears but the pane stays
    42px short and the content area shows a blank strip at the bottom. */
