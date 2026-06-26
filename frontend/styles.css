@@ -2949,32 +2949,26 @@ pre.text {
   flex-direction: column;
   position: relative;
   animation: msg-in var(--t-base);
-  /* Skip layout/paint for off-screen bubbles. Long conversations render
-     every message into the DOM (no virtualization), so on phones the
-     accumulated layout/paint cost of scrolled-away bubbles freezes the
-     WebView. content-visibility:auto makes the browser skip rendering work
-     for any bubble outside the viewport while keeping it in the DOM —
-     find-in-page still matches it, and the on-screen streaming bubble is
-     unaffected. `auto` in contain-intrinsic-size lets the browser remember
-     each bubble's last-rendered height, so scrolled-up content doesn't
-     collapse to the 200px placeholder and jump the scrollbar. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 200px;
+  /* Render eagerly (no content-visibility:auto). content-visibility:auto used
+     to skip layout/paint for off-screen bubbles, added back when a long
+     conversation kept EVERY message in the DOM. But history is now lazy-loaded
+     (INITIAL_LOAD window + paged batches + live cap), so only ~50 bubbles are
+     ever in the DOM — and `auto` deferred each bubble's layout+paint to the
+     moment it scrolled into view, which on phone CPUs meant per-bubble frame
+     drops while scrolling through history (measured: 1244ms total scroll jank,
+     331ms worst frame under 6× CPU throttle; eager render → 137ms / 58ms).
+     The heavy work (mdRender + hljs) already runs at load regardless of this,
+     so eager rendering just lets the browser paint the bounded window up front
+     instead of stuttering every scroll. */
 }
-/* The recent bubbles of an actively-streaming turn must ALWAYS paint (the last
-   ~8 — the whole region the user is watching the agent work in). The tail's
-   turn-footer (the "running" thinking-dots + elapsed counter) lives INSIDE its
-   .msg, so when content-visibility:auto skips it — which happens any time
-   auto-follow hasn't fully pinned the tail into the viewport (slight scroll,
-   fast agentic turn with many tool cards) — the footer silently disappears AND
-   each skipped bubble collapses to its contain-intrinsic-size estimate, leaving
-   blank bands mid-conversation. Forcing `visible` on only the recent streaming
-   region keeps the long-session perf win for all scrolled-away history while
-   guaranteeing the live turn never blanks out or shows the "running" footer. */
-.msg.is-streaming-tail {
-  content-visibility: visible;
-  contain-intrinsic-size: auto;
-}
+/* Paged-in history bubbles ("Load earlier" / live-cap restore) mount as a
+   batch of 20+ at once. Each .msg would play the msg-in entrance animation on
+   mount, so the whole batch fades+slides in simultaneously the instant you load
+   — a janky "loading" flash. The entrance animation is for genuinely-new
+   incoming messages, not for revealing old history, so suppress it here.
+   (The scroll-into-view layout/paint jank that also hit paged batches is now
+   handled globally — .msg no longer uses content-visibility:auto.) */
+.msg.no-anim { animation: none; }
 @keyframes msg-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 /* Collapse empty message wrappers. Every msg is rendered as
    <div class="msg role"> regardless of whether any inner <template x-if>

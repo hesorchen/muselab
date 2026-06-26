@@ -1579,7 +1579,7 @@
           <template x-for="tid in residentPaneIds()" :key="tid">
           <div class="msg-pane" x-show="tid === currentId">
           <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + ((streaming && i >= messages.length - 8) ? ' is-streaming-tail' : '')"
+            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
                  :data-uuid="m.uuid || ''"
                  :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
               <!-- compact-summary pill -->

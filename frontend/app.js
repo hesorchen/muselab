@@ -8412,6 +8412,10 @@ function portal() {
             ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
         }
       }
+      // These are OLD history bubbles being revealed, not new arrivals — flag
+      // them so the .msg entrance animation (msg-in) doesn't replay across the
+      // whole batch the instant they mount, which janks the scroll-to-top load.
+      for (const m of batch) m._noAnim = true;
       const isCurrent = sid === this.currentId;
       // Capture scroll geometry BEFORE the DOM grows so we can restore the
       // user's visible-content offset after Alpine re-renders.
