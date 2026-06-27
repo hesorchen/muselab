@@ -61,6 +61,50 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 
 推荐的 CLIProxyAPI 模板关闭了 proxy 自己的 auth/model cooldown 调度。这样可以避免上游失败后被本地 proxy 额外放大成黑窗期，体验更接近直接使用 Codex app/CLI。它不能绕过真实的上游额度限制或模型级 429。
 
+## 参考实现方案：CLIProxyAPI sidecar
+
+muselab 采用的参考方案是把 **CLIProxyAPI** 放在 muselab 旁边作为本地 sidecar：
+
+```text
+浏览器
+  → muselab 后端
+  → Claude Agent SDK
+  → Anthropic Messages API 请求（model: codex:gpt-5.5）
+  → muselab 剥掉 codex: 前缀（model: gpt-5.5）
+  → http://127.0.0.1:8317/v1/messages
+  → CLIProxyAPI
+  → 用户已登录 / 已授权的 Codex 后端
+```
+
+这套方案的边界是：
+
+- **muselab 负责**：provider catalog、模型下拉、会话级 base URL / api key 注入、工具调用和 transcript 仍由 Claude Agent SDK 驱动。
+- **CLIProxyAPI 负责**：保存和使用 Codex 侧认证、把 Anthropic Messages 请求转换到 Codex/OpenAI 后端、把流式响应和错误再转换回 Anthropic 形状。
+- **用户负责**：在本机运行 sidecar，并把同一个本地 token 同时写进 `~/.cli-proxy-muselab/config.yaml` 和 muselab 的 `CODEX_GATEWAY_API_KEY`。
+
+`examples/cli-proxy-muselab.config.yaml` 是 muselab 推荐的最小参考配置。它刻意做了这些选择：
+
+| 配置 | 推荐值 | 原因 |
+|---|---|---|
+| `host` | `127.0.0.1` | 只允许本机访问，避免把本地 Codex 能力暴露到公网 |
+| `port` | `8317` | 对应 muselab 内置默认 `CODEX_GATEWAY_BASE_URL` |
+| `api-keys` | 用户自设高强度 token | 即使只监听 loopback，也避免本机其它进程无鉴权调用 |
+| `disable-cooling` | `true` | 不让 proxy 额外制造本地冷却黑窗期 |
+| `session-affinity` | `false` | 默认不把 muselab 会话绑定到某个 credential |
+| `logging-to-file` | `false` | 降低把 prompt / token / 上游错误落盘的风险 |
+| `remote-management.allow-remote` | `false` | 禁止远程管理面板 |
+
+这个 sidecar **不会由 muselab 自动安装或自动启动**。如果你希望开机自启，可以自己用 systemd / launchd / supervisor 管理 `cli-proxy-api -config ~/.cli-proxy-muselab/config.yaml`，但不要把 Codex OAuth 文件或 gateway 日志提交进仓库。
+
+### Docker 注意事项
+
+如果 muselab 跑在 Docker 里，`http://127.0.0.1:8317` 指的是**容器内部**，不是宿主机。可选做法：
+
+- 把 gateway 也放进同一个 compose/network，然后把 `CODEX_GATEWAY_BASE_URL` 指到 gateway service 名；
+- 或让容器访问宿主机 gateway，例如使用 `host.docker.internal`（Linux 可能还需要额外 host-gateway 配置）。
+
+不要直接把 gateway 绑定到 `0.0.0.0` 暴露公网。确实需要跨机器访问时，必须放在 HTTPS / 反向代理 / 防火墙后面，并使用高熵 token。
+
 ## 网关要求
 
 sidecar 至少要实现 Anthropic Messages API 中 agent loop 需要的部分：

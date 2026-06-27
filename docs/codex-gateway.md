@@ -72,6 +72,66 @@ cooldown scheduling. This makes muselab avoid extra proxy-side blackout windows
 after an upstream failure, which is closer to the direct Codex app/CLI
 experience. It does not bypass real upstream quota or model-level 429s.
 
+## Reference implementation: CLIProxyAPI sidecar
+
+muselab's reference setup runs **CLIProxyAPI** next to muselab as a local
+sidecar:
+
+```text
+browser
+  → muselab backend
+  → Claude Agent SDK
+  → Anthropic Messages API request (model: codex:gpt-5.5)
+  → muselab strips the codex: prefix (model: gpt-5.5)
+  → http://127.0.0.1:8317/v1/messages
+  → CLIProxyAPI
+  → user-authenticated Codex backend
+```
+
+The boundary is:
+
+- **muselab owns** the provider catalog, model picker, session-level base URL /
+  API key injection, and the agent loop / tool calls / transcripts through the
+  Claude Agent SDK.
+- **CLIProxyAPI owns** Codex-side authentication, translating Anthropic Messages
+  requests to the Codex/OpenAI backend, and translating streaming responses and
+  errors back to the Anthropic shape.
+- **The user owns** running the sidecar locally and putting the same local token
+  in both `~/.cli-proxy-muselab/config.yaml` and muselab's
+  `CODEX_GATEWAY_API_KEY`.
+
+`examples/cli-proxy-muselab.config.yaml` is muselab's recommended minimal
+reference config. It intentionally uses these defaults:
+
+| Setting | Recommended value | Why |
+|---|---|---|
+| `host` | `127.0.0.1` | Keep the gateway local-only and avoid exposing local Codex access to the internet |
+| `port` | `8317` | Matches muselab's built-in `CODEX_GATEWAY_BASE_URL` default |
+| `api-keys` | user-generated strong token | Prevent other local processes from calling the gateway unauthenticated |
+| `disable-cooling` | `true` | Avoid extra proxy-side local cooldown blackout windows |
+| `session-affinity` | `false` | Do not bind muselab sessions to a specific credential by default |
+| `logging-to-file` | `false` | Reduce the risk of writing prompts, tokens, or upstream errors to disk |
+| `remote-management.allow-remote` | `false` | Disable the remote management surface |
+
+muselab does **not** install or start this sidecar automatically. If you want it
+to start on boot, manage `cli-proxy-api -config ~/.cli-proxy-muselab/config.yaml`
+with systemd, launchd, or another local supervisor. Do not commit Codex OAuth
+files or gateway logs to the repository.
+
+### Docker note
+
+If muselab runs in Docker, `http://127.0.0.1:8317` means **inside the muselab
+container**, not the host machine. Options:
+
+- run the gateway in the same compose/network and set `CODEX_GATEWAY_BASE_URL`
+  to that gateway service name;
+- or point the container at a host-running gateway, for example with
+  `host.docker.internal` (Linux may also need extra host-gateway configuration).
+
+Do not bind the gateway to `0.0.0.0` and expose it directly to the internet. If
+you must access it across machines, put it behind HTTPS, a reverse proxy, and a
+firewall, and use a high-entropy token.
+
 ## Gateway requirements
 
 The sidecar must implement enough of the Anthropic Messages API for agent use:
