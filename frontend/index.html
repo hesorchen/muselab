@@ -1925,17 +1925,6 @@
                          :title="toolFilePath(m)"
                          x-text="toolFilePath(m)"></a>
                     </template>
-                    <!-- Edit / Write / MultiEdit: +X / -Y badge showing
-                         change magnitude at a glance without expanding diff. -->
-                    <template x-if="['Edit','MultiEdit','Write'].includes(m.name) && editDiffStats(m)">
-                      <span class="diff-badge"
-                            :title="lang==='zh' ? '本次改动行数(+插入 / −删除)' : 'lines changed (+insert / −delete)'">
-                        <span class="diff-badge-plus" x-show="(editDiffStats(m)?.plus ?? 0) > 0"
-                              x-text="'+' + (editDiffStats(m)?.plus ?? 0)"></span>
-                        <span class="diff-badge-minus" x-show="(editDiffStats(m)?.minus ?? 0) > 0"
-                              x-text="'−' + (editDiffStats(m)?.minus ?? 0)"></span>
-                      </span>
-                    </template>
                     <!-- MCP input preview: compact key:val · key:val list -->
                     <template x-if="!toolFilePath(m) && m.name && m.name.startsWith('mcp__') && mcpInputPreview(m)">
                       <span class="tool-arg mcp-input-preview" x-text="mcpInputPreview(m)"></span>

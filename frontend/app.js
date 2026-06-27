@@ -6007,7 +6007,7 @@ function portal() {
 
     // Find the matching tool_use for a given tool_result by walking
     // backwards through messages and matching tool_use_id. Used by the
-    // diff-badge renderer to count +/- on Edit/Write/MultiEdit.
+    // diff preview renderer to count +/- on Edit/Write/MultiEdit.
     findToolUseFor(toolResult, fromIdx) {
       if (!toolResult || fromIdx === undefined || fromIdx === null) return null;
       const id = toolResult.tool_use_id || toolResult.tool_id;

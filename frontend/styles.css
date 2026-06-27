@@ -8386,32 +8386,6 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
 .mcp-result-text p:last-child  { margin-bottom: 0; }
 
 /* ============================================================
-   Edit / Write / MultiEdit — +X/−Y diff badge in tool bubble.
-   ============================================================ */
-.diff-badge {
-  display: inline-flex;
-  gap: 5px;
-  margin-left: var(--sp-2);
-  font-family: monospace;
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  align-items: center;
-  cursor: help;
-}
-.diff-badge-plus {
-  color: #16a34a;
-  background: rgba(22, 163, 74, 0.1);
-  padding: 1px 6px;
-  border-radius: var(--r-sm);
-}
-.diff-badge-minus {
-  color: #dc2626;
-  background: rgba(220, 38, 38, 0.1);
-  padding: 1px 6px;
-  border-radius: var(--r-sm);
-}
-
-/* ============================================================
    Grep / Glob — clickable search hits replacing raw <pre>.
    ============================================================ */
 .search-hits-list {
@@ -8679,14 +8653,6 @@ html[data-theme="eyecare"] .diff-body-cr .diff-line.diff-ins .diff-sign,
 html[data-theme="eyecare"] .diff-strip-plus { color: #5e8a56; }
 html[data-theme="eyecare"] .diff-body-cr .diff-line.diff-del .diff-sign,
 html[data-theme="eyecare"] .diff-strip-minus { color: #aa503c; }
-
-/* ---- Diff badge on tool bubble ---- */
-.diff-badge-plus  { color: #22c55e; background: rgba(34, 197, 94, 0.14); }
-.diff-badge-minus { color: #ef4444; background: rgba(239, 68, 68, 0.12); }
-html[data-theme="light"] .diff-badge-plus  { color: #16a34a; background: rgba(22, 163, 74, 0.10); }
-html[data-theme="light"] .diff-badge-minus { color: #dc2626; background: rgba(220, 38, 38, 0.08); }
-html[data-theme="eyecare"] .diff-badge-plus  { color: #5e8a56; background: rgba(94, 138, 86, 0.12); }
-html[data-theme="eyecare"] .diff-badge-minus { color: #aa503c; background: rgba(170, 80, 60, 0.10); }
 
 /* ---- Task log lines (plan panel) ---- */
 .task-log-line {
