@@ -513,6 +513,9 @@ function portal() {
       useReferences: false,
       loading: false,
       images: [],
+      jobs: [],
+      jobsLoading: false,
+      pollTimer: null,
       error: "",
     },
     // Flipped true inside sendMessage when the user clicks send while an
@@ -2991,14 +2994,49 @@ function portal() {
       if (!this.imageGen.prompt && this.input.trim()) {
         this.imageGen.prompt = this.input.trim();
       }
+      this.refreshImageGenJobs();
+      this.ensureImageGenPolling();
       this.$nextTick(() => {
         const ta = this.$refs.imageGenPrompt;
         if (ta) ta.focus();
       });
     },
     closeImageGen() {
-      if (this.imageGen.loading) return;
       this.imageGen.show = false;
+    },
+    ensureImageGenPolling() {
+      if (this.imageGen.pollTimer) return;
+      this.imageGen.pollTimer = setInterval(() => {
+        const hasRunning = (this.imageGen.jobs || [])
+          .some(j => j && (j.status === "queued" || j.status === "running"));
+        if (!this.imageGen.show && !hasRunning) {
+          clearInterval(this.imageGen.pollTimer);
+          this.imageGen.pollTimer = null;
+          return;
+        }
+        this.refreshImageGenJobs({ silent: true });
+      }, 3000);
+    },
+    async refreshImageGenJobs(opts = {}) {
+      if (this.imageGen.jobsLoading && opts.silent) return;
+      this.imageGen.jobsLoading = !opts.silent;
+      try {
+        const r = await fetch("/api/chat/image-generate/jobs?limit=60", {
+          headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        this.imageGen.jobs = d.jobs || [];
+        const hasRunning = this.imageGen.jobs
+          .some(j => j && (j.status === "queued" || j.status === "running"));
+        if (hasRunning) this.ensureImageGenPolling();
+      } catch (e) {
+        if (!opts.silent) {
+          this.imageGen.error = e && e.message ? e.message : String(e || "");
+        }
+      } finally {
+        if (!opts.silent) this.imageGen.jobsLoading = false;
+      }
     },
     imageGenReferenceIds() {
       if (!this.imageGen.useReferences) return [];
@@ -3012,7 +3050,7 @@ function portal() {
       this.imageGen.loading = true;
       this.imageGen.error = "";
       try {
-        const r = await fetch("/api/chat/image-generate", {
+        const r = await fetch("/api/chat/image-generate/jobs", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -3036,20 +3074,24 @@ function portal() {
           throw new Error(msg || `HTTP ${r.status}`);
         }
         const d = await r.json();
-        this.imageGen.images = d.images || [];
-        if (!this.imageGen.images.length) {
-          throw new Error(this.lang === "zh" ? "没有返回图片" : "No image returned");
+        const job = d.job;
+        if (job && job.id) {
+          this.imageGen.jobs = [job].concat((this.imageGen.jobs || [])
+            .filter(x => x && x.id !== job.id));
         }
+        this.toast(this.lang === "zh" ? "生图任务已提交" : "Image job submitted",
+                   "success", 1800);
+        this.ensureImageGenPolling();
       } catch (e) {
         const msg = e && e.message ? e.message : String(e || "");
         this.imageGen.error = msg;
-        this.toast((this.lang === "zh" ? "生图失败：" : "Image generation failed: ") + msg,
+        this.toast((this.lang === "zh" ? "提交失败：" : "Submit failed: ") + msg,
                    "error", 5000);
       } finally {
         this.imageGen.loading = false;
       }
     },
-    attachGeneratedImage(img) {
+    async attachGeneratedImage(img) {
       if (!img || !img.id) return;
       const entry = {
         id: img.id,
@@ -3064,6 +3106,39 @@ function portal() {
       this.toast(this.lang === "zh" ? "已加入当前消息" : "Added to current message",
                  "success", 1800);
       this.imageGen.show = false;
+    },
+    async attachImageGenHistory(job, img) {
+      if (!job || !job.id || !img || !img.image_id) return;
+      try {
+        const r = await fetch(
+          `/api/chat/image-generate/jobs/${encodeURIComponent(job.id)}/attach/${encodeURIComponent(img.image_id)}`,
+          { method: "POST", headers: this.hdr() },
+        );
+        if (!r.ok) {
+          let msg = "";
+          try {
+            const d = await r.json();
+            msg = d.detail || "";
+          } catch (_) {
+            try { msg = await r.text(); } catch (_) {}
+          }
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
+        const d = await r.json();
+        await this.attachGeneratedImage(d.image);
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e || "");
+        this.toast((this.lang === "zh" ? "加入失败：" : "Attach failed: ") + msg,
+                   "error", 4000);
+      }
+    },
+    imageGenStatusLabel(status) {
+      const zh = this.lang === "zh";
+      if (status === "queued") return zh ? "排队中" : "Queued";
+      if (status === "running") return zh ? "生成中" : "Running";
+      if (status === "succeeded") return zh ? "已完成" : "Done";
+      if (status === "failed") return zh ? "失败" : "Failed";
+      return status || "";
     },
 
     // Alias for use in inline x-html (shorter name reads better in markup).

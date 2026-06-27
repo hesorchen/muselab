@@ -36,9 +36,11 @@ uses the native OpenAI Image API when `OPENAI_IMAGE_API_KEY` (or
 `MUSELAB_IMAGE_PROVIDER=openai` or `codex_imagegen` to force one path.
 
 Generated images are staged as normal muselab image attachments, so they can be
-previewed, annotated, and sent into the current chat. The Codex imagegen path is
-intended for localhost single-user deployments; do not expose a muselab instance
-with local Codex access to the public internet.
+previewed, annotated, and sent into the current chat. Image requests run as
+background jobs and are also kept in the image history drawer, so refreshing the
+page does not lose completed outputs. The Codex imagegen path is intended for
+localhost single-user deployments; do not expose a muselab instance with local
+Codex access to the public internet.
 
 ## Switching model mid-conversation
 

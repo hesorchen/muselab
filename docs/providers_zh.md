@@ -29,8 +29,9 @@ API；如果没有图片 API key，则尝试通过本机已登录的 `codex` CLI
 `codex_imagegen` 强制指定通路。
 
 生成结果会作为普通 muselab 图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。
-Codex imagegen 通路只适合 localhost 单用户部署；不要把带本机 Codex 能力的
-muselab 实例暴露到公网。
+生图请求会作为后台任务执行，并保留在生图历史里，刷新页面也不会丢掉已完成结果。
+Codex imagegen 通路只适合 localhost 单用户部署；不要把带本机 Codex 能力的 muselab
+实例暴露到公网。
 
 ## 对话中切换模型
 

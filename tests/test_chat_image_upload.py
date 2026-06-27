@@ -312,3 +312,50 @@ def test_image_generate_codex_imagegen_falls_back_to_codex_generated_dir(
     staged = chat._image_store[img["id"]]
     assert staged["mime"] == "image/png"
     assert base64.b64decode(staged["b64"]) == PNG_1X1
+
+
+def test_image_generate_history_lists_and_attaches(client, auth):
+    from backend import chat
+
+    job_id = "jobhist1"
+    image_id = "imghist1"
+    job_dir = chat._IMAGEGEN_FILES / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "image-1.png").write_bytes(PNG_1X1)
+    chat._imagegen_put_job({
+        "id": job_id,
+        "status": "succeeded",
+        "prompt": "muselab github icon",
+        "model": "codex-imagegen",
+        "provider": "codex_imagegen",
+        "size": "1024x1024",
+        "quality": "low",
+        "output_format": "png",
+        "n": 1,
+        "error": "",
+        "images": [{
+            "image_id": image_id,
+            "file": "image-1.png",
+            "name": "image-1.png",
+            "mime": "image/png",
+            "bytes": len(PNG_1X1),
+            "attach_ext": "png",
+        }],
+        "created_at": 123.0,
+        "updated_at": 124.0,
+    })
+
+    r = client.get("/api/chat/image-generate/jobs", headers=auth)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    job = next(j for j in body["jobs"] if j["id"] == job_id)
+    assert job["images"][0]["data_url"].startswith("data:image/png;base64,")
+
+    r = client.post(
+        f"/api/chat/image-generate/jobs/{job_id}/attach/{image_id}",
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    img = r.json()["image"]
+    assert img["id"]
+    assert base64.b64decode(chat._image_store[img["id"]]["b64"]) == PNG_1X1

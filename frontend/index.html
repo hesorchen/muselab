@@ -3040,18 +3040,47 @@
           <span x-text="lang==='zh' ? '用当前待发送图片作为参考' : 'Use current pending images as references'"></span>
         </label>
         <div class="settings-hint warn" x-show="imageGen.error" x-text="imageGen.error"></div>
-        <div class="image-gen-results" x-show="imageGen.images.length">
-          <template x-for="img in imageGen.images" :key="img.id">
-            <div class="image-gen-card">
-              <button type="button" class="image-gen-preview"
-                      @click="openLightbox(img.data_url, img.name)">
-                <img :src="img.data_url" alt="" />
-              </button>
-              <div class="image-gen-card-foot">
-                <span x-text="img.name"></span>
-                <button class="btn-primary sm"
-                        @click="attachGeneratedImage(img)"
-                        x-text="lang==='zh' ? '加入消息' : 'Attach'"></button>
+        <div class="image-gen-history-head">
+          <span x-text="lang==='zh' ? '历史生成' : 'History'"></span>
+          <button class="btn-ghost sm" type="button"
+                  @click="refreshImageGenJobs()"
+                  :disabled="imageGen.jobsLoading"
+                  x-text="imageGen.jobsLoading ? (lang==='zh' ? '刷新中…' : 'Refreshing…') : (lang==='zh' ? '刷新' : 'Refresh')"></button>
+        </div>
+        <div class="image-gen-empty" x-show="!imageGen.jobs.length && !imageGen.jobsLoading"
+             x-text="lang==='zh' ? '还没有生成记录。' : 'No generated images yet.'"></div>
+        <div class="image-gen-results" x-show="imageGen.jobs.length">
+          <template x-for="job in imageGen.jobs" :key="job.id">
+            <div class="image-gen-job" :class="'status-' + job.status">
+              <div class="image-gen-job-head">
+                <div class="image-gen-job-title">
+                  <span class="image-gen-status" x-text="imageGenStatusLabel(job.status)"></span>
+                  <span x-text="job.provider || job.model || 'imagegen'"></span>
+                </div>
+                <span class="image-gen-job-time" x-text="fmtHM((job.updated_at || job.created_at) * 1000)"></span>
+              </div>
+              <div class="image-gen-job-prompt" x-text="job.prompt"></div>
+              <div class="settings-hint warn" x-show="job.error" x-text="job.error"></div>
+              <div class="image-gen-job-pending"
+                   x-show="job.status === 'queued' || job.status === 'running'">
+                <span class="thinking-dots"><span></span><span></span><span></span></span>
+                <span x-text="lang==='zh' ? '后台生成中，可以关闭这个窗口。' : 'Generating in the background. You can close this window.'"></span>
+              </div>
+              <div class="image-gen-job-grid" x-show="job.images && job.images.length">
+                <template x-for="img in (job.images || [])" :key="img.image_id">
+                  <div class="image-gen-card">
+                    <button type="button" class="image-gen-preview"
+                            @click="openLightbox(img.data_url, img.name)">
+                      <img :src="img.data_url" alt="" />
+                    </button>
+                    <div class="image-gen-card-foot">
+                      <span x-text="img.name"></span>
+                      <button class="btn-primary sm"
+                              @click="attachImageGenHistory(job, img)"
+                              x-text="lang==='zh' ? '加入消息' : 'Attach'"></button>
+                    </div>
+                  </div>
+                </template>
               </div>
             </div>
           </template>
@@ -3059,12 +3088,11 @@
       </div>
       <div class="modal-foot">
         <button class="btn-ghost" @click="closeImageGen()"
-                :disabled="imageGen.loading"
                 x-text="t('btn.cancel')"></button>
         <button class="btn-primary"
                 @click="runImageGen()"
                 :disabled="imageGen.loading || !imageGen.prompt.trim()"
-                x-text="imageGen.loading ? (lang==='zh' ? '生成中…' : 'Generating…') : (lang==='zh' ? '生成' : 'Generate')"></button>
+                x-text="imageGen.loading ? (lang==='zh' ? '提交中…' : 'Submitting…') : (lang==='zh' ? '提交后台任务' : 'Submit job')"></button>
       </div>
     </div>
   </div>

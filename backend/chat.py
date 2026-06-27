@@ -5179,6 +5179,12 @@ _IMAGE_FILE_MIME = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
 }
+_IMAGEGEN_ROOT = ROOT / ".muselab" / "imagegen"
+_IMAGEGEN_FILES = _IMAGEGEN_ROOT / "files"
+_IMAGEGEN_JOBS_PATH = _IMAGEGEN_ROOT / "jobs.json"
+_IMAGEGEN_JOBS_MAX = 200
+_imagegen_jobs_lock = threading.RLock()
+_imagegen_jobs: dict[str, dict] | None = None
 
 
 def _validate_image_size(size: str) -> str:
@@ -5312,6 +5318,215 @@ def _stage_generated_image_bytes(raw: bytes, mime: str, idx: int) -> dict:
     if len(raw) > _IMAGE_MAX_BYTES:
         raise HTTPException(502, "image generation returned an image over the local 10MB limit")
     return _stage_generated_image(base64.b64encode(raw).decode("ascii"), mime, idx)
+
+
+def _imagegen_load_jobs() -> dict[str, dict]:
+    global _imagegen_jobs
+    with _imagegen_jobs_lock:
+        if _imagegen_jobs is not None:
+            return _imagegen_jobs
+        jobs: dict[str, dict] = {}
+        try:
+            raw = json.loads(_IMAGEGEN_JOBS_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                raw_jobs = raw.get("jobs", {})
+                if isinstance(raw_jobs, dict):
+                    for jid, job in raw_jobs.items():
+                        if not isinstance(jid, str) or not isinstance(job, dict):
+                            continue
+                        # A process restart loses in-flight asyncio tasks; make
+                        # that visible instead of leaving history stuck forever.
+                        if job.get("status") in {"queued", "running"}:
+                            job = {
+                                **job,
+                                "status": "failed",
+                                "error": "image generation was interrupted by backend restart",
+                                "updated_at": time.time(),
+                            }
+                        jobs[jid] = job
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[muselab] failed to load imagegen jobs: {e}",
+                  file=sys.stderr, flush=True)
+        _imagegen_jobs = jobs
+        return _imagegen_jobs
+
+
+def _imagegen_save_jobs_locked() -> None:
+    jobs = _imagegen_jobs or {}
+    ordered = dict(sorted(
+        jobs.items(),
+        key=lambda kv: float(kv[1].get("created_at") or 0),
+        reverse=True,
+    )[:_IMAGEGEN_JOBS_MAX])
+    jobs.clear()
+    jobs.update(ordered)
+    atomic_write_text(_IMAGEGEN_JOBS_PATH, json.dumps({"jobs": jobs}, ensure_ascii=False))
+
+
+def _imagegen_put_job(job: dict) -> dict:
+    with _imagegen_jobs_lock:
+        jobs = _imagegen_load_jobs()
+        jobs[job["id"]] = job
+        _imagegen_save_jobs_locked()
+        return job
+
+
+def _imagegen_update_job(job_id: str, **patch: Any) -> dict | None:
+    with _imagegen_jobs_lock:
+        jobs = _imagegen_load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return None
+        job.update(patch)
+        job["updated_at"] = time.time()
+        _imagegen_save_jobs_locked()
+        return job
+
+
+def _imagegen_job_file(job: dict, img: dict) -> Path:
+    rel = str(img.get("file") or "")
+    if not rel:
+        raise HTTPException(404, "image file missing")
+    base = (_IMAGEGEN_FILES / str(job.get("id") or "")).resolve()
+    p = (base / rel).resolve()
+    try:
+        p.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, "invalid image file path") from None
+    return p
+
+
+def _imagegen_public_image(job: dict, img: dict, *, include_data: bool) -> dict:
+    out = {
+        "job_id": job.get("id"),
+        "image_id": img.get("image_id"),
+        "name": img.get("name"),
+        "mime": img.get("mime"),
+        "bytes": img.get("bytes"),
+        "attach_ext": img.get("attach_ext"),
+    }
+    if include_data:
+        try:
+            raw = _imagegen_job_file(job, img).read_bytes()
+            out["data_url"] = (
+                f"data:{img.get('mime') or 'image/png'};"
+                f"base64,{base64.b64encode(raw).decode('ascii')}"
+            )
+        except OSError:
+            out["missing"] = True
+    return out
+
+
+def _imagegen_public_job(job: dict, *, include_data: bool = True) -> dict:
+    images = job.get("images") if isinstance(job.get("images"), list) else []
+    return {
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "prompt": job.get("prompt"),
+        "model": job.get("model"),
+        "provider": job.get("provider"),
+        "size": job.get("size"),
+        "quality": job.get("quality"),
+        "output_format": job.get("output_format"),
+        "n": job.get("n"),
+        "error": job.get("error") or "",
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "images": [_imagegen_public_image(job, img, include_data=include_data)
+                   for img in images if isinstance(img, dict)],
+    }
+
+
+def _imagegen_list_jobs(limit: int) -> list[dict]:
+    with _imagegen_jobs_lock:
+        jobs = list(_imagegen_load_jobs().values())
+    jobs.sort(key=lambda j: float(j.get("created_at") or 0), reverse=True)
+    return [_imagegen_public_job(j, include_data=True) for j in jobs[:max(1, min(limit, 100))]]
+
+
+def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
+    images = result.get("images") if isinstance(result, dict) else None
+    if not isinstance(images, list):
+        return []
+    job_dir = _IMAGEGEN_FILES / job["id"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    persisted: list[dict] = []
+    for idx, img in enumerate(images, start=1):
+        if not isinstance(img, dict):
+            continue
+        data_url = str(img.get("data_url") or "")
+        marker = ";base64,"
+        if marker not in data_url:
+            continue
+        mime = str(img.get("mime") or data_url[5:data_url.find(";")] or "image/png")
+        try:
+            raw = base64.b64decode(data_url.split(marker, 1)[1], validate=True)
+        except Exception:
+            continue
+        ext = str(img.get("attach_ext") or "png").lower()
+        if ext == "jpg":
+            ext = "jpeg"
+        if ext not in {"png", "jpeg", "webp"}:
+            ext = "png"
+        filename = f"image-{idx}.{ext}"
+        (job_dir / filename).write_bytes(raw)
+        persisted.append({
+            "image_id": uuid.uuid4().hex,
+            "file": filename,
+            "name": img.get("name") or filename,
+            "mime": mime,
+            "bytes": len(raw),
+            "attach_ext": "jpg" if ext == "jpeg" else ext,
+        })
+    return persisted
+
+
+async def _run_imagegen_job(job_id: str, req: ImageGenerateReq, image_ids: list[str]) -> None:
+    _imagegen_update_job(job_id, status="running", error="")
+    try:
+        prompt = req.prompt.strip()
+        model = req.model.strip() or "gpt-image-2"
+        size = _validate_image_size(req.size)
+        quality = (req.quality or "low").strip()
+        output_format = (req.output_format or "png").strip().lower()
+        provider = _image_provider()
+        if provider == "codex":
+            result = await _generate_codex_imagegen(
+                req=req,
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                output_format=output_format,
+                image_ids=image_ids,
+            )
+        else:
+            result = await _generate_openai_image_api(
+                req=req,
+                prompt=prompt,
+                model=model,
+                size=size,
+                quality=quality,
+                output_format=output_format,
+                image_ids=image_ids,
+            )
+        with _imagegen_jobs_lock:
+            jobs = _imagegen_load_jobs()
+            job = jobs.get(job_id)
+            if not job:
+                return
+            job["provider"] = result.get("provider")
+            job["model"] = result.get("model") or model
+            job["images"] = _persist_imagegen_result(job, result)
+            job["status"] = "succeeded" if job["images"] else "failed"
+            job["error"] = "" if job["images"] else "image generation returned no images"
+            job["updated_at"] = time.time()
+            _imagegen_save_jobs_locked()
+    except HTTPException as e:
+        _imagegen_update_job(job_id, status="failed", error=str(e.detail))
+    except Exception as e:
+        _imagegen_update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
 
 
 def _image_file_mime(path: Path) -> str | None:
@@ -5714,6 +5929,82 @@ async def generate_image(req: ImageGenerateReq) -> dict:
         output_format=output_format,
         image_ids=image_ids,
     )
+
+
+@router.post("/image-generate/jobs", dependencies=[Depends(require_token)])
+async def create_image_generate_job(req: ImageGenerateReq) -> dict:
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+    model = req.model.strip() or "gpt-image-2"
+    if not _IMAGE_MODEL_RE.fullmatch(model):
+        raise HTTPException(400, "invalid image model")
+    size = _validate_image_size(req.size)
+    quality = (req.quality or "low").strip()
+    if quality not in {"low", "medium", "high", "auto"}:
+        raise HTTPException(400, "invalid image quality")
+    output_format = (req.output_format or "png").strip().lower()
+    if output_format not in _IMAGE_OUTPUT_MIME:
+        raise HTTPException(400, "invalid image output format")
+    image_ids = [x.strip() for x in (req.image_ids or []) if isinstance(x, str) and x.strip()]
+
+    now = time.time()
+    job = {
+        "id": uuid.uuid4().hex,
+        "status": "queued",
+        "prompt": prompt,
+        "model": model,
+        "provider": None,
+        "size": size,
+        "quality": quality,
+        "output_format": output_format,
+        "n": req.n,
+        "error": "",
+        "images": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    _imagegen_put_job(job)
+    task = asyncio.create_task(_run_imagegen_job(job["id"], req, image_ids))
+    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
+
+
+@router.get("/image-generate/jobs", dependencies=[Depends(require_token)])
+async def list_image_generate_jobs(limit: int = Query(40, ge=1, le=100)) -> dict:
+    return {"ok": True, "jobs": _imagegen_list_jobs(limit)}
+
+
+@router.get("/image-generate/jobs/{job_id}", dependencies=[Depends(require_token)])
+async def get_image_generate_job(job_id: str) -> dict:
+    with _imagegen_jobs_lock:
+        job = _imagegen_load_jobs().get(job_id)
+    if not job:
+        raise HTTPException(404, "image generation job not found")
+    return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
+
+
+@router.post("/image-generate/jobs/{job_id}/attach/{image_id}",
+             dependencies=[Depends(require_token)])
+async def attach_image_generate_job_image(job_id: str, image_id: str) -> dict:
+    with _imagegen_jobs_lock:
+        job = _imagegen_load_jobs().get(job_id)
+        if not job:
+            raise HTTPException(404, "image generation job not found")
+        images = job.get("images") if isinstance(job.get("images"), list) else []
+        img = next((x for x in images
+                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    if not img:
+        raise HTTPException(404, "image generation image not found")
+    try:
+        raw = _imagegen_job_file(job, img).read_bytes()
+    except OSError:
+        raise HTTPException(404, "image file missing") from None
+    item = _stage_generated_image_bytes(raw, img.get("mime") or "image/png", 1)
+    if img.get("name"):
+        _image_store[item["id"]]["name"] = img["name"]
+        item["name"] = img["name"]
+    return {"ok": True, "image": item}
 
 
 def _xlsx_to_text(body: bytes, name: str) -> str:

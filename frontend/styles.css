@@ -4271,9 +4271,102 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-fg-2);
 }
 .image-gen-results {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 12px;
+}
+.image-gen-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 2px;
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  color: var(--c-fg-1);
+}
+.image-gen-empty {
+  padding: 16px;
+  border: 1px dashed var(--c-border);
+  border-radius: var(--r-md);
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+.image-gen-job {
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  padding: 10px;
+}
+.image-gen-job.status-failed {
+  border-color: color-mix(in srgb, var(--c-warning, #b45309) 45%, var(--c-border));
+}
+.image-gen-job-head,
+.image-gen-job-title,
+.image-gen-job-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.image-gen-job-head {
+  justify-content: space-between;
+  min-width: 0;
+}
+.image-gen-job-title {
+  min-width: 0;
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+}
+.image-gen-status {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--c-bg-2);
+  color: var(--c-fg-1);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.status-running .image-gen-status,
+.status-queued .image-gen-status {
+  background: color-mix(in srgb, var(--c-accent) 14%, var(--c-bg-2));
+  color: var(--c-accent);
+}
+.status-succeeded .image-gen-status {
+  background: color-mix(in srgb, #10b981 14%, var(--c-bg-2));
+  color: #047857;
+}
+.status-failed .image-gen-status {
+  background: color-mix(in srgb, var(--c-warning, #b45309) 16%, var(--c-bg-2));
+  color: var(--c-warning, #b45309);
+}
+.image-gen-job-time {
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.image-gen-job-prompt {
+  margin-top: 8px;
+  color: var(--c-fg-1);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.image-gen-job-pending {
+  margin-top: 10px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
+}
+.image-gen-job-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
 }
 .image-gen-card {
   border: 1px solid var(--c-border);
@@ -4329,6 +4422,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
     grid-column: 1 / -1;
   }
   .image-gen-results {
+    gap: 10px;
+  }
+  .image-gen-job-grid {
     grid-template-columns: 1fr;
   }
 }
