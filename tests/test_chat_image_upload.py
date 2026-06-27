@@ -349,7 +349,12 @@ def test_image_generate_history_lists_and_attaches(client, auth):
     assert r.status_code == 200, r.text
     body = r.json()
     job = next(j for j in body["jobs"] if j["id"] == job_id)
-    assert job["images"][0]["data_url"].startswith("data:image/png;base64,")
+    assert job["images"][0]["url"].endswith(f"/image-generate/jobs/{job_id}/images/{image_id}")
+    assert "data_url" not in job["images"][0]
+
+    r = client.get(job["images"][0]["url"], headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.content == PNG_1X1
 
     r = client.post(
         f"/api/chat/image-generate/jobs/{job_id}/attach/{image_id}",

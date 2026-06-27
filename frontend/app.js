@@ -3020,9 +3020,12 @@ function portal() {
     async refreshImageGenJobs(opts = {}) {
       if (this.imageGen.jobsLoading && opts.silent) return;
       this.imageGen.jobsLoading = !opts.silent;
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 20000);
       try {
         const r = await fetch("/api/chat/image-generate/jobs?limit=60", {
           headers: this.hdr(),
+          signal: ac.signal,
         });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = await r.json();
@@ -3032,9 +3035,12 @@ function portal() {
         if (hasRunning) this.ensureImageGenPolling();
       } catch (e) {
         if (!opts.silent) {
-          this.imageGen.error = e && e.message ? e.message : String(e || "");
+          this.imageGen.error = e && e.name === "AbortError"
+            ? (this.lang === "zh" ? "刷新超时" : "Refresh timed out")
+            : (e && e.message ? e.message : String(e || ""));
         }
       } finally {
+        clearTimeout(timer);
         if (!opts.silent) this.imageGen.jobsLoading = false;
       }
     },
@@ -4070,6 +4076,11 @@ function portal() {
     },
 
     hdr() { return { "X-Auth-Token": this.token }; },
+    authedUrl(path) {
+      if (!path) return "";
+      const sep = path.includes("?") ? "&" : "?";
+      return `${path}${sep}token=${encodeURIComponent(this.token || "")}`;
+    },
 
     // ===== unified fetch wrapper =====
     // Consolidates the ~60 hand-written fetch calls. Auto-attaches token

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, Field
 from claude_agent_sdk import (
@@ -5399,13 +5400,19 @@ def _imagegen_job_file(job: dict, img: dict) -> Path:
 
 
 def _imagegen_public_image(job: dict, img: dict, *, include_data: bool) -> dict:
+    job_id = str(job.get("id") or "")
+    image_id = str(img.get("image_id") or "")
     out = {
-        "job_id": job.get("id"),
-        "image_id": img.get("image_id"),
+        "job_id": job_id,
+        "image_id": image_id,
         "name": img.get("name"),
         "mime": img.get("mime"),
         "bytes": img.get("bytes"),
         "attach_ext": img.get("attach_ext"),
+        "url": (
+            f"/api/chat/image-generate/jobs/{urllib.parse.quote(job_id, safe='')}"
+            f"/images/{urllib.parse.quote(image_id, safe='')}"
+        ) if job_id and image_id else "",
     }
     if include_data:
         try:
@@ -5443,7 +5450,7 @@ def _imagegen_list_jobs(limit: int) -> list[dict]:
     with _imagegen_jobs_lock:
         jobs = list(_imagegen_load_jobs().values())
     jobs.sort(key=lambda j: float(j.get("created_at") or 0), reverse=True)
-    return [_imagegen_public_job(j, include_data=True) for j in jobs[:max(1, min(limit, 100))]]
+    return [_imagegen_public_job(j, include_data=False) for j in jobs[:max(1, min(limit, 100))]]
 
 
 def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
@@ -5982,6 +5989,28 @@ async def get_image_generate_job(job_id: str) -> dict:
     if not job:
         raise HTTPException(404, "image generation job not found")
     return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
+
+
+@router.get("/image-generate/jobs/{job_id}/images/{image_id}",
+            dependencies=[Depends(require_token)])
+async def get_image_generate_job_image(job_id: str, image_id: str) -> FileResponse:
+    with _imagegen_jobs_lock:
+        job = _imagegen_load_jobs().get(job_id)
+        if not job:
+            raise HTTPException(404, "image generation job not found")
+        images = job.get("images") if isinstance(job.get("images"), list) else []
+        img = next((x for x in images
+                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    if not img:
+        raise HTTPException(404, "image generation image not found")
+    path = _imagegen_job_file(job, img)
+    if not path.exists():
+        raise HTTPException(404, "image file missing")
+    return FileResponse(
+        path,
+        media_type=img.get("mime") or "image/png",
+        filename=img.get("name") or path.name,
+    )
 
 
 @router.post("/image-generate/jobs/{job_id}/attach/{image_id}",

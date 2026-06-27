@@ -3070,8 +3070,8 @@
                 <template x-for="img in (job.images || [])" :key="img.image_id">
                   <div class="image-gen-card">
                     <button type="button" class="image-gen-preview"
-                            @click="openLightbox(img.data_url, img.name)">
-                      <img :src="img.data_url" alt="" />
+                            @click="openLightbox(img.data_url || authedUrl(img.url), img.name)">
+                      <img :src="img.data_url || authedUrl(img.url)" alt="" />
                     </button>
                     <div class="image-gen-card-foot">
                       <span x-text="img.name"></span>
