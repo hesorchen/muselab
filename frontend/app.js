@@ -502,6 +502,22 @@ function portal() {
       _snapshot: null,       // ImageData captured at pointerdown (for rect/arrow live preview)
       _baseBitmap: null,     // original ImageBitmap — used by eraser
     },
+    imageGen: {
+      show: false,
+      prompt: "",
+      model: "gpt-image-2",
+      size: "1024x1024",
+      quality: "low",
+      output_format: "png",
+      n: 1,
+      useReferences: false,
+      loading: false,
+      jobs: [],
+      blobUrls: [],
+      jobsLoading: false,
+      pollTimer: null,
+      error: "",
+    },
     // Flipped true inside sendMessage when the user clicks send while an
     // attachment upload is still in flight. Disables the send button so a
     // double-click can't enqueue two sends. Auto-resets when the wait
@@ -552,6 +568,10 @@ function portal() {
     // rateLimit changes, NOT per render, so the toolbar x-show is a cheap
     // property read. null = nothing to show.
     rlBadge: null,
+    // Codex Gateway quota snapshot. Backend reads only local Codex session
+    // JSONL rate-limit events; it never touches Codex OAuth credentials.
+    codexLimit: { windows: {}, updated_at: 0, ok: false },
+    codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
     atBottom: true,
@@ -841,6 +861,11 @@ function portal() {
         url: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application/v2",
         zh: "去百度智能云千帆控制台创建应用，获取 API key（ERNIE 系列走此 key）。注意需要 IAM 鉴权，非普通 sk-xxx 格式。",
         en: "Create an app in Baidu Qianfan console to get an API key (for ERNIE models). Note: IAM auth, not plain sk-xxx format.",
+      },
+      CODEX_GATEWAY_API_KEY: {
+        url: "docs/codex-gateway.md",
+        zh: "连接你本机 127.0.0.1 上的 Codex Gateway。muselab 不保存 Codex OAuth 凭据，也不直接调用 OpenAI 原生接口。",
+        en: "Connect your local Codex Gateway on 127.0.0.1. muselab does not store Codex OAuth credentials or call OpenAI-native APIs directly.",
       },
     },
 
@@ -2963,6 +2988,167 @@ function portal() {
       }
     },
 
+    openImageGen() {
+      this.imageGen.show = true;
+      this.imageGen.error = "";
+      if (!this.imageGen.prompt && this.input.trim()) {
+        this.imageGen.prompt = this.input.trim();
+      }
+      this.refreshImageGenJobs();
+      this.ensureImageGenPolling();
+      this.$nextTick(() => {
+        const ta = this.$refs.imageGenPrompt;
+        if (ta) ta.focus();
+      });
+    },
+    closeImageGen() {
+      this.imageGen.show = false;
+    },
+    ensureImageGenPolling() {
+      if (this.imageGen.pollTimer) return;
+      this.imageGen.pollTimer = setInterval(() => {
+        const hasRunning = (this.imageGen.jobs || [])
+          .some(j => j && (j.status === "queued" || j.status === "running"));
+        if (!this.imageGen.show && !hasRunning) {
+          clearInterval(this.imageGen.pollTimer);
+          this.imageGen.pollTimer = null;
+          return;
+        }
+        this.refreshImageGenJobs({ silent: true });
+      }, 3000);
+    },
+    async refreshImageGenJobs(opts = {}) {
+      if (this.imageGen.jobsLoading && opts.silent) return;
+      this.imageGen.jobsLoading = !opts.silent;
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 20000);
+      try {
+        const res = await this.api("/api/chat/image-generate/jobs", {
+          query: { limit: 60 },
+          signal: ac.signal,
+        });
+        if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
+        const jobs = res.data.jobs || [];
+        this.cleanupImageGenBlobUrls();
+        await this.hydrateImageGenJobImages(jobs);
+        this.imageGen.jobs = jobs;
+        const hasRunning = this.imageGen.jobs
+          .some(j => j && (j.status === "queued" || j.status === "running"));
+        if (hasRunning) this.ensureImageGenPolling();
+      } catch (e) {
+        if (!opts.silent) {
+          this.imageGen.error = e && e.name === "AbortError"
+            ? (this.lang === "zh" ? "刷新超时" : "Refresh timed out")
+            : (e && e.message ? e.message : String(e || ""));
+        }
+      } finally {
+        clearTimeout(timer);
+        if (!opts.silent) this.imageGen.jobsLoading = false;
+      }
+    },
+    cleanupImageGenBlobUrls() {
+      for (const url of (this.imageGen.blobUrls || [])) {
+        try { URL.revokeObjectURL(url); } catch (_) {}
+      }
+      this.imageGen.blobUrls = [];
+    },
+    async hydrateImageGenJobImages(jobs) {
+      const tasks = [];
+      for (const job of (jobs || [])) {
+        for (const img of ((job && job.images) || [])) {
+          if (!img || img.data_url || !img.url) continue;
+          tasks.push(this.api(img.url, { responseType: "blob" }).then(res => {
+            if (!res.ok || !res.data) return;
+            const url = URL.createObjectURL(res.data);
+            img.blob_url = url;
+            this.imageGen.blobUrls.push(url);
+          }));
+        }
+      }
+      await Promise.allSettled(tasks);
+    },
+    imageGenReferenceIds() {
+      if (!this.imageGen.useReferences) return [];
+      return (this.pendingImages || [])
+        .filter(x => x && x.id && !x.uploading && !x.error)
+        .map(x => x.id);
+    },
+    async runImageGen() {
+      const prompt = (this.imageGen.prompt || "").trim();
+      if (!prompt || this.imageGen.loading) return;
+      this.imageGen.loading = true;
+      this.imageGen.error = "";
+      try {
+        const res = await this.api("/api/chat/image-generate/jobs", {
+          method: "POST",
+          json: {
+            prompt,
+            model: this.imageGen.model || "gpt-image-2",
+            size: this.imageGen.size || "1024x1024",
+            quality: this.imageGen.quality || "low",
+            output_format: this.imageGen.output_format || "png",
+            n: Number(this.imageGen.n || 1),
+            image_ids: this.imageGenReferenceIds(),
+          },
+        });
+        if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
+        const job = res.data.job;
+        if (job && job.id) {
+          this.imageGen.jobs = [job].concat((this.imageGen.jobs || [])
+            .filter(x => x && x.id !== job.id));
+        }
+        this.toast(this.lang === "zh" ? "生图任务已提交" : "Image job submitted",
+                   "success", 1800);
+        this.ensureImageGenPolling();
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e || "");
+        this.imageGen.error = msg;
+        this.toast((this.lang === "zh" ? "提交失败：" : "Submit failed: ") + msg,
+                   "error", 5000);
+      } finally {
+        this.imageGen.loading = false;
+      }
+    },
+    async attachGeneratedImage(img) {
+      if (!img || !img.id) return;
+      const entry = {
+        id: img.id,
+        mime: img.mime || "image/png",
+        preview: img.data_url || "",
+        uploading: false,
+        error: false,
+        attach_ext: img.attach_ext || "png",
+        generated: true,
+      };
+      this.pendingImages.push(entry);
+      this.toast(this.lang === "zh" ? "已加入当前消息" : "Added to current message",
+                 "success", 1800);
+      this.imageGen.show = false;
+    },
+    async attachImageGenHistory(job, img) {
+      if (!job || !job.id || !img || !img.image_id) return;
+      try {
+        const res = await this.api(
+          `/api/chat/image-generate/jobs/${encodeURIComponent(job.id)}/attach/${encodeURIComponent(img.image_id)}`,
+          { method: "POST" },
+        );
+        if (!res.ok) throw new Error(res.error || `HTTP ${res.status}`);
+        await this.attachGeneratedImage(res.data.image);
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e || "");
+        this.toast((this.lang === "zh" ? "加入失败：" : "Attach failed: ") + msg,
+                   "error", 4000);
+      }
+    },
+    imageGenStatusLabel(status) {
+      const zh = this.lang === "zh";
+      if (status === "queued") return zh ? "排队中" : "Queued";
+      if (status === "running") return zh ? "生成中" : "Running";
+      if (status === "succeeded") return zh ? "已完成" : "Done";
+      if (status === "failed") return zh ? "失败" : "Failed";
+      return status || "";
+    },
+
     // Alias for use in inline x-html (shorter name reads better in markup).
     renderMd(text) { return this.mdRender(text); },
     // Friendly label for a model id — falls back to the raw id if not in catalog.
@@ -3925,7 +4111,7 @@ function portal() {
       }
       let r;
       try {
-        r = await fetch(url, { method, headers, body });
+        r = await fetch(url, { method, headers, body, signal: opts.signal });
       } catch (e) {
         if (opts.toastError) this.toast(
           (this.lang === "zh" ? "网络错误：" : "Network error: ") + e.message,
@@ -4244,6 +4430,7 @@ function portal() {
       } catch {}
       await this.fetchMcp();
       await this.fetchRateLimit();
+      await this.fetchCodexRateLimit();
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
@@ -4252,6 +4439,25 @@ function portal() {
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           this._ensureValidModel();
           this._rebindModelSelect();
+        }
+      } catch {}
+    },
+
+    async fetchCodexRateLimit() {
+      try {
+        const r = await fetch("/api/chat/codex-rate-limit", {
+          headers: this.hdr(),
+          cache: "no-store",
+        });
+        if (r.ok) {
+          const d = await r.json();
+          this.codexLimit = {
+            ...d,
+            windows: d.windows || {},
+            updated_at: d.updated_at || 0,
+            ok: !!d.ok,
+          };
+          this.codexBadge = this.limitBadgeFromWindows(this.codexLimit.windows);
         }
       } catch {}
     },
@@ -4280,6 +4486,10 @@ function portal() {
     // `text` is the visible label; `warn`/`crit` drive color.
     rateLimitWorst() {
       const ws = this.rateLimit && this.rateLimit.windows;
+      return this.limitBadgeFromWindows(ws);
+    },
+
+    limitBadgeFromWindows(ws) {
       if (!ws) return null;
       let worst = null;   // window with the highest numeric utilization
       let known = null;   // any reported window, preferring five_hour
@@ -4319,6 +4529,28 @@ function portal() {
       };
     },
 
+    currentQuotaBadge() {
+      if (this._isCodexModel(this.model)) return this.codexBadge;
+      if (this._isClaudeModel(this.model)) return this.rlBadge;
+      return null;
+    },
+
+    currentQuotaText() {
+      if (this._isCodexModel(this.model)) {
+        const rows = this.codexLimitRows();
+        if (!rows.length) return "";
+        return rows.map(w => {
+          const tag = this.rateLimitWindowLabel(w.rate_limit_type) || w.key;
+          const rem = (w.remaining_percent !== null && w.remaining_percent !== undefined)
+            ? Math.round(w.remaining_percent) + "%"
+            : this.t("rl.ok");
+          return `${tag} ${rem}`;
+        }).join(" · ");
+      }
+      const b = this.currentQuotaBadge();
+      return b ? b.text : "";
+    },
+
     // Human label for a rate-limit window key. The h/d abbreviations are
     // universal; only "overage" gets a zh form.
     rateLimitWindowLabel(type) {
@@ -4327,6 +4559,7 @@ function portal() {
         seven_day: "7d",
         seven_day_opus: "7d Opus",
         seven_day_sonnet: "7d Sonnet",
+        monthly: this.lang === "zh" ? "月" : "mo",
         overage: this.t("rl.overage"),
       };
       return m[type] || type || "";
@@ -4348,7 +4581,22 @@ function portal() {
     // text is hidden, so a tap surfaces the same detail). Extracted from the
     // old inline :title expression so both paths stay in sync.
     rlBadgeDesc() {
-      const b = this.rlBadge;
+      if (this._isCodexModel(this.model)) {
+        const rows = this.codexLimitRows();
+        if (!rows.length) return "";
+        return rows.map(w => {
+          const tag = this.rateLimitWindowLabel(w.rate_limit_type) || w.key;
+          const rem = (w.remaining_percent !== null && w.remaining_percent !== undefined)
+            ? `${this.t("set.cost.remaining")} ${w.remaining_percent}%`
+            : this.t("rl.ok");
+          const used = (w.used_percent !== null && w.used_percent !== undefined)
+            ? ` · ${this.t("set.cost.used")} ${w.used_percent}%`
+            : "";
+          const reset = this.rateLimitResetText(w.resets_at);
+          return `${tag} ${rem}${used}${reset ? " · " + this.t("rl.resets", { t: reset }) : ""}`;
+        }).join("\n");
+      }
+      const b = this.currentQuotaBadge();
       if (!b) return "";
       let s = this.rateLimitWindowLabel(b.type);
       if (b.pct !== null && b.pct !== undefined) s += " " + b.pct + "%";
@@ -4503,6 +4751,12 @@ function portal() {
     // dropdown space.
     _isClaudeModel(model) {
       return (model || "").startsWith("claude-");
+    },
+    _isCodexModel(model) {
+      const m = model || "";
+      if (m.startsWith("codex:")) return true;
+      const meta = (this.availableModels || []).find(x => x.model === m);
+      return !!(meta && /codex/i.test(meta.group || ""));
     },
     _isOpus47(model) {
       // Misnomer kept for blast-radius reasons: this gate fires for any
@@ -8575,6 +8829,7 @@ function portal() {
       this.refreshSkillList();
       this.loadCostDashboard();
       this.loadClaudeAuthStatus();
+      this.fetchCodexRateLimit();
     },
 
     // ===== Claude Auth methods =====
@@ -8764,10 +9019,25 @@ function portal() {
       if (s === "free") return "Free";
       return s;
     },
+    codexLimitRows() {
+      const ws = (this.codexLimit && this.codexLimit.windows) || {};
+      return Object.entries(ws).map(([key, w]) => ({ key, ...w }));
+    },
+    codexLimitUpdatedText() {
+      const ts = this.codexLimit && this.codexLimit.updated_at;
+      if (!ts) return "";
+      return new Date(ts * 1000).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    },
     async loadCostDashboard(force = false) {
       if (this.cost.loading) return;
       if (this.cost.data && !force) return;
       this.cost.loading = true;
+      this.fetchCodexRateLimit();
       try {
         // Browser timezone offset is -getTimezoneOffset (JS reports east as
         // negative, server expects east-positive minutes).

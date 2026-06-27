@@ -1416,6 +1416,15 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      ring (18px); the "5h 正常" text is hidden and a tap surfaces it via toast. */
   .chat-toolbar-rl { cursor: pointer; height: 44px; padding: 0 8px; gap: 0; }
   .chat-toolbar-rl-text { display: none; }
+  .chat-toolbar-rl.codex {
+    max-width: 104px;
+    padding: 0 5px;
+    gap: 3px;
+  }
+  .chat-toolbar-rl.codex .chat-toolbar-rl-text {
+    display: inline;
+    max-width: 76px;
+  }
   .chat-toolbar-rl svg { width: 18px; height: 18px; opacity: 1; }
   .chat-toolbar-btn,
   .chat-toolbar-ring,
@@ -4209,6 +4218,216 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   from { background-position: 100% 0; }
   to   { background-position: -100% 0; }
 }
+.image-gen-modal {
+  width: min(760px, 92vw);
+  max-height: min(86vh, 780px);
+}
+.image-gen-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.image-gen-prompt {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  color: var(--c-fg-0);
+  font: inherit;
+  line-height: 1.5;
+}
+.image-gen-controls {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.2fr) repeat(4, minmax(90px, 1fr));
+  gap: 10px;
+}
+.image-gen-controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+}
+.image-gen-controls input,
+.image-gen-controls select {
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-1);
+  color: var(--c-fg-1);
+  font: inherit;
+}
+.image-gen-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-sm);
+  color: var(--c-fg-2);
+}
+.image-gen-results {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.image-gen-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 2px;
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  color: var(--c-fg-1);
+}
+.image-gen-empty {
+  padding: 16px;
+  border: 1px dashed var(--c-border);
+  border-radius: var(--r-md);
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+.image-gen-job {
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  padding: 10px;
+}
+.image-gen-job.status-failed {
+  border-color: color-mix(in srgb, var(--c-warning, #b45309) 45%, var(--c-border));
+}
+.image-gen-job-head,
+.image-gen-job-title,
+.image-gen-job-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.image-gen-job-head {
+  justify-content: space-between;
+  min-width: 0;
+}
+.image-gen-job-title {
+  min-width: 0;
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+}
+.image-gen-status {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--c-bg-2);
+  color: var(--c-fg-1);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.status-running .image-gen-status,
+.status-queued .image-gen-status {
+  background: color-mix(in srgb, var(--c-accent) 14%, var(--c-bg-2));
+  color: var(--c-accent);
+}
+.status-succeeded .image-gen-status {
+  background: color-mix(in srgb, #10b981 14%, var(--c-bg-2));
+  color: #047857;
+}
+.status-failed .image-gen-status {
+  background: color-mix(in srgb, var(--c-warning, #b45309) 16%, var(--c-bg-2));
+  color: var(--c-warning, #b45309);
+}
+.image-gen-job-time {
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.image-gen-job-prompt {
+  margin-top: 8px;
+  color: var(--c-fg-1);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.image-gen-job-pending {
+  margin-top: 10px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-sm);
+}
+.image-gen-job-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.image-gen-card {
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  overflow: hidden;
+}
+.image-gen-preview {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  padding: 0;
+  border: 0;
+  background: var(--c-bg-0);
+  cursor: zoom-in;
+}
+.image-gen-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+.image-gen-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+}
+.image-gen-card-foot span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.image-gen-card-foot .sm {
+  height: 28px;
+  padding: 0 10px;
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+@media (max-width: 720px) {
+  .image-gen-modal {
+    width: 100dvw;
+    max-height: 100dvh;
+  }
+  .image-gen-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .image-gen-controls label:first-child {
+    grid-column: 1 / -1;
+  }
+  .image-gen-results {
+    gap: 10px;
+  }
+  .image-gen-job-grid {
+    grid-template-columns: 1fr;
+  }
+}
 .img-chip-x {
   position: absolute; top: 2px; right: 2px;
   width: 18px; height: 18px;
@@ -5550,8 +5769,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-text-3);
   border-radius: var(--r-md);
   cursor: default; user-select: none;
+  max-width: 180px;
 }
 .chat-toolbar-rl svg { display: block; opacity: 0.8; }
+.chat-toolbar-rl-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .chat-toolbar-rl.warn { color: var(--c-warn); }
 .chat-toolbar-rl.crit { color: var(--c-danger); }
 .chat-toolbar-spacer { flex: 1; }
@@ -5836,7 +6061,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .toast.error .icon { color: var(--c-danger); }
 .toast.warn { border-left-color: var(--c-warn); }
 .toast.warn .icon { color: var(--c-warn); }
-.toast .body { flex: 1; }
+.toast .body { flex: 1; white-space: pre-line; }
 .toast .icon { padding-top: 1px; }
 .toast .close { background: transparent; border: 0; color: var(--c-fg-3); cursor: pointer; padding: 0; }
 .toast .close:hover { color: var(--c-fg-0); }
@@ -5945,6 +6170,36 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      footer + the existing border-top is enough separation, and matches
      how Linear / Notion / GitHub render modal action bars now. */
   background: transparent; border-radius: 0 0 var(--r-lg) var(--r-lg);
+}
+
+/* Image generation modal. Keep this after the global .modal rules: those set
+   max-width:480px and generic input margins for small confirm dialogs. */
+.modal.image-gen-modal {
+  width: min(760px, 92vw);
+  max-width: min(760px, 92vw);
+  max-height: min(86vh, 780px);
+  display: flex;
+  flex-direction: column;
+}
+.modal.image-gen-modal .image-gen-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.modal.image-gen-modal .image-gen-controls input,
+.modal.image-gen-modal .image-gen-controls select {
+  width: 100%;
+  margin-top: 0;
+}
+@media (max-width: 720px) {
+  .modal.image-gen-modal {
+    width: 100vw;
+    width: 100dvw;
+    max-width: 100vw;
+    max-width: 100dvw;
+    max-height: 100dvh;
+    border-radius: 0;
+  }
 }
 
 /* ---- Modal choice list (disambiguation picker) ---- */
@@ -6869,6 +7124,49 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
   color: var(--c-fg-1);
   font-variant-numeric: tabular-nums;
 }
+.codex-quota-card {
+  margin: 8px 0 16px;
+  padding: 12px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-2);
+}
+.codex-quota-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: 10px;
+}
+.codex-quota-head .cost-block-title {
+  margin: 0 0 2px;
+}
+.codex-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.codex-quota-window {
+  padding: 10px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-1);
+}
+.codex-quota-label,
+.codex-quota-sub,
+.codex-quota-reset {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+}
+.codex-quota-value {
+  margin: 4px 0;
+  font-size: var(--fs-2xl);
+  font-weight: 650;
+  color: var(--c-fg-1);
+  font-variant-numeric: tabular-nums;
+}
+.codex-quota-window.warn .codex-quota-value { color: var(--c-warn); }
+.codex-quota-window.crit .codex-quota-value { color: var(--c-danger); }
 /* Token-class filter chips — clickable to toggle a category's inclusion
    in every aggregate below. .inactive = user has hidden this class
    (greyed + line-through so the chip still acts as a "click to re-add"
@@ -6995,6 +7293,7 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
 }
 @media (max-width: 720px) {
   .cost-kpis { grid-template-columns: repeat(2, 1fr); }
+  .codex-quota-grid { grid-template-columns: 1fr; }
   .cost-model-row { grid-template-columns: 100px 1fr 100px; font-size: var(--fs-xs); }
 }
 .cmd-palette-item-label {

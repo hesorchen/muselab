@@ -5,7 +5,9 @@
 muselab uses the **Claude Agent SDK** as the single chat backend. For
 non-Claude models, a per-session env override routes the SDK at the
 vendor's Anthropic-compatible endpoint. **Every provider gets the full
-agent loop** — not just chat. No proxy, no protocol translation.
+agent loop** — not just chat. muselab itself never implements OpenAI-native
+protocols; if a backend is not Anthropic-compatible, put a gateway in front
+of it.
 
 | Provider | How to enable | Tool use | Where to get the key |
 |---|---|---|---|
@@ -17,10 +19,29 @@ agent loop** — not just chat. No proxy, no protocol translation.
 | **Qwen** (Qwen3 / 3.5 / 3.6 series — Max / Plus / Flash / Coder; 国际 endpoint via same key) | `DASHSCOPE_API_KEY` | ✅ | dashscope.console.aliyun.com — one key works for 国内 + 国际 (latency-only difference) |
 | **Xiaomi MiMo** (V2.5 Pro / V2.5 / V2 Flash) | `XIAOMI_MIMO_API_KEY` | ✅ | platform.xiaomimimo.com (beta) |
 | **Baidu Qianfan** (ERNIE 4 / 4.5 / 5 series + X1 reasoning + DeepSeek V3.2 via Qianfan) | `QIANFAN_API_KEY` | ✅ | console.bce.baidu.com/qianfan — Anthropic-compat path needs an IAM **access token** (`bce-v3/ALTAK-xxx/xxx`), not a plain `sk-xxx` key |
+| **Codex Gateway** (local sidecar) | `CODEX_GATEWAY_API_KEY` | ✅* | A user-run Anthropic-compatible gateway at `127.0.0.1`; see [codex-gateway.md](codex-gateway.md) |
+
+\* Tool use depends on the gateway translating Anthropic `tool_use` / `tool_result` correctly.
 
 Exact model ids in each family come from the UI dropdown — they're sourced
 from the effective catalog (built-in defaults + your Settings overrides) and
 may evolve faster than this table.
+
+## Image generation
+
+The composer image button is not a chat provider. `MUSELAB_IMAGE_PROVIDER=auto`
+uses the native OpenAI Image API when `OPENAI_IMAGE_API_KEY` (or
+`OPENAI_API_KEY`) is configured. The local Codex `$imagegen` path is explicit
+opt-in: set `MUSELAB_IMAGE_PROVIDER=codex_imagegen` and
+`CODEX_IMAGEGEN_ENABLED=true` to use the logged-in `codex` CLI. Set
+`MUSELAB_IMAGE_PROVIDER=openai` to force the OpenAI-compatible path.
+
+Generated images are staged as normal muselab image attachments, so they can be
+previewed, annotated, and sent into the current chat. Image requests run as
+background jobs and are also kept in the image history drawer, so refreshing the
+page does not lose completed outputs. The Codex imagegen path is intended for
+localhost single-user deployments; do not expose a muselab instance with local
+Codex access to the public internet.
 
 ## Switching model mid-conversation
 

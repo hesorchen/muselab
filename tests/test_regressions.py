@@ -138,6 +138,16 @@ def test_context_used_fallback_when_sdk_value_missing(client, auth):
     assert body["context_used"] != 42_500   # explicitly NOT the cumulative sum
 
 
+def test_codex_gateway_ctx_limit_fallback_is_400k(client, auth):
+    """Codex Gateway models are third-party from the SDK's perspective, so the
+    context meter must use muselab's GPT-5/Codex table instead of the 128K
+    generic fallback."""
+    r = client.get("/api/chat/usage/no-such-codex-sid?model=codex:gpt-5.5",
+                   headers=auth)
+    assert r.status_code == 200
+    assert r.json()["context_limit"] == 400_000
+
+
 # ============================================================================
 # Bug 3b (2026-06-06): context ring read ~5x too low. The Claude entries in
 # MODEL_CONTEXT_LIMITS claimed a 1M window, but the bundled CLI's
@@ -702,7 +712,12 @@ def test_normalize_questions_passes_preview_through():
 # Plus a top-level by_vendor rollup for at-a-glance totals.
 # ============================================================================
 
-def test_vendor_label_for_known_models():
+def test_vendor_label_for_known_models(monkeypatch, tmp_path):
+    from backend import endpoints as ep
+    monkeypatch.setattr(ep, "OVERRIDES_PATH", tmp_path / "provider_overrides.json")
+    ep._OVERRIDES_CACHE = None
+    ep._CATALOG_CACHE = None
+    ep._SORTED_CATALOG_CACHE = None
     from backend.chat import _vendor_label_for
     assert _vendor_label_for("claude-sonnet-4-6")   == "Claude"
     assert _vendor_label_for("claude-haiku-4-5")    == "Claude"

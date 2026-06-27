@@ -40,7 +40,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **no-build frontend（无构建前端）** — 前端以纯 HTML + JavaScript + CSS 提供服务，无需打包工具、编译器或 `npm install`。经过审查的第三方库已提交至 `frontend/vendor/`。重型库（KaTeX、CodeMirror、Mermaid、highlight.js）在首次使用时延迟加载。参见 [`architecture_zh.md — 关键设计决策`](architecture_zh.md#关键设计决策)。
 
-**provider（提供商）** — `backend/endpoints.py` 中定义的提供商配置记录。每个提供商有 `prefix`（用于最长前缀路由）、`base_url`、`env_key`（API 密钥环境变量名），以及 `supports_thinking` 和 `max_output_tokens` 等标志。内置目录覆盖 8 家提供商；用户自定义提供商使用 `c:<slug>` 稳定 ID 格式。参见 [`routing.md — Model Resolution`](routing.md#1-model-resolution) 和 [`providers.md`](providers.md)。
+**provider（提供商）** — `backend/endpoints.py` 中定义的提供商配置记录。每个提供商有 `prefix`（用于最长前缀路由）、`base_url`、`env_key`（API 密钥环境变量名），以及 `supports_thinking` 和 `max_output_tokens` 等标志。内置目录覆盖 9 个提供商（含本地网关预设）；用户自定义提供商使用 `c:<slug>` 稳定 ID 格式。参见 [`routing.md — Model Resolution`](routing.md#1-model-resolution) 和 [`providers.md`](providers.md)。
 
 **provider catalog（提供商目录）** — `backend/endpoints.py` 中 `catalog()` 返回的全部可用提供商列表。内置条目带有以 `b:` 为前缀的稳定 ID。目录按 `provider_overrides.json` 的 `(mtime_ns, size)` 缓存，文件变更时重新读取。Claude（Anthropic）单独管理，不在目录中。参见 [`backend/endpoints.py:L170`](../backend/endpoints.py#L170)。
 
@@ -74,7 +74,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **thinking toggle（thinking 开关）** — 每会话的布尔值（`thinking`，默认 `true`），用于启用或禁用 `ThinkingConfigEnabled`。通过 `PATCH /sessions/{sid}` 将其设为 `false` 是处理特定工具调用交错模式引发的「最新助手消息中的 thinking 块不可修改」400 错误的应急手段。修改后会使缓存的 client 失效。参见 [`routing.md — Reasoning Effort and Extended Thinking`](routing.md#5-reasoning-effort-and-extended-thinking)。
 
-**token（MUSELAB_TOKEN）** — `.env` 中设置的至少 16 字符的共享密钥，用于保护每个 API 端点。比较时使用 `hmac.compare_digest`（常量时间）以抵御时序攻击。对于大多数端点，令牌通过 `X-Auth-Token` header 传入；对于浏览器无法发送自定义 header 的 SSE、图片和文件下载端点，则通过 `?token=` 查询参数传入。参见 [`backend-security.md — Authentication`](backend-security.md#authentication)。
+**token（MUSELAB_TOKEN）** — `.env` 中设置的至少 16 字符的共享密钥，用于保护每个 API 端点。比较时使用 `hmac.compare_digest`（常量时间）以抵御时序攻击。对于大多数端点，令牌通过 `X-Auth-Token` header 传入；对于浏览器无法发送自定义 header 的 SSE 和文件下载端点，则通过 `?token=` 查询参数传入。需要鉴权的图片预览会用 header fetch 后渲染为 blob URL，避免把全局 token 放进图片 URL。参见 [`backend-security.md — Authentication`](backend-security.md#authentication)。
 
 **vendored libraries（内置第三方库）** — 提交到 `frontend/vendor/` 下的第三方 JavaScript 库，使前端无需运行时 npm 依赖。包含 Alpine.js、marked、DOMPurify、Mermaid、highlight.js、KaTeX 和 CodeMirror。许可证信息见 [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md)。参见 [`architecture_zh.md — 关键设计决策`](architecture_zh.md#关键设计决策)。
 

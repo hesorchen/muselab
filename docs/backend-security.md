@@ -32,7 +32,7 @@ Three FastAPI dependencies handle different transport constraints ([`backend/aut
 | `require_token_query` | `/api/files/raw`, `/api/files/download` | `?token=` query param only |
 | `require_token_header_or_query` | Chat SSE stream (`/api/chat/stream`) | Either header or `?token=` |
 
-The query-param variants exist because browsers cannot send custom headers for `<img src>`, `<iframe src>`, and `EventSource` connections. `fetch()` calls can use headers and do so in preference to the query param; the query-param path remains as a fallback for iframe downloads and copied links ([`backend/auth.py:L33-L54`](../backend/auth.py#L33-L54)).
+The query-param variants exist because browsers cannot send custom headers for `<iframe src>` and `EventSource` connections. Image previews that need authorization are fetched with `X-Auth-Token` and rendered as blob URLs, so the global token is not placed in image URLs. `fetch()` calls can use headers and do so in preference to the query param; the query-param path remains as a fallback for iframe downloads and copied links ([`backend/auth.py:L33-L54`](../backend/auth.py#L33-L54)).
 
 ### Unauthenticated routes
 

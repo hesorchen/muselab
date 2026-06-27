@@ -259,6 +259,7 @@ def get_settings() -> dict:
             "base_url": m["base_url"],
             "prefix": m["prefix"],
             "models": m["models"],
+            "supports_thinking": m.get("supports_thinking", True),
             "is_builtin": m["is_builtin"],
             "is_overridden": m["is_overridden"],
             "editable": True,

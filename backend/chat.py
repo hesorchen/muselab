@@ -7,15 +7,17 @@ import asyncio
 import re
 import sys
 import shutil
+import tempfile
 import time
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
@@ -34,7 +36,15 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import PermissionMode
 from .auth import require_token_query, require_token, require_token_header_or_query
-from .settings import ROOT, MODEL, atomic_write_text, env_float, env_int, is_chinese_locale
+from .settings import (
+    ROOT,
+    MODEL,
+    atomic_write_text,
+    env_float,
+    env_int,
+    is_chinese_locale,
+    locate_executable,
+)
 from . import sessions as sess
 from . import endpoints
 from .ask_user_question import (
@@ -711,13 +721,16 @@ _session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
 # Per-model context windows. Used as the meter's denominator when a SDK
 # get_context_usage() truth isn't available (first turn of a session, or
 # any third-party model where CLI's tokenizer / window inference is
-# unreliable). Numbers verified 2026-05-18 from each vendor's docs:
+# unreliable). Numbers verified from each vendor's docs:
 #   - Anthropic:   tygartmedia.com / anthropic.com (Opus/Sonnet 4.6+ default
 #                  to 1M on Pro/Max/Enterprise; Haiku 4.5 stays 200K)
 #   - DeepSeek V4: api-docs.deepseek.com (V4 series ships 1M native context)
 #   - Zhipu GLM:   glm-5.org / docs.z.ai (GLM-5 + GLM-4.7 both 200K context)
 #   - MiniMax:     platform.minimax.io (M2.5 / M2.7 both 204_800, cline #10007
 #                  PR fixed the prior 192K/245K misinformation)
+#   - OpenAI Codex/GPT-5: developers.openai.com model cards (400K context,
+#                  128K max output; GPT-5-Codex is Responses-API-only behind
+#                  the local gateway)
 MODEL_CONTEXT_LIMITS = {
     # Anthropic — the bundled Claude Code CLI reports a 200K effective window
     # for these models (verified via get_context_usage: maxTokens=200000). The
@@ -747,6 +760,13 @@ MODEL_CONTEXT_LIMITS = {
     "minimax-m2.7":                 204_800,
     "minimax-m2.7-highspeed":       204_800,
     "minimax-m2.5":                 204_800,
+    # Codex Gateway — local sidecars can expose Codex/GPT aliases with large
+    # context windows. Gateway implementations may still fail earlier if their
+    # translation layer or account tier has a smaller effective window.
+    "codex:gpt-5.5":                400_000,
+    "codex:gpt-5.4":                400_000,
+    "codex:gpt-5.4-mini":           400_000,
+    "codex:gpt-5.3-codex-spark":    400_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
 
@@ -3381,6 +3401,133 @@ def rate_limit() -> dict:
     }
 
 
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def _codex_rate_limit_type(key: str, window: dict) -> str:
+    minutes = int(window.get("window_minutes") or 0)
+    if minutes == 300:
+        return "five_hour"
+    if minutes == 10080:
+        return "seven_day"
+    # Treat the common calendar-month approximations as monthly. Keep the
+    # original window_minutes in the payload so callers can still display the
+    # exact reset horizon if Codex changes the duration.
+    if 28 * 24 * 60 <= minutes <= 31 * 24 * 60:
+        return "monthly"
+    return key
+
+
+def _codex_rate_limits_from_payload(payload: dict, source: Path, ts: str | None) -> dict | None:
+    raw = payload.get("rate_limits")
+    if not isinstance(raw, dict):
+        return None
+    windows: dict[str, dict] = {}
+    reached = raw.get("rate_limit_reached_type")
+    for key in ("primary", "secondary"):
+        w = raw.get(key)
+        if not isinstance(w, dict):
+            continue
+        used = w.get("used_percent")
+        try:
+            used_f = float(used)
+        except (TypeError, ValueError):
+            used_f = None
+        status = "allowed"
+        if reached and (reached == key or reached == _codex_rate_limit_type(key, w)):
+            status = "rejected"
+        elif used_f is not None and used_f >= 90:
+            status = "allowed_warning"
+        windows[key] = {
+            "rate_limit_type": _codex_rate_limit_type(key, w),
+            "window_minutes": int(w.get("window_minutes") or 0),
+            "resets_at": int(w.get("resets_at") or 0) or None,
+            "used_percent": used_f,
+            "remaining_percent": (round(max(0.0, 100.0 - used_f), 1)
+                                  if used_f is not None else None),
+            # Match the Claude SDK shape consumed by the existing FE badge.
+            "utilization": (used_f / 100.0 if used_f is not None else None),
+            "status": status,
+        }
+    if not windows:
+        return None
+    updated_at = 0.0
+    if ts:
+        try:
+            updated_at = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            updated_at = 0.0
+    return {
+        "ok": True,
+        "source": "codex-session-log",
+        "source_file": str(source),
+        "updated_at": updated_at,
+        "timestamp": ts,
+        "limit_id": raw.get("limit_id"),
+        "limit_name": raw.get("limit_name"),
+        "plan_type": raw.get("plan_type"),
+        "rate_limit_reached_type": reached,
+        "credits": raw.get("credits"),
+        "individual_limit": raw.get("individual_limit"),
+        "windows": windows,
+    }
+
+
+def _latest_codex_rate_limits() -> dict:
+    """Read the newest Codex quota snapshot from local Codex session JSONL.
+
+    Codex already writes rate-limit snapshots into token_count events. Reading
+    those logs avoids touching ~/.codex/auth.json or calling private OpenAI
+    endpoints. We only inspect lines containing the literal "rate_limits" and
+    stop at the newest usable event.
+    """
+    home = _codex_home()
+    sessions_dir = home / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": False, "reason": "codex_sessions_missing", "windows": {}, "updated_at": 0}
+    try:
+        files = sorted(
+            sessions_dir.rglob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError as e:
+        return {"ok": False, "reason": f"codex_sessions_unreadable: {e}", "windows": {},
+                "updated_at": 0}
+    max_files = max(1, env_int("MUSELAB_CODEX_RATE_LIMIT_SCAN_FILES", 80, min_value=1))
+    for path in files[:max_files]:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            parsed = _codex_rate_limits_from_payload(payload, path, event.get("timestamp"))
+            if parsed:
+                return parsed
+    return {"ok": False, "reason": "codex_rate_limits_not_found", "windows": {},
+            "updated_at": 0}
+
+
+@router.get("/codex-rate-limit", dependencies=[Depends(require_token)])
+def codex_rate_limit() -> dict:
+    """Latest Codex subscription quota snapshot from local Codex session logs.
+
+    This is intentionally a read-only local-state bridge. It does not read
+    Codex OAuth credentials and it does not call OpenAI-native APIs.
+    """
+    return _latest_codex_rate_limits()
+
+
 @router.get("/usage", dependencies=[Depends(require_token)])
 async def usage() -> dict:
     cr = _stats.get("total_cache_read_tokens", 0)
@@ -4924,6 +5071,7 @@ _IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
 _IMAGE_STORE_MAX_BYTES = 256 * 1024 * 1024
 _IMAGE_STORE_MAX_ENTRIES = 48
 _IMAGE_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_IMAGE_OUTPUT_MIME = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
 _PDF_MIME = {"application/pdf"}
 # text-ish formats we'll inline. Browsers send vague mimes — we also gate by
 # extension below as a fallback.
@@ -5011,6 +5159,886 @@ def _classify_attachment(mime: str, name: str) -> str:
         if lower.endswith(ext):
             return "xlsx"
     return ""
+
+
+class ImageGenerateReq(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=4000)
+    model: str = Field(default="gpt-image-2", max_length=80)
+    size: str = Field(default="1024x1024", max_length=32)
+    quality: str = Field(default="low", max_length=16)
+    output_format: str = Field(default="png", max_length=8)
+    n: int = Field(default=1, ge=1, le=4)
+    image_ids: list[str] | None = None
+
+
+_IMAGE_SIZE_RE = re.compile(r"^(auto|[1-9][0-9]{2,3}x[1-9][0-9]{2,3})$")
+_IMAGE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+_IMAGE_PROVIDER_VALUES = {"auto", "openai", "openai_image_api", "codex", "codex_imagegen"}
+_IMAGE_FILE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+_IMAGEGEN_ROOT = ROOT / ".muselab" / "imagegen"
+_IMAGEGEN_FILES = _IMAGEGEN_ROOT / "files"
+_IMAGEGEN_JOBS_PATH = _IMAGEGEN_ROOT / "jobs.json"
+_IMAGEGEN_JOBS_MAX = 200
+_imagegen_jobs_lock = threading.RLock()
+_imagegen_jobs: dict[str, dict] | None = None
+
+
+def _validate_image_size(size: str) -> str:
+    s = (size or "1024x1024").strip()
+    if not _IMAGE_SIZE_RE.fullmatch(s):
+        raise HTTPException(400, "invalid image size")
+    if s == "auto":
+        return s
+    w, h = [int(x) for x in s.split("x", 1)]
+    if w > 3840 or h > 3840:
+        raise HTTPException(400, "image size edge must be <= 3840")
+    if w % 16 or h % 16:
+        raise HTTPException(400, "image size edges must be multiples of 16")
+    if max(w, h) / min(w, h) > 3:
+        raise HTTPException(400, "image aspect ratio must be <= 3:1")
+    pixels = w * h
+    if pixels < 655_360 or pixels > 8_294_400:
+        raise HTTPException(400, "image size pixels out of range")
+    return s
+
+
+def _openai_image_api_config() -> tuple[str, str]:
+    key = (
+        os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
+        or os.environ.get("CODEX_IMAGE_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    if not key:
+        raise HTTPException(
+            400,
+            "missing OPENAI_IMAGE_API_KEY or OPENAI_API_KEY for image generation",
+        )
+    base_url = (
+        os.environ.get("OPENAI_IMAGE_BASE_URL", "").strip()
+        or os.environ.get("CODEX_IMAGE_BASE_URL", "").strip()
+        or os.environ.get("OPENAI_BASE_URL", "").strip()
+        or "https://api.openai.com/v1"
+    ).rstrip("/")
+    parsed = urllib.parse.urlsplit(base_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https" and host:
+        return key, base_url
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme == "http" and host in loopback_hosts:
+        return key, base_url
+    raise HTTPException(400, "OPENAI_IMAGE_BASE_URL must be https or loopback http")
+
+
+def _openai_image_api_key_present() -> bool:
+    return bool(
+        os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
+        or os.environ.get("CODEX_IMAGE_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+
+
+def _env_enabled(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _image_provider() -> str:
+    raw = os.environ.get("MUSELAB_IMAGE_PROVIDER", "auto").strip().lower()
+    if raw not in _IMAGE_PROVIDER_VALUES:
+        raise HTTPException(
+            400,
+            "invalid MUSELAB_IMAGE_PROVIDER "
+            "(expected auto, openai, or codex_imagegen)",
+        )
+    if raw in {"openai", "openai_image_api"}:
+        return "openai"
+    if raw in {"codex", "codex_imagegen"}:
+        return "codex"
+    if _openai_image_api_key_present():
+        return "openai"
+    if _env_enabled("CODEX_IMAGEGEN_ENABLED", False):
+        return "codex"
+    return "openai"
+
+
+def _image_error_message(status: int, body: str) -> str:
+    try:
+        data = json.loads(body)
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else None
+        if isinstance(msg, str) and msg:
+            return f"image generation failed ({status}): {msg[:500]}"
+    except Exception:
+        pass
+    return f"image generation failed ({status})"
+
+
+def _image_response_items(data: dict) -> list[str]:
+    out = data.get("data")
+    if not isinstance(out, list):
+        return []
+    b64s: list[str] = []
+    for item in out:
+        if isinstance(item, dict) and isinstance(item.get("b64_json"), str):
+            b64s.append(item["b64_json"])
+    return b64s
+
+
+def _normalize_image_generate_req(
+    req: ImageGenerateReq,
+) -> tuple[str, str, str, str, str, list[str]]:
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+    model = req.model.strip() or "gpt-image-2"
+    if not _IMAGE_MODEL_RE.fullmatch(model):
+        raise HTTPException(400, "invalid image model")
+    size = _validate_image_size(req.size)
+    quality = (req.quality or "low").strip()
+    if quality not in {"low", "medium", "high", "auto"}:
+        raise HTTPException(400, "invalid image quality")
+    output_format = (req.output_format or "png").strip().lower()
+    if output_format not in _IMAGE_OUTPUT_MIME:
+        raise HTTPException(400, "invalid image output format")
+    image_ids = [x.strip() for x in (req.image_ids or []) if isinstance(x, str) and x.strip()]
+    return prompt, model, size, quality, output_format, image_ids
+
+
+def _stage_generated_image(b64: str, mime: str, idx: int) -> dict:
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(502, "image API returned invalid base64") from None
+    if len(raw) > _IMAGE_MAX_BYTES:
+        raise HTTPException(502, "image API returned an image over the local 10MB limit")
+    aid = uuid.uuid4().hex
+    fmt = {v: k for k, v in _IMAGE_OUTPUT_MIME.items()}.get(mime, "png")
+    name = f"generated-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{idx}.{fmt}"
+    _image_store[aid] = {
+        "kind": "image",
+        "mime": mime,
+        "name": name,
+        "b64": base64.b64encode(raw).decode("ascii"),
+        "ts": time.time(),
+    }
+    _enforce_image_budget()
+    return {
+        "id": aid,
+        "mime": mime,
+        "name": name,
+        "bytes": len(raw),
+        "attach_ext": "jpg" if fmt == "jpeg" else fmt,
+        "data_url": f"data:{mime};base64,{_image_store[aid]['b64']}",
+    }
+
+
+def _stage_generated_image_bytes(raw: bytes, mime: str, idx: int) -> dict:
+    if len(raw) > _IMAGE_MAX_BYTES:
+        raise HTTPException(502, "image generation returned an image over the local 10MB limit")
+    return _stage_generated_image(base64.b64encode(raw).decode("ascii"), mime, idx)
+
+
+def _imagegen_load_jobs() -> dict[str, dict]:
+    global _imagegen_jobs
+    with _imagegen_jobs_lock:
+        if _imagegen_jobs is not None:
+            return _imagegen_jobs
+        jobs: dict[str, dict] = {}
+        try:
+            raw = json.loads(_IMAGEGEN_JOBS_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                raw_jobs = raw.get("jobs", {})
+                if isinstance(raw_jobs, dict):
+                    for jid, job in raw_jobs.items():
+                        if not isinstance(jid, str) or not isinstance(job, dict):
+                            continue
+                        # A process restart loses in-flight asyncio tasks; make
+                        # that visible instead of leaving history stuck forever.
+                        if job.get("status") in {"queued", "running"}:
+                            job = {
+                                **job,
+                                "status": "failed",
+                                "error": "image generation was interrupted by backend restart",
+                                "updated_at": time.time(),
+                            }
+                        jobs[jid] = job
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[muselab] failed to load imagegen jobs: {e}",
+                  file=sys.stderr, flush=True)
+        _imagegen_jobs = jobs
+        return _imagegen_jobs
+
+
+def _imagegen_save_jobs_locked() -> None:
+    jobs = _imagegen_jobs or {}
+    ordered = dict(sorted(
+        jobs.items(),
+        key=lambda kv: float(kv[1].get("created_at") or 0),
+        reverse=True,
+    )[:_IMAGEGEN_JOBS_MAX])
+    jobs.clear()
+    jobs.update(ordered)
+    atomic_write_text(_IMAGEGEN_JOBS_PATH, json.dumps({"jobs": jobs}, ensure_ascii=False))
+
+
+def _imagegen_put_job(job: dict) -> dict:
+    with _imagegen_jobs_lock:
+        jobs = _imagegen_load_jobs()
+        jobs[job["id"]] = job
+        _imagegen_save_jobs_locked()
+        return job
+
+
+def _imagegen_update_job(job_id: str, **patch: Any) -> dict | None:
+    with _imagegen_jobs_lock:
+        jobs = _imagegen_load_jobs()
+        job = jobs.get(job_id)
+        if not job:
+            return None
+        job.update(patch)
+        job["updated_at"] = time.time()
+        _imagegen_save_jobs_locked()
+        return job
+
+
+def _imagegen_job_file(job: dict, img: dict) -> Path:
+    rel = str(img.get("file") or "")
+    if not rel:
+        raise HTTPException(404, "image file missing")
+    base = (_IMAGEGEN_FILES / str(job.get("id") or "")).resolve()
+    p = (base / rel).resolve()
+    try:
+        p.relative_to(base)
+    except ValueError:
+        raise HTTPException(400, "invalid image file path") from None
+    return p
+
+
+def _imagegen_public_image(job: dict, img: dict, *, include_data: bool) -> dict:
+    job_id = str(job.get("id") or "")
+    image_id = str(img.get("image_id") or "")
+    out = {
+        "job_id": job_id,
+        "image_id": image_id,
+        "name": img.get("name"),
+        "mime": img.get("mime"),
+        "bytes": img.get("bytes"),
+        "attach_ext": img.get("attach_ext"),
+        "url": (
+            f"/api/chat/image-generate/jobs/{urllib.parse.quote(job_id, safe='')}"
+            f"/images/{urllib.parse.quote(image_id, safe='')}"
+        ) if job_id and image_id else "",
+    }
+    if include_data:
+        try:
+            raw = _imagegen_job_file(job, img).read_bytes()
+            out["data_url"] = (
+                f"data:{img.get('mime') or 'image/png'};"
+                f"base64,{base64.b64encode(raw).decode('ascii')}"
+            )
+        except OSError:
+            out["missing"] = True
+    return out
+
+
+def _imagegen_public_job(job: dict, *, include_data: bool = True) -> dict:
+    images = job.get("images") if isinstance(job.get("images"), list) else []
+    return {
+        "id": job.get("id"),
+        "status": job.get("status"),
+        "prompt": job.get("prompt"),
+        "model": job.get("model"),
+        "provider": job.get("provider"),
+        "size": job.get("size"),
+        "quality": job.get("quality"),
+        "output_format": job.get("output_format"),
+        "n": job.get("n"),
+        "error": job.get("error") or "",
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "images": [_imagegen_public_image(job, img, include_data=include_data)
+                   for img in images if isinstance(img, dict)],
+    }
+
+
+def _imagegen_list_jobs(limit: int) -> list[dict]:
+    with _imagegen_jobs_lock:
+        jobs = list(_imagegen_load_jobs().values())
+    jobs.sort(key=lambda j: float(j.get("created_at") or 0), reverse=True)
+    return [_imagegen_public_job(j, include_data=False) for j in jobs[:max(1, min(limit, 100))]]
+
+
+def _persist_imagegen_result(job: dict, result: dict) -> list[dict]:
+    images = result.get("images") if isinstance(result, dict) else None
+    if not isinstance(images, list):
+        return []
+    job_dir = _IMAGEGEN_FILES / job["id"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    persisted: list[dict] = []
+    for idx, img in enumerate(images, start=1):
+        if not isinstance(img, dict):
+            continue
+        data_url = str(img.get("data_url") or "")
+        marker = ";base64,"
+        if marker not in data_url:
+            continue
+        mime = str(img.get("mime") or data_url[5:data_url.find(";")] or "image/png")
+        try:
+            raw = base64.b64decode(data_url.split(marker, 1)[1], validate=True)
+        except Exception:
+            continue
+        ext = str(img.get("attach_ext") or "png").lower()
+        if ext == "jpg":
+            ext = "jpeg"
+        if ext not in {"png", "jpeg", "webp"}:
+            ext = "png"
+        filename = f"image-{idx}.{ext}"
+        (job_dir / filename).write_bytes(raw)
+        persisted.append({
+            "image_id": uuid.uuid4().hex,
+            "file": filename,
+            "name": img.get("name") or filename,
+            "mime": mime,
+            "bytes": len(raw),
+            "attach_ext": "jpg" if ext == "jpeg" else ext,
+        })
+    return persisted
+
+
+async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
+    _imagegen_update_job(job_id, status="running", error="")
+    try:
+        prompt, model, size, quality, output_format, image_ids = _normalize_image_generate_req(req)
+        provider = _image_provider()
+        if provider == "codex":
+            result = await _generate_codex_imagegen(
+                req=req,
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                output_format=output_format,
+                image_ids=image_ids,
+            )
+        else:
+            result = await _generate_openai_image_api(
+                req=req,
+                prompt=prompt,
+                model=model,
+                size=size,
+                quality=quality,
+                output_format=output_format,
+                image_ids=image_ids,
+            )
+        with _imagegen_jobs_lock:
+            jobs = _imagegen_load_jobs()
+            job = jobs.get(job_id)
+            if not job:
+                return
+            job["provider"] = result.get("provider")
+            job["model"] = result.get("model") or model
+            job["images"] = _persist_imagegen_result(job, result)
+            job["status"] = "succeeded" if job["images"] else "failed"
+            job["error"] = "" if job["images"] else "image generation returned no images"
+            job["updated_at"] = time.time()
+            _imagegen_save_jobs_locked()
+    except HTTPException as e:
+        _imagegen_update_job(job_id, status="failed", error=str(e.detail))
+    except Exception as e:
+        _imagegen_update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
+
+
+def _image_file_mime(path: Path) -> str | None:
+    mime = _IMAGE_FILE_MIME.get(path.suffix.lower())
+    if not mime:
+        return None
+    try:
+        head = path.read_bytes()[:16]
+    except OSError:
+        return None
+    if mime == "image/png" and head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return mime
+    if mime == "image/jpeg" and head.startswith(b"\xff\xd8\xff"):
+        return mime
+    if mime == "image/webp" and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return mime
+    return None
+
+
+def _extract_json_object(text: str) -> dict | None:
+    if not text:
+        return None
+    candidates = [text.strip()]
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
+    if match:
+        candidates.insert(0, match.group(1).strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(text[start:end + 1])
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _codex_imagegen_prompt(
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    output_format: str,
+    n: int,
+    out_dir: Path,
+    has_refs: bool,
+) -> str:
+    ref_line = (
+        "Attached images are visual references or edit inputs for the user's prompt. "
+        if has_refs else ""
+    )
+    return f"""$imagegen
+
+You are fulfilling a local muselab image-generation request.
+Use the built-in Codex image generation skill/tool. Do not call OpenAI APIs,
+do not ask for API keys, and do not modify source files.
+
+User prompt:
+{prompt}
+
+Generation constraints:
+- Size: {size}
+- Quality target: {quality}
+- Output format requested by muselab: {output_format}
+- Number of final images: {n}
+- {ref_line}If the image tool saves files outside the requested directory, copy the final
+  selected image file(s) into this exact directory:
+  {out_dir}
+- Use simple filenames like image-1.png, image-2.png, image-1.jpg, or image-1.webp.
+- Put only final generated images in that directory.
+
+When finished, respond with only compact JSON in this shape:
+{{"images":[{{"path":"{out_dir}/image-1.png"}}]}}
+"""
+
+
+def _codex_imagegen_output_files(out_dir: Path, final_text: str) -> list[Path]:
+    files: list[Path] = []
+    parsed = _extract_json_object(final_text)
+    if isinstance(parsed, dict):
+        images = parsed.get("images")
+        if isinstance(images, list):
+            for item in images:
+                raw_path = item.get("path") if isinstance(item, dict) else item
+                if not isinstance(raw_path, str) or not raw_path:
+                    continue
+                try:
+                    p = Path(raw_path).resolve()
+                    p.relative_to(out_dir.resolve())
+                except Exception:
+                    continue
+                if p.is_file() and _image_file_mime(p):
+                    files.append(p)
+    if not files:
+        for p in sorted(out_dir.iterdir()):
+            if p.is_file() and _image_file_mime(p):
+                files.append(p)
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for p in files:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+
+def _codex_generated_images_since(start_ts: float, limit: int) -> list[Path]:
+    root = Path(os.environ.get("CODEX_HOME", "").strip() or (Path.home() / ".codex"))
+    gen_root = root / "generated_images"
+    if not gen_root.exists():
+        return []
+    found: list[tuple[float, Path]] = []
+    min_mtime = start_ts - 2.0
+    try:
+        gen_root_resolved = gen_root.resolve()
+    except OSError:
+        return []
+    for p in gen_root.rglob("*"):
+        if not p.is_file() or not _image_file_mime(p):
+            continue
+        try:
+            resolved = p.resolve()
+            resolved.relative_to(gen_root_resolved)
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        except ValueError:
+            continue
+        if mtime >= min_mtime:
+            found.append((mtime, resolved))
+    found.sort(key=lambda item: item[0])
+    return [p for _, p in found[-limit:]]
+
+
+async def _prepare_codex_reference_images(image_ids: list[str], input_dir: Path) -> list[Path]:
+    if not image_ids:
+        return []
+    _gc_images()
+    refs: list[Path] = []
+    for idx, aid in enumerate(image_ids[:8], start=1):
+        entry = _image_store.get(aid)
+        if not entry or entry.get("kind") != "image" or not entry.get("b64"):
+            continue
+        try:
+            raw = base64.b64decode(entry["b64"])
+        except Exception:
+            continue
+        ext = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+        }.get(entry.get("mime") or "image/png", "png")
+        p = input_dir / f"reference-{idx}.{ext}"
+        p.write_bytes(raw)
+        refs.append(p)
+    if not refs:
+        raise HTTPException(400, "reference images are missing or expired")
+    return refs
+
+
+async def _generate_openai_image_api(
+    *,
+    req: ImageGenerateReq,
+    prompt: str,
+    model: str,
+    size: str,
+    quality: str,
+    output_format: str,
+    image_ids: list[str],
+) -> dict:
+    key, base_url = _openai_image_api_config()
+    headers = {"Authorization": f"Bearer {key}"}
+    timeout = max(10.0, env_float("MUSELAB_IMAGE_GENERATION_TIMEOUT", 180.0))
+
+    import httpx
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if image_ids:
+            _gc_images()
+            data = {
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "output_format": output_format,
+                "n": str(req.n),
+            }
+            files = []
+            for aid in image_ids[:8]:
+                entry = _image_store.get(aid)
+                if not entry or entry.get("kind") != "image" or not entry.get("b64"):
+                    continue
+                try:
+                    raw = base64.b64decode(entry["b64"])
+                except Exception:
+                    continue
+                files.append(("image[]", (entry.get("name") or f"{aid}.png",
+                                          raw, entry.get("mime") or "image/png")))
+            if not files:
+                raise HTTPException(400, "reference images are missing or expired")
+            resp = await client.post(
+                f"{base_url}/images/edits",
+                headers=headers,
+                data=data,
+                files=files,
+            )
+        else:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "output_format": output_format,
+                "n": req.n,
+            }
+            resp = await client.post(
+                f"{base_url}/images/generations",
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload,
+            )
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _image_error_message(resp.status_code, resp.text))
+    try:
+        body = resp.json()
+    except ValueError:
+        raise HTTPException(502, "image API returned non-JSON response") from None
+    b64s = _image_response_items(body)
+    if not b64s:
+        raise HTTPException(502, "image API returned no base64 image")
+    mime = _IMAGE_OUTPUT_MIME[output_format]
+    items = [_stage_generated_image(b64, mime, i + 1) for i, b64 in enumerate(b64s)]
+    return {
+        "ok": True,
+        "provider": "openai",
+        "model": model,
+        "images": items,
+        "usage": body.get("usage") if isinstance(body, dict) else None,
+    }
+
+
+async def _generate_codex_imagegen(
+    *,
+    req: ImageGenerateReq,
+    prompt: str,
+    size: str,
+    quality: str,
+    output_format: str,
+    image_ids: list[str],
+) -> dict:
+    codex_bin = os.environ.get("CODEX_BIN", "").strip() or locate_executable("codex")
+    if not codex_bin:
+        raise HTTPException(
+            400,
+            "missing OpenAI image API key and codex CLI was not found for codex_imagegen",
+        )
+    if not _env_enabled("CODEX_IMAGEGEN_ENABLED", False):
+        raise HTTPException(400, "codex_imagegen is disabled by CODEX_IMAGEGEN_ENABLED")
+
+    timeout = max(
+        30.0,
+        env_float(
+            "CODEX_IMAGEGEN_TIMEOUT_SECONDS",
+            env_float("MUSELAB_IMAGE_GENERATION_TIMEOUT", 300.0),
+        ),
+    )
+    start_ts = time.time()
+    with tempfile.TemporaryDirectory(prefix="muselab-codex-imagegen-") as td:
+        work_dir = Path(td)
+        out_dir = work_dir / "out"
+        input_dir = work_dir / "input"
+        out_dir.mkdir()
+        input_dir.mkdir()
+        ref_paths = await _prepare_codex_reference_images(image_ids, input_dir)
+        final_msg = work_dir / "final.json"
+        bridge_prompt = _codex_imagegen_prompt(
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            output_format=output_format,
+            n=req.n,
+            out_dir=out_dir,
+            has_refs=bool(ref_paths),
+        )
+        cmd = [
+            codex_bin,
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "workspace-write",
+            "--cd",
+            str(work_dir),
+            "--output-last-message",
+            str(final_msg),
+        ]
+        for p in ref_paths:
+            cmd.extend(["--image", str(p)])
+        cmd.append("-")
+        env = {
+            name: value
+            for name, value in os.environ.items()
+            if name in {
+                "CODEX_HOME",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "TERM",
+                "TMPDIR",
+            }
+        }
+        env["NO_COLOR"] = "1"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(bridge_prompt.encode("utf-8")),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()  # type: ignore[possibly-undefined]
+                await proc.wait()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+            raise HTTPException(504, "codex image generation timed out") from None
+        except OSError as e:
+            raise HTTPException(502, f"failed to start codex imagegen: {e}") from None
+
+        final_text = ""
+        try:
+            final_text = final_msg.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        if proc.returncode != 0:
+            detail = (stderr or stdout).decode("utf-8", "replace").strip()
+            if final_text.strip():
+                detail = final_text.strip()
+            raise HTTPException(
+                502,
+                "codex image generation failed" + (f": {detail[:500]}" if detail else ""),
+            )
+        files = _codex_imagegen_output_files(out_dir, final_text)
+        if not files:
+            files = _codex_generated_images_since(start_ts, req.n)
+        if not files:
+            raise HTTPException(502, "codex image generation returned no image file")
+        staged = []
+        for idx, path in enumerate(files[:req.n], start=1):
+            mime = _image_file_mime(path)
+            if not mime:
+                continue
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            staged.append(_stage_generated_image_bytes(raw, mime, idx))
+        if not staged:
+            raise HTTPException(502, "codex image generation returned no readable image file")
+    return {
+        "ok": True,
+        "provider": "codex_imagegen",
+        "model": "codex-imagegen",
+        "images": staged,
+        "usage": None,
+    }
+
+
+@router.post("/image-generate", dependencies=[Depends(require_token)])
+async def generate_image(req: ImageGenerateReq) -> dict:
+    """Generate images and stage them as ordinary muselab image attachments."""
+    prompt, model, size, quality, output_format, image_ids = _normalize_image_generate_req(req)
+    provider = _image_provider()
+    if provider == "codex":
+        return await _generate_codex_imagegen(
+            req=req,
+            prompt=prompt,
+            size=size,
+            quality=quality,
+            output_format=output_format,
+            image_ids=image_ids,
+        )
+    return await _generate_openai_image_api(
+        req=req,
+        prompt=prompt,
+        model=model,
+        size=size,
+        quality=quality,
+        output_format=output_format,
+        image_ids=image_ids,
+    )
+
+
+@router.post("/image-generate/jobs", dependencies=[Depends(require_token)])
+async def create_image_generate_job(req: ImageGenerateReq) -> dict:
+    prompt, model, size, quality, output_format, _image_ids = _normalize_image_generate_req(req)
+
+    now = time.time()
+    job = {
+        "id": uuid.uuid4().hex,
+        "status": "queued",
+        "prompt": prompt,
+        "model": model,
+        "provider": None,
+        "size": size,
+        "quality": quality,
+        "output_format": output_format,
+        "n": req.n,
+        "error": "",
+        "images": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    _imagegen_put_job(job)
+    task = asyncio.create_task(_run_imagegen_job(job["id"], req))
+    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
+
+
+@router.get("/image-generate/jobs", dependencies=[Depends(require_token)])
+async def list_image_generate_jobs(limit: int = Query(40, ge=1, le=100)) -> dict:
+    return {"ok": True, "jobs": _imagegen_list_jobs(limit)}
+
+
+@router.get("/image-generate/jobs/{job_id}", dependencies=[Depends(require_token)])
+async def get_image_generate_job(job_id: str) -> dict:
+    with _imagegen_jobs_lock:
+        job = _imagegen_load_jobs().get(job_id)
+    if not job:
+        raise HTTPException(404, "image generation job not found")
+    return {"ok": True, "job": _imagegen_public_job(job, include_data=True)}
+
+
+@router.get("/image-generate/jobs/{job_id}/images/{image_id}",
+            dependencies=[Depends(require_token)])
+async def get_image_generate_job_image(job_id: str, image_id: str) -> FileResponse:
+    with _imagegen_jobs_lock:
+        job = _imagegen_load_jobs().get(job_id)
+        if not job:
+            raise HTTPException(404, "image generation job not found")
+        images = job.get("images") if isinstance(job.get("images"), list) else []
+        img = next((x for x in images
+                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    if not img:
+        raise HTTPException(404, "image generation image not found")
+    path = _imagegen_job_file(job, img)
+    if not path.exists():
+        raise HTTPException(404, "image file missing")
+    return FileResponse(
+        path,
+        media_type=img.get("mime") or "image/png",
+        filename=img.get("name") or path.name,
+    )
+
+
+@router.post("/image-generate/jobs/{job_id}/attach/{image_id}",
+             dependencies=[Depends(require_token)])
+async def attach_image_generate_job_image(job_id: str, image_id: str) -> dict:
+    with _imagegen_jobs_lock:
+        job = _imagegen_load_jobs().get(job_id)
+        if not job:
+            raise HTTPException(404, "image generation job not found")
+        images = job.get("images") if isinstance(job.get("images"), list) else []
+        img = next((x for x in images
+                    if isinstance(x, dict) and x.get("image_id") == image_id), None)
+    if not img:
+        raise HTTPException(404, "image generation image not found")
+    try:
+        raw = _imagegen_job_file(job, img).read_bytes()
+    except OSError:
+        raise HTTPException(404, "image file missing") from None
+    item = _stage_generated_image_bytes(raw, img.get("mime") or "image/png", 1)
+    if img.get("name"):
+        _image_store[item["id"]]["name"] = img["name"]
+        item["name"] = img["name"]
+    return {"ok": True, "image": item}
 
 
 def _xlsx_to_text(body: bytes, name: str) -> str:

@@ -19,7 +19,8 @@
 ## Models
 
 - [Providers](providers.md) — the built-in catalog (Claude, DeepSeek, GLM,
-  MiniMax, Kimi, Qwen, Xiaomi MiMo, Baidu ERNIE)
+  MiniMax, Kimi, Qwen, Xiaomi MiMo, Baidu ERNIE, Codex Gateway)
+- [Codex Gateway](codex-gateway.md) — connect a local Codex-backed Anthropic-compatible sidecar
 - [Add a provider](add-provider.md) — wire any Anthropic-compatible endpoint
 - [Model routing & the chat loop](routing.md) — how a model is chosen, pooled,
   and billed to the right account

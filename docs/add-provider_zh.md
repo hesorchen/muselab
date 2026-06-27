@@ -17,8 +17,11 @@ muselab 不限于 Claude。只要模型厂商提供 **Anthropic Messages API 兼
 | Qwen（DashScope）| `https://dashscope.aliyuncs.com/apps/anthropic`（国内默认；国际站走 `dashscope-intl.aliyuncs.com`）| ✅ 内置 |
 | 小米 MiMo | `https://api.xiaomimimo.com/anthropic` | ✅ 内置 |
 | 百度千帆 | `https://qianfan.baidubce.com/anthropic` | ✅ 内置 |
+| Codex Gateway | `http://127.0.0.1:8317` | ✅ 内置本地网关预设 |
 
 **未提供 Anthropic 端点的厂商**暂不支持。可以联系厂商发布兼容端点，或使用 [claude-code-router](https://github.com/musistudio/claude-code-router) 进行协议转换（存在功能损失，需额外进程）。
+
+对于 Codex/OpenAI 后端模型，内置的 **Codex Gateway** 预设假设用户自备一个运行在本机的 sidecar，并在 `http://127.0.0.1:8317` 暴露 Anthropic Messages 兼容端点。muselab 不读取 Codex OAuth 文件，也不直接调用 OpenAI 原生接口。见 [codex-gateway_zh.md](codex-gateway_zh.md)。
 
 ---
 

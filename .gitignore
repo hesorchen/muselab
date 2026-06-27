@@ -19,6 +19,14 @@ mcp.json
 # OVERRIDES_PATH, "next to mcp.json") — per-instance state, same class as
 # mcp.json above; never ship a maintainer's copy in the repo.
 provider_overrides.json
+# Local Codex / gateway runtime state — credentials, logs, and tokens are never
+# part of the open-source artifact.
+.codex/
+.cli-proxy-muselab/
+.muselab/codex-gateway/
+.muselab/imagegen/
+codex-gateway/.env
+codex-gateway/*.log
 data/
 # frontend/data/ ships tracked static JS modules (i18n alternatives, slash
 # commands, etc.); carve out from the generic data/ rule above.

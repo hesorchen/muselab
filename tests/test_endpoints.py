@@ -1,5 +1,7 @@
 """Third-party provider catalog: prefix→endpoint+key dispatch."""
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,12 @@ def _reload_endpoints(monkeypatch, env: dict):
     if "backend.endpoints" in sys.modules:
         del sys.modules["backend.endpoints"]
     from backend import endpoints as ep   # type: ignore[import]
+    # Keep catalog tests hermetic: a developer's local provider_overrides.json
+    # (gitignored runtime state) must not change built-in routing assertions.
+    monkeypatch.setattr(ep, "OVERRIDES_PATH", Path(tempfile.mkdtemp()) / "provider_overrides.json")
+    ep._OVERRIDES_CACHE = None
+    ep._CATALOG_CACHE = None
+    ep._SORTED_CATALOG_CACHE = None
     return ep
 
 
@@ -59,6 +67,7 @@ def test_is_third_party(monkeypatch):
     assert ep.is_third_party("qwen3-max")
     assert ep.is_third_party("qwen-plus")
     assert ep.is_third_party("mimo-v2.5-pro")
+    assert ep.is_third_party("codex:gpt-5.5")
     assert not ep.is_third_party("claude-sonnet-4-6")
 
 
@@ -101,6 +110,8 @@ def test_available_groups_only_lists_configured(monkeypatch):
     ("mimo-v2.5-pro",           "api.xiaomimimo.com"),
     # Baidu Qianfan — aggregator hosting ERNIE + cross-vendor models
     ("ernie-4.5-turbo-128k",    "qianfan.baidubce.com"),
+    # Codex Gateway is a local Anthropic-compatible sidecar by default.
+    ("codex:gpt-5.5",           "127.0.0.1:8317"),
     # NOTE: "deepseek-v3.2" via Qianfan is documented in Qianfan's catalog
     # but lookup() matches by prefix → DeepSeek's own provider wins (the
     # "deepseek-" prefix entry registers first). Users wanting Qianfan-
@@ -134,6 +145,18 @@ def test_longest_prefix_wins(monkeypatch):
     assert p is not None and p.prefix == "deepseek-"
 
 
+def test_codex_gateway_strips_internal_prefix_and_honors_base_url(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {
+        "CODEX_GATEWAY_API_KEY": "local-secret",
+        "CODEX_GATEWAY_BASE_URL": "http://127.0.0.1:9876",
+    })
+    assert ep.normalize_model_id("codex:gpt-5.5") == "gpt-5.5"
+    env = ep.env_override("codex:gpt-5.5")
+    assert env is not None
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
+    assert env["ANTHROPIC_API_KEY"] == "local-secret"
+
+
 def test_env_override_merges_with_os_environ(monkeypatch):
     """SDK passes env as full subprocess replacement; we must include PATH/HOME
     or claude CLI crashes with exit 1."""
@@ -162,8 +185,11 @@ def test_all_catalog_providers_have_valid_fields(monkeypatch):
     for p in ep.CATALOG:
         assert p.prefix, "prefix must be non-empty"
         assert p.prefix == p.prefix.lower(), f"prefix should be lowercase: {p.prefix}"
-        assert p.base_url.startswith("https://"), f"base_url should be https: {p.base_url}"
-        assert "anthropic" in p.base_url, "base_url should hit /anthropic endpoint"
+        assert (p.base_url.startswith("https://")
+                or p.base_url.startswith("http://127.0.0.1:")), \
+            f"base_url should be https or loopback http: {p.base_url}"
+        if p.env_key != "CODEX_GATEWAY_API_KEY":
+            assert "anthropic" in p.base_url, "base_url should hit /anthropic endpoint"
         assert p.env_key.endswith("_API_KEY"), f"env_key convention: {p.env_key}"
         assert len(p.models) > 0, f"provider {p.prefix} has no models listed"
         if p.env_key in AGGREGATOR_ENV_KEYS:

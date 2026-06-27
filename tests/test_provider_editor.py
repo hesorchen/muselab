@@ -52,6 +52,7 @@ def test_edit_builtin_endpoint_and_models(client, auth, iso_overrides):
     assert ds["is_overridden"] is True
     assert ds["base_url"] == "https://proxy.internal/anthropic"
     assert ds["models"] == ["deepseek-chat", "deepseek-reasoner"]
+    assert ds["supports_thinking"] is True
     # New model id routes back to this provider, endpoint override applies.
     assert iso_overrides.lookup("deepseek-reasoner").id == "b:deepseek-"
 
@@ -68,6 +69,18 @@ def test_restore_builtin_to_factory(client, auth, iso_overrides):
     ds = _provider(client, auth, "b:deepseek-")
     assert ds["is_overridden"] is False
     assert "deepseek.com" in ds["base_url"]
+
+
+def test_codex_gateway_builtin_surfaces_as_local_sidecar(client, auth, iso_overrides):
+    p = _provider(client, auth, "b:codex:")
+    assert p is not None
+    assert p["display"] == "Codex Gateway"
+    assert p["env_key"] == "CODEX_GATEWAY_API_KEY"
+    assert p["base_url"] == "http://127.0.0.1:8317"
+    assert p["prefix"] == "codex:"
+    assert p["models"] and all(m.startswith("codex:") for m in p["models"])
+    assert "codex:gpt-5.5" in p["models"]
+    assert p["supports_thinking"] is False
 
 
 def test_create_custom_provider_with_key(client, auth, iso_overrides, monkeypatch, tmp_path):

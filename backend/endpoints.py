@@ -80,6 +80,10 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     # explicitly documents the /anthropic endpoint.
     "XIAOMI_MIMO_API_KEY":    "https://api.xiaomimimo.com/anthropic",
     "QIANFAN_API_KEY":        "https://qianfan.baidubce.com/anthropic",
+    # Local sidecar gateway that translates Anthropic Messages requests to a
+    # user-authenticated Codex/OpenAI backend. Loopback-only by default: muselab
+    # never reads Codex OAuth files and never calls OpenAI-native APIs directly.
+    "CODEX_GATEWAY_API_KEY":   "http://127.0.0.1:8317",
 }
 # Map api-key env name → base-url override env name. Self-hosters can point
 # any provider at a proxy / regional mirror via these.
@@ -91,6 +95,7 @@ _BASE_URL_ENV_BY_KEY: dict[str, str] = {
     "DASHSCOPE_API_KEY":    "DASHSCOPE_BASE_URL",
     "XIAOMI_MIMO_API_KEY":  "XIAOMI_MIMO_BASE_URL",
     "QIANFAN_API_KEY":      "QIANFAN_BASE_URL",
+    "CODEX_GATEWAY_API_KEY": "CODEX_GATEWAY_BASE_URL",
 }
 
 
@@ -139,10 +144,13 @@ def _resolve_base_url(env_key: str, provider: Provider | None = None) -> str:
     host split is kept by default."""
     # Colon-tagged mirror groups (prefix like "qwen-intl:") get a dedicated
     # override env so they don't share the generic <KEY>_BASE_URL with the
-    # primary group that holds the same api key.
+    # primary group that holds the same api key. Only apply this split when the
+    # key is actually shared by multiple built-ins; single-provider colon tags
+    # (e.g. a local Codex gateway) should honor the generic override normally.
     if provider is not None and provider.prefix.endswith(":"):
         generic_env = _BASE_URL_ENV_BY_KEY.get(env_key, "")
-        if generic_env.endswith("_BASE_URL"):
+        shared_key = sum(1 for p in CATALOG if p.env_key == env_key) > 1
+        if shared_key and generic_env.endswith("_BASE_URL"):
             tag = provider.prefix.rstrip(":").rsplit("-", 1)[-1].upper()
             tagged_env = generic_env[:-len("_BASE_URL")] + f"_{tag}_BASE_URL"
             v = os.environ.get(tagged_env, "").strip()
@@ -316,6 +324,24 @@ CATALOG: tuple[Provider, ...] = (
             ("ernie-x1.1-preview",        "ERNIE X1.1 推理 (preview)"),
             ("ernie-x1-turbo-32k",        "ERNIE X1 推理"),
             ("deepseek-v3.2",             "DeepSeek V3.2 (千帆)"),
+        ),
+    ),
+    # Codex Gateway — local sidecar that speaks Anthropic Messages on one side
+    # and uses the user's own authenticated Codex/OpenAI backend on the other.
+    # This is NOT native OpenAI protocol support inside muselab: the gateway is
+    # responsible for translation, auth, and model availability. Loopback HTTP is
+    # intentional here; remote gateways should be put behind HTTPS + a strong key.
+    Provider(
+        prefix="codex:",
+        base_url=_DEFAULT_BASE_URLS["CODEX_GATEWAY_API_KEY"],
+        env_key="CODEX_GATEWAY_API_KEY",
+        display="Codex Gateway",
+        supports_thinking=False,
+        models=(
+            ("codex:gpt-5.5",               "GPT-5.5"),
+            ("codex:gpt-5.4",               "GPT-5.4"),
+            ("codex:gpt-5.4-mini",          "GPT-5.4 Mini"),
+            ("codex:gpt-5.3-codex-spark",   "GPT-5.3 Codex Spark"),
         ),
     ),
     # Doubao (字节 Volcengine) deliberately NOT added — only
@@ -692,6 +718,7 @@ def provider_meta() -> list[dict]:
             "prefix": p.prefix,
             "env_key": p.env_key,
             "models": [mid for mid, _ in p.models],
+            "supports_thinking": p.supports_thinking,
             "is_builtin": _builtin_by_id(p.id) is not None,
             "is_overridden": p.id in overridden,
             "probe_model": p.models[0][0] if p.models else "",

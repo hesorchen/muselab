@@ -18,7 +18,8 @@
 
 ## 模型
 
-- [模型 / Providers](providers_zh.md) —— 内置目录（Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo、百度 ERNIE）
+- [模型 / Providers](providers_zh.md) —— 内置目录（Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo、百度 ERNIE、Codex Gateway）
+- [Codex Gateway](codex-gateway_zh.md) —— 连接本地 Codex 后端 Anthropic 兼容 sidecar
 - [接入新 provider](add-provider_zh.md) —— 接任意 Anthropic 兼容端点
 - [模型路由与 chat 循环](routing_zh.md) —— 模型如何被选择、池化，以及费用如何计入正确账户
 

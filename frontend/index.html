@@ -1044,6 +1044,11 @@
                 aria-label="Open skills list">
           <svg><use href="#i-puzzle"/></svg>
         </button>
+        <button @click="openImageGen()" class="icon-btn"
+                :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'"
+                aria-label="Codex Image 2">
+          <svg><use href="#i-image"/></svg>
+        </button>
         <button @click="toggleMcpDrawer()" class="icon-btn"
                 :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
                 aria-label="Open MCP servers">
@@ -2860,21 +2865,18 @@
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>
-            <!-- Pro/Max rate-limit badge. Resident whenever the CLI has
-                 reported any quota window: shows the most-constrained window's
-                 utilization% when the SDK gives a number, otherwise a status
-                 word (正常 / 接近上限 / 已限流). rlBadge is precomputed on
-                 rate_limit SSE / snapshot, not per render. Hidden entirely for
-                 third-party / API-key setups, which the CLI never rate-limit-
-                 reports. warn ≥75%, crit at ≥90% / warning / rejected status. -->
+            <!-- Subscription quota badge. Claude uses SDK rate_limit events;
+                 Codex Gateway uses local Codex session-log snapshots. Hidden
+                 for other third-party / API-key providers. -->
             <span class="chat-toolbar-rl"
-                  x-show="rlBadge && _isClaudeModel(model)"
-                  :class="{ warn: rlBadge && rlBadge.warn && !rlBadge.crit,
-                            crit: rlBadge && rlBadge.crit }"
-                  @click="rlBadge && toast(rlBadgeDesc(), rlBadge.crit ? 'error' : (rlBadge.warn ? 'warn' : 'info'))"
+                  x-show="currentQuotaBadge()"
+                  :class="{ warn: currentQuotaBadge() && currentQuotaBadge().warn && !currentQuotaBadge().crit,
+                            crit: currentQuotaBadge() && currentQuotaBadge().crit,
+                            codex: _isCodexModel(model) }"
+                  @click="currentQuotaBadge() && toast(rlBadgeDesc(), currentQuotaBadge().crit ? 'error' : (currentQuotaBadge().warn ? 'warn' : 'info'))"
                   :title="rlBadgeDesc()">
               <svg viewBox="0 0 24 24" width="13" height="13"><use href="#i-gauge"/></svg>
-              <span class="chat-toolbar-rl-text" x-text="rlBadge ? rlBadge.text : ''"></span>
+              <span class="chat-toolbar-rl-text" x-text="currentQuotaText()"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
             <!-- Send / Stop. The button is disabled while ANY attachment is
@@ -2963,6 +2965,135 @@
       </ul>
       <div x-show="outlineMessages().length === 0" class="msg-outline-empty"
            x-text="lang==='zh' ? '此会话还没有 user 消息' : 'No user messages yet'"></div>
+    </div>
+  </div>
+
+  <!-- ============ Codex / OpenAI image generation ============ -->
+  <div class="modal-backdrop image-gen-backdrop"
+       x-show="imageGen.show"
+       x-cloak
+       @click.self="closeImageGen()">
+    <div class="modal image-gen-modal"
+         @keydown.escape.window="closeImageGen()"
+         role="dialog" aria-modal="true"
+         :aria-label="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
+      <div class="modal-head">
+        <span class="modal-title">
+          <svg class="modal-title-icon"><use href="#i-image"/></svg>
+          <span x-text="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2'"></span>
+        </span>
+        <button class="modal-close"
+                @click="closeImageGen()"
+                :disabled="imageGen.loading"
+                :title="lang==='zh' ? '关闭' : 'Close'">×</button>
+      </div>
+      <div class="modal-body image-gen-body">
+        <textarea x-ref="imageGenPrompt"
+                  x-model="imageGen.prompt"
+                  class="image-gen-prompt"
+                  rows="5"
+                  :placeholder="lang==='zh' ? '描述你想生成的图片……' : 'Describe the image you want…'"></textarea>
+        <div class="image-gen-controls">
+          <label>
+            <span x-text="lang==='zh' ? '模型' : 'Model'"></span>
+            <input x-model="imageGen.model" />
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '尺寸' : 'Size'"></span>
+            <select x-model="imageGen.size">
+              <option value="1024x1024">1024×1024</option>
+              <option value="1536x1024">1536×1024</option>
+              <option value="1024x1536">1024×1536</option>
+              <option value="auto">auto</option>
+            </select>
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '质量' : 'Quality'"></span>
+            <select x-model="imageGen.quality">
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="auto">auto</option>
+            </select>
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '格式' : 'Format'"></span>
+            <select x-model="imageGen.output_format">
+              <option value="png">png</option>
+              <option value="jpeg">jpeg</option>
+              <option value="webp">webp</option>
+            </select>
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '张数' : 'Count'"></span>
+            <select x-model.number="imageGen.n">
+              <option :value="1">1</option>
+              <option :value="2">2</option>
+              <option :value="3">3</option>
+              <option :value="4">4</option>
+            </select>
+          </label>
+        </div>
+        <label class="image-gen-ref"
+               x-show="pendingImages.some(x => x && x.id && !x.uploading && !x.error)">
+          <input type="checkbox" x-model="imageGen.useReferences">
+          <span x-text="lang==='zh' ? '用当前待发送图片作为参考' : 'Use current pending images as references'"></span>
+        </label>
+        <div class="settings-hint warn" x-show="imageGen.error" x-text="imageGen.error"></div>
+        <div class="image-gen-history-head">
+          <span x-text="lang==='zh' ? '历史生成' : 'History'"></span>
+          <button class="btn-ghost sm" type="button"
+                  @click="refreshImageGenJobs()"
+                  :disabled="imageGen.jobsLoading"
+                  x-text="imageGen.jobsLoading ? (lang==='zh' ? '刷新中…' : 'Refreshing…') : (lang==='zh' ? '刷新' : 'Refresh')"></button>
+        </div>
+        <div class="image-gen-empty" x-show="!imageGen.jobs.length && !imageGen.jobsLoading"
+             x-text="lang==='zh' ? '还没有生成记录。' : 'No generated images yet.'"></div>
+        <div class="image-gen-results" x-show="imageGen.jobs.length">
+          <template x-for="job in imageGen.jobs" :key="job.id">
+            <div class="image-gen-job" :class="'status-' + job.status">
+              <div class="image-gen-job-head">
+                <div class="image-gen-job-title">
+                  <span class="image-gen-status" x-text="imageGenStatusLabel(job.status)"></span>
+                  <span x-text="job.provider || job.model || 'imagegen'"></span>
+                </div>
+                <span class="image-gen-job-time" x-text="fmtHM((job.updated_at || job.created_at) * 1000)"></span>
+              </div>
+              <div class="image-gen-job-prompt" x-text="job.prompt"></div>
+              <div class="settings-hint warn" x-show="job.error" x-text="job.error"></div>
+              <div class="image-gen-job-pending"
+                   x-show="job.status === 'queued' || job.status === 'running'">
+                <span class="thinking-dots"><span></span><span></span><span></span></span>
+                <span x-text="lang==='zh' ? '后台生成中，可以关闭这个窗口。' : 'Generating in the background. You can close this window.'"></span>
+              </div>
+              <div class="image-gen-job-grid" x-show="job.images && job.images.length">
+                <template x-for="img in (job.images || [])" :key="img.image_id">
+                  <div class="image-gen-card">
+                    <button type="button" class="image-gen-preview"
+                            @click="openLightbox(img.data_url || img.blob_url, img.name)">
+                      <img :src="img.data_url || img.blob_url" alt="" />
+                    </button>
+                    <div class="image-gen-card-foot">
+                      <span x-text="img.name"></span>
+                      <button class="btn-primary sm"
+                              @click="attachImageGenHistory(job, img)"
+                              x-text="lang==='zh' ? '加入消息' : 'Attach'"></button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn-ghost" @click="closeImageGen()"
+                x-text="t('btn.cancel')"></button>
+        <button class="btn-primary"
+                @click="runImageGen()"
+                :disabled="imageGen.loading || !imageGen.prompt.trim()"
+                x-text="imageGen.loading ? (lang==='zh' ? '提交中…' : 'Submitting…') : (lang==='zh' ? '提交后台任务' : 'Submit job')"></button>
+      </div>
     </div>
   </div>
 
@@ -3282,7 +3413,9 @@
                     <a x-show="PROVIDER_HELP[p.env_key]?.url"
                        :href="PROVIDER_HELP[p.env_key]?.url"
                        target="_blank" rel="noopener"
-                       x-text="lang==='zh' ? '打开控制台 ↗' : 'Open console ↗'"></a>
+                       x-text="PROVIDER_HELP[p.env_key]?.url?.startsWith('docs/')
+                         ? (lang==='zh' ? '打开文档 ↗' : 'Open docs ↗')
+                         : (lang==='zh' ? '打开控制台 ↗' : 'Open console ↗')"></a>
                   </div>
                   <div x-show="settings.probeResults[p.probe_model]"
                        class="probe-result"
@@ -3627,6 +3760,37 @@
           </div>
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
+          </template>
+          <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at">
+            <div class="codex-quota-head">
+              <div>
+                <div class="cost-block-title" x-text="t('set.cost.codex_quota')"></div>
+                <div class="settings-hint"
+                     x-text="t('set.cost.codex_quota_hint') + (codexLimitUpdatedText() ? ' · ' + codexLimitUpdatedText() : '')"></div>
+              </div>
+              <span class="settings-badge ok"
+                    x-show="codexLimit.plan_type"
+                    x-text="codexLimit.plan_type"></span>
+            </div>
+            <div class="codex-quota-grid">
+              <template x-for="w in codexLimitRows()" :key="w.key">
+                <div class="codex-quota-window"
+                     :class="{ warn: w.used_percent >= 75 && w.used_percent < 90,
+                               crit: w.used_percent >= 90 || w.status === 'rejected' }">
+                  <div class="codex-quota-label" x-text="rateLimitWindowLabel(w.rate_limit_type) || w.key"></div>
+                  <div class="codex-quota-value"
+                       x-text="(w.remaining_percent ?? '—') + '%'"></div>
+                  <div class="codex-quota-sub"
+                       x-text="t('set.cost.remaining') + ' · ' + t('set.cost.used') + ' ' + (w.used_percent ?? '—') + '%'"></div>
+                  <div class="codex-quota-reset"
+                       x-show="w.resets_at"
+                       x-text="t('rl.resets', { t: rateLimitResetText(w.resets_at) })"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+          <template x-if="codexLimit && !codexLimit.updated_at">
+            <div class="settings-hint" x-text="t('set.cost.codex_quota_empty')"></div>
           </template>
           <!-- Skeleton while the (uncached / cold) dashboard scan runs — the
                first load on a large archive reads every session JSONL and can
