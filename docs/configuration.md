@@ -51,6 +51,7 @@ Settings panel.
 | Qwen / DashScope | `DASHSCOPE_API_KEY` | dashscope.aliyuncs.com/apps/anthropic | `DASHSCOPE_BASE_URL` |
 | Xiaomi MiMo | `XIAOMI_MIMO_API_KEY` | api.xiaomimimo.com/anthropic | `XIAOMI_MIMO_BASE_URL` |
 | Baidu ERNIE (Qianfan) | `QIANFAN_API_KEY` | qianfan.baidubce.com/anthropic | `QIANFAN_BASE_URL` |
+| Codex Gateway | `CODEX_GATEWAY_API_KEY` | 127.0.0.1:8766/anthropic | `CODEX_GATEWAY_BASE_URL` |
 
 Notes:
 - **MiniMax China vs Global use different keys.** A `minimaxi.com` key 401s on
@@ -59,6 +60,8 @@ Notes:
   the Global variant is selected per-model in the UI.
 - Providers you add yourself in Settings get a key named
   `MUSELAB_PROVIDER_<SLUG>_API_KEY`.
+- **Codex Gateway** is a local Anthropic-compatible sidecar. The token is for
+  the gateway only; muselab does not store Codex OAuth credentials.
 
 See [add-provider.md](add-provider.md) for adding an Anthropic-compatible
 endpoint that isn't in this list.

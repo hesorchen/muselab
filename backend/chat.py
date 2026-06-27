@@ -711,13 +711,16 @@ _session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
 # Per-model context windows. Used as the meter's denominator when a SDK
 # get_context_usage() truth isn't available (first turn of a session, or
 # any third-party model where CLI's tokenizer / window inference is
-# unreliable). Numbers verified 2026-05-18 from each vendor's docs:
+# unreliable). Numbers verified from each vendor's docs:
 #   - Anthropic:   tygartmedia.com / anthropic.com (Opus/Sonnet 4.6+ default
 #                  to 1M on Pro/Max/Enterprise; Haiku 4.5 stays 200K)
 #   - DeepSeek V4: api-docs.deepseek.com (V4 series ships 1M native context)
 #   - Zhipu GLM:   glm-5.org / docs.z.ai (GLM-5 + GLM-4.7 both 200K context)
 #   - MiniMax:     platform.minimax.io (M2.5 / M2.7 both 204_800, cline #10007
 #                  PR fixed the prior 192K/245K misinformation)
+#   - OpenAI Codex/GPT-5: developers.openai.com model cards (400K context,
+#                  128K max output; GPT-5-Codex is Responses-API-only behind
+#                  the local gateway)
 MODEL_CONTEXT_LIMITS = {
     # Anthropic — the bundled Claude Code CLI reports a 200K effective window
     # for these models (verified via get_context_usage: maxTokens=200000). The
@@ -747,6 +750,12 @@ MODEL_CONTEXT_LIMITS = {
     "minimax-m2.7":                 204_800,
     "minimax-m2.7-highspeed":       204_800,
     "minimax-m2.5":                 204_800,
+    # Codex Gateway — OpenAI GPT-5 / GPT-5 mini / GPT-5-Codex model cards list
+    # 400K context windows. Gateway implementations may still fail earlier if
+    # their translation layer or account tier has a smaller effective window.
+    "codex:gpt-5-codex":            400_000,
+    "codex:gpt-5":                  400_000,
+    "codex:gpt-5-mini":             400_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
 
@@ -3379,6 +3388,133 @@ def rate_limit() -> dict:
         "windows": _rate_limit_state,
         "updated_at": _rate_limit_updated_at,
     }
+
+
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def _codex_rate_limit_type(key: str, window: dict) -> str:
+    minutes = int(window.get("window_minutes") or 0)
+    if minutes == 300:
+        return "five_hour"
+    if minutes == 10080:
+        return "seven_day"
+    # Treat the common calendar-month approximations as monthly. Keep the
+    # original window_minutes in the payload so callers can still display the
+    # exact reset horizon if Codex changes the duration.
+    if 28 * 24 * 60 <= minutes <= 31 * 24 * 60:
+        return "monthly"
+    return key
+
+
+def _codex_rate_limits_from_payload(payload: dict, source: Path, ts: str | None) -> dict | None:
+    raw = payload.get("rate_limits")
+    if not isinstance(raw, dict):
+        return None
+    windows: dict[str, dict] = {}
+    reached = raw.get("rate_limit_reached_type")
+    for key in ("primary", "secondary"):
+        w = raw.get(key)
+        if not isinstance(w, dict):
+            continue
+        used = w.get("used_percent")
+        try:
+            used_f = float(used)
+        except (TypeError, ValueError):
+            used_f = None
+        status = "allowed"
+        if reached and (reached == key or reached == _codex_rate_limit_type(key, w)):
+            status = "rejected"
+        elif used_f is not None and used_f >= 90:
+            status = "allowed_warning"
+        windows[key] = {
+            "rate_limit_type": _codex_rate_limit_type(key, w),
+            "window_minutes": int(w.get("window_minutes") or 0),
+            "resets_at": int(w.get("resets_at") or 0) or None,
+            "used_percent": used_f,
+            "remaining_percent": (round(max(0.0, 100.0 - used_f), 1)
+                                  if used_f is not None else None),
+            # Match the Claude SDK shape consumed by the existing FE badge.
+            "utilization": (used_f / 100.0 if used_f is not None else None),
+            "status": status,
+        }
+    if not windows:
+        return None
+    updated_at = 0.0
+    if ts:
+        try:
+            updated_at = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            updated_at = 0.0
+    return {
+        "ok": True,
+        "source": "codex-session-log",
+        "source_file": str(source),
+        "updated_at": updated_at,
+        "timestamp": ts,
+        "limit_id": raw.get("limit_id"),
+        "limit_name": raw.get("limit_name"),
+        "plan_type": raw.get("plan_type"),
+        "rate_limit_reached_type": reached,
+        "credits": raw.get("credits"),
+        "individual_limit": raw.get("individual_limit"),
+        "windows": windows,
+    }
+
+
+def _latest_codex_rate_limits() -> dict:
+    """Read the newest Codex quota snapshot from local Codex session JSONL.
+
+    Codex already writes rate-limit snapshots into token_count events. Reading
+    those logs avoids touching ~/.codex/auth.json or calling private OpenAI
+    endpoints. We only inspect lines containing the literal "rate_limits" and
+    stop at the newest usable event.
+    """
+    home = _codex_home()
+    sessions_dir = home / "sessions"
+    if not sessions_dir.exists():
+        return {"ok": False, "reason": "codex_sessions_missing", "windows": {}, "updated_at": 0}
+    try:
+        files = sorted(
+            sessions_dir.rglob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError as e:
+        return {"ok": False, "reason": f"codex_sessions_unreadable: {e}", "windows": {},
+                "updated_at": 0}
+    max_files = max(1, env_int("MUSELAB_CODEX_RATE_LIMIT_SCAN_FILES", 80, min_value=1))
+    for path in files[:max_files]:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            parsed = _codex_rate_limits_from_payload(payload, path, event.get("timestamp"))
+            if parsed:
+                return parsed
+    return {"ok": False, "reason": "codex_rate_limits_not_found", "windows": {},
+            "updated_at": 0}
+
+
+@router.get("/codex-rate-limit", dependencies=[Depends(require_token)])
+def codex_rate_limit() -> dict:
+    """Latest Codex subscription quota snapshot from local Codex session logs.
+
+    This is intentionally a read-only local-state bridge. It does not read
+    Codex OAuth credentials and it does not call OpenAI-native APIs.
+    """
+    return _latest_codex_rate_limits()
 
 
 @router.get("/usage", dependencies=[Depends(require_token)])

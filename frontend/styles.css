@@ -1416,6 +1416,15 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      ring (18px); the "5h 正常" text is hidden and a tap surfaces it via toast. */
   .chat-toolbar-rl { cursor: pointer; height: 44px; padding: 0 8px; gap: 0; }
   .chat-toolbar-rl-text { display: none; }
+  .chat-toolbar-rl.codex {
+    max-width: 104px;
+    padding: 0 5px;
+    gap: 3px;
+  }
+  .chat-toolbar-rl.codex .chat-toolbar-rl-text {
+    display: inline;
+    max-width: 76px;
+  }
   .chat-toolbar-rl svg { width: 18px; height: 18px; opacity: 1; }
   .chat-toolbar-btn,
   .chat-toolbar-ring,
@@ -5550,8 +5559,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-text-3);
   border-radius: var(--r-md);
   cursor: default; user-select: none;
+  max-width: 180px;
 }
 .chat-toolbar-rl svg { display: block; opacity: 0.8; }
+.chat-toolbar-rl-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .chat-toolbar-rl.warn { color: var(--c-warn); }
 .chat-toolbar-rl.crit { color: var(--c-danger); }
 .chat-toolbar-spacer { flex: 1; }
@@ -5836,7 +5851,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .toast.error .icon { color: var(--c-danger); }
 .toast.warn { border-left-color: var(--c-warn); }
 .toast.warn .icon { color: var(--c-warn); }
-.toast .body { flex: 1; }
+.toast .body { flex: 1; white-space: pre-line; }
 .toast .icon { padding-top: 1px; }
 .toast .close { background: transparent; border: 0; color: var(--c-fg-3); cursor: pointer; padding: 0; }
 .toast .close:hover { color: var(--c-fg-0); }
@@ -6869,6 +6884,49 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
   color: var(--c-fg-1);
   font-variant-numeric: tabular-nums;
 }
+.codex-quota-card {
+  margin: 8px 0 16px;
+  padding: 12px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-2);
+}
+.codex-quota-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: 10px;
+}
+.codex-quota-head .cost-block-title {
+  margin: 0 0 2px;
+}
+.codex-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.codex-quota-window {
+  padding: 10px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-1);
+}
+.codex-quota-label,
+.codex-quota-sub,
+.codex-quota-reset {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+}
+.codex-quota-value {
+  margin: 4px 0;
+  font-size: var(--fs-2xl);
+  font-weight: 650;
+  color: var(--c-fg-1);
+  font-variant-numeric: tabular-nums;
+}
+.codex-quota-window.warn .codex-quota-value { color: var(--c-warn); }
+.codex-quota-window.crit .codex-quota-value { color: var(--c-danger); }
 /* Token-class filter chips — clickable to toggle a category's inclusion
    in every aggregate below. .inactive = user has hidden this class
    (greyed + line-through so the chip still acts as a "click to re-add"
@@ -6995,6 +7053,7 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
 }
 @media (max-width: 720px) {
   .cost-kpis { grid-template-columns: repeat(2, 1fr); }
+  .codex-quota-grid { grid-template-columns: 1fr; }
   .cost-model-row { grid-template-columns: 100px 1fr 100px; font-size: var(--fs-xs); }
 }
 .cmd-palette-item-label {

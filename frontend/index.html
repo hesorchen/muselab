@@ -2860,21 +2860,18 @@
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>
-            <!-- Pro/Max rate-limit badge. Resident whenever the CLI has
-                 reported any quota window: shows the most-constrained window's
-                 utilization% when the SDK gives a number, otherwise a status
-                 word (正常 / 接近上限 / 已限流). rlBadge is precomputed on
-                 rate_limit SSE / snapshot, not per render. Hidden entirely for
-                 third-party / API-key setups, which the CLI never rate-limit-
-                 reports. warn ≥75%, crit at ≥90% / warning / rejected status. -->
+            <!-- Subscription quota badge. Claude uses SDK rate_limit events;
+                 Codex Gateway uses local Codex session-log snapshots. Hidden
+                 for other third-party / API-key providers. -->
             <span class="chat-toolbar-rl"
-                  x-show="rlBadge && _isClaudeModel(model)"
-                  :class="{ warn: rlBadge && rlBadge.warn && !rlBadge.crit,
-                            crit: rlBadge && rlBadge.crit }"
-                  @click="rlBadge && toast(rlBadgeDesc(), rlBadge.crit ? 'error' : (rlBadge.warn ? 'warn' : 'info'))"
+                  x-show="currentQuotaBadge()"
+                  :class="{ warn: currentQuotaBadge() && currentQuotaBadge().warn && !currentQuotaBadge().crit,
+                            crit: currentQuotaBadge() && currentQuotaBadge().crit,
+                            codex: _isCodexModel(model) }"
+                  @click="currentQuotaBadge() && toast(rlBadgeDesc(), currentQuotaBadge().crit ? 'error' : (currentQuotaBadge().warn ? 'warn' : 'info'))"
                   :title="rlBadgeDesc()">
               <svg viewBox="0 0 24 24" width="13" height="13"><use href="#i-gauge"/></svg>
-              <span class="chat-toolbar-rl-text" x-text="rlBadge ? rlBadge.text : ''"></span>
+              <span class="chat-toolbar-rl-text" x-text="currentQuotaText()"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
             <!-- Send / Stop. The button is disabled while ANY attachment is
@@ -3282,7 +3279,9 @@
                     <a x-show="PROVIDER_HELP[p.env_key]?.url"
                        :href="PROVIDER_HELP[p.env_key]?.url"
                        target="_blank" rel="noopener"
-                       x-text="lang==='zh' ? '打开控制台 ↗' : 'Open console ↗'"></a>
+                       x-text="PROVIDER_HELP[p.env_key]?.url?.startsWith('docs/')
+                         ? (lang==='zh' ? '打开文档 ↗' : 'Open docs ↗')
+                         : (lang==='zh' ? '打开控制台 ↗' : 'Open console ↗')"></a>
                   </div>
                   <div x-show="settings.probeResults[p.probe_model]"
                        class="probe-result"
@@ -3627,6 +3626,37 @@
           </div>
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
+          </template>
+          <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at">
+            <div class="codex-quota-head">
+              <div>
+                <div class="cost-block-title" x-text="t('set.cost.codex_quota')"></div>
+                <div class="settings-hint"
+                     x-text="t('set.cost.codex_quota_hint') + (codexLimitUpdatedText() ? ' · ' + codexLimitUpdatedText() : '')"></div>
+              </div>
+              <span class="settings-badge ok"
+                    x-show="codexLimit.plan_type"
+                    x-text="codexLimit.plan_type"></span>
+            </div>
+            <div class="codex-quota-grid">
+              <template x-for="w in codexLimitRows()" :key="w.key">
+                <div class="codex-quota-window"
+                     :class="{ warn: w.used_percent >= 75 && w.used_percent < 90,
+                               crit: w.used_percent >= 90 || w.status === 'rejected' }">
+                  <div class="codex-quota-label" x-text="rateLimitWindowLabel(w.rate_limit_type) || w.key"></div>
+                  <div class="codex-quota-value"
+                       x-text="(w.remaining_percent ?? '—') + '%'"></div>
+                  <div class="codex-quota-sub"
+                       x-text="t('set.cost.remaining') + ' · ' + t('set.cost.used') + ' ' + (w.used_percent ?? '—') + '%'"></div>
+                  <div class="codex-quota-reset"
+                       x-show="w.resets_at"
+                       x-text="t('rl.resets', { t: rateLimitResetText(w.resets_at) })"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+          <template x-if="codexLimit && !codexLimit.updated_at">
+            <div class="settings-hint" x-text="t('set.cost.codex_quota_empty')"></div>
           </template>
           <!-- Skeleton while the (uncached / cold) dashboard scan runs — the
                first load on a large archive reads every session JSONL and can
