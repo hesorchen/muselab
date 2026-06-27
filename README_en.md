@@ -36,7 +36,7 @@
 |---|---|
 | **Complete user context** | Your personal archive keeps accumulating; the more you use it, the better Muse understands you, creating compounding context |
 | **Leading Agent Harness** | Built on the Claude Agent SDK, with agent capabilities such as tool use, Skills, and MCP extensions |
-| **Switchable foundation models** | One-click switching across 9 providers: Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE / Codex Gateway |
+| **Switchable foundation models** | One-click switching across 9 provider families: Claude (OAuth) / GPT via local Codex Gateway / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE |
 | **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
 | **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
 | **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |

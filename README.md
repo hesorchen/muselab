@@ -36,7 +36,7 @@
 |---|---|
 | **完整的用户上下文** | 不断累积的个人档案，越用越懂你，产生 context 复利 |
 | **领先的 Agent Harness** | 基于 Claude Agent SDK 构建，具备工具调用、Skills、MCP 扩展等 Agent 能力|
-| **灵活切换的基座模型** | Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE / Codex Gateway 等 9 类模型提供方一键切换 |
+| **灵活切换的基座模型** | Claude（OAuth） / GPT（通过本地 Codex Gateway） / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE 等 9 类模型提供方一键切换 |
 | **跨领域交叉分析** | 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
 | **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
 | **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
