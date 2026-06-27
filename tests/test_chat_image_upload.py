@@ -102,3 +102,119 @@ def test_image_store_gc_drops_expired(client, auth, monkeypatch):
     monkeypatch.setattr(chat, "_IMAGE_TTL_S", 100)
     chat._gc_images()
     assert "old" not in chat._image_store
+
+
+def test_image_generate_posts_to_openai_and_stages_attachment(client, auth, monkeypatch):
+    monkeypatch.setenv("OPENAI_IMAGE_API_KEY", "sk-test-image-key")
+    monkeypatch.setenv("OPENAI_IMAGE_BASE_URL", "https://api.openai.test/v1")
+    posted = {}
+
+    class _FakeResp:
+        status_code = 200
+        text = '{"data":[{"b64_json":"ignored-by-json"}]}'
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(PNG_1X1).decode("ascii")}]}
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            posted["timeout"] = k.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None, data=None, files=None):
+            posted["url"] = url
+            posted["headers"] = headers
+            posted["json"] = json
+            posted["data"] = data
+            posted["files"] = files
+            return _FakeResp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    r = client.post("/api/chat/image-generate", headers=auth, json={
+        "prompt": "a small blue square",
+        "model": "gpt-image-2",
+        "size": "1024x1024",
+        "quality": "low",
+        "output_format": "png",
+        "n": 1,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    img = body["images"][0]
+    assert img["id"]
+    assert img["data_url"].startswith("data:image/png;base64,")
+    assert posted["url"] == "https://api.openai.test/v1/images/generations"
+    assert posted["headers"]["Authorization"] == "Bearer sk-test-image-key"
+    assert posted["json"]["model"] == "gpt-image-2"
+    assert posted["json"]["prompt"] == "a small blue square"
+
+    from backend import chat
+    staged = chat._image_store[img["id"]]
+    assert staged["kind"] == "image"
+    assert staged["mime"] == "image/png"
+    assert base64.b64decode(staged["b64"]) == PNG_1X1
+
+
+def test_image_generate_can_use_pending_reference_image(client, auth, monkeypatch):
+    monkeypatch.setenv("OPENAI_IMAGE_API_KEY", "sk-test-image-key")
+    posted = {}
+    from backend import chat
+    chat._image_store["ref1"] = {
+        "kind": "image",
+        "mime": "image/png",
+        "name": "ref.png",
+        "b64": base64.b64encode(PNG_1X1).decode("ascii"),
+        "ts": 9999999999,
+    }
+
+    class _FakeResp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(PNG_1X1).decode("ascii")}]}
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None, data=None, files=None):
+            posted["url"] = url
+            posted["data"] = data
+            posted["files"] = files
+            return _FakeResp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    r = client.post("/api/chat/image-generate", headers=auth, json={
+        "prompt": "make it brighter",
+        "image_ids": ["ref1"],
+    })
+    assert r.status_code == 200, r.text
+    assert posted["url"].endswith("/images/edits")
+    assert posted["data"]["prompt"] == "make it brighter"
+    assert posted["files"][0][0] == "image[]"
+    assert posted["files"][0][1][0] == "ref.png"
+
+
+def test_image_generate_requires_image_key(client, auth):
+    r = client.post("/api/chat/image-generate", headers=auth, json={
+        "prompt": "hello",
+    })
+    assert r.status_code == 400
+    assert "OPENAI_IMAGE_API_KEY" in r.json()["detail"]

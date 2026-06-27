@@ -20,6 +20,13 @@ muselab 以 **Claude Agent SDK** 作为唯一对话后端。非 Claude 模型通
 
 各家具体型号以 UI 下拉为准 —— 来源是生效中的 catalog（内置默认 + 你在 Settings 里的改动），更新频率比本表高。
 
+## 生图
+
+Composer 里的图片按钮不是聊天 provider。它默认用 `gpt-image-2` 调 OpenAI
+Image API，读取 `OPENAI_IMAGE_API_KEY`（或 `OPENAI_API_KEY`）以及可选的
+`OPENAI_IMAGE_BASE_URL`。生成结果会作为普通 muselab 图片附件暂存，因此可预览、
+画笔标注，并加入当前聊天发送。
+
 ## 对话中切换模型
 
 当前会话已有消息时，下拉菜单弹确认 → fork 一个使用新模型的新会话，原会话保留在历史。空会话则直接原地切换（不 fork）。fork 是为了避免跨厂商的思考签名漂移——将一家厂商签名的思考块直接发送给另一家厂商会导致难以排查的错误。

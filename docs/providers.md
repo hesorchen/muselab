@@ -27,6 +27,14 @@ Exact model ids in each family come from the UI dropdown — they're sourced
 from the effective catalog (built-in defaults + your Settings overrides) and
 may evolve faster than this table.
 
+## Image generation
+
+The composer image button is not a chat provider. It calls the native OpenAI
+Image API with `gpt-image-2` by default, using `OPENAI_IMAGE_API_KEY` (or
+`OPENAI_API_KEY`) and optional `OPENAI_IMAGE_BASE_URL`. Generated images are
+staged as normal muselab image attachments, so they can be previewed, annotated,
+and sent into the current chat.
+
 ## Switching model mid-conversation
 
 If the current session already has messages, the dropdown opens a confirm

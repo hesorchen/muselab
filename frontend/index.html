@@ -2723,6 +2723,11 @@
                     :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
             </button>
+            <button @click="openImageGen()"
+                    class="chat-toolbar-btn"
+                    :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
+              <svg><use href="#i-image"/></svg>
+            </button>
             <!-- Command-palette opener lives in the chat pane's TOP bar
                  (global "files / sessions / actions" entry), not here.
                  This bottom toolbar is reserved for per-turn controls
@@ -2960,6 +2965,107 @@
       </ul>
       <div x-show="outlineMessages().length === 0" class="msg-outline-empty"
            x-text="lang==='zh' ? '此会话还没有 user 消息' : 'No user messages yet'"></div>
+    </div>
+  </div>
+
+  <!-- ============ Codex / OpenAI image generation ============ -->
+  <div class="modal-backdrop image-gen-backdrop"
+       x-show="imageGen.show"
+       x-cloak
+       @click.self="closeImageGen()">
+    <div class="modal image-gen-modal"
+         @keydown.escape.window="closeImageGen()"
+         role="dialog" aria-modal="true"
+         :aria-label="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
+      <div class="modal-head">
+        <span class="modal-title">
+          <svg class="modal-title-icon"><use href="#i-image"/></svg>
+          <span x-text="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2'"></span>
+        </span>
+        <button class="modal-close"
+                @click="closeImageGen()"
+                :disabled="imageGen.loading"
+                :title="lang==='zh' ? '关闭' : 'Close'">×</button>
+      </div>
+      <div class="modal-body image-gen-body">
+        <textarea x-ref="imageGenPrompt"
+                  x-model="imageGen.prompt"
+                  class="image-gen-prompt"
+                  rows="5"
+                  :placeholder="lang==='zh' ? '描述你想生成的图片……' : 'Describe the image you want…'"></textarea>
+        <div class="image-gen-controls">
+          <label>
+            <span x-text="lang==='zh' ? '模型' : 'Model'"></span>
+            <input x-model="imageGen.model" />
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '尺寸' : 'Size'"></span>
+            <select x-model="imageGen.size">
+              <option value="1024x1024">1024×1024</option>
+              <option value="1536x1024">1536×1024</option>
+              <option value="1024x1536">1024×1536</option>
+              <option value="auto">auto</option>
+            </select>
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '质量' : 'Quality'"></span>
+            <select x-model="imageGen.quality">
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="auto">auto</option>
+            </select>
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '格式' : 'Format'"></span>
+            <select x-model="imageGen.output_format">
+              <option value="png">png</option>
+              <option value="jpeg">jpeg</option>
+              <option value="webp">webp</option>
+            </select>
+          </label>
+          <label>
+            <span x-text="lang==='zh' ? '张数' : 'Count'"></span>
+            <select x-model.number="imageGen.n">
+              <option :value="1">1</option>
+              <option :value="2">2</option>
+              <option :value="3">3</option>
+              <option :value="4">4</option>
+            </select>
+          </label>
+        </div>
+        <label class="image-gen-ref"
+               x-show="pendingImages.some(x => x && x.id && !x.uploading && !x.error)">
+          <input type="checkbox" x-model="imageGen.useReferences">
+          <span x-text="lang==='zh' ? '用当前待发送图片作为参考' : 'Use current pending images as references'"></span>
+        </label>
+        <div class="settings-hint warn" x-show="imageGen.error" x-text="imageGen.error"></div>
+        <div class="image-gen-results" x-show="imageGen.images.length">
+          <template x-for="img in imageGen.images" :key="img.id">
+            <div class="image-gen-card">
+              <button type="button" class="image-gen-preview"
+                      @click="openLightbox(img.data_url, img.name)">
+                <img :src="img.data_url" alt="" />
+              </button>
+              <div class="image-gen-card-foot">
+                <span x-text="img.name"></span>
+                <button class="btn-primary sm"
+                        @click="attachGeneratedImage(img)"
+                        x-text="lang==='zh' ? '加入消息' : 'Attach'"></button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn-ghost" @click="closeImageGen()"
+                :disabled="imageGen.loading"
+                x-text="t('btn.cancel')"></button>
+        <button class="btn-primary"
+                @click="runImageGen()"
+                :disabled="imageGen.loading || !imageGen.prompt.trim()"
+                x-text="imageGen.loading ? (lang==='zh' ? '生成中…' : 'Generating…') : (lang==='zh' ? '生成' : 'Generate')"></button>
+      </div>
     </div>
   </div>
 

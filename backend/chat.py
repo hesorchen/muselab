@@ -10,12 +10,12 @@ import shutil
 import time
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from claude_agent_sdk import (
     ClaudeSDKClient, ClaudeAgentOptions,
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
@@ -5060,6 +5060,7 @@ _IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
 _IMAGE_STORE_MAX_BYTES = 256 * 1024 * 1024
 _IMAGE_STORE_MAX_ENTRIES = 48
 _IMAGE_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_IMAGE_OUTPUT_MIME = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
 _PDF_MIME = {"application/pdf"}
 # text-ish formats we'll inline. Browsers send vague mimes — we also gate by
 # extension below as a fallback.
@@ -5147,6 +5148,205 @@ def _classify_attachment(mime: str, name: str) -> str:
         if lower.endswith(ext):
             return "xlsx"
     return ""
+
+
+class ImageGenerateReq(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=4000)
+    model: str = Field(default="gpt-image-2", max_length=80)
+    size: str = Field(default="1024x1024", max_length=32)
+    quality: str = Field(default="low", max_length=16)
+    output_format: str = Field(default="png", max_length=8)
+    n: int = Field(default=1, ge=1, le=4)
+    image_ids: list[str] | None = None
+
+
+_IMAGE_SIZE_RE = re.compile(r"^(auto|[1-9][0-9]{2,3}x[1-9][0-9]{2,3})$")
+_IMAGE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+
+
+def _validate_image_size(size: str) -> str:
+    s = (size or "1024x1024").strip()
+    if not _IMAGE_SIZE_RE.fullmatch(s):
+        raise HTTPException(400, "invalid image size")
+    if s == "auto":
+        return s
+    w, h = [int(x) for x in s.split("x", 1)]
+    if w > 3840 or h > 3840:
+        raise HTTPException(400, "image size edge must be <= 3840")
+    if w % 16 or h % 16:
+        raise HTTPException(400, "image size edges must be multiples of 16")
+    if max(w, h) / min(w, h) > 3:
+        raise HTTPException(400, "image aspect ratio must be <= 3:1")
+    pixels = w * h
+    if pixels < 655_360 or pixels > 8_294_400:
+        raise HTTPException(400, "image size pixels out of range")
+    return s
+
+
+def _openai_image_api_config() -> tuple[str, str]:
+    key = (
+        os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
+        or os.environ.get("CODEX_IMAGE_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+    if not key:
+        raise HTTPException(
+            400,
+            "missing OPENAI_IMAGE_API_KEY or OPENAI_API_KEY for image generation",
+        )
+    base_url = (
+        os.environ.get("OPENAI_IMAGE_BASE_URL", "").strip()
+        or os.environ.get("CODEX_IMAGE_BASE_URL", "").strip()
+        or os.environ.get("OPENAI_BASE_URL", "").strip()
+        or "https://api.openai.com/v1"
+    ).rstrip("/")
+    if not (base_url.startswith("https://") or base_url.startswith("http://127.0.0.1")
+            or base_url.startswith("http://localhost")):
+        raise HTTPException(400, "OPENAI_IMAGE_BASE_URL must be https or loopback http")
+    return key, base_url
+
+
+def _image_error_message(status: int, body: str) -> str:
+    try:
+        data = json.loads(body)
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message") if isinstance(err, dict) else None
+        if isinstance(msg, str) and msg:
+            return f"image generation failed ({status}): {msg[:500]}"
+    except Exception:
+        pass
+    return f"image generation failed ({status})"
+
+
+def _image_response_items(data: dict) -> list[str]:
+    out = data.get("data")
+    if not isinstance(out, list):
+        return []
+    b64s: list[str] = []
+    for item in out:
+        if isinstance(item, dict) and isinstance(item.get("b64_json"), str):
+            b64s.append(item["b64_json"])
+    return b64s
+
+
+def _stage_generated_image(b64: str, mime: str, idx: int) -> dict:
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HTTPException(502, "image API returned invalid base64") from None
+    if len(raw) > _IMAGE_MAX_BYTES:
+        raise HTTPException(502, "image API returned an image over the local 10MB limit")
+    aid = uuid.uuid4().hex
+    fmt = {v: k for k, v in _IMAGE_OUTPUT_MIME.items()}.get(mime, "png")
+    name = f"generated-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{idx}.{fmt}"
+    _image_store[aid] = {
+        "kind": "image",
+        "mime": mime,
+        "name": name,
+        "b64": base64.b64encode(raw).decode("ascii"),
+        "ts": time.time(),
+    }
+    _enforce_image_budget()
+    return {
+        "id": aid,
+        "mime": mime,
+        "name": name,
+        "bytes": len(raw),
+        "attach_ext": "jpg" if fmt == "jpeg" else fmt,
+        "data_url": f"data:{mime};base64,{_image_store[aid]['b64']}",
+    }
+
+
+@router.post("/image-generate", dependencies=[Depends(require_token)])
+async def generate_image(req: ImageGenerateReq) -> dict:
+    """Generate images with GPT Image via the OpenAI Image API.
+
+    Kept separate from provider routing: chat providers are Anthropic Messages
+    compatible agent runtimes, while image generation is a native Image API
+    call. The generated image is staged in the same in-memory attachment store
+    as uploaded images so the user can immediately attach it to a chat turn.
+    """
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is required")
+    model = req.model.strip() or "gpt-image-2"
+    if not _IMAGE_MODEL_RE.fullmatch(model):
+        raise HTTPException(400, "invalid image model")
+    size = _validate_image_size(req.size)
+    quality = (req.quality or "low").strip()
+    if quality not in {"low", "medium", "high", "auto"}:
+        raise HTTPException(400, "invalid image quality")
+    output_format = (req.output_format or "png").strip().lower()
+    if output_format not in _IMAGE_OUTPUT_MIME:
+        raise HTTPException(400, "invalid image output format")
+
+    key, base_url = _openai_image_api_config()
+    headers = {"Authorization": f"Bearer {key}"}
+    timeout = max(10.0, env_float("MUSELAB_IMAGE_GENERATION_TIMEOUT", 180.0))
+    image_ids = [x.strip() for x in (req.image_ids or []) if isinstance(x, str) and x.strip()]
+
+    import httpx
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if image_ids:
+            _gc_images()
+            data = {
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "output_format": output_format,
+                "n": str(req.n),
+            }
+            files = []
+            for aid in image_ids[:8]:
+                entry = _image_store.get(aid)
+                if not entry or entry.get("kind") != "image" or not entry.get("b64"):
+                    continue
+                try:
+                    raw = base64.b64decode(entry["b64"])
+                except Exception:
+                    continue
+                files.append(("image[]", (entry.get("name") or f"{aid}.png",
+                                          raw, entry.get("mime") or "image/png")))
+            if not files:
+                raise HTTPException(400, "reference images are missing or expired")
+            resp = await client.post(
+                f"{base_url}/images/edits",
+                headers=headers,
+                data=data,
+                files=files,
+            )
+        else:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+                "output_format": output_format,
+                "n": req.n,
+            }
+            resp = await client.post(
+                f"{base_url}/images/generations",
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload,
+            )
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, _image_error_message(resp.status_code, resp.text))
+    try:
+        body = resp.json()
+    except ValueError:
+        raise HTTPException(502, "image API returned non-JSON response") from None
+    b64s = _image_response_items(body)
+    if not b64s:
+        raise HTTPException(502, "image API returned no base64 image")
+    mime = _IMAGE_OUTPUT_MIME[output_format]
+    items = [_stage_generated_image(b64, mime, i + 1) for i, b64 in enumerate(b64s)]
+    return {
+        "ok": True,
+        "model": model,
+        "images": items,
+        "usage": body.get("usage") if isinstance(body, dict) else None,
+    }
 
 
 def _xlsx_to_text(body: bytes, name: str) -> str:

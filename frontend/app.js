@@ -502,6 +502,19 @@ function portal() {
       _snapshot: null,       // ImageData captured at pointerdown (for rect/arrow live preview)
       _baseBitmap: null,     // original ImageBitmap — used by eraser
     },
+    imageGen: {
+      show: false,
+      prompt: "",
+      model: "gpt-image-2",
+      size: "1024x1024",
+      quality: "low",
+      output_format: "png",
+      n: 1,
+      useReferences: false,
+      loading: false,
+      images: [],
+      error: "",
+    },
     // Flipped true inside sendMessage when the user clicks send while an
     // attachment upload is still in flight. Disables the send button so a
     // double-click can't enqueue two sends. Auto-resets when the wait
@@ -2970,6 +2983,87 @@ function portal() {
                           || "network error";
         this.toast(`${this.t("img.upload_failed")} — ${reason}`, "error", 4000);
       }
+    },
+
+    openImageGen() {
+      this.imageGen.show = true;
+      this.imageGen.error = "";
+      if (!this.imageGen.prompt && this.input.trim()) {
+        this.imageGen.prompt = this.input.trim();
+      }
+      this.$nextTick(() => {
+        const ta = this.$refs.imageGenPrompt;
+        if (ta) ta.focus();
+      });
+    },
+    closeImageGen() {
+      if (this.imageGen.loading) return;
+      this.imageGen.show = false;
+    },
+    imageGenReferenceIds() {
+      if (!this.imageGen.useReferences) return [];
+      return (this.pendingImages || [])
+        .filter(x => x && x.id && !x.uploading && !x.error)
+        .map(x => x.id);
+    },
+    async runImageGen() {
+      const prompt = (this.imageGen.prompt || "").trim();
+      if (!prompt || this.imageGen.loading) return;
+      this.imageGen.loading = true;
+      this.imageGen.error = "";
+      try {
+        const r = await fetch("/api/chat/image-generate", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt,
+            model: this.imageGen.model || "gpt-image-2",
+            size: this.imageGen.size || "1024x1024",
+            quality: this.imageGen.quality || "low",
+            output_format: this.imageGen.output_format || "png",
+            n: Number(this.imageGen.n || 1),
+            image_ids: this.imageGenReferenceIds(),
+          }),
+        });
+        if (!r.ok) {
+          let msg = "";
+          try {
+            const d = await r.json();
+            msg = d.detail || "";
+          } catch (_) {
+            try { msg = await r.text(); } catch (_) {}
+          }
+          throw new Error(msg || `HTTP ${r.status}`);
+        }
+        const d = await r.json();
+        this.imageGen.images = d.images || [];
+        if (!this.imageGen.images.length) {
+          throw new Error(this.lang === "zh" ? "没有返回图片" : "No image returned");
+        }
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e || "");
+        this.imageGen.error = msg;
+        this.toast((this.lang === "zh" ? "生图失败：" : "Image generation failed: ") + msg,
+                   "error", 5000);
+      } finally {
+        this.imageGen.loading = false;
+      }
+    },
+    attachGeneratedImage(img) {
+      if (!img || !img.id) return;
+      const entry = {
+        id: img.id,
+        mime: img.mime || "image/png",
+        preview: img.data_url || "",
+        uploading: false,
+        error: false,
+        attach_ext: img.attach_ext || "png",
+        generated: true,
+      };
+      this.pendingImages.push(entry);
+      this.toast(this.lang === "zh" ? "已加入当前消息" : "Added to current message",
+                 "success", 1800);
+      this.imageGen.show = false;
     },
 
     // Alias for use in inline x-html (shorter name reads better in markup).

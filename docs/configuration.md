@@ -62,6 +62,10 @@ Notes:
   `MUSELAB_PROVIDER_<SLUG>_API_KEY`.
 - **Codex Gateway** is a local Anthropic-compatible sidecar. The token is for
   the gateway only; muselab does not store Codex OAuth credentials.
+- **Image generation** is separate from chat providers. Set
+  `OPENAI_IMAGE_API_KEY` (or `OPENAI_API_KEY`) for the composer image tool.
+  If your local gateway exposes OpenAI-compatible image endpoints, point
+  `OPENAI_IMAGE_BASE_URL` at that `/v1` base URL.
 
 See [add-provider.md](add-provider.md) for adding an Anthropic-compatible
 endpoint that isn't in this list.
@@ -75,6 +79,9 @@ All optional; sensible defaults apply if unset.
 | `MUSELAB_PROMPT_CACHE_TTL` | Claude prompt-cache TTL (`1h` / `5m` / empty=CLI default) | `1h` |
 | `MUSELAB_BUDGET_USD` | Soft monthly budget — UI badge only, no hard stop | `0` (off) |
 | `MUSELAB_MAX_UPLOAD_MB` | Max single upload size (MiB) | `100` |
+| `OPENAI_IMAGE_API_KEY` | API key for the composer GPT Image tool | unset |
+| `OPENAI_IMAGE_BASE_URL` | OpenAI-compatible `/v1` base for image generation | `https://api.openai.com/v1` |
+| `MUSELAB_IMAGE_GENERATION_TIMEOUT` | Image generation timeout, seconds | `180` |
 | `MUSELAB_MAX_TURNS` | Max turns per session (0 = no cap) | `0` |
 | `MUSELAB_THINKING_BUDGET` | Extended-thinking token budget (0 = off) | `10000` |
 | `MUSELAB_CLIENT_POOL_CAP` | Pooled SDK clients kept warm | `3` |

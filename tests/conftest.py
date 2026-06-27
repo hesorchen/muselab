@@ -51,6 +51,9 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("XIAOMI_MIMO_API_KEY", raising=False)
     monkeypatch.delenv("QIANFAN_API_KEY", raising=False)
     monkeypatch.delenv("CODEX_GATEWAY_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_IMAGE_BASE_URL", raising=False)
 
     # NOTE (audit I/312 — fragility, intentionally left as-is for now):
     # Deleting every `backend.*` module forces a full re-import of the whole
@@ -108,6 +111,7 @@ def app_module(monkeypatch, temp_root, tmp_path):
     for k in ("DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY",
               "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY", "XIAOMI_MIMO_API_KEY",
               "QIANFAN_API_KEY",
+              "OPENAI_API_KEY", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL",
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
               "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
               "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",
