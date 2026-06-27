@@ -274,3 +274,41 @@ def test_image_generate_can_use_codex_imagegen(client, auth, monkeypatch):
     staged = chat._image_store[img["id"]]
     assert staged["kind"] == "image"
     assert base64.b64decode(staged["b64"]) == PNG_1X1
+
+
+def test_image_generate_codex_imagegen_falls_back_to_codex_generated_dir(
+        client, auth, monkeypatch, tmp_path):
+    monkeypatch.setenv("MUSELAB_IMAGE_PROVIDER", "codex_imagegen")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    from backend import chat
+    monkeypatch.setattr(chat, "locate_executable", lambda name: "/usr/bin/codex")
+
+    calls = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, payload):
+            calls["prompt"] = payload.decode("utf-8")
+            gen_dir = Path(calls["kwargs"]["env"]["CODEX_HOME"]) / "generated_images" / "run1"
+            gen_dir.mkdir(parents=True)
+            (gen_dir / "image.png").write_bytes(PNG_1X1)
+            return b"", b""
+
+    async def _fake_create_subprocess_exec(*cmd, **kwargs):
+        calls["cmd"] = list(cmd)
+        calls["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(chat.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    r = client.post("/api/chat/image-generate", headers=auth, json={
+        "prompt": "a minimal muselab github icon",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "codex_imagegen"
+    img = body["images"][0]
+    staged = chat._image_store[img["id"]]
+    assert staged["mime"] == "image/png"
+    assert base64.b64decode(staged["b64"]) == PNG_1X1

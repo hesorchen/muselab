@@ -5421,6 +5421,34 @@ def _codex_imagegen_output_files(out_dir: Path, final_text: str) -> list[Path]:
     return deduped
 
 
+def _codex_generated_images_since(start_ts: float, limit: int) -> list[Path]:
+    root = Path(os.environ.get("CODEX_HOME", "").strip() or (Path.home() / ".codex"))
+    gen_root = root / "generated_images"
+    if not gen_root.exists():
+        return []
+    found: list[tuple[float, Path]] = []
+    min_mtime = start_ts - 2.0
+    try:
+        gen_root_resolved = gen_root.resolve()
+    except OSError:
+        return []
+    for p in gen_root.rglob("*"):
+        if not p.is_file() or not _image_file_mime(p):
+            continue
+        try:
+            resolved = p.resolve()
+            resolved.relative_to(gen_root_resolved)
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        except ValueError:
+            continue
+        if mtime >= min_mtime:
+            found.append((mtime, resolved))
+    found.sort(key=lambda item: item[0])
+    return [p for _, p in found[-limit:]]
+
+
 async def _prepare_codex_reference_images(image_ids: list[str], input_dir: Path) -> list[Path]:
     if not image_ids:
         return []
@@ -5551,6 +5579,7 @@ async def _generate_codex_imagegen(
             env_float("MUSELAB_IMAGE_GENERATION_TIMEOUT", 300.0),
         ),
     )
+    start_ts = time.time()
     with tempfile.TemporaryDirectory(prefix="muselab-codex-imagegen-") as td:
         work_dir = Path(td)
         out_dir = work_dir / "out"
@@ -5623,6 +5652,8 @@ async def _generate_codex_imagegen(
                 "codex image generation failed" + (f": {detail[:500]}" if detail else ""),
             )
         files = _codex_imagegen_output_files(out_dir, final_text)
+        if not files:
+            files = _codex_generated_images_since(start_ts, req.n)
         if not files:
             raise HTTPException(502, "codex image generation returned no image file")
         staged = []
