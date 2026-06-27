@@ -3,6 +3,8 @@ import base64
 import io
 from pathlib import Path
 
+from tests.conftest import TEST_TOKEN
+
 
 # 1x1 PNG (8-byte signature + minimal chunks) — small valid PNG
 PNG_1X1 = base64.b64decode(
@@ -353,6 +355,9 @@ def test_image_generate_history_lists_and_attaches(client, auth):
     assert "data_url" not in job["images"][0]
 
     r = client.get(job["images"][0]["url"], headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.content == PNG_1X1
+    r = client.get(f"{job['images'][0]['url']}?token={TEST_TOKEN}")
     assert r.status_code == 200, r.text
     assert r.content == PNG_1X1
 

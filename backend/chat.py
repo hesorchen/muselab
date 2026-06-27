@@ -5992,7 +5992,7 @@ async def get_image_generate_job(job_id: str) -> dict:
 
 
 @router.get("/image-generate/jobs/{job_id}/images/{image_id}",
-            dependencies=[Depends(require_token)])
+            dependencies=[Depends(require_token_header_or_query)])
 async def get_image_generate_job_image(job_id: str, image_id: str) -> FileResponse:
     with _imagegen_jobs_lock:
         job = _imagegen_load_jobs().get(job_id)
