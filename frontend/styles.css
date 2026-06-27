@@ -6076,6 +6076,36 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: transparent; border-radius: 0 0 var(--r-lg) var(--r-lg);
 }
 
+/* Image generation modal. Keep this after the global .modal rules: those set
+   max-width:480px and generic input margins for small confirm dialogs. */
+.modal.image-gen-modal {
+  width: min(760px, 92vw);
+  max-width: min(760px, 92vw);
+  max-height: min(86vh, 780px);
+  display: flex;
+  flex-direction: column;
+}
+.modal.image-gen-modal .image-gen-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.modal.image-gen-modal .image-gen-controls input,
+.modal.image-gen-modal .image-gen-controls select {
+  width: 100%;
+  margin-top: 0;
+}
+@media (max-width: 720px) {
+  .modal.image-gen-modal {
+    width: 100vw;
+    width: 100dvw;
+    max-width: 100vw;
+    max-width: 100dvw;
+    max-height: 100dvh;
+    border-radius: 0;
+  }
+}
+
 /* ---- Modal choice list (disambiguation picker) ---- */
 .modal-choices { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }
 .modal-choice {

@@ -1044,6 +1044,11 @@
                 aria-label="Open skills list">
           <svg><use href="#i-puzzle"/></svg>
         </button>
+        <button @click="openImageGen()" class="icon-btn"
+                :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'"
+                aria-label="Codex Image 2">
+          <svg><use href="#i-image"/></svg>
+        </button>
         <button @click="toggleMcpDrawer()" class="icon-btn"
                 :title="(lang==='zh'?'MCP 服务 (':'MCP servers (') + mcp.servers.length + ')'"
                 aria-label="Open MCP servers">
@@ -2722,11 +2727,6 @@
                     class="chat-toolbar-btn"
                     :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
-            </button>
-            <button @click="openImageGen()"
-                    class="chat-toolbar-btn"
-                    :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
-              <svg><use href="#i-image"/></svg>
             </button>
             <!-- Command-palette opener lives in the chat pane's TOP bar
                  (global "files / sessions / actions" entry), not here.
