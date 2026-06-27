@@ -1,6 +1,7 @@
 """Tests for POST /api/chat/upload-image."""
 import base64
 import io
+from pathlib import Path
 
 
 # 1x1 PNG (8-byte signature + minimal chunks) — small valid PNG
@@ -212,9 +213,64 @@ def test_image_generate_can_use_pending_reference_image(client, auth, monkeypatc
     assert posted["files"][0][1][0] == "ref.png"
 
 
-def test_image_generate_requires_image_key(client, auth):
+def test_image_generate_requires_image_key(client, auth, monkeypatch):
+    # Force the OpenAI provider so this test does not depend on whether the
+    # developer running tests has a logged-in local codex CLI.
+    monkeypatch.setenv("MUSELAB_IMAGE_PROVIDER", "openai")
     r = client.post("/api/chat/image-generate", headers=auth, json={
         "prompt": "hello",
     })
     assert r.status_code == 400
     assert "OPENAI_IMAGE_API_KEY" in r.json()["detail"]
+
+
+def test_image_generate_can_use_codex_imagegen(client, auth, monkeypatch):
+    monkeypatch.setenv("MUSELAB_IMAGE_PROVIDER", "codex_imagegen")
+    from backend import chat
+    monkeypatch.setattr(chat, "locate_executable", lambda name: "/usr/bin/codex")
+
+    calls = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, payload):
+            prompt = payload.decode("utf-8")
+            calls["prompt"] = prompt
+            final_path = calls["cmd"][calls["cmd"].index("--output-last-message") + 1]
+            out_dir = Path(final_path).parent / "out"
+            image_path = out_dir / "image-1.png"
+            image_path.write_bytes(PNG_1X1)
+            Path(final_path).write_text(
+                f'{{"images":[{{"path":"{image_path}"}}]}}',
+                encoding="utf-8",
+            )
+            return b"", b""
+
+    async def _fake_create_subprocess_exec(*cmd, **kwargs):
+        calls["cmd"] = list(cmd)
+        calls["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(chat.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    r = client.post("/api/chat/image-generate", headers=auth, json={
+        "prompt": "a minimal tomato timer app icon",
+        "size": "1024x1024",
+        "quality": "low",
+        "output_format": "png",
+        "n": 1,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "codex_imagegen"
+    assert body["model"] == "codex-imagegen"
+    img = body["images"][0]
+    assert img["data_url"].startswith("data:image/png;base64,")
+    assert calls["cmd"][:2] == ["/usr/bin/codex", "exec"]
+    assert "$imagegen" in calls["prompt"]
+    assert "a minimal tomato timer app icon" in calls["prompt"]
+
+    staged = chat._image_store[img["id"]]
+    assert staged["kind"] == "image"
+    assert base64.b64decode(staged["b64"]) == PNG_1X1

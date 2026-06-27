@@ -54,6 +54,9 @@ def app_module(monkeypatch, temp_root, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_IMAGE_BASE_URL", raising=False)
+    monkeypatch.delenv("MUSELAB_IMAGE_PROVIDER", raising=False)
+    monkeypatch.delenv("CODEX_IMAGEGEN_ENABLED", raising=False)
+    monkeypatch.delenv("CODEX_BIN", raising=False)
 
     # NOTE (audit I/312 — fragility, intentionally left as-is for now):
     # Deleting every `backend.*` module forces a full re-import of the whole

@@ -22,10 +22,15 @@ muselab 以 **Claude Agent SDK** 作为唯一对话后端。非 Claude 模型通
 
 ## 生图
 
-Composer 里的图片按钮不是聊天 provider。它默认用 `gpt-image-2` 调 OpenAI
-Image API，读取 `OPENAI_IMAGE_API_KEY`（或 `OPENAI_API_KEY`）以及可选的
-`OPENAI_IMAGE_BASE_URL`。生成结果会作为普通 muselab 图片附件暂存，因此可预览、
-画笔标注，并加入当前聊天发送。
+Composer 里的图片按钮不是聊天 provider。`MUSELAB_IMAGE_PROVIDER=auto` 时，
+如果配置了 `OPENAI_IMAGE_API_KEY`（或 `OPENAI_API_KEY`），会走 OpenAI Image
+API；如果没有图片 API key，则尝试通过本机已登录的 `codex` CLI 调用 Codex
+`$imagegen` skill。也可以设置 `MUSELAB_IMAGE_PROVIDER=openai` 或
+`codex_imagegen` 强制指定通路。
+
+生成结果会作为普通 muselab 图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。
+Codex imagegen 通路只适合 localhost 单用户部署；不要把带本机 Codex 能力的
+muselab 实例暴露到公网。
 
 ## 对话中切换模型
 

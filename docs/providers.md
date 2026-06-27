@@ -29,11 +29,16 @@ may evolve faster than this table.
 
 ## Image generation
 
-The composer image button is not a chat provider. It calls the native OpenAI
-Image API with `gpt-image-2` by default, using `OPENAI_IMAGE_API_KEY` (or
-`OPENAI_API_KEY`) and optional `OPENAI_IMAGE_BASE_URL`. Generated images are
-staged as normal muselab image attachments, so they can be previewed, annotated,
-and sent into the current chat.
+The composer image button is not a chat provider. `MUSELAB_IMAGE_PROVIDER=auto`
+uses the native OpenAI Image API when `OPENAI_IMAGE_API_KEY` (or
+`OPENAI_API_KEY`) is configured, and otherwise tries the local Codex
+`$imagegen` skill through the logged-in `codex` CLI. Set
+`MUSELAB_IMAGE_PROVIDER=openai` or `codex_imagegen` to force one path.
+
+Generated images are staged as normal muselab image attachments, so they can be
+previewed, annotated, and sent into the current chat. The Codex imagegen path is
+intended for localhost single-user deployments; do not expose a muselab instance
+with local Codex access to the public internet.
 
 ## Switching model mid-conversation
 
