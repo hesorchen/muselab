@@ -17,7 +17,7 @@
   ```bash
   claude login
   ```
-  会把 OAuth 写到 `~/.claude/`，agent 会直接使用。非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度千帆（ERNIE））只需 API key——稍后在 Settings UI 里填。
+  会把 OAuth 写到 `~/.claude/`，agent 会直接使用。多数非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度千帆（ERNIE））只需 API key——稍后在 Settings UI 里填。Codex Gateway 需要本地 sidecar 和本地 token，见 [Codex Gateway](codex-gateway_zh.md)。
 
 ## 安装
 

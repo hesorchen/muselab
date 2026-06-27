@@ -17,9 +17,10 @@ no `sudo`, autostarts on login, restarts on crash.
   ```bash
   claude login
   ```
-  This stores OAuth in `~/.claude/` which the agent reuses. Non-Claude providers
-  (DeepSeek / GLM / MiniMax / Kimi / Qwen / Xiaomi MiMo / Baidu Qianfan (ERNIE)) only need
-  API keys via Settings UI.
+  This stores OAuth in `~/.claude/` which the agent reuses. Most non-Claude
+  providers (DeepSeek / GLM / MiniMax / Kimi / Qwen / Xiaomi MiMo / Baidu
+  Qianfan (ERNIE)) only need API keys via Settings UI. Codex Gateway needs a
+  local sidecar and local token; see [Codex Gateway](codex-gateway.md).
 
 ## Install
 

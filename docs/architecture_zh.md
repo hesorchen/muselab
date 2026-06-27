@@ -22,6 +22,7 @@ flowchart TB
   V --> QW[Qwen]
   V --> XM[小米 MiMo]
   V --> QF[百度千帆（ERNIE）]
+  V --> CG[Codex Gateway]
 ```
 
 ## 关键设计决策

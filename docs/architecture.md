@@ -22,6 +22,7 @@ flowchart TB
   V --> QW[Qwen]
   V --> XM[Xiaomi MiMo]
   V --> QF[Baidu Qianfan (ERNIE)]
+  V --> CG[Codex Gateway]
 ```
 
 ## Key design decisions

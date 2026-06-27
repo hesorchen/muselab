@@ -16,9 +16,10 @@ systemd service** — no root, no system-wide config, easy to undo.
   ```bash
   claude login
   ```
-  Non-Claude providers (DeepSeek / GLM / MiniMax / Kimi / Qwen /
+  Most non-Claude providers (DeepSeek / GLM / MiniMax / Kimi / Qwen /
   Xiaomi MiMo / Baidu Qianfan (ERNIE)) only need API keys — paste them in the
-  Settings UI after install, no CLI needed.
+  Settings UI after install, no CLI needed. Codex Gateway needs a local sidecar
+  and local token; see [Codex Gateway](codex-gateway.md).
 
 ## Install
 
