@@ -76,9 +76,10 @@ def test_codex_gateway_builtin_surfaces_as_local_sidecar(client, auth, iso_overr
     assert p is not None
     assert p["display"] == "Codex Gateway"
     assert p["env_key"] == "CODEX_GATEWAY_API_KEY"
-    assert p["base_url"] == "http://127.0.0.1:8766/anthropic"
+    assert p["base_url"] == "http://127.0.0.1:8317"
     assert p["prefix"] == "codex:"
     assert p["models"] and all(m.startswith("codex:") for m in p["models"])
+    assert "codex:gpt-5.5" in p["models"]
     assert p["supports_thinking"] is False
 
 

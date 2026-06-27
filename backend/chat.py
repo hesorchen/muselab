@@ -750,12 +750,13 @@ MODEL_CONTEXT_LIMITS = {
     "minimax-m2.7":                 204_800,
     "minimax-m2.7-highspeed":       204_800,
     "minimax-m2.5":                 204_800,
-    # Codex Gateway — OpenAI GPT-5 / GPT-5 mini / GPT-5-Codex model cards list
-    # 400K context windows. Gateway implementations may still fail earlier if
-    # their translation layer or account tier has a smaller effective window.
-    "codex:gpt-5-codex":            400_000,
-    "codex:gpt-5":                  400_000,
-    "codex:gpt-5-mini":             400_000,
+    # Codex Gateway — local sidecars can expose Codex/GPT aliases with large
+    # context windows. Gateway implementations may still fail earlier if their
+    # translation layer or account tier has a smaller effective window.
+    "codex:gpt-5.5":                400_000,
+    "codex:gpt-5.4":                400_000,
+    "codex:gpt-5.4-mini":           400_000,
+    "codex:gpt-5.3-codex-spark":    400_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
 

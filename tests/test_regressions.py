@@ -142,7 +142,7 @@ def test_codex_gateway_ctx_limit_fallback_is_400k(client, auth):
     """Codex Gateway models are third-party from the SDK's perspective, so the
     context meter must use muselab's GPT-5/Codex table instead of the 128K
     generic fallback."""
-    r = client.get("/api/chat/usage/no-such-codex-sid?model=codex:gpt-5-codex",
+    r = client.get("/api/chat/usage/no-such-codex-sid?model=codex:gpt-5.5",
                    headers=auth)
     assert r.status_code == 200
     assert r.json()["context_limit"] == 400_000

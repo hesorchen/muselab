@@ -23,37 +23,54 @@ The model catalog includes a disabled-by-default provider preset:
 | Field | Default |
 |---|---|
 | Provider | `Codex Gateway` |
-| Endpoint | `http://127.0.0.1:8766/anthropic` |
+| Endpoint | `http://127.0.0.1:8317` |
 | Env key | `CODEX_GATEWAY_API_KEY` |
 | Base URL override | `CODEX_GATEWAY_BASE_URL` |
 | Internal prefix | `codex:` |
-| Models | `codex:gpt-5-codex`, `codex:gpt-5`, `codex:gpt-5-mini` |
+| Models | `codex:gpt-5.5`, `codex:gpt-5.4`, `codex:gpt-5.4-mini`, `codex:gpt-5.3-codex-spark` |
 
 The `codex:` prefix is muselab-internal. Before sending the model id to the
-gateway, muselab strips the prefix, so `codex:gpt-5-codex` becomes
-`gpt-5-codex` on the gateway side.
+gateway, muselab strips the prefix, so `codex:gpt-5.5` becomes `gpt-5.5` on
+the gateway side.
 
 ## Enable it
 
-1. Run your Codex gateway locally and bind it to loopback only:
+1. Start from muselab's recommended CLIProxyAPI config:
 
    ```bash
-   # Example only — use the gateway implementation you trust.
-   codex-gateway --host 127.0.0.1 --port 8766
+   mkdir -p ~/.cli-proxy-muselab
+   cp examples/cli-proxy-muselab.config.yaml ~/.cli-proxy-muselab/config.yaml
    ```
 
-2. Put a strong gateway token in `.env`:
+2. Edit `~/.cli-proxy-muselab/config.yaml`:
+
+   - replace `replace-with-a-random-local-token` with a strong local token;
+   - keep `disable-cooling: true` and `session-affinity: false` unless you
+     explicitly want the proxy to add local cooldown windows.
+
+3. Run CLIProxyAPI locally and bind it to loopback only:
+
+   ```bash
+   cli-proxy-api -config ~/.cli-proxy-muselab/config.yaml
+   ```
+
+4. Put the same gateway token in `.env`:
 
    ```bash
    CODEX_GATEWAY_API_KEY=replace-with-a-random-local-token
    # Optional if your gateway uses a different loopback port:
-   # CODEX_GATEWAY_BASE_URL=http://127.0.0.1:8766/anthropic
+   # CODEX_GATEWAY_BASE_URL=http://127.0.0.1:8317
    ```
 
-3. Restart muselab if you edited `.env` by hand, or paste the key in
+5. Restart muselab if you edited `.env` by hand, or paste the key in
    **Settings → Providers → Codex Gateway** to apply it without restart.
 
-4. Pick a `codex:*` model in the chat model dropdown.
+6. Pick a `codex:*` model in the chat model dropdown.
+
+The recommended CLIProxyAPI template disables the proxy's local auth/model
+cooldown scheduling. This makes muselab avoid extra proxy-side blackout windows
+after an upstream failure, which is closer to the direct Codex app/CLI
+experience. It does not bypass real upstream quota or model-level 429s.
 
 ## Gateway requirements
 
@@ -73,8 +90,8 @@ advertised as full muselab agent support.
 ## Context window notes
 
 muselab's context meter treats the built-in Codex Gateway models as 400K-context
-models, matching OpenAI's public GPT-5 / GPT-5 mini / GPT-5-Codex model cards
-(128K max output; GPT-5-Codex is Responses-API-only behind the gateway).
+models. The gateway can still enforce a different effective window depending on
+the selected backend model and account tier.
 
 A gateway can still fail earlier with `input exceeds the context window` if its
 translation layer, selected backend model, or account tier has a smaller

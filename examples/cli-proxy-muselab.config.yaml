@@ -1,0 +1,62 @@
+# Recommended CLIProxyAPI sidecar config for muselab's built-in Codex Gateway.
+#
+# Usage:
+#   1. Copy this file outside the repository, for example:
+#      ~/.cli-proxy-muselab/config.yaml
+#   2. Replace the api-keys value with a random local token.
+#   3. Put the same token in muselab's .env as CODEX_GATEWAY_API_KEY.
+#   4. Run CLIProxyAPI with:
+#      cli-proxy-api -config ~/.cli-proxy-muselab/config.yaml
+#
+# Do not commit auth files, logs, generated .cds cooldown files, or real tokens.
+
+host: "127.0.0.1"
+port: 8317
+
+auth-dir: "~/.cli-proxy-muselab/auths"
+
+api-keys:
+  - "replace-with-a-random-local-token"
+
+debug: false
+logging-to-file: false
+commercial-mode: false
+usage-statistics-enabled: false
+
+# Keep muselab close to the direct Codex app/CLI experience: do not let the
+# local proxy add long model/auth blackout windows after an upstream failure.
+# If the upstream really returns 429, muselab will still surface that 429.
+request-retry: 3
+max-retry-credentials: 0
+max-retry-interval: 0
+disable-cooling: true
+save-cooldown-status: false
+transient-error-cooldown-seconds: -1
+
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true
+
+plugins:
+  enabled: false
+  dir: "plugins"
+  configs: {}
+
+routing:
+  strategy: "round-robin"
+  session-affinity: false
+  session-affinity-ttl: "5m"
+
+ws-auth: true
+
+oauth-model-alias:
+  codex:
+    - name: "gpt-5.5"
+      alias: "gpt-5.5"
+    - name: "gpt-5.4"
+      alias: "gpt-5.4"
+    - name: "gpt-5.4-mini"
+      alias: "gpt-5.4-mini"
+    - name: "gpt-5.3-codex-spark"
+      alias: "gpt-5.3-codex-spark"

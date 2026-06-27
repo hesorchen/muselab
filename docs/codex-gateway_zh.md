@@ -19,34 +19,47 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 | 字段 | 默认值 |
 |---|---|
 | Provider | `Codex Gateway` |
-| Endpoint | `http://127.0.0.1:8766/anthropic` |
+| Endpoint | `http://127.0.0.1:8317` |
 | Env key | `CODEX_GATEWAY_API_KEY` |
 | Base URL override | `CODEX_GATEWAY_BASE_URL` |
 | 内部前缀 | `codex:` |
-| 模型 | `codex:gpt-5-codex`、`codex:gpt-5`、`codex:gpt-5-mini` |
+| 模型 | `codex:gpt-5.5`、`codex:gpt-5.4`、`codex:gpt-5.4-mini`、`codex:gpt-5.3-codex-spark` |
 
-`codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab 里的 `codex:gpt-5-codex` 到网关侧会变成 `gpt-5-codex`。
+`codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab 里的 `codex:gpt-5.5` 到网关侧会变成 `gpt-5.5`。
 
 ## 启用方式
 
-1. 在本机启动 Codex Gateway，并只监听 loopback：
+1. 从 muselab 推荐的 CLIProxyAPI 配置开始：
 
    ```bash
-   # 仅为示例 —— 请使用你信任的 gateway 实现。
-   codex-gateway --host 127.0.0.1 --port 8766
+   mkdir -p ~/.cli-proxy-muselab
+   cp examples/cli-proxy-muselab.config.yaml ~/.cli-proxy-muselab/config.yaml
    ```
 
-2. 在 `.env` 里放一个高强度本地 token：
+2. 编辑 `~/.cli-proxy-muselab/config.yaml`：
+
+   - 把 `replace-with-a-random-local-token` 换成高强度本地 token；
+   - 除非你明确希望 proxy 额外增加本地冷却窗口，否则保留 `disable-cooling: true` 和 `session-affinity: false`。
+
+3. 在本机启动 CLIProxyAPI，并只监听 loopback：
+
+   ```bash
+   cli-proxy-api -config ~/.cli-proxy-muselab/config.yaml
+   ```
+
+4. 在 `.env` 里放同一个 gateway token：
 
    ```bash
    CODEX_GATEWAY_API_KEY=replace-with-a-random-local-token
    # 如果你的 gateway 使用不同端口，可覆盖：
-   # CODEX_GATEWAY_BASE_URL=http://127.0.0.1:8766/anthropic
+   # CODEX_GATEWAY_BASE_URL=http://127.0.0.1:8317
    ```
 
-3. 如果是手动编辑 `.env`，重启 muselab；如果在 **Settings → Providers → Codex Gateway** 里粘贴 key，则无需重启。
+5. 如果是手动编辑 `.env`，重启 muselab；如果在 **Settings → Providers → Codex Gateway** 里粘贴 key，则无需重启。
 
-4. 在聊天模型下拉里选择 `codex:*` 模型。
+6. 在聊天模型下拉里选择 `codex:*` 模型。
+
+推荐的 CLIProxyAPI 模板关闭了 proxy 自己的 auth/model cooldown 调度。这样可以避免上游失败后被本地 proxy 额外放大成黑窗期，体验更接近直接使用 Codex app/CLI。它不能绕过真实的上游额度限制或模型级 429。
 
 ## 网关要求
 
@@ -62,7 +75,7 @@ sidecar 至少要实现 Anthropic Messages API 中 agent loop 需要的部分：
 
 ## 上下文窗口说明
 
-muselab 的上下文仪表会把内置 Codex Gateway 模型按 400K context 处理，这与 OpenAI 公开的 GPT-5 / GPT-5 mini / GPT-5-Codex model card 一致（128K max output；GPT-5-Codex 在 gateway 背后走 Responses API）。
+muselab 的上下文仪表会把内置 Codex Gateway 模型按 400K context 处理。gateway 仍可能根据后端模型和账号档位执行不同的有效窗口。
 
 如果实际运行仍报 `input exceeds the context window`，通常说明 gateway 转换层、所选后端模型或账号档位的有效窗口更小。此时可以新开会话、压缩历史，或切到上下文窗口已确认更大的模型 / gateway 路径。
 

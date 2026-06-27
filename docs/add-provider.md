@@ -24,7 +24,7 @@ known integrations:
 | Qwen (DashScope) | `https://dashscope.aliyuncs.com/apps/anthropic` (domestic default; international group uses `dashscope-intl.aliyuncs.com`) | ✅ built-in |
 | Xiaomi MiMo | `https://api.xiaomimimo.com/anthropic` | ✅ built-in |
 | Baidu Qianfan (ERNIE) | `https://qianfan.baidubce.com/anthropic` | ✅ built-in |
-| Codex Gateway | `http://127.0.0.1:8766/anthropic` | ✅ built-in local-gateway preset |
+| Codex Gateway | `http://127.0.0.1:8317` | ✅ built-in local-gateway preset |
 
 **Vendors without an Anthropic endpoint** are not supported. Options are to
 request that the vendor ship a compatible endpoint, or to use
@@ -33,7 +33,7 @@ protocol translator (lossy; requires an additional process).
 
 For Codex/OpenAI-backed models, the built-in **Codex Gateway** preset assumes a
 user-run local sidecar that already speaks Anthropic Messages at
-`http://127.0.0.1:8766/anthropic`. muselab does not read Codex OAuth files and
+`http://127.0.0.1:8317`. muselab does not read Codex OAuth files and
 does not call OpenAI-native APIs directly. See [codex-gateway.md](codex-gateway.md).
 
 ---

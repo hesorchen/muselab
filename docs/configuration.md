@@ -51,7 +51,7 @@ Settings panel.
 | Qwen / DashScope | `DASHSCOPE_API_KEY` | dashscope.aliyuncs.com/apps/anthropic | `DASHSCOPE_BASE_URL` |
 | Xiaomi MiMo | `XIAOMI_MIMO_API_KEY` | api.xiaomimimo.com/anthropic | `XIAOMI_MIMO_BASE_URL` |
 | Baidu ERNIE (Qianfan) | `QIANFAN_API_KEY` | qianfan.baidubce.com/anthropic | `QIANFAN_BASE_URL` |
-| Codex Gateway | `CODEX_GATEWAY_API_KEY` | 127.0.0.1:8766/anthropic | `CODEX_GATEWAY_BASE_URL` |
+| Codex Gateway | `CODEX_GATEWAY_API_KEY` | 127.0.0.1:8317 | `CODEX_GATEWAY_BASE_URL` |
 
 Notes:
 - **MiniMax China vs Global use different keys.** A `minimaxi.com` key 401s on

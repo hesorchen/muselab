@@ -83,7 +83,7 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
     # Local sidecar gateway that translates Anthropic Messages requests to a
     # user-authenticated Codex/OpenAI backend. Loopback-only by default: muselab
     # never reads Codex OAuth files and never calls OpenAI-native APIs directly.
-    "CODEX_GATEWAY_API_KEY":   "http://127.0.0.1:8766/anthropic",
+    "CODEX_GATEWAY_API_KEY":   "http://127.0.0.1:8317",
 }
 # Map api-key env name → base-url override env name. Self-hosters can point
 # any provider at a proxy / regional mirror via these.
@@ -338,9 +338,10 @@ CATALOG: tuple[Provider, ...] = (
         display="Codex Gateway",
         supports_thinking=False,
         models=(
-            ("codex:gpt-5-codex", "GPT-5 Codex"),
-            ("codex:gpt-5",       "GPT-5"),
-            ("codex:gpt-5-mini",  "GPT-5 Mini"),
+            ("codex:gpt-5.5",               "GPT-5.5"),
+            ("codex:gpt-5.4",               "GPT-5.4"),
+            ("codex:gpt-5.4-mini",          "GPT-5.4 Mini"),
+            ("codex:gpt-5.3-codex-spark",   "GPT-5.3 Codex Spark"),
         ),
     ),
     # Doubao (字节 Volcengine) deliberately NOT added — only
