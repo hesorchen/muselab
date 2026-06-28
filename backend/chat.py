@@ -1023,13 +1023,13 @@ async def _build_and_connect_client(
         # before seeing anything. With this, each token shows up.
         include_partial_messages=True,
     )
-    # Skills get attached to the system prompt as JSON tool defs.
-    # Claude handles a large skill catalog fine; third-party vendors
-    # (DeepSeek / GLM / MiniMax) often time out or 400 on the bigger
-    # payload. So default to skills only on Claude; opt-out via env.
-    is_third_party = endpoints.is_third_party(model)
+    # Skills get attached to the system prompt as JSON tool defs. Enable them
+    # for every provider, including Anthropic-compatible third-party gateways:
+    # users expect an explicitly named local skill (e.g. galatea) to be usable
+    # regardless of the selected model. Operators who hit vendor payload limits
+    # can still opt out globally via MUSELAB_DISABLE_SKILLS=1.
     skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in ("1", "true", "yes")
-    if not is_third_party and not skills_off:
+    if not skills_off:
         opts_kwargs["skills"] = "all"
     # Optional model params from env (UI-editable via /api/settings).
     mt = env_int("MUSELAB_MAX_TURNS", 0, min_value=0)

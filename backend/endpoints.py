@@ -337,6 +337,10 @@ CATALOG: tuple[Provider, ...] = (
         env_key="CODEX_GATEWAY_API_KEY",
         display="Codex Gateway",
         supports_thinking=False,
+        # GPT-5 Codex-style models can emit far beyond Claude Code's default
+        # 32K output cap. Without this env override the CLI aborts long turns
+        # before the gateway/model has a chance to finish.
+        max_output_tokens=128000,
         models=(
             ("codex:gpt-5.5",               "GPT-5.5"),
             ("codex:gpt-5.4",               "GPT-5.4"),

@@ -13,8 +13,8 @@ flowchart TB
     B["/api/chat/*<br/>ClaudeSDKClient 池<br/>per (session, model, effort)"]
   end
   BE ==> SDK[Claude Agent SDK<br/>启动 claude CLI 子进程]
-  SDK -->|claude-* 模型<br/>走 Pro OAuth| AN[api.anthropic.com]
-  SDK -->|per-request env override| V[Vendor anthropic 兼容端点]
+  SDK -->|claude-* 模型| CL[Claude<br/>Pro / Max OAuth]
+  SDK -->|per-request env override| V[Anthropic 兼容端点]
   V --> DS[DeepSeek]
   V --> GL[智谱 GLM]
   V --> MM[MiniMax]
@@ -22,7 +22,10 @@ flowchart TB
   V --> QW[Qwen]
   V --> XM[小米 MiMo]
   V --> QF[百度千帆（ERNIE）]
-  V --> CG[Codex Gateway]
+  V --> CG[GPT / Codex Gateway<br/>Codex / GPT OAuth]
+
+  class CL,CG subscriptionOauth
+  classDef subscriptionOauth fill:#FFF3CD,stroke:#D97706,stroke-width:2px,color:#111827
 ```
 
 ## 关键设计决策

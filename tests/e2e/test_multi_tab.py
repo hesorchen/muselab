@@ -38,6 +38,13 @@ def _login(page: Page, base: str, token: str) -> None:
         page.fill(SEL_LOGIN_INPUT, token)
         page.keyboard.press("Enter")
     expect(page.locator(SEL_TABS)).to_be_visible(timeout=5000)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector("#app")?._x_dataStack?.[0];
+          return app && app.authed === true && app.currentId
+            && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
+        }"""
+    )
 
 
 def test_new_and_switch_and_close_tabs(page: Page, backend_url, auth_token):

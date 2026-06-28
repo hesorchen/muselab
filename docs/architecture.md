@@ -13,16 +13,19 @@ flowchart TB
     B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model, effort)"]
   end
   BE ==> SDK[Claude Agent SDK<br/>spawns claude CLI subprocess]
-  SDK -->|claude-* models<br/>via Pro OAuth| AN[api.anthropic.com]
-  SDK -->|env override per request| V[Vendor Anthropic-compat endpoints]
+  SDK -->|claude-* models| CL[Claude<br/>Pro / Max OAuth]
+  SDK -->|env override per request| V[Anthropic-compatible endpoints]
   V --> DS[DeepSeek]
-  V --> GL[智谱 GLM]
+  V --> GL[Zhipu GLM]
   V --> MM[MiniMax]
   V --> KM[Kimi]
   V --> QW[Qwen]
   V --> XM[Xiaomi MiMo]
   V --> QF[Baidu Qianfan (ERNIE)]
-  V --> CG[Codex Gateway]
+  V --> CG[GPT / Codex Gateway<br/>Codex / GPT OAuth]
+
+  class CL,CG subscriptionOauth
+  classDef subscriptionOauth fill:#FFF3CD,stroke:#D97706,stroke-width:2px,color:#111827
 ```
 
 ## Key design decisions

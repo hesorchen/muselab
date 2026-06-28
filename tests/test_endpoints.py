@@ -155,6 +155,7 @@ def test_codex_gateway_strips_internal_prefix_and_honors_base_url(monkeypatch):
     assert env is not None
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
     assert env["ANTHROPIC_API_KEY"] == "local-secret"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "128000"
 
 
 def test_env_override_merges_with_os_environ(monkeypatch):
