@@ -49,7 +49,7 @@ dependencies = [
     # Path/effort drift is already auto-eliminated via
     # project_key_for_directory() + EffortLevel.
     "claude-agent-sdk>=0.2.106,<0.3",
-    "fastapi>=0.138.0",
+    "fastapi>=0.138.1",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
     # CVE-scan CI job stays green.
