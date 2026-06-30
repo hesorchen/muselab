@@ -1024,6 +1024,14 @@ body.kb-open .layout:focus-within {
   grid-template-rows: calc(100dvh - var(--kb-inset, 0px));
   transition: height var(--t-fast) ease-out;
 }
+/* Mobile panes have their own fixed `100dvh - tabbar` height. When the
+   keyboard is open the tab bar is hidden and the layout row is already
+   shortened by --kb-inset; keep the active pane inside that shortened row
+   instead of letting it overflow behind the keyboard. */
+body.kb-open .layout:focus-within .pane {
+  height: calc(100vh - var(--kb-inset, 0px));
+  height: calc(100dvh - var(--kb-inset, 0px));
+}
 /* Same `:focus-within` guard as the layout-shrink above — a stuck
    `.kb-open` must not leave the bottom tab bar permanently hidden (which
    would strand the user with no way to switch panes). Hide it only while

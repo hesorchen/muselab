@@ -8626,7 +8626,7 @@ function portal() {
       }
       // Take from the END of the earlier stash (those are the messages
       // immediately preceding what's currently shown — "closest in time").
-      const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
+      const batchSize = this._isMobileLayout() ? 10 : this.LOAD_MORE_BATCH;
       const batch = st._earlierMessages.splice(-batchSize);
       // Deferred mdRender pass on this batch only — chunked so a full 50-item
       // batch parses across several frames instead of one blocking long task
@@ -11533,17 +11533,18 @@ function portal() {
       }
       return out;
     },
-    // Walk the FIRST `n` `.msg` element children of the chat body — the
-    // bubbles just prepended by a "Load earlier" / jump-into-history batch
+    // Walk the FIRST `n` `.msg` element children of the visible message pane —
+    // the bubbles just prepended by a "Load earlier" / jump-into-history batch
     // (unshift puts them at the front). Stops as soon as it has n, so it's
-    // O(n) regardless of how much history is already rendered. The
-    // load-earlier-wrap is the chat body's first child but isn't a `.msg`,
-    // so it's skipped naturally.
+    // O(n) regardless of how much history is already rendered.
     _leadingMsgEls(n) {
       const body = this.$refs.chatBody;
       if (!body || n <= 0) return [];
       const out = [];
-      let node = body.firstElementChild;
+      const panes = Array.from(body.querySelectorAll(".msg-pane"))
+        .filter(p => getComputedStyle(p).display !== "none");
+      const root = panes[0] || body;
+      let node = root.firstElementChild;
       while (node && out.length < n) {
         if (node.classList && node.classList.contains("msg")) out.push(node);
         node = node.nextElementSibling;

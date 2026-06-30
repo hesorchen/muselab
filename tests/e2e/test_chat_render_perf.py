@@ -414,9 +414,16 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
     assert page.locator(".msg-pane:visible .msg").count() <= 75
 
     # Drain the tail-local stash, then force the server-backed older window.
-    for _ in range(4):
+    # Mobile intentionally uses a smaller load-more batch to keep each tap
+    # responsive, so avoid coupling this regression check to an exact tap count.
+    for _ in range(10):
         _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
         page.wait_for_timeout(50)
+        if _app_eval(
+            page,
+            """return app.messages.some(m => (m.text || "").includes("WINDOW_MSG_100"));""",
+        ):
+            break
 
     page.wait_for_function(
         """() => {
