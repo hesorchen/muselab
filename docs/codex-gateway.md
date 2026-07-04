@@ -31,7 +31,10 @@ The model catalog includes a disabled-by-default provider preset:
 
 The `codex:` prefix is muselab-internal. Before sending the model id to the
 gateway, muselab strips the prefix, so `codex:gpt-5.5` becomes `gpt-5.5` on
-the gateway side.
+the gateway side. Codex Gateway also opts into muselab's per-session reasoning
+`effort` selector; muselab passes the selected value through the Claude Agent
+SDK, and the sidecar is expected to translate it to the backend's reasoning
+parameter.
 
 ## Enable it
 
@@ -142,21 +145,40 @@ The sidecar must implement enough of the Anthropic Messages API for agent use:
 - Anthropic-style error responses for auth, quota, invalid model, and network
   failures;
 - support for the headers muselab sends: `x-api-key` and/or
-  `Authorization: Bearer`.
+  `Authorization: Bearer`;
+- support for the reasoning `effort` field that Claude Agent SDK emits, mapping
+  at least `low`, `medium`, `high`, and `max` to the Codex/OpenAI backend's
+  equivalent reasoning-effort control.
 
 If plain chat works but tools fail, the gateway is chat-only and should not be
 advertised as full muselab agent support.
 
 ## Context window notes
 
-muselab's context meter treats the built-in Codex Gateway models as 400K-context
-models. The gateway can still enforce a different effective window depending on
-the selected backend model and account tier.
+muselab keeps 400K as the documentation-level fallback for built-in Codex
+Gateway models, but runtime context accounting does not treat that number as the
+only source of truth. The effective window is resolved in this order:
 
-A gateway can still fail earlier with `input exceeds the context window` if its
-translation layer, selected backend model, or account tier has a smaller
-effective window. In that case, start a fresh session, compact the conversation,
-or switch to a model/gateway path with a larger confirmed window.
+1. explicit env overrides: `MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5`,
+   `CODEX_GATEWAY_CONTEXT_LIMIT`, or `MUSELAB_THIRD_PARTY_CONTEXT_LIMIT`;
+2. capability fields exposed by the gateway's `/v1/models` response, such as
+   `max_input_tokens` or `context_window`;
+3. Claude Agent SDK `get_context_usage()` values (`maxTokens` / `rawMaxTokens`);
+4. a conservative fallback (Codex Gateway defaults to a 200K effective window for
+   prevention).
+
+Before sending a new user message, muselab asks the SDK for current context usage.
+If the session is close to the effective window, it runs Claude Code's native
+`/compact` first, then sends the user's message. This preflight compact happens
+earlier than the post-reply auto-compact path and reduces gateway-side
+`input exceeds the context window` failures at request entry.
+
+A gateway can still fail with `input exceeds the context window` if its
+translation layer, selected backend model, or account tier has an even smaller
+effective window, or if the session is already too large for `/compact` itself to
+enter the model. In that case, start a fresh session, lower
+`CODEX_GATEWAY_CONTEXT_LIMIT`, compact the conversation, or switch to a
+model/gateway path with a larger confirmed window.
 
 ## Security model
 

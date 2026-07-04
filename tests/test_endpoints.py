@@ -151,11 +151,51 @@ def test_codex_gateway_strips_internal_prefix_and_honors_base_url(monkeypatch):
         "CODEX_GATEWAY_BASE_URL": "http://127.0.0.1:9876",
     })
     assert ep.normalize_model_id("codex:gpt-5.5") == "gpt-5.5"
+    p = ep.lookup("codex:gpt-5.5")
+    assert p is not None
+    assert p.supports_effort is True
+    assert p.supports_thinking is False
     env = ep.env_override("codex:gpt-5.5")
     assert env is not None
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
     assert env["ANTHROPIC_API_KEY"] == "local-secret"
     assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "128000"
+    groups = ep.available_groups()
+    codex = next(g for g in groups if g["group"] == "Codex Gateway")
+    assert codex["supports_effort"] is True
+    assert codex["supports_thinking"] is False
+
+
+def test_legacy_custom_codex_provider_gets_effort_capability(monkeypatch):
+    """Older installs may have a custom raw `gpt-*` Codex sidecar provider.
+
+    Custom providers do not persist capability flags, so the known local Codex
+    sidecar shape must infer Effort support for the frontend controls.
+    """
+    ep = _reload_endpoints(monkeypatch, {"MUSELAB_PROVIDER_CODEX_API_KEY": "local-secret"})
+    ep.OVERRIDES_PATH.write_text(
+        '{"providers":{"c:http-127-0-0-1-8317":{'
+        '"display":"Codex (ChatGPT subscription)",'
+        '"prefix":"gpt-",'
+        '"base_url":"http://127.0.0.1:8317",'
+        '"env_key":"MUSELAB_PROVIDER_CODEX_API_KEY",'
+        '"models":["gpt-5.5","gpt-5.4"]'
+        '}}}',
+        encoding="utf-8",
+    )
+    ep._OVERRIDES_CACHE = None
+    ep._CATALOG_CACHE = None
+    ep._SORTED_CATALOG_CACHE = None
+
+    p = ep.lookup("gpt-5.5")
+    assert p is not None
+    assert p.supports_effort is True
+    assert p.supports_thinking is False
+    assert p.max_output_tokens == 128000
+    groups = ep.available_groups()
+    codex = next(g for g in groups if g["group"] == "Codex (ChatGPT subscription)")
+    assert codex["supports_effort"] is True
+    assert codex["supports_thinking"] is False
 
 
 def test_env_override_merges_with_os_environ(monkeypatch):

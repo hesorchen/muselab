@@ -319,7 +319,7 @@ ThinkingConfigEnabled(type="enabled", budget_tokens=10000, display="summarized")
 models default to `display="omitted"` (signature only, no plaintext), which
 produces empty thinking blocks in the frontend.
 
-### Per-provider thinking support
+### Per-provider thinking and effort support
 
 `supports_thinking` is resolved as
 `(provider is None or provider.supports_thinking) and thinking_pref`
@@ -327,15 +327,19 @@ produces empty thinking blocks in the frontend.
 
 - `provider is None` means Claude/Anthropic — always enabled.
 - Third-party providers: the `Provider.supports_thinking` field in
-  [`backend/endpoints.py`](../backend/endpoints.py). Baidu Qianfan sets this
-  to `False`; all other built-in providers default to `True`.
+  [`backend/endpoints.py`](../backend/endpoints.py). Baidu Qianfan and Codex
+  Gateway set this to `False`; other built-ins default to `True`.
 - Per-session opt-out: `PATCH /sessions/{sid}` with `thinking=false` is the
   escape hatch for the "thinking blocks cannot be modified" 400 error that
   occurs with certain tool-use interleaving patterns.
 
-For third-party providers, effort is passed as-is to `ClaudeAgentOptions`. If
-the vendor's Anthropic-compatible layer does not honor the effort parameter,
-it is silently ignored at the vendor side.
+Effort exposure is gated separately by `supports_effort` in `/api/chat/providers`.
+Claude models always expose the selector. Third-party providers default to
+`False`; Codex Gateway opts in, so the frontend shows `low` / `medium` / `high`
+/ `max` for `codex:*` while keeping `xhigh` Opus-only. On send, muselab passes
+the selected value as `ClaudeAgentOptions.effort`; the Codex sidecar is
+responsible for translating that Anthropic-compatible request field to the
+Codex/OpenAI backend's reasoning-effort parameter.
 
 ---
 

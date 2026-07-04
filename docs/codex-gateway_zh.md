@@ -25,7 +25,7 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 | 内部前缀 | `codex:` |
 | 模型 | `codex:gpt-5.5`、`codex:gpt-5.4`、`codex:gpt-5.4-mini`、`codex:gpt-5.3-codex-spark` |
 
-`codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab 里的 `codex:gpt-5.5` 到网关侧会变成 `gpt-5.5`。
+`codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab 里的 `codex:gpt-5.5` 到网关侧会变成 `gpt-5.5`。Codex Gateway 也会在 muselab 里打开按会话设置的 reasoning `effort` 下拉；muselab 通过 Claude Agent SDK 透传所选值，sidecar 负责把它映射到 Codex/OpenAI 后端的推理强度参数。
 
 ## 启用方式
 
@@ -113,15 +113,23 @@ sidecar 至少要实现 Anthropic Messages API 中 agent loop 需要的部分：
 - Anthropic SSE 事件形状的文本流式输出；
 - `tool_use` 与 `tool_result` 往返；
 - auth、quota、invalid model、network failure 等错误的 Anthropic 风格响应；
-- 接受 muselab 发送的 `x-api-key` 和 / 或 `Authorization: Bearer`。
+- 接受 muselab 发送的 `x-api-key` 和 / 或 `Authorization: Bearer`；
+- 支持 Claude Agent SDK 发出的 reasoning `effort` 字段，并至少把 `low`、`medium`、`high`、`max` 映射到 Codex/OpenAI 后端等价的推理强度控制。
 
 如果普通聊天可用但工具调用失败，说明该 gateway 仍是 chat-only，不能作为完整 muselab agent 支持来宣传。
 
 ## 上下文窗口说明
 
-muselab 的上下文仪表会把内置 Codex Gateway 模型按 400K context 处理。gateway 仍可能根据后端模型和账号档位执行不同的有效窗口。
+muselab 的内置 Codex Gateway 模型表仍保留 400K 作为文档级 fallback，但运行时不会把它当作唯一真相源。实际上下文窗口会按以下优先级决定：
 
-如果实际运行仍报 `input exceeds the context window`，通常说明 gateway 转换层、所选后端模型或账号档位的有效窗口更小。此时可以新开会话、压缩历史，或切到上下文窗口已确认更大的模型 / gateway 路径。
+1. 显式环境变量：`MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5`、`CODEX_GATEWAY_CONTEXT_LIMIT`、`MUSELAB_THIRD_PARTY_CONTEXT_LIMIT`；
+2. gateway `/v1/models` 暴露的 `max_input_tokens` / `context_window` 等能力字段；
+3. Claude Agent SDK `get_context_usage()` 返回的 `maxTokens` / `rawMaxTokens`；
+4. 保守 fallback（Codex Gateway 默认按 200K effective window 预防）。
+
+发送新消息前，muselab 会先调用 SDK 的上下文统计；如果接近 effective window，会优先执行 Claude Code 原生 `/compact`，再发送用户消息。这样比等一轮回复成功后的事后 compact 更早，能减少 gateway 在请求入口直接报 `input exceeds the context window` 的概率。
+
+如果实际运行仍报 `input exceeds the context window`，通常说明 gateway 转换层、所选后端模型或账号档位的有效窗口更小，或当前会话已经超过到连 `/compact` 也无法进入模型。此时可以新开会话、手动降低 `CODEX_GATEWAY_CONTEXT_LIMIT`、压缩历史，或切到上下文窗口已确认更大的模型 / gateway 路径。
 
 ## 安全模型
 

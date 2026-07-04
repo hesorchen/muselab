@@ -36,6 +36,12 @@
   --c-accent-hover: #7aa3ff;
   --c-accent-soft: rgba(96, 147, 255, 0.12);
   --c-accent-fg: #b8cdff;
+  /* Text selection must be much stronger than accent-soft. Selection is a
+     transient reading aid, not a subtle surface state; keep it solid enough
+     that selected text remains obvious over chat bubbles, markdown and forms. */
+  --c-selection-bg: #2f66d0;
+  --c-selection-fg: #ffffff;
+  --c-caret: #ffffff;
   /* Primary-CTA tokens. Kept separate from --c-accent so accent can
      stay vivid for links / focus / active state, while button labels
      get a WCAG-safe pair. Naïvely using `var(--c-accent) + white` gave
@@ -165,8 +171,9 @@ svg { stroke: currentColor; fill: none; stroke-width: 1.75;
       stroke-linecap: round; stroke-linejoin: round; }
 
 /* 全局主题色细节：选中、光标、滚动条等 */
-::selection { background: var(--c-accent-soft); color: var(--c-fg-0); }
-textarea, input { caret-color: var(--c-accent); }
+::selection { background-color: var(--c-selection-bg); color: var(--c-selection-fg); }
+::-moz-selection { background-color: var(--c-selection-bg); color: var(--c-selection-fg); }
+textarea, input { caret-color: var(--c-caret); }
 ::-webkit-scrollbar-thumb:hover { background: var(--c-accent); }
 /* 链接（不在 markdown / bubble 里时也有主题色） */
 a { color: var(--c-accent); }
@@ -212,6 +219,9 @@ html[data-theme="light"] {
   --c-accent-hover: #2962d9;
   --c-accent-soft: rgba(58, 120, 240, 0.10);
   --c-accent-fg: #1d4dcc;
+  --c-selection-bg: var(--c-accent-fg);
+  --c-selection-fg: #ffffff;
+  --c-caret: var(--c-accent-fg);
   /* Light theme: white text on a darker bg keeps the conventional
      "primary CTA" look. white on --c-accent (#3a78f0) was only 4.10,
      so use the deeper accent-fg shade as button bg: 7.03:1. Hover
@@ -279,6 +289,9 @@ html[data-theme="eyecare"] {
   --c-accent-hover: #4a7d5a;
   --c-accent-soft: rgba(90, 143, 106, 0.10);
   --c-accent-fg: #3a5a30;
+  --c-selection-bg: #b8d4ad;
+  --c-selection-fg: #1d2418;
+  --c-caret: var(--c-accent-fg);
   /* Eyecare: sage accent + white was only 3.77; deepen to #3f6b4c
      (white = 6.14:1) for button bg. Hover goes deeper still. */
   --c-btn-primary-bg: #3f6b4c;
@@ -342,6 +355,7 @@ html, body {
 button, input, textarea, select {
   font: inherit; outline: none;
   background: var(--c-bg-2); color: var(--c-fg-1);
+  caret-color: var(--c-caret);
   border: 1px solid var(--c-border-strong);
   padding: 6px 10px; border-radius: var(--r-md);
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
@@ -392,7 +406,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
 }
 .icon-btn:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
 .icon-btn:active { background: var(--c-bg-4); }
-.icon-btn.active { background: var(--c-accent-soft); color: var(--c-accent); }
+.icon-btn.active { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .icon-btn:hover { color: var(--c-accent); }   /* 所有 icon-btn hover 变主色 */
 .icon-btn svg { width: 15px; height: 15px; }
 .icon-btn.sm { width: 22px; height: 22px; }
@@ -2198,7 +2212,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   transition: background var(--t-fast), color var(--t-fast);
 }
 .preview-find-btn:hover:not(:disabled) { background: var(--c-bg-3); color: var(--c-fg-0); }
-.preview-find-btn.active { background: var(--c-accent-soft); color: var(--c-accent); }
+.preview-find-btn.active { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .preview-find-btn:disabled { opacity: 0.35; cursor: default; }
 .preview-find-list {
   margin-top: var(--sp-1);
@@ -2223,7 +2237,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .preview-find-item-snip { overflow: hidden; text-overflow: ellipsis; font-family: var(--font-mono); }
 .preview-find-item-snip mark,
-.preview-find-list mark { background: var(--c-accent-soft); color: var(--c-accent); padding: 0 1px; border-radius: 2px; }
+.preview-find-list mark { background: var(--c-accent-soft); color: var(--c-accent-fg); padding: 0 1px; border-radius: 2px; }
 
 /* Injected highlight marks in the live preview content. */
 .preview-body mark.find-hit {
@@ -2574,7 +2588,7 @@ pre.text {
 @media (hover: hover) {
   .session-picker-row:hover { background: var(--c-bg-2); }
 }
-.session-picker-row.active { background: var(--c-accent-soft); color: var(--c-accent); }
+.session-picker-row.active { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .session-picker-row .ellipsis { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-picker-count {
   font-size: var(--fs-xs); color: var(--c-fg-3); padding: 1px 6px;
@@ -3311,7 +3325,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   display: inline-block;
   padding: 4px 14px;
   margin-bottom: 6px;
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   border: 1px dashed var(--c-accent);
   border-radius: var(--r-full);
   font-size: var(--fs-xs); font-weight: var(--fw-semibold);
@@ -3546,12 +3560,12 @@ pre.has-copy-btn .code-copy-btn:focus {
   opacity: 1;                   /* reveal on hover or keyboard focus */
 }
 pre.has-copy-btn .code-copy-btn:hover {
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   border-color: var(--c-accent);
 }
 pre.has-copy-btn .code-copy-btn.copied {
   opacity: 1;
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   border-color: var(--c-accent);
 }
 /* On mobile (no hover), always show but smaller + low-key */
@@ -4031,7 +4045,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ask-submitted-tag {
   margin-left: auto;
   padding: 1px 8px; border-radius: var(--r-full);
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   font-size: var(--fs-xs); letter-spacing: 0.5px;
 }
 .ask-question-block { margin-bottom: var(--sp-3); }
@@ -4833,7 +4847,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .ctx-meter-action {
   flex-shrink: 0; padding: 2px 10px; border-radius: var(--r-md);
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   border: 1px solid transparent; cursor: pointer;
   font-size: var(--fs-xs); font-family: inherit;
   transition: background var(--t-fast), border-color var(--t-fast);
@@ -4889,7 +4903,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); font-family: var(--font-mono);
   line-height: 1.5;
 }
-.provider-row .probe-result.ok  { background: var(--c-accent-soft); color: var(--c-accent); }
+.provider-row .probe-result.ok  { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .provider-row .probe-result.err { background: rgba(220, 53, 69, 0.10); color: var(--c-danger); }
 
 /* Per-provider help text (where to get key, alt paths) */
@@ -4929,7 +4943,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   vertical-align: middle;
 }
 .provider-meta-tag.mono { font-family: var(--font-mono); }
-.provider-meta-tag.edited { background: var(--c-accent-soft); color: var(--c-accent); }
+.provider-meta-tag.edited { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .provider-meta-tag.custom { background: rgba(99, 102, 241, 0.12); color: #6366f1; }
 
 /* Expanded provider editor (endpoint / prefix / models / api-key). Lives in
@@ -5241,7 +5255,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   cursor: default;
 }
 .ctx-chip.ok {
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
 }
 .ctx-chip.warn {
   background: rgba(245, 158, 11, 0.12); color: var(--c-warn);
@@ -5304,7 +5318,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .todo-in_progress .todo-text { font-weight: var(--fw-semibold); }
 .todo-tag {
   padding: 1px 6px; border-radius: var(--r-sm);
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   font-size: var(--fs-xs);
 }
 
@@ -5451,8 +5465,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); letter-spacing: 0.5px;
   flex-shrink: 0;
 }
-.perm-decision-allow { background: var(--c-accent-soft); color: var(--c-accent); }
-.perm-decision-always { background: var(--c-accent-soft); color: var(--c-accent); }
+.perm-decision-allow { background: var(--c-accent-soft); color: var(--c-accent-fg); }
+.perm-decision-always { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .perm-decision-deny { background: var(--c-error-soft, rgba(220,53,69,0.1)); color: var(--c-error, #dc3545); }
 .perm-body { margin-bottom: 0; }
 .perm-tool {
@@ -5619,6 +5633,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   padding: 6px 14px;
   border: 0; outline: none;
   color: var(--c-fg-0);
+  caret-color: var(--c-caret);
   line-height: 1.5;
 }
 .chat-input-textarea::placeholder { color: var(--c-fg-3); }
@@ -5996,7 +6011,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   cursor: pointer; align-items: center;
   transition: background var(--t-fast);
 }
-.mention-item:hover, .mention-item.sel { background: var(--c-accent-soft); color: var(--c-accent); }
+.mention-item:hover, .mention-item.sel { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .mention-item .icon { color: var(--c-fg-2); }
 .mention-item:hover .icon, .mention-item.sel .icon { color: var(--c-accent); }
 .mention-item .body { flex: 1; min-width: 0; }
@@ -6550,7 +6565,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-transform: uppercase;
 }
 .skill-scope-project { background: rgba(245, 158, 11, 0.15); color: var(--c-warn); }
-.skill-scope-user { background: var(--c-accent-soft); color: var(--c-accent); }
+.skill-scope-user { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .skill-scope-plugin { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
 .skill-row-desc {
   font-size: var(--fs-xs); color: var(--c-fg-2);
@@ -6754,7 +6769,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .seg-btn:hover { color: var(--c-fg-1); }
 .seg-btn.seg-active {
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   font-weight: var(--fw-medium);
 }
 
@@ -6827,6 +6842,22 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
   background: transparent !important; padding: 0 !important;
 }
 
+/* Inline code must stay readable even if hljs theme classes leak onto it.
+   The hljs theme CSS is loaded after styles.css, so use higher specificity
+   and theme-scoped !important to beat `.hljs { color: ... }` without touching
+   real fenced code blocks. Exclude file-link chips: they have their own
+   click affordance and accent contrast rules. */
+html[data-theme="dark"] .markdown :not(pre) > code:not(.has-file-link),
+html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) {
+  background: var(--c-bg-3) !important;
+  color: var(--c-fg-0) !important;
+}
+html[data-theme="dark"] .markdown :not(pre) > code:not(.has-file-link) *,
+html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
+  background: transparent !important;
+  color: inherit !important;
+}
+
 /* ==========================================================================
    Versions + upgrade — Settings panel section
    ========================================================================== */
@@ -6850,7 +6881,7 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
   display: inline-block;
   padding: 1px 8px; border-radius: var(--r-full);
   font-size: var(--fs-2xs); font-weight: var(--fw-semibold);
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   /* Without nowrap a narrow viewport (mobile, the rightmost column
      squeezed by the long-Chinese-name first column) wraps "有更新"
      into three vertical glyphs. Badges are short labels — they must
@@ -7794,7 +7825,7 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
   padding: 1px 6px;
   font-size: var(--fs-xs); font-weight: var(--fw-normal);
   font-family: var(--font-mono);
-  background: var(--c-accent-soft); color: var(--c-accent);
+  background: var(--c-accent-soft); color: var(--c-accent-fg);
   border-radius: var(--r-full);
   vertical-align: middle;
 }
@@ -8132,7 +8163,8 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
   border-color: rgba(255, 255, 255, 0.65);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.12);
 }
-.edit-msg-ta::selection { background: rgba(255, 255, 255, 0.25); }
+.edit-msg-ta::selection { background: var(--c-selection-bg); color: var(--c-selection-fg); }
+.edit-msg-ta::-moz-selection { background: var(--c-selection-bg); color: var(--c-selection-fg); }
 .edit-msg-footer {
   display: flex; justify-content: flex-end; gap: 6px;
 }

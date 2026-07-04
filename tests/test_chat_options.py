@@ -39,6 +39,26 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-test"
 
 
+def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    monkeypatch.setenv("CODEX_GATEWAY_BASE_URL", "http://127.0.0.1:9876")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    client = asyncio.run(chat_mod._build_and_connect_client(
+        "sid-codex-effort", "codex:gpt-5.5", "bypassPermissions", "high"))
+
+    assert captured["connected"] is True
+    assert client is not None
+    assert captured["model"] == "gpt-5.5"
+    assert captured["effort"] == "high"
+    assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
+    assert captured["env"]["ANTHROPIC_API_KEY"] == "local-secret"
+
+
 def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):
     from backend import chat as chat_mod
     from backend import endpoints

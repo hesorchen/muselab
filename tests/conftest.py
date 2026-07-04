@@ -113,7 +113,7 @@ def app_module(monkeypatch, temp_root, tmp_path):
     # change, skip write" → file assertion fails.)
     for k in ("DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY", "MINIMAX_API_KEY",
               "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY", "XIAOMI_MIMO_API_KEY",
-              "QIANFAN_API_KEY",
+              "QIANFAN_API_KEY", "CODEX_GATEWAY_API_KEY",
               "OPENAI_API_KEY", "OPENAI_IMAGE_API_KEY", "OPENAI_IMAGE_BASE_URL",
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
               "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",

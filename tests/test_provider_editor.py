@@ -81,6 +81,7 @@ def test_codex_gateway_builtin_surfaces_as_local_sidecar(client, auth, iso_overr
     assert p["models"] and all(m.startswith("codex:") for m in p["models"])
     assert "codex:gpt-5.5" in p["models"]
     assert p["supports_thinking"] is False
+    assert p["supports_effort"] is True
 
 
 def test_create_custom_provider_with_key(client, auth, iso_overrides, monkeypatch, tmp_path):

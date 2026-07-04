@@ -207,6 +207,28 @@ def test_providers_includes_deepseek_after_key_set(client, auth, monkeypatch):
                 for m in ds_models)
 
 
+def test_providers_marks_codex_effort_capability(client, auth, monkeypatch):
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    r = client.get("/api/chat/providers", headers=auth)
+    assert r.status_code == 200
+    models = r.json()["models"]
+    codex = next(m for m in models if m["model"] == "codex:gpt-5.5")
+    assert codex["supports_effort"] is True
+    assert codex["supports_thinking"] is False
+
+
+def test_codex_legacy_raw_model_alias_resolves(app_module, monkeypatch):
+    """Existing sessions/prefs may store the vendor id without `codex:`.
+
+    The backend must canonicalize it before routing, while the frontend maps the
+    same alias for capability gates so the mobile gear can show Effort.
+    """
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    import backend.chat as chat
+    assert chat._resolve_default_model("gpt-5.5", allow_fallback=False) == "codex:gpt-5.5"
+    assert chat._heal_unreachable_locked_model("no-such-sid", "gpt-5.5", "") == "codex:gpt-5.5"
+
+
 def test_heal_unreachable_locked_model_switches_to_configured(app_module, monkeypatch):
     """A session pinned to claude (no Anthropic auth) before any provider was
     configured self-heals to the configured DeepSeek once the user sets the

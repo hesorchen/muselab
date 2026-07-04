@@ -218,7 +218,7 @@
   <symbol id="m-wave"     viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5 12 Q 8.5 6 12 12 T 19 12"/></symbol> <!-- Euterpe: 声波 -->
   <symbol id="m-crescent" viewBox="0 0 24 24"><path d="M16 3 A 9 9 0 1 0 16 21 A 7 7 0 1 1 16 3 Z"/></symbol>                  <!-- Melpomene: 残月，悲剧之夜 -->
   <symbol id="m-halo"     viewBox="0 0 24 24"><circle cx="12" cy="14" r="5"/><path d="M5 8 A 7 4 0 0 1 19 8"/></symbol>      <!-- Polyhymnia: 圣光环 -->
-  <symbol id="m-trio"     viewBox="0 0 24 24"><circle cx="12" cy="6" r="2" fill="currentColor"/><circle cx="6" cy="17" r="2" fill="currentColor"/><circle cx="18" cy="17" r="2" fill="currentColor"/></symbol> <!-- Terpsichore: 三美神舞步 -->
+  <symbol id="m-trio"     viewBox="0 0 24 24"><path d="M12 6 L6 17 L18 17 Z"/><circle cx="12" cy="6" r="2" fill="currentColor"/><circle cx="6" cy="17" r="2" fill="currentColor"/><circle cx="18" cy="17" r="2" fill="currentColor"/></symbol> <!-- Terpsichore: 三美神舞步 -->
   <symbol id="m-spark"    viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/><circle cx="12" cy="12" r="2" fill="currentColor"/></symbol> <!-- Thalia: 火花/喜剧的灵光 -->
   <symbol id="m-orbit"    viewBox="0 0 24 24"><circle cx="11" cy="13" r="5"/><circle cx="18.5" cy="6" r="1.6" fill="currentColor"/></symbol> <!-- Urania: 行星 + 卫星 -->
 </defs>
@@ -2753,22 +2753,19 @@
                  adaptive thinking picks per turn). Overrides apply session-
                  wide and trigger a client rebuild on next turn.
 
-                 Options visibility tracks current model: non-Claude models
-                 hide the whole dropdown (effort is Anthropic-API specific;
-                 vendor proxies don't reliably honor it). Among Claude
-                 models, xhigh is Opus-4.7-only — SDK falls back to high on
-                 Sonnet/Haiku, so we hide rather than mislead. See
-                 _supportsEffort / _effortAllowed in app.js. -->
+                 Options visibility tracks current model/provider metadata:
+                 Claude models always show it; non-Claude providers show it
+                 only when /api/chat/providers marks supports_effort=true
+                 (currently Codex Gateway). xhigh remains Opus-only — SDK
+                 falls back to high elsewhere, so we hide rather than mislead.
+                 See _supportsEffort / _effortAllowed in app.js. -->
             <select x-model="effort" @change="onEffortChange()"
                     x-show="_supportsEffort(model)"
                     class="chat-toolbar-select chat-toolbar-effort"
                     :title="t('effort.title')">
-              <option value="" x-text="t('effort.auto')"></option>
-              <option value="low" x-show="_effortAllowed('low', model)" x-text="t('effort.low')"></option>
-              <option value="medium" x-show="_effortAllowed('medium', model)" x-text="t('effort.medium')"></option>
-              <option value="high" x-show="_effortAllowed('high', model)" x-text="t('effort.high')"></option>
-              <option value="xhigh" x-show="_effortAllowed('xhigh', model)" x-text="t('effort.xhigh')"></option>
-              <option value="max" x-show="_effortAllowed('max', model)" x-text="t('effort.max')"></option>
+              <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
+                <option :value="opt.value" x-text="t(opt.labelKey)"></option>
+              </template>
             </select>
             <!-- Mobile-only gear: on phones the permission + effort selects
                  above are hidden (CSS) and collapsed in here, so the composer
@@ -2800,12 +2797,9 @@
                 <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
                   <span x-text="t('effort.title')"></span>
                   <select x-model="effort" @change="onEffortChange()">
-                    <option value="" x-text="t('effort.auto')"></option>
-                    <option value="low" x-show="_effortAllowed('low', model)" x-text="t('effort.low')"></option>
-                    <option value="medium" x-show="_effortAllowed('medium', model)" x-text="t('effort.medium')"></option>
-                    <option value="high" x-show="_effortAllowed('high', model)" x-text="t('effort.high')"></option>
-                    <option value="xhigh" x-show="_effortAllowed('xhigh', model)" x-text="t('effort.xhigh')"></option>
-                    <option value="max" x-show="_effortAllowed('max', model)" x-text="t('effort.max')"></option>
+                    <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
+                      <option :value="opt.value" x-text="t(opt.labelKey)"></option>
+                    </template>
                   </select>
                 </label>
               </div>

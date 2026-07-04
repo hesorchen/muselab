@@ -764,12 +764,165 @@ MODEL_CONTEXT_LIMITS = {
     # Codex Gateway — local sidecars can expose Codex/GPT aliases with large
     # context windows. Gateway implementations may still fail earlier if their
     # translation layer or account tier has a smaller effective window.
+    # Codex Gateway docs/model cards may advertise 400K, but the local sidecar,
+    # account tier, or Anthropic→Codex translation layer can enforce a smaller
+    # effective window. Treat these as last-resort catalog fallbacks only; runtime
+    # code below prefers explicit env overrides and SDK/gateway observations.
     "codex:gpt-5.5":                400_000,
     "codex:gpt-5.4":                400_000,
     "codex:gpt-5.4-mini":           400_000,
     "codex:gpt-5.3-codex-spark":    400_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
+CODEX_GATEWAY_SAFE_CONTEXT_LIMIT = 200_000
+_CONTEXT_LIMIT_PROBE_CACHE: dict[str, int] = {}
+
+
+def _positive_int(v: Any) -> int:
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _is_codex_gateway_model(model: str) -> bool:
+    if (model or "").startswith("codex:"):
+        return True
+    provider = endpoints.lookup(model or "")
+    return bool(
+        provider
+        and provider.supports_effort
+        and provider.supports_thinking is False
+        and provider.max_output_tokens == 128_000
+        and "codex" in (provider.display or "").lower()
+    )
+
+
+def _context_limit_env_override(model: str) -> int:
+    """Explicit operator override for third-party effective context windows.
+
+    Model-specific env wins over provider-wide env. Example for codex:gpt-5.5:
+    MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5=180000. Provider-wide fallback:
+    CODEX_GATEWAY_CONTEXT_LIMIT=180000.
+    """
+    key = re.sub(r"[^A-Za-z0-9]+", "_", (model or "").upper()).strip("_")
+    names = []
+    if key:
+        names.append(f"MUSELAB_CONTEXT_LIMIT_{key}")
+    if _is_codex_gateway_model(model):
+        names.append("CODEX_GATEWAY_CONTEXT_LIMIT")
+    names.append("MUSELAB_THIRD_PARTY_CONTEXT_LIMIT")
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        n = _positive_int(raw)
+        if n:
+            return n
+    return 0
+
+
+def _effective_context_limit(
+    model: str,
+    *,
+    sdk_max: int = 0,
+    sdk_raw: int = 0,
+    stored: int = 0,
+    detected: int = 0,
+) -> int:
+    """Runtime denominator for the context meter and preflight compact.
+
+    Official Claude path: SDK maxTokens is authoritative. Third-party gateways:
+    explicit env override wins; for Codex Gateway use a conservative safe default
+    ahead of the optimistic 400K catalog entry because gateway/backend/account
+    tiers often fail earlier than the model card window.
+    """
+    override = _context_limit_env_override(model)
+    if override:
+        return override
+    if not endpoints.is_third_party(model):
+        return _positive_int(sdk_max) or _positive_int(stored) or MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+    if _is_codex_gateway_model(model):
+        # If SDK/gateway reports a smaller window than our safe default, respect
+        # that. Gateway-detected capability beats SDK-inferred model-card values.
+        observed = min([n for n in (_positive_int(detected), _positive_int(sdk_max), _positive_int(sdk_raw)) if n] or [0])
+        if observed:
+            return min(observed, CODEX_GATEWAY_SAFE_CONTEXT_LIMIT)
+        return CODEX_GATEWAY_SAFE_CONTEXT_LIMIT
+    hardcoded = MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+    return _positive_int(sdk_max) or max(_positive_int(stored), hardcoded)
+
+
+def _compact_threshold(model: str, limit: int, sdk_threshold: int = 0) -> int:
+    if limit <= 0:
+        return 0
+    # Gateway conversion layers are less predictable; compact earlier.
+    ratio = 0.75 if _is_codex_gateway_model(model) else 0.90
+    soft = int(limit * ratio)
+    sdk_t = _positive_int(sdk_threshold)
+    if sdk_t:
+        return min(sdk_t, soft)
+    return soft
+
+
+def _rough_prompt_tokens(text: str) -> int:
+    # Conservative language-agnostic estimate for preflight only. The SDK/tokenizer
+    # truth arrives after the turn; here we just avoid sending when already close.
+    if not text:
+        return 0
+    return max(1, len(text) // 3)
+
+
+async def _detect_gateway_context_limit(model: str) -> int:
+    """Best-effort capability discovery for Anthropic-compatible gateways.
+
+    Official Claude uses the Models API. Local gateways vary, so accept a few
+    common field names and cache the result. Failure is fine: callers fall back to
+    env overrides / SDK context usage / conservative defaults.
+    """
+    if not _is_codex_gateway_model(model):
+        return 0
+    if model in _CONTEXT_LIMIT_PROBE_CACHE:
+        return _CONTEXT_LIMIT_PROBE_CACHE[model]
+    env = endpoints.env_override(model) or {}
+    base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
+    key = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    if not base:
+        return 0
+    headers = {"anthropic-version": "2023-06-01"}
+    if key:
+        headers.update({"x-api-key": key, "Authorization": f"Bearer {key}"})
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=2.0) as hc:
+            # Try Anthropic-style retrieve first, then OpenAI-style list.
+            urls = [
+                f"{base}/v1/models/{endpoints.normalize_model_id(model)}",
+                f"{base}/v1/models",
+            ]
+            for url in urls:
+                r = await hc.get(url, headers=headers)
+                if r.status_code >= 400:
+                    continue
+                body = r.json()
+                candidates = []
+                if isinstance(body, dict):
+                    candidates.append(body)
+                    for item in body.get("data") or []:
+                        if isinstance(item, dict) and item.get("id") in {model, endpoints.normalize_model_id(model)}:
+                            candidates.insert(0, item)
+                for item in candidates:
+                    for field in ("max_input_tokens", "context_window", "context_length", "max_context_tokens"):
+                        n = _positive_int(item.get(field)) if isinstance(item, dict) else 0
+                        if n:
+                            _CONTEXT_LIMIT_PROBE_CACHE[model] = n
+                            return n
+    except Exception as e:
+        sys.stderr.write(
+            f"[ctx-probe] gateway context probe skipped model={model}: {type(e).__name__}\n")
+    _CONTEXT_LIMIT_PROBE_CACHE[model] = 0
+    return 0
 
 # Soft budget. If set (via MUSELAB_BUDGET_USD env or PUT /api/settings),
 # usage endpoint flags overrun so the UI can color the cost badge red.
@@ -1726,6 +1879,29 @@ def list_sessions_api(
     return body
 
 
+def _canonical_available_model(model: str, groups: list[dict] | None = None) -> str:
+    """Return the catalog id for an available model, accepting safe legacy aliases.
+
+    Codex Gateway uses `codex:` as a muselab-internal routing prefix and strips it
+    before calling the gateway. Some sessions / prefs may still carry the
+    vendor-facing id (`gpt-5.5`). Map that alias back to `codex:gpt-5.5` so the
+    backend routes through the configured Codex provider instead of treating it as
+    an unknown Claude model.
+    """
+    wanted = (model or "").strip()
+    if not wanted:
+        return ""
+    groups = endpoints.available_groups() if groups is None else groups
+    available = {item["model"] for g in groups for item in g.get("items", [])}
+    if wanted in available:
+        return wanted
+    if ":" not in wanted:
+        codex_alias = f"codex:{wanted}"
+        if codex_alias in available:
+            return codex_alias
+    return ""
+
+
 def _resolve_default_model(requested: str = "", *, allow_fallback: bool = True) -> str:
     """Pick a model id for a new session. Three-tier fallback:
       1. `requested` (what the caller sent) — used ONLY if its provider
@@ -1745,16 +1921,16 @@ def _resolve_default_model(requested: str = "", *, allow_fallback: bool = True) 
         (by which point the user has been gated into configuring one).
     """
     groups = endpoints.available_groups()
-    available = {item["model"] for g in groups for item in g.get("items", [])}
-
     # 1. Caller-requested model, if its provider is wired.
-    if requested and requested in available:
-        return requested
+    resolved = _canonical_available_model(requested, groups)
+    if resolved:
+        return resolved
 
     # 2. Env-pinned default, if its provider is wired.
     explicit = (MODEL or "").strip()
-    if explicit and explicit in available:
-        return explicit
+    resolved = _canonical_available_model(explicit, groups)
+    if resolved:
+        return resolved
 
     # 3. First actually-available model.
     if groups and groups[0].get("items"):
@@ -1789,9 +1965,15 @@ def _heal_unreachable_locked_model(session_id: str, locked: str, requested: str 
     """
     groups = endpoints.available_groups()
     available = {item["model"] for g in groups for item in g.get("items", [])}
-    # Locked model still reachable (or nothing configured at all → can't do
-    # better; the no-provider onboarding card handles that case) → keep it.
-    if not available or locked in available:
+    # Locked model still reachable (or is a safe legacy alias such as
+    # `gpt-5.5` → `codex:gpt-5.5`) → keep/canonicalize it. Canonicalizing a
+    # Codex alias is not a vendor switch; it restores the internal routing tag.
+    canonical_locked = _canonical_available_model(locked, groups)
+    if canonical_locked:
+        return canonical_locked
+    # Nothing configured at all → can't do better; the no-provider onboarding
+    # card handles that case.
+    if not available:
         return locked
     # Don't touch a session that has actually run — switching vendors on real
     # history can corrupt cross-vendor thinking signatures.
@@ -3705,7 +3887,10 @@ def _session_usage_from_jsonl(sid: str) -> dict | None:
         sdk_window = sess.get_session_ctx_window(sid)
     except Exception:
         sdk_window = None
-    limit = sdk_window or MODEL_CONTEXT_LIMITS.get(last_model, 0)
+    if endpoints.is_third_party(last_model):
+        limit = _effective_context_limit(last_model)
+    else:
+        limit = sdk_window or MODEL_CONTEXT_LIMITS.get(last_model, 0)
     pct = round(ctx_used / limit * 100, 1) if limit else 0.0
     return {
         "input_tokens": in_t, "output_tokens": out_t,
@@ -3758,7 +3943,10 @@ def session_usage(session_id: str, model: str = "") -> dict:
         sdk_window = None
     stored = int(u.get("context_limit", 0) or 0)
     hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
-    limit = sdk_window or max(stored, hardcoded)
+    if endpoints.is_third_party(m):
+        limit = _effective_context_limit(m, stored=stored)
+    else:
+        limit = sdk_window or max(stored, hardcoded)
     # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
     # handler. Fall back to the legacy estimate only if no turn has completed
     # yet (in which case `context_used` is 0 anyway → 0% display, correct).
@@ -4274,10 +4462,15 @@ async def native_compact_session_api(sid: str) -> dict:
         if real_total:
             sess_u["context_used"] = real_total
         if endpoints.is_third_party(model):
-            # CLI tokenizer doesn't know third-party windows — trust the table
-            # for the denominator (matches the stream done-handler logic).
-            sess_u["context_limit"] = MODEL_CONTEXT_LIMITS.get(
-                model, DEFAULT_CONTEXT_LIMIT)
+            # Third-party gateways may have a smaller effective window than their
+            # public model card. Prefer explicit/probed effective limits over the
+            # optimistic catalog table.
+            sess_u["context_limit"] = _effective_context_limit(
+                model, sdk_max=real_max, sdk_raw=_positive_int(cu.get("rawMaxTokens")))
+            sess_u["sdk_context_max_tokens"] = real_max
+            sess_u["sdk_context_raw_max_tokens"] = _positive_int(cu.get("rawMaxTokens"))
+            if cu.get("autoCompactThreshold"):
+                sess_u["auto_compact_threshold"] = _positive_int(cu.get("autoCompactThreshold"))
         elif real_max:
             sess_u["context_limit"] = real_max
             try:
@@ -7328,6 +7521,99 @@ async def _start_turn(
     # cleared per turn.
     inflight_tasks: dict[str, dict] = {}
 
+    async def _preflight_compact_if_needed() -> None:
+        """Use Claude Code's native context accounting before sending a turn.
+
+        The previous auto-compact path only ran after a successful `done` event,
+        which is too late for gateways that reject the next request at the API
+        boundary. This preflight uses the SDK's `/context` equivalent first, and
+        then the SDK-native `/compact` slash command if the effective window is
+        close to full.
+        """
+        try:
+            cu = await client.get_context_usage()
+        except Exception as e:
+            sys.stderr.write(
+                f"[chat-preflight] get_context_usage skipped sid={session_id[:8]} "
+                f"model={model_to_use}: {type(e).__name__}\n")
+            return
+        total = _positive_int(cu.get("totalTokens"))
+        sdk_max = _positive_int(cu.get("maxTokens"))
+        sdk_raw = _positive_int(cu.get("rawMaxTokens"))
+        detected = await _detect_gateway_context_limit(model_to_use)
+        limit = _effective_context_limit(model_to_use, sdk_max=sdk_max, sdk_raw=sdk_raw, detected=detected)
+        threshold = _compact_threshold(
+            model_to_use, limit, _positive_int(cu.get("autoCompactThreshold")))
+        # Attachments can be expensive; add a rough safety margin rather than
+        # pretending the typed text is the whole next request.
+        next_est = _rough_prompt_tokens(prompt) + len(img_blocks) * 2500 + len(pdf_blocks) * 12000
+        if not threshold or total + next_est < threshold:
+            # Still refresh the meter with the effective denominator so the UI can
+            # warn before a successful turn completes.
+            sess_u = _session_usage.setdefault(session_id, {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0,
+                "context_limit": 0,
+            })
+            sess_u["context_used"] = total or sess_u.get("context_used", 0)
+            sess_u["context_limit"] = limit or sess_u.get("context_limit", 0)
+            sess_u["sdk_context_max_tokens"] = sdk_max
+            sess_u["sdk_context_raw_max_tokens"] = sdk_raw
+            if threshold:
+                sess_u["auto_compact_threshold"] = threshold
+            if sess_u.get("context_limit") and sess_u.get("context_used"):
+                sess_u["context_used_pct"] = round(
+                    sess_u["context_used"] / sess_u["context_limit"] * 100, 1)
+            return
+        sys.stderr.write(
+            f"[chat-preflight] native compact sid={session_id[:8]} model={model_to_use} "
+            f"total={total} next~={next_est} threshold={threshold} limit={limit}\n")
+        sys.stderr.flush()
+        try:
+            await client.query("/compact")
+            async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 600, min_value=1)):
+                async for msg in client.receive_response():
+                    if isinstance(msg, ResultMessage):
+                        break
+        except Exception as e:
+            # Do not swallow the user's actual turn forever. If compact failed
+            # because the session is already over the gateway's true limit, the
+            # subsequent turn will surface the vendor error; this log preserves why
+            # preflight did not prevent it.
+            sys.stderr.write(
+                f"[chat-preflight] native compact failed sid={session_id[:8]} "
+                f"model={model_to_use}: {type(e).__name__}: {e}\n")
+            sys.stderr.flush()
+            return
+        try:
+            cu2 = await client.get_context_usage()
+            real_total = _positive_int(cu2.get("totalTokens"))
+            real_max = _positive_int(cu2.get("maxTokens"))
+            real_raw = _positive_int(cu2.get("rawMaxTokens"))
+            lim = _effective_context_limit(model_to_use, sdk_max=real_max, sdk_raw=real_raw)
+            sess_u = _session_usage.setdefault(session_id, {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "total_cost_usd": 0.0, "last_turn_at": 0.0,
+                "context_used": 0, "context_used_pct": 0.0,
+                "context_limit": 0,
+            })
+            if real_total:
+                sess_u["context_used"] = real_total
+            if lim:
+                sess_u["context_limit"] = lim
+            sess_u["sdk_context_max_tokens"] = real_max
+            sess_u["sdk_context_raw_max_tokens"] = real_raw
+            th = _compact_threshold(model_to_use, lim, _positive_int(cu2.get("autoCompactThreshold")))
+            if th:
+                sess_u["auto_compact_threshold"] = th
+            if real_total and lim:
+                sess_u["context_used_pct"] = round(real_total / lim * 100, 1)
+        except Exception:
+            pass
+
     async def event_gen():
         nonlocal assistant_acc, streamed_in_bubble
         # Subscribe to the session's side-channel queue. The MCP ask_user_question
@@ -7356,6 +7642,7 @@ async def _start_turn(
         async def pump_claude():
             """Pull from claude SDK response stream into the merge queue."""
             try:
+                await _preflight_compact_if_needed()
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
                 binary_blocks = [*img_blocks, *pdf_blocks]
@@ -7753,11 +8040,27 @@ async def _start_turn(
             # vendor's documented window. AssistantMessage.usage already
             # populated context_used / pct against that limit a few lines up.
             if endpoints.is_third_party(model_to_use):
-                # Re-anchor context_limit to muselab's table in case a prior
-                # turn (under a different model) left a Claude-style 1M
-                # value behind.
-                sess_u["context_limit"] = MODEL_CONTEXT_LIMITS.get(
-                    model_to_use, DEFAULT_CONTEXT_LIMIT)
+                # Re-anchor context_limit to the runtime effective limit, not the
+                # optimistic catalog value. For Codex Gateway this prevents the UI
+                # from showing e.g. 30% while the sidecar/backend is already near
+                # its real context ceiling.
+                sdk_max = sdk_raw = sdk_threshold = 0
+                try:
+                    cu = await client.get_context_usage()
+                    sdk_max = _positive_int(cu.get("maxTokens"))
+                    sdk_raw = _positive_int(cu.get("rawMaxTokens"))
+                    sdk_threshold = _positive_int(cu.get("autoCompactThreshold"))
+                except Exception as _e:
+                    sys.stderr.write(
+                        f"[chat-stream] third-party get_context_usage skipped for "
+                        f"sid={session_id}: {type(_e).__name__}\n")
+                sess_u["context_limit"] = _effective_context_limit(
+                    model_to_use, sdk_max=sdk_max, sdk_raw=sdk_raw,
+                    stored=_positive_int(sess_u.get("context_limit")))
+                sess_u["sdk_context_max_tokens"] = sdk_max
+                sess_u["sdk_context_raw_max_tokens"] = sdk_raw
+                if sdk_threshold:
+                    sess_u["auto_compact_threshold"] = sdk_threshold
                 # Recompute pct against the corrected limit.
                 if sess_u["context_limit"]:
                     sess_u["context_used_pct"] = round(
@@ -8551,11 +8854,12 @@ def providers_list() -> dict:
     """Available model groups based on which provider API keys are configured."""
     groups = endpoints.available_groups()
     # Flatten to the {group, label, model} shape the frontend expects.
-    # supports_thinking is provider-level (see available_groups) — the FE uses
-    # it to show/hide the per-session thinking toggle, so models on vendors
-    # that reject the standard thinking config don't get a no-op switch.
+    # supports_thinking / supports_effort are provider-level (see
+    # available_groups) — the FE uses them to show/hide per-session controls so
+    # models on vendors that reject or ignore the knobs don't get no-op switches.
     flat = [{"group": g["group"], "label": i["label"], "model": i["model"],
-             "supports_thinking": g.get("supports_thinking", True)}
+             "supports_thinking": g.get("supports_thinking", True),
+             "supports_effort": g.get("supports_effort", False)}
             for g in groups for i in g["items"]]
     # default_model: the configured "new-session default" (MUSELAB_MODEL),
     # already narrowed to a reachable model by _resolve_default_model. The

@@ -3156,7 +3156,7 @@ function portal() {
     // (deepseek / glm / claude variants) instead of just the long id.
     modelLabel(id) {
       if (!id) return "";
-      const meta = (this.availableModels || []).find(m => m.model === id);
+      const meta = this._modelMeta(id);
       return meta ? meta.label : id;
     },
     // Format a millis-since-epoch timestamp as "HH:MM" in the user's
@@ -4723,22 +4723,37 @@ function portal() {
     //   - "low"/"medium"/"high"/"max"  → all Anthropic models honor
     //   - "xhigh"                       → Opus 4.7 / 4.8 only; SDK silently
     //                                     falls back to "high" on Sonnet / Haiku
-    //   - non-Claude (DeepSeek / GLM / MiniMax) → param is forwarded to
-    //                                     vendor's anthropic-compatible
-    //                                     proxy but honoring is vendor-
-    //                                     specific and undocumented;
-    //                                     hide the entire dropdown rather
-    //                                     than pretend it works
+    //   - non-Claude providers           → show only when /api/chat/providers
+    //                                     marks supports_effort=true. Codex
+    //                                     Gateway opts in because its sidecar
+    //                                     translates the Anthropic-compatible
+    //                                     request to a Codex/OpenAI backend.
     // Per "无效的直接隐藏" feedback (2026-05-22) we don't grey-out — we
     // hide. User feedback: greyed options still look pick-able and waste
     // dropdown space.
+    _modelMeta(model) {
+      const m = model || "";
+      const list = this.availableModels || [];
+      let meta = list.find(x => x.model === m);
+      if (meta) return meta;
+      // Legacy / already-normalized Codex sessions may store the vendor-facing
+      // id (`gpt-5.5`) while the picker catalog uses muselab's internal routing
+      // id (`codex:gpt-5.5`). Treat that as the same model for UI capability
+      // gates so the mobile gear still exposes Effort until the session is
+      // re-saved with the canonical id.
+      if (m && !m.includes(":")) {
+        meta = list.find(x => x.model === `codex:${m}`);
+        if (meta) return meta;
+      }
+      return null;
+    },
     _isClaudeModel(model) {
       return (model || "").startsWith("claude-");
     },
     _isCodexModel(model) {
       const m = model || "";
       if (m.startsWith("codex:")) return true;
-      const meta = (this.availableModels || []).find(x => x.model === m);
+      const meta = this._modelMeta(m);
       return !!(meta && /codex/i.test(meta.group || ""));
     },
     _isOpus47(model) {
@@ -4752,8 +4767,9 @@ function portal() {
       return m.startsWith("claude-opus-4-7") || m.startsWith("claude-opus-4-8");
     },
     _supportsEffort(model) {
-      // The whole dropdown shows only for Claude models.
-      return this._isClaudeModel(model);
+      if (this._isClaudeModel(model)) return true;
+      const meta = this._modelMeta(model);
+      return !!(meta && meta.supports_effort === true);
     },
     _supportsThinking(model) {
       // Thinking toggle shows for any provider whose endpoint honors the
@@ -4762,15 +4778,23 @@ function portal() {
       // (e.g. Qianfan) are hidden so the switch isn't a no-op. Default true
       // when the model isn't in the catalog yet (optimistic — matches the
       // backend, which enables thinking unless a provider opts out).
-      const meta = (this.availableModels || []).find(x => x.model === model);
+      const meta = this._modelMeta(model);
       if (!meta) return true;
       return meta.supports_thinking !== false;
     },
     _effortAllowed(level, model) {
       if (level === "") return true;            // "auto" always available
-      if (!this._isClaudeModel(model)) return false;
+      if (!this._supportsEffort(model)) return false;
       if (level === "xhigh") return this._isOpus47(model);
       return true;                              // low / medium / high / max
+    },
+    effortChoices(model) {
+      // Avoid x-show directly on <option>: iOS Safari's native picker can cache
+      // or ignore dynamically hidden option nodes, leaving only the selected
+      // "auto" visible. Render the filtered option list instead.
+      return ["", "low", "medium", "high", "xhigh", "max"]
+        .filter(level => this._effortAllowed(level, model))
+        .map(level => ({ value: level, labelKey: "effort." + (level || "auto") }));
     },
     async onEffortChange() {
       if (!this.currentId) return;
@@ -4824,7 +4848,7 @@ function portal() {
     },
 
     currentModelLabel() {
-      const m = this.availableModels.find(x => x.model === this.model);
+      const m = this._modelMeta(this.model);
       if (m) return m.label;
       // fallback：直接显示 model id
       return this.model || "AI";
@@ -6984,8 +7008,7 @@ function portal() {
       const limit_s = limit >= 1_000_000
         ? (limit / 1_000_000).toFixed(0) + "M"
         : (limit / 1000).toFixed(0) + "K";
-      const meta = (this.availableModels || []).find(m => m.model === this.model);
-      const modelLabel = meta ? meta.label : this.model;
+      const modelLabel = this.modelLabel(this.model);
       const hint = this.lang === "zh"
         ? "（点击压缩 · 右键看拆分）"
         : "(click to compact · right-click for breakdown)";
@@ -13190,55 +13213,65 @@ function portal() {
       this.pinTab(this.selected);
     },
     async saveEdit() {
-      // Pull the current buffer once, here, instead of mirroring it into the
-      // reactive editText on every keystroke. CM is the source of truth when
-      // active; the textarea fallback (this._cm === null) keeps editText synced
-      // via its input listener. Everything below (write body, post-save
-      // rawText sync) reads this.editText, so refresh it first.
-      if (this._cm) this.editText = this._cm.getValue();
-      let r;
+      // Ctrl/Cmd+S can enter from two places when CodeMirror has focus:
+      // CodeMirror.extraKeys and the document-level keydown handler. Guard at
+      // the save primitive so one physical shortcut cannot emit two writes and
+      // two identical "saved" toasts.
+      if (this._saveEditInFlight) return;
+      this._saveEditInFlight = true;
       try {
-        r = await fetch("/api/files/write", {
-          method: "PUT",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ path: this.selected, content: this.editText }),
-        });
-      } catch (e) {
-        // Keep editing=true so the unsaved buffer is preserved for retry.
-        this.errToast("save", String((e && e.message) || e));
-        return;
-      }
-      if (r.ok) {
-        this.rawText = this.editText;
-        // Keep the preview cache in step with the just-saved body. For md/text
-        // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
-        // the stale entry so the next switch-back re-fetches.
-        this._previewCacheDel(this.selected);
-        if (this.previewMode === "md") {
-          this.renderedMd = this._renderPreviewMd(this.rawText);
-          if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+        // Pull the current buffer once, here, instead of mirroring it into the
+        // reactive editText on every keystroke. CM is the source of truth when
+        // active; the textarea fallback (this._cm === null) keeps editText synced
+        // via its input listener. Everything below (write body, post-save
+        // rawText sync) reads this.editText, so refresh it first.
+        if (this._cm) this.editText = this._cm.getValue();
+        let r;
+        try {
+          r = await fetch("/api/files/write", {
+            method: "PUT",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ path: this.selected, content: this.editText }),
+          });
+        } catch (e) {
+          // Keep editing=true so the unsaved buffer is preserved for retry.
+          this.errToast("save", String((e && e.message) || e));
+          return;
+        }
+        if (r.ok) {
+          this.rawText = this.editText;
+          // Keep the preview cache in step with the just-saved body. For md/text
+          // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
+          // the stale entry so the next switch-back re-fetches.
+          this._previewCacheDel(this.selected);
+          if (this.previewMode === "md") {
+            this.renderedMd = this._renderPreviewMd(this.rawText);
+            if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+              this._previewCacheSet(this.selected, {
+                mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
+              });
+            }
+            this.$nextTick(() => this.highlightCode(".markdown"));
+          } else if (this.previewMode === "text"
+                     && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
             this._previewCacheSet(this.selected, {
-              mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
+              mode: "text", rawText: this.rawText, previewLang: this.previewLang,
             });
           }
-          this.$nextTick(() => this.highlightCode(".markdown"));
-        } else if (this.previewMode === "text"
-                   && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-          this._previewCacheSet(this.selected, {
-            mode: "text", rawText: this.rawText, previewLang: this.previewLang,
-          });
-        }
-        // Bump previewVersion so HTML / PDF / image iframes pick up the new
-        // file content. Without this, iframes keep showing the stale render
-        // (browser disk cache + same URL) until the user hard-refreshes —
-        // the issue was visible when editing a html report styled in dark
-        // mode to light mode: editor saved, preview iframe still showed dark.
-        this.previewVersion = Date.now();
-        this.editing = false;
-        // Saving moved the file's mtime — refresh the header strip.
-        this.loadSelectedMeta(this.selected);
-        this.toast(this.t("toast.saved"), "success");
-      } else this.errToast("save", await r.text());
+          // Bump previewVersion so HTML / PDF / image iframes pick up the new
+          // file content. Without this, iframes keep showing the stale render
+          // (browser disk cache + same URL) until the user hard-refreshes —
+          // the issue was visible when editing a html report styled in dark
+          // mode to light mode: editor saved, preview iframe still showed dark.
+          this.previewVersion = Date.now();
+          this.editing = false;
+          // Saving moved the file's mtime — refresh the header strip.
+          this.loadSelectedMeta(this.selected);
+          this.toast(this.t("toast.saved"), "success");
+        } else this.errToast("save", await r.text());
+      } finally {
+        this._saveEditInFlight = false;
+      }
     },
 
     // ===== @ mention =====

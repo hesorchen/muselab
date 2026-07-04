@@ -216,15 +216,15 @@ ThinkingConfigEnabled(type="enabled", budget_tokens=10000, display="summarized")
 
 `budget_tokens` 默认为 10 000，可通过 `MUSELAB_THINKING_BUDGET` 调整。`display="summarized"` 对 Opus 4.7 及以后版本**是必填项**：不设置时这些模型默认 `display="omitted"`（仅签名，无明文），导致前端 thinking block 为空。
 
-### 按提供商的思考支持
+### 按提供商的思考与 effort 支持
 
 `supports_thinking` 解析为 `(provider is None or provider.supports_thinking) and thinking_pref`（[`chat.py:L1049`](../backend/chat.py#L1049)）：
 
 - `provider is None` 表示 Claude/Anthropic —— 始终启用。
-- 第三方提供商：取决于 [`backend/endpoints.py`](../backend/endpoints.py) 中 `Provider.supports_thinking` 字段。百度千帆设为 `False`；其他所有内置提供商默认为 `True`。
+- 第三方提供商：取决于 [`backend/endpoints.py`](../backend/endpoints.py) 中 `Provider.supports_thinking` 字段。百度千帆和 Codex Gateway 设为 `False`；其他内置提供商默认为 `True`。
 - 按会话关闭：`PATCH /sessions/{sid}` 带 `thinking=false` 是关闭开关，用于处理某些工具调用交错模式下出现的「thinking blocks cannot be modified」400 错误。
 
-对于第三方提供商，effort 原样传入 `ClaudeAgentOptions`。若 vendor 的 Anthropic 兼容层不支持 effort 参数，vendor 侧会静默忽略。
+effort 下拉单独由 `/api/chat/providers` 中的 `supports_effort` 控制。Claude 模型始终显示；第三方提供商默认 `False`，Codex Gateway 显式打开，因此前端会为 `codex:*` 显示 `low` / `medium` / `high` / `max`，但仍把 `xhigh` 限定在 Opus。发送时，muselab 将所选值作为 `ClaudeAgentOptions.effort` 传入；Codex sidecar 负责把这个 Anthropic 兼容请求字段映射到 Codex/OpenAI 后端的 reasoning-effort 参数。
 
 ---
 

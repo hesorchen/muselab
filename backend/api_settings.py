@@ -260,6 +260,7 @@ def get_settings() -> dict:
             "prefix": m["prefix"],
             "models": m["models"],
             "supports_thinking": m.get("supports_thinking", True),
+            "supports_effort": m.get("supports_effort", False),
             "is_builtin": m["is_builtin"],
             "is_overridden": m["is_overridden"],
             "editable": True,

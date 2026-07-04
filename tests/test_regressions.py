@@ -138,14 +138,14 @@ def test_context_used_fallback_when_sdk_value_missing(client, auth):
     assert body["context_used"] != 42_500   # explicitly NOT the cumulative sum
 
 
-def test_codex_gateway_ctx_limit_fallback_is_400k(client, auth):
-    """Codex Gateway models are third-party from the SDK's perspective, so the
-    context meter must use muselab's GPT-5/Codex table instead of the 128K
-    generic fallback."""
+def test_codex_gateway_ctx_limit_fallback_is_safe_200k(client, auth):
+    """Codex Gateway model cards may advertise 400K, but local sidecars and
+    account tiers can fail earlier, so the meter uses the conservative 200K
+    fallback until the gateway reports a smaller runtime window."""
     r = client.get("/api/chat/usage/no-such-codex-sid?model=codex:gpt-5.5",
                    headers=auth)
     assert r.status_code == 200
-    assert r.json()["context_limit"] == 400_000
+    assert r.json()["context_limit"] == 200_000
 
 
 # ============================================================================

@@ -34,6 +34,11 @@ class Provider:
     # or where thinking budget pushes max_tokens past the vendor's output limit
     # (e.g. Qianfan 12288 cap). Defaults to True at the call site.
     supports_thinking: bool = True
+    # Whether muselab should expose the per-session reasoning-effort selector
+    # for this provider. Most third-party Anthropic-compatible endpoints either
+    # ignore or reject Claude SDK's effort parameter, so default to False and
+    # opt in only for gateways that explicitly translate it (e.g. Codex Gateway).
+    supports_effort: bool = False
     # Vendor's hard cap on max output tokens, if it's lower than what the
     # claude CLI's default would send. None = let the CLI pick its default
     # (typically 32k+ on real Anthropic). For vendors that 400 the request
@@ -337,6 +342,7 @@ CATALOG: tuple[Provider, ...] = (
         env_key="CODEX_GATEWAY_API_KEY",
         display="Codex Gateway",
         supports_thinking=False,
+        supports_effort=True,
         # GPT-5 Codex-style models can emit far beyond Claude Code's default
         # 32K output cap. Without this env override the CLI aborts long turns
         # before the gateway/model has a chance to finish.
@@ -373,10 +379,10 @@ CATALOG: tuple[Provider, ...] = (
 # ===========================================================================
 OVERRIDES_PATH = Path(__file__).resolve().parent.parent / "provider_overrides.json"
 
-# Fields a stored override / custom provider may carry. supports_thinking and
-# max_output_tokens are intentionally NOT user-editable in the UI (vendor
-# quirks that break the request if wrong); built-ins keep their baked values,
-# user-created providers take the safe defaults below.
+# Fields a stored override / custom provider may carry. supports_thinking,
+# supports_effort, and max_output_tokens are intentionally NOT user-editable in
+# the UI (vendor quirks that break the request if wrong); built-ins keep their
+# baked values, user-created providers take the safe defaults below.
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,99}$")
 _PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\-]{0,39}$")
 
@@ -507,6 +513,27 @@ def _save_overrides(store: dict) -> None:
     )
 
 
+def _looks_like_codex_provider(display: str, prefix: str, env_key: str, base_url: str) -> bool:
+    """Legacy custom Codex sidecar compatibility.
+
+    Older installs could have a user-created "Codex (ChatGPT subscription)"
+    provider (`gpt-*` models on the same local sidecar) before Codex Gateway
+    became a built-in. Custom providers don't carry capability bits in
+    provider_overrides.json, so infer the known Codex sidecar shape here.
+    """
+    low_display = (display or "").lower()
+    low_url = (base_url or "").lower()
+    return (
+        "codex" in low_display
+        and (prefix or "").startswith(("gpt-", "codex:"))
+        and (
+            env_key == "MUSELAB_PROVIDER_CODEX_API_KEY"
+            or "127.0.0.1:8317" in low_url
+            or "localhost:8317" in low_url
+        )
+    )
+
+
 def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
     """Build a Provider from a stored override dict, falling back to `base`
     (the built-in) for any field the override omits. For user-created
@@ -527,14 +554,17 @@ def _provider_from_def(pid: str, d: dict, base: Provider | None) -> Provider:
         models = base.models
     else:
         models = ()
+    is_legacy_codex = base is None and _looks_like_codex_provider(
+        display, prefix, env_key, base_url)
     return Provider(
         prefix=prefix,
         base_url=base_url,
         env_key=env_key,
         display=display,
         models=models,
-        supports_thinking=base.supports_thinking if base else True,
-        max_output_tokens=base.max_output_tokens if base else None,
+        supports_thinking=base.supports_thinking if base else (False if is_legacy_codex else True),
+        supports_effort=base.supports_effort if base else is_legacy_codex,
+        max_output_tokens=base.max_output_tokens if base else (128000 if is_legacy_codex else None),
         id=pid,
     )
 
@@ -723,6 +753,7 @@ def provider_meta() -> list[dict]:
             "env_key": p.env_key,
             "models": [mid for mid, _ in p.models],
             "supports_thinking": p.supports_thinking,
+            "supports_effort": p.supports_effort,
             "is_builtin": _builtin_by_id(p.id) is not None,
             "is_overridden": p.id in overridden,
             "probe_model": p.models[0][0] if p.models else "",
@@ -1024,7 +1055,8 @@ def available_groups() -> list[dict]:
             # Anthropic's own endpoint always handles the standard thinking
             # config (it IS the standard) → supports_thinking True.
             groups.append({"group": "Claude", "items": claude_items,
-                           "supports_thinking": True})
+                           "supports_thinking": True,
+                           "supports_effort": True})
     for p in catalog():
         if not p.models:
             continue
@@ -1038,9 +1070,9 @@ def available_groups() -> list[dict]:
         groups.append({
             "group": p.display,
             "items": [{"label": label, "model": mid} for mid, label in p.models],
-            # Provider-level flag — some vendors (e.g. Qianfan) reject the
-            # standard thinking config; the FE uses this to hide the thinking
-            # toggle for models that can't honor it anyway.
+            # Provider-level flags: the FE uses these to hide controls that
+            # the selected endpoint cannot honor instead of showing no-op knobs.
             "supports_thinking": p.supports_thinking,
+            "supports_effort": p.supports_effort,
         })
     return groups
