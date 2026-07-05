@@ -7373,6 +7373,7 @@ async def _start_turn(
     img_blocks: list[dict] = []
     pdf_blocks: list[dict] = []
     text_attachments: list[tuple[str, str]] = []   # (name, content)
+    pdf_path_attachments: list[tuple[str, str]] = []   # (name, local path)
     persisted_imgs: list[dict] = []
     persisted_docs: list[dict] = []
     if image_ids:
@@ -7457,8 +7458,24 @@ async def _start_turn(
                         "data": entry["b64"],
                     },
                 })
-                persisted_docs.append({"name": entry.get("name", "doc.pdf"),
-                                        "kind": "pdf"})
+                # Keep the native Anthropic PDF document block above, but also
+                # persist a local copy and inject its path into the prompt.
+                # Some Anthropic-compatible gateways accept image blocks but
+                # silently ignore PDF document blocks; the path fallback lets
+                # Claude Code/Agent tools inspect the same PDF via Read.
+                doc_name = entry.get("name", "doc.pdf")
+                attach_dir = _attachments_base() / session_id
+                try:
+                    attach_dir.mkdir(parents=True, exist_ok=True)
+                    attach_path = attach_dir / f"{aid}.pdf"
+                    attach_path.write_bytes(base64.b64decode(entry["b64"]))
+                    pdf_path_attachments.append((doc_name, str(attach_path)))
+                except Exception as _e:
+                    sys.stderr.write(
+                        f"[attach] pdf persist failed sid={session_id} aid={aid} "
+                        f"path={attach_dir} err={type(_e).__name__}: {_e}\n")
+                    sys.stderr.flush()
+                persisted_docs.append({"name": doc_name, "kind": "pdf"})
             elif kind == "text":
                 text_attachments.append((entry.get("name", "file.txt"),
                                           entry["text"]))
@@ -7483,6 +7500,21 @@ async def _start_turn(
             parts.append(
                 f"\n\n--- Attached file: {name} ---\n{fence}\n{body}\n{fence}\n--- end {name} ---"
             )
+        prompt = "\n".join(parts).lstrip()
+
+    # PDF document blocks are not reliably supported by every
+    # Anthropic-compatible backend. Tell the agent where the same PDF lives on
+    # disk so it can call Read if the native document block is unavailable.
+    if pdf_path_attachments:
+        parts = [prompt] if prompt else []
+        lines = [
+            "\n\n--- Attached PDF files available on disk ---",
+            "If you cannot access the PDF document block directly, use the Read tool on these local paths:",
+        ]
+        for name, path in pdf_path_attachments:
+            lines.append(f"- {name}: {path}")
+        lines.append("--- end attached PDF files ---")
+        parts.append("\n".join(lines))
         prompt = "\n".join(parts).lstrip()
 
     # New architecture: CLI's JSONL is the transcript source-of-truth. We no
