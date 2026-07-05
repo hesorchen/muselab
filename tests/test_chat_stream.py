@@ -8,6 +8,7 @@ assert the SSE frames the frontend depends on (text → tool_use → tool_result
 
 No real network, no real CLI subprocess, no Anthropic API.
 """
+import base64
 import json
 from types import SimpleNamespace
 
@@ -31,7 +32,13 @@ class _FakeStreamClient:
         self.queried = []
 
     async def query(self, prompt_or_gen):
-        self.queried.append(prompt_or_gen)
+        if hasattr(prompt_or_gen, "__aiter__"):
+            items = []
+            async for item in prompt_or_gen:
+                items.append(item)
+            self.queried.append(items)
+        else:
+            self.queried.append(prompt_or_gen)
 
     async def receive_response(self):
         for m in self._messages:
@@ -175,6 +182,54 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
+
+
+def test_stream_pdf_attachment_persists_path_fallback(stream_env, client, monkeypatch):
+    """PDF attachments keep the native document block, and also expose a
+    local Read-able file path for Anthropic-compatible backends that ignore
+    document blocks."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    pdf_bytes = b"%PDF-1.4\nminimal test pdf\n%%EOF\n"
+    chat_mod._image_store["pdf1"] = {
+        "kind": "pdf",
+        "mime": "application/pdf",
+        "name": "doc.pdf",
+        "b64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "ts": 9999999999,
+    }
+
+    messages = [
+        ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=90,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+    ]
+    fake = _FakeStreamClient(messages)
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=please read it&image_ids=pdf1&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+
+    attach_path = chat_mod._attachments_base() / sid / "pdf1.pdf"
+    assert attach_path.read_bytes() == pdf_bytes
+
+    assert fake.queried, "stream handler never called client.query"
+    sent = fake.queried[0][0]
+    content = sent["message"]["content"]
+    assert content[0]["type"] == "document"
+    assert content[0]["source"]["media_type"] == "application/pdf"
+    text = content[1]["text"]
+    assert "please read it" in text
+    assert "Attached PDF files available on disk" in text
+    assert "doc.pdf" in text
+    assert str(attach_path) in text
 
 
 def test_stream_background_task_messages_flow_through(stream_env, client, monkeypatch):
