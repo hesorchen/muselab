@@ -27,11 +27,11 @@ The model catalog includes a disabled-by-default provider preset:
 | Env key | `CODEX_GATEWAY_API_KEY` |
 | Base URL override | `CODEX_GATEWAY_BASE_URL` |
 | Internal prefix | `codex:` |
-| Models | `codex:gpt-5.5`, `codex:gpt-5.4`, `codex:gpt-5.4-mini`, `codex:gpt-5.3-codex-spark` |
+| Models | `codex:gpt-5.6-sol`, `codex:gpt-5.6-terra`, `codex:gpt-5.6-luna`, `codex:gpt-5.5`, `codex:gpt-5.4`, `codex:gpt-5.4-mini`, `codex:gpt-5.3-codex-spark` |
 
 The `codex:` prefix is muselab-internal. Before sending the model id to the
-gateway, muselab strips the prefix, so `codex:gpt-5.5` becomes `gpt-5.5` on
-the gateway side. Codex Gateway also opts into muselab's per-session reasoning
+gateway, muselab strips the prefix, so `codex:gpt-5.6-sol` becomes
+`gpt-5.6-sol` on the gateway side. Codex Gateway also opts into muselab's per-session reasoning
 `effort` selector; muselab passes the selected value through the Claude Agent
 SDK, and the sidecar is expected to translate it to the backend's reasoning
 parameter.
@@ -84,8 +84,8 @@ sidecar:
 browser
   → muselab backend
   → Claude Agent SDK
-  → Anthropic Messages API request (model: codex:gpt-5.5)
-  → muselab strips the codex: prefix (model: gpt-5.5)
+  → Anthropic Messages API request (model: codex:gpt-5.6-sol)
+  → muselab strips the codex: prefix (model: gpt-5.6-sol)
   → http://127.0.0.1:8317/v1/messages
   → CLIProxyAPI
   → user-authenticated Codex backend
@@ -155,12 +155,14 @@ advertised as full muselab agent support.
 
 ## Context window notes
 
-muselab keeps 400K as the documentation-level fallback for built-in Codex
-Gateway models, but runtime context accounting does not treat that number as the
-only source of truth. The effective window is resolved in this order:
+muselab keeps 372K for the built-in GPT-5.6 aliases and 400K for earlier GPT-5.x
+models as documentation-level fallbacks for Codex Gateway models, but runtime
+context accounting does not treat those numbers as the only source of truth.
+The effective window is resolved in this order:
 
-1. explicit env overrides: `MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5`,
-   `CODEX_GATEWAY_CONTEXT_LIMIT`, or `MUSELAB_THIRD_PARTY_CONTEXT_LIMIT`;
+1. explicit env overrides: `MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_6_SOL`,
+   `MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5`, `CODEX_GATEWAY_CONTEXT_LIMIT`, or
+   `MUSELAB_THIRD_PARTY_CONTEXT_LIMIT`;
 2. capability fields exposed by the gateway's `/v1/models` response, such as
    `max_input_tokens` or `context_window`;
 3. Claude Agent SDK `get_context_usage()` values (`maxTokens` / `rawMaxTokens`);

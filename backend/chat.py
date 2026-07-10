@@ -764,10 +764,13 @@ MODEL_CONTEXT_LIMITS = {
     # Codex Gateway — local sidecars can expose Codex/GPT aliases with large
     # context windows. Gateway implementations may still fail earlier if their
     # translation layer or account tier has a smaller effective window.
-    # Codex Gateway docs/model cards may advertise 400K, but the local sidecar,
-    # account tier, or Anthropic→Codex translation layer can enforce a smaller
-    # effective window. Treat these as last-resort catalog fallbacks only; runtime
-    # code below prefers explicit env overrides and SDK/gateway observations.
+    # Codex Gateway docs/model metadata may advertise roughly 400K, but the local
+    # sidecar, account tier, or Anthropic→Codex translation layer can enforce a
+    # smaller effective window. Treat these as last-resort catalog fallbacks only;
+    # runtime code below prefers explicit env overrides and SDK/gateway observations.
+    "codex:gpt-5.6-sol":              372_000,
+    "codex:gpt-5.6-terra":            372_000,
+    "codex:gpt-5.6-luna":             372_000,
     "codex:gpt-5.5":                400_000,
     "codex:gpt-5.4":                400_000,
     "codex:gpt-5.4-mini":           400_000,

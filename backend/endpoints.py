@@ -348,6 +348,9 @@ CATALOG: tuple[Provider, ...] = (
         # before the gateway/model has a chance to finish.
         max_output_tokens=128000,
         models=(
+            ("codex:gpt-5.6-sol",           "GPT-5.6 Sol"),
+            ("codex:gpt-5.6-terra",         "GPT-5.6 Terra"),
+            ("codex:gpt-5.6-luna",          "GPT-5.6 Luna"),
             ("codex:gpt-5.5",               "GPT-5.5"),
             ("codex:gpt-5.4",               "GPT-5.4"),
             ("codex:gpt-5.4-mini",          "GPT-5.4 Mini"),

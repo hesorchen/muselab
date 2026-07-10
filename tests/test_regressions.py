@@ -148,6 +148,16 @@ def test_codex_gateway_ctx_limit_fallback_is_safe_200k(client, auth):
     assert r.json()["context_limit"] == 200_000
 
 
+def test_codex_56_catalog_fallback_matches_runtime_model_metadata(app_module):
+    """The local Codex catalog exposes a 372K usable window for GPT-5.6;
+    do not regress to an unsupported 1.05M assumption."""
+    from backend import chat as chat_mod
+
+    assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.6-sol"] == 372_000
+    assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.6-terra"] == 372_000
+    assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.6-luna"] == 372_000
+
+
 # ============================================================================
 # Bug 3b (2026-06-06): context ring read ~5x too low. The Claude entries in
 # MODEL_CONTEXT_LIMITS claimed a 1M window, but the bundled CLI's

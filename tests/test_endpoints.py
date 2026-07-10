@@ -155,6 +155,11 @@ def test_codex_gateway_strips_internal_prefix_and_honors_base_url(monkeypatch):
     assert p is not None
     assert p.supports_effort is True
     assert p.supports_thinking is False
+    assert [model for model, _label in p.models[:3]] == [
+        "codex:gpt-5.6-sol",
+        "codex:gpt-5.6-terra",
+        "codex:gpt-5.6-luna",
+    ]
     env = ep.env_override("codex:gpt-5.5")
     assert env is not None
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9876"
