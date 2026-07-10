@@ -250,7 +250,17 @@ def test_queue_endpoint_clear(client, auth):
                       headers=auth).json()["items"] == []
 
 
-def test_queue_endpoint_pause_toggle(client, auth):
+def test_queue_endpoint_pause_toggle(client, auth, monkeypatch):
+    from backend import chat
+
+    drains = []
+
+    async def fake_drain(sid):
+        drains.append(sid)
+
+    # Resuming deliberately invokes the headless drain. Keep this endpoint
+    # test hermetic: spawning a real Claude SDK subprocess is out of scope.
+    monkeypatch.setattr(chat, "_maybe_drain_queue", fake_drain)
     sid = _mint_session(client, auth)
     client.post(f"/api/chat/sessions/{sid}/queue", headers=auth,
                 json={"text": "m"})
@@ -267,6 +277,7 @@ def test_queue_endpoint_pause_toggle(client, auth):
                     json={"paused": False})
     assert r.status_code == 200
     assert r.json()["paused"] is False
+    assert drains == [sid]
 
 
 def test_queue_endpoint_requires_auth(client):
