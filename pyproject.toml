@@ -89,7 +89,7 @@ dev = [
     # Pinned alongside dev deps so `scripts/lint.sh` and CI both have a
     # deterministic ruff version. Without this each dev / CI run pulled
     # latest via `uv run --with ruff`, occasionally causing rule churn.
-    "ruff>=0.15.20",
+    "ruff>=0.15.21",
 ]
 
 # Ruff config — keep targeted, not aggressive. Goal: catch real bugs
