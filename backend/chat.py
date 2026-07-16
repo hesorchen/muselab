@@ -7431,6 +7431,14 @@ async def _start_turn(
                 _active_turns.pop(session_id, None)
         raise _TurnStartError(err_msg)
 
+    # Record only after the SDK client is ready, so connection failures do not
+    # leave a phantom running task in the global activity center.
+    try:
+        from .activity import activity as _activity
+        await asyncio.to_thread(_activity.start, session_id, summary=prompt)
+    except Exception as e:
+        sys.stderr.write(f"[activity] start failed sid={session_id}: {e}\n")
+
     # Cross-turn background-task handoff: if a prior turn on this session left
     # a watcher draining the (now shared) client stream, cancel it before we
     # read so we don't double-read. Buffered TaskNotifications it hadn't drained
@@ -8486,6 +8494,17 @@ async def _start_turn(
             while True:
                 kind, payload = await merge_q.get()
                 if kind == "side":
+                    if isinstance(payload, dict) and payload.get("event") in {
+                        "ask_user_question", "permission_request"
+                    }:
+                        try:
+                            from .activity import activity as _activity
+                            await asyncio.to_thread(
+                                _activity.set_state, session_id,
+                                "waiting_approval", detail="Waiting for user input")
+                        except Exception as e:
+                            sys.stderr.write(
+                                f"[activity] waiting state failed sid={session_id}: {e}\n")
                     # Already shaped as {"event": "...", "data": "..."} — pass through.
                     yield payload
                     continue
@@ -8633,6 +8652,14 @@ async def _start_turn(
             sys.stderr.flush()
             broadcast.publish(_error_event(f"{type(e).__name__}: {e}"))
         finally:
+            try:
+                from .activity import activity as _activity
+                _activity_status = ("cancelled" if broadcast.cancelled else
+                                    "failed" if turn_errored else "completed")
+                await asyncio.to_thread(
+                    _activity.finish, session_id, _activity_status)
+            except Exception as e:
+                sys.stderr.write(f"[activity] finish failed sid={session_id}: {e}\n")
             broadcast.finish()
             _active_turns.pop(session_id, None)
             # Grace-keep: a fast (esp. server-drained) turn can finish + get

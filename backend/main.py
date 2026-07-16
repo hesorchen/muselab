@@ -18,6 +18,7 @@ from .api_settings import router as settings_router
 from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
 from .workspaces import router as workspaces_router
+from .activity_api import router as activity_router
 from .settings import ROOT, PORT, HOST
 
 
@@ -342,6 +343,7 @@ app.include_router(settings_router)
 app.include_router(scheduler_router)
 app.include_router(push_router)
 app.include_router(workspaces_router)
+app.include_router(activity_router)
 
 
 @functools.lru_cache(maxsize=1)

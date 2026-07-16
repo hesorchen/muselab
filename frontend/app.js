@@ -405,6 +405,12 @@ function portal() {
         session_mode: "fresh",
       },
     },
+    activity: {
+      show: false, loading: false, events: [],
+      summary: { running: 0, unread: 0, attention: 0, workspaces: [] },
+    },
+    _activityEtags: {},
+    _activityFetchPromises: {},
     // Per-task "run-now" inflight flag — disables retry / send buttons
     // until the LLM call returns and history is reloaded. Keyed by task id.
     schedRunning: {},
@@ -458,6 +464,9 @@ function portal() {
     },
     workspaceLastSession: {},
     workspaceSurfaces: {},
+    _workspaceRuntimeCaches: new Map(),
+    _workspaceTreeCacheTimers: new Map(),
+    _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
     _sessionLoadPromises: {},
     _sessionsInitialized: false,
@@ -1715,6 +1724,7 @@ function portal() {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
+      this.fetchActivity();
     },
 
     // FIX ⑪: near-real-time multi-device sync for the session LIST while the
@@ -1747,6 +1757,7 @@ function portal() {
           }
         } catch (_) { /* best-effort; next tick retries */ }
         await this._recoverStalledStream(this.currentId);
+        await this.fetchActivity({ summaryOnly: !this.activity.show });
       }, 10_000);
     },
 
@@ -6138,6 +6149,7 @@ function portal() {
           Number(st._reconcileTargetUpdated) || 0,
           newU,
         );
+        const acceptedTarget = Number(st._reconcileTargetUpdated) || newU;
 
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
@@ -6180,6 +6192,10 @@ function portal() {
             }
             succeeded = true;
             st._loaded = true;
+            st._seenUpdated = Math.max(
+              Number(st._seenUpdated) || 0,
+              acceptedTarget,
+            );
             if (attach) await this._checkActiveTurn(sid);
           } catch (_) {
             st._pendingExternalUpdate = true;
@@ -6293,12 +6309,27 @@ function portal() {
       return entry ? entry.name
         : (value.split("/").filter(Boolean).pop() || (this.lang === "zh" ? "工作目录" : "Workspace"));
     },
+
+    workspaceActivity(path = "") {
+      const target = path || this.currentWorkspacePath();
+      return (this.activity.summary.workspaces || []).find(w => w.path === target)
+        || { running: 0, unread: 0, attention: 0 };
+    },
     async fetchSessionWorkspaces() {
+      const cacheKey = "muselab_workspace_registry_v1";
+      try {
+        const cached = JSON.parse(sessionStorage.getItem(cacheKey) || "null");
+        if (cached && Array.isArray(cached.workspaces)
+            && Date.now() - Number(cached.savedAt || 0) < 10 * 60_000) {
+          this.sessionWorkspaces = cached.workspaces;
+        }
+      } catch (_) {}
       try {
         const response = await fetch("/api/chat/workspaces", { headers: this.hdr() });
         if (!response.ok) return false;
         const payload = await response.json();
         this.sessionWorkspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
+        try { sessionStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), workspaces: this.sessionWorkspaces })); } catch (_) {}
         const valid = new Set(this.sessionWorkspaces.map(w => w.path));
         const session = this.sessions.find(s => s.id === this.currentId);
         const fallback = (session && valid.has(session.cwd) && session.cwd)
@@ -6388,6 +6419,18 @@ function portal() {
           openFilesHeight: this.openFilesHeight,
         },
       };
+      this._workspaceRuntimeCaches.delete(cwd);
+      this._workspaceRuntimeCaches.set(cwd, {
+        visible: (this.visible || []).map(node => ({ ...node })),
+        childCache: Object.fromEntries(Object.entries(this.childCache || {}).map(
+          ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows])),
+        previewCache: this._previewCache ? Array.from(this._previewCache.entries()) : [],
+        previewCacheBytes: Number(this._previewCacheBytes) || 0,
+        trash: { ...this.trash, items: (this.trash.items || []).map(item => ({ ...item })) },
+      });
+      while (this._workspaceRuntimeCaches.size > 12) {
+        this._workspaceRuntimeCaches.delete(this._workspaceRuntimeCaches.keys().next().value);
+      }
     },
     async _changeWorkspaceSurface(path) {
       if (!path || path === this.activeWorkspace) return true;
@@ -6415,21 +6458,27 @@ function portal() {
       this.palette.fileLoading = false;
 
       const surface = this.workspaceSurfaces[path] || {};
+      const runtime = this._workspaceRuntimeCaches.get(path) || null;
+      if (runtime) {
+        this._workspaceRuntimeCaches.delete(path);
+        this._workspaceRuntimeCaches.set(path, runtime);
+      }
       const keepMobileTab = this.mobileTab;
       this.activeWorkspace = path;
       this.clearSearch();
-      this.visible = [];
-      this.childCache = {};
+      this.visible = runtime ? runtime.visible.map(node => ({ ...node })) : [];
+      this.childCache = runtime ? Object.fromEntries(Object.entries(runtime.childCache || {}).map(
+        ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows])) : {};
       this.treeError = "";
       this.treeFocusPath = "";
       this.selectedPaths = new Set();
       this._selAnchor = "";
       this.fileClipboard = { path: "", name: "" };
-      this.trash.items = [];
-      this.trash.count = 0;
-      this.trash.loading = false;
-      if (this._previewCache) this._previewCache.clear();
-      this._previewCacheBytes = 0;
+      this.trash = runtime && runtime.trash
+        ? { ...runtime.trash, items: (runtime.trash.items || []).map(item => ({ ...item })), loading: false }
+        : { ...this.trash, items: [], count: 0, loading: false };
+      this._previewCache = new Map(runtime ? runtime.previewCache || [] : []);
+      this._previewCacheBytes = runtime ? Number(runtime.previewCacheBytes) || 0 : 0;
       this._clearPreviewState();
       this.tabs = this._workspacePreviewTabs(surface);
       this.showHidden = typeof surface.showHidden === "boolean"
@@ -6442,7 +6491,8 @@ function portal() {
 
       const selected = typeof surface.previewSelected === "string"
         ? surface.previewSelected : "";
-      await Promise.all([this.loadRoot(), this.loadTrash(), this.fetchContextInfo()]);
+      const refresh = Promise.allSettled([this.loadRoot(), this.loadTrash(), this.fetchContextInfo()]);
+      if (!runtime) await refresh;
       if (selected && this.tabs.some(t => t.path === selected)) {
         const tab = this.tabs.find(t => t.path === selected);
         await this.openFile(
@@ -18278,6 +18328,104 @@ function portal() {
       // Tiny svg id mapping; falls back to a dot if unknown.
       return ({ act: "#i-settings", session: "#i-file-text",
                  file: "#i-file", message: "#i-search" })[type] || "#i-circle";
+    },
+
+    // ===== global cross-workspace activity center =====
+    async fetchActivity(opts = {}) {
+      const key = opts.summaryOnly ? "summary" : "events";
+      if (this._activityFetchPromises[key]) return this._activityFetchPromises[key];
+      const promise = (async () => {
+        try {
+          const path = opts.summaryOnly ? "/api/activity/summary" : "/api/activity?limit=150";
+          const headers = { ...this.hdr() };
+          if (this._activityEtags[key]) headers["If-None-Match"] = this._activityEtags[key];
+          const r = await fetch(path, { headers });
+          if (r.status === 304 || !r.ok) return false;
+          const etag = r.headers.get("etag");
+          if (etag) this._activityEtags[key] = etag;
+          const data = await r.json();
+          const summary = opts.summaryOnly ? data : data.summary;
+          if (summary) this.activity.summary = summary;
+          if (!opts.summaryOnly && Array.isArray(data.events)) this.activity.events = data.events;
+          this._syncAppBadge();
+          return true;
+        } catch (_) { return false; }
+      })();
+      this._activityFetchPromises[key] = promise;
+      try { return await promise; }
+      finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
+    },
+    async openActivityCenter() {
+      this.activity.show = true;
+      this.activity.loading = true;
+      await this.fetchActivity();
+      this.activity.loading = false;
+    },
+    activityGroups() {
+      const zh = this.lang === "zh";
+      return [
+        { key: "attention", label: zh ? "需要处理" : "Needs attention", states: ["waiting_approval", "paused", "failed"] },
+        { key: "unread", label: zh ? "待查看结果" : "Results to review", states: ["completed"], unreadOnly: true },
+        { key: "running", label: zh ? "进行中" : "Running", states: ["running"] },
+        { key: "recent", label: zh ? "最近完成" : "Recent", states: ["completed", "cancelled"], readOnly: true },
+      ];
+    },
+    activityEvents(group) {
+      const states = new Set(group.states || []);
+      return (this.activity.events || []).filter(item => {
+        const unread = !!item.needs_attention && !item.read;
+        return states.has(item.state) && (!group.unreadOnly || unread) && (!group.readOnly || !unread);
+      });
+    },
+    activityStateLabel(state) {
+      const zh = this.lang === "zh";
+      return ({ running: zh ? "进行中" : "Running", waiting_approval: zh ? "等待处理" : "Waiting",
+        paused: zh ? "已暂停" : "Paused", completed: zh ? "已完成" : "Completed",
+        failed: zh ? "失败" : "Failed", cancelled: zh ? "已取消" : "Cancelled" })[state] || state;
+    },
+    activityTime(item) {
+      const ts = Number(item.finished_at || item.started_at || 0) * 1000;
+      return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
+        { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    },
+    async openActivityEvent(item) {
+      if (!item) return;
+      if (item.needs_attention && !item.read) {
+        try {
+          const r = await fetch(`/api/activity/${encodeURIComponent(item.id)}/ack`,
+            { method: "POST", headers: this.hdr() });
+          if (r.ok) { const d = await r.json(); item.read = true; this.activity.summary = d.summary; }
+        } catch (_) {}
+      }
+      this.activity.show = false;
+      const sid = item.session_id || item.thread_id;
+      if (sid) await this._openSessionFromDeeplink(sid);
+      this._syncAppBadge();
+    },
+    async ackAllActivity() {
+      try {
+        const r = await fetch("/api/activity/ack-all", { method: "POST", headers: this.hdr() });
+        if (!r.ok) return;
+        const d = await r.json();
+        for (const item of this.activity.events) item.read = true;
+        this.activity.summary = d.summary;
+        this._syncAppBadge();
+      } catch (_) {}
+    },
+    async ackActivitySession(sid) {
+      if (!sid) return;
+      try {
+        const r = await fetch(`/api/activity/session/${encodeURIComponent(sid)}/ack`,
+          { method: "POST", headers: this.hdr() });
+        if (r.ok) { const d = await r.json(); this.activity.summary = d.summary; this._syncAppBadge(); }
+      } catch (_) {}
+    },
+    _syncAppBadge() {
+      const count = Number(this.activity?.summary?.unread) || 0;
+      try {
+        if (count > 0 && navigator.setAppBadge) navigator.setAppBadge(count);
+        else if (navigator.clearAppBadge) navigator.clearAppBadge();
+      } catch (_) {}
     },
 
     // ===== scheduler drawer =====

@@ -1066,6 +1066,40 @@
           </span>
           <span x-text="t('pane.chat')"></span>
         </span>
+        <div class="workspace-picker chat-head-workspace" @click.outside="workspaceMenuOpen = false">
+          <button class="workspace-picker-btn" type="button"
+                  @click="workspaceMenuOpen = !workspaceMenuOpen"
+                  :disabled="workspaceSwitching" :title="currentWorkspacePath()"
+                  :aria-expanded="workspaceMenuOpen">
+            <svg><use href="#i-folder"/></svg>
+            <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
+            <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
+          </button>
+          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak>
+            <div class="workspace-picker-title" x-text="lang==='zh' ? '工作目录' : 'Workspaces'"></div>
+            <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
+              <div class="workspace-picker-row" :class="{ active: workspace.path === currentWorkspacePath() }">
+                <button class="workspace-picker-select" @click="switchWorkspace(workspace.path)">
+                  <span class="workspace-picker-check" x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
+                  <span class="workspace-picker-meta"><strong x-text="workspace.name"></strong><small x-text="workspace.path"></small></span>
+                  <span class="workspace-activity-mini" x-show="workspaceActivity(workspace.path).running || workspaceActivity(workspace.path).unread">
+                    <span class="running" x-show="workspaceActivity(workspace.path).running" x-text="'◌ ' + workspaceActivity(workspace.path).running"></span>
+                    <span class="unread" x-show="workspaceActivity(workspace.path).unread" x-text="'✓ ' + workspaceActivity(workspace.path).unread"></span>
+                  </span>
+                </button>
+                <button class="workspace-picker-remove" x-show="!workspace.primary" @click.stop="removeWorkspace(workspace.path)"><svg><use href="#i-x"/></svg></button>
+              </div>
+            </template>
+            <button class="workspace-picker-add" @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span></button>
+          </div>
+        </div>
+        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
+                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
+                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
+          <svg><use href="#i-list"/></svg>
+          <span class="activity-running" x-show="activity.summary.running" x-text="activity.summary.running"></span>
+          <span class="activity-unread" x-show="activity.summary.unread" x-text="activity.summary.unread > 99 ? '99+' : activity.summary.unread"></span>
+        </button>
         <span class="spacer"></span>
         <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
              by default, so the "present" state is implicit). When missing,
@@ -1380,47 +1414,6 @@
                 <span x-text="lang==='zh' ? '清理 7 天前的会话' : 'Clear sessions older than 7 days'"></span>
               </button>
             </div>
-          </div>
-        </div>
-        <div class="workspace-picker" @click.outside="workspaceMenuOpen = false">
-          <button class="workspace-picker-btn" type="button"
-                  @click="workspaceMenuOpen = !workspaceMenuOpen"
-                  :disabled="workspaceSwitching"
-                  :title="currentWorkspacePath()"
-                  :aria-expanded="workspaceMenuOpen"
-                  :aria-label="lang==='zh' ? '切换工作目录' : 'Switch workspace'">
-            <svg><use href="#i-folder"/></svg>
-            <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
-            <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
-          </button>
-          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak
-               x-transition.opacity.duration.120ms>
-            <div class="workspace-picker-title"
-                 x-text="lang==='zh' ? '工作目录' : 'Workspaces'"></div>
-            <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
-              <div class="workspace-picker-row"
-                   :class="{ active: workspace.path === currentWorkspacePath() }"
-                   :title="workspace.path">
-                <button class="workspace-picker-select"
-                        @click="switchWorkspace(workspace.path)">
-                  <span class="workspace-picker-check"
-                        x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
-                  <span class="workspace-picker-meta">
-                    <strong x-text="workspace.name"></strong>
-                    <small x-text="workspace.path"></small>
-                  </span>
-                </button>
-                <button class="workspace-picker-remove" x-show="!workspace.primary"
-                        @click.stop="removeWorkspace(workspace.path)"
-                        :title="lang==='zh' ? '移除目录' : 'Remove workspace'">
-                  <svg><use href="#i-x"/></svg>
-                </button>
-              </div>
-            </template>
-            <button class="workspace-picker-add" @click="addWorkspace()">
-              <svg><use href="#i-folder-plus"/></svg>
-              <span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span>
-            </button>
           </div>
         </div>
         <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
@@ -4655,6 +4648,39 @@
         <button @click="emptyTrash()" class="btn-danger"
                 :disabled="!trash.items.length"
                 x-text="lang==='zh' ? '清空垃圾桶' : 'Empty trash'"></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" x-show="activity.show" @click.self="activity.show=false" x-cloak>
+    <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="activity.show=false">
+      <div class="modal-head">
+        <span class="modal-title"><svg class="modal-title-icon"><use href="#i-list"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
+        <button class="modal-close" @click="activity.show=false" aria-label="Close">×</button>
+      </div>
+      <div class="activity-summary">
+        <span class="running" x-text="(lang==='zh'?'进行中 ':'Running ') + activity.summary.running"></span>
+        <span class="unread" x-text="(lang==='zh'?'待查看 ':'Unread ') + activity.summary.unread"></span>
+        <button class="btn-ghost sm" x-show="activity.summary.unread" @click="ackAllActivity()" x-text="lang==='zh' ? '全部标为已读' : 'Mark all read'"></button>
+      </div>
+      <div class="modal-body activity-body">
+        <div class="hint-row" x-show="activity.loading" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+        <template x-for="group in activityGroups()" :key="group.key">
+          <section class="activity-group" x-show="activityEvents(group).length">
+            <h3 x-text="group.label"></h3>
+            <template x-for="item in activityEvents(group)" :key="item.id">
+              <button class="activity-row" @click="openActivityEvent(item)" :class="[item.state, {'is-unread': item.needs_attention && !item.read}]">
+                <span class="activity-state-dot"></span>
+                <span class="activity-row-main">
+                  <strong x-text="item.task_summary || item.session_name"></strong>
+                  <small><span x-text="item.workspace_name"></span><span x-show="item.session_name"> · <span x-text="item.session_name"></span></span><span x-show="item.status_detail"> · <span x-text="item.status_detail"></span></span></small>
+                </span>
+                <span class="activity-row-side"><span x-text="activityStateLabel(item.state)"></span><small x-text="activityTime(item)"></small></span>
+              </button>
+            </template>
+          </section>
+        </template>
+        <div class="hint-row" x-show="!activity.loading && !activity.events.length" x-text="lang==='zh' ? '暂无任务记录' : 'No activity yet'"></div>
       </div>
     </div>
   </div>
