@@ -34,6 +34,12 @@ muselab is single-user. One token guards the whole web UI and every API call.
 > `MUSELAB_ROOT` may not be a bare system path (`/`, `/etc`, `/home`, `/var`, …);
 > the backend rejects those to avoid handing the agent your whole disk.
 
+`MUSELAB_ROOT` is the default workspace. The workspace picker can register
+additional existing directories after token authentication. File APIs, preview
+tabs, visible sessions, and new-session `cwd` then follow the selected
+registered root together. Register only directories the service user should be
+able to expose; the registry is stored in `$MUSELAB_ROOT/.muselab/workspaces.json`.
+
 ## Provider keys
 
 Configure at least one. Anthropic works through `claude login` (Pro/Max OAuth) —

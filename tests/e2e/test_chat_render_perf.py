@@ -773,6 +773,79 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     _assert_no_browser_errors(page, errors)
 
 
+def test_mobile_keyboard_close_without_viewport_event_restores_full_layout(
+    page: Page, backend_url, auth_token,
+):
+    """A dropped iOS visualViewport close event must not leave a bottom band."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    _app_eval(page, "app.mobileTab = 'chat'; return true;")
+
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const input = document.querySelector('.chat-input-textarea');
+          input.disabled = false;
+          input.focus();
+          const vv = window.visualViewport;
+          window.__testVvHeight = innerHeight - 140;
+          window.__composerScrollIntoViewCalls = 0;
+          input.scrollIntoView = () => { window.__composerScrollIntoViewCalls += 1; };
+          Object.defineProperty(vv, 'height', {
+            configurable: true,
+            get: () => window.__testVvHeight,
+          });
+          window.__nativeScrollTo = window.scrollTo;
+          window.__rootResetCalls = 0;
+          window.scrollTo = (...args) => {
+            window.__rootResetCalls += 1;
+            return window.__nativeScrollTo.apply(window, args);
+          };
+          app._syncMobileKeyboardViewport();
+        }"""
+    )
+    page.wait_for_function(
+        """() => {
+          const layout = document.querySelector('.layout').getBoundingClientRect();
+          return document.activeElement === document.querySelector('.chat-input-textarea')
+            && document.body.classList.contains('kb-open')
+            && layout.bottom <= innerHeight - 130;
+        }""",
+        timeout=2000,
+    )
+
+    # Geometry becomes current, but Safari drops resize/scroll notification.
+    page.evaluate("() => { window.__testVvHeight = innerHeight; }")
+    page.wait_for_function(
+        """() => {
+          const layout = document.querySelector('.layout').getBoundingClientRect();
+          const tab = document.querySelector('.mobile-tab-bar');
+          const tabRect = tab.getBoundingClientRect();
+          return document.activeElement === document.querySelector('.chat-input-textarea')
+            && !document.body.classList.contains('kb-open')
+            && getComputedStyle(document.documentElement)
+                 .getPropertyValue('--kb-inset').trim() === '0px'
+            && Math.abs(layout.top) < 2
+            && Math.abs(layout.bottom - innerHeight) < 2
+            && getComputedStyle(tab).display === 'flex'
+            && Math.abs(tabRect.bottom - innerHeight) < 2
+            && window.__rootResetCalls > 0;
+        }""",
+        timeout=3000,
+    )
+    assert page.evaluate("() => window.__composerScrollIntoViewCalls") == 0
+    page.evaluate(
+        """() => {
+          delete window.visualViewport.height;
+          window.scrollTo = window.__nativeScrollTo;
+          delete window.__nativeScrollTo;
+          delete window.__testVvHeight;
+        }"""
+    )
+    _assert_no_browser_errors(page, errors)
+
+
 def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend_url, auth_token):
     """Drive the real send()/SSE handlers with a long mixed event stream."""
     errors = _capture_browser_errors(page)

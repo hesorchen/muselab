@@ -39,6 +39,7 @@
 | **Switchable foundation models** | One-click switching across 9 provider families: Claude (OAuth) / GPT via local Codex Gateway / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE |
 | **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
 | **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
+| **Multiple workspaces and sessions** | File trees, preview tabs, and sessions switch together by working directory, each retaining its own browsing state |
 | **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
 
 ## Quick start
@@ -94,6 +95,9 @@ Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How
 ## Practical details
 
 - **Modern file tree** — Modern file operations: drag-and-drop upload, fuzzy search, rename, and trash
+- **Continuous previews** — Markdown, text, spreadsheets, and HTML restore their reading position; the four most recent HTML reports keep their live page state
+- **Workspace isolation** — Register multiple local directories and switch files, previews, session tabs, and new-session cwd as one surface
+- **Self-healing sessions** — After mobile suspension or a silent SSE drop, muselab probes, reconnects, and pulls the final message automatically
 - **Multiple modes and themes** — Light / dark / eye-care themes, with your own accent color
 - **Bilingual UI** — Switch between English and Chinese in one click, without refreshing the page
 - **Message queue** — Keep sending messages while Muse thinks; the queue runs them in order so no idea is lost

@@ -38,13 +38,14 @@ flowchart TB
 
 - **Client cache keyed by `(session_id, model, effort)`** ([`backend/chat.py:L303`](../backend/chat.py#L303)). Switching model or reasoning effort lands on its own pooled client; each assistant message stores its own `model` field so badges stay accurate after reload. Pool cap, LRU rules: [Model routing § client pool](routing.md#2-the-client-pool).
 
-- **Whole-file as the unit of input.** `MUSELAB_ROOT` is a directory you own; the root-level `CLAUDE.md` auto-loads on every conversation. The assistant reaches files via Read / Grep / Edit on demand — no pre-embedding.
+- **Whole-file as the unit of input.** `MUSELAB_ROOT` is the default workspace and additional directories may be registered explicitly. Each session stays bound to one workspace; its root-level `CLAUDE.md` auto-loads on every turn. The assistant reaches files via Read / Grep / Edit on demand — no pre-embedding.
 
 ## Directory map
 
-Two roots matter at runtime: the **repo** (code + per-install state) and the
-**archive** (`MUSELAB_ROOT`, your own files). They are deliberately separate so
-you can back up or move your data without touching the install.
+Two kinds of roots matter at runtime: the **repo** (code + per-install state)
+and one or more **workspaces** (`MUSELAB_ROOT` plus explicitly registered local
+directories). They are deliberately separate so you can back up or move your
+data without touching the install.
 
 ```
 muselab/                      # repo root
@@ -54,6 +55,7 @@ muselab/                      # repo root
 │   ├── chat.py               # /api/chat/* — SDK client pool, SSE turn loop
 │   ├── endpoints.py          # provider catalog + per-request env wiring
 │   ├── files.py              # /api/files/* — safe-resolve read/write/grep
+│   ├── workspaces.py         # registered roots + bounded server folder picker
 │   ├── sessions.py           # session index + sidecar + queue (repo/sessions/)
 │   ├── scheduler.py          # asyncio cron loop → <archive>/.muselab/scheduler.json
 │   ├── push.py               # Web Push / VAPID → <archive>/.muselab/
@@ -69,10 +71,14 @@ muselab/                      # repo root
 ├── .env                      # ← per-install config + secrets (gitignored)
 └── sessions/                 # ← session metadata, sidecars, queues (gitignored)
 
-$MUSELAB_ROOT/                # the archive — YOUR files, never inside the repo
+$MUSELAB_ROOT/                # default workspace — YOUR files, outside the repo
 ├── CLAUDE.md                 # auto-loads every conversation
 ├── health/ work/ money/ …    # whatever subdirs you create
-└── .muselab/                 # scheduler.json · vapid.json · push_subs.json
+└── .muselab/                 # scheduler.json · workspaces.json · push state
+
+<registered-workspace>/       # optional additional workspace
+├── CLAUDE.md                 # instructions for sessions bound to this cwd
+└── .muselab-dustbin/         # this workspace's recoverable file trash
 ```
 
 The actual conversation transcripts are owned by the Claude CLI, not muselab:
@@ -102,7 +108,7 @@ A chat turn is one Server-Sent Events (SSE) stream:
    wrong account.
 4. **Agent loop.** The SDK spawns the `claude` CLI subprocess, which runs the
    full loop — tool calls (Read/Grep/Edit/Bash), MCP servers, skills, plan mode
-   — against your archive as the working directory.
+   — against the session's registered workspace as the working directory.
 5. **Backend → browser (SSE).** Tokens, tool-call events, and a final `done`
    event stream back. The turn is published through a `TurnBroadcast`, so a
    browser disconnect never kills the reply — reconnecting replays the buffer

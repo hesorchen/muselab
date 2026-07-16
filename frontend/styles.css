@@ -1615,6 +1615,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   cursor: pointer;
 }
 .root-action:hover { background: var(--c-bg-3); color: var(--c-fg-1); }
+.root-action:disabled { opacity: 0.55; cursor: wait; }
+.root-action svg.spinning { animation: spin 0.8s linear infinite; }
 /* Drop target highlight — drag a tree node / OS file onto the root bar to
    move / upload it to the archive root. Mirrors `li.drag-over` (accent fill
    + inset ring) so the affordance reads the same as dropping onto a node. */
@@ -1764,6 +1766,20 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   transition: background var(--t-fast);
   position: relative;
 }
+.filelist li.filelist-status {
+  min-height: 96px;
+  padding: var(--sp-5) var(--sp-4);
+  display: flex; flex-direction: column; justify-content: center;
+  gap: var(--sp-2);
+  color: var(--c-fg-3); text-align: center;
+  cursor: default; user-select: text; -webkit-user-select: text;
+  line-height: 1.5;
+}
+.filelist li.filelist-status:hover { background: transparent; }
+.filelist li.filelist-status .icon { color: var(--c-fg-4); }
+.filelist li.filelist-status .icon svg { width: 28px; height: 28px; }
+.filelist li.filelist-status.error-state { color: var(--c-danger); }
+.filelist li.filelist-status .btn-text { align-self: center; }
 /* Indent guide — single vertical line at the current depth so nested files
    feel anchored to their parent. Hidden at depth 0 (top-level has no parent
    to point to). 50% opacity keeps it subtle. */
@@ -2903,6 +2919,125 @@ pre.text {
    escapes the parent .chat-tabs overflow: auto clip. Just bump z-index. */
 .chat-tab-history .session-picker-pop { z-index: 1500; }
 
+/* Application-level workspace picker. It sits between history and the session
+   tabs so the selected directory clearly owns files, preview, and chat. */
+.workspace-picker {
+  position: relative;
+  flex: 0 0 auto;
+  border-right: 1px solid var(--c-border);
+}
+.workspace-picker-btn {
+  height: 34px;
+  max-width: 180px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 0;
+  background: transparent;
+  color: var(--c-fg-2);
+  font: inherit;
+  cursor: pointer;
+}
+.workspace-picker-btn:hover,
+.workspace-picker-btn[aria-expanded="true"] {
+  background: var(--c-bg-2);
+  color: var(--c-fg-0);
+}
+.workspace-picker-btn:disabled { opacity: .55; cursor: wait; }
+.workspace-picker-btn > svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+}
+.workspace-picker-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--fs-sm);
+}
+.workspace-picker-btn .workspace-picker-caret { width: 11px; height: 11px; }
+.workspace-picker-pop {
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 4px;
+  z-index: 1800;
+  width: min(340px, calc(100vw - 16px));
+  max-height: min(420px, calc(100vh - 100px));
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .28);
+}
+.workspace-picker-title {
+  padding: 4px 8px 7px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.workspace-picker-row {
+  display: flex;
+  align-items: stretch;
+  border-radius: var(--r-sm);
+}
+.workspace-picker-row:hover,
+.workspace-picker-row.active { background: var(--c-bg-2); }
+.workspace-picker-select {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--c-fg-1);
+  text-align: left;
+  cursor: pointer;
+}
+.workspace-picker-check { width: 14px; flex: 0 0 14px; color: var(--c-accent); }
+.workspace-picker-meta { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.workspace-picker-meta strong,
+.workspace-picker-meta small { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.workspace-picker-meta strong { font-size: var(--fs-sm); font-weight: var(--fw-medium); }
+.workspace-picker-meta small { color: var(--c-fg-3); font-size: 10px; }
+.workspace-picker-remove {
+  width: 32px;
+  flex: 0 0 32px;
+  border: 0;
+  background: transparent;
+  color: var(--c-fg-3);
+  cursor: pointer;
+}
+.workspace-picker-remove:hover { color: var(--c-danger); }
+.workspace-picker-remove svg,
+.workspace-picker-add svg { width: 14px; height: 14px; }
+.workspace-picker-add {
+  width: 100%;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+  padding: 0 9px;
+  border: 0;
+  border-top: 1px solid var(--c-border);
+  background: transparent;
+  color: var(--c-accent);
+  cursor: pointer;
+}
+.workspace-picker-add:hover { background: var(--c-bg-2); }
+
+@media (max-width: 600px) {
+  .workspace-picker-btn { max-width: 112px; padding-inline: 7px; }
+  .workspace-picker-pop { left: 2px; }
+}
+
 /* ====== Tab right-click context menu ====== */
 .tab-ctx-menu {
   position: fixed; z-index: 2000;
@@ -2934,6 +3069,13 @@ pre.text {
 .chk .icon svg { width: 14px; height: 14px; }
 
 .chat-scroll-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
+.chat-transcript-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
 .chat-body {
   flex: 1; overflow-y: auto;
   /* overflow-x: hidden is a hard safety net — any single misbehaving
@@ -6246,6 +6388,110 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .modal-choice-sub { font-size: var(--fs-xs); color: var(--c-fg-3); }
 
 /* ---- Cheat-sheet modal ---- */
+/* Server-side workspace folder browser. */
+.workspace-browser-backdrop { z-index: 1250; }
+.workspace-browser-modal {
+  width: min(680px, calc(100vw - 32px));
+  min-width: min(620px, calc(100vw - 32px));
+  max-width: 680px;
+  overflow: hidden;
+}
+.workspace-browser-title { display: inline-flex; align-items: center; gap: 8px; }
+.workspace-browser-title svg,
+.workspace-browser-location svg,
+.workspace-browser-row svg {
+  width: 16px; height: 16px; fill: none; stroke: currentColor;
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+}
+.workspace-browser-location {
+  min-height: 44px; display: flex; align-items: center; gap: 8px;
+  padding: 7px var(--sp-4); border-bottom: 1px solid var(--c-border);
+  background: var(--c-bg-2);
+}
+.workspace-browser-up {
+  width: 30px; height: 30px; flex: 0 0 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0; border: 1px solid transparent; border-radius: var(--r-sm);
+  background: transparent; color: var(--c-fg-2); cursor: pointer;
+}
+.workspace-browser-up:hover:not(:disabled) {
+  background: var(--c-bg-3); border-color: var(--c-border); color: var(--c-fg-0);
+}
+.workspace-browser-up:disabled { opacity: .35; cursor: default; }
+.workspace-browser-path {
+  min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; padding: 5px 9px;
+  border: 1px solid var(--c-border); border-radius: var(--r-sm);
+  background: var(--c-bg-1); color: var(--c-fg-1);
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+}
+.workspace-browser-manual {
+  height: 30px; flex: 0 0 auto; padding: 0 9px;
+  border: 1px solid var(--c-border); border-radius: var(--r-sm);
+  background: var(--c-bg-1); color: var(--c-fg-2); cursor: pointer;
+  font-size: var(--fs-xs); white-space: nowrap;
+}
+.workspace-browser-manual:hover:not(:disabled) {
+  border-color: var(--c-border-strong); color: var(--c-fg-0); background: var(--c-bg-3);
+}
+.workspace-browser-manual:disabled { opacity: .5; cursor: wait; }
+.workspace-browser-body { height: min(440px, calc(100vh - 230px)); padding: 6px; overflow-y: auto; }
+.workspace-browser-list { display: flex; flex-direction: column; }
+.workspace-browser-row {
+  min-height: 44px; display: flex; align-items: stretch;
+  border: 1px solid transparent; border-radius: var(--r-sm);
+}
+.workspace-browser-row:hover { background: var(--c-bg-2); }
+.workspace-browser-row.selected {
+  border-color: color-mix(in srgb, var(--c-accent) 55%, transparent);
+  background: var(--c-accent-soft);
+}
+.workspace-browser-row.registered { opacity: .62; }
+.workspace-browser-entry {
+  min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border: 0; background: transparent;
+  color: var(--c-fg-1); text-align: left; cursor: pointer;
+}
+.workspace-browser-folder { flex: 0 0 auto; color: var(--c-accent); }
+.workspace-browser-entry-meta { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.workspace-browser-entry-meta strong {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--c-fg-0); font-size: var(--fs-sm); font-weight: var(--fw-medium);
+}
+.workspace-browser-entry-meta small { color: var(--c-fg-3); font-size: var(--fs-xs); }
+.workspace-browser-open {
+  width: 38px; flex: 0 0 38px; display: inline-flex; align-items: center;
+  justify-content: center; padding: 0; border: 0; border-radius: var(--r-sm);
+  background: transparent; color: var(--c-fg-3); cursor: pointer;
+}
+.workspace-browser-open:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.workspace-browser-loading,
+.workspace-browser-empty {
+  min-height: 180px; display: flex; align-items: center; justify-content: center;
+  gap: 9px; color: var(--c-fg-3); text-align: center;
+}
+.workspace-browser-error {
+  margin: 6px; padding: 9px 10px; border-radius: var(--r-sm);
+  background: var(--c-danger-soft); color: var(--c-danger); font-size: var(--fs-sm);
+}
+.workspace-browser-truncated { padding: 8px 10px; color: var(--c-fg-3); font-size: var(--fs-xs); }
+.workspace-browser-foot { min-width: 0; }
+.workspace-browser-selection {
+  min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--c-fg-2); font-size: var(--fs-xs);
+}
+
+@media (max-width: 720px) {
+  .workspace-browser-modal {
+    width: 100vw; width: 100dvw; min-width: 0;
+    max-width: 100vw; max-width: 100dvw; height: 100dvh; max-height: 100dvh;
+  }
+  .workspace-browser-body { height: auto; min-height: 0; flex: 1 1 auto; }
+  .workspace-browser-location { padding-inline: var(--sp-3); }
+  .workspace-browser-foot { flex-wrap: nowrap; }
+  .workspace-browser-foot button { flex: 0 0 auto; min-width: 0; }
+}
+
 .cheatsheet-modal { min-width: 460px; max-width: 560px; }
 @media (max-width: 480px) {
   /* Cheatsheet on phone: drop the 460px min-width and let the modal
@@ -7008,6 +7254,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
 }
+.xlsx-preview .table-empty { flex: 1; min-height: 160px; }
 .xlsx-scroll {
   flex: 1; min-height: 0;
   overflow: auto;
@@ -7018,7 +7265,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   font-size: var(--fs-sm);
   background: var(--c-bg-1);
 }
-.xlsx-table td {
+.xlsx-table td,
+.xlsx-table th {
   border: 1px solid var(--c-border);
   padding: 4px 10px;
   white-space: nowrap;
@@ -7028,8 +7276,16 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   color: var(--c-fg-0);
   vertical-align: top;
 }
+.xlsx-table th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--c-bg-2);
+  color: var(--c-fg-1);
+  text-align: left;
+  font-weight: var(--fw-semibold);
+}
+.xlsx-table th.xlsx-rownum { left: 0; z-index: 3; }
 .xlsx-table tr:hover td { background: var(--c-bg-2); }
-.xlsx-table td.xlsx-rownum {
+.xlsx-table .xlsx-rownum {
   position: sticky; left: 0;
   background: var(--c-bg-2);
   color: var(--c-fg-3);
@@ -7039,7 +7295,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   user-select: none;
   z-index: 1;
 }
-.xlsx-table tr:hover td.xlsx-rownum { background: var(--c-bg-3); }
+.xlsx-table tr:hover .xlsx-rownum { background: var(--c-bg-3); }
 .xlsx-meta {
   padding: 6px 10px;
   font-size: var(--fs-xs);
@@ -8102,6 +8358,43 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
    We force 16px on all text-input controls for touch / coarse-pointer
    devices, which is the exact threshold WebKit checks.
    ========================================================================== */
+/* Touch-first file/preview ergonomics. Desktop keeps the compact VSCode-like
+   density; coarse pointers get real finger targets and wrapping toolbars. */
+@media (pointer: coarse) {
+  .filelist li:not(.filelist-status) {
+    min-height: 40px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+  .tree-action,
+  .root-action {
+    min-width: 36px;
+    width: 36px;
+    height: 36px;
+  }
+  .filelist-sticky-root { min-height: 44px; padding-top: 4px; padding-bottom: 4px; }
+  .open-files-head { min-height: 40px; }
+  .open-files .open-files-close-all { width: 36px; height: 36px; }
+  .open-files-list { max-height: calc(40px * 5); }
+  .open-files-list li {
+    min-height: 40px;
+    grid-template-columns: 16px minmax(0, 1fr) 36px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+  }
+  .open-files-x { width: 36px; height: 36px; font-size: 20px; }
+  .srow { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
+  .csv-toolbar { flex-wrap: wrap; gap: 6px; }
+  .csv-toolbar .btn-text { min-height: 36px; padding: 5px 12px; }
+  .csv-meta { margin-left: 0; }
+  .csv-range { flex: 1; min-width: max-content; }
+  .preview-find { width: calc(100% - var(--sp-4)); }
+  .preview-find-bar { width: 100%; }
+  .preview-find-input { flex: 1; min-width: 0; width: auto; max-width: none; }
+  .preview-find-btn { width: 32px; height: 32px; }
+  .pane.preview .pane-head .preview-keep-mobile { min-width: 34px; min-height: 34px; }
+}
+
 @media (pointer: coarse) {
   input,
   textarea,

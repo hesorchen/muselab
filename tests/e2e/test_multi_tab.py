@@ -9,6 +9,8 @@ multi-tab sprint and can ONLY be caught in a real browser:
 
 Skipped by default. Enable with `RUN_E2E=1`. See tests/e2e/README.md."""
 from __future__ import annotations
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("playwright.sync_api",
@@ -103,6 +105,170 @@ def test_keyboard_shortcut_ctrl_t_opens_tab(page: Page, backend_url, auth_token)
     page.locator(SEL_TABS).click()
     page.keyboard.press("Control+t")
     expect(page.locator(SEL_TAB)).to_have_count(start + 1)
+
+
+def test_workspace_picker_switches_files_previews_and_sessions_together(
+        page: Page, backend_url, auth_token, tmp_path):
+    """A workspace switch restores its files, preview and conversation."""
+    _login(page, backend_url, auth_token)
+    primary = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath()")
+    primary_id = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    other = Path(primary) / ("workspace-two-" + tmp_path.name)
+    other.mkdir()
+    (other / "WORKSPACE_ONLY.md").write_text(
+        "# second workspace\n\nworkspace-isolated-preview\n", encoding="utf-8")
+
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'README.md' && app.rawText.includes('muselab e2e');
+        }""")
+
+    page.locator(".workspace-picker-btn").click()
+    page.locator(".workspace-picker-add").click()
+    modal = page.locator(".workspace-browser-modal")
+    expect(modal).to_be_visible()
+    row = page.locator(
+        f'.workspace-browser-row[data-workspace-path="{other}"]')
+    expect(row).to_be_visible(timeout=5000)
+    row.locator(".workspace-browser-entry").click()
+    page.locator(".workspace-browser-confirm").click()
+    page.wait_for_function(
+        """([path]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const session = app.sessions.find(item => item.id === app.currentId);
+          return app.currentWorkspacePath() === path && !app.workspaceSwitching
+            && session?.cwd === path;
+        }""",
+        arg=[str(other)],
+        timeout=15000,
+    )
+
+    state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            visible: app.visible.map(item => item.path),
+            selected: app.selected,
+            currentId: app.currentId,
+            tabCwds: app.workspaceOpenTabIds().map(id =>
+              app.sessions.find(item => item.id === id)?.cwd),
+          };
+        }""")
+    assert "WORKSPACE_ONLY.md" in state["visible"]
+    assert "README.md" not in state["visible"]
+    assert state["selected"] == ""
+    assert state["tabCwds"] and set(state["tabCwds"]) == {str(other)}
+    secondary_id = state["currentId"]
+
+    page.locator('.filelist li[data-path="WORKSPACE_ONLY.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'WORKSPACE_ONLY.md'
+            && app.rawText.includes('workspace-isolated-preview');
+        }""")
+
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{primary}"] .workspace-picker-select').click()
+    page.wait_for_function(
+        """([path, sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.currentWorkspacePath() === path && app.currentId === sid
+            && app.selected === 'README.md' && app.rawText.includes('muselab e2e')
+            && !app.workspaceSwitching;
+        }""",
+        arg=[primary, primary_id],
+        timeout=15000,
+    )
+
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{other}"] .workspace-picker-select').click()
+    page.wait_for_function(
+        """([path, sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.currentWorkspacePath() === path && app.currentId === sid
+            && app.selected === 'WORKSPACE_ONLY.md'
+            && app.rawText.includes('workspace-isolated-preview')
+            && !app.workspaceSwitching;
+        }""",
+        arg=[str(other), secondary_id],
+        timeout=15000,
+    )
+
+    # Remove the registry entry through the UI; project files remain untouched.
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{primary}"] .workspace-picker-select').click()
+    page.wait_for_function(
+        "([path]) => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath() === path",
+        arg=[primary],
+    )
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{other}"] .workspace-picker-remove').click()
+    expect(page.locator(".confirm-modal")).to_be_visible()
+    page.locator(".confirm-modal .btn-danger").click()
+    page.wait_for_function(
+        """([path]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return !app.workspaceSwitching
+            && !app.sessionWorkspaces.some(item => item.path === path);
+        }""",
+        arg=[str(other)],
+    )
+
+
+def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
+        page: Page, backend_url, auth_token, tmp_path):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    primary = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath()")
+    parent = Path(primary) / ("mobile-picker-" + tmp_path.name)
+    child = parent / "nested-project"
+    child.mkdir(parents=True)
+    (child / "package.json").write_text('{"name":"nested"}\n', encoding="utf-8")
+
+    page.locator(".workspace-picker-btn").click()
+    page.locator(".workspace-picker-add").click()
+    modal = page.locator(".workspace-browser-modal")
+    expect(modal).to_be_visible()
+    page.wait_for_timeout(250)
+    box = modal.bounding_box()
+    assert box is not None
+    assert box["x"] == 0
+    assert box["y"] == 0
+    assert box["width"] >= 389
+    assert box["height"] >= 843
+
+    parent_row = page.locator(
+        f'.workspace-browser-row[data-workspace-path="{parent}"]')
+    expect(parent_row).to_be_visible(timeout=5000)
+    parent_row.locator(".workspace-browser-open").click()
+    page.wait_for_function(
+        """([path]) => document.querySelector('#app')._x_dataStack[0]
+          .workspaceBrowser.path === path""",
+        arg=[str(parent)],
+    )
+    child_row = page.locator(
+        f'.workspace-browser-row[data-workspace-path="{child}"]')
+    expect(child_row).to_be_visible()
+    expect(child_row).to_contain_text("Node.js")
+
+    page.locator(".workspace-browser-up").click()
+    page.wait_for_function(
+        """([path]) => document.querySelector('#app')._x_dataStack[0]
+          .workspaceBrowser.path === path""",
+        arg=[primary],
+    )
+    page.locator(".workspace-browser-modal .modal-close").click()
+    expect(modal).to_be_hidden()
 
 
 # Note: drag-and-drop tab reorder and right-click context menu are harder

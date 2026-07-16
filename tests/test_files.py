@@ -460,3 +460,42 @@ def test_csv_preview_rejects_non_csv(client, auth):
     """README.md is text but not CSV — endpoint rejects with 415."""
     r = client.get("/api/files/csv?path=README.md", headers=auth)
     assert r.status_code == 415
+
+
+def test_csv_total_cache_reuses_signature_and_invalidates_on_write(
+        client, auth, temp_root):
+    """Pagination caches only the row count and refreshes it after a write."""
+    from backend import files as files_module
+
+    path = temp_root / "cached.csv"
+    path.write_text(
+        "id,name\n" + "".join(f"{i},row-{i}\n" for i in range(40)),
+        encoding="utf-8",
+    )
+    with files_module._CSV_TOTAL_CACHE_LOCK:
+        files_module._CSV_TOTAL_CACHE.clear()
+
+    first = client.get(
+        "/api/files/csv?path=cached.csv&offset=0&limit=3", headers=auth)
+    assert first.status_code == 200
+    first_total = first.json()["total_rows"]
+    cache_key = str(path.resolve())
+    with files_module._CSV_TOTAL_CACHE_LOCK:
+        cached = files_module._CSV_TOTAL_CACHE[cache_key]
+    assert cached[2] == first_total
+
+    second = client.get(
+        "/api/files/csv?path=cached.csv&offset=10&limit=3", headers=auth)
+    assert second.status_code == 200
+    assert second.json()["total_rows"] == first_total
+    with files_module._CSV_TOTAL_CACHE_LOCK:
+        assert files_module._CSV_TOTAL_CACHE[cache_key] == cached
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("40,row-40\n")
+    changed = client.get(
+        "/api/files/csv?path=cached.csv&offset=0&limit=3", headers=auth)
+    assert changed.status_code == 200
+    assert changed.json()["total_rows"] == first_total + 1
+    with files_module._CSV_TOTAL_CACHE_LOCK:
+        assert files_module._CSV_TOTAL_CACHE[cache_key][1] > cached[1]

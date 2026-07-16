@@ -41,6 +41,22 @@ def backend_url(tmp_path_factory):
     root = tmp_path_factory.mktemp("e2e-root")
     (root / "README.md").write_text("# muselab e2e fixture\n")
     (root / "notes.md").write_text("scratch\n")
+    (root / "smooth-preview.html").write_text(
+        "<!doctype html><html><head><style>"
+        "html{scroll-behavior:smooth!important}body{margin:0}"
+        ".spacer{height:6000px}"
+        "</style></head><body><h1>Smooth preview</h1>"
+        "<div class='spacer'></div></body></html>",
+        encoding="utf-8",
+    )
+    for i in range(5):
+        (root / f"cache-{i}.html").write_text(
+            "<!doctype html><html><body>"
+            f"<h1>Cache fixture {i}</h1><input value='initial-{i}'>"
+            "<div style='height:4000px'></div>"
+            "</body></html>",
+            encoding="utf-8",
+        )
 
     port = _free_port()
     env = {
@@ -53,11 +69,16 @@ def backend_url(tmp_path_factory):
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
 
     repo_root = Path(__file__).resolve().parents[2]
+    # Never leave a chatty long-running server attached to an unread PIPE.
+    # A browser suite can fill the pipe buffer and block the backend event
+    # loop, making later page navigations time out for unrelated reasons.
+    log_path = root / "backend.log"
+    log_file = log_path.open("wb")
     proc = subprocess.Popen(
         [sys.executable, "-m", "backend.main"],
         cwd=repo_root,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
     )
     base = f"http://127.0.0.1:{port}"
@@ -66,7 +87,9 @@ def backend_url(tmp_path_factory):
     import urllib.request
     while time.time() < deadline:
         if proc.poll() is not None:
-            out = proc.stdout.read().decode("utf-8", errors="replace") if proc.stdout else ""
+            log_file.flush()
+            out = log_path.read_text(encoding="utf-8", errors="replace")
+            log_file.close()
             raise RuntimeError(f"backend died during startup:\n{out}")
         try:
             urllib.request.urlopen(f"{base}/static/app.js", timeout=0.5).close()
@@ -75,6 +98,8 @@ def backend_url(tmp_path_factory):
             time.sleep(0.2)
     else:
         proc.kill()
+        proc.wait(timeout=5)
+        log_file.close()
         raise RuntimeError("backend never became ready")
 
     yield base
@@ -83,6 +108,9 @@ def backend_url(tmp_path_factory):
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(timeout=5)
+    finally:
+        log_file.close()
 
 
 @pytest.fixture(scope="session")

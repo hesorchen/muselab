@@ -192,6 +192,10 @@ function portal() {
     connState: "ok",
     _connFails: 0,
     _connHeartbeat: null,
+    _presenceTimer: null,
+    _presenceVisibilityHandler: null,
+    _presencePagehideHandler: null,
+    _sessionsSyncTimer: null,
     _splashHintTimer: null,
     _splashHardTimeout: null,
 
@@ -204,8 +208,16 @@ function portal() {
                        && window.matchMedia("(hover: hover)").matches,
 
     // ===== file tree =====
-    visible: [], expanded: new Set(), childCache: {},
+    visible: [], expanded: new Set(), childCache: {}, treeLoading: false,
+    treeError: "",
     selected: "",
+    // The row that owns keyboard/copy/paste focus in the file tree. Keep this
+    // separate from `selected`, which is the file whose body is rendered in
+    // the preview pane. Ctrl/Shift-clicking a directory must not relabel an
+    // already-rendered preview as that directory.
+    treeFocusPath: "",
+    _treeLoadSeq: 0,
+    _childFetches: null,
     dragOver: "",
     // Highlight flag for the sticky root bar while a tree node / OS file is
     // dragged over it (drop = move/upload to archive root).
@@ -223,6 +235,7 @@ function portal() {
     // list auto-scrolls underneath — matching native OS marquee feel).
     marquee: { active: false, x: 0, y: 0, w: 0, h: 0 },
     searchQ: "", searchMode: false, searching: false,
+    _fileSearchSeq: 0, _fileSearchAbort: null,
     searchHits: [], searchTruncated: false,
     grepHits: [], grepTruncated: false,
 
@@ -252,11 +265,17 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // Keep a bounded set of live HTML browsing contexts. Switching back to a
+    // recent report preserves its DOM, script state and scroll position.
+    htmlPreviewFrames: [],
+    _htmlPreviewFrameClock: 0,
+    HTML_PREVIEW_CACHE_MAX: 4,
     // On-disk metadata for the currently-selected file ({path, name, is_dir,
     // size, mtime} | null). Drives the preview-header path + last-modified
     // strip. Loaded by a $watch on `selected` → loadSelectedMeta(); null while
     // nothing is open or the stat fetch 404s (stale/phantom tab).
     selectedMeta: null,
+    _selectedMetaSeq: 0,
     // Set when a preview READ fails (404/413/403/…), so the unsupported empty
     // state can show a status-aware reason instead of always blaming the file
     // type. null = no error (genuine "unsupported type" or normal preview).
@@ -267,8 +286,17 @@ function portal() {
     // keyword match. `matches` holds serializable {snippet} for the results
     // list; the parallel live <mark> elements are kept off-reactive in
     // _pfEls so Vue/Alpine never proxies DOM nodes.
-    previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false },
+    previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false, truncated: false },
     _pfEls: [],
+    PREVIEW_FIND_MAX_MATCHES: 500,
+    _previewLoadSeq: 0,
+    _previewAbort: null,
+    _previewViewSaveTimer: null,
+    _previewViewRestoreTimers: [],
+    _previewRestoringPath: "",
+    _previewRestoringLoadSeq: 0,
+    _htmlPreviewFramePosition: null,
+    _htmlPreviewScrollSaveTimer: null,
     // xlsx preview state. previewMode==='xlsx' uses xlsxSheets (array of
     // {name, rows, rows_truncated, cols_truncated}). xlsxActive picks the
     // sheet tab. xlsxLimits carries the server's row/col caps for the UI
@@ -278,10 +306,14 @@ function portal() {
     // backend response for the current page; csvOffset advances by limit
     // when the user pages forward.
     csvPath: "", csvData: null, csvOffset: 0, csvLimit: 200, csvLoading: false,
+    _csvLoadSeq: 0, _csvAbort: null,
     // Bumped whenever an assistant tool_use edits a file. Used as a cache
     // buster on iframe / read URLs so the preview reflects the new content
     // without the user needing to manually refresh the page.
     previewVersion: 0,
+    // Disk changed while the editor buffer deliberately stayed intact. The
+    // next safe open/exit-edit bypasses cache and reconciles automatically.
+    _previewNeedsReload: "",
     // Browser-like zoom for the preview content (md/text/img/xlsx/csv/html).
     // Applied as CSS `zoom` on the content nodes only (NOT the .preview-body
     // container) so the find bar / drop overlay stay at 100%. Sticky across
@@ -415,6 +447,28 @@ function portal() {
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    sessionWorkspaces: [],
+    activeWorkspace: "",
+    workspaceMenuOpen: false,
+    workspaceSwitching: false,
+    workspaceBrowser: {
+      show: false, loading: false, error: "", path: "", name: "", parent: "",
+      directories: [], selected: "", registered: false, selectable: false,
+      truncated: false, requestSeq: 0,
+    },
+    workspaceLastSession: {},
+    workspaceSurfaces: {},
+    _paletteFileSeq: 0,
+    _sessionLoadPromises: {},
+    _sessionsInitialized: false,
+    _sessionInitPromise: null,
+    _sessionListPullPromise: null,
+    _sessionListTimeoutMs: 8000,
+    _sessionReadTimeoutMs: 15000,
+    _mobileKeyboardGeometryOpen: false,
+    _mobileKeyboardPollTimer: null,
+    _mobileViewportSettleTimers: [],
+    _mobileRootResetTimers: [],
     // [resident-panes] Which tabs keep their message-pane DOM mounted. The chat
     // panes (index.html) render one .msg-pane per id HERE — not per openTabIds —
     // so far-back tabs are unmounted, bounding how much retained DOM the browser
@@ -667,6 +721,7 @@ function portal() {
       items: [],
       count: 0,
     },
+    _trashLoadSeq: 0,
     // Toggled by onTrashDragOver/onTrashDragLeave to drive the red-highlight
     // animation on the trash button. Stays out of the trash{} sub-object
     // so it can be touched in dragover handlers (60+ events/sec while
@@ -708,6 +763,7 @@ function portal() {
 
     // ===== @ mention =====
     mentionShow: false, mentionResults: [], mentionIdx: 0, mentionAnchor: -1,
+    _mentionSeq: 0, _mentionAbort: null,
 
     // ===== toast / modal / ctx menu =====
     toasts: [], _toastId: 0,
@@ -944,9 +1000,10 @@ function portal() {
         if (sel && sel.toString && sel.toString().length > 0) return;
         const isCopy = ev.key === "c" || ev.key === "C";
         if (isCopy) {
-          // Need a selected file (not directory). this.selected holds the
-          // path string of the currently-highlighted tree node.
-          const node = this._findTreeNode(this.selected);
+          // Need a focused file (not directory). Tree focus is intentionally
+          // separate from the preview owner: Ctrl-click must not relabel the
+          // already-rendered preview pane.
+          const node = this._findTreeNode(this.treeFocusPath || this.selected);
           if (!node || node.is_dir) return;
           ev.preventDefault();
           this.fileClipboard = { path: node.path, name: node.name };
@@ -1005,7 +1062,7 @@ function portal() {
       }
       if (ev.key === "Escape") {
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
-        if (this.mentionShow) { this.mentionShow = false; return; }
+        if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
         if (this.settings.show) { this.settings.show = false; return; }
@@ -1182,17 +1239,22 @@ function portal() {
         this.osFileDragging = false;
       });
 
-      // Click-to-zoom bridge for HTML previews. The sandboxed (opaque-origin)
-      // preview iframe can't be reached from here to intercept image clicks,
-      // so files.py injects a script that postMessages the clicked image's
-      // src up. Validate the message came from OUR preview iframe (not some
-      // other framed content posting to window) before opening the lightbox.
+      // HTML preview bridge. Each live sandboxed frame reports image clicks,
+      // readiness and internal scrolling through postMessage.
       window.addEventListener("message", (e) => {
-        const f = this.$refs.htmlFrame;
-        if (!f || e.source !== f.contentWindow) return;
+        const ownerPath = this._htmlPreviewMessageOwner(e.source);
+        if (!ownerPath) return;
         const d = e.data;
-        if (!d || d.__muselab !== "preview-img" || typeof d.src !== "string") return;
-        this.openLightbox(d.src, typeof d.alt === "string" ? d.alt : "");
+        if (!d || typeof d.__muselab !== "string") return;
+        if (d.__muselab === "preview-img" && typeof d.src === "string") {
+          if (ownerPath === this.selected && this.previewMode === "html") {
+            this.openLightbox(d.src, typeof d.alt === "string" ? d.alt : "");
+          }
+        } else if (d.__muselab === "preview-scroll") {
+          this.onHtmlPreviewScrollMessage(d, ownerPath);
+        } else if (d.__muselab === "preview-ready") {
+          this.onPreviewFrameLoad("html", ownerPath);
+        }
       });
 
       // Listen for SW → page messages. The service worker posts
@@ -1336,19 +1398,10 @@ function portal() {
     //
     // `scroll-margin-bottom: 16px` on the textarea (see styles.css) leaves a
     // breathing-room gap so the input isn't flush against the keyboard top.
-    onChatInputFocus(ev) {
+    onChatInputFocus() {
+      document.documentElement.style.setProperty("--kb-inset", "0px");
       document.body.classList.add("kb-open");
-      const ta = ev && ev.target;
-      if (!ta || typeof ta.scrollIntoView !== "function") return;
-      // Two pings: one fast (covers fast keyboards / Android), one slow
-      // (waits out iOS PWA's lazy resize). Idempotent — second call is a
-      // no-op if the input is already in view.
-      const lift = () => {
-        try { ta.scrollIntoView({ block: "end", behavior: "smooth" }); }
-        catch (_) { try { ta.scrollIntoView(false); } catch (__) {} }
-      };
-      setTimeout(lift, 50);
-      setTimeout(lift, 400);
+      this._reconcileMobileViewport();
     },
 
     // Paired teardown for onChatInputFocus. MUST reset --kb-inset alongside
@@ -1364,6 +1417,8 @@ function portal() {
     onChatInputBlur() {
       document.body.classList.remove("kb-open");
       document.documentElement.style.setProperty("--kb-inset", "0px");
+      this._scheduleMobileRootReset();
+      this._reconcileMobileViewport();
     },
 
     // Triple-click (or any 3+ rapid click) on the chat input selects all
@@ -1392,59 +1447,79 @@ function portal() {
       }
     },
 
-    _initMobileKeyboardWatch() {
-      if (!window.visualViewport) return;
+    _mobileKeyboardInset() {
       const vv = window.visualViewport;
-      const update = () => {
-        const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-        // Anything > 80px likely means the on-screen keyboard is up (small
-        // values are OS-chrome / address-bar transitions, not the keyboard).
-        const kbOpen = inset > 80;
-        const wasOpen = document.body.classList.contains("kb-open");
-        if (kbOpen) {
-          document.body.classList.add("kb-open");
-          document.documentElement.style.setProperty("--kb-inset", inset + "px");
-        } else {
-          document.body.classList.remove("kb-open");
-          document.documentElement.style.setProperty("--kb-inset", "0px");
-        }
-        // Keyboard open/close shrinks/grows chat-body. If the user was
-        // already at the bottom, the new viewport leaves the latest
-        // message stranded mid-screen — re-pin to bottom. Use rAF so
-        // the browser has done layout pass for the new height. We pass
-        // force=false because scrollToBottom honors `atBottom`, so a
-        // user mid-history won't get yanked.
-        if (kbOpen !== wasOpen) {
-          requestAnimationFrame(() => this.scrollToBottom(false));
-        }
+      if (!vv) return 0;
+      return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    },
+
+    _clearMobileKeyboardPoll() {
+      if (!this._mobileKeyboardPollTimer) return;
+      clearInterval(this._mobileKeyboardPollTimer);
+      this._mobileKeyboardPollTimer = null;
+    },
+
+    _scheduleMobileRootReset() {
+      for (const timer of this._mobileRootResetTimers || []) clearTimeout(timer);
+      const reset = () => {
+        if (this._mobileKeyboardInset() > 80) return;
+        try { window.scrollTo(0, 0); } catch (_) {}
+        const root = document.scrollingElement || document.documentElement;
+        if (root) root.scrollTop = 0;
+        if (document.body) document.body.scrollTop = 0;
       };
-      vv.addEventListener("resize", update);
-      vv.addEventListener("scroll", update);
+      requestAnimationFrame(reset);
+      this._mobileRootResetTimers = [120, 450, 800].map(
+        delay => setTimeout(reset, delay));
+    },
 
-      // Event-independent reconciliation. iOS Safari — and standalone PWA in
-      // particular — frequently FAILS to fire vv `resize` when the keyboard
-      // dismisses: focus is retained via Enter-to-send so no blur path runs,
-      // or the event is simply dropped. update() then never re-runs and
-      // --kb-inset is stranded at the last keyboard height with no keyboard
-      // present → `body.kb-open .layout:focus-within` shrinks the layout to
-      // `100dvh - <stale>` → page rides up with a blank band at the bottom
-      // (the recurring bug). Fix: don't rely on the vv event firing. On any
-      // focus change / foregrounding, re-RUN update() — `vv.height` is a live
-      // property, so re-reading it (after a short settle delay for iOS) yields
-      // the true post-keyboard height and the else-branch zeroes the inset.
-      const reconcile = () => { update(); setTimeout(update, 300); };
-      // focusout bubbles (blur does not), so this catches the composer losing
-      // focus regardless of which element it was — including the
-      // Enter-to-send-then-tap-elsewhere path that onChatInputBlur can miss.
-      document.addEventListener("focusout", reconcile);
-      // Returning to the foreground (PWA re-activation / tab switch) can also
-      // surface a stale inset captured before backgrounding.
-      window.addEventListener("focus", reconcile);
+    _syncMobileKeyboardViewport() {
+      if (!window.visualViewport) return false;
+      const inset = this._mobileKeyboardInset();
+      const kbOpen = inset > 80;
+      const wasOpen = !!this._mobileKeyboardGeometryOpen;
+      this._mobileKeyboardGeometryOpen = kbOpen;
+      if (kbOpen) {
+        document.body.classList.add("kb-open");
+        document.documentElement.style.setProperty("--kb-inset", inset + "px");
+        for (const timer of this._mobileRootResetTimers || []) clearTimeout(timer);
+        this._mobileRootResetTimers = [];
+        if (!this._mobileKeyboardPollTimer) {
+          this._mobileKeyboardPollTimer = setInterval(
+            () => this._syncMobileKeyboardViewport(), 400);
+        }
+      } else {
+        document.body.classList.remove("kb-open");
+        document.documentElement.style.setProperty("--kb-inset", "0px");
+        this._clearMobileKeyboardPoll();
+        if (wasOpen) this._scheduleMobileRootReset();
+      }
+      if (kbOpen !== wasOpen) {
+        requestAnimationFrame(() => this.scrollToBottom(false));
+      }
+      return kbOpen;
+    },
+
+    _reconcileMobileViewport() {
+      for (const timer of this._mobileViewportSettleTimers || []) clearTimeout(timer);
+      this._mobileViewportSettleTimers = [0, 100, 350, 700].map(
+        delay => setTimeout(() => this._syncMobileKeyboardViewport(), delay));
+    },
+
+    _initMobileKeyboardWatch() {
+      const vv = window.visualViewport;
+      if (vv) {
+        vv.addEventListener("resize", () => this._syncMobileKeyboardViewport());
+        vv.addEventListener("scroll", () => this._syncMobileKeyboardViewport());
+      }
+      window.addEventListener("resize", () => this._reconcileMobileViewport());
+      document.addEventListener("focusout", () => this._reconcileMobileViewport());
+      window.addEventListener("focus", () => this._reconcileMobileViewport());
+      window.addEventListener("pageshow", () => this._reconcileMobileViewport());
       document.addEventListener("visibilitychange", () => {
-        if (!document.hidden) reconcile();
+        if (!document.hidden) this._reconcileMobileViewport();
       });
-
-      update();
+      this._syncMobileKeyboardViewport();
     },
 
     // Attach iOS-style pull-to-refresh to a scrollable element. Mobile
@@ -1556,6 +1631,9 @@ function portal() {
       }, 8000);
 
       this.loadPrefs();
+      // Resolve the persisted workspace before the first file request; file
+      // paths are relative and must never flash content from the primary root.
+      await this.fetchSessionWorkspaces();
       this.loadRoot();
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
@@ -1611,7 +1689,7 @@ function portal() {
         const wantTab = this._pendingMobileTab;
         this._pendingMobileTab = null;
         this.$nextTick(() => {
-          if (this._isMobileLayout()) this.mobileTab = wantTab;
+          if (this._isMobileLayout()) this.setMobileTab(wantTab);
         });
       }
       // Block readiness on context-info (the most important one for the
@@ -1661,8 +1739,14 @@ function portal() {
             && document.visibilityState !== "visible") return;
         if (!this.token) return;
         try {
-          await this._syncSessionListQuiet();
+          const updated = await this._syncSessionListQuiet();
+          // A transient cold-boot failure must not leave an authenticated
+          // page with no active conversation until the user reloads it.
+          if (updated && !this._sessionsInitialized) {
+            await this.initSessions({ skipRefresh: true });
+          }
         } catch (_) { /* best-effort; next tick retries */ }
+        await this._recoverStalledStream(this.currentId);
       }, 10_000);
     },
 
@@ -3224,12 +3308,18 @@ function portal() {
     // Outline click → scroll the chat to that user msg + flash highlight.
     // .msg[data-uuid] is rendered for every message (see chat template);
     // on mobile we also switch to the chat tab so the jump is visible.
-    _scrollToUserMsg(m) {
+    _scrollToUserMsg(m, ownerSid = this.currentId) {
       const uuid = m && m.uuid;
-      if (!uuid) return;
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      const sid = ownerSid;
+      if (!uuid || !sid) return;
+      if (this._isMobileLayout()) this.setMobileTab("chat");
+      const activeState = this.tabState && this.tabState[sid];
+      if (activeState) activeState.atBottom = false;
+      if (sid === this.currentId) this.atBottom = false;
       const tryScroll = () => {
-        const el = document.querySelector(
+        if (sid !== this.currentId) return false;
+        const body = this.$refs && this.$refs.chatBody;
+        const el = body && body.querySelector(
           `.msg[data-uuid="${CSS.escape(uuid)}"]`);
         if (!el) return false;
         el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -3238,13 +3328,14 @@ function portal() {
         return true;
       };
       this.$nextTick(() => {
+        if (sid !== this.currentId) return;
         if (tryScroll()) return;
         // Target not in DOM — it lives in the lazy stash. Find it there
         // and pull everything from that index forward into visible
         // messages, then retry scroll. Mirrors jumpToOutlineItem's
         // backend branch but for the modal outline path.
-        const sid = this.currentId;
-        const st = sid && this.tabState && this.tabState[sid];
+        const st = this.tabState && this.tabState[sid];
+        if (!st) return;
         const earlier = (st && st._earlierMessages) || [];
         const idx = earlier.findIndex(em => em && em.uuid === uuid);
         if (idx < 0) {
@@ -3258,11 +3349,14 @@ function portal() {
           if (st && st._loadedOffset > 0 && !st._fetchingOlder) {
             (async () => {
               const pulled = await this._fetchOlderWindow(sid);
+              if (this.tabState[sid] !== st || sid !== this.currentId) return;
               if (pulled > 0) {
-                this.$nextTick(() => this._scrollToUserMsg(m));
+                this.$nextTick(() => this._scrollToUserMsg(m, sid));
               } else if (!st._fullLoaded) {
                 await this.loadSession(sid, { full: true });
-                this.$nextTick(() => this._scrollToUserMsg(m));
+                if (this.tabState[sid] === st && sid === this.currentId) {
+                  this.$nextTick(() => this._scrollToUserMsg(m, sid));
+                }
               }
             })();
             return;
@@ -3270,7 +3364,9 @@ function portal() {
           if (st && !st._fullLoaded) {
             (async () => {
               await this.loadSession(sid, { full: true });
-              this.$nextTick(() => this._scrollToUserMsg(m));
+              if (this.tabState[sid] === st && sid === this.currentId) {
+                this.$nextTick(() => this._scrollToUserMsg(m, sid));
+              }
             })();
           }
           return;
@@ -3285,10 +3381,11 @@ function portal() {
         const oldScrollHeight = oldScrollEl ? oldScrollEl.scrollHeight : 0;
         const oldScrollTop = oldScrollEl ? oldScrollEl.scrollTop : 0;
         st.messages.unshift(...batch);
-        this.messages = st.messages;
+        if (sid === this.currentId) this.messages = st.messages;
         st._hasMoreHistory =
           (st._earlierMessages || []).length > 0 || st._loadedOffset > 0;
         this.$nextTick(() => {
+          if (this.tabState[sid] !== st || sid !== this.currentId) return;
           if (oldScrollEl) {
             const newScrollHeight = oldScrollEl.scrollHeight;
             oldScrollEl.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
@@ -3298,7 +3395,9 @@ function portal() {
           // chat body.
           const newEls = this._leadingMsgEls(batch.length);
           this.highlightCode(".chat-body", newEls.length ? newEls : null);
-          setTimeout(tryScroll, 50);
+          setTimeout(() => {
+            if (this.tabState[sid] === st) tryScroll();
+          }, 50);
         });
       });
     },
@@ -3914,10 +4013,10 @@ function portal() {
     // ROOT-relative path whose full path ends with the clicked path (same
     // file, just a missing prefix). Caller decides: 0 → not-found toast,
     // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
-    async _findBySuffix(path, name) {
+    async _findBySuffix(path, name, requestHeaders = this.hdr()) {
       try {
         const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
-          { headers: this.hdr() });
+          { headers: requestHeaders });
         if (!r.ok) return [];
         const d = await r.json();
         const suffix = "/" + path.replace(/^\/+/, "");
@@ -3949,6 +4048,8 @@ function portal() {
     // entry came from the API). For chat-link clicks the path comes from
     // model output and may not exist — surface the failure as a toast.
     async openByPathToasted(path) {
+      const ownerWorkspace = this.currentWorkspacePath();
+      const requestHeaders = this.hdr();
       // HEAD-equivalent check via list on the parent dir is fragile (binary
       // files, images etc. don't go through /api/files/read). Just delegate
       // to openFile and let it set previewMode='unsupported' / pdf / img,
@@ -3958,10 +4059,14 @@ function portal() {
       const name = path.split("/").pop();
       try {
         const r = await fetch("/api/files/list?path=" + encodeURIComponent(parent),
-          { headers: this.hdr() });
-        const hit = r.ok
-          ? ((await r.json()).entries || []).find(e => e.name === name)
-          : null;
+          { headers: requestHeaders });
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        let hit = null;
+        if (r.ok) {
+          const data = await r.json();
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          hit = (data.entries || []).find(e => e.name === name) || null;
+        }
         // Direct ROOT-relative lookup missed. The model commonly emits a path
         // relative to a SUBDIR of the archive root (e.g. "learning/x.html"
         // when the file actually lives at "claude_space/learning/x.html").
@@ -3969,7 +4074,8 @@ function portal() {
         // path ends with the clicked path — same file, just a missing prefix.
         // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
         if (!hit) {
-          const matches = await this._findBySuffix(path, name);
+          const matches = await this._findBySuffix(path, name, requestHeaders);
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           let resolved = "";
           if (matches.length === 1) {
             resolved = matches[0].path;
@@ -3982,10 +4088,12 @@ function portal() {
                 : `"${path}" matches ${matches.length} files. Pick one to open:`,
               choices: matches.map(m => ({ label: m.path, value: m.path })),
             });
+            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
             if (!resolved) return;   // cancelled
           }
           if (resolved) {
             await this.openFile({ path: resolved, name });
+            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});
             return;
           }
@@ -3997,6 +4105,7 @@ function portal() {
           return;
         }
         await this.openFile({ path, name });
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         // Mirror the click into the file tree: expand parents + scroll the
         // row into view so the user sees where the file lives. Use background
         // mode — a chat-link click wants the file's CONTENT (the preview
@@ -4004,7 +4113,9 @@ function portal() {
         // "files". Best-effort: never let a tree-sync hiccup swallow the open.
         this.revealInTree(path, { mode: "background" }).catch(() => {});
       } catch (e) {
-        this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+        }
       }
     },
 
@@ -4061,11 +4172,16 @@ function portal() {
       this.loginErr = "";
       this.token = this.tokenInput.trim();
       try {
-        const r = await fetch("/api/files/list?path=", { headers: this.hdr() });
+        // Authenticate independently of a possibly stale persisted workspace.
+        // fetchSessionWorkspaces() below validates/falls back that directory.
+        const r = await fetch("/api/files/list?path=", {
+          headers: { "X-Auth-Token": this.token },
+        });
         if (!r.ok) throw new Error("token 错误");
         this._setLS("muselab_token", this.token);
         this.authed = true;
         this.loadPrefs();
+        await this.fetchSessionWorkspaces();
         await this.loadRoot();
         await this.initSessions();
         this.fetchStats();
@@ -4095,7 +4211,15 @@ function portal() {
       location.reload();
     },
 
-    hdr() { return { "X-Auth-Token": this.token }; },
+    hdr() {
+      const headers = { "X-Auth-Token": this.token };
+      // Header values must be ByteString-safe. The backend decodes this and
+      // accepts it only when it is present in the registered workspace list.
+      if (this.activeWorkspace) {
+        headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace);
+      }
+      return headers;
+    },
 
     // ===== unified fetch wrapper =====
     // Consolidates the ~60 hand-written fetch calls. Auto-attaches token
@@ -4338,14 +4462,18 @@ function portal() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
+      this._captureWorkspaceSurface();
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 2,          // bump when prefs format changes incompatibly
+        schema: 3,          // v3 adds per-workspace file/preview surfaces
         model: this.model, defaultModel: this.defaultModel, permission: this.permission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
-        previewTabs: this.tabs.map(t => ({ path: t.path, name: t.name, preview: !!t.preview })),
+        previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         expanded: Array.from(this.expanded),
+        activeWorkspace: this.activeWorkspace,
+        workspaceLastSession: this.workspaceLastSession,
+        workspaceSurfaces: this.workspaceSurfaces,
         leftOpen: this.leftOpen, rightOpen: this.rightOpen,
         leftWidth: this.leftWidth, rightWidth: this.rightWidth,
         showHidden: this.showHidden,
@@ -4367,6 +4495,16 @@ function portal() {
       // when another device pushed a different state.
     },
 
+    _scheduleSavePrefs() {
+      // localStorage is synchronous. Coalesce rapid preview/tab/scroll changes
+      // and persist outside the interaction frame.
+      clearTimeout(this._savePrefsTimer);
+      this._savePrefsTimer = setTimeout(() => {
+        this._savePrefsTimer = null;
+        this.savePrefs();
+      }, 80);
+    },
+
     loadPrefs() {
       try {
         const p = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
@@ -4378,6 +4516,15 @@ function portal() {
         if (p.model) this.model = p.model;
         if (p.defaultModel) this.defaultModel = p.defaultModel;
         if (p.permission) this.permission = p.permission;
+        if (typeof p.activeWorkspace === "string") this.activeWorkspace = p.activeWorkspace;
+        if (p.workspaceLastSession && typeof p.workspaceLastSession === "object"
+            && !Array.isArray(p.workspaceLastSession)) {
+          this.workspaceLastSession = p.workspaceLastSession;
+        }
+        if (p.workspaceSurfaces && typeof p.workspaceSurfaces === "object"
+            && !Array.isArray(p.workspaceSurfaces)) {
+          this.workspaceSurfaces = p.workspaceSurfaces;
+        }
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
         if (typeof p.rightOpen === "boolean") this.rightOpen = p.rightOpen;
         if (typeof p.leftWidth === "number") this.leftWidth = p.leftWidth;
@@ -4388,7 +4535,9 @@ function portal() {
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
-        if (Array.isArray(p.previewTabs)) this.tabs = p.previewTabs;
+        if (Array.isArray(p.previewTabs)) {
+          this.tabs = p.previewTabs.map(t => this._previewTabSnapshot(t));
+        }
         if (typeof p.previewSelected === "string") this._pendingPreviewSelected = p.previewSelected;
         // Stash the mobile tab choice in a "pending" slot — actually applying
         // it has to wait until after _bootApp's openFile(previewSelected)
@@ -4418,6 +4567,19 @@ function portal() {
           this.openFilesHeight = null;
         }
         this._pendingExpanded = p.expanded || [];
+        const surface = this.activeWorkspace
+          && this.workspaceSurfaces[this.activeWorkspace];
+        if (surface && typeof surface === "object") {
+          this.tabs = this._workspacePreviewTabs(surface);
+          this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+            ? surface.previewSelected : "";
+          this.showHidden = typeof surface.showHidden === "boolean"
+            ? surface.showHidden : this.showHidden;
+          this.openFilesCollapsed = !!surface.openFilesCollapsed;
+          this.openFilesHeight = typeof surface.openFilesHeight === "number"
+            ? surface.openFilesHeight : null;
+          this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
+        }
       } catch {}
     },
 
@@ -4455,7 +4617,7 @@ function portal() {
           this.availableModels = d.models || [];
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           this._ensureValidModel();
-          this._rebindModelSelect();
+          await this._rebindModelSelect();
         }
       } catch {}
     },
@@ -4629,7 +4791,9 @@ function portal() {
     async onModelChange() {
       const newM = this.model;
       if (!this.currentId) return;
-      const cur = this.sessions.find(s => s.id === this.currentId);
+      const sid = this.currentId;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const cur = this.sessions.find(s => s.id === sid);
       const oldM = cur ? cur.model : "";
       if (newM === oldM) return;
       // If the new model doesn't honor the current effort (e.g. switched
@@ -4664,26 +4828,30 @@ function portal() {
       // Still toast so the user gets visual confirmation the switch happened.
       if (persistedCount === 0) {
         try {
-          const r = await fetch("/api/chat/sessions/" + this.currentId, {
+          const r = await fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
             method: "PATCH",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
             body: JSON.stringify({ model: newM }),
           });
           if (!r.ok) {
-            this.model = oldM;
-            this.toast(this.t("slash.failed"), "error");
+            if (this.currentId === sid) this.model = oldM;
+            if (this.currentId === sid) this.toast(this.t("slash.failed"), "error");
             return;
           }
           await this.refreshSessions();
-          this.savePrefs();
+          if (this.currentId === sid) this.savePrefs();
           const label = this.modelLabel(newM);
-          this.toast(this.lang === "zh"
-            ? `已切到 ${label}（空会话，无需新建）`
-            : `Switched to ${label} (empty session, no fork needed)`,
-            "success", 1800);
+          if (this.currentId === sid) {
+            this.toast(this.lang === "zh"
+              ? `已切到 ${label}（空会话，无需新建）`
+              : `Switched to ${label} (empty session, no fork needed)`,
+              "success", 1800);
+          }
         } catch (e) {
-          this.model = oldM;
-          this.toast(this.t("slash.failed"), "error");
+          if (this.currentId === sid) {
+            this.model = oldM;
+            this.toast(this.t("slash.failed"), "error");
+          }
         }
         return;
       }
@@ -4696,7 +4864,7 @@ function portal() {
         okText: this.t("model.switch_new"),
       });
       if (!ok) {
-        this.model = oldM;     // revert dropdown
+        if (this.currentId === sid) this.model = oldM;
         return;
       }
       try {
@@ -4705,10 +4873,13 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           // open_ids: same open-tab protection as newSession() (this model-fork
           // also creates a session, which triggers the empty-session recycler).
-          body: JSON.stringify({ name: "", model: newM, open_ids: this.openTabIds || [] }),
+          body: JSON.stringify({
+            name: "", model: newM, cwd: ownerWorkspace,
+            open_ids: this.openTabIds || [],
+          }),
         });
         if (!r.ok) {
-          this.model = oldM;
+          if (this.currentId === sid) this.model = oldM;
           this.toast(this.t("slash.failed"), "error");
           return;
         }
@@ -4716,17 +4887,23 @@ function portal() {
         await this.refreshSessions();
         // Model-fork creates a brand-new session — wire it up as a tab the
         // same way newSession() does (tabState + openTabIds + activate).
-        this.currentId = meta.id;
         const newSt = this._ensureTabState(meta.id);
         newSt.messages.length = 0;
         newSt._loaded = true;
-        this._activateTabState(meta.id);
         if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+        if (this._workspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
+          this.currentId = meta.id;
+          this._activateTabState(meta.id);
+          this.workspaceLastSession = {
+            ...this.workspaceLastSession,
+            [ownerWorkspace]: meta.id,
+          };
+        }
         this._fetchTabUsage(meta.id);
         this.savePrefs();
         this.toast(this.t("model.new_session_ok", { label }), "success", 2000);
       } catch (e) {
-        this.model = oldM;
+        if (this.currentId === sid) this.model = oldM;
         this.toast(this.t("slash.failed"), "error");
       }
     },
@@ -4814,45 +4991,119 @@ function portal() {
         .filter(level => this._effortAllowed(level, model))
         .map(level => ({ value: level, labelKey: "effort." + (level || "auto") }));
     },
-    async onEffortChange() {
-      if (!this.currentId) return;
-      const e = this.effort || "";
+    async _serializeTabSettingPatch(st, tailKey, work) {
+      const prior = st[tailKey] || Promise.resolve();
+      const run = Promise.resolve(prior).catch(() => {}).then(work);
+      st[tailKey] = run;
       try {
-        const r = await fetch("/api/chat/sessions/" + this.currentId, {
-          method: "PATCH",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ effort: e }),
-        });
+        return await run;
+      } finally {
+        if (st[tailKey] === run) st[tailKey] = null;
+      }
+    },
+    async onEffortChange() {
+      if (!this.currentId) return false;
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      const seq = ++st._effortPatchSeq;
+      const e = this.effort || "";
+      const session = this.sessions.find(s => s.id === sid);
+      const previous = (session && session.effort) || "";
+      const priorExpected = st._effortExpected;
+      const expected = {
+        seq, value: e,
+        fallback: priorExpected ? priorExpected.fallback : previous,
+      };
+      st._effortExpected = expected;
+      try {
+        const r = await this._serializeTabSettingPatch(
+          st, "_effortPatchTail", async () => {
+            if (this.tabState[sid] !== st || st._effortPatchSeq !== seq) return null;
+            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+              method: "PATCH",
+              headers: { ...this.hdr(), "Content-Type": "application/json" },
+              body: JSON.stringify({ effort: e }),
+            });
+          },
+        );
+        if (!r) return false;
         if (!r.ok) throw new Error(await r.text());
+        if (this.tabState[sid] !== st) return false;
+        const cur = this.sessions.find(s => s.id === sid);
+        if (cur) cur.effort = e;
+        if (st._effortExpected) {
+          st._effortExpected.fallback = e;
+          if (st._effortExpected.seq === seq && st._effortExpected.echoed) {
+            st._effortExpected = null;
+          }
+        }
+        if (st._effortPatchSeq !== seq) return false;
         const label = this.t("effort." + (e || "auto"));
         this.toast(this.t("effort.changed", { label }), "info", 1800);
-        // Mirror into the session list cache so tab-switch sees the right value.
-        const cur = this.sessions.find(s => s.id === this.currentId);
-        if (cur) cur.effort = e;
+        if (this.currentId === sid) this.effort = e;
+        return true;
       } catch (err) {
+        if (this.tabState[sid] !== st || st._effortPatchSeq !== seq) return false;
+        const fallback = expected.fallback;
+        if (st._effortExpected === expected) st._effortExpected = null;
+        const actual = this.sessions.find(s => s.id === sid);
+        if (actual) actual.effort = fallback;
+        if (this.currentId === sid) this.effort = fallback;
         this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        return false;
       }
     },
     async onThinkingChange() {
       // Toggles the backend thinking CONFIG for this session (not display).
       // PATCH {thinking} → server rebuilds the client; next turn honors it.
-      if (!this.currentId) return;
+      if (!this.currentId) return false;
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      const seq = ++st._thinkingPatchSeq;
       const on = !!this.thinkingEnabled;
+      const session = this.sessions.find(s => s.id === sid);
+      const previous = session ? session.thinking !== false : true;
+      const priorExpected = st._thinkingExpected;
+      const expected = {
+        seq, value: on,
+        fallback: priorExpected ? priorExpected.fallback : previous,
+      };
+      st._thinkingExpected = expected;
       try {
-        const r = await fetch("/api/chat/sessions/" + this.currentId, {
-          method: "PATCH",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ thinking: on }),
-        });
+        const r = await this._serializeTabSettingPatch(
+          st, "_thinkingPatchTail", async () => {
+            if (this.tabState[sid] !== st || st._thinkingPatchSeq !== seq) return null;
+            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+              method: "PATCH",
+              headers: { ...this.hdr(), "Content-Type": "application/json" },
+              body: JSON.stringify({ thinking: on }),
+            });
+          },
+        );
+        if (!r) return false;
         if (!r.ok) throw new Error(await r.text());
-        this.toast(this.t(on ? "thinking.on" : "thinking.off"), "info", 1800);
-        // Mirror into the session list cache so tab-switch sees the right value.
-        const cur = this.sessions.find(s => s.id === this.currentId);
+        if (this.tabState[sid] !== st) return false;
+        const cur = this.sessions.find(s => s.id === sid);
         if (cur) cur.thinking = on;
+        if (st._thinkingExpected) {
+          st._thinkingExpected.fallback = on;
+          if (st._thinkingExpected.seq === seq && st._thinkingExpected.echoed) {
+            st._thinkingExpected = null;
+          }
+        }
+        if (st._thinkingPatchSeq !== seq) return false;
+        this.toast(this.t(on ? "thinking.on" : "thinking.off"), "info", 1800);
+        if (this.currentId === sid) this.thinkingEnabled = on;
+        return true;
       } catch (err) {
-        // Revert the checkbox so UI reflects the real (unchanged) state.
-        this.thinkingEnabled = !on;
+        if (this.tabState[sid] !== st || st._thinkingPatchSeq !== seq) return false;
+        const fallback = expected.fallback;
+        if (st._thinkingExpected === expected) st._thinkingExpected = null;
+        const actual = this.sessions.find(s => s.id === sid);
+        if (actual) actual.thinking = fallback;
+        if (this.currentId === sid) this.thinkingEnabled = fallback;
         this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        return false;
       }
     },
 
@@ -4887,7 +5138,27 @@ function portal() {
         streamElapsed: 0,
         _streamTimer: null,
         _streamStartedAt: 0,
+        _lastSseActivity: 0,
+        _stallWatch: null,
+        _serverActiveObserved: false,
+        _streamHealthProbe: null,
+        _reconnectTimer: null,
+        _effortPatchSeq: 0,
+        _thinkingPatchSeq: 0,
+        _effortExpected: null,
+        _thinkingExpected: null,
+        _effortPatchTail: null,
+        _thinkingPatchTail: null,
         _loaded: false,   // set true after first loadSession populates messages
+        _seenUpdated: undefined,
+        _reconcileTargetUpdated: 0,
+        _reconcilePromise: null,
+        _reconcileRetryTimer: null,
+        _pendingExternalUpdate: false,
+        atBottom: true,
+        scrollTop: 0,
+        _userScrollAt: 0,
+        _autoScrolling: false,
         // True when this tab's turn finished while the user was looking at a
         // different tab — drives a green dot on the tab strip so the user
         // notices "this one's ready". Cleared when the user activates the tab.
@@ -4982,6 +5253,31 @@ function portal() {
       if (window.innerWidth <= 900) return true;
       return !!(window.matchMedia
                  && window.matchMedia("(pointer: coarse) and (max-height: 500px)").matches);
+    },
+    setMobileTab(next) {
+      if (!["files", "preview", "chat"].includes(next) || next === this.mobileTab) return;
+      const previous = this.mobileTab;
+      const ownerPath = this.selected;
+      const ownerLoadSeq = this._previewLoadSeq;
+      if (previous === "preview" && next !== "preview") {
+        this._capturePreviewViewState(ownerPath);
+        this._cancelPreviewViewRestore();
+      }
+      // Restore the iframe while it is still hidden, then retry after the pane
+      // is measurable. This avoids the visible top-to-saved-position glide.
+      if (next === "preview" && previous !== "preview" && ownerPath
+          && this.previewMode === "html") {
+        this._restorePreviewViewState(ownerPath, ownerLoadSeq);
+      }
+      this.mobileTab = next;
+      if (next === "preview" && previous !== "preview" && ownerPath) {
+        this.$nextTick(() => requestAnimationFrame(() => {
+          if (this.mobileTab === "preview" && this.selected === ownerPath
+              && this._previewLoadSeq === ownerLoadSeq) {
+            this._schedulePreviewViewRestore(ownerPath, ownerLoadSeq);
+          }
+        }));
+      }
     },
     // The queue is authoritative server-side now (sessions/{sid}.queue.json,
     // drained autonomously by the backend — Option B). The browser keeps a
@@ -5403,6 +5699,7 @@ function portal() {
       this.streamElapsed = st.streamElapsed;
       this._streamTimer = st._streamTimer;
       this._streamStartedAt = st._streamStartedAt;
+      this.atBottom = st.atBottom !== false;
       // Tab cache may hold an out-of-date sessionUsage (e.g. backend table
       // updated since we last polled). Fire-and-forget a re-fetch so the
       // meter reflects current truth without blocking the UI swap.
@@ -5476,16 +5773,40 @@ function portal() {
       this._residentTabIds = list;
     },
 
-    async initSessions() {
-      await this.refreshSessions();
-      if (!this.sessions.length) {
+    async initSessions(options = {}) {
+      if (this._sessionInitPromise) return this._sessionInitPromise;
+      this._sessionInitPromise = this._initSessionsOnce(options);
+      try {
+        return await this._sessionInitPromise;
+      } finally {
+        this._sessionInitPromise = null;
+      }
+    },
+    async _initSessionsOnce(options = {}) {
+      let refreshed = !!options.skipRefresh;
+      // Retry once: a service generation can disappear between token
+      // validation and the first session pull during restart/deploy.
+      for (let attempt = 0; !refreshed && attempt < 2; attempt++) {
+        refreshed = await this.refreshSessions();
+        if (!refreshed && attempt === 0) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      if (!refreshed) {
+        this.connState = "reconnecting";
+        return false;
+      }
+      const inWorkspace = this.workspaceSessions();
+      const remembered = this.workspaceLastSession[this.currentWorkspacePath()];
+      if (!inWorkspace.length) {
         const s = await this.newSession();
         this.currentId = s.id;
-      } else if (!this.sessions.find(x => x.id === this.currentId)) {
+      } else if (!this.sessionInCurrentWorkspace(this.currentId)) {
         // localStorage had no saved session (new device / cleared storage).
         // Tab state is device-local now, so just land on the most recent
         // session rather than restoring a cross-device last-active pointer.
-        this.currentId = this.sessions[0].id;
+        const target = inWorkspace.find(s => s.id === remembered) || inWorkspace[0];
+        this.currentId = target.id;
       }
       // Reconcile openTabIds (restored from prefs) with what still exists on
       // the server: drop tabs whose session was deleted, then ensure currentId
@@ -5495,6 +5816,12 @@ function portal() {
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
+      if (this.currentWorkspacePath() && this.currentId) {
+        this.workspaceLastSession = {
+          ...this.workspaceLastSession,
+          [this.currentWorkspacePath()]: this.currentId,
+        };
+      }
       // [resident-panes] Seed the LRU with the landing tab only. Other restored
       // tabs lazy-mount on first switch (rebuild path), so a multi-tab restore
       // doesn't pay to render every pane up front.
@@ -5502,10 +5829,11 @@ function portal() {
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
-        await this.loadSession(this.currentId);
-        st._loaded = true;
+        await this._ensureSessionLoaded(this.currentId);
       }
-      this.savePrefs();
+      this._sessionsInitialized = true;
+      this._scheduleSavePrefs();
+      return true;
     },
     // Shared session-list pull behind both the explicit refresh and the 10s
     // quiet poll. Returns true when the list was (re)applied, false on a 304
@@ -5521,6 +5849,15 @@ function portal() {
     // a direct fetch. Both call paths cache the latest ETag so the next
     // conditional poll always compares against a fresh baseline.
     async _pullSessionList(conditional = false, extraIds = "") {
+      if (this._sessionListPullPromise) return this._sessionListPullPromise;
+      this._sessionListPullPromise = this._pullSessionListOnce(conditional, extraIds);
+      try {
+        return await this._sessionListPullPromise;
+      } finally {
+        this._sessionListPullPromise = null;
+      }
+    },
+    async _pullSessionListOnce(conditional = false, extraIds = "") {
       const headers = { ...this.hdr() };
       if (conditional && this._sessionsEtag) {
         headers["If-None-Match"] = this._sessionsEtag;
@@ -5543,12 +5880,27 @@ function portal() {
       }
       const _ids = encodeURIComponent(_idSet.join(","));
       let r;
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+      );
       try {
-        r = await fetch(`/api/chat/sessions?limit=100&ids=${_ids}`, { headers });
+        r = await fetch(`/api/chat/sessions?limit=100&ids=${_ids}`, {
+          headers,
+          signal: controller.signal,
+        });
       } catch (_) {
         return false;  // network blip; next tick retries
+      } finally {
+        clearTimeout(timeout);
       }
-      if (r.status === 304) return false;  // unchanged — skip re-render
+      if (r.status === 304) {
+        // A transcript revision may have been deferred while its local stream
+        // owned the pane. Drain it even when the list body itself is unchanged.
+        this._reconcileOpenSession(this.sessions);
+        return false;
+      }
       if (!r.ok) return false;
       const et = r.headers.get("etag");
       if (et) this._sessionsEtag = et;
@@ -5559,10 +5911,11 @@ function portal() {
     },
     async refreshSessions() {
       const ok = await this._pullSessionList(false);
-      if (!ok) return;
-      // <select x-model="currentId"> needs a tickle to sync display when
-      // sessions populate (same Alpine-x-model-on-dynamic-options race).
-      await this._rebindSelect("currentId");
+      if (!ok) return false;
+      await this._recoverStalledStream(this.currentId);
+      // Session tabs are keyed buttons now; toggling currentId through an
+      // empty value only tears down Alpine DOM and loses the scroll position.
+      return true;
     },
     // FIX ⑪: quiet variant for the 10s foreground poll. Identical list-merge
     // (incl. the FIX ⑩ active-flag dots + green-dot transition) but WITHOUT
@@ -5574,7 +5927,32 @@ function portal() {
     // _applySessionList, so an idle multi-tab user stops re-rendering the
     // picker every 10s.
     async _syncSessionListQuiet() {
-      await this._pullSessionList(true);
+      return await this._pullSessionList(true);
+    },
+    _retainExpectedSessionSettings(meta) {
+      const st = meta && this.tabState && this.tabState[meta.id];
+      if (!st) return meta;
+      let out = meta;
+      const fields = [
+        ["_effortExpected", "_effortPatchTail", "effort",
+          value => value || ""],
+        ["_thinkingExpected", "_thinkingPatchTail", "thinking",
+          value => value !== false],
+      ];
+      for (const [expectedKey, tailKey, field, normalize] of fields) {
+        const expected = st[expectedKey];
+        if (!expected) continue;
+        const incoming = normalize(meta[field]);
+        if (incoming === expected.value) {
+          expected.fallback = incoming;
+          if (st[tailKey]) expected.echoed = true;
+          else st[expectedKey] = null;
+          continue;
+        }
+        if (out === meta) out = { ...meta };
+        out[field] = expected.value;
+      }
+      return out;
     },
     // Shared session-list applier. Snapshots the prior server-side `active`
     // flags BEFORE swapping in the new list (FIX ⑩) so we can detect a
@@ -5602,6 +5980,7 @@ function portal() {
       if (_pending.length) {
         next = [...(_pending.map(id => _om[id])), ...next];
       }
+      next = next.map(meta => this._retainExpectedSessionSettings(meta));
       // Keep the OPEN conversation's messages live too — not just the session
       // LIST. Runs BEFORE the equality early-return so it fires every pull even
       // when the picker itself doesn't need a re-render (e.g. a turn still
@@ -5638,42 +6017,191 @@ function portal() {
     // "nothing changed" tick. `_openSeenUpdated` is the updated_at the rendered
     // messages reflect; a real load / switch / our-own-stream-done re-baselines
     // it (set to undefined) so we never reload a session we just pulled.
+    async _recoverStalledStream(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st || (!st.streaming && !st.es) || st._reconnectTimer) return false;
+      if (st._streamHealthProbe) return st._streamHealthProbe;
+
+      const ownerEs = st.es;
+      const observedActivity = Number(st._lastSseActivity)
+        || Number(st._streamStartedAt) || Date.now();
+      const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
+      if (!transportClosed && Date.now() - observedActivity < 18_000) return false;
+
+      const task = (async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
+        try {
+          const r = await fetch(`/api/chat/sessions/${sid}/active`, {
+            headers: this.hdr(), signal: controller.signal,
+          });
+          if (!r.ok) return false;
+          const d = await r.json();
+          if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+
+          if (d.active) {
+            st._serverActiveObserved = true;
+            const silenceMs = Date.now() - (Number(st._lastSseActivity)
+              || Number(st._streamStartedAt) || Date.now());
+            const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
+            const closedNow = !!(st.es && Number(st.es.readyState) === 2);
+            if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
+              return false;
+            }
+            try { st.es.close(); } catch (_) {}
+            if (st._stallWatch) clearInterval(st._stallWatch);
+            st._stallWatch = null;
+            st.es = null;
+            st.streaming = false;
+            st._reconnectAttempts = 0;
+            if (sid === this.currentId) {
+              this.es = null;
+              this.streaming = false;
+            }
+            await this.send({
+              reconnect: true,
+              sessionId: sid,
+              startedAt: d.started_at,
+            });
+            return true;
+          }
+
+          if (!st._serverActiveObserved && !st._pendingExternalUpdate) return false;
+          this._retireStaleSessionStream(sid, st);
+          st._pendingExternalUpdate = true;
+          const loaded = await this.loadSession(sid, { quiet: true });
+          if (loaded) {
+            st._loaded = true;
+            st._pendingExternalUpdate = false;
+            this._syncQueueFromServer(sid);
+          }
+          return !!loaded;
+        } catch (_) {
+          return false;
+        } finally {
+          clearTimeout(timeout);
+        }
+      })();
+      st._streamHealthProbe = task;
+      try {
+        return await task;
+      } finally {
+        if (this.tabState[sid] === st && st._streamHealthProbe === task) {
+          st._streamHealthProbe = null;
+        }
+      }
+    },
+
+    _retireStaleSessionStream(sid, st) {
+      if (st.es) { try { st.es.close(); } catch (_) {} st.es = null; }
+      if (st._streamTimer) {
+        clearInterval(st._streamTimer);
+        st._streamTimer = null;
+      }
+      if (st._stallWatch) {
+        clearInterval(st._stallWatch);
+        st._stallWatch = null;
+      }
+      st.streaming = false;
+      st._draining = false;
+      st._reconnectAttempts = 0;
+      st._serverActiveObserved = false;
+      st.streamElapsed = 0;
+      st._streamStartedAt = 0;
+      if (sid === this.currentId) {
+        this.streaming = false;
+        this.es = null;
+        this._streamTimer = null;
+        this.streamElapsed = 0;
+        this._streamStartedAt = 0;
+      }
+    },
+
     _reconcileOpenSession(next) {
-      const sid = this.currentId;
-      if (!sid) return;
-      // Hidden tab: defer — visibilitychange→visible re-pulls the list and we
-      // reconcile then. Avoids churn (and battery) while the user isn't looking.
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") return;
-      // Our own live stream already owns the view (renders incrementally).
-      if (this.streaming) return;
-      const cur = (next || []).find(s => s && s.id === sid);
-      if (!cur) return;
-      const newU = Number(cur.updated_at) || 0;
-      const baseline = this._openSeenUpdated;
-      this._openSeenUpdated = newU;
-      // First sight after a fresh load / switch: just baseline. loadSession
-      // already pulled the latest and _checkActiveTurn re-attached any live turn.
-      if (baseline === undefined) return;
-      if (cur.active) {
-        // Server reports a live turn on the OPEN session but this tab isn't
-        // streaming it (PWA resumed with a dropped SSE, or the turn is running
-        // on another device). Quiet-reload pulls the authoritative server view
-        // — including a prompt that was sent on another device, which this tab
-        // never had — and loadSession's internal _checkActiveTurn then reconnects
-        // the SSE so the reply streams in live. (Reconnecting WITHOUT the reload
-        // would let send({reconnect})'s "truncate back to last user msg" eat a
-        // real prior reply when the externally-sent prompt isn't in our view.)
-        // Runs regardless of scroll — reconnect is append-only and honors
-        // atBottom, so a user reading history isn't yanked. Self-limiting: once
-        // the reconnect sets streaming=true the guard above skips repeat ticks.
-        this.loadSession(sid, { quiet: true });
-      } else if (newU > baseline && this.atBottom) {
-        // A turn finished from OUTSIDE this tab (another device / background
-        // task) — its final messages are on disk now. Pull them in place. Gated
-        // on atBottom so a user scrolled up reading history is never yanked down;
-        // they'll get the update on their next scroll-to-bottom / switch / send.
-        this.loadSession(sid, { quiet: true });
+      const metas = next || [];
+      for (const sid of (this.currentId ? [this.currentId] : [])) {
+        const cur = metas.find(s => s && s.id === sid);
+        if (!cur) continue;
+        const st = this._ensureTabState(sid);
+        const previous = (this.sessions || []).find(s => s && s.id === sid);
+        const newU = Number(cur.updated_at) || 0;
+        const baseline = st._seenUpdated;
+        const baselineN = Number(baseline);
+        const hasBaseline = baseline !== undefined && Number.isFinite(baselineN);
+        const newer = hasBaseline && newU > baselineN;
+        st._reconcileTargetUpdated = Math.max(
+          Number(st._reconcileTargetUpdated) || 0,
+          newU,
+        );
+
+        const streamAgeMs = st._streamStartedAt
+          ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
+        if (cur.active) st._serverActiveObserved = true;
+        const serverSettled = !cur.active && (
+          st._serverActiveObserved
+          || !!(previous && previous.active)
+          || (newer && streamAgeMs >= 5000)
+        );
+        if ((st.streaming || st.es) && serverSettled) {
+          this._retireStaleSessionStream(sid, st);
+          st._pendingExternalUpdate = true;
+        }
+        if (st.streaming || st.es) {
+          if (newer) st._pendingExternalUpdate = true;
+          continue;
+        }
+
+        const needsRefresh = !!cur.active || st._pendingExternalUpdate || newer;
+        if (st._reconcilePromise) {
+          if (needsRefresh) st._pendingExternalUpdate = true;
+          continue;
+        }
+        if (!needsRefresh) {
+          if (!hasBaseline && st._loaded && newU) st._seenUpdated = newU;
+          continue;
+        }
+
+        const attach = !!cur.active;
+        st._pendingExternalUpdate = false;
+        let succeeded = false;
+        const task = (async () => {
+          try {
+            const loaded = this._sessionLoadPromises[sid]
+              ? await this._sessionLoadPromises[sid]
+              : await this.loadSession(sid, { quiet: true });
+            if (!loaded) {
+              st._pendingExternalUpdate = true;
+              return;
+            }
+            succeeded = true;
+            st._loaded = true;
+            if (attach) await this._checkActiveTurn(sid);
+          } catch (_) {
+            st._pendingExternalUpdate = true;
+          } finally {
+            if (st._reconcilePromise === task) st._reconcilePromise = null;
+            const seen = Number(st._seenUpdated);
+            const hasSeen = st._seenUpdated !== undefined && Number.isFinite(seen);
+            const target = Number(st._reconcileTargetUpdated) || 0;
+            const stillBehind = target > 0 && (!hasSeen || target > seen);
+            if (stillBehind) st._pendingExternalUpdate = true;
+            else if (succeeded) st._pendingExternalUpdate = false;
+            if (succeeded && stillBehind && !st.streaming && !st.es
+                && !st._reconcileRetryTimer) {
+              st._reconcileRetryTimer = setTimeout(() => {
+                st._reconcileRetryTimer = null;
+                const latest = (this.sessions || []).find(s => s && s.id === sid);
+                if (latest) this._reconcileOpenSession([latest]);
+              }, 250);
+            }
+          }
+        })();
+        st._reconcilePromise = task;
       }
     },
     // Field-level equality over the rendered session metadata. Returns true
@@ -5697,6 +6225,7 @@ function portal() {
         if ((x.effort || "") !== (y.effort || "")) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
         if ((x.system_prompt || "") !== (y.system_prompt || "")) return false;
+        if ((x.cwd || "") !== (y.cwd || "")) return false;
       }
       return true;
     },
@@ -5749,7 +6278,403 @@ function portal() {
       return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-` +
              `${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
     },
-    newSession() {
+    currentWorkspacePath() {
+      if (this.activeWorkspace) return this.activeWorkspace;
+      const session = this.sessions.find(s => s.id === this.currentId);
+      return (session && session.cwd)
+        || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+    },
+    _workspaceIsCurrent(path) {
+      return String(path || "") === String(this.currentWorkspacePath() || "");
+    },
+    workspaceLabel(path = "") {
+      const value = path || this.currentWorkspacePath();
+      const entry = this.sessionWorkspaces.find(w => w.path === value);
+      return entry ? entry.name
+        : (value.split("/").filter(Boolean).pop() || (this.lang === "zh" ? "工作目录" : "Workspace"));
+    },
+    async fetchSessionWorkspaces() {
+      try {
+        const response = await fetch("/api/chat/workspaces", { headers: this.hdr() });
+        if (!response.ok) return false;
+        const payload = await response.json();
+        this.sessionWorkspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
+        const valid = new Set(this.sessionWorkspaces.map(w => w.path));
+        const session = this.sessions.find(s => s.id === this.currentId);
+        const fallback = (session && valid.has(session.cwd) && session.cwd)
+          || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+        const requested = this.activeWorkspace;
+        if (!valid.has(requested)) {
+          this.activeWorkspace = fallback;
+          if (requested && fallback) {
+            const surface = this.workspaceSurfaces[fallback] || {};
+            this.tabs = this._workspacePreviewTabs(surface);
+            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+              ? surface.previewSelected : "";
+            this.showHidden = typeof surface.showHidden === "boolean"
+              ? surface.showHidden : false;
+            this.openFilesCollapsed = !!surface.openFilesCollapsed;
+            this.openFilesHeight = typeof surface.openFilesHeight === "number"
+              ? surface.openFilesHeight : null;
+            this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
+            this._pendingExpanded = Array.from(this.expanded);
+          }
+        }
+        return true;
+      } catch (_) {
+        return false;
+      }
+    },
+    async _pullAllSessions() {
+      try {
+        const response = await fetch("/api/chat/sessions", { headers: this.hdr() });
+        if (!response.ok) return false;
+        const data = await response.json();
+        this._applySessionList((data && data.sessions) || []);
+        const etag = response.headers.get("etag");
+        if (etag) this._sessionsEtag = etag;
+        return true;
+      } catch (_) {
+        return false;
+      }
+    },
+    async _refreshSessionsAfterWorkspaceRegistryChange() {
+      this._sessionsEtag = "";
+      return await this._pullAllSessions();
+    },
+    workspaceOpenTabIds(path = "") {
+      const cwd = path || this.currentWorkspacePath();
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const byId = new Map(this.sessions.map(s => [s.id, s]));
+      return (this.openTabIds || []).filter(id => {
+        const session = byId.get(id);
+        return session && (session.cwd || primary) === cwd;
+      });
+    },
+    sessionInCurrentWorkspace(id) {
+      const session = this.sessions.find(s => s.id === id);
+      if (!session) return false;
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      return (session.cwd || primary) === this.currentWorkspacePath();
+    },
+    workspaceSessions(path = "") {
+      const cwd = path || this.currentWorkspacePath();
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      return (this.sessions || []).filter(s => s && (s.cwd || primary) === cwd);
+    },
+    _workspacePreviewTabs(surface = {}) {
+      const seen = new Set();
+      return (Array.isArray(surface.previewTabs) ? surface.previewTabs : [])
+        .filter(tab => {
+          const path = tab && typeof tab.path === "string" ? tab.path : "";
+          if (!path || seen.has(path)) return false;
+          seen.add(path);
+          return true;
+        })
+        .map(tab => this._previewTabSnapshot(tab));
+    },
+    _captureWorkspaceSurface(path = "") {
+      const cwd = path || this.currentWorkspacePath();
+      if (!cwd) return;
+      this._capturePreviewViewState(this.selected);
+      this.workspaceSurfaces = {
+        ...this.workspaceSurfaces,
+        [cwd]: {
+          previewTabs: (this.tabs || []).map(t => this._previewTabSnapshot(t)),
+          previewSelected: this.selected || "",
+          expanded: Array.from(this.expanded || []),
+          showHidden: !!this.showHidden,
+          openFilesCollapsed: !!this.openFilesCollapsed,
+          openFilesHeight: this.openFilesHeight,
+        },
+      };
+    },
+    async _changeWorkspaceSurface(path) {
+      if (!path || path === this.activeWorkspace) return true;
+      const previous = this.activeWorkspace;
+      if (previous) this._captureWorkspaceSurface(previous);
+
+      // Invalidate owner-scoped file operations before changing the header.
+      // Relative paths such as README.md repeat across projects, so late
+      // responses from the old root must never land in the new one.
+      ++this._treeLoadSeq;
+      this._childFetches = new Map();
+      if (this._fileSearchAbort) this._fileSearchAbort.abort();
+      if (this._previewAbort) this._previewAbort.abort();
+      if (this._csvAbort) this._csvAbort.abort();
+      this._fileSearchAbort = this._previewAbort = this._csvAbort = null;
+      ++this._fileSearchSeq;
+      ++this._previewLoadSeq;
+      ++this._csvLoadSeq;
+      ++this._selectedMetaSeq;
+      ++this._trashLoadSeq;
+      this._cancelMentionLookup();
+      ++this._paletteFileSeq;
+      this.palette.fileResults = [];
+      this.palette.fileQuery = "";
+      this.palette.fileLoading = false;
+
+      const surface = this.workspaceSurfaces[path] || {};
+      const keepMobileTab = this.mobileTab;
+      this.activeWorkspace = path;
+      this.clearSearch();
+      this.visible = [];
+      this.childCache = {};
+      this.treeError = "";
+      this.treeFocusPath = "";
+      this.selectedPaths = new Set();
+      this._selAnchor = "";
+      this.fileClipboard = { path: "", name: "" };
+      this.trash.items = [];
+      this.trash.count = 0;
+      this.trash.loading = false;
+      if (this._previewCache) this._previewCache.clear();
+      this._previewCacheBytes = 0;
+      this._clearPreviewState();
+      this.tabs = this._workspacePreviewTabs(surface);
+      this.showHidden = typeof surface.showHidden === "boolean"
+        ? surface.showHidden : false;
+      this.openFilesCollapsed = !!surface.openFilesCollapsed;
+      this.openFilesHeight = typeof surface.openFilesHeight === "number"
+        ? surface.openFilesHeight : null;
+      this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
+      this._pendingExpanded = Array.from(this.expanded);
+
+      const selected = typeof surface.previewSelected === "string"
+        ? surface.previewSelected : "";
+      await Promise.all([this.loadRoot(), this.loadTrash(), this.fetchContextInfo()]);
+      if (selected && this.tabs.some(t => t.path === selected)) {
+        const tab = this.tabs.find(t => t.path === selected);
+        await this.openFile(
+          { path: selected, name: tab.name || selected.split("/").pop() },
+          { preview: !!tab.preview },
+        );
+      }
+      this.setMobileTab(keepMobileTab);
+      this.savePrefs();
+      return true;
+    },
+    async switchWorkspace(path) {
+      this.workspaceMenuOpen = false;
+      if (!path || path === this.activeWorkspace || this.workspaceSwitching) return;
+      if (!this.sessionWorkspaces.some(w => w.path === path)) {
+        this.toast(this.lang === "zh" ? "工作目录未登记" : "Workspace is not registered", "error");
+        return;
+      }
+      if (!this._confirmLoseEdits()) return;
+      this.workspaceSwitching = true;
+      try {
+        await this._changeWorkspaceSurface(path);
+        if (!this.workspaceSessions(path).length) await this._pullAllSessions();
+        const remembered = this.workspaceLastSession[path];
+        const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
+          || this.workspaceOpenTabIds(path).map(id => this.sessions.find(s => s.id === id)).find(Boolean)
+          || this.workspaceSessions(path)[0];
+        if (target) await this.openTab(target.id);
+        else this.newSession({ cwd: path });
+        this.toast((this.lang === "zh" ? "已切换到 " : "Switched to ")
+          + this.workspaceLabel(path), "success", 1600);
+      } finally {
+        this.workspaceSwitching = false;
+      }
+    },
+    closeWorkspaceBrowser() {
+      if (!this.workspaceBrowser.show || this.workspaceSwitching) return;
+      this.workspaceBrowser.show = false;
+      this.workspaceBrowser.requestSeq++;
+      this.workspaceBrowser.loading = false;
+      this.workspaceBrowser.error = "";
+      this.workspaceBrowser.selected = "";
+    },
+    async browseWorkspaceDirectory(path = "") {
+      const browser = this.workspaceBrowser;
+      const requestSeq = ++browser.requestSeq;
+      browser.loading = true;
+      browser.error = "";
+      browser.selected = "";
+      try {
+        const query = path ? "?path=" + encodeURIComponent(path) : "";
+        const response = await fetch("/api/chat/workspaces/browse" + query,
+          { headers: this.hdr() });
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        if (!browser.show || requestSeq !== browser.requestSeq) return false;
+        browser.path = typeof payload.path === "string" ? payload.path : "";
+        browser.name = typeof payload.name === "string" ? payload.name : "";
+        browser.parent = typeof payload.parent === "string" ? payload.parent : "";
+        browser.directories = Array.isArray(payload.directories) ? payload.directories : [];
+        browser.registered = !!payload.registered;
+        browser.selectable = !!payload.selectable;
+        browser.truncated = !!payload.truncated;
+        return true;
+      } catch (_) {
+        if (!browser.show || requestSeq !== browser.requestSeq) return false;
+        browser.error = this.lang === "zh"
+          ? "无法读取该目录，请返回上级后重试。"
+          : "Could not read this directory. Go up and try again.";
+        browser.directories = [];
+        return false;
+      } finally {
+        if (requestSeq === browser.requestSeq) browser.loading = false;
+      }
+    },
+    selectWorkspaceDirectory(directory) {
+      if (!directory || directory.registered || !directory.selectable) return;
+      this.workspaceBrowser.selected = directory.path;
+    },
+    workspaceBrowserTarget() {
+      const browser = this.workspaceBrowser;
+      if (browser.selected) {
+        const selected = browser.directories.find(d => d.path === browser.selected);
+        if (selected && selected.selectable && !selected.registered) return selected.path;
+      }
+      return browser.selectable && !browser.registered ? browser.path : "";
+    },
+    workspaceBrowserTargetLabel() {
+      const target = this.workspaceBrowserTarget();
+      if (!target) return this.lang === "zh" ? "请选择一个文件夹" : "Select a folder";
+      const name = target.split("/").filter(Boolean).pop() || target;
+      return (this.lang === "zh" ? "将添加：" : "Add: ") + name;
+    },
+    async _registerWorkspacePath(path) {
+      if (!path || this.workspaceSwitching) return null;
+      this.workspaceSwitching = true;
+      let entry = null;
+      try {
+        const response = await fetch("/api/chat/workspaces", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        entry = await response.json();
+        await this.fetchSessionWorkspaces();
+        await this._refreshSessionsAfterWorkspaceRegistryChange();
+      } catch (_) {
+        this.workspaceBrowser.error = this.lang === "zh"
+          ? "目录无效、不可读取或已经无法访问。"
+          : "The directory is invalid, unreadable, or no longer available.";
+        this.toast(this.lang === "zh" ? "目录无法登记" : "Could not register that directory", "error");
+      } finally {
+        this.workspaceSwitching = false;
+      }
+      return entry;
+    },
+    async confirmWorkspaceBrowser() {
+      const entry = await this._registerWorkspacePath(this.workspaceBrowserTarget());
+      if (!entry || !entry.path) return;
+      this.closeWorkspaceBrowser();
+      await this.switchWorkspace(entry.path);
+    },
+    async addWorkspacePathManually() {
+      if (this.workspaceSwitching) return;
+      const value = await this.prompt({
+        title: this.lang === "zh" ? "输入工作目录路径" : "Enter workspace path",
+        body: this.lang === "zh"
+          ? "用于选择器范围外的服务器目录；请输入已存在目录的绝对路径。"
+          : "For server folders outside the browser roots, enter an existing absolute path.",
+        placeholder: "/path/to/project",
+        okText: this.lang === "zh" ? "添加" : "Add",
+      });
+      const path = String(value || "").trim();
+      if (!path) return;
+      const entry = await this._registerWorkspacePath(path);
+      if (!entry || !entry.path) return;
+      this.closeWorkspaceBrowser();
+      await this.switchWorkspace(entry.path);
+    },
+    async addWorkspace() {
+      this.workspaceMenuOpen = false;
+      if (this.workspaceSwitching) return;
+      const browser = this.workspaceBrowser;
+      browser.show = true;
+      browser.error = "";
+      browser.selected = "";
+      browser.directories = [];
+      await this.browseWorkspaceDirectory(this.currentWorkspacePath());
+    },
+    _disposeTabRuntime(id) {
+      if (!id) return;
+      const st = this.tabState[id];
+      if (st) {
+        const ownedEs = st.es;
+        if (ownedEs) { try { ownedEs.close(); } catch {} }
+        if (st._streamTimer) clearInterval(st._streamTimer);
+        if (st._stallWatch) clearInterval(st._stallWatch);
+        if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
+        if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+        st.es = null;
+        st.streaming = false;
+        st._streamTimer = null;
+        st._stallWatch = null;
+        st._reconnectTimer = null;
+        st._streamHealthProbe = null;
+        st._serverActiveObserved = false;
+        st._reconcileRetryTimer = null;
+        st._reconcilePromise = null;
+        st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
+        st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
+        if (this.currentId === id && this.es === ownedEs) {
+          this.es = null;
+          this.streaming = false;
+          this._streamTimer = null;
+        }
+      }
+      this._stopBgContPoller(id);
+      if (this._sessionLoadPromises) delete this._sessionLoadPromises[id];
+      if (this._prefetching) delete this._prefetching[id];
+      if (this.tabState[id] === st) delete this.tabState[id];
+      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
+      this._clearSessionWarnFlags(id);
+    },
+    async removeWorkspace(path) {
+      const entry = this.sessionWorkspaces.find(w => w.path === path);
+      if (!entry || entry.primary || this.workspaceSwitching) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "移除工作目录" : "Remove workspace",
+        body: this.lang === "zh"
+          ? `确定移除「${entry.name}」吗？磁盘文件和已有会话不会被删除。`
+          : `Remove “${entry.name}”? Files on disk and existing sessions will not be deleted.`,
+        danger: true,
+        okText: this.lang === "zh" ? "移除" : "Remove",
+      });
+      if (!ok) return;
+      this.workspaceSwitching = true;
+      try {
+        if (this.activeWorkspace === path) {
+          const primary = this.sessionWorkspaces.find(w => w.primary);
+          if (primary) await this._changeWorkspaceSurface(primary.path);
+        }
+        const response = await fetch(
+          "/api/chat/workspaces?path=" + encodeURIComponent(path),
+          { method: "DELETE", headers: this.hdr() },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        const removedIds = new Set(this.sessions.filter(s => s.cwd === path).map(s => s.id));
+        for (const id of removedIds) this._disposeTabRuntime(id);
+        this.openTabIds = this.openTabIds.filter(id => !removedIds.has(id));
+        this.sessions = this.sessions.filter(s => !removedIds.has(s.id));
+        const surfaces = { ...this.workspaceSurfaces };
+        delete surfaces[path];
+        this.workspaceSurfaces = surfaces;
+        const lastSessions = { ...this.workspaceLastSession };
+        delete lastSessions[path];
+        this.workspaceLastSession = lastSessions;
+        await this.fetchSessionWorkspaces();
+        await this._refreshSessionsAfterWorkspaceRegistryChange();
+        if (!this.sessions.find(s => s.id === this.currentId)) {
+          const target = this.workspaceSessions()[0];
+          if (target) await this.openTab(target.id);
+          else this.newSession({ cwd: this.currentWorkspacePath() });
+        }
+        this.savePrefs();
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "移除工作目录失败" : "Could not remove workspace", "error");
+      } finally {
+        this.workspaceSwitching = false;
+      }
+    },
+    newSession(options = {}) {
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
       // Default name uses the user's BROWSER-LOCAL clock — the backend
@@ -5778,6 +6703,7 @@ function portal() {
       // old session you were just viewing). Fall back to this.model only when
       // the default isn't known yet (very first load before /providers lands).
       const seedModel = this.defaultModel || this.model || "";
+      const seedCwd = options.cwd || this.currentWorkspacePath();
       // Reflect it in the dropdown immediately — _activateTabState doesn't touch
       // this.model, so without this the selector would still show the old
       // session's model even though the new session is seeded with the default.
@@ -5793,6 +6719,7 @@ function portal() {
         auto_named: true,
         pinned: false,
         active: false,
+        cwd: seedCwd,
       };
       // --- synchronous, zero-network UI open ---
       // Track as optimistic so a sync poll firing before registration lands
@@ -5801,12 +6728,18 @@ function portal() {
       if (!this.sessions.some(s => s.id === id)) {
         this.sessions = [meta, ...this.sessions];
       }
+      this._captureChatPosition(this.currentId);
       this.currentId = id;
+      if (seedCwd) {
+        this.activeWorkspace = seedCwd;
+        this.workspaceLastSession = { ...this.workspaceLastSession, [seedCwd]: id };
+      }
       const st = this._ensureTabState(id);
       st.messages.length = 0;
       st._loaded = true;
       this._activateTabState(id);
       if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
+      if (this._isMobileLayout()) this.setMobileTab("chat");
       this.savePrefs();
       // --- background registration (fire-and-forget) ---
       // keepalive: lets the POST survive a tab navigation right after clicking.
@@ -5819,7 +6752,10 @@ function portal() {
         // open_ids: protect THIS browser's open tabs from the backend's
         // empty-session recycler (prune_empty_sessions keep_ids) — an open but
         // still-empty scratch tab must not be swept when a new one is created.
-        body: JSON.stringify({ id, name: meta.name, model: seedModel, open_ids: this.openTabIds || [] }),
+        body: JSON.stringify({
+          id, name: meta.name, model: seedModel, cwd: seedCwd,
+          open_ids: this.openTabIds || [],
+        }),
       }).then(r => (r && r.ok ? r.json() : null)).then(srv => {
         // Confirmed: drop the optimistic guard and reconcile any server-side
         // normalisation (e.g. provider model fallback) into the local row.
@@ -5863,7 +6799,7 @@ function portal() {
       const r = await fetch("/api/chat/sessions/organize", {
         method: "POST",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model }),
+        body: JSON.stringify({ model: this.model, cwd: this.currentWorkspacePath() }),
       });
       if (!r.ok) {
         this.toast(this.lang === "zh"
@@ -5873,7 +6809,12 @@ function portal() {
       }
       const meta = await r.json();
       await this.refreshSessions();
+      this._captureChatPosition(this.currentId);
       this.currentId = meta.id;
+      if (meta.cwd || this.currentWorkspacePath()) {
+        const cwd = meta.cwd || this.currentWorkspacePath();
+        this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: meta.id };
+      }
       const st = this._ensureTabState(meta.id);
       st.messages.length = 0;
       st._loaded = true;
@@ -5896,6 +6837,13 @@ function portal() {
     // Switch to (and if needed open) a tab. Used by the picker dropdown to
     // promote a history session into a tab.
     async openTab(id, makeCurrent = true) {
+      const session = this.sessions.find(s => s.id === id);
+      const cwd = session && session.cwd;
+      if (cwd && cwd !== this.currentWorkspacePath()
+          && this.sessionWorkspaces.some(w => w.path === cwd)) {
+        if (!this._confirmLoseEdits()) return;
+        await this._changeWorkspaceSurface(cwd);
+      }
       if (!this.openTabIds.includes(id)) {
         const MAX_TABS = 20;
         while (this.openTabIds.length >= MAX_TABS) {
@@ -5906,8 +6854,12 @@ function portal() {
         this.openTabIds.push(id);
       }
       if (makeCurrent && id !== this.currentId) {
+        this._captureChatPosition(this.currentId);
         this.currentId = id;
         await this.switchSession();
+      }
+      if (cwd) {
+        this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: id };
       }
       this.savePrefs();
     },
@@ -5944,33 +6896,17 @@ function portal() {
       const idx = this.openTabIds.indexOf(id);
       if (idx < 0) return;
       const wasActive = this.currentId === id;
-      const st = this.tabState[id];
-      // Don't offer undo for a tab whose stream is in flight — we'd have to
-      // re-attach to a live EventSource which gets hairy fast. Tearing it
-      // down and silently swallowing the in-flight reply is the lesser evil
-      // (and the user clicked × explicitly).
-      const wasStreaming = !!(st && st.streaming);
-      if (st) {
-        if (st.es) { try { st.es.close(); } catch {} }
-        if (st._streamTimer) clearInterval(st._streamTimer);
-        // preview is now a data URL (base64 thumbnail) — no blob revoke needed.
-      }
       this.openTabIds.splice(idx, 1);
-      // [resident-panes] Drop the closed tab's pane from the resident set (its
-      // DOM is unmounting). If it was active, switchSession below re-promotes
-      // the neighbor we land on.
-      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
+      this._disposeTabRuntime(id);
       if (wasActive) {
-        if (this.openTabIds.length) {
-          const nextIdx = Math.min(idx, this.openTabIds.length - 1);
-          this.currentId = this.openTabIds[nextIdx];
+        const workspaceTabs = this.workspaceOpenTabIds();
+        if (workspaceTabs.length) {
+          this.currentId = workspaceTabs[workspaceTabs.length - 1];
           await this.switchSession();
         } else {
           await this.newSession();
         }
       }
-      if (this.tabState[id]) delete this.tabState[id];
-      this._clearSessionWarnFlags(id);
       this.savePrefs();
       // Closing a tab is a cheap, reversible action (session is still in
       // history picker / sidebar). The previous toast-with-undo was noise
@@ -7051,14 +7987,14 @@ function portal() {
       return q ? `📦 Compacting… queued ${q}` : "📦 Compacting…";
     },
 
-    activateTab(tid) {
+    async activateTab(tid) {
       if (tid === this.currentId) return;
-      this.currentId = tid;
+      await this.openTab(tid);
+      if (this.currentId !== tid) return;
       // Clear the green "task done while you were elsewhere" dot now that
       // the user is actually looking at this tab.
       const st = this.tabState && this.tabState[tid];
       if (st && st.unread) st.unread = false;
-      this.switchSession();
       // Scroll the newly-active tab into view — when the strip overflows
       // horizontally (many sessions open), keyboard shortcuts / programmatic
       // activation would otherwise leave the active tab hidden off-screen.
@@ -7186,41 +8122,33 @@ function portal() {
       if (!m) return;
       const path = m.path;
       this.previewTabCtxMenu = null;
-      // Unsaved-edits guard for bulk-close actions that may evict the tab
-      // currently being edited. closeAll always does; closeOthers evicts the
-      // active edit unless it's the kept tab; closeRight evicts it only when
-      // the active edit sits to the right of `path`.
-      if (this.editing) {
-        const ti = this.tabs.findIndex(t => t.path === path);
-        const si = this.tabs.findIndex(t => t.path === this.selected);
-        const evictsEdit =
-          action === "closeAll" ||
-          (action === "closeOthers" && this.selected !== path) ||
-          (action === "closeRight" && ti >= 0 && si > ti);
-        if (evictsEdit && !this._confirmLoseEdits()) return;
-      }
       switch (action) {
         case "close":
           this.closeTab(path);
           break;
         case "closeOthers":
+          // Switch first, mutate second. openFile owns the dirty-editor guard;
+          // if the user cancels, keep the original tab array intact.
+          if (this.selected !== path) {
+            await this.switchTab(path);
+            if (this.selected !== path) return;
+          }
           this.tabs = this.tabs.filter(t => t.path === path);
-          if (this.selected !== path) await this.switchTab(path);
           this.savePrefs();
           break;
         case "closeRight": {
           const idx = this.tabs.findIndex(t => t.path === path);
+          const selectedIdx = this.tabs.findIndex(t => t.path === this.selected);
+          if (idx >= 0 && selectedIdx > idx) {
+            await this.switchTab(path);
+            if (this.selected !== path) return;
+          }
           if (idx >= 0) this.tabs = this.tabs.slice(0, idx + 1);
           this.savePrefs();
           break;
         }
         case "closeAll":
-          this.tabs = []; this.selected = "";
-          this.previewMode = "";
-          this.rawText = "";
-          this.renderedMd = "";
-          this.editing = false;
-          this.savePrefs();
+          this.closeAllTabs();
           break;
         case "reveal":
           await this.revealInTree(path);
@@ -7244,6 +8172,9 @@ function portal() {
       this._dragCounter = 0;
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const uploadContext = this._prepareUploadOverwrite("", files);
+      if (!uploadContext) return;
       // Always upload to the archive root (MUSELAB_ROOT), regardless of
       // which file is currently open in the preview pane. Earlier this
       // dropped into the previewed file's parent directory, but that
@@ -7262,9 +8193,13 @@ function portal() {
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet("", f))
       );
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
-      this.reloadTree();
+      await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (failed && !ok) {
         this.toast(this.lang === "zh"
           ? `${failed} 个文件上传失败`
@@ -7285,7 +8220,8 @@ function portal() {
     },
     // Single-file upload without tree reload / toast — used by parallel
     // drop handlers (onPreviewDrop, tree-onDrop multi-file) so the caller
-    // can batch the side effects. Returns true on success, false on error.
+    // can batch the side effects. Returns uploaded path metadata on success,
+    // false on error.
     async _uploadFileQuiet(dirPath, file) {
       const fd = new FormData();
       fd.append("path", dirPath);
@@ -7298,12 +8234,73 @@ function portal() {
           console.warn("[upload]", file.name, "failed:", r.status);
           return false;
         }
-        delete this.childCache[dirPath];
-        return true;
+        const data = await r.json().catch(() => ({}));
+        return {
+          path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
+          replaced_trash_id: data.replaced_trash_id || null,
+        };
       } catch (e) {
         console.warn("[upload]", file.name, "error:", e);
         return false;
       }
+    },
+    _prepareUploadOverwrite(dirPath, files) {
+      const targets = (files || []).map(file =>
+        dirPath ? `${dirPath}/${file.name}` : file.name);
+      const context = { editorPath: "", editorText: "", editorRef: null };
+      if (!this.editing || !targets.includes(this.selected)) return context;
+      if (!this._confirmLoseEdits()) return null;
+      context.editorPath = this.selected;
+      context.editorText = this._cm ? this._cm.getValue() : this.editText;
+      context.editorRef = this._cm;
+      return context;
+    },
+    async _syncUploadedFiles(
+      results,
+      uploadContext = {},
+      ownerWorkspace = this.currentWorkspacePath(),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      const uploaded = (results || [])
+        .filter(r => r.status === "fulfilled" && r.value && r.value.path)
+        .map(r => r.value);
+      if (!uploaded.length) return;
+      for (const item of uploaded) this._previewCacheDel(item.path);
+      const replaced = uploaded.filter(item => item.replaced_trash_id).length;
+      if (replaced) {
+        this.trash.count += replaced;
+        this.toast(this.lang === "zh"
+          ? `${replaced} 个同名旧文件已移到垃圾桶`
+          : `${replaced} replaced file(s) moved to trash`, "info", 3500);
+      }
+      if (!uploaded.some(item => item.path === this.selected)) return;
+      const path = this.selected;
+      if (this.editing) {
+        // Confirmation belongs to the exact editor buffer that existed when
+        // upload began. If the user switched away/back, entered edit mode
+        // afterwards, or kept typing while bytes were in flight, preserve that
+        // newer buffer instead of letting upload completion silently close it.
+        const sameEditor = uploadContext.editorPath === path
+          && uploadContext.editorRef === this._cm;
+        const liveText = this._cm ? this._cm.getValue() : this.editText;
+        if (!sameEditor || liveText !== uploadContext.editorText) {
+          this.cmStatus = { ...this.cmStatus, dirty: true };
+          this._previewNeedsReload = path;
+          this.previewVersion = Date.now();
+          this.toast(this.lang === "zh"
+            ? "上传已完成；上传期间的新编辑仍保留，尚未保存"
+            : "Upload finished; newer editor changes were kept unsaved",
+          "warn", 4000);
+          return;
+        }
+        this.editing = false;
+      }
+      const tab = this.tabs.find(t => t.path === path);
+      this.previewVersion = Date.now();
+      await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(tab && tab.preview), forceReload: true },
+      );
     },
     onPreviewTabDragStart(ev, path) {
       this._draggingPreviewTabPath = path;
@@ -7330,8 +8327,10 @@ function portal() {
       const from = this.tabs.findIndex(t => t.path === src);
       const to = this.tabs.findIndex(t => t.path === path);
       if (from < 0 || to < 0) return;
-      const [moved] = this.tabs.splice(from, 1);
-      this.tabs.splice(to, 0, moved);
+      const next = this.tabs.slice();
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      this.tabs = next;
       this.savePrefs();
     },
     onPreviewTabDragEnd() {
@@ -7402,15 +8401,19 @@ function portal() {
     _optimisticMetas: {},
     filteredSessions() {
       const q = (this.sessionPickerSearch || "").trim().toLowerCase();
-      if (!q) return this.sessions;
+      const cwd = this.currentWorkspacePath();
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const belongsHere = s => s && (s.cwd || primary) === cwd;
+      const local = this.workspaceSessions();
+      if (!q) return local;
       // Server search has answered for THIS exact query → use the full-archive
       // result set (reaches sessions outside the recent window).
       if (this._sessionSearchQuery === q && Array.isArray(this._sessionSearchResults)) {
-        return this._sessionSearchResults;
+        return this._sessionSearchResults.filter(belongsHere);
       }
       // Not yet (debounce / network in flight) → instant local feedback over
       // the loaded window; _searchSessions() replaces it with the server set.
-      return this.sessions.filter(s =>
+      return local.filter(s =>
         (s.name && s.name.toLowerCase().includes(q))
         || (s.first_prompt && s.first_prompt.toLowerCase().includes(q))
       );
@@ -7605,10 +8608,7 @@ function portal() {
         danger: true,
       });
       if (!ok) return;
-      await this.deleteSessionById(sid);
-      this.openTabIds = this.openTabIds.filter(x => x !== sid);
-      if (this.tabState[sid]) delete this.tabState[sid];
-      this.savePrefs();
+      await this.deleteSessionById(sid, { confirmed: true });
     },
 
     // One-click bulk clear of stale history (footer of the session picker).
@@ -7680,13 +8680,7 @@ function portal() {
       // loaded locally).
       const deletedIds = new Set((resp && resp.ids) || []);
       for (const sid of deletedIds) {
-        const st = this.tabState[sid];
-        if (st) {
-          if (st.es) { try { st.es.close(); } catch {} }
-          if (st._streamTimer) clearInterval(st._streamTimer);
-          delete this.tabState[sid];
-        }
-        this._clearSessionWarnFlags(sid);
+        this._disposeTabRuntime(sid);
       }
       this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
       await this.refreshSessions();
@@ -7752,24 +8746,7 @@ function portal() {
     },
     async menuDelete(id) {
       this.closeTabMenu();
-      // Close side effects (ES / interval) on the dying tab BEFORE the
-      // server delete, but defer tabState[id] cleanup until after we've
-      // removed the tab from openTabIds (so x-for unmounts its DOM first).
-      const st = this.tabState[id];
-      if (st) {
-        if (st.es) { try { st.es.close(); } catch {} }
-        if (st._streamTimer) clearInterval(st._streamTimer);
-      }
-      // deleteSessionById handles server delete + sessions-list refresh AND
-      // bumps the user to a remaining session if id was current.
       await this.deleteSessionById(id);
-      this.openTabIds = this.openTabIds.filter(x => x !== id);
-      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
-      if (!this.openTabIds.includes(this.currentId)) {
-        this.openTabIds.push(this.currentId);
-      }
-      if (this.tabState[id]) delete this.tabState[id];
-      this.savePrefs();
     },
     async switchSession() {
       // Re-baseline the open-session resync cursor on every switch — incl. the
@@ -7783,7 +8760,7 @@ function portal() {
       // chat-tabs strip, slash /resume, ctx-menu, programmatic newSession).
       // Earlier we only did this in openTab, which left chat-tabs taps and
       // a few other paths needing a second tap on the bottom Muse icon.
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      if (this._isMobileLayout()) this.setMobileTab("chat");
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
@@ -7807,6 +8784,10 @@ function portal() {
       // to effort which has the same shape (per-session metadata).
       const cur = this.sessions.find(s => s.id === this.currentId);
       if (cur) {
+        const cwd = cur.cwd || this.currentWorkspacePath();
+        if (cwd) {
+          this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: cur.id };
+        }
         if (cur.model) this.model = cur.model;
         // effort: explicit assignment even when empty — switching from
         // a high-effort tab to one with no override should clear the
@@ -7817,8 +8798,7 @@ function portal() {
       }
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
-        await this.loadSession(this.currentId);
-        st._loaded = true;
+        await this._ensureSessionLoaded(this.currentId);
       } else if (_wasResident) {
         // Already loaded — content is in the DOM, the switch is just an x-show
         // flip. The click→switch lag came from the browser laying out the
@@ -7827,8 +8807,9 @@ function portal() {
         // full-body walk, all BEFORE the browser could paint the currentId
         // change — so a big tab "froze" ~1.5s and even small tabs lagged
         // ~100-200ms.
-        this.atBottom = true;
         const stCur = this.tabState && this.tabState[this.currentId];
+        const shouldFollow = !stCur || stCur.atBottom !== false;
+        this.atBottom = shouldFollow;
         const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
         // Heavy history → keep the bubbles display:none'd for one frame
         // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
@@ -7855,11 +8836,8 @@ function portal() {
         // bubbles that realize as they scroll in — and onChatScroll is
         // suppressed during it, so the default cap is cheap in the common case
         // while still landing correctly on tall histories.
-        const settle = () => {
-          this._settleScrollToBottom();
-          this.atBottom = true;
-        };
-        if (histLen > 60) {
+        const settle = () => this._restoreChatPosition(target);
+        if (histLen > 60 && shouldFollow) {
           this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
           this._afterPaint(() => {
             if (this.currentId !== target) return;
@@ -7887,9 +8865,10 @@ function portal() {
         // (skip net/parse/md) — wait for the mount to paint, then highlight +
         // settle scroll. Cost is O(target history), bounded by THIS session, not
         // the sum of every open tab's retained DOM (that was the lag root cause).
-        this.atBottom = true;
         const target = this.currentId;
         const stCur = this.tabState && this.tabState[this.currentId];
+        const shouldFollow = !stCur || stCur.atBottom !== false;
+        this.atBottom = shouldFollow;
         // Hide bubbles for one frame so the tab-bar flip + skeleton paint
         // instantly; reveal next frame so the O(M) fresh-mount layout lands AFTER
         // the switch is on-screen (same trick as the heavy-warm path above).
@@ -7899,8 +8878,7 @@ function portal() {
           this.messagesReady = true;
           this._afterPaint(() => {
             if (this.currentId !== target) return;
-            this._settleScrollToBottom();
-            this.atBottom = true;
+            this._restoreChatPosition(target);
             // Fresh DOM → always (re)highlight; reset the sentinel first.
             if (stCur) stCur._highlighted = false;
             this.highlightCode(".chat-body");
@@ -7929,14 +8907,22 @@ function portal() {
       // Refresh the queue mirror on every load/reconnect probe so a session
       // with server-side queued items shows them immediately (e.g. items that
       // were waiting behind an active turn, or left dormant after a restart).
+      const st = this.tabState && this.tabState[sid];
+      if (!sid || !st) return;
       this._syncQueueFromServer(sid);
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+      );
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                               { headers: this.hdr() });
+                               { headers: this.hdr(), signal: controller.signal });
         if (!r.ok) return;
         const d = await r.json();
-        if (this.currentId !== sid) return;
-        if (d.active && !this.streaming) {
+        if (this.tabState[sid] !== st) return;
+        if (d.active && !st.streaming && !st.es) {
+          st._serverActiveObserved = true;
           // Reconnect any time the backend says there's an active turn.
           // get_session_api returns SDK-only messages (no broadcast
           // overlay), so loadSession's view is just the user msg — the
@@ -7949,7 +8935,7 @@ function portal() {
           // reload / tab-switch / SSE re-subscribe to an in-flight turn).
           // continuation: a bg-task watcher's headless turn — attach in
           // continuation mode so we DON'T truncate the launching card.
-          this.send({ reconnect: true, startedAt: d.started_at,
+          this.send({ reconnect: true, sessionId: sid, startedAt: d.started_at,
                        continuation: !!d.continuation });
           return;
         }
@@ -7963,6 +8949,7 @@ function portal() {
         // eventual completion surfaces live without a manual reload.
         this._ensureBgContPoller(sid);
       } catch (e) { /* silent */ }
+      finally { clearTimeout(timeout); }
     },
 
     // Hover-prefetch: kick off loadSession when the user's mouse rests
@@ -7998,16 +8985,36 @@ function portal() {
         if (st2 && st2._loaded) return;
         this._prefetching[sid] = true;
         try {
-          await this.loadSession(sid);
-          const st3 = this._ensureTabState(sid);
-          st3._loaded = true;
+          await this._ensureSessionLoaded(sid);
         } catch (_) { /* silent — actual click will retry */ }
         delete this._prefetching[sid];
       }, 300);
     },
 
+    async _ensureSessionLoaded(sid) {
+      if (!sid) return false;
+      const st = this._ensureTabState(sid);
+      if (st._loaded) return true;
+      if (this._sessionLoadPromises[sid]) {
+        return this._sessionLoadPromises[sid];
+      }
+      const task = (async () => {
+        const ok = await this.loadSession(sid);
+        if (ok) st._loaded = true;
+        return !!ok;
+      })();
+      this._sessionLoadPromises[sid] = task;
+      try {
+        return await task;
+      } finally {
+        if (this._sessionLoadPromises[sid] === task) {
+          delete this._sessionLoadPromises[sid];
+        }
+      }
+    },
+
     async loadSession(sid, opts = {}) {
-      if (!sid) return;
+      if (!sid) return false;
       // full:true → fetch the raw-JSONL view (?full=1) so PRE-compaction
       // messages are included. Used by jump-to-outline when the target
       // prompt lives before a compact boundary (the default SDK view starts
@@ -8027,7 +9034,7 @@ function portal() {
       // mid-reply. _reconcileOpenSession already gates on this.streaming, but a
       // reconnect can flip streaming true during this function's awaits, so we
       // bail up-front AND re-check right before the swap.
-      if (quiet && (st.streaming || st.es)) return;
+      if (quiet && (st.streaming || st.es)) return true;
       // Skeleton on the active tab during the fetch — markdown rendering of
       // a long history can also take a noticeable beat after the network
       // returns, so the flag must wrap both phases.
@@ -8037,6 +9044,8 @@ function portal() {
       // mid-load corrupts the now-active tab (messages not assigned / skeleton
       // stuck / model/effort overwritten by the old session). See loadSession race.
       const isCurrent = sid === this.currentId;
+      const quietScrollEl = quiet && isCurrent ? this.$refs.chatBody : null;
+      const quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
       // Quiet refresh keeps the existing bubbles on screen (morph swap below) —
       // raising the skeleton would defeat the point, so only cold/switch loads
       // flip it. Also re-baseline the open-session resync cursor on a real load
@@ -8066,13 +9075,28 @@ function portal() {
           : (_coldEarly ? 12 : 18);
         const FETCH_TAIL = _initialLoadEarly * 5;
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
-        const r = await fetch("/api/chat/sessions/" + sid + qs, { headers: this.hdr() });
-        if (!r.ok) {
-          st.messages.length = 0;
-          if (sid === this.currentId) this.messages = st.messages;
-          return;
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          full ? 60_000 : Math.max(100, Number(this._sessionReadTimeoutMs) || 15000),
+        );
+        let r;
+        try {
+          r = await fetch("/api/chat/sessions/" + sid + qs, {
+            headers: this.hdr(), signal: controller.signal,
+          });
+        } catch (_) {
+          return false;
+        } finally {
+          clearTimeout(timeout);
         }
-        const s = await r.json();
+        if (!r.ok) {
+          return false;
+        }
+        const s = this._retainExpectedSessionSettings(await r.json());
+        if (this.tabState[sid] !== st) return false;
+        const loadedUpdated = Number(s.updated_at) || 0;
+        if (loadedUpdated) st._seenUpdated = loadedUpdated;
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
         // Server messages only store {mime} for images — no preview URL —
@@ -8204,7 +9228,7 @@ function portal() {
         if (sid === this.currentId && quiet) {
           // Re-check after the fetch await: if a stream started meanwhile, abort
           // the swap so we don't wipe live bubbles (see up-front guard above).
-          if (st.streaming || st.es) return;
+          if (st.streaming || st.es) return true;
           // One-shot splice swap: Alpine morphs by stable :key (_k = sid+idx), so
           // already-rendered bubbles stay mounted (no blank flash, scroll kept)
           // and only the newly-finished tail bubbles get added.
@@ -8264,10 +9288,14 @@ function portal() {
               catch (_e) { /* highlight best-effort */ }
               if (sid === this.currentId && _wasAtBottom) {
                 this.atBottom = true; this.scrollToBottom(true);
+              } else if (sid === this.currentId && quietScrollEl) {
+                quietScrollEl.scrollTop = quietScrollTop;
+                st.scrollTop = quietScrollTop;
+                st.atBottom = false;
               }
             });
             await this._fetchTabUsage(sid);
-            return;
+            return true;
           }
           this.atBottom = true;
           // Hold the skeleton until highlight + artifacts finish, then reveal
@@ -8304,6 +9332,7 @@ function portal() {
           });
         }
         await this._fetchTabUsage(sid);
+        return true;
       } finally {
         // Re-check live: only clear the skeleton if this sid is STILL the
         // active tab. If the user switched away mid-load, the now-active tab
@@ -8468,7 +9497,7 @@ function portal() {
       });
     },
     _idlePreloadStep() {
-      const ids = this.openTabIds || [];
+      const ids = this.workspaceOpenTabIds();
       const next = ids.find(id => {
         if (!id || id === this.currentId) return false;
         const st = this.tabState && this.tabState[id];
@@ -8482,8 +9511,10 @@ function portal() {
       }
       if (!this._prefetching) this._prefetching = {};
       this._prefetching[next] = true;
-      this.loadSession(next)
-        .then(() => { this._ensureTabState(next)._loaded = true; })
+      this._ensureSessionLoaded(next)
+        .then(ok => {
+          if (!ok) this._ensureTabState(next)._preloadFailed = true;
+        })
         .catch(() => {
           // Mark so a persistently-failing tab isn't retried every idle
           // cycle; the real click still loads it via switchSession (which
@@ -9609,41 +10640,52 @@ function portal() {
       if (this._autoCompacted) delete this._autoCompacted[sid];
       if (this._prefetching) delete this._prefetching[sid];
     },
-    async deleteSessionById(sid) {
+    async deleteSessionById(sid, { confirmed = false } = {}) {
       const s = this.sessions.find(x => x.id === sid);
       const _dName = s?.name || sid.slice(0, 8);
-      const ok = await this.confirm({
-        title: this.t("modal.delete_session_title"),
-        body: this.t("modal.delete_session_body", { name: _dName }),
-        danger: true,
-        okText: this.t("modal.delete_session_ok"),
-      });
-      if (!ok) return;
-      // Tear down per-tab cached state before we forget about the session.
-      const dyingTab = this.tabState[sid];
-      if (dyingTab) {
-        if (dyingTab.es) { try { dyingTab.es.close(); } catch {} }
-        if (dyingTab._streamTimer) clearInterval(dyingTab._streamTimer);
-        delete this.tabState[sid];
+      if (!confirmed) {
+        const ok = await this.confirm({
+          title: this.t("modal.delete_session_title"),
+          body: this.t("modal.delete_session_body", { name: _dName }),
+          danger: true,
+          okText: this.t("modal.delete_session_ok"),
+        });
+        if (!ok) return false;
       }
-      this._clearSessionWarnFlags(sid);
+      const openBefore = this.workspaceOpenTabIds();
+      const openIdx = openBefore.indexOf(sid);
+      let response;
       try {
-        await fetch(`/api/chat/sessions/${sid}`, { method: "DELETE", headers: this.hdr() });
+        response = await fetch(`/api/chat/sessions/${sid}`, {
+          method: "DELETE", headers: this.hdr(),
+        });
       } catch (e) {
         this.errToast("delete", String((e && e.message) || e));
+        return false;
       }
+      if (!response.ok) {
+        this.errToast("delete", await response.text());
+        return false;
+      }
+      this._disposeTabRuntime(sid);
       await this.refreshSessions();
+      this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
       if (this.currentId === sid) {
-        if (this.sessions.length === 0) {
-          // newSession already pushes to openTabIds + activates tab state.
-          await this.newSession();
+        const workspaceSessions = this.workspaceSessions();
+        if (workspaceSessions.length === 0) {
+          await this.newSession({ cwd: this.currentWorkspacePath() });
         } else {
-          this.currentId = this.sessions[0].id;
-          this._activateTabState(this.currentId);
+          const valid = new Set(workspaceSessions.map(meta => meta.id));
+          const openFallbacks = openBefore.filter(id => id !== sid && valid.has(id));
+          const neighbor = openFallbacks[
+            Math.min(Math.max(0, openIdx), openFallbacks.length - 1)];
+          this.currentId = neighbor || workspaceSessions[0].id;
+          if (!this.openTabIds.includes(this.currentId)) this.openTabIds.push(this.currentId);
           await this.switchSession();
         }
-        this.savePrefs();
       }
+      this.savePrefs();
+      return true;
     },
 
     // ===== Versions + upgrade =====
@@ -9846,7 +10888,7 @@ function portal() {
           // chat.py 的 auth 守卫报错。saveProviderKey（逐行保存）走 _fetchModels
           // 已含此校正，批量保存这条路径之前漏了。
           this._ensureValidModel();
-          this._rebindModelSelect();
+          await this._rebindModelSelect();
         }
         // 也刷新 contextInfo — has_any_provider 变了，否则 "no provider" 卡片不消失
         this.fetchContextInfo();
@@ -9865,32 +10907,86 @@ function portal() {
         okText: this.t("modal.delete_session_ok"),
       });
       if (!ok) return;
-      await fetch("/api/chat/sessions/" + cur.id, { method: "DELETE", headers: this.hdr() });
-      await this.refreshSessions();
-      if (this.sessions.length === 0) { const s = await this.newSession(); this.currentId = s.id; }
-      else { this.currentId = this.sessions[0].id; }
-      await this.loadSession(this.currentId);
-      this.savePrefs();
-      this.toast(this.t("toast.deleted"), "success");
+      const deleted = await this.deleteSessionById(cur.id, { confirmed: true });
+      if (deleted) this.toast(this.t("toast.deleted"), "success");
     },
 
     // ===== file tree =====
     async loadRoot() {
-      this.childCache = {};
-      const children = await this.fetchChildren("");
-      this.visible = children.map(c => ({ ...c, depth: 0 }));
-      this.expanded = new Set();
-      const want = this._pendingExpanded || [];
-      this._pendingExpanded = null;
-      for (const p of want.sort((a, b) => a.length - b.length)) {
-        const node = this.visible.find(n => n.path === p);
-        if (node && node.is_dir) await this.expand(node);
+      const treeSeq = ++this._treeLoadSeq;
+      this.treeLoading = true;
+      this.treeError = "";
+      const pendingExpanded = [...new Set(this._pendingExpanded || [])];
+      const wantedExpanded = new Set(pendingExpanded);
+      const oldChildCache = this.childCache;
+      const showHidden = this.showHidden;
+      let children;
+      try {
+        // Keep the last-good tree visible until the complete refresh succeeds.
+        children = await this.fetchChildren("", {
+          force: true, cache: false, treeSeq,
+        });
+      } catch (_e) {
+        if (treeSeq === this._treeLoadSeq) {
+          this.treeLoading = false;
+          this.treeError = this.lang === "zh"
+            ? "文件列表加载失败，请检查连接后重试。"
+            : "Could not load files. Check your connection and retry.";
+          this.toast(this.visible.length
+            ? (this.lang === "zh" ? "文件列表刷新失败，已保留原内容"
+                                  : "Could not refresh files; kept the previous list")
+            : this.treeError, "error", 3500);
+        }
+        return false;
       }
+      if (treeSeq !== this._treeLoadSeq) return false;
+      const nextCache = { [`:${showHidden}`]: children };
+      const nextExpanded = new Set();
+      let nestedRefreshFailed = false;
+
+      const buildRows = async (items, depth) => {
+        const rows = [];
+        for (const child of this._uniqueFileNodes(items)) {
+          if (treeSeq !== this._treeLoadSeq) return rows;
+          const node = { ...child, depth };
+          rows.push(node);
+          if (!node.is_dir || !wantedExpanded.has(node.path)) continue;
+          const cacheKey = `${node.path}:${showHidden}`;
+          let grandchildren;
+          try {
+            grandchildren = await this.fetchChildren(node.path, {
+              force: true, cache: false, treeSeq,
+            });
+          } catch (_e) {
+            nestedRefreshFailed = true;
+            grandchildren = oldChildCache[cacheKey];
+            if (!Array.isArray(grandchildren)) continue;
+          }
+          if (treeSeq !== this._treeLoadSeq) return rows;
+          nextCache[cacheKey] = grandchildren;
+          nextExpanded.add(node.path);
+          rows.push(...await buildRows(grandchildren, depth + 1));
+        }
+        return rows;
+      };
+      const nextVisible = await buildRows(children, 0);
+      if (treeSeq !== this._treeLoadSeq) return false;
+      this.childCache = nextCache;
+      this.visible = nextVisible;
+      this.expanded = nextExpanded;
+      this._pendingExpanded = null;
+      if (nestedRefreshFailed) {
+        this.toast(this.lang === "zh"
+          ? "部分目录刷新失败，已保留上次内容"
+          : "Some folders could not refresh; kept their previous contents",
+        "warn", 3500);
+      }
+      this.treeLoading = false;
+      return true;
     },
     reloadTree() {
       this._pendingExpanded = Array.from(this.expanded);
-      this.childCache = {};
-      this.loadRoot();
+      return this.loadRoot();
     },
     // In-place removal of a node (and its descendants, if a dir) from the
     // visible flat-list. Avoids the full reloadTree() that delete used to
@@ -9937,15 +11033,18 @@ function portal() {
     // currently expanded (or restored to root and root isn't loaded),
     // we fall back to reloadTree — rare in practice but covers the
     // edge case without bespoke logic.
-    async _refreshParentInTree(restoredPath) {
-      if (!restoredPath) { this.reloadTree(); return; }
+    async _refreshParentInTree(
+      restoredPath,
+      ownerWorkspace = this.currentWorkspacePath(),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (!restoredPath) return this.reloadTree();
       const parent = restoredPath.split("/").slice(0, -1).join("/");
       delete this.childCache[`${parent}:true`];
       delete this.childCache[`${parent}:false`];
       if (!parent) {
         // Root-level restore: re-merge root children, preserving expanded subtrees.
-        this.reloadTree();
-        return;
+        return this.reloadTree();
       }
       if (!this.expanded.has(parent)) {
         // Parent is collapsed → nothing visible changes; expanding later
@@ -9953,48 +11052,133 @@ function portal() {
         return;
       }
       const parentIdx = this.visible.findIndex(n => n.path === parent);
-      if (parentIdx < 0) { this.reloadTree(); return; }
+      if (parentIdx < 0) return this.reloadTree();
       const parentNode = this.visible[parentIdx];
       // Snapshot inner-expanded subtrees so we can restore them after
       // re-rendering the parent's children.
       const innerExpanded = Array.from(this.expanded)
         .filter(p => p !== parent && p.startsWith(parent + "/"));
+      // Fetch first, mutate second. A failed refresh must not destroy the
+      // currently-visible subtree and replace it with a misleading blank.
+      let children;
+      try {
+        children = await this.fetchChildren(parent, {
+          force: true, ownerWorkspace,
+        });
+      } catch (e) {
+        if (!e.staleWorkspace && this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast(this.lang === "zh"
+            ? "目录刷新失败，已保留原内容"
+            : "Could not refresh folder; kept the previous contents", "error", 3500);
+        }
+        return false;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
       // Splice out parent's current rendered subtree.
       let end = parentIdx + 1;
       while (end < this.visible.length
               && this.visible[end].depth > parentNode.depth) end++;
-      this.visible.splice(parentIdx + 1, end - parentIdx - 1);
+      this.visible = [
+        ...this.visible.slice(0, parentIdx + 1),
+        ...this.visible.slice(end),
+      ];
       for (const p of innerExpanded) this.expanded.delete(p);
-      const children = await this.fetchChildren(parent);
-      const items = children.map(c => ({ ...c, depth: parentNode.depth + 1 }));
-      this.visible.splice(parentIdx + 1, 0, ...items);
+      const items = this._uniqueFileNodes(children)
+        .map(c => ({ ...c, depth: parentNode.depth + 1 }));
+      this.visible = [
+        ...this.visible.slice(0, parentIdx + 1),
+        ...items,
+        ...this.visible.slice(parentIdx + 1),
+      ];
       // Re-expand previously-open inner subtrees in shortest-path-first
       // order so each expand() can find its parent already rendered.
       for (const p of innerExpanded.sort((a, b) => a.length - b.length)) {
         const node = this.visible.find(n => n.path === p);
-        if (node && node.is_dir) await this.expand(node);
+        if (node && node.is_dir) {
+          await this.expand(node, { ownerWorkspace, quiet: true });
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+        }
       }
       this.expanded = new Set(this.expanded);
+      return true;
     },
-    async fetchChildren(path) {
-      const cacheKey = `${path}:${this.showHidden}`;
-      if (this.childCache[cacheKey]) return this.childCache[cacheKey];
+    async fetchChildren(path, opts = {}) {
+      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
+        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
+      if (!isOwner()) {
+        const stale = new Error("stale workspace file request");
+        stale.staleWorkspace = true;
+        throw stale;
+      }
+      const showHidden = this.showHidden;
+      const cacheKey = `${path}:${showHidden}`;
+      if (!opts.force && Object.prototype.hasOwnProperty.call(this.childCache, cacheKey)) {
+        return this.childCache[cacheKey];
+      }
+      if (!this._childFetches) this._childFetches = new Map();
+      const pendingKey = `${ownerWorkspace}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
+      if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
-        + (this.showHidden ? "&show_hidden=true" : "");
-      const r = await fetch(url, { headers: this.hdr() });
-      if (!r.ok) return [];
-      const d = await r.json();
-      this.childCache[cacheKey] = d.entries;
-      // LRU: keep at most 100 directory entries to prevent unbounded growth
-      const keys = Object.keys(this.childCache);
-      if (keys.length > 100) {
-        // Delete oldest 20 entries (insertion order preserved in modern JS)
-        keys.slice(0, 20).forEach(k => delete this.childCache[k]);
+        + (showHidden ? "&show_hidden=true" : "");
+      const requestHeaders = this.hdr();
+      const promise = (async () => {
+        let r;
+        try {
+          r = await fetch(url, { headers: requestHeaders });
+        } catch (e) {
+          throw new Error(String((e && e.message) || e || "network error"));
+        }
+        if (!isOwner()) {
+          const stale = new Error("stale workspace file request");
+          stale.staleWorkspace = true;
+          throw stale;
+        }
+        if (!r.ok) {
+          let detail = "";
+          try { detail = await r.text(); } catch (_) {}
+          if (!isOwner()) {
+            const stale = new Error("stale workspace file request");
+            stale.staleWorkspace = true;
+            throw stale;
+          }
+          throw new Error(detail || `HTTP ${r.status}`);
+        }
+        const d = await r.json();
+        if (!isOwner()) {
+          const stale = new Error("stale workspace file request");
+          stale.staleWorkspace = true;
+          throw stale;
+        }
+        const entries = d.entries || [];
+        const treeOwner = isOwner();
+        if (opts.cache !== false && treeOwner) {
+          this.childCache[cacheKey] = entries;
+          const keys = Object.keys(this.childCache);
+          if (keys.length > 100) keys.slice(0, 20).forEach(k => delete this.childCache[k]);
+        }
+        if (d.truncated && treeOwner) {
+          this.toast(this.t("toast.dir_truncated", { path: path || "", n: entries.length }), "warn", 3500);
+        }
+        return entries;
+      })();
+      this._childFetches.set(pendingKey, promise);
+      try {
+        return await promise;
+      } finally {
+        if (this._childFetches.get(pendingKey) === promise) {
+          this._childFetches.delete(pendingKey);
+        }
       }
-      if (d.truncated) {
-        this.toast(this.t("toast.dir_truncated", { path: path || "", n: d.entries.length }), "warn", 3500);
-      }
-      return d.entries;
+    },
+    _uniqueFileNodes(nodes) {
+      const seen = new Set();
+      return (nodes || []).filter(n => {
+        const path = n && typeof n.path === "string" ? n.path : "";
+        if (!path || seen.has(path)) return false;
+        seen.add(path);
+        return true;
+      });
     },
     toggleHidden() {
       this.showHidden = !this.showHidden;
@@ -10012,25 +11196,29 @@ function portal() {
       if (ev && (ev.ctrlKey || ev.metaKey)) {
         this._toggleSelect(n.path);
         this._selAnchor = n.path;
-        this.selected = n.path;          // active focus follows the toggled row
+        this.treeFocusPath = n.path;
         return;
       }
       if (ev && ev.shiftKey) {
         if (ev.preventDefault) ev.preventDefault();   // suppress text selection
         this._rangeSelect(n.path);
-        this.selected = n.path;
+        this.treeFocusPath = n.path;
         return;
       }
       // ---- Plain click → single selection (clears any batch set) ----
       this.clearTreeSelection();
       this._selAnchor = n.path;
+      this.treeFocusPath = n.path;
       if (n.is_dir) {
         if (this.expanded.has(n.path)) this.collapse(n);
         else await this.expand(n);
         this.savePrefs();
       } else {
-        // Single-click ⇒ ephemeral preview tab (VSCode behavior).
-        await this.openFile(n, { preview: true });
+        // Desktop keeps VS Code's reusable preview slot. Phones have no
+        // reliable double-click gesture to pin it, so recycling A when B is
+        // tapped would also discard A's saved reading position. Mobile taps
+        // therefore open normal, closable tabs.
+        await this.openFile(n, { preview: !this._isMobileLayout() });
       }
     },
     // ===== multi-select helpers =====
@@ -10041,7 +11229,7 @@ function portal() {
     // active/preview highlight (unchanged legacy behavior).
     isRowSelected(n) {
       if (this.selectedPaths.size) return this.selectedPaths.has(n.path);
-      return this.selected === n.path;
+      return (this.treeFocusPath || this.selected) === n.path;
     },
     clearTreeSelection() {
       if (this.selectedPaths.size) this.selectedPaths = new Set();
@@ -10059,7 +11247,7 @@ function portal() {
     // Range-select from the anchor to `targetPath` in flattened `visible`
     // order. Falls back to a single selection when the anchor is gone.
     _rangeSelect(targetPath) {
-      const anchor = this._selAnchor || this.selected || targetPath;
+      const anchor = this._selAnchor || this.treeFocusPath || this.selected || targetPath;
       const ai = this.visible.findIndex(x => x.path === anchor);
       const ti = this.visible.findIndex(x => x.path === targetPath);
       if (ai < 0 || ti < 0) { this._setSelection([targetPath]); return; }
@@ -10075,6 +11263,89 @@ function portal() {
     _pruneDescendants(paths) {
       return paths.filter(p => !paths.some(q => q !== p && p.startsWith(q + "/")));
     },
+    _pathAtOrBelow(path, root) {
+      return !!path && !!root && (path === root || path.startsWith(root + "/"));
+    },
+    _remapPath(path, src, dst) {
+      if (!this._pathAtOrBelow(path, src)) return path;
+      return dst + path.slice(src.length);
+    },
+    _invalidatePreviewCacheUnder(root) {
+      if (!this._previewCache || !root) return;
+      for (const path of Array.from(this._previewCache.keys())) {
+        if (this._pathAtOrBelow(path, root)) this._previewCacheDel(path);
+      }
+    },
+    // Rename/move is a prefix operation when the source is a directory. Keep
+    // every path-bearing client state in sync, not only an exact active tab.
+    // Returns true when the active preview itself moved and should be re-read.
+    _remapPreviewPaths(src, dst) {
+      if (!src || !dst || src === dst) return false;
+      const activeMoved = this._pathAtOrBelow(this.selected, src);
+      const remap = p => this._remapPath(p, src, dst);
+      this.tabs = this.tabs.map(t => this._pathAtOrBelow(t.path, src)
+        ? { ...t, path: remap(t.path), name: remap(t.path).split("/").pop() }
+        : t);
+      this.selected = remap(this.selected);
+      this.treeFocusPath = remap(this.treeFocusPath);
+      this._selAnchor = remap(this._selAnchor);
+      this.selectedPaths = new Set(Array.from(this.selectedPaths, remap));
+      this.expanded = new Set(Array.from(this.expanded, remap));
+      if (this._pendingExpanded) this._pendingExpanded = this._pendingExpanded.map(remap);
+      if (this.fileClipboard.path) {
+        const next = remap(this.fileClipboard.path);
+        if (next !== this.fileClipboard.path) {
+          this.fileClipboard = { path: next, name: next.split("/").pop() };
+        }
+      }
+      if (this.csvPath) this.csvPath = remap(this.csvPath);
+      this._previewNeedsReload = remap(this._previewNeedsReload);
+      this.htmlPreviewFrames = this.htmlPreviewFrames.map(entry =>
+        this._pathAtOrBelow(entry.path, src)
+          ? { ...entry, path: remap(entry.path) }
+          : entry);
+      this._invalidatePreviewCacheUnder(src);
+      this._scheduleSavePrefs();
+      return activeMoved;
+    },
+    _canRemovePreviewPaths(roots) {
+      const list = (roots || []).filter(Boolean);
+      if (!this.editing || !list.some(p => this._pathAtOrBelow(this.selected, p))) {
+        return true;
+      }
+      return this._confirmLoseEdits();
+    },
+    // Remove a path and every descendant from open-preview state. If the
+    // active tab disappears, activate its nearest surviving neighbour instead
+    // of leaving a blank pane while other valid tabs are still open.
+    async _dropPreviewPathsUnder(roots) {
+      const list = this._pruneDescendants((roots || []).filter(Boolean));
+      if (!list.length) return;
+      const removed = p => list.some(root => this._pathAtOrBelow(p, root));
+      const oldTabs = this.tabs.slice();
+      const oldIndex = oldTabs.findIndex(t => t.path === this.selected);
+      const activeRemoved = removed(this.selected);
+      this.tabs = oldTabs.filter(t => !removed(t.path));
+      for (const root of list) this._invalidatePreviewCacheUnder(root);
+      this._dropHtmlPreviewFramesUnder(list);
+      this.selectedPaths = new Set(Array.from(this.selectedPaths).filter(p => !removed(p)));
+      if (removed(this.treeFocusPath)) this.treeFocusPath = "";
+      if (removed(this._selAnchor)) this._selAnchor = "";
+      if (removed(this.fileClipboard.path)) this.fileClipboard = { path: "", name: "" };
+      if (removed(this._previewNeedsReload)) this._previewNeedsReload = "";
+      if (activeRemoved) {
+        this._clearPreviewState();
+        if (this.tabs.length) {
+          const next = this.tabs[Math.min(Math.max(0, oldIndex), this.tabs.length - 1)];
+          await this.openFile(
+            { path: next.path, name: next.name || next.path.split("/").pop() },
+            { preview: !!next.preview },
+          );
+          return;
+        }
+      }
+      this._scheduleSavePrefs();
+    },
     // Double-click a tree file ⇒ pin it as a permanent tab. The two preceding
     // single-click events already opened it in the preview slot; this just
     // promotes that slot to permanent (openFile's `existing && !asPreview`
@@ -10087,32 +11358,60 @@ function portal() {
     pinTab(path) {
       const t = this.tabs.find(x => x.path === path);
       if (t && t.preview) {
-        t.preview = false;
+        this.tabs = this.tabs.map(x => x.path === path
+          ? { ...x, preview: false } : x);
         this.savePrefs();
       }
     },
-    async expand(n) {
+    async expand(n, opts = {}) {
       // Idempotency guard (both sides of the await): two concurrent reveals
       // — e.g. a fire-and-forget revealInTree racing an awaited one after a
       // search — can both pass a single pre-await check and double-splice the
       // same children, corrupting the flat `visible` array. Re-check after the
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
-      const children = await this.fetchChildren(n.path);
+      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      let children;
+      try {
+        children = await this.fetchChildren(n.path, {
+          treeSeq: opts.treeSeq, ownerWorkspace,
+        });
+      } catch (e) {
+        if (!opts.quiet && !e.staleWorkspace
+            && this._workspaceIsCurrent(ownerWorkspace)
+            && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)) {
+          this.toast(this.lang === "zh"
+            ? `无法展开 /${n.path}` : `Could not open /${n.path}`, "error", 3000);
+        }
+        return false;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (opts.treeSeq != null && opts.treeSeq !== this._treeLoadSeq) return false;
       if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
-      const items = children.map(c => ({ ...c, depth: n.depth + 1 }));
-      this.visible.splice(idx + 1, 0, ...items);
+      const existingPaths = new Set(this.visible.map(x => x.path));
+      const items = this._uniqueFileNodes(children)
+        .filter(c => !existingPaths.has(c.path))
+        .map(c => ({ ...c, depth: n.depth + 1 }));
+      this.visible = [
+        ...this.visible.slice(0, idx + 1),
+        ...items,
+        ...this.visible.slice(idx + 1),
+      ];
       this.expanded.add(n.path);
       this.expanded = new Set(this.expanded);
+      return true;
     },
     collapse(n) {
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
       let end = idx + 1;
       while (end < this.visible.length && this.visible[end].depth > n.depth) end++;
-      this.visible.splice(idx + 1, end - idx - 1);
+      this.visible = [
+        ...this.visible.slice(0, idx + 1),
+        ...this.visible.slice(end),
+      ];
       for (const p of Array.from(this.expanded)) {
         if (p === n.path || p.startsWith(n.path + "/")) this.expanded.delete(p);
       }
@@ -10130,6 +11429,7 @@ function portal() {
       } else if (this.selectedPaths.size) {
         this.clearTreeSelection();
       }
+      if (n) this.treeFocusPath = n.path;
       // Clamp to viewport so menu doesn't overflow.
       const MENU_W = 200, MENU_H = 280;
       const x = Math.min(ev.clientX, window.innerWidth - MENU_W - 8);
@@ -10175,12 +11475,14 @@ function portal() {
           break;
         case "upload":
           this._ctxUploadDir = n.path;
+          this._ctxUploadWorkspace = this.currentWorkspacePath();
           this.$refs.ctxUpload.click();
           break;
       }
     },
     async doNewFile(dirNode) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建文件" : "New file",
         // Root has no meaningful path to show ("在 /" reads broken); a
@@ -10190,7 +11492,7 @@ function portal() {
           ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "new.md",
       });
-      if (!name) return;
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const path = dirNode.path ? `${dirNode.path}/${name}` : name;
       let r;
       try {
@@ -10199,18 +11501,30 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path, content: "" }),
         });
-      } catch (e) { this.errToast("create", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         delete this.childCache[dirNode.path];
-        this.reloadTree();
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast(this.t("toast.created_name", { name }), "success");
         // 自动打开编辑
         await this.openFile({ path, name });
-        this.editing = true;
-      } else this.errToast("create", await r.text());
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (this.selected === path) await this.toggleEdit();
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("create", detail);
+      }
     },
     async doNewDir(dirNode) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: dirNode.path
           ? (zh ? "新建子目录" : "New subdirectory")
@@ -10220,7 +11534,7 @@ function portal() {
           ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "",
       });
-      if (!name) return;
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const path = dirNode.path ? `${dirNode.path}/${name}` : name;
       let r;
       try {
@@ -10229,29 +11543,45 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
         });
-      } catch (e) { this.errToast("create", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         delete this.childCache[dirNode.path];
-        this.reloadTree();
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast(this.t("toast.created_dir", { name }), "success");
-      } else this.errToast("generic", await r.text());
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("generic", detail);
+      }
     },
     _ctxUploadDir: "",
+    _ctxUploadWorkspace: "",
     async ctxUploadHandler(ev) {
       const file = ev.target.files[0];
-      if (!file) return;
-      await this.uploadFileTo(this._ctxUploadDir, file);
+      const dirPath = this._ctxUploadDir;
+      const ownerWorkspace = this._ctxUploadWorkspace;
       ev.target.value = "";
       this._ctxUploadDir = "";
+      this._ctxUploadWorkspace = "";
+      if (!file || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      await this.uploadFileTo(dirPath, file);
     },
     async doRename(n) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const newName = await this.prompt({
         title: zh ? "重命名" : "Rename",
         body: (zh ? "当前路径:" : "Current path: ") + n.path,
         value: n.name,
       });
-      if (!newName || newName === n.name) return;
+      if (!newName || newName === n.name
+          || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const parent = n.path.split("/").slice(0, -1).join("/");
       const newPath = parent ? `${parent}/${newName}` : newName;
       let r;
@@ -10261,16 +11591,31 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ src: n.path, dst: newPath }),
         });
-      } catch (e) { this.errToast("rename", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("rename", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
-        if (this.selected === n.path) this.selected = newPath;
-        // Old path no longer exists; drop its cached body so a future file
-        // created at the same path can't serve this one's stale content.
-        this._previewCacheDel(n.path);
+        const activeMoved = this._remapPreviewPaths(n.path, newPath);
         delete this.childCache[parent];
-        this.reloadTree();
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (activeMoved && this.selected && !this.editing) {
+          const active = this.tabs.find(t => t.path === this.selected);
+          await this.openFile(
+            { path: this.selected, name: this.selected.split("/").pop() },
+            { preview: !!(active && active.preview), forceReload: true },
+          );
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        }
         this.toast(this.t("toast.renamed"), "success");
-      } else this.errToast("rename", await r.text());
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("rename", detail);
+      }
     },
     // Look up a tree node by path in the current flat-rendered tree.
     // Returns the node object or null. Used by the Ctrl+C keyboard
@@ -10284,6 +11629,7 @@ function portal() {
     // "Copy as .bak" menu (dst_dir omitted → same-dir duplicate) and
     // the Ctrl+V paste path (dst_dir = selected directory).
     async _postCopyBak(srcPath, dstDir) {
+      const ownerWorkspace = this.currentWorkspacePath();
       const body = dstDir ? { src: srcPath, dst_dir: dstDir }
                           : { src: srcPath };
       let r;
@@ -10294,21 +11640,29 @@ function portal() {
           body: JSON.stringify(body),
         });
       } catch (e) {
-        this.toast(this.t("toast.copy_failed") + ": " + String((e && e.message) || e), "error", 4000);
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast(this.t("toast.copy_failed") + ": "
+            + String((e && e.message) || e), "error", 4000);
+        }
         return null;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
       if (!r.ok) {
         const msg = await r.text();
-        this.toast(this.t("toast.copy_failed") + ": " + msg, "error", 4000);
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast(this.t("toast.copy_failed") + ": " + msg, "error", 4000);
+        }
         return null;
       }
       const data = await r.json();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
       // In-place tree update: only re-fetch the destination parent dir
       // (or fall back to full reload if parent isn't visible — root /
       // collapsed parent). Avoids the whole-tree flicker that the prior
       // reloadTree() caused, matching how delete + drag-to-trash
       // already optimise. The newly-created .bak appears in-place.
-      await this._refreshParentInTree(data.path);
+      await this._refreshParentInTree(data.path, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
       this.toast(
         this.t("toast.copied_as_bak").replace("{name}", data.name),
         "success",
@@ -10330,7 +11684,7 @@ function portal() {
       //   - nothing selected → fall through (backend defaults to src
       //     parent, i.e. same-directory duplicate)
       let dstDir = "";
-      const selNode = this._findTreeNode(this.selected);
+      const selNode = this._findTreeNode(this.treeFocusPath || this.selected);
       if (selNode) {
         dstDir = selNode.is_dir
           ? selNode.path
@@ -10346,6 +11700,7 @@ function portal() {
     },
     async doDelete(n) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       // Soft-delete now: backend moves the target into <ROOT>/.muselab-dustbin/
       // and returns a trash_id. Confirm copy says "move to trash" rather
       // than "permanently delete"; the prior "(only empty dirs)" caveat
@@ -10367,7 +11722,8 @@ function portal() {
         danger: false,
         okText: zh ? "移到垃圾桶" : "Move to trash",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (!this._canRemovePreviewPaths([n.path])) return;
       let r;
       try {
         r = await fetch("/api/files/delete", {
@@ -10375,26 +11731,33 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: n.path }),
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         // 404 = already gone (stale tree row, or its parent dir was trashed
         // moments ago). The goal state is reached, so refresh the tree to
         // drop the phantom row rather than surfacing a "not found" error.
         if (r.status === 404) {
-          this.tabs = this.tabs.filter(t => t.path !== n.path);
-          if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
+          await this._dropPreviewPathsUnder([n.path]);
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           await this.reloadTree();
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           this.toast(zh ? `${n.name} 已不存在，已刷新列表` : `${n.name} no longer exists — refreshed`, "info", 2500);
           return;
         }
-        this.errToast("delete", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("delete", detail);
         return;
       }
       let data = {};
       try { data = await r.json(); } catch (_) {}
-      // 同步 tabs：删了的文件如果在 tabs 也清掉
-      this.tabs = this.tabs.filter(t => t.path !== n.path);
-      if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
+      await this._dropPreviewPathsUnder([n.path]);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       // In-place tree removal: no full reload, no flicker. Helper also
       // invalidates the parent's childCache so a future re-expand fetches
       // fresh truth from disk.
@@ -10427,20 +11790,27 @@ function portal() {
       // paths that fire pre-auth (any future ones) just silently no-op
       // until login/_bootApp re-invokes us.
       if (!this.token) return;
+      const loadSeq = ++this._trashLoadSeq;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const isOwner = () => loadSeq === this._trashLoadSeq
+        && ownerWorkspace === this.currentWorkspacePath();
       this.trash.loading = true;
       try {
         const r = await fetch("/api/files/trash/list", { headers: this.hdr() });
+        if (!isOwner()) return;
         if (!r.ok) {
-          this.errToast("trash list", await r.text());
+          const detail = await r.text();
+          if (isOwner()) this.errToast("trash list", detail);
           return;
         }
         const d = await r.json();
+        if (!isOwner()) return;
         this.trash.items = d.items || [];
         this.trash.count = this.trash.items.length;
       } catch (e) {
-        this.toast(String(e.message || e), "error");
+        if (isOwner()) this.toast(String(e.message || e), "error");
       } finally {
-        this.trash.loading = false;
+        if (isOwner()) this.trash.loading = false;
       }
     },
     openTrashModal() {
@@ -10451,6 +11821,7 @@ function portal() {
       this.trash.modalOpen = false;
     },
     async restoreTrash(tid) {
+      const ownerWorkspace = this.currentWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/trash/restore", {
@@ -10460,18 +11831,24 @@ function portal() {
         });
       } catch (e) {
         const zh = this.lang === "zh";
-        this.toast((zh ? "恢复失败：" : "Restore failed: ") + String((e && e.message) || e), "error", 4500);
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast((zh ? "恢复失败：" : "Restore failed: ")
+            + String((e && e.message) || e), "error", 4500);
+        }
         return;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         // 409 = original path occupied; surface backend detail verbatim
         let detail = "";
         try { detail = (await r.json()).detail || ""; } catch (_) {}
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         const zh = this.lang === "zh";
         this.toast(detail || (zh ? "恢复失败" : "Restore failed"), "error", 4500);
         return;
       }
       const d = await r.json();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.trash.items = this.trash.items.filter(it => it.trash_id !== tid);
       this.trash.count = Math.max(0, this.trash.count - 1);
       // Targeted refresh: re-fetch ONLY the parent dir's children + splice
@@ -10479,12 +11856,14 @@ function portal() {
       // Falls back to reloadTree internally for the root / unloaded-parent
       // edge cases.
       const restored = d.restored_path || "";
-      await this._refreshParentInTree(restored);
+      await this._refreshParentInTree(restored, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const zh = this.lang === "zh";
       this.toast(zh ? `已恢复：${restored}` : `Restored: ${restored}`, "success", 2500);
     },
     async purgeTrash(tid) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "彻底删除" : "Permanently delete",
         body: zh ? "这一项将被永久删除，无法恢复。继续？"
@@ -10492,7 +11871,7 @@ function portal() {
         danger: true,
         okText: zh ? "彻底删除" : "Delete forever",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
       let r;
       try {
         r = await fetch("/api/files/trash/purge", {
@@ -10500,9 +11879,16 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ trash_id: tid }),
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
-        this.errToast("trash purge", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("trash purge", detail);
         return;
       }
       this.trash.items = this.trash.items.filter(it => it.trash_id !== tid);
@@ -10512,6 +11898,7 @@ function portal() {
     async emptyTrash() {
       const zh = this.lang === "zh";
       if (!this.trash.items.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "清空垃圾桶" : "Empty trash",
         body: zh ? `${this.trash.items.length} 项将被永久删除，无法恢复。继续？`
@@ -10519,16 +11906,23 @@ function portal() {
         danger: true,
         okText: zh ? "清空" : "Empty",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
       let r;
       try {
         r = await fetch("/api/files/trash/empty", {
           method: "DELETE",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
-        this.errToast("trash empty", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("trash empty", detail);
         return;
       }
 
@@ -10576,7 +11970,9 @@ function portal() {
     // committed), then sync tabs / trash count / tree once. Mirrors
     // deleteSelected's batch arm but without the modal.
     async _trashManyPaths(paths) {
+      if (!this._canRemovePreviewPaths(paths)) return;
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
@@ -10585,16 +11981,15 @@ function portal() {
           // 404 = already gone — count as done, not a failure.
         }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
       ));
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
-      for (const p of okPaths) {
-        this.tabs = this.tabs.filter(t => t.path !== p);
-        this._previewCacheDel(p);
-        if (this.selected === p) { this.selected = ""; this.previewMode = ""; }
-      }
+      await this._dropPreviewPathsUnder(okPaths);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.trash.count += okPaths.length;
       this.clearTreeSelection();
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (failed && !okPaths.length) {
         this.toast(zh ? `${failed} 项删除失败` : `${failed} item(s) failed to delete`, "error", 4000);
       } else if (failed) {
@@ -10606,7 +12001,9 @@ function portal() {
       }
     },
     async _sendToTrash(path) {
+      if (!this._canRemovePreviewPaths([path])) return;
       const name = path.split("/").pop() || path;
+      const ownerWorkspace = this.currentWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/delete", {
@@ -10614,26 +12011,32 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         // 404 = already gone — refresh instead of erroring (see doDelete).
         if (r.status === 404) {
-          this.tabs = this.tabs.filter(t => t.path !== path);
-          this._previewCacheDel(path);
-          if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
+          await this._dropPreviewPathsUnder([path]);
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           await this.reloadTree();
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           const zh = this.lang === "zh";
           this.toast(zh ? `${name} 已不存在，已刷新列表` : `${name} no longer exists — refreshed`, "info", 2500);
           return;
         }
-        this.errToast("delete", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("delete", detail);
         return;
       }
       let data = {};
       try { data = await r.json(); } catch (_) {}
-      this.tabs = this.tabs.filter(t => t.path !== path);
-      this._previewCacheDel(path);
-      if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
+      await this._dropPreviewPathsUnder([path]);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       // In-place removal — see _removeNodeFromTree for rationale.
       this._removeNodeFromTree(path);
       this.trash.count += 1;
@@ -10664,6 +12067,240 @@ function portal() {
       if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
       return (n / 1024 / 1024).toFixed(1) + " MB";
     },
+    // ===== Preview-tab reading position =====
+    _sanitizePreviewViewState(view = {}) {
+      const nonNegative = value => {
+        const n = Number(value);
+        return Number.isFinite(n) ? Math.max(0, n) : 0;
+      };
+      const modes = new Set(["md", "text", "html", "img", "pdf", "xlsx", "csv"]);
+      return {
+        mode: modes.has(view.mode) ? view.mode : "",
+        scrollTop: nonNegative(view.scrollTop),
+        scrollLeft: nonNegative(view.scrollLeft),
+        innerScrollTop: nonNegative(view.innerScrollTop),
+        innerScrollLeft: nonNegative(view.innerScrollLeft),
+        frameScrollTop: nonNegative(view.frameScrollTop),
+        frameScrollLeft: nonNegative(view.frameScrollLeft),
+        xlsxActive: typeof view.xlsxActive === "string" ? view.xlsxActive : "",
+        csvOffset: Math.floor(nonNegative(view.csvOffset)),
+      };
+    },
+    _previewTabSnapshot(tab = {}) {
+      const path = typeof tab.path === "string" ? tab.path : "";
+      return {
+        path,
+        name: typeof tab.name === "string" && tab.name
+          ? tab.name : path.split("/").pop(),
+        preview: !!tab.preview,
+        view: this._sanitizePreviewViewState(tab.view),
+      };
+    },
+    _previewTabViewState(path = this.selected) {
+      const tab = (this.tabs || []).find(t => t.path === path);
+      return this._sanitizePreviewViewState(tab && tab.view);
+    },
+    _previewScrollBody() {
+      return (this.$refs && this.$refs.previewBody)
+        || document.querySelector(".pane.preview .preview-body");
+    },
+    _previewInnerScrollEl(mode = this.previewMode, body = this._previewScrollBody()) {
+      if (!body) return null;
+      if (mode === "xlsx") {
+        return body.querySelector(".xlsx-preview:not(.csv-preview) .xlsx-scroll");
+      }
+      if (mode === "csv") return body.querySelector(".csv-preview .xlsx-scroll");
+      return null;
+    },
+    _htmlPreviewFrameEls(body = this._previewScrollBody()) {
+      return body ? Array.from(body.querySelectorAll("iframe[data-preview-html-path]")) : [];
+    },
+    _htmlPreviewFrameForPath(path, body = this._previewScrollBody()) {
+      if (!path) return null;
+      return this._htmlPreviewFrameEls(body).find(
+        frame => frame.dataset.previewHtmlPath === path) || null;
+    },
+    _htmlPreviewMessageOwner(source) {
+      if (!source) return "";
+      const frame = this._htmlPreviewFrameEls().find(item => item.contentWindow === source);
+      return (frame && frame.dataset.previewHtmlPath) || "";
+    },
+    _touchHtmlPreviewFrame(path) {
+      if (!path) return false;
+      const lastUsed = ++this._htmlPreviewFrameClock;
+      const existing = this.htmlPreviewFrames.find(entry => entry.path === path);
+      if (existing) {
+        existing.lastUsed = lastUsed;
+        return true;
+      }
+      let next = this.htmlPreviewFrames.slice();
+      if (next.length >= this.HTML_PREVIEW_CACHE_MAX) {
+        const oldest = next.reduce((a, b) => a.lastUsed <= b.lastUsed ? a : b);
+        next = next.filter(entry => entry.path !== oldest.path);
+      }
+      this.htmlPreviewFrames = [...next, { path, lastUsed }];
+      return false;
+    },
+    _dropHtmlPreviewFramesUnder(roots) {
+      const list = (roots || []).filter(Boolean);
+      if (!list.length || !this.htmlPreviewFrames.length) return;
+      this.htmlPreviewFrames = this.htmlPreviewFrames.filter(entry =>
+        !list.some(root => this._pathAtOrBelow(entry.path, root)));
+    },
+    _previewFrameEl(mode = this.previewMode, body = this._previewScrollBody()) {
+      if (mode === "html") return this._htmlPreviewFrameForPath(this.selected, body);
+      if (mode === "pdf") return (this.$refs && this.$refs.pdfFrame)
+        || (body && body.querySelector('iframe[x-ref="pdfFrame"]'));
+      return null;
+    },
+    _capturePreviewViewState(path = this.selected) {
+      if (!path || path !== this.selected || this.editing
+          || !this.previewMode || this.previewMode === "loading") return null;
+      if (this._isMobileLayout() && this.mobileTab !== "preview") return null;
+      if (this._previewRestoringPath === path
+          && this._previewRestoringLoadSeq === this._previewLoadSeq) return null;
+      const tab = (this.tabs || []).find(t => t.path === path);
+      const body = this._previewScrollBody();
+      if (!tab || !body) return null;
+      const view = {
+        ...this._previewTabViewState(path),
+        mode: this.previewMode,
+        scrollTop: Math.max(0, Number(body.scrollTop) || 0),
+        scrollLeft: Math.max(0, Number(body.scrollLeft) || 0),
+      };
+      const inner = this._previewInnerScrollEl(this.previewMode, body);
+      if (inner) {
+        view.innerScrollTop = Math.max(0, Number(inner.scrollTop) || 0);
+        view.innerScrollLeft = Math.max(0, Number(inner.scrollLeft) || 0);
+      }
+      if (this.previewMode === "xlsx") view.xlsxActive = this.xlsxActive || "";
+      if (this.previewMode === "csv") view.csvOffset = Math.max(0, this.csvOffset || 0);
+      const bridged = this._htmlPreviewFramePosition;
+      if (this.previewMode === "html" && bridged && bridged.path === path
+          && bridged.loadSeq === this._previewLoadSeq) {
+        view.frameScrollTop = bridged.top;
+        view.frameScrollLeft = bridged.left;
+      }
+      const frame = this._previewFrameEl(this.previewMode, body);
+      if (frame) {
+        try {
+          const win = frame.contentWindow;
+          const docEl = frame.contentDocument && frame.contentDocument.scrollingElement;
+          view.frameScrollTop = Math.max(0,
+            Number((win && win.scrollY) || (docEl && docEl.scrollTop)) || 0);
+          view.frameScrollLeft = Math.max(0,
+            Number((win && win.scrollX) || (docEl && docEl.scrollLeft)) || 0);
+        } catch (_) { /* sandboxed / browser-owned viewer */ }
+      }
+      const saved = this._sanitizePreviewViewState(view);
+      this.tabs = this.tabs.map(t => t.path === path ? { ...t, view: saved } : t);
+      return saved;
+    },
+    onPreviewViewportScroll() {
+      clearTimeout(this._previewViewSaveTimer);
+      const ownerPath = this.selected;
+      const ownerLoadSeq = this._previewLoadSeq;
+      this._previewViewSaveTimer = setTimeout(() => {
+        this._previewViewSaveTimer = null;
+        if (this.selected !== ownerPath || this._previewLoadSeq !== ownerLoadSeq) return;
+        if (!this._capturePreviewViewState(ownerPath)) return;
+        this._scheduleSavePrefs();
+      }, 160);
+    },
+    onHtmlPreviewScrollMessage(data = {}, ownerPath = this.selected) {
+      if (!ownerPath || ownerPath !== this.selected || this.previewMode !== "html") return;
+      if (this._isMobileLayout() && this.mobileTab !== "preview") return;
+      const ownerLoadSeq = this._previewLoadSeq;
+      if (this._previewRestoringPath === ownerPath
+          && this._previewRestoringLoadSeq === ownerLoadSeq) return;
+      this._htmlPreviewFramePosition = {
+        path: ownerPath,
+        loadSeq: ownerLoadSeq,
+        top: Math.max(0, Number(data.top) || 0),
+        left: Math.max(0, Number(data.left) || 0),
+      };
+      clearTimeout(this._htmlPreviewScrollSaveTimer);
+      this._htmlPreviewScrollSaveTimer = setTimeout(() => {
+        this._htmlPreviewScrollSaveTimer = null;
+        if (this.selected !== ownerPath || this._previewLoadSeq !== ownerLoadSeq) return;
+        if (!this._capturePreviewViewState(ownerPath)) return;
+        this._scheduleSavePrefs();
+      }, 160);
+    },
+    _applyPreviewModeViewState(path, savedView = null) {
+      const view = this._sanitizePreviewViewState(
+        savedView || this._previewTabViewState(path));
+      if (this.previewMode === "xlsx" && view.xlsxActive
+          && this.xlsxSheets.some(sheet => sheet.name === view.xlsxActive)) {
+        this.xlsxActive = view.xlsxActive;
+      }
+      return view;
+    },
+    _restorePreviewViewState(path, loadSeq = this._previewLoadSeq, savedView = null) {
+      if (!path || path !== this.selected || loadSeq !== this._previewLoadSeq
+          || this.editing || this.previewMode === "loading") return false;
+      const body = this._previewScrollBody();
+      if (!body) return false;
+      const view = this._applyPreviewModeViewState(path, savedView);
+      body.scrollTop = view.scrollTop;
+      body.scrollLeft = view.scrollLeft;
+      const inner = this._previewInnerScrollEl(this.previewMode, body);
+      if (inner) {
+        inner.scrollTop = view.innerScrollTop;
+        inner.scrollLeft = view.innerScrollLeft;
+      }
+      const frame = this._previewFrameEl(this.previewMode, body);
+      if (frame) {
+        const win = frame.contentWindow;
+        if (this.previewMode === "html" && win) {
+          try {
+            win.postMessage({
+              __muselab: "preview-scroll-restore",
+              top: view.frameScrollTop,
+              left: view.frameScrollLeft,
+            }, "*");
+          } catch (_) {}
+        }
+        try {
+          if (win && typeof win.scrollTo === "function") {
+            win.scrollTo(view.frameScrollLeft, view.frameScrollTop);
+          }
+        } catch (_) {}
+      }
+      return true;
+    },
+    _cancelPreviewViewRestore() {
+      for (const timer of this._previewViewRestoreTimers || []) clearTimeout(timer);
+      this._previewViewRestoreTimers = [];
+      this._previewRestoringPath = "";
+      this._previewRestoringLoadSeq = 0;
+    },
+    _schedulePreviewViewRestore(path, loadSeq = this._previewLoadSeq) {
+      this._cancelPreviewViewRestore();
+      const savedView = this._previewTabViewState(path);
+      this._previewRestoringPath = path;
+      this._previewRestoringLoadSeq = loadSeq;
+      const apply = () => this._restorePreviewViewState(path, loadSeq, savedView);
+      const finish = () => {
+        apply();
+        if (this._previewRestoringPath === path
+            && this._previewRestoringLoadSeq === loadSeq) {
+          this._previewRestoringPath = "";
+          this._previewRestoringLoadSeq = 0;
+        }
+      };
+      this.$nextTick(() => requestAnimationFrame(apply));
+      this._previewViewRestoreTimers = [setTimeout(apply, 80), setTimeout(finish, 240)];
+    },
+    onPreviewContentLoad(mode) {
+      if (mode !== this.previewMode || !this.selected) return;
+      this._schedulePreviewViewRestore(this.selected, this._previewLoadSeq);
+    },
+    onPreviewFrameLoad(mode, ownerPath = this.selected) {
+      if (ownerPath !== this.selected) return;
+      this.onPreviewContentLoad(mode);
+    },
+
     // ===== Preview-tab content cache =====
     // Chat-session tabs cache their loaded state (tabState[id]._loaded) so
     // switching back is instant; preview tabs had no equivalent — every
@@ -10671,11 +12308,12 @@ function portal() {
     // a "loading" state even for a file already shown moments ago. This LRU
     // caches the parsed/rendered preview for md / text / xlsx so a tab switch
     // back is synchronous (no fetch, no loading flash). Bounded by entry count
-    // and per-entry body size so it can't hoard memory on huge files. csv is
+    // and a total byte budget so it can't hoard memory on huge workbooks. csv is
     // paginated (stateful) and html/img/pdf are URL-based (already instant), so
     // neither is cached. Invalidated on edit-save / reload / external write.
     PREVIEW_CACHE_MAX_ENTRIES: 16,
     PREVIEW_CACHE_MAX_CHARS: 512 * 1024,   // skip caching bodies larger than this
+    PREVIEW_CACHE_MAX_BYTES: 8 * 1024 * 1024,
     LARGE_MD_DEFER_CHARS: 200 * 1024,      // above this, render md off the click frame
     _previewCacheGet(path) {
       if (!this._previewCache || !path) return null;
@@ -10689,14 +12327,65 @@ function portal() {
     _previewCacheSet(path, entry) {
       if (!path || !entry) return;
       if (!this._previewCache) this._previewCache = new Map();
+      if (!Number.isFinite(this._previewCacheBytes)) this._previewCacheBytes = 0;
+      const old = this._previewCache.get(path);
+      if (old) this._previewCacheBytes -= old._cacheBytes || 0;
       this._previewCache.delete(path);
-      this._previewCache.set(path, entry);
-      while (this._previewCache.size > this.PREVIEW_CACHE_MAX_ENTRIES) {
-        this._previewCache.delete(this._previewCache.keys().next().value);
+      const bytes = this._previewCacheEntryBytes(entry);
+      // A single large xlsx response can be several megabytes even though it
+      // is row-capped server-side. Do not let one entry evict everything and
+      // remain as an over-budget cache by itself.
+      if (bytes > this.PREVIEW_CACHE_MAX_BYTES) return;
+      const stored = { ...entry, _cacheBytes: bytes };
+      this._previewCache.set(path, stored);
+      this._previewCacheBytes += bytes;
+      while (this._previewCache.size > this.PREVIEW_CACHE_MAX_ENTRIES
+             || this._previewCacheBytes > this.PREVIEW_CACHE_MAX_BYTES) {
+        const oldest = this._previewCache.keys().next().value;
+        const evicted = this._previewCache.get(oldest);
+        this._previewCache.delete(oldest);
+        this._previewCacheBytes -= (evicted && evicted._cacheBytes) || 0;
       }
+      this._previewCacheBytes = Math.max(0, this._previewCacheBytes);
+    },
+    _previewCacheEntryBytes(entry) {
+      // Iterative, allocation-light estimate. Avoid JSON.stringify here: a
+      // large workbook would briefly allocate a second giant string merely
+      // to decide that it should not be cached.
+      let bytes = 0;
+      const stack = [entry];
+      const seen = new Set();
+      while (stack.length) {
+        const value = stack.pop();
+        if (typeof value === "string") {
+          bytes += value.length * 2;
+        } else if (typeof value === "number" || typeof value === "boolean") {
+          bytes += 8;
+        } else if (value && typeof value === "object" && !seen.has(value)) {
+          seen.add(value);
+          if (Array.isArray(value)) {
+            bytes += value.length * 8;
+            for (const item of value) stack.push(item);
+          } else {
+            for (const [key, item] of Object.entries(value)) {
+              if (key === "_cacheBytes") continue;
+              bytes += key.length * 2 + 8;
+              stack.push(item);
+            }
+          }
+        }
+        if (bytes > this.PREVIEW_CACHE_MAX_BYTES) return bytes;
+      }
+      return bytes;
     },
     _previewCacheDel(path) {
-      if (this._previewCache && path) this._previewCache.delete(path);
+      if (!this._previewCache || !path) return;
+      const old = this._previewCache.get(path);
+      if (old && Number.isFinite(this._previewCacheBytes)) {
+        this._previewCacheBytes = Math.max(0,
+          this._previewCacheBytes - (old._cacheBytes || 0));
+      }
+      this._previewCache.delete(path);
     },
     // Restore preview-pane reactive state from a cache entry; mirrors the
     // post-fetch assignments in openFile's per-mode branches.
@@ -10755,12 +12444,27 @@ function portal() {
     // A 404 means the file is gone, so we also drop the phantom tab openFile
     // optimistically created (otherwise a dead, un-openable tab lingers and
     // the user has to × it by hand). closeTab() re-selects an adjacent tab.
-    async _previewFail(r, path) {
+    async _previewFail(r, path, loadSeq = this._previewLoadSeq) {
       const reason = await this._readFailReason(r);
+      if (loadSeq !== this._previewLoadSeq || this.selected !== path) return;
       this.errToast("read", reason.hint || reason.title);
       if (reason.status === 404) { this.closeTab(path); return; }
       this.previewError = reason;
       this.previewMode = "unsupported";
+    },
+    _previewNetworkFail(error, path, loadSeq) {
+      if (loadSeq !== this._previewLoadSeq || this.selected !== path) return;
+      const zh = this.lang === "zh";
+      const detail = String((error && error.message) || error || "");
+      this.previewError = {
+        status: 0,
+        title: zh ? "网络连接失败" : "Network error",
+        hint: zh ? "无法读取文件，请检查连接后重试。"
+                 : "Could not read the file. Check your connection and retry.",
+        detail,
+      };
+      this.previewMode = "unsupported";
+      this.toast(this.previewError.hint, "error", 3500);
     },
     // ----- Find in preview (magnifier) ----------------------------------
     // The live container whose DOM text we search/highlight. Only the two
@@ -10790,6 +12494,7 @@ function portal() {
       this.previewFind.active = -1;
       this.previewFind.count = 0;
       this.previewFind.listOpen = false;
+      this.previewFind.truncated = false;
     },
     // Unwrap every <mark class="find-hit"> we injected, restoring the original
     // text so a re-run (or close) leaves the DOM exactly as the renderer left
@@ -10822,6 +12527,7 @@ function portal() {
       this.previewFind.matches = [];
       this.previewFind.active = -1;
       this.previewFind.count = 0;
+      this.previewFind.truncated = false;
       const q = this.previewFind.query || "";
       if (!q) return;
       const container = this._previewFindContainer();
@@ -10847,8 +12553,18 @@ function portal() {
         const lower = text.toLowerCase();
         const starts = [];
         let idx = 0, from = 0;
-        while ((idx = lower.indexOf(needle, from)) !== -1) { starts.push(idx); from = idx + needle.length; }
-        if (!starts.length) continue;
+        while ((idx = lower.indexOf(needle, from)) !== -1) {
+          if (matches.length + starts.length >= this.PREVIEW_FIND_MAX_MATCHES) {
+            this.previewFind.truncated = true;
+            break;
+          }
+          starts.push(idx);
+          from = idx + needle.length;
+        }
+        if (!starts.length) {
+          if (this.previewFind.truncated) break;
+          continue;
+        }
         const frag = document.createDocumentFragment();
         let cursor = 0;
         for (const s of starts) {
@@ -10863,6 +12579,7 @@ function portal() {
         }
         if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
         tn.parentNode.replaceChild(frag, tn);
+        if (this.previewFind.truncated) break;
       }
       this._pfEls = els;
       this.previewFind.matches = matches;
@@ -10884,13 +12601,39 @@ function portal() {
     previewFindNext() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active + 1); },
     previewFindPrev() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active - 1); },
     async openFile(n, opts = {}) {
-      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
-      // is dirty would silently drop the changes. Confirm first; abort the
-      // switch if the user cancels. Re-opening the same path is a no-op for
-      // dirtiness (we'd just re-enter the same buffer), so skip the prompt.
-      if (this.editing && n && n.path !== this.selected && !this._confirmLoseEdits()) {
-        return;
+      if (!n || !n.path) return false;
+      // Clicking / double-clicking the file that already owns the editor is a
+      // focus or pin gesture, not a request to throw the buffer away and read
+      // it again. The old path guard only prompted for a *different* file, but
+      // then unconditionally set editing=false below — so one innocent repeat
+      // click silently discarded dirty text. Explicit force-reload is the one
+      // same-path operation that is allowed to replace the buffer.
+      if (this.editing && n.path === this.selected && !opts.forceReload) {
+        if (!opts.preview) this.pinTab(n.path);
+        this.treeFocusPath = n.path;
+        return true;
       }
+      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
+      // is dirty, or explicitly force-reloading the current one, would replace
+      // the buffer. Confirm first; reloadPreview can pass the confirmation it
+      // already obtained so the user never sees the same dialog twice.
+      if (this.editing && !opts.editsConfirmed && !this._confirmLoseEdits()) {
+        return false;
+      }
+      this._capturePreviewViewState(this.selected);
+      this._cancelPreviewViewRestore();
+      // A preview has one owner: the latest open request. Abort the old
+      // transport as well as invalidating its sequence so a slow A response
+      // cannot land under B's header (and so mobile radios stop doing wasted
+      // work after a rapid tab switch).
+      if (this._previewAbort) this._previewAbort.abort();
+      this._previewAbort = null;
+      const loadSeq = ++this._previewLoadSeq;
+      if (this._csvAbort) this._csvAbort.abort();
+      this._csvAbort = null;
+      ++this._csvLoadSeq;
+      this.csvLoading = false;
+      this.csvPath = "";
       // Switching to a different file invalidates any open find session — the
       // old file's <mark> nodes get blown away by the new x-html/x-text render
       // anyway, so drop the find UI + state cleanly.
@@ -10908,28 +12651,43 @@ function portal() {
         if (existing) {
           // Target already open (preview or pinned) — keep its pin state, but
           // the temp slot follows the user: drop any OTHER preview tab.
-          this.tabs = this.tabs.filter(t => t.path === n.path || !t.preview);
+          if (this.tabs.some(t => t.path !== n.path && t.preview)) {
+            this.tabs = this.tabs.filter(t => t.path === n.path || !t.preview);
+          }
         } else {
           // Recycle the single existing preview slot in place (keeps tab
           // order stable); otherwise create the preview tab.
           const pi = this.tabs.findIndex(t => t.preview);
-          if (pi >= 0) this.tabs.splice(pi, 1, { path: n.path, name, preview: true });
-          else this.tabs.push({ path: n.path, name, preview: true });
+          // Immutable replacement keeps Alpine's independent keyed tab lists
+          // from interleaving around a node that was removed in-place.
+          if (pi >= 0) {
+            this.tabs = this.tabs.map((t, i) => i === pi
+              ? { path: n.path, name, preview: true } : t);
+          } else {
+            this.tabs = [...this.tabs, { path: n.path, name, preview: true }];
+          }
         }
       } else {
         // Deliberate open / pin. Promote an existing preview tab to permanent,
         // or create a permanent tab.
         const existing = this.tabs.find(t => t.path === n.path);
-        if (existing) existing.preview = false;
-        else this.tabs.push({ path: n.path, name, preview: false });
+        if (existing && existing.preview) {
+          this.tabs = this.tabs.map(t => t.path === n.path
+            ? { ...t, preview: false } : t);
+        } else if (!existing) {
+          this.tabs = [...this.tabs, { path: n.path, name, preview: false }];
+        }
       }
-      this.selected = n.path;
+      const targetView = this._previewTabViewState(n.path);
+      // Tear down CodeMirror while it still belongs to the old path.
       this.editing = false;
+      this.selected = n.path;
+      this.treeFocusPath = n.path;
       // Persist preview-pane state so a refresh restores tabs + selected.
-      this.savePrefs();
+      this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
-      if (this._isMobileLayout()) this.mobileTab = "preview";
+      if (this._isMobileLayout()) this.setMobileTab("preview");
       // When many files are open, the active row/tab can end up off-screen
       // in both the Open files list (vertical scroll) and the preview tab
       // bar (horizontal scroll). Scroll the active item into view so users
@@ -10938,10 +12696,20 @@ function portal() {
       this.$nextTick(() => this._scrollPreviewSelectedIntoView());
       // Cache hit: serve a previously-loaded md/text/xlsx body synchronously —
       // no fetch, no "loading" flash. Invalidated on edit/reload/external write.
-      const cachedPrev = this._previewCacheGet(n.path);
+      const needsDiskReload = this._previewNeedsReload === n.path;
+      const cachedPrev = (opts.forceReload || needsDiskReload)
+        ? null : this._previewCacheGet(n.path);
       if (cachedPrev) {
-        this._applyPreviewCache(cachedPrev);
-        return;
+        const cachedPath = n.path;
+        this.previewMode = "loading";
+        requestAnimationFrame(() => {
+          if (this.selected === cachedPath && loadSeq === this._previewLoadSeq) {
+            this._applyPreviewCache(cachedPrev);
+            this._applyPreviewModeViewState(cachedPath);
+            this._schedulePreviewViewRestore(cachedPath, loadSeq);
+          }
+        });
+        return true;
       }
       // Clear the previous file's preview data and surface a loading
       // indicator. Without this, switching from a 10MB markdown file to
@@ -10961,18 +12729,25 @@ function portal() {
       // the target now; `_stale()` checks it after every await — a stale
       // response is silently dropped (B's own open owns the pane).
       const targetPath = n.path;
-      const _stale = () => this.selected !== targetPath;
+      const _stale = () => this.selected !== targetPath
+        || loadSeq !== this._previewLoadSeq;
+      const controller = new AbortController();
+      this._previewAbort = controller;
       const ext = name.split(".").pop().toLowerCase();
+      let loadOk = true;
+      let reusedHtmlFrame = false;
+      try {
       if (["md", "markdown"].includes(ext)) {
         // Stay in "loading" until content actually arrives — renderMd() flips
         // it to "md" once rawText is set. Setting it early would briefly show
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
-        if (_stale()) return;
+        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path),
+                              { headers: this.hdr(), signal: controller.signal });
+        if (_stale()) return false;
         if (r.ok) {
           const body = await r.text();
-          if (_stale()) return;
+          if (_stale()) return false;
           this.rawText = body;
           // For large markdown the synchronous markdown-it + sanitize pass can
           // block the main thread long enough to make the click feel frozen
@@ -10980,15 +12755,18 @@ function portal() {
           // next animation frame. The `selected` guard aborts the deferred
           // render if the user switched tabs while it was pending.
           const renderMd = () => {
-            if (this.selected !== targetPath) return;   // switched away mid-defer
-            this.renderedMd = this._renderPreviewMd(this.rawText);
+            if (_stale()) return;
+            this.renderedMd = this._renderPreviewMd(body);
             this.previewMode = "md";
-            if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-              this._previewCacheSet(targetPath, { mode: "md", rawText: this.rawText, renderedMd: this.renderedMd });
+            if (body.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+              this._previewCacheSet(targetPath, { mode: "md", rawText: body, renderedMd: this.renderedMd });
             }
-            this.$nextTick(() => this.highlightCode(".markdown"));
+            if (body.length <= this.LARGE_MD_DEFER_CHARS) {
+              this.$nextTick(() => this.highlightCode(".markdown"));
+            }
+            this._schedulePreviewViewRestore(targetPath, loadSeq);
           };
-          if (this.rawText.length > this.LARGE_MD_DEFER_CHARS) {
+          if (body.length > this.LARGE_MD_DEFER_CHARS) {
             this.previewMode = "loading";
             requestAnimationFrame(() => requestAnimationFrame(renderMd));
           } else {
@@ -10997,27 +12775,32 @@ function portal() {
         } else {
           // Failed read left previewMode="md" with empty rawText → blank white
           // pane. Surface a status-aware reason (404 drops the phantom tab).
-          await this._previewFail(r, n.path);
+          await this._previewFail(r, n.path, loadSeq);
+          loadOk = false;
         }
       } else if (["html", "htm"].includes(ext)) {
         // Render via sandboxed iframe (backend sends strict CSP + sandbox token).
+        reusedHtmlFrame = this._touchHtmlPreviewFrame(n.path);
         this.previewMode = "html";
       }
-      else if (["png", "jpg", "jpeg", "gif", "webp", "ico", "bmp"].includes(ext)) this.previewMode = "img";
+      else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) this.previewMode = "img";
       else if (ext === "pdf") this.previewMode = "pdf";
       else if (["xlsx", "xlsm", "xltx", "xltm"].includes(ext)) {
         // xlsx preview: backend serializes the workbook into capped per-sheet
         // string matrices so the frontend just renders <table>s. No formula
         // evaluation; cells show the last-cached value.
         const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
-                              { headers: this.hdr() });
-        if (_stale()) return;
+                              { headers: this.hdr(), signal: controller.signal });
+        if (_stale()) return false;
         if (r.ok) {
           const data = await r.json();
-          if (_stale()) return;
+          if (_stale()) return false;
           this.previewMode = "xlsx";
           this.xlsxSheets = data.sheets || [];
-          this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
+          this.xlsxActive = targetView.xlsxActive
+            && this.xlsxSheets.some(sheet => sheet.name === targetView.xlsxActive)
+            ? targetView.xlsxActive
+            : ((this.xlsxSheets[0] && this.xlsxSheets[0].name) || "");
           this.xlsxLimits = data.limits || null;
           this.xlsxSheetsTruncated = !!data.sheets_truncated;
           this._previewCacheSet(n.path, {
@@ -11025,7 +12808,8 @@ function portal() {
             xlsxLimits: this.xlsxLimits, xlsxSheetsTruncated: this.xlsxSheetsTruncated,
           });
         } else {
-          await this._previewFail(r, n.path);
+          await this._previewFail(r, n.path, loadSeq);
+          loadOk = false;
         }
       }
       else if (["csv", "tsv"].includes(ext)) {
@@ -11033,10 +12817,9 @@ function portal() {
         // file doesn't blow the browser. First page only here; "next page"
         // button is wired through csvLoadPage().
         this.csvPath = n.path;
-        this.csvOffset = 0;
-        await this.csvLoadPage();
-        if (_stale()) return;
-        if (this.csvData) {
+        const csvOk = await this.csvLoadPage(targetView.csvOffset);
+        if (_stale()) return false;
+        if (csvOk && this.csvData) {
           this.previewMode = "csv";
         } else {
           // csvLoadPage() already toasted the failure; give the empty state a
@@ -11047,6 +12830,7 @@ function portal() {
             hint:  this.lang === "zh" ? "无法解析该 CSV 文件。" : "Could not parse this CSV file.",
           };
           this.previewMode = "unsupported";
+          loadOk = false;
         }
       }
       else {
@@ -11054,14 +12838,16 @@ function portal() {
         // (e.g. bg-task .output files under /tmp via /api/chat/task-output)
         // that the archive-scoped /api/files/read can't reach.
         const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
-        const r = await fetch(readUrl, { headers: this.hdr() });
-        if (_stale()) return;
+        const r = await fetch(readUrl, {
+          headers: this.hdr(), signal: controller.signal,
+        });
+        if (_stale()) return false;
         if (r.ok) {
           // Read body BEFORE flipping previewMode → text, otherwise the
           // empty-file placeholder (previewMode==='text' && !rawText) flashes
           // during the await on a non-empty file.
           const body = await r.text();
-          if (_stale()) return;
+          if (_stale()) return false;
           this.rawText = body;
           this.previewMode = "text";
           this.previewLang = this.hljsLang(n.path);
@@ -11074,49 +12860,84 @@ function portal() {
             this.highlightCode(".text");
           });
         }
-        else await this._previewFail(r, n.path);
+        else {
+          await this._previewFail(r, n.path, loadSeq);
+          loadOk = false;
+        }
       }
+      } catch (e) {
+        if ((e && e.name === "AbortError") || _stale()) return false;
+        this._previewNetworkFail(e, targetPath, loadSeq);
+        return false;
+      } finally {
+        if (loadSeq === this._previewLoadSeq && this._previewAbort === controller) {
+          this._previewAbort = null;
+        }
+      }
+      if (loadOk && this.selected === targetPath && loadSeq === this._previewLoadSeq
+          && this._previewNeedsReload === targetPath) {
+        this._previewNeedsReload = "";
+      }
+      if (this.selected === targetPath && loadSeq === this._previewLoadSeq
+          && !(this.previewMode === "html" && reusedHtmlFrame)) {
+        this._schedulePreviewViewRestore(targetPath, loadSeq);
+      }
+      return loadOk;
     },
-    async csvLoadPage() {
-      if (!this.csvPath || this.csvLoading) return;
+    async csvLoadPage(requestedOffset = this.csvOffset) {
+      if (!this.csvPath) return false;
+      // A newly-opened CSV must supersede an older in-flight CSV instead of
+      // being rejected by a global `csvLoading` flag. This was the rapid
+      // A.csv → B.csv blank-preview bug.
+      if (this._csvAbort) this._csvAbort.abort();
+      const controller = new AbortController();
+      this._csvAbort = controller;
+      const loadSeq = ++this._csvLoadSeq;
       this.csvLoading = true;
-      // Snapshot the request identity — by the time the response lands the
-      // user may have opened a DIFFERENT csv (openFile resets csvPath) or
-      // paged again. Writing a stale response into csvData would show the
-      // old file / old offset's rows under the new header.
       const reqPath = this.csvPath;
-      const reqOffset = this.csvOffset;
-      const _csvStale = () =>
-        this.csvPath !== reqPath || this.csvOffset !== reqOffset;
+      const reqOffset = Math.max(0, Number(requestedOffset) || 0);
+      const _csvStale = () => loadSeq !== this._csvLoadSeq
+        || this.csvPath !== reqPath || this.selected !== reqPath;
       try {
         const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
                     + `&offset=${reqOffset}&limit=${this.csvLimit}`;
-        const r = await fetch(url, { headers: this.hdr() });
-        if (_csvStale()) return;
+        const r = await fetch(url, { headers: this.hdr(), signal: controller.signal });
+        if (_csvStale()) return false;
         if (r.ok) {
           const data = await r.json();
-          if (_csvStale()) return;
+          if (_csvStale()) return false;
+          // Commit the page number only after the page itself arrived. A
+          // failed Next therefore leaves the last good range and rows intact.
+          this.csvOffset = reqOffset;
           this.csvData = data;
+          return true;
         } else {
-          this.csvData = null;
           this.toast(this.lang === "zh" ? "CSV 解析失败" : "CSV parse failed",
                       "error", 3000);
+          return false;
         }
+      } catch (e) {
+        if ((e && e.name === "AbortError") || _csvStale()) return false;
+        this.toast(this.lang === "zh"
+          ? "CSV 加载失败，请检查网络后重试"
+          : "CSV load failed. Check your connection and retry.", "error", 3500);
+        return false;
       } finally {
-        this.csvLoading = false;
+        if (loadSeq === this._csvLoadSeq) {
+          this.csvLoading = false;
+          if (this._csvAbort === controller) this._csvAbort = null;
+        }
       }
     },
     csvNextPage() {
-      if (!this.csvData) return;
+      if (!this.csvData || this.csvLoading) return;
       const next = this.csvOffset + this.csvLimit;
       if (next >= (this.csvData.total_rows || 0)) return;
-      this.csvOffset = next;
-      this.csvLoadPage();
+      this.csvLoadPage(next);
     },
     csvPrevPage() {
-      if (this.csvOffset <= 0) return;
-      this.csvOffset = Math.max(0, this.csvOffset - this.csvLimit);
-      this.csvLoadPage();
+      if (this.csvOffset <= 0 || this.csvLoading) return;
+      this.csvLoadPage(Math.max(0, this.csvOffset - this.csvLimit));
     },
     csvWindowEnd() {
       if (!this.csvData) return 0;
@@ -11162,14 +12983,18 @@ function portal() {
     async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
 
     async switchTab(path) {
+      if (!path || path === this.selected) return true;
       // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容。
       // Preserve the tab's preview/pinned state: a single-click to view a
       // preview tab must NOT pin it (only a double-click / edit does). Pass
       // the tab's current preview flag so openFile's "existing" branch leaves
       // it untouched.
       const cur = this.tabs.find(t => t.path === path);
-      await this.openFile({ path, name: path.split("/").pop() },
-                          { preview: !!(cur && cur.preview) });
+      const opened = await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(cur && cur.preview) },
+      );
+      if (!opened) return false;
       // Pass mode:"background" so we expand/scroll the tree quietly —
       // the user clicked a preview tab, they want to STAY in preview
       // (especially on mobile, where revealInTree's default mode would
@@ -11177,6 +13002,7 @@ function portal() {
       // doesn't fire here because there's no "I'm looking for this
       // file in the tree" user intent — they were already on it.
       await this.revealInTree(path, { mode: "background" });
+      return true;
     },
     async revealInTree(path, opts = {}) {
       // Make the file's row visible in the tree pane and flash it so the
@@ -11210,7 +13036,7 @@ function portal() {
       const interactive = opts.mode !== "background";
       if (interactive) {
         if (this.searchMode) this.clearSearch();
-        if (this._isMobileLayout()) this.mobileTab = "files";
+        if (this._isMobileLayout()) this.setMobileTab("files");
       }
       const parts = path.split("/");
       parts.pop();   // drop the filename, keep only directory chain
@@ -11245,7 +13071,8 @@ function portal() {
       if (idx < 0) return;
       // Closing the tab being edited would discard unsaved changes — confirm.
       if (this.editing && path === this.selected && !this._confirmLoseEdits()) return;
-      this.tabs.splice(idx, 1);
+      this.tabs = this.tabs.filter(t => t.path !== path);
+      this._dropHtmlPreviewFramesUnder([path]);
       if (this.selected === path) {
         // 关掉的是当前 tab，切到旁边
         if (this.tabs.length === 0) {
@@ -11266,27 +13093,76 @@ function portal() {
     // preview pane keeps showing the last file's content because rawText/
     // renderedMd were never cleared (2026-05-23 user feedback).
     _clearPreviewState() {
+      if (this._previewAbort) this._previewAbort.abort();
+      if (this._csvAbort) this._csvAbort.abort();
+      clearTimeout(this._previewViewSaveTimer);
+      this._previewViewSaveTimer = null;
+      clearTimeout(this._htmlPreviewScrollSaveTimer);
+      this._htmlPreviewScrollSaveTimer = null;
+      this._htmlPreviewFramePosition = null;
+      this.htmlPreviewFrames = [];
+      this._htmlPreviewFrameClock = 0;
+      this._cancelPreviewViewRestore();
+      this._previewAbort = null;
+      this._csvAbort = null;
+      ++this._previewLoadSeq;
+      ++this._csvLoadSeq;
+      if (this.previewFind.open || this._pfEls.length) this.closePreviewFind();
+      // Set editing first: the selected watcher remounts CodeMirror whenever
+      // the path changes *while* editing. Clearing selected in the opposite
+      // order caused a pointless mount against an empty path before unmount.
+      this.editing = false;
       this.selected = "";
+      this.treeFocusPath = "";
       this.previewMode = "";
       this.previewError = null;
       this.rawText = "";
       this.renderedMd = "";
-      this.editing = false;
+      this.xlsxSheets = [];
+      this.xlsxActive = "";
+      this.xlsxLimits = null;
+      this.xlsxSheetsTruncated = false;
+      this.csvPath = "";
+      this.csvData = null;
+      this.csvOffset = 0;
+      this.csvLoading = false;
+      this.editText = "";
+      this.livePreviewHtml = "";
+      this.editorIsMd = false;
+      this.cmStatus = { ...this.cmStatus, dirty: false };
+      this._previewNeedsReload = "";
       this.selectedMeta = null;
+    },
+    onPreviewImageError() {
+      if (!this.selected || this.previewMode !== "img") return;
+      this.previewError = {
+        status: 0,
+        title: this.lang === "zh" ? "图片无法显示" : "Image could not be displayed",
+        hint: this.lang === "zh"
+          ? "文件可能已移动、网络中断，或图片格式已损坏。请刷新后重试。"
+          : "The file may have moved, the connection failed, or the image is invalid. Try reloading.",
+      };
+      this.previewMode = "unsupported";
     },
     // Fetch on-disk metadata (mtime / size) for the preview-header strip.
     // Guarded against races: by the time the await resolves the user may have
     // switched files, so only apply if `path` is still the selected one. A
     // failed/404 stat clears the strip rather than showing stale numbers.
     async loadSelectedMeta(path) {
+      const loadSeq = ++this._selectedMetaSeq;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const isOwner = () => loadSeq === this._selectedMetaSeq
+        && ownerWorkspace === this.currentWorkspacePath()
+        && this.selected === path;
       if (!path) { this.selectedMeta = null; return; }
       try {
         const r = await fetch("/api/files/stat?path=" + encodeURIComponent(path),
                               { headers: this.hdr() });
-        if (!r.ok) { if (this.selected === path) this.selectedMeta = null; return; }
+        if (!isOwner()) return;
+        if (!r.ok) { this.selectedMeta = null; return; }
         const d = await r.json();
-        if (this.selected === path) this.selectedMeta = d;
-      } catch { if (this.selected === path) this.selectedMeta = null; }
+        if (isOwner()) this.selectedMeta = d;
+      } catch { if (isOwner()) this.selectedMeta = null; }
     },
     // Format a unix-seconds mtime as "YYYY-MM-DD HH:mm" in local time for the
     // preview-header strip. Returns "" for a falsy timestamp.
@@ -11308,12 +13184,16 @@ function portal() {
 
     rawUrl(p, opts = {}) {
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
+      // Iframe/img/pdf/anchor requests cannot attach our custom workspace
+      // header, so carry the registered root in the query string too.
+      const workspace = this.currentWorkspacePath()
+        ? "&workspace=" + encodeURIComponent(this.currentWorkspacePath()) : "";
       // preview=1 asks the backend to inject the click-to-zoom bridge into
       // HTML (see files.py). Only the html preview iframe passes it; images /
       // pdf / downloads stream untouched.
       const pv = opts.preview ? "&preview=1" : "";
       return "/api/files/raw?path=" + encodeURIComponent(p)
-              + "&token=" + encodeURIComponent(this.token) + v + pv;
+              + "&token=" + encodeURIComponent(this.token) + workspace + v + pv;
     },
     async reloadPreview() {
       // Manual "🗘 reload" button in preview header. Bumps previewVersion
@@ -11321,46 +13201,27 @@ function portal() {
       // read endpoint for md / text. Useful when the file changed outside
       // muselab's normal write paths (terminal git pull, external editor).
       if (!this.selected) return;
+      if (this.editing && !this._confirmLoseEdits()) return;
+      const path = this.selected;
+      const tab = this.tabs.find(t => t.path === path);
       // Re-render replaces the content nodes our find marks live in; close the
       // find session so it doesn't dangle on detached <mark> elements.
       if (this.previewFind.open) this.closePreviewFind();
       this.previewVersion = Date.now();
       // File content changed underneath us — drop any stale cached body so a
       // later tab switch back re-fetches instead of serving the old render.
-      this._previewCacheDel(this.selected);
-      if (this.previewMode === "md" || this.previewMode === "text") {
-        const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
-                     + "&_v=" + this.previewVersion;
-        try {
-          const r = await fetch(url, { headers: this.hdr() });
-          if (r.ok) {
-            this.rawText = await r.text();
-            if (this.previewMode === "md") {
-              this.renderedMd = this._renderPreviewMd(this.rawText);
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
-                });
-              }
-              this.$nextTick(() => this.highlightCode(".markdown"));
-            } else {
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "text", rawText: this.rawText, previewLang: this.previewLang,
-                });
-              }
-              this.$nextTick(() => {
-                document.querySelectorAll(".text code")
-                  .forEach(el => { delete el.dataset.hl; });
-                this.highlightCode(".text");
-              });
-            }
-          }
-        } catch (_e) { /* network blip */ }
-      }
+      this._previewCacheDel(path);
+      // Route every type through the same owner-safe loader. The old manual
+      // implementation only refreshed md/text while claiming success for
+      // CSV/XLSX, and a late response could overwrite a newly-selected file.
+      const ok = await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(tab && tab.preview), forceReload: true, editsConfirmed: true },
+      );
+      if (!ok || this.selected !== path) return;
       // mtime almost certainly changed if the reload was triggered by an
       // external edit — refresh the header strip too.
-      this.loadSelectedMeta(this.selected);
+      this.loadSelectedMeta(path);
       this.toast(this.lang === "zh" ? "已刷新预览" : "Preview reloaded",
                   "success", 1200);
     },
@@ -11387,8 +13248,9 @@ function portal() {
     resetPreviewZoom() { this.setPreviewZoom(1); },
     previewZoomPct() { return Math.round(this.previewZoom * 100) + "%"; },
 
-    async _maybeReloadPreview(toolFilePath) {
+    async _maybeReloadPreview(toolFilePath, ownerWorkspace = "") {
       // Called from the tool_use SSE handler when a write-style tool fires.
+      if (ownerWorkspace && ownerWorkspace !== this.currentWorkspacePath()) return;
       // Refresh the preview pane if the tool's target path matches what's
       // currently being previewed. Path matching is by basename + suffix
       // match against this.selected (which may be absolute or ROOT-relative);
@@ -11396,7 +13258,8 @@ function portal() {
       // acceptable (we'd over-refresh, which is harmless) vs missing a real
       // hit by being too strict on path normalization.
       if (!this.selected || !toolFilePath) return;
-      const selBase = this.selected.split("/").pop();
+      const path = this.selected;
+      const selBase = path.split("/").pop();
       const toolBase = toolFilePath.split("/").pop();
       if (selBase !== toolBase) return;
       // Same basename → cache-bust. For html/img/pdf/iframe the new
@@ -11404,41 +13267,30 @@ function portal() {
       // also need to re-fetch since rawText is cached in the component.
       this.previewVersion = Date.now();
       // An external/tool write invalidated the cached body — drop it.
-      this._previewCacheDel(this.selected);
-      if (this.previewMode === "md" || this.previewMode === "text") {
-        const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
-                     + "&_v=" + this.previewVersion;
-        try {
-          const r = await fetch(url, { headers: this.hdr() });
-          if (r.ok) {
-            this.rawText = await r.text();
-            if (this.previewMode === "md") {
-              this.renderedMd = this._renderPreviewMd(this.rawText);
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
-                });
-              }
-              this.$nextTick(() => this.highlightCode(".markdown"));
-            } else {
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "text", rawText: this.rawText, previewLang: this.previewLang,
-                });
-              }
-              this.$nextTick(() => {
-                document.querySelectorAll(".text code")
-                  .forEach(el => { delete el.dataset.hl; });
-                this.highlightCode(".text");
-              });
-            }
-          }
-        } catch (e) { /* network blip — manual refresh still possible */ }
+      this._previewCacheDel(path);
+      // Never overwrite an editor buffer after a tool write. Keeping the
+      // user's local text is safer; metadata still updates and the next
+      // explicit reload will reconcile the disk version.
+      if (this.editing) {
+        this._previewNeedsReload = path;
+        this.loadSelectedMeta(path);
+        return;
       }
+      const tab = this.tabs.find(t => t.path === path);
+      await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(tab && tab.preview), forceReload: true },
+      );
+      if (this.selected !== path) return;
       // A tool just wrote this file → its mtime moved; refresh the strip.
-      this.loadSelectedMeta(this.selected);
+      this.loadSelectedMeta(path);
     },
-    downloadUrl(p) { return "/api/files/download?path=" + encodeURIComponent(p) + "&token=" + encodeURIComponent(this.token); },
+    downloadUrl(p) {
+      const workspace = this.currentWorkspacePath()
+        ? "&workspace=" + encodeURIComponent(this.currentWorkspacePath()) : "";
+      return "/api/files/download?path=" + encodeURIComponent(p)
+        + "&token=" + encodeURIComponent(this.token) + workspace;
+    },
 
     iconRef(n) {
       if (n.is_dir) return "#i-folder";
@@ -12302,6 +14154,9 @@ function portal() {
     // ===== search =====
     async doSearch() {
       const q = this.searchQ.trim();
+      if (this._fileSearchAbort) this._fileSearchAbort.abort();
+      this._fileSearchAbort = null;
+      const searchSeq = ++this._fileSearchSeq;
       if (q.length < 2) {
         // Don't full clearSearch() here — that resets `searchQ = ""` and
         // breaks IME composition on mobile (observed 2026-05-28 on iOS
@@ -12320,17 +14175,46 @@ function portal() {
       }
       this.searchMode = true;
       this.searching = true;
-      const [a, b] = await Promise.all([
-        fetch("/api/files/search?q=" + encodeURIComponent(q), { headers: this.hdr() }).then(r => r.ok ? r.json() : { entries: [] }),
-        fetch("/api/files/grep?q=" + encodeURIComponent(q), { headers: this.hdr() }).then(r => r.ok ? r.json() : { hits: [] }),
-      ]);
-      this.searchHits = a.entries || [];
-      this.searchTruncated = !!a.truncated;
-      this.grepHits = b.hits || [];
-      this.grepTruncated = !!b.truncated;
-      this.searching = false;
+      const controller = new AbortController();
+      this._fileSearchAbort = controller;
+      const readJson = async (url) => {
+        const r = await fetch(url, { headers: this.hdr(), signal: controller.signal });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      };
+      try {
+        // Let filename and content search fail independently. A permission
+        // error in grep should not hide perfectly-good filename matches.
+        const [names, content] = await Promise.allSettled([
+          readJson("/api/files/search?q=" + encodeURIComponent(q)),
+          readJson("/api/files/grep?q=" + encodeURIComponent(q)),
+        ]);
+        if (searchSeq !== this._fileSearchSeq || this.searchQ.trim() !== q) return;
+        const a = names.status === "fulfilled" ? names.value : null;
+        const b = content.status === "fulfilled" ? content.value : null;
+        this.searchHits = (a && a.entries) || [];
+        this.searchTruncated = !!(a && a.truncated);
+        this.grepHits = (b && b.hits) || [];
+        this.grepTruncated = !!(b && b.truncated);
+        if (!a && !b) {
+          this.toast(this.lang === "zh" ? "文件搜索失败" : "File search failed",
+                     "error", 3500);
+        } else if (!a || !b) {
+          this.toast(this.lang === "zh"
+            ? "部分搜索结果暂时不可用" : "Some search results are unavailable",
+            "warn", 2500);
+        }
+      } finally {
+        if (searchSeq === this._fileSearchSeq) {
+          this.searching = false;
+          if (this._fileSearchAbort === controller) this._fileSearchAbort = null;
+        }
+      }
     },
     clearSearch() {
+      if (this._fileSearchAbort) this._fileSearchAbort.abort();
+      this._fileSearchAbort = null;
+      ++this._fileSearchSeq;
       this.searchQ = ""; this.searchMode = false; this.searching = false;
       this.searchHits = []; this.grepHits = []; this.searchTruncated = false; this.grepTruncated = false;
     },
@@ -12356,12 +14240,31 @@ function portal() {
       // the upload button silently uploaded just the first one.
       const files = Array.from(ev.target.files || []);
       if (!files.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const uploadContext = this._prepareUploadOverwrite("", files);
+      if (!uploadContext) {
+        ev.target.value = "";
+        return;
+      }
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet("", f))
       );
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        ev.target.value = "";
+        return;
+      }
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
-      this.reloadTree();
+      await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        ev.target.value = "";
+        return;
+      }
+      await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        ev.target.value = "";
+        return;
+      }
       if (failed && !ok) {
         this.toast(this.lang === "zh"
           ? `${failed} 个文件上传失败`
@@ -12382,17 +14285,39 @@ function portal() {
       ev.target.value = "";
     },
     async uploadFileTo(dirPath, file) {
+      const ownerWorkspace = this.currentWorkspacePath();
+      const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
+      if (!uploadContext) return;
       const fd = new FormData();
       fd.append("path", dirPath);
       fd.append("file", file);
       let r;
       try {
         r = await fetch("/api/files/upload", { method: "POST", headers: this.hdr(), body: fd });
-      } catch (e) { this.errToast("upload", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("upload", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         delete this.childCache[dirPath];
-        this.reloadTree();
         const data = await r.json().catch(() => ({}));
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        await this._refreshParentInTree(
+          data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
+          ownerWorkspace,
+        );
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        await this._syncUploadedFiles([{
+          status: "fulfilled",
+          value: {
+            path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
+            replaced_trash_id: data.replaced_trash_id || null,
+          },
+        }], uploadContext, ownerWorkspace);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         // Backend trashes any same-name file it replaced; tell the user so a
         // silent overwrite isn't mistaken for a clean upload.
         if (data.replaced_trash_id) {
@@ -12400,7 +14325,10 @@ function portal() {
         } else {
           this.toast(this.t("toast.uploaded_to", { name: file.name, dir: dirPath || "" }), "success");
         }
-      } else this.errToast("upload", await r.text());
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("upload", detail);
+      }
     },
     // Custom MIME so tree-internal drags don't collide with OS file drops.
     // Reading getData with this type during dragover would force a stale
@@ -12558,12 +14486,23 @@ function portal() {
     // multi-file drop doesn't serialize.
     async _uploadFilesToDir(targetDir, files) {
       if (!files.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const uploadContext = this._prepareUploadOverwrite(targetDir, files);
+      if (!uploadContext) return;
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet(targetDir, f))
       );
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
-      this.reloadTree();
+      const firstUploaded = results.find(r =>
+        r.status === "fulfilled" && r.value && r.value.path);
+      if (firstUploaded) {
+        await this._refreshParentInTree(firstUploaded.value.path, ownerWorkspace);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      }
+      await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const intoLabel = targetDir ? `/${targetDir}` : "/";
       if (failed && !ok) {
         this.toast(this.lang === "zh"
@@ -12616,6 +14555,7 @@ function portal() {
     },
     async moveTreeItem(srcPath, targetDir) {
       if (!srcPath) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const srcName = srcPath.split("/").pop();
       const srcParent = srcPath.split("/").slice(0, -1).join("/");
       // Same-parent drop = no-op (user dragged a file inside its own
@@ -12632,13 +14572,24 @@ function portal() {
         return;
       }
       const newPath = targetDir ? `${targetDir}/${srcName}` : srcName;
-      const r = await fetch("/api/files/rename", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ src: srcPath, dst: newPath }),
-      });
+      let r;
+      try {
+        r = await fetch("/api/files/rename", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ src: srcPath, dst: newPath }),
+        });
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ")
+            + String((e && e.message) || e), "error", 4000);
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         const err = await r.text();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ") + err,
           "error", 4000);
         return;
@@ -12646,12 +14597,17 @@ function portal() {
       this.toast(this.lang === "zh"
         ? `已移动到 /${targetDir || "(根)"}`
         : `Moved to /${targetDir || "(root)"}`, "success", 2000);
-      // Refresh the tree and reroute selected/preview if we just moved
-      // the currently-open file.
-      if (this.selected === srcPath) this.selected = newPath;
-      const openTab = this.tabs.find(t => t.path === srcPath);
-      if (openTab) openTab.path = newPath;
+      const activeMoved = this._remapPreviewPaths(srcPath, newPath);
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (activeMoved && this.selected && !this.editing) {
+        const active = this.tabs.find(t => t.path === this.selected);
+        await this.openFile(
+          { path: this.selected, name: this.selected.split("/").pop() },
+          { preview: !!(active && active.preview), forceReload: true },
+        );
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      }
     },
     // Batch move: drag a multi-selection onto a folder (or the root bar).
     // Delegates to the single-item path when there's only one, so toasts /
@@ -12660,10 +14616,12 @@ function portal() {
     // open tabs ONCE. No backend batch endpoint — same parallel-then-refresh
     // pattern as _uploadFilesToDir.
     async moveTreeItems(srcPaths, targetDir) {
+      const ownerWorkspace = this.currentWorkspacePath();
       const list = this._pruneDescendants((srcPaths || []).filter(Boolean));
       if (!list.length) return;
       if (list.length === 1) {
         await this.moveTreeItem(list[0], targetDir);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.clearTreeSelection();
         return;
       }
@@ -12683,16 +14641,25 @@ function portal() {
           body: JSON.stringify({ src: p.src, dst: p.dst }),
         }).then(r => (r.ok ? p : Promise.reject(new Error(p.src))))
       ));
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const okItems = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okItems.length;
-      // Reroute the active focus + any open tabs for moved items.
+      // Reroute the active focus + every descendant open tab for moved dirs.
+      let activeMoved = false;
       for (const { src, dst } of okItems) {
-        if (this.selected === src) this.selected = dst;
-        const tab = this.tabs.find(t => t.path === src);
-        if (tab) tab.path = dst;
+        activeMoved = this._remapPreviewPaths(src, dst) || activeMoved;
       }
       this.clearTreeSelection();
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (activeMoved && this.selected && !this.editing) {
+        const active = this.tabs.find(t => t.path === this.selected);
+        await this.openFile(
+          { path: this.selected, name: this.selected.split("/").pop() },
+          { preview: !!(active && active.preview), forceReload: true },
+        );
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      }
       const zh = this.lang === "zh";
       const into = targetDir ? `/${targetDir}` : (zh ? "/(根)" : "/(root)");
       if (failed && !okItems.length) {
@@ -12711,9 +14678,10 @@ function portal() {
     // sync tabs. No per-item Undo for batches — items are still recoverable
     // from the trash modal.
     async deleteSelected() {
+      const ownerWorkspace = this.currentWorkspacePath();
       const paths = this._pruneDescendants(Array.from(this.selectedPaths));
       if (paths.length <= 1) {
-        const p = paths[0] || this.selected;
+        const p = paths[0] || this.treeFocusPath || this.selected;
         const node = p && this._findTreeNode(p);
         if (node) await this.doDelete(node);
         return;
@@ -12725,7 +14693,8 @@ function portal() {
                  : `Move ${paths.length} selected items to trash? Recoverable from the trash.`,
         okText: zh ? "移到垃圾桶" : "Move to trash",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (!this._canRemovePreviewPaths(paths)) return;
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
@@ -12735,15 +14704,15 @@ function portal() {
           // in the same batch) — count it as done, not a failure.
         }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
       ));
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
-      for (const p of okPaths) {
-        this.tabs = this.tabs.filter(t => t.path !== p);
-        if (this.selected === p) { this.selected = ""; this.previewMode = ""; }
-      }
+      await this._dropPreviewPathsUnder(okPaths);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.trash.count += okPaths.length;
       this.clearTreeSelection();
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (failed && !okPaths.length) {
         this.toast(zh ? `${failed} 项删除失败` : `${failed} item(s) failed to delete`, "error", 4000);
       } else if (failed) {
@@ -12858,20 +14827,36 @@ function portal() {
     },
     async mkdirPrompt() {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建目录" : "New directory",
         body: zh ? "输入相对根的路径，例如 archives/2026"
                  : "Path relative to root, e.g. archives/2026",
         placeholder: "archives/2026",
       });
-      if (!name) return;
-      const r = await fetch("/api/files/mkdir", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ path: name }),
-      });
-      if (r.ok) { this.reloadTree(); this.toast(this.t("toast.created"), "success"); }
-      else this.errToast("generic", await r.text());
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      let r;
+      try {
+        r = await fetch("/api/files/mkdir", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: name }),
+        });
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (r.ok) {
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        this.toast(this.t("toast.created"), "success");
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("generic", detail);
+      }
     },
 
     // ===== edit =====
@@ -13189,29 +15174,72 @@ function portal() {
     async toggleEdit() {
       if (this.editing) {
         if (!this._confirmLoseEdits()) return;
+        const reloadPath = this._previewNeedsReload === this.selected
+          ? this.selected : "";
         this.editing = false;
+        if (reloadPath) {
+          const tab = this.tabs.find(t => t.path === reloadPath);
+          await this.openFile(
+            { path: reloadPath, name: reloadPath.split("/").pop() },
+            { preview: !!(tab && tab.preview), forceReload: true, editsConfirmed: true },
+          );
+        }
         return;
       }
+      if (!this.selected) return;
+      const targetPath = this.selected;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const targetMode = this.previewMode;
+      // Entering the editor takes ownership of the file body. Cancel any
+      // preview/CSV transport and invalidate deferred markdown rendering so it
+      // cannot replace rawText after the editable buffer has been seeded.
+      if (this._previewAbort) this._previewAbort.abort();
+      this._previewAbort = null;
+      ++this._previewLoadSeq;
+      if (this._csvAbort) this._csvAbort.abort();
+      this._csvAbort = null;
+      ++this._csvLoadSeq;
+      this.csvLoading = false;
       // Entering edit mode hides the rendered .markdown/pre.text containers our
       // find marks live in — close find so it can't point at a hidden DOM.
       if (this.previewFind.open) this.closePreviewFind();
       // 进入编辑：确保 rawText 已加载（html/img/pdf 走 raw 模式时没 fetch 文本）
-      if (!this.rawText || this.previewMode === "html" || this.previewMode === "pdf" || this.previewMode === "img") {
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(this.selected), { headers: this.hdr() });
-        if (!r.ok) {
-          this.errToast("read", this.lang === "zh"
-                                  ? "可能是二进制或太大 — " + (await r.text())
-                                  : "binary or too large — " + (await r.text()));
+      if (!this.rawText || targetMode === "html" || targetMode === "pdf" || targetMode === "img") {
+        let r;
+        try {
+          r = await fetch("/api/files/read?path=" + encodeURIComponent(targetPath),
+                          { headers: this.hdr() });
+        } catch (e) {
+          if (this._workspaceIsCurrent(ownerWorkspace)
+              && this.selected === targetPath) {
+            this.errToast("read", String((e && e.message) || e));
+          }
           return;
         }
-        this.rawText = await r.text();
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || this.selected !== targetPath) return;
+        if (!r.ok) {
+          const detail = await r.text();
+          if (!this._workspaceIsCurrent(ownerWorkspace)
+              || this.selected !== targetPath) return;
+          this.errToast("read", this.lang === "zh"
+                                  ? "可能是二进制或太大 — " + detail
+                                  : "binary or too large — " + detail);
+          return;
+        }
+        const body = await r.text();
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || this.selected !== targetPath) return;
+        this.rawText = body;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || this.selected !== targetPath) return;
       this.editText = this.rawText;
       // Live-preview setup: markdown files get the split pane; others edit
       // full-width (editorView forced to "edit" so the template hides the
       // preview + view-switch toolbar). For md, restore the persisted layout
       // choice and seed the preview HTML so it's there on first paint.
-      this.editorIsMd = this._isMdPath(this.selected);
+      this.editorIsMd = this._isMdPath(targetPath);
       if (this.editorIsMd) {
         const saved = localStorage.getItem("muselab_editor_view");
         this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
@@ -13228,7 +15256,7 @@ function portal() {
       this.editing = true;
       // Editing is a deliberate commitment to the file — pin its tab so it
       // doesn't get recycled out from under the editor by the next preview.
-      this.pinTab(this.selected);
+      this.pinTab(targetPath);
     },
     async saveEdit() {
       // Ctrl/Cmd+S can enter from two places when CodeMirror has focus:
@@ -13243,37 +15271,57 @@ function portal() {
         // active; the textarea fallback (this._cm === null) keeps editText synced
         // via its input listener. Everything below (write body, post-save
         // rawText sync) reads this.editText, so refresh it first.
-        if (this._cm) this.editText = this._cm.getValue();
+        if (!this.selected) return;
+        const savePath = this.selected;
+        const ownerWorkspace = this.currentWorkspacePath();
+        const saveMode = this.previewMode;
+        const saveLang = this.previewLang;
+        const saveText = this._cm ? this._cm.getValue() : this.editText;
+        this.editText = saveText;
         let r;
         try {
           r = await fetch("/api/files/write", {
             method: "PUT",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ path: this.selected, content: this.editText }),
+            body: JSON.stringify({ path: savePath, content: saveText }),
           });
         } catch (e) {
           // Keep editing=true so the unsaved buffer is preserved for retry.
-          this.errToast("save", String((e && e.message) || e));
+          if (this._workspaceIsCurrent(ownerWorkspace)
+              && this.selected === savePath) {
+            this.errToast("save", String((e && e.message) || e));
+          }
           return;
         }
         if (r.ok) {
-          this.rawText = this.editText;
+          // The user can keep typing while the request is in flight. Compare
+          // the live buffer with the exact payload that reached disk before
+          // deciding whether it is safe to close the editor.
+          const sameOwner = this._workspaceIsCurrent(ownerWorkspace)
+            && this.selected === savePath;
+          const liveText = sameOwner && this.editing
+            ? (this._cm ? this._cm.getValue() : this.editText)
+            : saveText;
+          const hasNewerEdits = sameOwner && liveText !== saveText;
+          if (!sameOwner) return;
+          this._previewCacheDel(savePath);
+          if (this._previewNeedsReload === savePath) this._previewNeedsReload = "";
+          this.rawText = saveText;
           // Keep the preview cache in step with the just-saved body. For md/text
           // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
           // the stale entry so the next switch-back re-fetches.
-          this._previewCacheDel(this.selected);
-          if (this.previewMode === "md") {
+          if (saveMode === "md") {
             this.renderedMd = this._renderPreviewMd(this.rawText);
             if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-              this._previewCacheSet(this.selected, {
+              this._previewCacheSet(savePath, {
                 mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
               });
             }
             this.$nextTick(() => this.highlightCode(".markdown"));
-          } else if (this.previewMode === "text"
+          } else if (saveMode === "text"
                      && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-            this._previewCacheSet(this.selected, {
-              mode: "text", rawText: this.rawText, previewLang: this.previewLang,
+            this._previewCacheSet(savePath, {
+              mode: "text", rawText: this.rawText, previewLang: saveLang,
             });
           }
           // Bump previewVersion so HTML / PDF / image iframes pick up the new
@@ -13282,11 +15330,24 @@ function portal() {
           // the issue was visible when editing a html report styled in dark
           // mode to light mode: editor saved, preview iframe still showed dark.
           this.previewVersion = Date.now();
-          this.editing = false;
+          if (hasNewerEdits) {
+            this.editText = liveText;
+            this.cmStatus = { ...this.cmStatus, dirty: true };
+          } else {
+            this.editText = saveText;
+            this.editing = false;
+          }
           // Saving moved the file's mtime — refresh the header strip.
-          this.loadSelectedMeta(this.selected);
-          this.toast(this.t("toast.saved"), "success");
-        } else this.errToast("save", await r.text());
+          this.loadSelectedMeta(savePath);
+          this.toast(hasNewerEdits
+            ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存"
+                                  : "Saved; newer edits are still unsaved")
+            : this.t("toast.saved"), "success", hasNewerEdits ? 3000 : 2000);
+        } else {
+          const detail = await r.text();
+          if (this._workspaceIsCurrent(ownerWorkspace)
+              && this.selected === savePath) this.errToast("save", detail);
+        }
       } finally {
         this._saveEditInFlight = false;
       }
@@ -13299,7 +15360,7 @@ function portal() {
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       this.toast(this.t("toast.mention_added", { path }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      if (this._isMobileLayout()) this.setMobileTab("chat");
     },
     autoGrow(ta) {
       // Grow to fit content up to max. The hard problem: iOS Safari
@@ -13453,13 +15514,7 @@ function portal() {
           await this.refreshSessions();
           // Drop the old session's tab + cached state, then open a fresh one
           // in its slot. newSession() handles tabState + openTabIds + switch.
-          const oldStreamState = this.tabState[oldId];
-          if (oldStreamState) {
-            if (oldStreamState.es) { try { oldStreamState.es.close(); } catch {} }
-            if (oldStreamState._streamTimer) clearInterval(oldStreamState._streamTimer);
-            delete this.tabState[oldId];
-          }
-          this._clearSessionWarnFlags(oldId);
+          this._disposeTabRuntime(oldId);
           this.openTabIds = this.openTabIds.filter(x => x !== oldId);
           await this.newSession();
           this.toast(this.t("slash.cleared"), "success", 1500);
@@ -13750,24 +15805,39 @@ function portal() {
     },
 
     async quickNewNote() {
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: this.t("preview.new_note_title"),
         body: this.t("preview.new_note_body"),
         value: "untitled.md",
       });
-      if (!name) return;
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const trimmed = name.trim();
       if (!trimmed) return;
       // Create empty file at archive root
-      const r = await fetch("/api/files/write", {
-        method: "PUT",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ path: trimmed, content: "# " + trimmed.replace(/\.md$/, "") + "\n\n" }),
-      });
+      let r;
+      try {
+        r = await fetch("/api/files/write", {
+          method: "PUT",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: trimmed, content: "# " + trimmed.replace(/\.md$/, "") + "\n\n" }),
+        });
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
       await this.loadRoot();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       await this.openFile({ path: trimmed, name: trimmed });
-      this.editing = true;
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      // Enter through the normal editor setup so CodeMirror receives the
+      // newly-created body instead of reusing a previous file's buffer.
+      if (this.selected === trimmed) await this.toggleEdit();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.toast(this.t("toast.saved"), "success", 1200);
     },
 
@@ -14011,6 +16081,12 @@ function portal() {
       // Otherwise let the browser handle ↑ (cursor up inside textarea).
     },
 
+    _cancelMentionLookup() {
+      if (this._mentionAbort) this._mentionAbort.abort();
+      this._mentionAbort = null;
+      ++this._mentionSeq;
+      this.mentionShow = false;
+    },
     onChatInput(ev) {
       const ta = ev.target;
       const pos = ta.selectionStart;
@@ -14027,7 +16103,7 @@ function portal() {
           this.slashShow = this.slashResults.length > 0;
           this.slashAnchor = 0;
         }
-        this.mentionShow = false;
+        this._cancelMentionLookup();
         return;
       } else {
         this.slashShow = false;
@@ -14042,14 +16118,17 @@ function portal() {
       // emails and the picker auto-hides as soon as a space is typed.
       // 2026-05-28 user request: "任何时候 @ 都弹出".
       const at = text.lastIndexOf("@");
-      if (at < 0) { this.mentionShow = false; return; }
+      if (at < 0) { this._cancelMentionLookup(); return; }
       const query = text.slice(at + 1);
-      if (/\s/.test(query)) { this.mentionShow = false; return; }
+      if (/\s/.test(query)) { this._cancelMentionLookup(); return; }
       this.mentionAnchor = at;
       clearTimeout(this._mentionDebounce);
       this._mentionDebounce = setTimeout(() => this.fetchMention(query), 200);
     },
     async fetchMention(q) {
+      if (this._mentionAbort) this._mentionAbort.abort();
+      this._mentionAbort = null;
+      const mentionSeq = ++this._mentionSeq;
       // Currently open preview tabs — surface them at the top of the picker
       // so the user can quickly @-reference whatever they're already looking
       // at. `this.tabs` is the preview-pane tab strip; each entry has
@@ -14064,7 +16143,10 @@ function portal() {
         // then a few root entries to keep the original "browse from root"
         // affordance. Dedupe so an open file at the root doesn't appear
         // twice.
-        const root = (await this.fetchChildren("")).slice(0, 8);
+        let root = [];
+        try { root = (await this.fetchChildren("")).slice(0, 8); }
+        catch (_) { /* open tabs remain useful while the tree is offline */ }
+        if (mentionSeq !== this._mentionSeq) return;
         const openPaths = new Set(openTabs.map(t => t.path));
         const rootFresh = root.filter(e => !openPaths.has(e.path));
         this.mentionResults = [...openTabs, ...rootFresh].slice(0, 12);
@@ -14078,14 +16160,27 @@ function portal() {
           (t.name || "").toLowerCase().includes(ql)
           || (t.path || "").toLowerCase().includes(ql)
         );
-        const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15",
-                                { headers: this.hdr() });
-        const d = r.ok ? await r.json() : { entries: [] };
+        const controller = new AbortController();
+        this._mentionAbort = controller;
+        let d = { entries: [] };
+        try {
+          const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15",
+                                { headers: this.hdr(), signal: controller.signal });
+          if (r.ok) d = await r.json();
+        } catch (e) {
+          if ((e && e.name === "AbortError") || mentionSeq !== this._mentionSeq) return;
+        } finally {
+          if (mentionSeq === this._mentionSeq && this._mentionAbort === controller) {
+            this._mentionAbort = null;
+          }
+        }
+        if (mentionSeq !== this._mentionSeq) return;
         const searchResults = (d.entries || []).filter(e => !e.is_dir);
         const openPaths = new Set(openMatches.map(t => t.path));
         const fresh = searchResults.filter(e => !openPaths.has(e.path));
         this.mentionResults = [...openMatches, ...fresh].slice(0, 15);
       }
+      if (mentionSeq !== this._mentionSeq) return;
       this.mentionIdx = 0;
       this.mentionShow = true;
     },
@@ -14097,7 +16192,7 @@ function portal() {
       const before = this.input.slice(0, this.mentionAnchor);
       const after = this.input.slice(ta.selectionStart);
       this.input = before + "@" + item.path + " " + after;
-      this.mentionShow = false;
+      this._cancelMentionLookup();
       this.$nextTick(() => {
         const newPos = (before + "@" + item.path + " ").length;
         ta.setSelectionRange(newPos, newPos);
@@ -14140,16 +16235,36 @@ function portal() {
       // badge and knows it will auto-send when the current turn finishes.
       this.send();
     },
+    _captureChatPosition(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      const el = this.$refs.chatBody;
+      if (!st || !el || sid !== this.currentId) return;
+      st.scrollTop = el.scrollTop;
+      st.atBottom = !!this.atBottom;
+    },
+    _restoreChatPosition(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      const el = this.$refs.chatBody;
+      if (!st || !el || sid !== this.currentId) return;
+      const shouldFollow = st.atBottom !== false;
+      this.atBottom = shouldFollow;
+      if (shouldFollow) {
+        this._settleScrollToBottom();
+      } else {
+        el.scrollTop = Math.max(0, Number(st.scrollTop) || 0);
+      }
+    },
     onChatScroll() {
       const el = this.$refs.chatBody;
       if (!el) return;
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
       // While WE are programmatically pinning to the bottom (the settle loop),
       // every per-frame `scrollTop = scrollHeight` fires this handler. Its
       // geometry read (scrollHeight/clientHeight) forces a synchronous reflow,
       // so letting it run doubles the per-switch layout thrash (~40ms/switch in
       // profiling). The settle sets `atBottom` itself, so this recompute is
       // redundant during that window — skip it.
-      if (this._autoScrolling) return;
+      if (this._autoScrolling || (st && st._autoScrolling)) return;
       // Strict "at bottom": 2px tolerance only — just enough to absorb
       // sub-pixel geometry (browser zoom / high-DPI displays can report
       // distance as 0.4–1.x even when visually at bottom; pure ==0 would
@@ -14159,6 +16274,10 @@ function portal() {
         // Reaching the bottom always (re-)engages auto-follow, regardless of
         // what moved us there — that's the unambiguous "I want to follow" state.
         this.atBottom = true;
+        if (st) {
+          st.atBottom = true;
+          st.scrollTop = el.scrollTop;
+        }
         return;
       }
       // Not at the bottom. ONLY a genuine user gesture (wheel / touch / scrollbar
@@ -14175,14 +16294,21 @@ function portal() {
       // Both must NOT stop following. Gate disengagement on a recent real
       // pointer/wheel gesture; layout-induced scrolls leave atBottom untouched
       // so the next streaming tick re-pins to the bottom.
-      const userDriven = (Date.now() - (this._userScrollAt || 0)) < 400;
-      if (userDriven) this.atBottom = false;
+      const userDriven = (Date.now() - ((st && st._userScrollAt)
+        || this._userScrollAt || 0)) < 400;
+      if (userDriven) {
+        this.atBottom = false;
+        if (st) st.atBottom = false;
+      }
+      if (st) st.scrollTop = el.scrollTop;
     },
     // Stamp the last genuine user scroll gesture. Bound to wheel / touchmove /
     // pointerdown on the chat body (see index.html) so onChatScroll can tell a
     // user scroll-up apart from a layout-induced scroll event.
     _userScrollIntent() {
       this._userScrollAt = Date.now();
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      if (st) st._userScrollAt = this._userScrollAt;
     },
     scrollToBottom(force) {
       const el = this.$refs.chatBody;
@@ -14206,6 +16332,8 @@ function portal() {
         // stops growing. See _settleScrollToBottom.
         this._settleScrollToBottom();
         this.atBottom = true;
+        const st = this.currentId && this.tabState && this.tabState[this.currentId];
+        if (st) st.atBottom = true;
         return;
       }
       // Streaming auto-follow path: bottom region is already realized,
@@ -14213,6 +16341,11 @@ function portal() {
       this.$nextTick(() => {
         el.scrollTop = el.scrollHeight;
         this.atBottom = true;
+        const st = this.currentId && this.tabState && this.tabState[this.currentId];
+        if (st) {
+          st.atBottom = true;
+          st.scrollTop = el.scrollTop;
+        }
       });
     },
 
@@ -14616,7 +16749,7 @@ function portal() {
           if (!this._isMobileLayout()) ta.focus();
         });
       }
-      this.mentionShow = false;
+      this._cancelMentionLookup();
       // streamSid + streamState alias the sendSid snapshot taken at function
       // entry. We KEEP the local names `streamSid` / `streamState` because
       // every downstream event handler (text / thinking / tool_use / done /
@@ -14625,8 +16758,13 @@ function portal() {
       // from `this.currentId` here. That was the bug.
       const streamSid = sendSid;
       const streamState = sendState;
+      const streamSession = this.sessions.find(s => s.id === streamSid);
+      const primaryWorkspace = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const streamWorkspace = (streamSession && streamSession.cwd) || primaryWorkspace;
 
-      streamState.streaming = true; this.streaming = true;
+      if (!isReconnect) streamState._serverActiveObserved = false;
+      streamState.streaming = true;
+      if (streamSid === this.currentId) this.streaming = true;
       // A live turn renders DIRECTLY into the visible pane, so it must never be
       // hidden by the bulk-reveal gate. `messagesReady=false` drives
       // `.chat-body.msgs-hidden .msg { display:none }` + the loading skeleton —
@@ -14690,9 +16828,10 @@ function portal() {
         _streamStartMs = Date.now();
       }
       streamState._streamStartedAt = _streamStartMs;
-      this._streamStartedAt = _streamStartMs;
+      if (streamSid === this.currentId) this._streamStartedAt = _streamStartMs;
       const _initElapsed = Math.max(0, (Date.now() - _streamStartMs) / 1000);
-      streamState.streamElapsed = _initElapsed; this.streamElapsed = _initElapsed;
+      streamState.streamElapsed = _initElapsed;
+      if (streamSid === this.currentId) this.streamElapsed = _initElapsed;
       // Tick immediately so the footer shows 0.0s right after submit
       // (without waiting for the first 200ms interval tick).
       if (streamState._streamTimer) clearInterval(streamState._streamTimer);
@@ -14701,9 +16840,11 @@ function portal() {
         streamState.streamElapsed = elapsed;
         if (this.currentId === streamSid) this.streamElapsed = elapsed;
       }, 200);
-      this._streamTimer = streamState._streamTimer;
-      this.atBottom = true;
-      this.scrollToBottom(true);
+      if (streamSid === this.currentId) this._streamTimer = streamState._streamTimer;
+      if (streamSid === this.currentId) {
+        this.atBottom = true;
+        this.scrollToBottom(true);
+      }
 
       // Ticket flow: POST the prompt + params with header auth, get a
       // one-time ticket, open the SSE with ONLY the ticket in the URL.
@@ -14759,7 +16900,8 @@ function portal() {
         return;
       }
       const es = new EventSource(url);
-      streamState.es = es; this.es = es;
+      streamState.es = es;
+      if (streamSid === this.currentId) this.es = es;
       // Reset auto-reconnect counter on each successful SSE open. NOTE
       // — we deliberately do NOT (re)start the elapsed-time counter
       // here. Timer + _streamStartedAt are set above at submit time so
@@ -14786,7 +16928,12 @@ function portal() {
       // from disk). Reconnect is idempotent (broadcast replay), so a false
       // trigger only costs a reconnect, never data.
       streamState._lastSseActivity = Date.now();
-      const _bumpSse = () => { streamState._lastSseActivity = Date.now(); };
+      const _bumpSse = (ev) => {
+        streamState._lastSseActivity = Date.now();
+        if (ev && ev.type !== "ping" && ev.type !== "error") {
+          streamState._serverActiveObserved = true;
+        }
+      };
       ["text", "thinking", "tool_use", "tool_result", "task_started",
        "task_progress", "task_notification", "rate_limit", "ping",
        "done", "error", "cancelled"].forEach(
@@ -14794,7 +16941,8 @@ function portal() {
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
-        if (Date.now() - (streamState._lastSseActivity || 0) > 40000) {
+        const silentMs = Date.now() - (streamState._lastSseActivity || 0);
+        if (silentMs > 40000 && !streamState._streamHealthProbe) {
           // 40s of total silence (server pings every 15s → ≥2 missed) means
           // the connection is dead in a way onerror never caught. Tear down
           // the watchdog and drive the existing reconnect logic via a
@@ -14802,6 +16950,8 @@ function portal() {
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
+        } else if (silentMs > 18000) {
+          this._recoverStalledStream(streamSid);
         }
       }, 10000);
 
@@ -15036,7 +17186,7 @@ function portal() {
         if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(d.name)) {
           const fp = (d.input && (d.input.file_path
                                     || d.input.notebook_path)) || "";
-          this._maybeReloadPreview(fp);
+          this._maybeReloadPreview(fp, streamWorkspace);
         }
 
         _scrollIfActive();
@@ -15200,6 +17350,7 @@ function portal() {
       const _markDone = (cancelled = false) => {
         streamState.streaming = false;
         streamState.es = null;
+        streamState._serverActiveObserved = false;
         // If the user is on a different tab when this turn lands, flag
         // unread so the tab strip can show a green dot. Doing it inside
         // _markDone covers every termination path (done / error /
@@ -15326,6 +17477,7 @@ function portal() {
         // cursor so the post-done list poll (updated_at now advanced) doesn't
         // mistake our own just-finished turn for an external change and quiet-
         // reload on top of it.
+        streamState._seenUpdated = undefined;
         if (streamSid === this.currentId) this._openSeenUpdated = undefined;
         this.refreshSessions();
         if (this.currentId === streamSid) {
@@ -15966,10 +18118,13 @@ function portal() {
     // rendered before scrolling.
     async _jumpToMessage(sid, uuid) {
       await this.openTab(sid);
+      if (this.currentId !== sid) return;
       // openTab fires loadSession async — give it a tick or two to render.
       for (let i = 0; i < 20; i++) {
         await new Promise(r => setTimeout(r, 50));
-        const target = document.querySelector(
+        if (this.currentId !== sid) return;
+        const body = this.$refs && this.$refs.chatBody;
+        const target = body && body.querySelector(
           `.msg[data-uuid="${CSS.escape(uuid)}"]`);
         if (target) {
           target.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -15985,28 +18140,39 @@ function portal() {
     async _fetchPaletteFiles() {
       const q = this.palette.query.trim();
       if (q.length < 2) {
+        ++this._paletteFileSeq;
         this.palette.fileResults = [];
         this.palette.fileQuery = "";
+        this.palette.fileLoading = false;
         return;
       }
       if (q === this.palette.fileQuery) return;
+      const requestSeq = ++this._paletteFileSeq;
       this.palette.fileQuery = q;
       this.palette.fileLoading = true;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const isOwner = () => requestSeq === this._paletteFileSeq
+        && this._workspaceIsCurrent(ownerWorkspace)
+        && this.palette.query.trim() === q;
       try {
         const r = await fetch(
           "/api/files/search?q=" + encodeURIComponent(q) + "&limit=30",
           { headers: this.hdr() });
+        if (!isOwner()) return;
         if (!r.ok) { this.palette.fileResults = []; return; }
         const data = await r.json();
         // Race: only commit if the user hasn't typed something else since
         // we kicked off this request.
-        if (this.palette.query.trim() === q) {
+        if (isOwner()) {
           this.palette.fileResults = (data.entries || []).filter(n => !n.is_dir);
         }
       } catch {
-        this.palette.fileResults = [];
+        if (isOwner()) this.palette.fileResults = [];
       } finally {
-        this.palette.fileLoading = false;
+        if (requestSeq === this._paletteFileSeq
+            && this._workspaceIsCurrent(ownerWorkspace)) {
+          this.palette.fileLoading = false;
+        }
       }
     },
     // Build the item list freshly each render — cheap (few hundred entries

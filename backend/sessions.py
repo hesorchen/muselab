@@ -44,6 +44,7 @@ from typing import Any
 from claude_agent_sdk import list_sessions as sdk_list_sessions
 from claude_agent_sdk import get_session_info as sdk_get_session_info
 from .settings import ROOT, atomic_write_text
+from .workspaces import registry as workspace_registry
 
 
 def _default_session_name() -> str:
@@ -271,7 +272,11 @@ def _save_sidecar(sid: str, data: dict) -> None:
 # Session-level CRUD (metadata only — no transcript handling)
 # ============================================================================
 
-def _merge_sdk_with_index(info: Any, m: dict) -> dict:
+def _merge_sdk_with_index(
+    info: Any,
+    m: dict,
+    workspace: str | Path | None = None,
+) -> dict:
     """Build a muselab-shaped session dict from a SDKSessionInfo + the
     muselab index entry (may be empty for sessions created outside muselab)."""
     name = (info.custom_title
@@ -315,6 +320,14 @@ def _merge_sdk_with_index(info: Any, m: dict) -> dict:
         # thinking on/off — default True so existing sessions keep reasoning.
         "effort": m.get("effort", ""),
         "thinking": bool(m.get("thinking", True)),
+        # Every conversation is bound to the directory the Claude SDK was
+        # started in.  Keep it in the sidecar so history, files and previews
+        # switch as one workspace instead of silently falling back to ROOT.
+        "cwd": str(
+            m.get("cwd")
+            if workspace_registry.contains(m.get("cwd"))
+            else (workspace or ROOT)
+        ),
     }
 
 
@@ -408,26 +421,39 @@ def _build_sessions_list() -> list[dict]:
     stale-while-revalidate)."""
     index = _load_index()
     index_by_id = {s["id"]: s for s in index}
-    sdk_list: list[Any] = []
-    if ROOT is not None:
+    sdk_list: list[tuple[Any, Path]] = []
+    for workspace in workspace_registry.paths():
         try:
-            sdk_list = sdk_list_sessions(directory=str(ROOT))
+            sdk_list.extend(
+                (info, workspace)
+                for info in sdk_list_sessions(directory=str(workspace))
+            )
         except Exception as e:
             sys.stderr.write(
-                f"[sessions] sdk_list_sessions failed, "
-                f"falling back to index.json only: "
+                f"[sessions] sdk_list_sessions failed for {workspace}, "
+                f"falling back to index.json for that workspace: "
                 f"{type(e).__name__}: {e}\n")
     out: list[dict] = []
     seen: set[str] = set()
-    for info in sdk_list:
+    for info, workspace in sdk_list:
+        if info.session_id in seen:
+            continue
         m = index_by_id.get(info.session_id, {})
-        out.append(_merge_sdk_with_index(info, m))
+        out.append(_merge_sdk_with_index(info, m, workspace))
         seen.add(info.session_id)
     # Append muselab-only entries (no JSONL on disk yet — usually because
     # the user just created the session but hasn't sent the first message).
     for s in index:
         if s["id"] not in seen:
-            out.append(s)
+            # Rows owned by a workspace that has since been removed stay in
+            # index.json (so re-registering the directory restores them), but
+            # must not leak into the active session list meanwhile.  Legacy
+            # rows without cwd belong to the primary workspace.
+            if s.get("cwd") and not workspace_registry.contains(s.get("cwd")):
+                continue
+            row = dict(s)
+            row.setdefault("cwd", str(ROOT))
+            out.append(row)
     # Sort: pinned sessions first (descending), then by updated_at desc.
     return sorted(
         out,
@@ -436,18 +462,26 @@ def _build_sessions_list() -> list[dict]:
     )
 
 
-def create_session(name: str = "", model: str = "", system_prompt: str = "") -> dict:
+def create_session(
+    name: str = "",
+    model: str = "",
+    system_prompt: str = "",
+    cwd: str | Path | None = None,
+) -> dict:
     return register_session(str(uuid.uuid4()), name=name, model=model,
-                            system_prompt=system_prompt, auto_named=True)
+                            system_prompt=system_prompt, auto_named=True,
+                            cwd=cwd)
 
 
 def register_session(sid: str, *, name: str = "", model: str = "",
                      system_prompt: str = "", auto_named: bool = True,
-                     message_count: int = 0) -> dict:
+                     message_count: int = 0,
+                     cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
     but without generating a fresh UUID."""
     now = time.time()
+    workspace = workspace_registry.resolve(cwd)
     meta = {
         "id": sid,
         "name": name or _default_session_name(),
@@ -457,6 +491,7 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "updated_at": now,
         "message_count": message_count,
         "auto_named": auto_named,
+        "cwd": str(workspace),
     }
     with _INDEX_LOCK:
         idx = _load_index()
@@ -494,14 +529,23 @@ def get_session_meta(sid: str) -> dict | None:
     idx = _load_index()
     m = next((s for s in idx if s["id"] == sid), None)
     info = None
-    if ROOT is not None:
+    candidates: tuple[Path, ...]
+    if m and workspace_registry.contains(m.get("cwd")):
+        candidates = (workspace_registry.resolve(m.get("cwd")),)
+    else:
+        candidates = workspace_registry.paths()
+    for workspace in candidates:
         try:
-            info = sdk_get_session_info(sid, directory=str(ROOT))
+            info = sdk_get_session_info(sid, directory=str(workspace))
+            if info is not None:
+                break
         except Exception as e:
             sys.stderr.write(
-                f"[sessions] sdk_get_session_info({sid}) failed: "
+                f"[sessions] sdk_get_session_info({sid}, {workspace}) failed: "
                 f"{type(e).__name__}: {e}\n")
-    meta = _merge_sdk_with_index(info, m or {}) if info is not None else m
+    meta = (_merge_sdk_with_index(info, m or {}, workspace)
+            if info is not None else ({**m, "cwd": str(m.get("cwd") or ROOT)}
+                                      if m is not None else None))
     if meta is not None:
         if len(_META_CACHE) >= _META_CACHE_MAX and sid not in _META_CACHE:
             _META_CACHE.pop(next(iter(_META_CACHE)), None)
@@ -511,6 +555,22 @@ def get_session_meta(sid: str) -> dict | None:
 
 # Back-compat alias — some code calls get_session() expecting metadata.
 get_session = get_session_meta
+
+
+def session_workspace(sid: str) -> Path:
+    """Return the registered working directory owned by ``sid``.
+
+    Legacy rows created before multi-workspace support intentionally resolve
+    to the primary ``MUSELAB_ROOT``.  A removed/unavailable workspace also
+    fails closed to the primary root instead of accepting an arbitrary path
+    from stale metadata.
+    """
+    meta = get_session_meta(sid)
+    cwd = meta.get("cwd") if meta else None
+    try:
+        return workspace_registry.resolve(cwd)
+    except ValueError:
+        return workspace_registry.resolve()
 
 
 def delete_session(sid: str) -> bool:
@@ -564,10 +624,12 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
     # SDK can enumerate HAVE a JSONL → treat as non-empty and skip. Only
     # truly transcript-less index stubs (created-but-never-sent) are eligible.
     transcript_ids: set[str] = set()
-    if ROOT is not None:
+    for workspace in workspace_registry.paths():
         try:
-            transcript_ids = {info.session_id
-                              for info in sdk_list_sessions(directory=str(ROOT))}
+            transcript_ids.update(
+                info.session_id
+                for info in sdk_list_sessions(directory=str(workspace))
+            )
         except Exception:
             # If we can't confirm which sessions have transcripts, fail SAFE:
             # delete nothing rather than risk nuking real history.
@@ -601,11 +663,17 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
                 q.unlink()
             except OSError:
                 pass
-        if ROOT is not None:
-            try:
-                sdk_delete_session(sid, directory=str(ROOT))
-            except Exception:
-                pass  # JSONL may not exist yet — that's fine
+        try:
+            workspace = next(
+                (s.get("cwd") for s in idx if s.get("id") == sid),
+                str(ROOT),
+            )
+            sdk_delete_session(
+                sid,
+                directory=str(workspace_registry.resolve(workspace)),
+            )
+        except Exception:
+            pass  # JSONL may not exist yet — that's fine
     if to_delete:
         invalidate_sessions_cache()
     return to_delete

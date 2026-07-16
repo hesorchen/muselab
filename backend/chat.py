@@ -48,6 +48,10 @@ from .settings import (
 )
 from . import sessions as sess
 from . import endpoints
+from .workspaces import (
+    registry as workspace_registry,
+    resolve_workspace_root,
+)
 from .ask_user_question import (
     build_server_for_session, register_session_queue,
     unregister_session_queue, submit_answer,
@@ -197,7 +201,8 @@ def _get_session_msgs(sid: str, model: str = "") -> list:
             old = os.environ.get("CLAUDE_CONFIG_DIR")
             try:
                 os.environ["CLAUDE_CONFIG_DIR"] = vendor_dir
-                return get_session_messages(sid, directory=str(ROOT))
+                return get_session_messages(
+                    sid, directory=str(sess.session_workspace(sid)))
             finally:
                 if old is not None:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
@@ -208,7 +213,8 @@ def _get_session_msgs(sid: str, model: str = "") -> list:
     # global CLAUDE_CONFIG_DIR temporarily flipped — otherwise we could
     # resolve against the vendor projects dir and return wrong messages.
     with _vendor_msg_lock:
-        return get_session_messages(sid, directory=str(ROOT))
+        return get_session_messages(
+            sid, directory=str(sess.session_workspace(sid)))
 
 
 class _RawMsg:
@@ -1082,9 +1088,16 @@ async def _build_and_connect_client(
         "above define exactly what you may write.\n\n"
         "Shared defaults (tone, tools, formatting) from the section below "
         "still apply where they don't conflict.")
+    workspace_root = sess.session_workspace(session_id)
     sp = (
         f"{custom_sp}\n\n---\n\n{_DEDICATED_PRECEDENCE}\n\n---\n\n{SYSTEM_PROMPT}"
         if custom_sp else SYSTEM_PROMPT)
+    if workspace_root != ROOT:
+        # SYSTEM_PROMPT predates multi-workspace support and contains the
+        # primary archive path in a few explanatory examples.  Keep those
+        # instructions truthful for this session while ClaudeAgentOptions.cwd
+        # provides the actual filesystem boundary.
+        sp = sp.replace(str(ROOT), str(workspace_root))
     # New CLI rule: session_id + resume/continue conflict unless fork_session
     # is set. So we use resume alone — it both loads existing state AND
     # implies the session id. Falls back to session_id-only for new sessions.
@@ -1124,7 +1137,7 @@ async def _build_and_connect_client(
         sys.stderr.flush()
 
     opts_kwargs = dict(
-        cwd=str(ROOT),
+        cwd=str(workspace_root),
         model=endpoints.normalize_model_id(model),
         permission_mode=permission,
         system_prompt=sp,
@@ -1686,6 +1699,7 @@ async def disconnect_client(session_id: str) -> None:
 class CreateReq(BaseModel):
     name: str | None = None
     model: str | None = None
+    cwd: str = ""
     # Optimistic-create (2026-06-07): the client mints the session UUID up
     # front so the new-chat tab opens with ZERO network wait, then POSTs here
     # in the background to register it. When present AND a valid canonical
@@ -2013,10 +2027,25 @@ def create_session_api(req: CreateReq) -> dict:
             raise HTTPException(400, "invalid session id")
         # register_session is idempotent (returns the existing row if the id is
         # already registered) so a client retry / keepalive resend is safe.
-        meta = sess.register_session(client_id, name=req.name or "",
-                                     model=resolved_model, auto_named=True)
+        try:
+            meta = sess.register_session(
+                client_id,
+                name=req.name or "",
+                model=resolved_model,
+                auto_named=True,
+                cwd=req.cwd or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     else:
-        meta = sess.create_session(name=req.name or "", model=resolved_model)
+        try:
+            meta = sess.create_session(
+                name=req.name or "",
+                model=resolved_model,
+                cwd=req.cwd or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     # Auto-prune (B): recycle blank scratch sessions left over from previous
     # tabs / accidental new-session clicks. keep_ids protects BOTH the session
     # we just created AND every tab the client currently has open — so a blank
@@ -2027,7 +2056,7 @@ def create_session_api(req: CreateReq) -> dict:
     return meta
 
 
-def _seed_claude_md_and_archive_skeleton() -> None:
+def _seed_claude_md_and_archive_skeleton(root: Path = ROOT) -> None:
     """If CLAUDE.md / archive skeleton dirs are missing under ROOT, seed
     them from the locale-aware template files in scripts/templates/.
     Idempotent — every step skips if the target already exists. Called
@@ -2037,7 +2066,7 @@ def _seed_claude_md_and_archive_skeleton() -> None:
     """
     import datetime as _dt
 
-    project_claude_md = ROOT / "CLAUDE.md"
+    project_claude_md = root / "CLAUDE.md"
     is_zh = is_chinese_locale()
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -2074,7 +2103,7 @@ def _seed_claude_md_and_archive_skeleton() -> None:
         # archives/ intentionally has no example — it's a raw-source dir
     }
     for sub in ("health", "work", "money", "people", "notes", "archives"):
-        sd = ROOT / sub
+        sd = root / sub
         if not sd.exists():
             try:
                 sd.mkdir(parents=True, exist_ok=True)
@@ -2104,7 +2133,11 @@ def create_organize_session_api(req: CreateReq | None = None) -> dict:
     auto-send to kick off the workflow. See backend/prompts.py."""
     from .prompts import CURATOR_SYSTEM_PROMPT, CURATOR_INITIAL_MESSAGE
     import datetime as _dt
-    _seed_claude_md_and_archive_skeleton()
+    try:
+        workspace = workspace_registry.resolve(req.cwd if req else None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _seed_claude_md_and_archive_skeleton(workspace)
     # Locale-aware default label so English users don't see "[整理档案]" in
     # their tab strip. Mirrors install scripts.
     _label = "[整理档案] " if is_chinese_locale() else "[Organize] "
@@ -2112,7 +2145,11 @@ def create_organize_session_api(req: CreateReq | None = None) -> dict:
         _label + _dt.datetime.now().strftime("%m-%d %H:%M"))
     model = (req.model if req else None) or MODEL
     meta = sess.create_session(
-        name=name, model=model, system_prompt=CURATOR_SYSTEM_PROMPT)
+        name=name,
+        model=model,
+        system_prompt=CURATOR_SYSTEM_PROMPT,
+        cwd=workspace,
+    )
     return {**meta, "initial_message": CURATOR_INITIAL_MESSAGE}
 
 
@@ -2189,14 +2226,28 @@ def search_sessions_api(q: str = Query(default="", min_length=0, max_length=200)
     if not query:
         return {"hits": [], "total": 0}
     qlower = query.lower()
-    if ROOT is None:
-        return {"hits": [], "total": 0}
-    cwd_key = _cli_encode_cwd(str(ROOT))
-    # Walk per-cwd subdirs under each CLI project root — both default
-    # and vendor-isolated. Skipping vendor would silently hide every
-    # third-party session from search.
-    proj_dirs = [r / cwd_key for r in _cli_project_roots()
-                 if (r / cwd_key).exists()]
+    # Walk every registered workspace's CLI project directory across both the
+    # default and vendor-isolated roots.  Include historical child-cwd folders
+    # too (encoded-workspace + "-") just like the cost dashboard does.
+    encoded_roots = tuple(
+        _cli_encode_cwd(str(root)) for root in workspace_registry.paths())
+    proj_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+    for projects_root in _cli_project_roots():
+        try:
+            candidates = projects_root.iterdir()
+        except OSError:
+            continue
+        for candidate in candidates:
+            name = candidate.name
+            if not candidate.is_dir() or not any(
+                name == encoded or name.startswith(encoded + "-")
+                for encoded in encoded_roots
+            ):
+                continue
+            if candidate not in seen_dirs:
+                seen_dirs.add(candidate)
+                proj_dirs.append(candidate)
     if not proj_dirs:
         return {"hits": [], "total": 0}
 
@@ -3150,8 +3201,9 @@ def purge_session_storage(sid: str) -> bool:
     (attachments / usage / active-turn sidecar) runs regardless so nothing
     is orphaned by a partial state."""
     removed = False
+    workspace = sess.session_workspace(sid)
     try:
-        sdk_delete_session(sid, directory=str(ROOT))
+        sdk_delete_session(sid, directory=str(workspace))
         removed = True
     except (FileNotFoundError, ValueError):
         pass   # JSONL never existed (session never streamed) — that's fine
@@ -3421,13 +3473,18 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         # Also propagate to CLI's JSONL so list_sessions() / manual claude
         # CLI runs see the new title. Silent no-op if JSONL doesn't exist yet.
         try:
-            sdk_rename_session(sid, req.name, directory=str(ROOT))
+            sdk_rename_session(
+                sid, req.name, directory=str(sess.session_workspace(sid)))
         except (FileNotFoundError, ValueError):
             pass
     if req.tag is not None:
         # Empty string → clear tag. SDK accepts None or str.
         try:
-            sdk_tag_session(sid, req.tag or None, directory=str(ROOT))
+            sdk_tag_session(
+                sid,
+                req.tag or None,
+                directory=str(sess.session_workspace(sid)),
+            )
             ok = True
         except (FileNotFoundError, ValueError) as e:
             # JSONL doesn't exist yet → tag has nowhere to live until first
@@ -4105,9 +4162,11 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
     if not project_roots:
         return _empty_dashboard_response(days, tz_offset_minutes, now)
 
-    # ROOT is guaranteed non-None here (settings.py asserts at startup).
-    root_encoded = _cli_encode_cwd(str(ROOT))
-    root_prefix = root_encoded + "-"
+    # A project directory counts when it belongs to any registered workspace.
+    # Prefix matching preserves sessions historically launched from a child
+    # cwd while excluding unrelated projects.
+    encoded_roots = tuple(
+        _cli_encode_cwd(str(root)) for root in workspace_registry.paths())
 
     jsonl_paths: list[Path] = []
     for projects_root in project_roots:
@@ -4116,7 +4175,10 @@ def cost_dashboard(days: int = Query(default=30, ge=1, le=365),
                 if not proj_sub.is_dir():
                     continue
                 name = proj_sub.name
-                if name != root_encoded and not name.startswith(root_prefix):
+                if not any(
+                    name == encoded or name.startswith(encoded + "-")
+                    for encoded in encoded_roots
+                ):
                     continue
                 for jsonl in proj_sub.glob("*.jsonl"):
                     jsonl_paths.append(jsonl)
@@ -4524,7 +4586,7 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
     try:
         result = sdk_fork_session(
             sid,
-            directory=str(ROOT),
+            directory=str(sess.session_workspace(sid)),
             up_to_message_id=req.up_to_message_id,
             title=req.title,
         )
@@ -4545,6 +4607,7 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         model=src_meta.get("model") or MODEL,
         system_prompt=src_meta.get("system_prompt") or "",
         auto_named=False,
+        cwd=src_meta.get("cwd") or str(ROOT),
     )
     return {"session_id": new_sid, "name": new_name}
 
@@ -4648,7 +4711,9 @@ def _scan_claude_md_source(scope: str, path: Path) -> dict | None:
 
 
 @router.get("/context-info", dependencies=[Depends(require_token)])
-def context_info() -> dict:
+def context_info(
+    workspace_root: Path = Depends(resolve_workspace_root),
+) -> dict:
     """Information about what Muse can see — used by the UI's onboarding
     hints (does the user have a CLAUDE.md? archive empty? skills loaded?
     has any working auth?). All paths relative to ROOT for safety.
@@ -4670,14 +4735,14 @@ def context_info() -> dict:
     """
     # Project-scope candidates at archive root
     candidates: list[tuple[str, Path]] = [
-        ("project",       ROOT / "CLAUDE.md"),
-        ("project_local", ROOT / "CLAUDE.local.md"),
-        ("project_dot",   ROOT / ".claude" / "CLAUDE.md"),
+        ("project",       workspace_root / "CLAUDE.md"),
+        ("project_local", workspace_root / "CLAUDE.local.md"),
+        ("project_dot",   workspace_root / ".claude" / "CLAUDE.md"),
         ("user",          Path.home() / ".claude" / "CLAUDE.md"),
     ]
     # Per-subdirectory CLAUDE.md (one level deep, skip hidden / archives)
     try:
-        for sub in sorted(ROOT.iterdir()):
+        for sub in sorted(workspace_root.iterdir()):
             if not sub.is_dir():
                 continue
             if sub.name.startswith(".") or sub.name == "archives":
@@ -4725,7 +4790,8 @@ def context_info() -> dict:
     # the profile as empty and prompt the user to fill it out.
     meaningfully_filled = any(s["meaningfully_filled"] for s in sources)
     info: dict = {
-        "archive_root": str(ROOT),
+        "archive_root": str(workspace_root),
+        "workspace_root": str(workspace_root),
         "claude_md_exists": len(sources) > 0,
         "claude_md_lines": total_lines,
         "claude_md_mtime": latest_mtime,
@@ -4742,7 +4808,7 @@ def context_info() -> dict:
     }
     # Subdirs the install scripts create — used to nudge "drop a doc into X"
     for sub in ("health", "work", "money", "people", "notes", "archives"):
-        d = ROOT / sub
+        d = workspace_root / sub
         present = d.exists() and d.is_dir()
         info["subdir_present"][sub] = present
         if present:
@@ -4757,7 +4823,7 @@ def context_info() -> dict:
     # If the root itself has user docs (not a subdir-only setup), also count
     if info["archive_empty"]:
         try:
-            for p in ROOT.iterdir():
+            for p in workspace_root.iterdir():
                 if p.is_file() and p.name not in ("CLAUDE.md",):
                     info["archive_empty"] = False
                     break

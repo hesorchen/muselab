@@ -17,6 +17,7 @@ from .chat import router as chat_router
 from .api_settings import router as settings_router
 from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
+from .workspaces import router as workspaces_router
 from .settings import ROOT, PORT, HOST
 
 
@@ -174,7 +175,11 @@ async def _lifespan(app: FastAPI):
     async def _bg_purge_trash() -> None:
         try:
             from . import files as _files_mod
-            purged = await _asyncio.to_thread(_files_mod.auto_purge_expired_trash)
+            from .workspaces import registry as _workspace_registry
+            purged = 0
+            for root in _workspace_registry.paths():
+                purged += await _asyncio.to_thread(
+                    _files_mod.auto_purge_expired_trash, root)
             if purged:
                 sys.stderr.write(
                     f"[muselab] auto-purged {purged} expired trash item(s) "
@@ -254,7 +259,7 @@ async def _backfill_turn_counts() -> None:
         if not sid:
             continue
         try:
-            msgs = _gsm(sid, directory=str(_ROOT))
+            msgs = _gsm(sid, directory=str(_sess.session_workspace(sid)))
         except Exception:
             continue
         n_turns = sum(1 for sm in msgs if _chat._is_real_user_prompt(sm))
@@ -336,6 +341,7 @@ app.include_router(chat_router)
 app.include_router(settings_router)
 app.include_router(scheduler_router)
 app.include_router(push_router)
+app.include_router(workspaces_router)
 
 
 @functools.lru_cache(maxsize=1)

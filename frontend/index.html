@@ -374,12 +374,12 @@
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
              :class="{ 'drag-over': dragOverRoot }"
-             :title="contextInfo.archive_root || ''"
+             :title="currentWorkspacePath() || contextInfo.archive_root || ''"
              @dragover.prevent="onTreeRootDragOver($event)"
              @dragleave="dragOverRoot = false"
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
-          <span class="path" x-text="contextInfo.archive_root || '—'"></span>
+          <span class="path" x-text="currentWorkspacePath() || contextInfo.archive_root || '—'"></span>
           <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
                "+" and ctx menu use — both already handle path:'' (root), so
                these are pure entry points, no new write paths. @click.stop
@@ -399,9 +399,10 @@
             </button>
             <button class="root-action" type="button"
                     @click.stop="reloadTree()"
+                    :disabled="treeLoading"
                     :title="t('btn.refresh')"
                     aria-label="Refresh file tree">
-              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-refresh"/></svg>
+              <svg :class="{ spinning: treeLoading }" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><use href="#i-refresh"/></svg>
             </button>
           </span>
         </div>
@@ -453,6 +454,23 @@
             <span class="size" x-show="!n.is_dir" x-text="fmtSize(n.size)"></span>
           </li>
         </template>
+        <li class="filelist-status" x-show="treeLoading && !visible.length"
+            aria-live="polite">
+          <span class="spinner-sm"></span>
+          <span x-text="lang==='zh' ? '正在加载文件…' : 'Loading files…'"></span>
+        </li>
+        <li class="filelist-status error-state"
+            x-show="!treeLoading && !visible.length && treeError"
+            aria-live="polite">
+          <span x-text="treeError"></span>
+          <button class="btn-text sm" type="button" @click="reloadTree()"
+                  x-text="lang==='zh' ? '重试' : 'Retry'"></button>
+        </li>
+        <li class="filelist-status empty-state"
+            x-show="!treeLoading && !visible.length && !treeError">
+          <span class="icon"><svg><use href="#i-folder"/></svg></span>
+          <span x-text="lang==='zh' ? '这里还没有文件，可从上方新建或拖入文件。' : 'No files yet. Create one above or drop files here.'"></span>
+        </li>
       </ul>
       <!-- Marquee (rubber-band) selection box. Lives in .filelist-wrap (which
            is position:relative + overflow:hidden, so the box is clipped to the
@@ -716,8 +734,9 @@
         </svg>
       </button>
 
-      <div class="preview-body"
+      <div class="preview-body" x-ref="previewBody"
            :class="{ 'drag-hover': previewDragHover || osFileDragging }"
+           @scroll.passive="onPreviewViewportScroll()"
            @dragover.prevent="previewDragHover = true"
            @dragenter.prevent="previewDragHover = true"
            @dragleave.prevent="previewDragHover = false"
@@ -761,7 +780,7 @@
                    :placeholder="lang==='zh' ? '搜索内容' : 'Find'" />
             <span class="preview-find-count"
                   x-text="previewFind.query
-                    ? (previewFind.count ? (previewFind.active + 1) + '/' + previewFind.count : (lang==='zh' ? '无结果' : 'No results'))
+                    ? (previewFind.count ? (previewFind.active + 1) + '/' + previewFind.count + (previewFind.truncated ? '+' : '') : (lang==='zh' ? '无结果' : 'No results'))
                     : ''"></span>
             <button class="preview-find-btn" @click="previewFindPrev()" :disabled="!previewFind.count"
                     :title="lang==='zh' ? '上一个' : 'Previous'">↑</button>
@@ -840,27 +859,37 @@
           <div class="empty-title" x-text="lang==='zh' ? '空文件' : 'Empty file'"></div>
           <div class="empty-hint" x-text="lang==='zh' ? '该文件没有内容。' : 'This file has no content.'"></div>
         </div>
-        <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，
-             避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
+        <!-- Keep up to four HTML reports mounted. Re-selecting a resident
+             report only toggles display, preserving its live DOM/scripts/forms
+             and avoiding another raw request. The keyed LRU removes the least
+             recently used browsing context when a fifth report is opened. -->
         <!-- Zoom via transform:scale (NOT `zoom`): `zoom` is non-standard and
              Safari scales the iframe box down to the top-left, leaving an empty
              right/bottom gutter, while Chrome reflows it to fill. transform +
              inverse width/height (e.g. 0.5 → 200% box scaled to 100%) gives the
              same "reflow & fill, show more, smaller" result on every engine.
              (2026-06-26 user report: html preview zoom gutters on mobile.) -->
-        <iframe x-show="!editing && previewMode==='html'"
-                x-ref="htmlFrame"
-                :src="previewMode==='html' ? rawUrl(selected, {preview:true}) : 'about:blank'"
-                :style="previewZoom === 1 ? {} : { transform: 'scale(' + previewZoom + ')', transformOrigin: 'top left', width: 'calc(100% / ' + previewZoom + ')', height: 'calc(100% / ' + previewZoom + ')' }"
-                class="frame" sandbox="allow-scripts"></iframe>
+        <template x-for="entry in htmlPreviewFrames" :key="entry.path">
+          <iframe x-show="!editing && previewMode==='html' && selected===entry.path"
+                  :src="rawUrl(entry.path, {preview:true})"
+                  :data-preview-html-path="entry.path"
+                  :style="previewZoom === 1 ? {} : { transform: 'scale(' + previewZoom + ')', transformOrigin: 'top left', width: 'calc(100% / ' + previewZoom + ')', height: 'calc(100% / ' + previewZoom + ')' }"
+                  @load="onPreviewFrameLoad('html', entry.path)"
+                  class="frame" sandbox="allow-scripts"></iframe>
+        </template>
         <!-- Use template x-if (not x-show) so the <img> isn't even in the DOM
              when not active — :src="" would otherwise resolve to the page URL
              and fire a spurious resource-load-failed error in console. -->
         <template x-if="!editing && previewMode==='img' && selected">
-          <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''" class="preview-img" :style="'zoom:' + previewZoom" />
+          <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''"
+               class="preview-img" :style="'zoom:' + previewZoom"
+               @load="onPreviewContentLoad('img')"
+               @error="onPreviewImageError()" />
         </template>
         <iframe x-show="!editing && previewMode==='pdf'"
                 :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
+                x-ref="pdfFrame"
+                @load="onPreviewFrameLoad('pdf')"
                 class="frame"></iframe>
 
         <!-- xlsx preview: per-sheet tabs + scrollable table. Backend caps to
@@ -888,7 +917,13 @@
                (perf: RED — index.html xlsx renders all sheets' DOM) -->
           <template x-for="sh in xlsxSheets.filter(s => s.name === xlsxActive)" :key="sh.name">
             <div class="xlsx-sheet-wrap">
-              <div class="xlsx-scroll">
+              <div class="empty table-empty" x-show="!sh.rows || !sh.rows.length">
+                <span class="icon"><svg><use href="#i-file"/></svg></span>
+                <div class="empty-title" x-text="lang==='zh' ? '空工作表' : 'Empty sheet'"></div>
+                <div class="empty-hint" x-text="lang==='zh' ? '这个工作表没有可显示的单元格。' : 'This sheet has no cells to display.'"></div>
+              </div>
+              <div class="xlsx-scroll" x-show="sh.rows && sh.rows.length"
+                   @scroll.passive="onPreviewViewportScroll()">
                 <table class="xlsx-table" :style="'zoom:' + previewZoom">
                   <tbody>
                     <template x-for="(row, ri) in sh.rows" :key="ri">
@@ -924,7 +959,7 @@
                     :disabled="csvOffset === 0 || csvLoading"
                     x-text="lang==='zh' ? '← 上页' : '← Prev'"></button>
             <span class="csv-range" x-show="csvData"
-                  x-text="(csvOffset + 1) + '–' + csvWindowEnd() + ' / ' + (csvData && csvData.total_rows || 0)"></span>
+                  x-text="((csvData && csvData.total_rows) ? (csvOffset + 1) : 0) + '–' + csvWindowEnd() + ' / ' + (csvData && csvData.total_rows || 0)"></span>
             <button class="btn-text sm" @click="csvNextPage()"
                     :disabled="!csvData || csvWindowEnd() >= (csvData && csvData.total_rows || 0) || csvLoading"
                     x-text="lang==='zh' ? '下页 →' : 'Next →'"></button>
@@ -934,7 +969,9 @@
             <span class="csv-meta" x-show="csvData && csvData.cols_truncated"
                   x-text="lang==='zh' ? '（列数已截断）' : '(cols truncated)'"></span>
           </div>
-          <div class="xlsx-scroll" x-show="csvData">
+          <div class="xlsx-scroll"
+               @scroll.passive="onPreviewViewportScroll()"
+               x-show="csvData && csvData.rows && csvData.rows.length">
             <table class="xlsx-table" :style="'zoom:' + previewZoom">
               <thead x-show="csvData && csvData.has_header && csvData.header && csvData.header.length">
                 <tr>
@@ -956,6 +993,12 @@
                 </template>
               </tbody>
             </table>
+          </div>
+          <div class="empty table-empty"
+               x-show="csvData && (!csvData.rows || !csvData.rows.length)">
+            <span class="icon"><svg><use href="#i-file"/></svg></span>
+            <div class="empty-title" x-text="lang==='zh' ? 'CSV 没有数据' : 'No CSV data'"></div>
+            <div class="empty-hint" x-text="lang==='zh' ? '该文件没有可显示的数据行。' : 'This file has no data rows to display.'"></div>
           </div>
           <div class="csv-loading" x-show="csvLoading"
                x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
@@ -1220,7 +1263,7 @@
         <div class="session-picker chat-tab-history" @click.outside="sessionPickerOpen = false">
           <button class="chat-tab-history-btn" @click="toggleHistoryPicker($event)" type="button"
                   :title="lang==='zh' ? '历史会话' : 'Session history'">
-            <svg><use href="#i-folder"/></svg>
+            <svg><use href="#i-history"/></svg>
           </button>
           <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
                class="session-picker-pop"
@@ -1339,8 +1382,49 @@
             </div>
           </div>
         </div>
+        <div class="workspace-picker" @click.outside="workspaceMenuOpen = false">
+          <button class="workspace-picker-btn" type="button"
+                  @click="workspaceMenuOpen = !workspaceMenuOpen"
+                  :disabled="workspaceSwitching"
+                  :title="currentWorkspacePath()"
+                  :aria-expanded="workspaceMenuOpen"
+                  :aria-label="lang==='zh' ? '切换工作目录' : 'Switch workspace'">
+            <svg><use href="#i-folder"/></svg>
+            <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
+            <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
+          </button>
+          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak
+               x-transition.opacity.duration.120ms>
+            <div class="workspace-picker-title"
+                 x-text="lang==='zh' ? '工作目录' : 'Workspaces'"></div>
+            <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
+              <div class="workspace-picker-row"
+                   :class="{ active: workspace.path === currentWorkspacePath() }"
+                   :title="workspace.path">
+                <button class="workspace-picker-select"
+                        @click="switchWorkspace(workspace.path)">
+                  <span class="workspace-picker-check"
+                        x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
+                  <span class="workspace-picker-meta">
+                    <strong x-text="workspace.name"></strong>
+                    <small x-text="workspace.path"></small>
+                  </span>
+                </button>
+                <button class="workspace-picker-remove" x-show="!workspace.primary"
+                        @click.stop="removeWorkspace(workspace.path)"
+                        :title="lang==='zh' ? '移除目录' : 'Remove workspace'">
+                  <svg><use href="#i-x"/></svg>
+                </button>
+              </div>
+            </template>
+            <button class="workspace-picker-add" @click="addWorkspace()">
+              <svg><use href="#i-folder-plus"/></svg>
+              <span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span>
+            </button>
+          </div>
+        </div>
         <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
-          <template x-for="tid in openTabIds" :key="tid">
+          <template x-for="tid in workspaceOpenTabIds()" :key="tid">
             <div class="chat-tab" :class="{active: tid === currentId, 'drag-over': tabDragOverId === tid}"
                  :data-tid="tid"
                  :draggable="isPointerDevice"
@@ -1422,6 +1506,10 @@
            moved to the chat-input toolbar at the bottom (VSCode-style). -->
 
       <div class="chat-scroll-wrap">
+        <!-- Position transcript controls against the area above the variable-
+             height composer, so they never disappear behind queued items or
+             the mobile keyboard toolbar. -->
+        <div class="chat-transcript-wrap">
         <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
@@ -2554,6 +2642,7 @@
         <button class="chat-prevuser-fab" x-show="!atBottom" @click="jumpToPrevUser()"
                 :title="lang==='zh' ? '上一条提问' : 'Previous message'"
                 :aria-label="lang==='zh' ? '跳到上一条用户消息' : 'Jump to previous user message'"><svg><use href="#i-arrow-up"/></svg></button>
+        </div>
       </div>
 
       <div class="chat-input">
@@ -2904,15 +2993,15 @@
          Sits as a sibling of the panes in the same grid; on mobile, the panes
          become full-width and we swap which one is visible via mobileTab. -->
     <nav class="mobile-tab-bar" x-show="authed">
-      <button :class="{active: mobileTab==='files'}" @click="mobileTab='files'">
+      <button :class="{active: mobileTab==='files'}" @click="setMobileTab('files')">
         <span class="icon"><svg><use href="#i-folder"/></svg></span>
         <span x-text="t('pane.files')"></span>
       </button>
-      <button :class="{active: mobileTab==='preview'}" @click="mobileTab='preview'">
+      <button :class="{active: mobileTab==='preview'}" @click="setMobileTab('preview')">
         <span class="icon"><svg><use href="#i-file-text"/></svg></span>
         <span x-text="t('pane.preview')"></span>
       </button>
-      <button :class="{active: mobileTab==='chat'}" @click="mobileTab='chat'">
+      <button :class="{active: mobileTab==='chat'}" @click="setMobileTab('chat')">
         <span class="icon"><svg><use href="#i-brain"/></svg></span>
         <span x-text="t('pane.chat')"></span>
       </button>
@@ -4329,6 +4418,93 @@
             </div>
           </template>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Server workspace folder browser ============ -->
+  <div class="modal-backdrop workspace-browser-backdrop"
+       x-show="workspaceBrowser.show" x-cloak
+       x-transition.opacity.duration.120ms
+       @click.self="closeWorkspaceBrowser()">
+    <div class="modal workspace-browser-modal"
+         @keydown.escape.window="workspaceBrowser.show && !modal.show && closeWorkspaceBrowser()"
+         role="dialog" aria-modal="true"
+         :aria-label="lang==='zh' ? '选择工作目录' : 'Select workspace folder'">
+      <div class="modal-head">
+        <span class="modal-title workspace-browser-title">
+          <svg><use href="#i-folder-plus"/></svg>
+          <span x-text="lang==='zh' ? '选择工作目录' : 'Select workspace folder'"></span>
+        </span>
+        <button class="modal-close" @click="closeWorkspaceBrowser()"
+                :disabled="workspaceSwitching"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="workspace-browser-location">
+        <button type="button" class="workspace-browser-up"
+                @click="browseWorkspaceDirectory(workspaceBrowser.parent)"
+                :disabled="workspaceBrowser.loading || !workspaceBrowser.parent"
+                :title="lang==='zh' ? '返回上级目录' : 'Go to parent folder'">
+          <svg><use href="#i-arrow-up"/></svg>
+        </button>
+        <div class="workspace-browser-path" :title="workspaceBrowser.path"
+             x-text="workspaceBrowser.path || (lang==='zh' ? '正在读取…' : 'Loading…')"></div>
+        <button type="button" class="workspace-browser-manual"
+                @click="addWorkspacePathManually()"
+                :disabled="workspaceSwitching"
+                :title="lang==='zh' ? '手动输入选择器范围外的绝对路径' : 'Enter an absolute path outside the browser roots'"
+                x-text="lang==='zh' ? '输入路径' : 'Enter path'"></button>
+      </div>
+      <div class="modal-body workspace-browser-body">
+        <div class="workspace-browser-error" x-show="workspaceBrowser.error"
+             x-text="workspaceBrowser.error"></div>
+        <div class="workspace-browser-loading" x-show="workspaceBrowser.loading">
+          <span class="spinner"></span>
+          <span x-text="lang==='zh' ? '正在检测文件夹…' : 'Detecting folders…'"></span>
+        </div>
+        <div class="workspace-browser-empty"
+             x-show="!workspaceBrowser.loading && !workspaceBrowser.error && !workspaceBrowser.directories.length"
+             x-text="lang==='zh' ? '这里没有可浏览的子目录' : 'No subfolders here'"></div>
+        <div class="workspace-browser-list" x-show="!workspaceBrowser.loading">
+          <template x-for="directory in workspaceBrowser.directories" :key="directory.path">
+            <div class="workspace-browser-row"
+                 :class="{ selected: workspaceBrowser.selected === directory.path, registered: directory.registered }"
+                 :data-workspace-path="directory.path">
+              <button type="button" class="workspace-browser-entry"
+                      @click="selectWorkspaceDirectory(directory)"
+                      @dblclick="browseWorkspaceDirectory(directory.path)"
+                      :aria-selected="workspaceBrowser.selected === directory.path"
+                      :title="directory.path">
+                <svg class="workspace-browser-folder"><use href="#i-folder"/></svg>
+                <span class="workspace-browser-entry-meta">
+                  <strong x-text="directory.name"></strong>
+                  <small x-show="directory.registered"
+                         x-text="lang==='zh' ? '已添加' : 'Already added'"></small>
+                  <small x-show="!directory.registered && directory.project"
+                         x-text="directory.project"></small>
+                </span>
+              </button>
+              <button type="button" class="workspace-browser-open"
+                      @click="browseWorkspaceDirectory(directory.path)"
+                      :title="lang==='zh' ? '进入文件夹' : 'Open folder'">
+                <svg><use href="#i-chevron-right"/></svg>
+              </button>
+            </div>
+          </template>
+        </div>
+        <div class="workspace-browser-truncated" x-show="workspaceBrowser.truncated"
+             x-text="lang==='zh' ? '目录较多，仅显示前 300 个。' : 'Showing the first 300 folders.'"></div>
+      </div>
+      <div class="modal-foot workspace-browser-foot">
+        <span class="workspace-browser-selection" :title="workspaceBrowserTarget()"
+              x-text="workspaceBrowserTargetLabel()"></span>
+        <button type="button" class="btn-ghost" @click="closeWorkspaceBrowser()"
+                :disabled="workspaceSwitching"
+                x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
+        <button type="button" class="btn-primary workspace-browser-confirm"
+                @click="confirmWorkspaceBrowser()"
+                :disabled="workspaceBrowser.loading || workspaceSwitching || !workspaceBrowserTarget()"
+                x-text="workspaceSwitching ? (lang==='zh' ? '添加中…' : 'Adding…') : (lang==='zh' ? '添加目录' : 'Add folder')"></button>
       </div>
     </div>
   </div>
