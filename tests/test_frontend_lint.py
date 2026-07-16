@@ -157,9 +157,13 @@ def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
         encoding="utf-8")
 
     assert "cwd: seedCwd" in app
-    assert 'headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace)' in app
-    assert '"&workspace=" + encodeURIComponent(this.currentWorkspacePath())' in app
+    assert "primaryWorkspacePath()" in app
+    assert "fileWorkspacePath()" in app
+    assert 'headers["X-Muselab-Workspace"] = encodeURIComponent(cwd)' in app
+    assert '"&workspace=" + encodeURIComponent(this.fileWorkspacePath())' in app
     assert "workspace-picker" in html
+    assert 'class="workspace-info-btn"' in html
+    assert "workspace.help" in html
     assert "workspaceOpenTabIds()" in html
     assert "chat-grid" not in html
     assert "_workspacePreviewTabs(surface = {})" in app
@@ -173,6 +177,21 @@ def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     mobile = css[css.index("@media (max-width: 720px)", css.index(
         ".workspace-browser-modal")):]
     assert "height: 100dvh" in mobile
+
+
+def test_workspace_switch_changes_conversation_only_and_keeps_archive_surface():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async switchWorkspace(path)")
+    end = app.index("\n    closeWorkspaceBrowser()", start)
+    switch = app[start:end]
+
+    assert "this.activeWorkspace = path" in switch
+    assert "await this.fetchContextInfo()" in switch
+    assert "_changeWorkspaceSurface" not in switch
+    assert "_confirmLoseEdits" not in switch
+    assert "loadRoot()" not in switch
+    assert "loadTrash()" not in switch
+    assert "_clearPreviewState" not in switch
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -202,15 +221,15 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     palette = method("async _fetchPaletteFiles()", "\n    // Build the item list")
 
     assert "const loadSeq = ++this._trashLoadSeq" in trash
-    assert "ownerWorkspace === this.currentWorkspacePath()" in trash
+    assert "ownerWorkspace === this.fileWorkspacePath()" in trash
     assert trash.count("if (!isOwner()) return") >= 2
     assert "const loadSeq = ++this._selectedMetaSeq" in meta
-    assert "ownerWorkspace === this.currentWorkspacePath()" in meta
-    assert "opts.ownerWorkspace || this.currentWorkspacePath()" in children
+    assert "ownerWorkspace === this.fileWorkspacePath()" in meta
+    assert "opts.ownerWorkspace || this.fileWorkspacePath()" in children
     assert "this._workspaceIsCurrent(ownerWorkspace)" in children
     assert "stale.staleWorkspace = true" in children
     assert "_uniqueFileNodes(nodes)" in app
-    assert "ownerWorkspace = this.currentWorkspacePath()" in upload
+    assert "ownerWorkspace = this.fileWorkspacePath()" in upload
     assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
     assert save.index("if (!sameOwner) return") < save.index(
         "this._previewCacheDel(savePath)")
@@ -342,7 +361,7 @@ def test_model_fork_keeps_workspace_and_does_not_hijack_a_new_active_tab():
     assert "const sid = this.currentId" in model
     assert "const ownerWorkspace = this.currentWorkspacePath()" in model
     assert "name: \"\", model: newM, cwd: ownerWorkspace" in model
-    assert "this._workspaceIsCurrent(ownerWorkspace) && this.currentId === sid" in model
+    assert "this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid" in model
 
 
 def test_history_jump_keeps_the_session_that_owned_the_click():
@@ -376,3 +395,28 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     assert "return false" in failed
     assert "st.messages.length = 0" not in failed
     assert "this.messages = st.messages" not in failed
+
+
+def test_activity_center_uses_two_compact_numberless_status_dots():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    start = html.index('class="activity-center-btn"')
+    button = html[start:html.index("</button>", start)]
+
+    assert 'class="activity-running"' in button
+    assert 'x-show="activity.summary.running"' in button
+    assert 'class="activity-unread"' in button
+    assert 'x-show="activity.summary.unread"' in button
+    assert "x-text=" not in button
+
+    def compact_rule(selector: str) -> str:
+        pos = css.index(selector)
+        return re.sub(r"\s+", "", css[pos:css.index("}", pos)])
+
+    running = compact_rule(".activity-center-btn .activity-running {")
+    unread = compact_rule(".activity-center-btn .activity-unread {")
+    assert "width:10px" in running and "height:10px" in running
+    assert "background:var(--c-running)" in running
+    assert "width:10px" in unread and "height:10px" in unread
+    assert "min-width" not in unread and "padding" not in unread
+    assert "background:var(--c-success)" in unread

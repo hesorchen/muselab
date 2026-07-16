@@ -463,6 +463,7 @@ function portal() {
       truncated: false, requestSeq: 0,
     },
     workspaceLastSession: {},
+    _loadedPrefsSchema: 4,
     workspaceSurfaces: {},
     _workspaceRuntimeCaches: new Map(),
     _workspaceTreeCacheTimers: new Map(),
@@ -618,7 +619,12 @@ function portal() {
     // Per-session context meter snapshot, updated on every SSE `done` event
     sessionUsage: { input_tokens: 0, output_tokens: 0,
                      cache_read_tokens: 0, cache_creation_tokens: 0,
-                     context_limit: 0, context_used: 0, context_used_pct: 0 },
+                     context_limit: 0, context_used: 0, context_used_pct: 0,
+                     context_used_source: "none",
+                     context_used_is_estimate: false,
+                     context_limit_source: "",
+                     context_limit_is_estimate: true,
+                     context_is_estimate: true },
     stats: { total_cost_usd: 0, total_messages: 0, total_input_tokens: 0,
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
@@ -631,8 +637,9 @@ function portal() {
     // rateLimit changes, NOT per render, so the toolbar x-show is a cheap
     // property read. null = nothing to show.
     rlBadge: null,
-    // Codex Gateway quota snapshot. Backend reads only local Codex session
-    // JSONL rate-limit events; it never touches Codex OAuth credentials.
+    // Local Codex account quota snapshot. Backend prefers read-only app-server
+    // RPCs and falls back to local JSONL; neither path reads OAuth credentials
+    // or sends a model request. The Gateway may use a different account.
     codexLimit: { windows: {}, updated_at: 0, ok: false },
     codexBadge: null,
     mcp: { configured: false, servers: [] },
@@ -1725,6 +1732,9 @@ function portal() {
       this._startPresence();
       this._startSessionsSync();
       this.fetchActivity();
+      // Restoring a saved current session means the user is already looking at
+      // it; clear any completion that landed before this page loaded.
+      this.ackCurrentActivity();
     },
 
     // FIX ⑪: near-real-time multi-device sync for the session LIST while the
@@ -1899,6 +1909,7 @@ function portal() {
         // might still get a phone push for a turn that finishes in the
         // first 15s of being back.
         ping();                  // presence: re-arm push suppression
+        this.ackCurrentActivity(); // visible current session is already viewed
         this._pingHealth();      // health: refresh conn state immediately
         // Refresh the session list in case another device created/deleted
         // sessions while this tab was hidden (drives the active-dot state).
@@ -4059,7 +4070,7 @@ function portal() {
     // entry came from the API). For chat-link clicks the path comes from
     // model output and may not exist — surface the failure as a toast.
     async openByPathToasted(path) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const requestHeaders = this.hdr();
       // HEAD-equivalent check via list on the parent dir is fragile (binary
       // files, images etc. don't go through /api/files/read). Just delegate
@@ -4223,12 +4234,20 @@ function portal() {
     },
 
     hdr() {
-      const headers = { "X-Auth-Token": this.token };
-      // Header values must be ByteString-safe. The backend decodes this and
-      // accepts it only when it is present in the registered workspace list.
-      if (this.activeWorkspace) {
-        headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace);
-      }
+      // Global/file requests intentionally omit a workspace header: backend
+      // file APIs then use their safe default, the primary MUSELAB_ROOT.
+      return { "X-Auth-Token": this.token };
+    },
+    conversationHdr(path = "") {
+      const headers = this.hdr();
+      const cwd = path || this.currentWorkspacePath();
+      if (cwd) headers["X-Muselab-Workspace"] = encodeURIComponent(cwd);
+      return headers;
+    },
+    fileHdr() {
+      const headers = this.hdr();
+      const root = this.fileWorkspacePath();
+      if (root) headers["X-Muselab-Workspace"] = encodeURIComponent(root);
       return headers;
     },
 
@@ -4473,9 +4492,8 @@ function portal() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
-      this._captureWorkspaceSurface();
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 3,          // v3 adds per-workspace file/preview surfaces
+        schema: 4,          // v4 decouples conversation cwd from the archive surface
         model: this.model, defaultModel: this.defaultModel, permission: this.permission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
@@ -4484,7 +4502,6 @@ function portal() {
         expanded: Array.from(this.expanded),
         activeWorkspace: this.activeWorkspace,
         workspaceLastSession: this.workspaceLastSession,
-        workspaceSurfaces: this.workspaceSurfaces,
         leftOpen: this.leftOpen, rightOpen: this.rightOpen,
         leftWidth: this.leftWidth, rightWidth: this.rightWidth,
         showHidden: this.showHidden,
@@ -4519,7 +4536,8 @@ function portal() {
     loadPrefs() {
       try {
         const p = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
-        if ((p.schema || 1) < 2) {
+        this._loadedPrefsSchema = Number(p.schema || 1);
+        if (this._loadedPrefsSchema < 2) {
           // Prefs format changed — clear stale data to avoid partial restore
           try { localStorage.removeItem("muselab_prefs"); } catch (_) {}
           return;
@@ -4578,24 +4596,13 @@ function portal() {
           this.openFilesHeight = null;
         }
         this._pendingExpanded = p.expanded || [];
-        const surface = this.activeWorkspace
-          && this.workspaceSurfaces[this.activeWorkspace];
-        if (surface && typeof surface === "object") {
-          this.tabs = this._workspacePreviewTabs(surface);
-          this._pendingPreviewSelected = typeof surface.previewSelected === "string"
-            ? surface.previewSelected : "";
-          this.showHidden = typeof surface.showHidden === "boolean"
-            ? surface.showHidden : this.showHidden;
-          this.openFilesCollapsed = !!surface.openFilesCollapsed;
-          this.openFilesHeight = typeof surface.openFilesHeight === "number"
-            ? surface.openFilesHeight : null;
-          this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
-        }
       } catch {}
     },
 
     async fetchContextInfo() {
-      const { ok, data } = await this.api("/api/chat/context-info");
+      const { ok, data } = await this.api("/api/chat/context-info", {
+        headers: this.conversationHdr(),
+      });
       if (!ok || !data) return;
       data._fetched = true;
       this.contextInfo = data;
@@ -4902,7 +4909,7 @@ function portal() {
         newSt.messages.length = 0;
         newSt._loaded = true;
         if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
-        if (this._workspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
+        if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
           this.currentId = meta.id;
           this._activateTabState(meta.id);
           this.workspaceLastSession = {
@@ -5142,7 +5149,12 @@ function portal() {
         messages: [],
         sessionUsage: { input_tokens: 0, output_tokens: 0,
                          cache_read_tokens: 0, cache_creation_tokens: 0,
-                         context_limit: 0, context_used: 0, context_used_pct: 0 },
+                         context_limit: 0, context_used: 0, context_used_pct: 0,
+                         context_used_source: "none",
+                         context_used_is_estimate: false,
+                         context_limit_source: "",
+                         context_limit_is_estimate: true,
+                         context_is_estimate: true },
         streaming: false,
         es: null,
         streamingModel: "",
@@ -6294,13 +6306,21 @@ function portal() {
       return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-` +
              `${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
     },
+    primaryWorkspacePath() {
+      return ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+    },
+    fileWorkspacePath() {
+      return this.primaryWorkspacePath();
+    },
     currentWorkspacePath() {
       if (this.activeWorkspace) return this.activeWorkspace;
       const session = this.sessions.find(s => s.id === this.currentId);
-      return (session && session.cwd)
-        || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+      return (session && session.cwd) || this.primaryWorkspacePath();
     },
     _workspaceIsCurrent(path) {
+      return String(path || "") === String(this.fileWorkspacePath() || "");
+    },
+    _conversationWorkspaceIsCurrent(path) {
       return String(path || "") === String(this.currentWorkspacePath() || "");
     },
     workspaceLabel(path = "") {
@@ -6330,27 +6350,32 @@ function portal() {
         const payload = await response.json();
         this.sessionWorkspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
         try { sessionStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), workspaces: this.sessionWorkspaces })); } catch (_) {}
+        const primaryFileRoot = this.primaryWorkspacePath();
+        if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
+          const surface = this.workspaceSurfaces[primaryFileRoot];
+          if (surface && typeof surface === "object") {
+            this.tabs = this._workspacePreviewTabs(surface);
+            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+              ? surface.previewSelected : "";
+            this.showHidden = typeof surface.showHidden === "boolean"
+              ? surface.showHidden : this.showHidden;
+            this.openFilesCollapsed = !!surface.openFilesCollapsed;
+            this.openFilesHeight = typeof surface.openFilesHeight === "number"
+              ? surface.openFilesHeight : null;
+            this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
+          } else if (this.activeWorkspace && this.activeWorkspace !== primaryFileRoot) {
+            this.tabs = [];
+            this._pendingPreviewSelected = "";
+            this._pendingExpanded = [];
+          }
+          this._loadedPrefsSchema = 4;
+        }
         const valid = new Set(this.sessionWorkspaces.map(w => w.path));
         const session = this.sessions.find(s => s.id === this.currentId);
         const fallback = (session && valid.has(session.cwd) && session.cwd)
           || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
         const requested = this.activeWorkspace;
-        if (!valid.has(requested)) {
-          this.activeWorkspace = fallback;
-          if (requested && fallback) {
-            const surface = this.workspaceSurfaces[fallback] || {};
-            this.tabs = this._workspacePreviewTabs(surface);
-            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
-              ? surface.previewSelected : "";
-            this.showHidden = typeof surface.showHidden === "boolean"
-              ? surface.showHidden : false;
-            this.openFilesCollapsed = !!surface.openFilesCollapsed;
-            this.openFilesHeight = typeof surface.openFilesHeight === "number"
-              ? surface.openFilesHeight : null;
-            this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
-            this._pendingExpanded = Array.from(this.expanded);
-          }
-        }
+        if (!valid.has(requested)) this.activeWorkspace = fallback;
         return true;
       } catch (_) {
         return false;
@@ -6511,10 +6536,12 @@ function portal() {
         this.toast(this.lang === "zh" ? "工作目录未登记" : "Workspace is not registered", "error");
         return;
       }
-      if (!this._confirmLoseEdits()) return;
       this.workspaceSwitching = true;
       try {
-        await this._changeWorkspaceSurface(path);
+        // Workspace selection changes only the conversation cwd. The file tree,
+        // preview tabs and editor remain rooted at primary MUSELAB_ROOT.
+        this.activeWorkspace = path;
+        await this.fetchContextInfo();
         if (!this.workspaceSessions(path).length) await this._pullAllSessions();
         const remembered = this.workspaceLastSession[path];
         const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
@@ -6693,7 +6720,10 @@ function portal() {
       try {
         if (this.activeWorkspace === path) {
           const primary = this.sessionWorkspaces.find(w => w.primary);
-          if (primary) await this._changeWorkspaceSurface(primary.path);
+          if (primary) {
+            this.activeWorkspace = primary.path;
+            await this.fetchContextInfo();
+          }
         }
         const response = await fetch(
           "/api/chat/workspaces?path=" + encodeURIComponent(path),
@@ -6891,8 +6921,8 @@ function portal() {
       const cwd = session && session.cwd;
       if (cwd && cwd !== this.currentWorkspacePath()
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
-        if (!this._confirmLoseEdits()) return;
-        await this._changeWorkspaceSurface(cwd);
+        this.activeWorkspace = cwd;
+        this.fetchContextInfo();
       }
       if (!this.openTabIds.includes(id)) {
         const MAX_TABS = 20;
@@ -7906,35 +7936,12 @@ function portal() {
       return trimmed + (text.length > 80 ? "…" : "");
     },
     async _refreshCtxMeter() {
-      // Pull SDK ContextUsageResponse via /context-breakdown so the meter
-      // shows post-compact (or any other out-of-band) state without waiting
-      // for the next stream's 'done' event.
+      // Use the canonical usage endpoint: it merges provider usage with the
+      // gateway's live model catalog and carries explicit provenance. The
+      // SDK breakdown endpoint remains for the right-click category popup;
+      // using it as the meter source used to reintroduce stale 200K limits.
       if (!this.currentId) return;
-      const { ok, data } = await this.api(
-        `/api/chat/context-breakdown/${this.currentId}`);
-      if (!ok || !data) return;
-      const used = Math.max(0, Number(data.totalTokens || 0));
-      const maxT = Math.max(0, Number(data.maxTokens
-                                       || this.sessionUsage.context_limit
-                                       || 200000));
-      // Write IN-PLACE into the tab's sessionUsage object, then re-point the
-      // root `this.sessionUsage` at that same object. Replacing this.sessionUsage
-      // with a fresh `{...}` literal (as before) detached it from
-      // tabState[sid].sessionUsage — the shared reference _activateTabState /
-      // the stream's done-handler rely on. After that split, later done-event
-      // updates (Object.assign onto the tab object) no longer reached the
-      // displayed ring, and a tab switch restored the stale tab object —
-      // i.e. the meter "wasn't accurate". Mutating the tab object keeps every
-      // reference in sync.
-      const st = this._ensureTabState(this.currentId);
-      Object.assign(st.sessionUsage, {
-        context_used: used,
-        context_limit: maxT,
-        context_used_pct: maxT
-          ? Math.round(used / maxT * 1000) / 10
-          : 0,
-      });
-      this.sessionUsage = st.sessionUsage;
+      await this._fetchTabUsage(this.currentId);
     },
 
     async showCtxBreakdown() {
@@ -7977,6 +7984,22 @@ function portal() {
       if (n >= 1000) return (n / 1000).toFixed(1) + "K";
       return String(n);
     },
+    ctxBreakdownAccuracyLabel() {
+      const d = (this.ctxBreakdown && this.ctxBreakdown.data) || {};
+      const used = d.context_used_is_estimate
+        ? (this.lang === "zh" ? "分类用量：SDK 估算" : "Categories: SDK estimate")
+        : (this.lang === "zh" ? "分类用量：SDK" : "Categories: SDK");
+      const limitSource = {
+        gateway_catalog: this.lang === "zh" ? "网关模型目录" : "gateway catalog",
+        env_override: this.lang === "zh" ? "环境配置" : "environment override",
+        sdk: "SDK",
+        session_sdk: this.lang === "zh" ? "会话 SDK" : "session SDK",
+        model_fallback: this.lang === "zh" ? "内置回退" : "built-in fallback",
+      }[d.context_limit_source] || (this.lang === "zh" ? "当前模型" : "current model");
+      const estimated = d.context_limit_is_estimate
+        ? (this.lang === "zh" ? "（估算）" : " (estimate)") : "";
+      return `${used} · ${this.lang === "zh" ? "窗口" : "window"}：${limitSource}${estimated}`;
+    },
     // Map a category name to its detailed sub-list. SDK returns
     // memoryFiles / mcpTools / agents as separate top-level arrays; we
     // surface them under whichever category row carries the same totals.
@@ -8013,10 +8036,37 @@ function portal() {
         ? (limit / 1_000_000).toFixed(0) + "M"
         : (limit / 1000).toFixed(0) + "K";
       const modelLabel = this.modelLabel(this.model);
+      const usedSource = {
+        provider_usage: this.lang === "zh" ? "网关用量（精确）" : "provider usage (exact)",
+        provider_usage_transcript: this.lang === "zh" ? "网关记录（精确）" : "provider transcript (exact)",
+        sdk_context: this.lang === "zh" ? "SDK 用量（估算）" : "SDK usage (estimate)",
+        input_fallback: this.lang === "zh" ? "输入用量（估算）" : "input usage (estimate)",
+        none: this.lang === "zh" ? "暂无用量" : "no usage yet",
+      }[u.context_used_source] || (u.context_used_is_estimate
+        ? (this.lang === "zh" ? "用量估算" : "usage estimate")
+        : (this.lang === "zh" ? "用量" : "usage"));
+      const limitSource = {
+        gateway_catalog: this.lang === "zh" ? "网关目录" : "gateway catalog",
+        env_override: this.lang === "zh" ? "配置覆盖" : "config override",
+        sdk: "SDK",
+        session_sdk: this.lang === "zh" ? "会话 SDK" : "session SDK",
+        gateway_models_api: this.lang === "zh" ? "网关模型 API" : "gateway models API",
+        model_fallback: this.lang === "zh" ? "内置回退（估算）" : "built-in fallback (estimate)",
+      }[u.context_limit_source] || (this.lang === "zh" ? "模型窗口" : "model window");
+      const raw = Number(u.context_raw_limit || 0);
+      const ceiling = Number(u.context_max_limit || 0);
+      const windowMeta = [];
+      if (raw && raw !== limit) {
+        windowMeta.push(`${this.lang === "zh" ? "原始" : "raw"} ${this.ctxFormatTokens(raw)}`);
+      }
+      if (ceiling && ceiling !== raw) {
+        windowMeta.push(`${this.lang === "zh" ? "可配置上限" : "configurable max"} ${this.ctxFormatTokens(ceiling)}`);
+      }
       const hint = this.lang === "zh"
         ? "（点击压缩 · 右键看拆分）"
         : "(click to compact · right-click for breakdown)";
-      return `${used_s} / ${limit_s} (${pct}%) · ${modelLabel}\n${hint}`;
+      const meta = windowMeta.length ? ` · ${windowMeta.join(" · ")}` : "";
+      return `${used_s} / ${limit_s} (${pct}%) · ${modelLabel}\n${usedSource} · ${limitSource}${meta}\n${hint}`;
     },
     compactStatusLabel() {
       // Single method instead of an inline template-literal expression in
@@ -8222,7 +8272,7 @@ function portal() {
       this._dragCounter = 0;
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) return;
       // Always upload to the archive root (MUSELAB_ROOT), regardless of
@@ -8308,7 +8358,7 @@ function portal() {
     async _syncUploadedFiles(
       results,
       uploadContext = {},
-      ownerWorkspace = this.currentWorkspacePath(),
+      ownerWorkspace = this.fileWorkspacePath(),
     ) {
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const uploaded = (results || [])
@@ -8822,6 +8872,7 @@ function portal() {
       const _wasResident = (this._residentTabIds || []).includes(this.currentId);
       this._promoteResident(this.currentId);
       this._activateTabState(this.currentId);
+      this.ackCurrentActivity();
       this.savePrefs();
       // Sync the model + effort dropdowns to THIS session's persisted
       // values on every tab switch. Without this, the dropdowns are
@@ -10125,6 +10176,43 @@ function portal() {
       const ws = (this.codexLimit && this.codexLimit.windows) || {};
       return Object.entries(ws).map(([key, w]) => ({ key, ...w }));
     },
+    codexWindowLabel(w) {
+      if (!w) return "";
+      const windowLabel = this.rateLimitWindowLabel(w.rate_limit_type) || w.key || "";
+      const bucketLabel = w.limit_name || "";
+      return bucketLabel ? `${bucketLabel} · ${windowLabel}` : windowLabel;
+    },
+    codexAccountStats() {
+      const limit = this.codexLimit || {};
+      const usage = limit.account_usage || {};
+      const summary = usage.summary || {};
+      const buckets = usage.daily_usage_buckets || [];
+      const latest = buckets.length ? buckets[buckets.length - 1] : null;
+      const resets = limit.rate_limit_reset_credits || {};
+      const stats = [];
+      if (latest) {
+        stats.push({
+          key: "latest",
+          label: `${this.t("set.cost.codex_latest_day")} · ${latest.start_date}`,
+          value: this.fmtTokens(latest.tokens || 0),
+        });
+      }
+      if (summary.lifetime_tokens !== null && summary.lifetime_tokens !== undefined) {
+        stats.push({
+          key: "lifetime",
+          label: this.t("set.cost.codex_lifetime"),
+          value: this.fmtTokens(summary.lifetime_tokens || 0),
+        });
+      }
+      if (resets.available_count !== null && resets.available_count !== undefined) {
+        stats.push({
+          key: "resets",
+          label: this.t("set.cost.codex_reset_credits_label"),
+          value: String(resets.available_count),
+        });
+      }
+      return stats;
+    },
     codexLimitUpdatedText() {
       const ts = this.codexLimit && this.codexLimit.updated_at;
       if (!ts) return "";
@@ -11085,7 +11173,7 @@ function portal() {
     // edge case without bespoke logic.
     async _refreshParentInTree(
       restoredPath,
-      ownerWorkspace = this.currentWorkspacePath(),
+      ownerWorkspace = this.fileWorkspacePath(),
     ) {
       if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
       if (!restoredPath) return this.reloadTree();
@@ -11153,7 +11241,7 @@ function portal() {
       return true;
     },
     async fetchChildren(path, opts = {}) {
-      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
       const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
         && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
       if (!isOwner()) {
@@ -11420,7 +11508,7 @@ function portal() {
       // same children, corrupting the flat `visible` array. Re-check after the
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
-      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
       let children;
       try {
         children = await this.fetchChildren(n.path, {
@@ -11532,7 +11620,7 @@ function portal() {
     },
     async doNewFile(dirNode) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建文件" : "New file",
         // Root has no meaningful path to show ("在 /" reads broken); a
@@ -11574,7 +11662,7 @@ function portal() {
     },
     async doNewDir(dirNode) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: dirNode.path
           ? (zh ? "新建子目录" : "New subdirectory")
@@ -11624,7 +11712,7 @@ function portal() {
     },
     async doRename(n) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const newName = await this.prompt({
         title: zh ? "重命名" : "Rename",
         body: (zh ? "当前路径:" : "Current path: ") + n.path,
@@ -11679,7 +11767,7 @@ function portal() {
     // "Copy as .bak" menu (dst_dir omitted → same-dir duplicate) and
     // the Ctrl+V paste path (dst_dir = selected directory).
     async _postCopyBak(srcPath, dstDir) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const body = dstDir ? { src: srcPath, dst_dir: dstDir }
                           : { src: srcPath };
       let r;
@@ -11750,7 +11838,7 @@ function portal() {
     },
     async doDelete(n) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       // Soft-delete now: backend moves the target into <ROOT>/.muselab-dustbin/
       // and returns a trash_id. Confirm copy says "move to trash" rather
       // than "permanently delete"; the prior "(only empty dirs)" caveat
@@ -11841,9 +11929,9 @@ function portal() {
       // until login/_bootApp re-invokes us.
       if (!this.token) return;
       const loadSeq = ++this._trashLoadSeq;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => loadSeq === this._trashLoadSeq
-        && ownerWorkspace === this.currentWorkspacePath();
+        && ownerWorkspace === this.fileWorkspacePath();
       this.trash.loading = true;
       try {
         const r = await fetch("/api/files/trash/list", { headers: this.hdr() });
@@ -11871,7 +11959,7 @@ function portal() {
       this.trash.modalOpen = false;
     },
     async restoreTrash(tid) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/trash/restore", {
@@ -11913,7 +12001,7 @@ function portal() {
     },
     async purgeTrash(tid) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "彻底删除" : "Permanently delete",
         body: zh ? "这一项将被永久删除，无法恢复。继续？"
@@ -11948,7 +12036,7 @@ function portal() {
     async emptyTrash() {
       const zh = this.lang === "zh";
       if (!this.trash.items.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "清空垃圾桶" : "Empty trash",
         body: zh ? `${this.trash.items.length} 项将被永久删除，无法恢复。继续？`
@@ -12022,7 +12110,7 @@ function portal() {
     async _trashManyPaths(paths) {
       if (!this._canRemovePreviewPaths(paths)) return;
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
@@ -12053,7 +12141,7 @@ function portal() {
     async _sendToTrash(path) {
       if (!this._canRemovePreviewPaths([path])) return;
       const name = path.split("/").pop() || path;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/delete", {
@@ -13200,9 +13288,9 @@ function portal() {
     // failed/404 stat clears the strip rather than showing stale numbers.
     async loadSelectedMeta(path) {
       const loadSeq = ++this._selectedMetaSeq;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => loadSeq === this._selectedMetaSeq
-        && ownerWorkspace === this.currentWorkspacePath()
+        && ownerWorkspace === this.fileWorkspacePath()
         && this.selected === path;
       if (!path) { this.selectedMeta = null; return; }
       try {
@@ -13236,8 +13324,8 @@ function portal() {
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
       // Iframe/img/pdf/anchor requests cannot attach our custom workspace
       // header, so carry the registered root in the query string too.
-      const workspace = this.currentWorkspacePath()
-        ? "&workspace=" + encodeURIComponent(this.currentWorkspacePath()) : "";
+      const workspace = this.fileWorkspacePath()
+        ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
       // preview=1 asks the backend to inject the click-to-zoom bridge into
       // HTML (see files.py). Only the html preview iframe passes it; images /
       // pdf / downloads stream untouched.
@@ -13336,8 +13424,8 @@ function portal() {
       this.loadSelectedMeta(path);
     },
     downloadUrl(p) {
-      const workspace = this.currentWorkspacePath()
-        ? "&workspace=" + encodeURIComponent(this.currentWorkspacePath()) : "";
+      const workspace = this.fileWorkspacePath()
+        ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
       return "/api/files/download?path=" + encodeURIComponent(p)
         + "&token=" + encodeURIComponent(this.token) + workspace;
     },
@@ -14290,7 +14378,7 @@ function portal() {
       // the upload button silently uploaded just the first one.
       const files = Array.from(ev.target.files || []);
       if (!files.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) {
         ev.target.value = "";
@@ -14335,7 +14423,7 @@ function portal() {
       ev.target.value = "";
     },
     async uploadFileTo(dirPath, file) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
       if (!uploadContext) return;
       const fd = new FormData();
@@ -14536,7 +14624,7 @@ function portal() {
     // multi-file drop doesn't serialize.
     async _uploadFilesToDir(targetDir, files) {
       if (!files.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(targetDir, files);
       if (!uploadContext) return;
       const results = await Promise.allSettled(
@@ -14605,7 +14693,7 @@ function portal() {
     },
     async moveTreeItem(srcPath, targetDir) {
       if (!srcPath) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const srcName = srcPath.split("/").pop();
       const srcParent = srcPath.split("/").slice(0, -1).join("/");
       // Same-parent drop = no-op (user dragged a file inside its own
@@ -14666,7 +14754,7 @@ function portal() {
     // open tabs ONCE. No backend batch endpoint — same parallel-then-refresh
     // pattern as _uploadFilesToDir.
     async moveTreeItems(srcPaths, targetDir) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const list = this._pruneDescendants((srcPaths || []).filter(Boolean));
       if (!list.length) return;
       if (list.length === 1) {
@@ -14728,7 +14816,7 @@ function portal() {
     // sync tabs. No per-item Undo for batches — items are still recoverable
     // from the trash modal.
     async deleteSelected() {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const paths = this._pruneDescendants(Array.from(this.selectedPaths));
       if (paths.length <= 1) {
         const p = paths[0] || this.treeFocusPath || this.selected;
@@ -14877,7 +14965,7 @@ function portal() {
     },
     async mkdirPrompt() {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建目录" : "New directory",
         body: zh ? "输入相对根的路径，例如 archives/2026"
@@ -15238,7 +15326,7 @@ function portal() {
       }
       if (!this.selected) return;
       const targetPath = this.selected;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const targetMode = this.previewMode;
       // Entering the editor takes ownership of the file body. Cancel any
       // preview/CSV transport and invalidate deferred markdown rendering so it
@@ -15323,7 +15411,7 @@ function portal() {
         // rawText sync) reads this.editText, so refresh it first.
         if (!this.selected) return;
         const savePath = this.selected;
-        const ownerWorkspace = this.currentWorkspacePath();
+        const ownerWorkspace = this.fileWorkspacePath();
         const saveMode = this.previewMode;
         const saveLang = this.previewLang;
         const saveText = this._cm ? this._cm.getValue() : this.editText;
@@ -15405,10 +15493,14 @@ function portal() {
 
     // ===== @ mention =====
     insertFileMention(path) {
-      const mention = "@" + path + " ";
+      const fileRoot = this.fileWorkspacePath();
+      const mentionPath = this.currentWorkspacePath() === fileRoot
+        ? path
+        : fileRoot.replace(/\/$/, "") + "/" + String(path || "").replace(/^\//, "");
+      const mention = "@" + mentionPath + " ";
       this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
-      this.toast(this.t("toast.mention_added", { path }), "success", 1500);
+      this.toast(this.t("toast.mention_added", { path: mentionPath }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
       if (this._isMobileLayout()) this.setMobileTab("chat");
     },
@@ -15855,7 +15947,7 @@ function portal() {
     },
 
     async quickNewNote() {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: this.t("preview.new_note_title"),
         body: this.t("preview.new_note_body"),
@@ -17142,7 +17234,6 @@ function portal() {
       // ⏳ running → ✅/❌ from this. merge=true so a later progress/terminal
       // event keeps fields an earlier event already set.
       const applyTaskStatus = (toolUseId, patch, merge = true) => {
-        if (!toolUseId) return;
         const msgs = streamState.messages;
         for (let k = msgs.length - 1; k >= 0; k--) {
           // role check is LOAD-BEARING: the tool_result bubble carries the
@@ -17152,7 +17243,14 @@ function portal() {
           // through only because the typed message arrives BEFORE the
           // tool_result; every TERMINAL notification arrived after and was
           // silently swallowed — the ⏳ card never flipped live (2026-06-11).
-          if (msgs[k] && msgs[k].id === toolUseId
+          const byToolUse = !!toolUseId && msgs[k] && msgs[k].id === toolUseId;
+          // TaskUpdatedMessage deliberately has no top-level tool_use_id.
+          // Fall back to the task_id stamped by the earlier TaskStarted event,
+          // otherwise terminal-only task_updated patches leave the card on ⏳.
+          const byTask = !toolUseId && patch && patch.task_id && msgs[k]
+            && msgs[k].task_status
+            && msgs[k].task_status.task_id === patch.task_id;
+          if (msgs[k] && (byToolUse || byTask)
               && msgs[k].role === "tool_use") {
             const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
             msgs[k].task_status = Object.assign({}, prev, patch);
@@ -17523,6 +17621,14 @@ function portal() {
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
         es.close(); _markDone(!!d.cancelled); _stopTimer();
+        const _viewedStream = this.currentId === streamSid
+          || (this.tabState && this.tabState[this.currentId] === streamState);
+        if (!d.cancelled && _viewedStream) {
+          // The user watched this reply finish in the current foreground tab.
+          // Resolve through currentId so an adopted/aliased session id cannot
+          // make the acknowledgement miss the durable activity row.
+          this.ackCurrentActivity(3);
+        }
         // We rendered this reply live — re-baseline the open-session resync
         // cursor so the post-done list poll (updated_at now advanced) doesn't
         // mistake our own just-finished turn for an external change and quiet-
@@ -18200,7 +18306,7 @@ function portal() {
       const requestSeq = ++this._paletteFileSeq;
       this.palette.fileQuery = q;
       this.palette.fileLoading = true;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => requestSeq === this._paletteFileSeq
         && this._workspaceIsCurrent(ownerWorkspace)
         && this.palette.query.trim() === q;
@@ -18412,12 +18518,29 @@ function portal() {
         this._syncAppBadge();
       } catch (_) {}
     },
-    async ackActivitySession(sid) {
+    ackCurrentActivity(retries = 0) {
+      if (!this.currentId || typeof document === "undefined"
+          || document.visibilityState !== "visible") return;
+      return this.ackActivitySession(this.currentId, retries);
+    },
+    async ackActivitySession(sid, retries = 0) {
       if (!sid) return;
       try {
         const r = await fetch(`/api/activity/session/${encodeURIComponent(sid)}/ack`,
           { method: "POST", headers: this.hdr() });
-        if (r.ok) { const d = await r.json(); this.activity.summary = d.summary; this._syncAppBadge(); }
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d.summary) this.activity.summary = d.summary;
+        if (Number(d.changed) > 0) {
+          for (const item of this.activity.events || []) {
+            if ((item.session_id || item.thread_id) === sid) item.read = true;
+          }
+        }
+        this._syncAppBadge();
+        if (Number(d.changed) === 0 && retries > 0
+            && this.currentId === sid && document.visibilityState === "visible") {
+          setTimeout(() => this.ackActivitySession(sid, retries - 1), 400);
+        }
       } catch (_) {}
     },
     _syncAppBadge() {

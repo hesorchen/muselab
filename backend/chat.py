@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
+    TaskUpdatedMessage, TERMINAL_TASK_STATUSES,
     RateLimitEvent,
     ClaudeSDKError,
     ThinkingConfigEnabled, ThinkingConfigDisabled,
@@ -575,6 +576,36 @@ _STOPPED_CONTINUATION_GRACE = env_int(
 _bg_task_descriptions: dict[str, str] = {}
 
 
+def _terminal_task_update(msg: TaskUpdatedMessage) -> dict | None:
+    """Normalize a terminal ``task_updated`` patch to task_notification shape.
+
+    Recent Claude CLI builds may emit only ``TaskUpdatedMessage`` for a
+    terminal transition (notably a user-stopped task reports ``killed``) and
+    suppress the older ``TaskNotificationMessage``.  Treat both as equal
+    lifecycle truth so task pins and UI cards cannot remain stuck forever.
+    """
+    status = getattr(msg, "status", None)
+    if status not in TERMINAL_TASK_STATUSES:
+        return None
+    patch = getattr(msg, "patch", None)
+    patch = patch if isinstance(patch, dict) else {}
+    frontend_status = "stopped" if status == "killed" else status
+    summary = patch.get("summary") or patch.get("error") or patch.get("result") or ""
+    if not isinstance(summary, str):
+        try:
+            summary = json.dumps(summary, ensure_ascii=False)
+        except (TypeError, ValueError):
+            summary = str(summary)
+    return {
+        "task_id": getattr(msg, "task_id", "") or "",
+        "tool_use_id": patch.get("tool_use_id") or patch.get("toolUseId"),
+        "status": frontend_status,
+        "summary": summary,
+        "output_file": patch.get("output_file") or patch.get("outputFile") or "",
+        "usage": dict(patch.get("usage") or {}) if isinstance(patch.get("usage"), dict) else {},
+    }
+
+
 # ---------------------------------------------------------------------------
 # In-flight turn persistence (survives muselab process restart)
 # ---------------------------------------------------------------------------
@@ -735,9 +766,9 @@ _session_usage: dict[str, dict] = {}     # sid -> {input_tokens, output_tokens,
 #   - Zhipu GLM:   glm-5.org / docs.z.ai (GLM-5 + GLM-4.7 both 200K context)
 #   - MiniMax:     platform.minimax.io (M2.5 / M2.7 both 204_800, cline #10007
 #                  PR fixed the prior 192K/245K misinformation)
-#   - OpenAI Codex/GPT-5: developers.openai.com model cards (400K context,
-#                  128K max output; GPT-5-Codex is Responses-API-only behind
-#                  the local gateway)
+#   - Codex/GPT-5: CLIProxyAPI's live Codex-client catalog (runtime source of
+#                  truth); the values below mirror that catalog only as an
+#                  offline fallback. Max output remains 128K at the gateway.
 MODEL_CONTEXT_LIMITS = {
     # Anthropic — the bundled Claude Code CLI reports a 200K effective window
     # for these models (verified via get_context_usage: maxTokens=200000). The
@@ -767,24 +798,28 @@ MODEL_CONTEXT_LIMITS = {
     "minimax-m2.7":                 204_800,
     "minimax-m2.7-highspeed":       204_800,
     "minimax-m2.5":                 204_800,
-    # Codex Gateway — local sidecars can expose Codex/GPT aliases with large
-    # context windows. Gateway implementations may still fail earlier if their
-    # translation layer or account tier has a smaller effective window.
-    # Codex Gateway docs/model metadata may advertise roughly 400K, but the local
-    # sidecar, account tier, or Anthropic→Codex translation layer can enforce a
-    # smaller effective window. Treat these as last-resort catalog fallbacks only;
-    # runtime code below prefers explicit env overrides and SDK/gateway observations.
+    # Codex Gateway — raw `context_window` fallbacks matching CLIProxyAPI's
+    # Codex client catalog. Runtime discovery via `/v1/models?client_version`
+    # wins; these values only cover a temporarily unavailable/older gateway.
+    # `_context_limit_details()` applies Codex's default 95% usable-input ratio,
+    # so the meter denominator is effective capacity rather than these raw values.
     "codex:gpt-5.6-sol":              372_000,
     "codex:gpt-5.6-terra":            372_000,
     "codex:gpt-5.6-luna":             372_000,
-    "codex:gpt-5.5":                400_000,
-    "codex:gpt-5.4":                400_000,
-    "codex:gpt-5.4-mini":           400_000,
-    "codex:gpt-5.3-codex-spark":    400_000,
+    "codex:gpt-5.5":                  272_000,
+    "codex:gpt-5.4":                  272_000,
+    "codex:gpt-5.4-mini":             272_000,
+    "codex:gpt-5.3-codex-spark":      128_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
-CODEX_GATEWAY_SAFE_CONTEXT_LIMIT = 200_000
-_CONTEXT_LIMIT_PROBE_CACHE: dict[str, int] = {}
+CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT = 95
+_CONTEXT_CAPABILITY_CACHE_TTL = max(
+    1.0, env_float("MUSELAB_CONTEXT_CATALOG_TTL_S", 300.0))
+_CONTEXT_CAPABILITY_FAILURE_TTL = max(
+    1.0, env_float("MUSELAB_CONTEXT_CATALOG_FAILURE_TTL_S", 15.0))
+# (gateway base URL, canonical model) -> (monotonic timestamp, capability | None)
+# No credential material is ever retained in this cache.
+_CONTEXT_CAPABILITY_CACHE: dict[tuple[str, str], tuple[float, dict | None]] = {}
 
 
 def _positive_int(v: Any) -> int:
@@ -795,8 +830,20 @@ def _positive_int(v: Any) -> int:
     return n if n > 0 else 0
 
 
+def _canonical_context_model(model: str) -> str:
+    """Restore muselab's routing prefix for raw Codex transcript model ids."""
+    value = (model or "").strip()
+    if value.startswith("codex:"):
+        return value
+    candidate = f"codex:{value}"
+    if candidate in MODEL_CONTEXT_LIMITS:
+        return candidate
+    return value
+
+
 def _is_codex_gateway_model(model: str) -> bool:
-    if (model or "").startswith("codex:"):
+    model = _canonical_context_model(model)
+    if model.startswith("codex:"):
         return True
     provider = endpoints.lookup(model or "")
     return bool(
@@ -815,7 +862,8 @@ def _context_limit_env_override(model: str) -> int:
     MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5=180000. Provider-wide fallback:
     CODEX_GATEWAY_CONTEXT_LIMIT=180000.
     """
-    key = re.sub(r"[^A-Za-z0-9]+", "_", (model or "").upper()).strip("_")
+    model = _canonical_context_model(model)
+    key = re.sub(r"[^A-Za-z0-9]+", "_", model.upper()).strip("_")
     names = []
     if key:
         names.append(f"MUSELAB_CONTEXT_LIMIT_{key}")
@@ -832,6 +880,236 @@ def _context_limit_env_override(model: str) -> int:
     return 0
 
 
+def _parse_codex_gateway_catalog(body: Any) -> dict[str, dict]:
+    """Parse CLIProxyAPI's Codex-client catalog into meter capabilities.
+
+    `context_window` is the currently selected raw window, while
+    `max_context_window` is only the ceiling for an explicit client override.
+    Codex reserves 5% for system/tool/output headroom when the catalog omits an
+    explicit `effective_context_window_percent`, matching the official client.
+    """
+    if not isinstance(body, dict):
+        return {}
+    rows = body.get("models")
+    if not isinstance(rows, list):
+        return {}
+    parsed: dict[str, dict] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or item.get("id") or "").strip()
+        raw = _positive_int(item.get("context_window"))
+        if not slug or not raw:
+            continue
+        max_window = max(raw, _positive_int(item.get("max_context_window")))
+        pct = _positive_int(item.get("effective_context_window_percent"))
+        if not 1 <= pct <= 100:
+            pct = CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT
+        effective = max(1, raw * pct // 100)
+        auto_compact = _positive_int(item.get("auto_compact_token_limit"))
+        parsed[slug] = {
+            "context_limit": effective,
+            "context_raw_limit": raw,
+            "context_max_limit": max_window,
+            "context_effective_percent": pct,
+            "catalog_auto_compact_threshold": (
+                min(auto_compact, effective) if auto_compact else 0),
+            "context_limit_source": "gateway_catalog",
+            "context_limit_is_estimate": False,
+        }
+    return parsed
+
+
+def _capability_from_model_item(item: Any, *, source: str) -> dict | None:
+    """Read common model-limit fields from non-Codex-catalog endpoints."""
+    if not isinstance(item, dict):
+        return None
+    limit = 0
+    for field in (
+        "max_input_tokens", "context_window", "context_length",
+        "max_context_tokens",
+    ):
+        limit = _positive_int(item.get(field))
+        if limit:
+            break
+    if not limit:
+        return None
+    return {
+        "context_limit": limit,
+        "context_raw_limit": limit,
+        "context_max_limit": limit,
+        "context_effective_percent": 100,
+        "catalog_auto_compact_threshold": 0,
+        "context_limit_source": source,
+        "context_limit_is_estimate": False,
+    }
+
+
+async def _detect_gateway_context_capability(model: str) -> dict | None:
+    """Discover the active Codex model window from CLIProxyAPI.
+
+    CLIProxyAPI 7.2.80 exposes the authoritative Codex-client model catalog at
+    `/v1/models?client_version`. Older generic `/v1/models` routes are retained
+    as compatibility fallbacks. Successes and failures use separate short TTLs
+    so a gateway upgrade/config change self-heals without restarting muselab.
+    """
+    if not _is_codex_gateway_model(model):
+        return None
+    canonical = _canonical_context_model(model)
+    slug = endpoints.normalize_model_id(canonical)
+    env = endpoints.env_override(canonical) or {}
+    base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
+    key = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    if not base:
+        return None
+    cache_key = (base, canonical)
+    cached = _CONTEXT_CAPABILITY_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, capability = cached
+        ttl = (_CONTEXT_CAPABILITY_CACHE_TTL if capability
+               else _CONTEXT_CAPABILITY_FAILURE_TTL)
+        if time.monotonic() - cached_at < ttl:
+            return dict(capability) if capability else None
+
+    headers: dict[str, str] = {}
+    if key:
+        headers.update({"x-api-key": key, "Authorization": f"Bearer {key}"})
+    now = time.monotonic()
+    try:
+        import httpx
+        timeout = max(0.2, env_float("MUSELAB_CONTEXT_CATALOG_TIMEOUT_S", 2.0))
+        async with httpx.AsyncClient(timeout=timeout) as hc:
+            # Query-string presence selects CLIProxyAPI's Codex-client catalog.
+            r = await hc.get(f"{base}/v1/models?client_version", headers=headers)
+            if r.status_code < 400:
+                catalog = _parse_codex_gateway_catalog(r.json())
+                if catalog:
+                    for item_slug, capability in catalog.items():
+                        item_model = _canonical_context_model(item_slug)
+                        _CONTEXT_CAPABILITY_CACHE[(base, item_model)] = (
+                            now, dict(capability))
+                        # Keep the routing-prefixed cache key too. This makes
+                        # newly-added gateway models cache correctly before
+                        # muselab's static fallback table learns their slug.
+                        _CONTEXT_CAPABILITY_CACHE[
+                            (base, f"codex:{item_slug}")
+                        ] = (now, dict(capability))
+                    found = catalog.get(slug)
+                    if found:
+                        return dict(found)
+
+            # Compatibility path for gateways that expose limits on ordinary
+            # OpenAI/Anthropic model endpoints instead of the Codex catalog.
+            anth_headers = {**headers, "anthropic-version": "2023-06-01"}
+            for url, req_headers in (
+                (f"{base}/v1/models/{slug}", anth_headers),
+                (f"{base}/v1/models", headers),
+                (f"{base}/v1/models", anth_headers),
+            ):
+                rr = await hc.get(url, headers=req_headers)
+                if rr.status_code >= 400:
+                    continue
+                body = rr.json()
+                candidates: list[Any] = [body]
+                if isinstance(body, dict):
+                    for item in body.get("data") or []:
+                        if (isinstance(item, dict)
+                                and item.get("id") in {canonical, slug}):
+                            candidates.insert(0, item)
+                for item in candidates:
+                    capability = _capability_from_model_item(
+                        item, source="gateway_models_api")
+                    if capability:
+                        _CONTEXT_CAPABILITY_CACHE[cache_key] = (
+                            now, dict(capability))
+                        return capability
+    except Exception as e:
+        sys.stderr.write(
+            f"[ctx-catalog] gateway context probe skipped model={canonical}: "
+            f"{type(e).__name__}\n")
+    _CONTEXT_CAPABILITY_CACHE[cache_key] = (now, None)
+    return None
+
+
+def _context_limit_details(
+    model: str,
+    *,
+    sdk_max: int = 0,
+    sdk_raw: int = 0,
+    stored: int = 0,
+    detected: int = 0,
+    capability: dict | None = None,
+) -> dict:
+    """Resolve denominator plus provenance for the meter and preflight.
+
+    Official Claude path: SDK maxTokens is authoritative. Third-party gateways:
+    explicit env override wins. Codex Gateway then trusts CLIProxyAPI's active
+    `context_window` catalog entry and deliberately ignores Claude CLI's legacy
+    200K model guess. `max_context_window` remains metadata, never the default.
+    """
+    model = _canonical_context_model(model)
+    override = _context_limit_env_override(model)
+    if override:
+        cap = capability or {}
+        return {
+            "context_limit": override,
+            # An override is already expressed in effective tokens. Do not
+            # attach the catalog's unrelated raw percentage to that value.
+            "context_raw_limit": override,
+            "context_max_limit": max(
+                override, _positive_int(cap.get("context_max_limit"))),
+            "context_effective_percent": 100,
+            "catalog_auto_compact_threshold": 0,
+            "context_limit_source": "env_override",
+            "context_limit_is_estimate": False,
+        }
+    if not endpoints.is_third_party(model):
+        limit = (_positive_int(sdk_max) or _positive_int(stored)
+                 or MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT))
+        raw = _positive_int(sdk_raw) or limit
+        source = ("sdk" if _positive_int(sdk_max) else
+                  "session_sdk" if _positive_int(stored) else "model_fallback")
+        return {
+            "context_limit": limit,
+            "context_raw_limit": raw,
+            "context_max_limit": raw,
+            "context_effective_percent": (
+                max(1, min(100, limit * 100 // raw)) if raw else 100),
+            "catalog_auto_compact_threshold": 0,
+            "context_limit_source": source,
+            "context_limit_is_estimate": source == "model_fallback",
+        }
+    if _is_codex_gateway_model(model):
+        if capability and _positive_int(capability.get("context_limit")):
+            return dict(capability)
+        if _positive_int(detected):
+            return _capability_from_model_item(
+                {"max_input_tokens": detected}, source="gateway_models_api") or {}
+        raw = MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+        pct = CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT
+        return {
+            "context_limit": max(1, raw * pct // 100),
+            "context_raw_limit": raw,
+            "context_max_limit": raw,
+            "context_effective_percent": pct,
+            "catalog_auto_compact_threshold": 0,
+            "context_limit_source": "model_fallback",
+            "context_limit_is_estimate": True,
+        }
+    hardcoded = MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+    limit = _positive_int(sdk_max) or max(_positive_int(stored), hardcoded)
+    source = "sdk" if _positive_int(sdk_max) else "model_fallback"
+    return {
+        "context_limit": limit,
+        "context_raw_limit": _positive_int(sdk_raw) or limit,
+        "context_max_limit": _positive_int(sdk_raw) or limit,
+        "context_effective_percent": 100,
+        "catalog_auto_compact_threshold": 0,
+        "context_limit_source": source,
+        "context_limit_is_estimate": source == "model_fallback",
+    }
+
+
 def _effective_context_limit(
     model: str,
     *,
@@ -839,37 +1117,57 @@ def _effective_context_limit(
     sdk_raw: int = 0,
     stored: int = 0,
     detected: int = 0,
+    capability: dict | None = None,
 ) -> int:
-    """Runtime denominator for the context meter and preflight compact.
-
-    Official Claude path: SDK maxTokens is authoritative. Third-party gateways:
-    explicit env override wins; for Codex Gateway use a conservative safe default
-    ahead of the optimistic 400K catalog entry because gateway/backend/account
-    tiers often fail earlier than the model card window.
-    """
-    override = _context_limit_env_override(model)
-    if override:
-        return override
-    if not endpoints.is_third_party(model):
-        return _positive_int(sdk_max) or _positive_int(stored) or MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
-    if _is_codex_gateway_model(model):
-        # If SDK/gateway reports a smaller window than our safe default, respect
-        # that. Gateway-detected capability beats SDK-inferred model-card values.
-        observed = min([n for n in (_positive_int(detected), _positive_int(sdk_max), _positive_int(sdk_raw)) if n] or [0])
-        if observed:
-            return min(observed, CODEX_GATEWAY_SAFE_CONTEXT_LIMIT)
-        return CODEX_GATEWAY_SAFE_CONTEXT_LIMIT
-    hardcoded = MODEL_CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
-    return _positive_int(sdk_max) or max(_positive_int(stored), hardcoded)
+    """Backward-compatible integer view of `_context_limit_details()`."""
+    return _positive_int(_context_limit_details(
+        model, sdk_max=sdk_max, sdk_raw=sdk_raw, stored=stored,
+        detected=detected, capability=capability).get("context_limit"))
 
 
-def _compact_threshold(model: str, limit: int, sdk_threshold: int = 0) -> int:
+def _apply_context_limit_details(target: dict, details: dict) -> None:
+    for key in (
+        "context_limit", "context_raw_limit", "context_max_limit",
+        "context_effective_percent", "context_limit_source",
+        "context_limit_is_estimate", "catalog_auto_compact_threshold",
+    ):
+        if key in details:
+            target[key] = details[key]
+    target["context_is_estimate"] = bool(
+        target.get("context_used_is_estimate", False)
+        or target.get("context_limit_is_estimate", False))
+
+
+def _mark_context_used(target: dict, source: str, *, estimate: bool) -> None:
+    target["context_used_source"] = source
+    target["context_used_is_estimate"] = bool(estimate)
+    target["context_is_estimate"] = bool(
+        estimate or target.get("context_limit_is_estimate", False))
+
+
+def _compact_threshold(
+    model: str,
+    limit: int,
+    sdk_threshold: int = 0,
+    *,
+    sdk_max: int = 0,
+    capability: dict | None = None,
+) -> int:
     if limit <= 0:
         return 0
-    # Gateway conversion layers are less predictable; compact earlier.
-    ratio = 0.75 if _is_codex_gateway_model(model) else 0.90
-    soft = int(limit * ratio)
     sdk_t = _positive_int(sdk_threshold)
+    if _is_codex_gateway_model(model):
+        catalog_t = _positive_int(
+            (capability or {}).get("catalog_auto_compact_threshold"))
+        if catalog_t:
+            return min(catalog_t, limit)
+        # A client created with our injected CLAUDE_CODE_MAX_CONTEXT_TOKENS
+        # reports sdk_max == catalog effective limit. Trust its exact buffer.
+        # Older live clients still report 200K/167K; ignore that stale pair.
+        if sdk_t and _positive_int(sdk_max) == limit:
+            return min(sdk_t, limit)
+        return int(limit * 0.90)
+    soft = int(limit * 0.90)
     if sdk_t:
         return min(sdk_t, soft)
     return soft
@@ -884,54 +1182,9 @@ def _rough_prompt_tokens(text: str) -> int:
 
 
 async def _detect_gateway_context_limit(model: str) -> int:
-    """Best-effort capability discovery for Anthropic-compatible gateways.
-
-    Official Claude uses the Models API. Local gateways vary, so accept a few
-    common field names and cache the result. Failure is fine: callers fall back to
-    env overrides / SDK context usage / conservative defaults.
-    """
-    if not _is_codex_gateway_model(model):
-        return 0
-    if model in _CONTEXT_LIMIT_PROBE_CACHE:
-        return _CONTEXT_LIMIT_PROBE_CACHE[model]
-    env = endpoints.env_override(model) or {}
-    base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
-    key = env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
-    if not base:
-        return 0
-    headers = {"anthropic-version": "2023-06-01"}
-    if key:
-        headers.update({"x-api-key": key, "Authorization": f"Bearer {key}"})
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=2.0) as hc:
-            # Try Anthropic-style retrieve first, then OpenAI-style list.
-            urls = [
-                f"{base}/v1/models/{endpoints.normalize_model_id(model)}",
-                f"{base}/v1/models",
-            ]
-            for url in urls:
-                r = await hc.get(url, headers=headers)
-                if r.status_code >= 400:
-                    continue
-                body = r.json()
-                candidates = []
-                if isinstance(body, dict):
-                    candidates.append(body)
-                    for item in body.get("data") or []:
-                        if isinstance(item, dict) and item.get("id") in {model, endpoints.normalize_model_id(model)}:
-                            candidates.insert(0, item)
-                for item in candidates:
-                    for field in ("max_input_tokens", "context_window", "context_length", "max_context_tokens"):
-                        n = _positive_int(item.get(field)) if isinstance(item, dict) else 0
-                        if n:
-                            _CONTEXT_LIMIT_PROBE_CACHE[model] = n
-                            return n
-    except Exception as e:
-        sys.stderr.write(
-            f"[ctx-probe] gateway context probe skipped model={model}: {type(e).__name__}\n")
-    _CONTEXT_LIMIT_PROBE_CACHE[model] = 0
-    return 0
+    """Compatibility wrapper returning only the effective integer limit."""
+    capability = await _detect_gateway_context_capability(model)
+    return _positive_int((capability or {}).get("context_limit"))
 
 # Soft budget. If set (via MUSELAB_BUDGET_USD env or PUT /api/settings),
 # usage endpoint flags overrun so the UI can color the cost badge red.
@@ -1150,7 +1403,7 @@ async def _build_and_connect_client(
         # version is left enabled too as a fallback if the model forgets the
         # MCP name; the frontend renders both shapes.
         #
-        # MAINTENANCE NOTE (audit E/253, updated 2026-06-11): this is a
+        # MAINTENANCE NOTE (audit E/253, updated 2026-07-16): this is a
         # hand-maintained DENYLIST — a future harness-only tool is silently
         # EXPOSED until added here. Drift is now mechanically checkable: the
         # CLI announces its tool catalog in the init SystemMessage;
@@ -1162,12 +1415,17 @@ async def _build_and_connect_client(
         # it adds no protection; an explicit allowlist inverts the failure mode
         # (new/renamed useful tools silently MISSING after a CLI bump).
         disallowed_tools=[
-            "ExitPlanMode",           # plan-mode handshake — no UI yet
             "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
             "CronCreate", "CronDelete", "CronList",
-            "EnterPlanMode", "EnterWorktree", "ExitWorktree",
-            "Monitor", "PushNotification", "RemoteTrigger",
+            "EnterWorktree", "ExitWorktree",
+            "Monitor", "PushNotification",
             "ShareOnboardingGuide",
+            # Claude CLI 2.1.211 additions whose protocol is owned by a
+            # Claude Code / claude.ai host. muselab has no matching design,
+            # review-findings, or teammate-message surface. Keep
+            # WaitForMcpServers enabled: it is a local CLI lifecycle helper
+            # and lets slow MCP servers finish connecting without a prompt.
+            "DesignSync", "ReportFindings", "SendMessage",
         ],
         # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
         # (cwd/CLAUDE.md → the user's archive), and local (.claude/
@@ -1212,6 +1470,19 @@ async def _build_and_connect_client(
     # Claude models still go direct so Pro OAuth keeps working.
     env_ovr = endpoints.env_override(model)
     if env_ovr is not None:
+        if _is_codex_gateway_model(model):
+            # Claude CLI cannot infer Codex/GPT windows from its native model
+            # table and otherwise hard-codes 200K (auto-compact around 167K).
+            # Feed it the same effective window used by muselab's meter so its
+            # own tokenizer, /context output, and native autocompaction agree
+            # with CLIProxyAPI's live model catalog. This is a local CLI knob;
+            # it does not alter or over-claim the gateway's raw model ceiling.
+            capability = await _detect_gateway_context_capability(model)
+            details = _context_limit_details(model, capability=capability)
+            effective_limit = _positive_int(details.get("context_limit"))
+            if effective_limit:
+                env_ovr = dict(env_ovr)
+                env_ovr["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(effective_limit)
         opts_kwargs["env"] = env_ovr
     else:
         # No env_override == this is Claude (or unknown model). CLI needs
@@ -2893,6 +3164,83 @@ def _cached_session_msgs(sid: str, model: str, full: bool) -> list:
     return msgs
 
 
+def _session_message_uuids(sid: str, model: str) -> frozenset[str]:
+    """Snapshot transcript UUIDs that existed before a new SDK query.
+
+    A pooled ``ClaudeSDKClient`` owns one receive queue across turns. Task
+    lifecycle messages — and, on some CLI builds, the tail of the prior
+    response — can arrive after that turn's ResultMessage and remain buffered
+    until the next ``receive_response()`` call. The snapshot gives the stream
+    pump a stable query boundary: messages whose UUID was already persisted
+    before ``query()`` belong to an older turn and must not be broadcast again.
+
+    This deliberately uses the normal post-compact SDK view. The only replay we
+    need to reject is the immediately preceding active-branch response, and the
+    existing (mtime, size) cache keeps the common path cheap. Failure is
+    fail-open so a transcript read problem never prevents sending a message.
+    """
+    try:
+        return frozenset(
+            str(uid)
+            for msg in _cached_session_msgs(sid, model, full=False)
+            if (uid := getattr(msg, "uuid", None))
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat-stream] UUID boundary snapshot skipped sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        return frozenset()
+
+
+class _TurnResponseBoundary:
+    """Classify pooled-SDK messages relative to one ``query()`` call."""
+
+    _LIFECYCLE_TYPES = (
+        TaskStartedMessage, TaskProgressMessage,
+        TaskNotificationMessage, TaskUpdatedMessage,
+        RateLimitEvent,
+    )
+    _TURN_TYPES = (StreamEvent, AssistantMessage, UserMessage, ResultMessage)
+
+    def __init__(self, existing_uuids: frozenset[str] | set[str]):
+        self.existing_uuids = frozenset(existing_uuids)
+        self.saw_current_payload = False
+
+    def classify(self, msg: Any) -> str:
+        """Return ``forward``, ``current_result``, ``drop`` or ``stale_result``.
+
+        Lifecycle/rate-limit events are intentionally out-of-band and always
+        pass through: a late TaskNotification still needs to settle the old
+        card. Turn-scoped payload with a UUID present before query is replay.
+        An error Result without UUID is accepted immediately so auth/vendor
+        failures cannot leave the UI streaming forever.
+        """
+        if isinstance(msg, self._LIFECYCLE_TYPES):
+            return "forward"
+        if not isinstance(msg, self._TURN_TYPES):
+            return "forward"
+
+        uid = str(getattr(msg, "uuid", None) or "")
+        if uid and uid in self.existing_uuids:
+            return "stale_result" if isinstance(msg, ResultMessage) else "drop"
+
+        if isinstance(msg, ResultMessage):
+            if bool(getattr(msg, "is_error", False)):
+                self.saw_current_payload = True
+                return "current_result"
+            # Current SDK builds provide Result UUIDs. Accept UUID-less success
+            # for older SDKs and existing test doubles; without a stable identity
+            # there is no safe basis for calling it replay, and rejecting it can
+            # make receive_response() loop forever on clients that replay a fixed
+            # result fixture on every call.
+            self.saw_current_payload = True
+            return "current_result"
+
+        self.saw_current_payload = True
+        return "forward"
+
+
 @router.get("/sessions/{sid}", dependencies=[Depends(require_token)])
 def get_session_api(
     sid: str,
@@ -3798,11 +4146,13 @@ def _refresh_codex_rate_limits() -> dict:
 
 @router.get("/codex-rate-limit", dependencies=[Depends(require_token)])
 def codex_rate_limit(refresh: bool = Query(default=False)) -> dict:
-    """Latest Codex CLI quota snapshot from local Codex session logs.
+    """Latest quota and usage for the locally authenticated Codex account.
 
-    This is intentionally a read-only local-state bridge. It does not read
-    Codex OAuth credentials and it does not call OpenAI-native APIs. It is not
-    authoritative provider telemetry for Codex Gateway traffic.
+    A refresh prefers the Codex app-server's read-only
+    ``account/rateLimits/read`` and ``account/usage/read`` RPCs. Older Codex
+    builds fall back to existing local session snapshots. Neither path reads
+    OAuth credential files or sends a model request. The result describes the
+    local Codex account, not necessarily CLIProxyAPI's Gateway identity.
     """
     if refresh:
         refreshed = _refresh_codex_rate_limits()
@@ -3947,22 +4297,23 @@ def _session_usage_from_jsonl(sid: str) -> dict | None:
         sdk_window = sess.get_session_ctx_window(sid)
     except Exception:
         sdk_window = None
-    if endpoints.is_third_party(last_model):
-        limit = _effective_context_limit(last_model)
-    else:
-        limit = sdk_window or MODEL_CONTEXT_LIMITS.get(last_model, 0)
+    details = _context_limit_details(
+        last_model, stored=_positive_int(sdk_window))
+    limit = _positive_int(details.get("context_limit"))
     pct = round(ctx_used / limit * 100, 1) if limit else 0.0
-    return {
+    rebuilt = {
         "input_tokens": in_t, "output_tokens": out_t,
         "cache_read_tokens": cr_t, "cache_creation_tokens": cc_t,
         "total_cost_usd": total_cost, "last_turn_at": last_ts,
         "context_used": ctx_used, "context_used_pct": pct,
-        "context_limit": limit,
+        **details,
     }
+    _mark_context_used(rebuilt, "provider_usage_transcript", estimate=False)
+    return rebuilt
 
 
 @router.get("/usage/{session_id}", dependencies=[Depends(require_token)])
-def session_usage(session_id: str, model: str = "") -> dict:
+async def session_usage(session_id: str, model: str = "") -> dict:
     """Per-session context meter — what fraction of the model's window we're at.
 
     Note: this is the cheap path — reads cached per-turn usage values.
@@ -3987,26 +4338,25 @@ def session_usage(session_id: str, model: str = "") -> dict:
                 "context_used": 0, "context_used_pct": 0.0, "context_limit": 0,
             }
     m = model or MODEL
-    # Denominator precedence: the SDK-authoritative window measured for THIS
-    # session (persisted across restarts, Claude only) wins outright; otherwise
-    # take max(in-memory stored, hardcoded table). The max() keeps the
-    # documented "table bump picks up the new ceiling" behavior for third-party
-    # models (where the table is the only truth — the CLI can't measure their
-    # windows). It no longer over-states Claude: the real bug was the Claude
-    # table entries claiming 1M when the CLI reports 200K, which made the meter
-    # read ~5x too low. With the table corrected to 200K and the SDK value
-    # persisted, max() can't inflate, and genuine-1M accounts win via sdk_window.
+    # Claude uses the per-session SDK window persisted across restarts. Codex
+    # uses CLIProxyAPI's live model catalog (with an explicit operator override
+    # above it), so a stale 200K value from an older Claude CLI client cannot
+    # leak back into the denominator. Other third-party providers keep their
+    # established SDK/table fallback behavior.
     sdk_window = None
     try:
         sdk_window = sess.get_session_ctx_window(session_id)
     except Exception:
         sdk_window = None
     stored = int(u.get("context_limit", 0) or 0)
-    hardcoded = MODEL_CONTEXT_LIMITS.get(m, DEFAULT_CONTEXT_LIMIT)
-    if endpoints.is_third_party(m):
-        limit = _effective_context_limit(m, stored=stored)
-    else:
-        limit = sdk_window or max(stored, hardcoded)
+    capability = await _detect_gateway_context_capability(m)
+    details = _context_limit_details(
+        m,
+        sdk_max=_positive_int(sdk_window),
+        stored=stored,
+        capability=capability,
+    )
+    limit = _positive_int(details.get("context_limit"))
     # Prefer SDK-authoritative numbers populated by the stream's ResultMessage
     # handler. Fall back to the legacy estimate only if no turn has completed
     # yet (in which case `context_used` is 0 anyway → 0% display, correct).
@@ -4021,13 +4371,24 @@ def session_usage(session_id: str, model: str = "") -> dict:
         # would inflate the meter — see ResultMessage handler comment).
         ctx_used = int(u.get("input_tokens", 0) or 0)
         ctx_pct = round(ctx_used / limit * 100, 1) if limit else 0
-    return {
+    result = {
         **u,
         "model": m,
-        "context_limit": limit,
+        **details,
         "context_used": ctx_used,
         "context_used_pct": ctx_pct,
     }
+    if not result.get("context_used_source"):
+        _mark_context_used(
+            result,
+            "input_fallback" if ctx_used else "none",
+            estimate=bool(ctx_used),
+        )
+    else:
+        result["context_is_estimate"] = bool(
+            result.get("context_used_is_estimate", False)
+            or result.get("context_limit_is_estimate", False))
+    return result
 
 
 def _parse_cost(raw: Any) -> float:
@@ -4437,9 +4798,39 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
         raise HTTPException(409, "no live client for this session — send a message first")
     try:
         breakdown = await client.get_context_usage()
-        # Pass through the SDK's response shape directly. Frontend can pick
-        # whichever fields it wants to render.
-        return dict(breakdown)
+        payload = dict(breakdown)
+        if _is_codex_gateway_model(m):
+            # Claude CLI can describe the live prompt categories accurately,
+            # but an older already-running client may still report its legacy
+            # 200K Claude denominator. Re-anchor the response to the active
+            # CLIProxyAPI catalog so the popup and bottom ring cannot disagree.
+            sdk_max = _positive_int(payload.get("maxTokens"))
+            sdk_raw = _positive_int(payload.get("rawMaxTokens"))
+            capability = await _detect_gateway_context_capability(m)
+            details = _context_limit_details(
+                m, sdk_max=sdk_max, sdk_raw=sdk_raw,
+                capability=capability)
+            limit = _positive_int(details.get("context_limit"))
+            total = _positive_int(payload.get("totalTokens"))
+            payload["sdkMaxTokens"] = sdk_max
+            payload["sdkRawMaxTokens"] = sdk_raw
+            payload["maxTokens"] = limit
+            payload["rawMaxTokens"] = _positive_int(
+                details.get("context_raw_limit"))
+            payload["maxContextTokens"] = _positive_int(
+                details.get("context_max_limit"))
+            payload["percentage"] = (
+                round(total / limit * 100, 1) if limit else 0.0)
+            payload["autoCompactThreshold"] = _compact_threshold(
+                m,
+                limit,
+                _positive_int(payload.get("autoCompactThreshold")),
+                sdk_max=sdk_max,
+                capability=capability,
+            )
+            _apply_context_limit_details(payload, details)
+            _mark_context_used(payload, "sdk_context", estimate=True)
+        return payload
     except Exception as e:
         # Log the raw exception to stderr (it can contain CLI subprocess
         # stderr lines that mention ~/.claude/.credentials.json paths or
@@ -4527,17 +4918,32 @@ async def native_compact_session_api(sid: str) -> dict:
         if real_total:
             sess_u["context_used"] = real_total
         if endpoints.is_third_party(model):
-            # Third-party gateways may have a smaller effective window than their
-            # public model card. Prefer explicit/probed effective limits over the
-            # optimistic catalog table.
-            sess_u["context_limit"] = _effective_context_limit(
-                model, sdk_max=real_max, sdk_raw=_positive_int(cu.get("rawMaxTokens")))
+            capability = await _detect_gateway_context_capability(model)
+            details = _context_limit_details(
+                model,
+                sdk_max=real_max,
+                sdk_raw=_positive_int(cu.get("rawMaxTokens")),
+                stored=_positive_int(sess_u.get("context_limit")),
+                capability=capability,
+            )
+            _apply_context_limit_details(sess_u, details)
             sess_u["sdk_context_max_tokens"] = real_max
             sess_u["sdk_context_raw_max_tokens"] = _positive_int(cu.get("rawMaxTokens"))
-            if cu.get("autoCompactThreshold"):
-                sess_u["auto_compact_threshold"] = _positive_int(cu.get("autoCompactThreshold"))
+            threshold = _compact_threshold(
+                model,
+                _positive_int(details.get("context_limit")),
+                _positive_int(cu.get("autoCompactThreshold")),
+                sdk_max=real_max,
+                capability=capability,
+            )
+            if threshold:
+                sess_u["auto_compact_threshold"] = threshold
+            if real_total:
+                _mark_context_used(sess_u, "sdk_context", estimate=True)
         elif real_max:
             sess_u["context_limit"] = real_max
+            if real_total:
+                _mark_context_used(sess_u, "sdk_context", estimate=False)
             try:
                 sess.set_session_ctx_window(sid, real_max)
             except Exception:
@@ -7113,6 +7519,26 @@ async def _watch_inflight_tasks(
                                 "output_file": getattr(msg, "output_file", None),
                                 "usage": dict(getattr(msg, "usage", None) or {}),
                             })})
+                elif isinstance(msg, TaskUpdatedMessage):
+                    terminal = _terminal_task_update(msg)
+                    if terminal is not None:
+                        tid = terminal["task_id"]
+                        won_updated = _on_task_settled(
+                            session_id, tid, status=terminal["status"])
+                        last_settle_status = terminal["status"]
+                        sys.stderr.write(
+                            f"[chat] task watcher: terminal update "
+                            f"sid={session_id[:8]} task={tid} "
+                            f"status={last_settle_status} won={won_updated}\n")
+                        pending.pop(tid, None)
+                        if won_updated:
+                            if cont is None:
+                                await _open_continuation()
+                            if cont is not None:
+                                cont.publish({
+                                    "event": "task_notification",
+                                    "data": json.dumps(terminal),
+                                })
                 elif isinstance(msg, TaskStartedMessage):
                     # A task launched DURING the auto-continue reaction (the
                     # model can run tools in that turn, including Bash
@@ -7649,10 +8075,21 @@ async def _start_turn(
         total = _positive_int(cu.get("totalTokens"))
         sdk_max = _positive_int(cu.get("maxTokens"))
         sdk_raw = _positive_int(cu.get("rawMaxTokens"))
-        detected = await _detect_gateway_context_limit(model_to_use)
-        limit = _effective_context_limit(model_to_use, sdk_max=sdk_max, sdk_raw=sdk_raw, detected=detected)
+        capability = await _detect_gateway_context_capability(model_to_use)
+        details = _context_limit_details(
+            model_to_use,
+            sdk_max=sdk_max,
+            sdk_raw=sdk_raw,
+            capability=capability,
+        )
+        limit = _positive_int(details.get("context_limit"))
         threshold = _compact_threshold(
-            model_to_use, limit, _positive_int(cu.get("autoCompactThreshold")))
+            model_to_use,
+            limit,
+            _positive_int(cu.get("autoCompactThreshold")),
+            sdk_max=sdk_max,
+            capability=capability,
+        )
         # Attachments can be expensive; add a rough safety margin rather than
         # pretending the typed text is the whole next request.
         next_est = _rough_prompt_tokens(prompt) + len(img_blocks) * 2500 + len(pdf_blocks) * 12000
@@ -7667,9 +8104,15 @@ async def _start_turn(
                 "context_limit": 0,
             })
             sess_u["context_used"] = total or sess_u.get("context_used", 0)
-            sess_u["context_limit"] = limit or sess_u.get("context_limit", 0)
+            _apply_context_limit_details(sess_u, details)
             sess_u["sdk_context_max_tokens"] = sdk_max
             sess_u["sdk_context_raw_max_tokens"] = sdk_raw
+            if total:
+                _mark_context_used(
+                    sess_u,
+                    "sdk_context",
+                    estimate=endpoints.is_third_party(model_to_use),
+                )
             if threshold:
                 sess_u["auto_compact_threshold"] = threshold
             if sess_u.get("context_limit") and sess_u.get("context_used"):
@@ -7701,7 +8144,13 @@ async def _start_turn(
             real_total = _positive_int(cu2.get("totalTokens"))
             real_max = _positive_int(cu2.get("maxTokens"))
             real_raw = _positive_int(cu2.get("rawMaxTokens"))
-            lim = _effective_context_limit(model_to_use, sdk_max=real_max, sdk_raw=real_raw)
+            refreshed_details = _context_limit_details(
+                model_to_use,
+                sdk_max=real_max,
+                sdk_raw=real_raw,
+                capability=capability,
+            )
+            lim = _positive_int(refreshed_details.get("context_limit"))
             sess_u = _session_usage.setdefault(session_id, {
                 "input_tokens": 0, "output_tokens": 0,
                 "cache_read_tokens": 0, "cache_creation_tokens": 0,
@@ -7711,11 +8160,21 @@ async def _start_turn(
             })
             if real_total:
                 sess_u["context_used"] = real_total
-            if lim:
-                sess_u["context_limit"] = lim
+                _mark_context_used(
+                    sess_u,
+                    "sdk_context",
+                    estimate=endpoints.is_third_party(model_to_use),
+                )
+            _apply_context_limit_details(sess_u, refreshed_details)
             sess_u["sdk_context_max_tokens"] = real_max
             sess_u["sdk_context_raw_max_tokens"] = real_raw
-            th = _compact_threshold(model_to_use, lim, _positive_int(cu2.get("autoCompactThreshold")))
+            th = _compact_threshold(
+                model_to_use,
+                lim,
+                _positive_int(cu2.get("autoCompactThreshold")),
+                sdk_max=real_max,
+                capability=capability,
+            )
             if th:
                 sess_u["auto_compact_threshold"] = th
             if real_total and lim:
@@ -7749,9 +8208,23 @@ async def _start_turn(
         SENTINEL_DONE = object()
 
         async def pump_claude():
-            """Pull from claude SDK response stream into the merge queue."""
+            """Pull one query's SDK response into the merge queue.
+
+            ``ClaudeSDKClient`` is pooled across turns and its receive queue is
+            not turn-scoped. A prior turn's late Task lifecycle — sometimes
+            followed by replayed Assistant/Result messages — can therefore be
+            the first data returned after the next query. Keep lifecycle events,
+            but filter already-persisted response UUIDs and continue past their
+            stale Result until the current query reaches its own terminal.
+            """
             try:
                 await _preflight_compact_if_needed()
+                # Snapshot AFTER preflight compact (which may write a new compact
+                # boundary) and immediately BEFORE this user query. A cache hit is
+                # cheap; to_thread keeps a long-session parse off the event loop.
+                existing_uuids = await asyncio.to_thread(
+                    _session_message_uuids, session_id, model_to_use)
+                boundary = _TurnResponseBoundary(existing_uuids)
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
                 binary_blocks = [*img_blocks, *pdf_blocks]
@@ -7767,10 +8240,39 @@ async def _start_turn(
                     await client.query(gen())
                 else:
                     await client.query(prompt)
-                async for msg in client.receive_response():
-                    await merge_q.put(("claude", msg))
-                    if isinstance(msg, ResultMessage):
+
+                replay_dropped = 0
+                while True:
+                    stale_terminal = False
+                    current_terminal = False
+                    async for msg in client.receive_response():
+                        decision = boundary.classify(msg)
+                        if decision == "drop":
+                            replay_dropped += 1
+                            continue
+                        if decision == "stale_result":
+                            replay_dropped += 1
+                            stale_terminal = True
+                            continue
+                        await merge_q.put(("claude", msg))
+                        if decision == "current_result":
+                            current_terminal = True
+                            break
+                    if current_terminal:
                         break
+                    if stale_terminal:
+                        # receive_response() itself returns at every ResultMessage.
+                        # Re-enter it to continue draining toward this query's
+                        # Result instead of ending the turn on the stale one.
+                        continue
+                    # Transport ended without a Result; preserve the existing
+                    # completion/error behavior rather than spinning forever.
+                    break
+                if replay_dropped:
+                    sys.stderr.write(
+                        f"[chat-stream] dropped stale replay sid={session_id[:8]} "
+                        f"messages={replay_dropped}\n")
+                    sys.stderr.flush()
             except Exception as e:
                 # Log the full exception type + message + traceback for diagnosis.
                 # SDK transport errors / vendor 401s land here. Without this we
@@ -7852,12 +8354,14 @@ async def _start_turn(
                     "context_used": 0, "context_used_pct": 0.0,
                     "context_limit": 0,
                 })
-                # Prefer the SDK-authoritative limit set by a prior turn's
-                # ResultMessage handler (real maxTokens, may be 1M). Fallback
-                # to the hardcoded estimate on the very first turn before
-                # any get_context_usage() has run.
-                limit = sess_u.get("context_limit") or MODEL_CONTEXT_LIMITS.get(
-                    model_to_use, DEFAULT_CONTEXT_LIMIT)
+                capability = await _detect_gateway_context_capability(
+                    model_to_use)
+                details = _context_limit_details(
+                    model_to_use,
+                    stored=_positive_int(sess_u.get("context_limit")),
+                    capability=capability,
+                )
+                limit = _positive_int(details.get("context_limit"))
                 sess_u["input_tokens"] = in_t
                 sess_u["cache_read_tokens"] = cr_t
                 sess_u["cache_creation_tokens"] = cc_t
@@ -7865,11 +8369,11 @@ async def _start_turn(
                 sess_u["context_used"] = ctx_used
                 sess_u["context_used_pct"] = (
                     round(ctx_used / limit * 100, 1) if limit else 0.0)
-                # Only write context_limit when it's still 0 (first turn).
-                # Otherwise keep the SDK-authoritative value the prior turn's
-                # ResultMessage handler wrote.
-                if not sess_u.get("context_limit"):
-                    sess_u["context_limit"] = limit
+                _apply_context_limit_details(sess_u, details)
+                # Provider response usage is the exact billed/request usage;
+                # unlike SDK category accounting it is not a tokenizer guess.
+                _mark_context_used(
+                    sess_u, "provider_usage", estimate=False)
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     # Defensive tail-emit (see message_parser.py:279-290 — SDK
@@ -8027,6 +8531,8 @@ async def _start_turn(
             TaskNotification (status completed/failed/stopped) → terminal;
                 clears inflight_tasks, carries summary + output_file so the FE
                 can offer an "open result" link via the existing openFile path.
+            TaskUpdated with a terminal patch → the same terminal path. This is
+                required because newer CLIs may omit TaskNotification entirely.
 
             Note: the probe (§3.4) showed the terminal TaskNotification
             usually arrives AFTER this turn's ResultMessage, so within a turn
@@ -8095,6 +8601,22 @@ async def _start_turn(
                 # buzzed, a user away from every screen does (e.g. a queued
                 # turn running headless).
                 _on_task_settled(session_id, tid, status=status)
+            elif isinstance(msg, TaskUpdatedMessage):
+                terminal = _terminal_task_update(msg)
+                if terminal is None:
+                    return
+                tid = terminal["task_id"]
+                inflight_tasks.pop(tid, None)
+                won_updated = _on_task_settled(
+                    session_id, tid, status=terminal["status"])
+                sys.stderr.write(
+                    f"[chat] in-turn terminal update sid={session_id[:8]} "
+                    f"task={tid} status={terminal['status']} won={won_updated}\n")
+                if won_updated:
+                    yield {
+                        "event": "task_notification",
+                        "data": json.dumps(terminal),
+                    }
 
         async def _handle_rate_limit(msg):
             """SDK RateLimitEvent → record the window's RateLimitInfo and emit a
@@ -8142,34 +8664,52 @@ async def _start_turn(
             # not the hardcoded 200K in MODEL_CONTEXT_LIMITS). One control
             # round-trip per turn — small price for accurate denominator.
             #
-            # Third-party caveat: CLI's get_context_usage uses Claude's
-            # tokenizer + doesn't know DeepSeek/GLM/MiniMax context windows,
-            # so for those vendors we trust our hardcoded MODEL_CONTEXT_LIMITS
-            # table instead. It's not perfect either but at least matches the
-            # vendor's documented window. AssistantMessage.usage already
-            # populated context_used / pct against that limit a few lines up.
+            # Third-party caveat: SDK category accounting uses Claude CLI's
+            # tokenizer. Keep provider response usage as the completed-turn
+            # numerator. For Codex, the denominator comes from CLIProxyAPI's
+            # live catalog; other providers retain their existing SDK/table
+            # fallback. The raw SDK figures are diagnostic metadata only.
             if endpoints.is_third_party(model_to_use):
                 # Re-anchor context_limit to the runtime effective limit, not the
                 # optimistic catalog value. For Codex Gateway this prevents the UI
                 # from showing e.g. 30% while the sidecar/backend is already near
                 # its real context ceiling.
-                sdk_max = sdk_raw = sdk_threshold = 0
+                sdk_max = sdk_raw = sdk_threshold = sdk_total = 0
                 try:
                     cu = await client.get_context_usage()
                     sdk_max = _positive_int(cu.get("maxTokens"))
                     sdk_raw = _positive_int(cu.get("rawMaxTokens"))
                     sdk_threshold = _positive_int(cu.get("autoCompactThreshold"))
+                    sdk_total = _positive_int(cu.get("totalTokens"))
                 except Exception as _e:
                     sys.stderr.write(
                         f"[chat-stream] third-party get_context_usage skipped for "
                         f"sid={session_id}: {type(_e).__name__}\n")
-                sess_u["context_limit"] = _effective_context_limit(
-                    model_to_use, sdk_max=sdk_max, sdk_raw=sdk_raw,
-                    stored=_positive_int(sess_u.get("context_limit")))
+                capability = await _detect_gateway_context_capability(
+                    model_to_use)
+                details = _context_limit_details(
+                    model_to_use,
+                    sdk_max=sdk_max,
+                    sdk_raw=sdk_raw,
+                    stored=_positive_int(sess_u.get("context_limit")),
+                    capability=capability,
+                )
+                _apply_context_limit_details(sess_u, details)
                 sess_u["sdk_context_max_tokens"] = sdk_max
                 sess_u["sdk_context_raw_max_tokens"] = sdk_raw
-                if sdk_threshold:
-                    sess_u["auto_compact_threshold"] = sdk_threshold
+                threshold = _compact_threshold(
+                    model_to_use,
+                    _positive_int(details.get("context_limit")),
+                    sdk_threshold,
+                    sdk_max=sdk_max,
+                    capability=capability,
+                )
+                if threshold:
+                    sess_u["auto_compact_threshold"] = threshold
+                if not sess_u.get("context_used") and sdk_total:
+                    sess_u["context_used"] = sdk_total
+                    _mark_context_used(
+                        sess_u, "sdk_context", estimate=True)
                 # Recompute pct against the corrected limit.
                 if sess_u["context_limit"]:
                     sess_u["context_used_pct"] = round(
@@ -8191,6 +8731,8 @@ async def _start_turn(
                             pass
                     if real_total:
                         sess_u["context_used"] = real_total
+                        _mark_context_used(
+                            sess_u, "sdk_context", estimate=False)
                     if real_max and real_total:
                         sess_u["context_used_pct"] = round(
                             real_total / real_max * 100, 1)
@@ -8541,7 +9083,7 @@ async def _start_turn(
                     async for ev in _handle_user_message(msg):
                         yield ev
                 elif isinstance(msg, (TaskStartedMessage, TaskProgressMessage,
-                                      TaskNotificationMessage)):
+                                      TaskNotificationMessage, TaskUpdatedMessage)):
                     # SDK-native background-task lifecycle. These are
                     # SystemMessage subclasses muselab used to silently drop;
                     # check them BEFORE any generic SystemMessage branch (none

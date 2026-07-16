@@ -138,24 +138,127 @@ def test_context_used_fallback_when_sdk_value_missing(client, auth):
     assert body["context_used"] != 42_500   # explicitly NOT the cumulative sum
 
 
-def test_codex_gateway_ctx_limit_fallback_is_safe_200k(client, auth):
-    """Codex Gateway model cards may advertise 400K, but local sidecars and
-    account tiers can fail earlier, so the meter uses the conservative 200K
-    fallback until the gateway reports a smaller runtime window."""
+def test_codex_gateway_ctx_limit_fallback_uses_effective_window(
+        client, auth, monkeypatch):
+    """When the live catalog is unavailable, Codex uses 95% of the bundled
+    raw window — never Claude CLI's unrelated legacy 200K guess."""
+    from backend import chat as chat_mod
+
+    async def no_catalog(_model):
+        return None
+
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability", no_catalog)
     r = client.get("/api/chat/usage/no-such-codex-sid?model=codex:gpt-5.5",
                    headers=auth)
     assert r.status_code == 200
-    assert r.json()["context_limit"] == 200_000
+    body = r.json()
+    assert body["context_limit"] == 258_400
+    assert body["context_raw_limit"] == 272_000
+    assert body["context_limit_source"] == "model_fallback"
+    assert body["context_limit_is_estimate"] is True
 
 
 def test_codex_56_catalog_fallback_matches_runtime_model_metadata(app_module):
-    """The local Codex catalog exposes a 372K usable window for GPT-5.6;
-    do not regress to an unsupported 1.05M assumption."""
+    """Bundled raw-window fallbacks mirror the gateway model families."""
     from backend import chat as chat_mod
 
     assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.6-sol"] == 372_000
     assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.6-terra"] == 372_000
     assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.6-luna"] == 372_000
+    assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.5"] == 272_000
+    assert chat_mod.MODEL_CONTEXT_LIMITS["codex:gpt-5.4"] == 272_000
+    assert chat_mod.MODEL_CONTEXT_LIMITS[
+        "codex:gpt-5.3-codex-spark"] == 128_000
+
+
+def test_codex_gateway_catalog_parser_preserves_raw_and_max_windows(app_module):
+    """`context_window` drives the effective meter; `max_context_window` is
+    metadata only and must not inflate the denominator."""
+    from backend import chat as chat_mod
+
+    parsed = chat_mod._parse_codex_gateway_catalog({
+        "models": [{
+            "slug": "gpt-5.4",
+            "context_window": 272_000,
+            "max_context_window": 1_000_000,
+        }],
+    })
+    cap = parsed["gpt-5.4"]
+    assert cap["context_limit"] == 258_400
+    assert cap["context_raw_limit"] == 272_000
+    assert cap["context_max_limit"] == 1_000_000
+    assert cap["context_effective_percent"] == 95
+    assert cap["context_limit_source"] == "gateway_catalog"
+    assert cap["context_limit_is_estimate"] is False
+
+
+def test_codex_usage_catalog_overrides_stale_200k_session(
+        client, auth, monkeypatch):
+    """A live gateway capability wins over stale 200K values left by an old
+    Claude CLI client, while preserving exact provider usage provenance."""
+    from backend import chat as chat_mod
+
+    async def catalog_capability(_model):
+        return {
+            "context_limit": 353_400,
+            "context_raw_limit": 372_000,
+            "context_max_limit": 372_000,
+            "context_effective_percent": 95,
+            "catalog_auto_compact_threshold": 0,
+            "context_limit_source": "gateway_catalog",
+            "context_limit_is_estimate": False,
+        }
+
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability", catalog_capability)
+    chat_mod._session_usage["stale-codex"] = {
+        "input_tokens": 53_460,
+        "output_tokens": 100,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_cost_usd": 0.0,
+        "last_turn_at": 0.0,
+        "context_used": 53_460,
+        "context_used_pct": 26.7,
+        "context_limit": 200_000,
+        "context_used_source": "provider_usage",
+        "context_used_is_estimate": False,
+    }
+
+    r = client.get(
+        "/api/chat/usage/stale-codex?model=codex:gpt-5.6-sol",
+        headers=auth,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["context_used"] == 53_460
+    assert body["context_limit"] == 353_400
+    assert body["context_used_pct"] == round(53_460 / 353_400 * 100, 1)
+    assert body["context_used_source"] == "provider_usage"
+    assert body["context_limit_source"] == "gateway_catalog"
+    assert body["context_is_estimate"] is False
+
+
+def test_codex_compact_threshold_ignores_stale_cli_window(app_module):
+    """The old 200K/167K Claude CLI pair must not trigger premature compact
+    once the gateway catalog says the effective window is 353.4K."""
+    from backend import chat as chat_mod
+
+    assert chat_mod._compact_threshold(
+        "codex:gpt-5.6-sol",
+        353_400,
+        167_000,
+        sdk_max=200_000,
+    ) == 318_060
+    # New clients receive CLAUDE_CODE_MAX_CONTEXT_TOKENS and can therefore
+    # contribute their exact native safety buffer.
+    assert chat_mod._compact_threshold(
+        "codex:gpt-5.6-sol",
+        353_400,
+        320_400,
+        sdk_max=353_400,
+    ) == 320_400
 
 
 # ============================================================================

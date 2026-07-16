@@ -10,6 +10,12 @@ request to the user's own Codex/OpenAI backend and translates the response back.
 muselab does **not** store Codex OAuth credentials and does **not** call
 OpenAI-native APIs directly.
 
+The compatibility baseline tested on 2026-07-16 is CLIProxyAPI `v7.2.80`,
+Claude Agent SDK `0.2.120`, and its bundled Claude CLI `2.1.211`. Newer
+CLIProxyAPI builds include fixes relevant to this bridge for Codex cache-token
+accounting, reasoning effort, tool-call replay, and Anthropic response
+translation.
+
 ```text
 muselab → Claude Agent SDK → Anthropic Messages request
         → Codex Gateway on 127.0.0.1
@@ -116,6 +122,17 @@ reference config. It intentionally uses these defaults:
 | `logging-to-file` | `false` | Reduce the risk of writing prompts, tokens, or upstream errors to disk |
 | `remote-management.allow-remote` | `false` | Disable the remote management surface |
 
+`usage-statistics-enabled` intentionally stays `false`. CLIProxyAPI `v7.2.80`
+exposes request details through `/v0/management/usage-queue`, but that endpoint
+requires the management surface, retains items only briefly, and pops records
+when read. It is useful as an event feed for a dedicated collector, not as the
+source of truth for a persistent personal usage dashboard.
+
+The separate `/v0/management/api-key-usage` endpoint is not a Codex token
+counter: it reports in-memory success/failure counts for upstream `api_key`
+credentials, while Codex normally uses OAuth, and its map keys include the
+upstream key itself. muselab therefore does not query or expose it.
+
 muselab does **not** install or start this sidecar automatically. If you want it
 to start on boot, manage `cli-proxy-api -config ~/.cli-proxy-muselab/config.yaml`
 with systemd, launchd, or another local supervisor. Do not commit Codex OAuth
@@ -153,21 +170,61 @@ The sidecar must implement enough of the Anthropic Messages API for agent use:
 If plain chat works but tools fail, the gateway is chat-only and should not be
 advertised as full muselab agent support.
 
+## Usage and quota reporting
+
+muselab keeps two scopes separate:
+
+- **Gateway-specific traffic:** the existing usage dashboard aggregates the
+  per-message token accounting written by Claude Agent SDK sessions. This is
+  persistent, model-level, and covers only traffic that actually ran through
+  muselab. CLIProxyAPI `v7.2.63+` improves the cache-write/cache-read fields that
+  flow into this accounting.
+- **Codex account-wide usage and limits:** when the usage dashboard opens,
+  `scripts/codex-quota-refresh.py` starts the local Codex app-server and calls
+  the read-only `account/rateLimits/read` and `account/usage/read` JSON-RPC
+  methods. This returns current limit buckets plus daily/lifetime token usage;
+  it does not send a prompt, consume a model turn, or read OAuth files. Older
+  Codex builds fall back to an already-existing local rate-limit log snapshot.
+
+The local Codex CLI and CLIProxyAPI may be authenticated as different accounts.
+For that reason the account card identifies itself as the **local Codex
+account**, and muselab does not claim that it is authoritative for a separately
+configured gateway identity.
+
 ## Context window notes
 
-muselab keeps 372K for the built-in GPT-5.6 aliases and 400K for earlier GPT-5.x
-models as documentation-level fallbacks for Codex Gateway models, but runtime
-context accounting does not treat those numbers as the only source of truth.
-The effective window is resolved in this order:
+CLIProxyAPI `v7.2.80` exposes the active Codex client model catalog at
+`GET /v1/models?client_version`. muselab reads and briefly caches each model's
+`context_window`, `max_context_window`, and optional
+`effective_context_window_percent` instead of assuming Claude CLI's unrelated
+200K default. When the percentage is omitted, muselab follows the Codex client
+default of 95% usable input capacity.
+
+The effective meter/compact window is resolved in this order:
 
 1. explicit env overrides: `MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_6_SOL`,
    `MUSELAB_CONTEXT_LIMIT_CODEX_GPT_5_5`, `CODEX_GATEWAY_CONTEXT_LIMIT`, or
    `MUSELAB_THIRD_PARTY_CONTEXT_LIMIT`;
-2. capability fields exposed by the gateway's `/v1/models` response, such as
-   `max_input_tokens` or `context_window`;
-3. Claude Agent SDK `get_context_usage()` values (`maxTokens` / `rawMaxTokens`);
-4. a conservative fallback (Codex Gateway defaults to a 200K effective window for
-   prevention).
+2. CLIProxyAPI's Codex catalog `context_window` (95% effective by default);
+3. capability fields exposed by older generic `/v1/models` endpoints;
+4. bundled raw-window fallbacks: 372K for GPT-5.6, 272K for GPT-5.5/5.4, and
+   128K for GPT-5.3 Codex Spark, with the same 95% effective ratio.
+
+`max_context_window` is displayed as a configurable ceiling only; it never
+silently inflates the active denominator. When muselab creates a Codex SDK
+client, it also injects the resolved effective value through
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Claude CLI's `/context`, native auto-compact,
+muselab's preflight compact, the breakdown popup, and the bottom ring therefore
+share one denominator.
+
+The bottom ring distinguishes both halves of the measurement:
+
+- completed-turn usage comes from the gateway/provider response and is marked
+  exact; after native `/compact`, before another provider response exists, the
+  live SDK count is explicitly marked as an estimate;
+- the window records whether it came from the gateway catalog, an operator
+  override, the SDK, or a bundled fallback. Only the bundled fallback is marked
+  as estimated.
 
 Before sending a new user message, muselab asks the SDK for current context usage.
 If the session is close to the effective window, it runs Claude Code's native

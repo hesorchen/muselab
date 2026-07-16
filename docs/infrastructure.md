@@ -12,7 +12,7 @@ All automation lives in [`scripts/`](../scripts/). Each script is standalone bas
 
 | Script | Purpose | Key env flags |
 |--------|---------|---------------|
-| [`versions.env`](../scripts/versions.env) | Single source of truth for pinned external tool versions (currently `CLAUDE_CLI_VERSION="2.1.156"`). Sourced by both platform installers; the Dockerfile mirrors the same pin and must be kept in sync manually. | — |
+| [`versions.env`](../scripts/versions.env) | Single source of truth for pinned external tool versions (currently `CLAUDE_CLI_VERSION="2.1.211"`). Sourced by both platform installers; the Dockerfile mirrors the same pin and must be kept in sync manually. | — |
 | [`quick-install.sh`](../scripts/quick-install.sh) | One-line bootstrap (`curl … \| bash`). Refuses root, detects OS, installs `uv` if missing, prompts for clone destination, then hands off to the platform installer via `exec bash` with `/dev/tty` reattached so interactive prompts work in a piped context. | `MUSELAB_NONINTERACTIVE=1` |
 | [`install-linux.sh`](../scripts/install-linux.sh) | Full Linux/WSL2 installer. Five phases: prerequisites → `uv sync --frozen` → write `.env` (random token, port, archive dir) → register systemd user unit → check/warn on linger. Includes a 7-question profile intake that writes `CLAUDE.md` and the archive subdirectory skeleton. | `MUSELAB_NONINTERACTIVE=1`, `MUSELAB_LOCALE=zh\|en`, `MUSELAB_SKIP_SERVICE=1`, `MUSELAB_NO_BROWSER=1` |
 | [`install-macos.sh`](../scripts/install-macos.sh) | Structurally identical to the Linux installer but registers a launchd LaunchAgent instead of a systemd unit. Port conflict detection uses `lsof` rather than `ss`; Node install prefers `brew` before falling back to `fnm`. | same four flags |
@@ -64,7 +64,7 @@ The [`Dockerfile`](../Dockerfile) uses two stages to keep the final image slim:
 
 **Stage 1 — builder** ([`Dockerfile:L8-L23`](../Dockerfile#L8)): `python:3.12-slim` base; copies `uv`/`uvx` from `ghcr.io/astral-sh/uv:0.11.14`; installs only production Python deps via `uv sync --frozen --no-dev --no-install-project` with a BuildKit layer cache at `/root/.cache/uv`.
 
-**Stage 2 — runtime** ([`Dockerfile:L25-L81`](../Dockerfile#L25)): fresh `python:3.12-slim`; installs `curl`, `git`, Node 20 (nodesource), and `@anthropic-ai/claude-code@2.1.156`; copies the pre-built `.venv` from the builder; creates a non-root user `muse` (uid 1000, gid 1000); exposes port 8765; declares a `HEALTHCHECK` against `/api/health` (30s interval, 5s timeout, 15s start period, 3 retries).
+**Stage 2 — runtime** ([`Dockerfile:L25-L81`](../Dockerfile#L25)): fresh `python:3.12-slim`; installs `curl`, `git`, Node 20 (nodesource), and `@anthropic-ai/claude-code@2.1.211`; copies the pre-built `.venv` from the builder; creates a non-root user `muse` (uid 1000, gid 1000); exposes port 8765; declares a `HEALTHCHECK` against `/api/health` (30s interval, 5s timeout, 15s start period, 3 retries).
 
 ### docker-compose.yml
 
@@ -203,7 +203,7 @@ Weekly uv bumps (grouped: `claude-agent-sdk`/`anthropic*` in one PR; `fastapi`/`
 
 | Package | Constraint | Rationale |
 |---------|-----------|-----------|
-| `claude-agent-sdk` | `>=0.2.82,<0.3` | Upper bound is deliberate: muselab maintains assumptions about the SDK's internal tool denylist and JSONL transcript format that are not part of its public contract. An unbounded `>=` would let a minor bump silently break parsing ([`pyproject.toml:L43-L51`](../pyproject.toml#L43)). |
+| `claude-agent-sdk` | `>=0.2.120,<0.3` | Upper bound is deliberate: muselab maintains assumptions about the SDK's internal tool denylist and JSONL transcript format that are not part of its public contract. An unbounded `>=` would let a minor bump silently break parsing ([`pyproject.toml:L43-L51`](../pyproject.toml#L43)). |
 | `starlette` | `>=1.0.1` | Pinned above the fastapi-transitive 1.0.0 to keep pip-audit green (PYSEC-2026-161). |
 | `pyjwt[crypto]` | `>=2.13.0` | Pinned above the mcp-transitive 2.12.1 (PYSEC-2026-175/177/178/179). |
 

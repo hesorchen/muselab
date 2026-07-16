@@ -17,6 +17,7 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, ResultMessage, StreamEvent,
     TextBlock, ToolUseBlock, ToolResultBlock,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
+    TaskUpdatedMessage,
 )
 
 from tests.conftest import TEST_TOKEN
@@ -46,6 +47,21 @@ class _FakeStreamClient:
 
     async def get_context_usage(self):
         return {"maxTokens": 200_000, "totalTokens": 1234}
+
+
+class _FakeBatchedStreamClient(_FakeStreamClient):
+    """One receive_response() batch per call, matching SDK Result boundaries."""
+
+    def __init__(self, batches):
+        super().__init__([])
+        self._batches = list(batches)
+        self.receive_calls = 0
+
+    async def receive_response(self):
+        self.receive_calls += 1
+        batch = self._batches.pop(0) if self._batches else []
+        for m in batch:
+            yield m
 
 
 @pytest.fixture()
@@ -182,6 +198,106 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
+
+
+def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
+        stream_env, client, monkeypatch):
+    """A pooled SDK queue may start with the preceding turn's delayed tail.
+
+    Task lifecycle must still settle the original card, while old UUID-scoped
+    text/tools/Result are discarded and cannot terminate the new query.
+    """
+    chat_mod = stream_env
+    sid = _make_session(client)
+    old_uuids = frozenset({"old-stream", "old-assistant", "old-user", "old-result"})
+    monkeypatch.setattr(
+        chat_mod, "_session_message_uuids", lambda _sid, _model: old_uuids)
+
+    stale_batch = [
+        TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="task-old",
+            status="completed", output_file="/tmp/task-old.output",
+            summary="old task completed", uuid="old-task-notification",
+            session_id=sid, tool_use_id="tu-old"),
+        StreamEvent(uuid="old-stream", session_id=sid, event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "OLD answer"},
+        }),
+        AssistantMessage(
+            content=[
+                TextBlock(text="OLD answer"),
+                ToolUseBlock(id="tu-old", name="Agent", input={
+                    "description": "old subagent", "prompt": "old prompt",
+                    "subagent_type": "general-purpose",
+                }),
+            ],
+            model="claude-sonnet-4-6", uuid="old-assistant"),
+        UserMessage(
+            content=[ToolResultBlock(
+                tool_use_id="tu-old", content="OLD tool result", is_error=False)],
+            uuid="old-user"),
+        ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=90,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=9.99, usage={"input_tokens": 99, "output_tokens": 99},
+            result="OLD answer", uuid="old-result"),
+    ]
+    current_batch = [
+        StreamEvent(uuid="new-stream", session_id=sid, event={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "Current answer"},
+        }),
+        AssistantMessage(
+            content=[TextBlock(text="Current answer")],
+            model="claude-sonnet-4-6", uuid="new-assistant",
+            usage={"input_tokens": 4, "output_tokens": 2}),
+        ResultMessage(
+            subtype="success", duration_ms=200, duration_api_ms=180,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.02, usage={"input_tokens": 4, "output_tokens": 2},
+            result="Current answer", uuid="new-result"),
+    ]
+    fake = _FakeBatchedStreamClient([stale_batch, current_batch])
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=current-question&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    events = _parse_sse(r.text)
+    kinds = [e for e, _ in events]
+
+    assert fake.receive_calls == 2, "stale Result should reopen receive_response"
+    assert kinds.count("task_notification") == 1
+    assert "tool_use" not in kinds
+    assert "tool_result" not in kinds
+    chunks = [json.loads(d)["text"] for e, d in events if e == "text"]
+    assert "".join(chunks) == "Current answer"
+    assert "OLD" not in r.text
+    assert kinds.count("done") == 1
+    done = next(json.loads(d) for e, d in events if e == "done")
+    assert done["total_cost_usd"] == pytest.approx(0.02)
+    assert sid not in chat_mod._active_turns
+
+
+def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env):
+    chat_mod = stream_env
+    boundary = chat_mod._TurnResponseBoundary({"old"})
+    old_result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="sid", uuid="old")
+    lifecycle = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="t", status="completed",
+        output_file="", summary="done", uuid="old", session_id="sid")
+    error_result = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id="sid", uuid=None)
+
+    assert boundary.classify(lifecycle) == "forward"
+    assert boundary.classify(old_result) == "stale_result"
+    assert boundary.classify(error_result) == "current_result"
 
 
 def test_stream_pdf_attachment_persists_path_fallback(stream_env, client, monkeypatch):
@@ -447,6 +563,48 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         assert payload["status"] == "completed"
         assert payload["output_file"] == "/tmp/o.md"
         # All pending settled → pin released, client reclaimable.
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert sid not in chat_mod._task_watchers
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._recent_turns.pop(sid, None)
+
+
+def test_watcher_settles_from_terminal_task_updated_without_notification(stream_env):
+    """SDK 0.2.101+ may report a terminal task only via task_updated."""
+    import asyncio
+
+    chat_mod = stream_env
+    sid = "sid-watch-updated"
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task_killed"}
+    updated = TaskUpdatedMessage(
+        subtype="task_updated",
+        data={},
+        task_id="task_killed",
+        patch={"status": "killed", "summary": "Stopped by user"},
+        status="killed",
+        session_id=sid,
+        uuid="u-updated",
+    )
+    fake_client = _FakeWatchClient([updated])
+
+    async def run():
+        await chat_mod._watch_inflight_tasks(
+            sid, fake_client, {"task_killed": "long command"})
+
+    try:
+        asyncio.run(run())
+        bc = chat_mod._recent_turns.get(sid)
+        assert bc is not None
+        terminal_event = next(
+            event for event in bc.events if event.get("event") == "task_notification"
+        )
+        payload = json.loads(terminal_event["data"])
+        assert payload["task_id"] == "task_killed"
+        assert payload["status"] == "stopped"
+        assert payload["tool_use_id"] is None
         assert sid not in chat_mod._sessions_with_inflight_tasks
         assert sid not in chat_mod._task_watchers
     finally:

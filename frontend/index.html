@@ -1076,7 +1076,15 @@
             <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
           </button>
           <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak>
-            <div class="workspace-picker-title" x-text="lang==='zh' ? '工作目录' : 'Workspaces'"></div>
+            <div class="workspace-picker-title">
+              <span x-text="t('workspace.title')"></span>
+              <button type="button" class="workspace-info-btn"
+                      @click.stop="toast(t('workspace.help'), 'info', 7000)"
+                      :title="t('workspace.help')"
+                      :aria-label="t('workspace.help')">
+                <svg><use href="#i-info"/></svg>
+              </button>
+            </div>
             <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
               <div class="workspace-picker-row" :class="{ active: workspace.path === currentWorkspacePath() }">
                 <button class="workspace-picker-select" @click="switchWorkspace(workspace.path)">
@@ -1093,13 +1101,6 @@
             <button class="workspace-picker-add" @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span></button>
           </div>
         </div>
-        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
-                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
-                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
-          <svg><use href="#i-list"/></svg>
-          <span class="activity-running" x-show="activity.summary.running" x-text="activity.summary.running"></span>
-          <span class="activity-unread" x-show="activity.summary.unread" x-text="activity.summary.unread > 99 ? '99+' : activity.summary.unread"></span>
-        </button>
         <span class="spacer"></span>
         <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
              by default, so the "present" state is implicit). When missing,
@@ -1111,6 +1112,14 @@
           <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
           <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
         </span>
+        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
+                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
+                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
+          <svg><use href="#i-list"/></svg>
+          <!-- Two compact state dots: blue = running, green = finished but unread. -->
+          <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
+          <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
+        </button>
         <!-- Skills + MCP drawer toggles. 2026-05-29: 从 chat-input 底 bar 移到
              顶 bar，与其它「能力 / 会话」入口（整理档案、定时任务、命令面板）
              并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
@@ -1225,7 +1234,7 @@
            x-transition.opacity
            class="ctx-breakdown-pop">
         <div class="ctx-breakdown-head">
-          <span x-text="lang==='zh' ? 'Context 拆分（SDK 真值）' : 'Context breakdown'"></span>
+          <span x-text="lang==='zh' ? 'Context 拆分（SDK）' : 'Context breakdown (SDK)'"></span>
           <button class="icon-btn sm"
                   :title="lang==='zh' ? '关闭' : 'Close'"
                   @click="ctxBreakdown.show = false">×</button>
@@ -1238,6 +1247,8 @@
           <div class="ctx-breakdown-body">
             <div class="ctx-breakdown-summary"
                  x-text="((ctxBreakdown.data.totalTokens||0)/1000).toFixed(1) + 'K / ' + ((ctxBreakdown.data.maxTokens||0)/1000).toFixed(0) + 'K (' + (ctxBreakdown.data.percentage||0).toFixed(1) + '%)'"></div>
+            <div class="ctx-breakdown-summary"
+                 x-text="ctxBreakdownAccuracyLabel()"></div>
             <!-- Stacked bar — shows each category as a colored segment so the
                  user can eyeball "where did 50K go" at a glance. -->
             <div class="ctx-breakdown-stack">
@@ -3835,10 +3846,13 @@
           </template>
           <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at">
             <div class="codex-quota-head">
-              <div>
+              <div class="codex-quota-title-group">
                 <div class="cost-block-title" x-text="t('set.cost.codex_quota')"></div>
-                <div class="settings-hint"
-                     x-text="t('set.cost.codex_quota_hint') + (codexLimitUpdatedText() ? ' · ' + codexLimitUpdatedText() : '')"></div>
+                <div class="codex-quota-source-row">
+                  <span x-text="t('set.cost.codex_quota_source')"></span>
+                  <span x-show="codexLimitUpdatedText()"
+                        x-text="t('set.cost.updated', { t: codexLimitUpdatedText() })"></span>
+                </div>
               </div>
               <span class="settings-badge ok"
                     x-show="codexLimit.plan_type"
@@ -3849,17 +3863,39 @@
                 <div class="codex-quota-window"
                      :class="{ warn: w.used_percent >= 75 && w.used_percent < 90,
                                crit: w.used_percent >= 90 || w.status === 'rejected' }">
-                  <div class="codex-quota-label" x-text="rateLimitWindowLabel(w.rate_limit_type) || w.key"></div>
-                  <div class="codex-quota-value"
-                       x-text="(w.remaining_percent ?? '—') + '%'"></div>
-                  <div class="codex-quota-sub"
-                       x-text="t('set.cost.remaining') + ' · ' + t('set.cost.used') + ' ' + (w.used_percent ?? '—') + '%'"></div>
-                  <div class="codex-quota-reset"
-                       x-show="w.resets_at"
-                       x-text="t('rl.resets', { t: rateLimitResetText(w.resets_at) })"></div>
+                  <div class="codex-quota-label" x-text="codexWindowLabel(w)"></div>
+                  <div class="codex-quota-metric">
+                    <span class="codex-quota-value"
+                          x-text="w.remaining_percent == null ? '—' : w.remaining_percent + '%'"></span>
+                    <span class="codex-quota-metric-label" x-text="t('set.cost.remaining')"></span>
+                  </div>
+                  <div class="codex-quota-track" role="progressbar"
+                       :aria-label="codexWindowLabel(w)"
+                       aria-valuemin="0" aria-valuemax="100"
+                       :aria-valuenow="w.remaining_percent == null ? null : w.remaining_percent">
+                    <div class="codex-quota-fill"
+                         :style="`width: ${w.remaining_percent ?? 0}%`"></div>
+                  </div>
+                  <div class="codex-quota-meta">
+                    <span x-text="w.used_percent === 0
+                                   ? t('set.cost.unused')
+                                   : t('set.cost.used_value', { n: w.used_percent ?? '—' })"></span>
+                    <span x-show="w.resets_at"
+                          x-text="t('rl.resets', { t: rateLimitResetText(w.resets_at) })"></span>
+                  </div>
                 </div>
               </template>
             </div>
+            <div class="codex-account-stats" x-show="codexAccountStats().length">
+              <template x-for="stat in codexAccountStats()" :key="stat.key">
+                <div class="codex-account-stat">
+                  <span class="codex-account-stat-label" x-text="stat.label"></span>
+                  <strong x-text="stat.value"></strong>
+                </div>
+              </template>
+            </div>
+            <div class="codex-quota-footnote"
+                 x-text="t('set.cost.codex_quota_footnote')"></div>
           </div>
           <template x-if="codexLimit && !codexLimit.updated_at">
             <div class="settings-hint" x-text="t('set.cost.codex_quota_empty')"></div>
@@ -4669,7 +4705,7 @@
           <section class="activity-group" x-show="activityEvents(group).length">
             <h3 x-text="group.label"></h3>
             <template x-for="item in activityEvents(group)" :key="item.id">
-              <button class="activity-row" @click="openActivityEvent(item)" :class="[item.state, {'is-unread': item.needs_attention && !item.read}]">
+              <button class="activity-row" @click="openActivityEvent(item)" :class="item.state + ((item.needs_attention && !item.read) ? ' is-unread' : '')">
                 <span class="activity-state-dot"></span>
                 <span class="activity-row-main">
                   <strong x-text="item.task_summary || item.session_name"></strong>

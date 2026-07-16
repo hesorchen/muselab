@@ -12,7 +12,7 @@
 
 | 脚本 | 用途 | 关键环境变量 |
 |------|------|------------|
-| [`versions.env`](../scripts/versions.env) | 固定外部工具版本的唯一真相源（当前为 `CLAUDE_CLI_VERSION="2.1.156"`）。由两个平台安装脚本引用；Dockerfile 中镜像同一版本号，需手动保持同步。| — |
+| [`versions.env`](../scripts/versions.env) | 固定外部工具版本的唯一真相源（当前为 `CLAUDE_CLI_VERSION="2.1.211"`）。由两个平台安装脚本引用；Dockerfile 中镜像同一版本号，需手动保持同步。| — |
 | [`quick-install.sh`](../scripts/quick-install.sh) | 一行引导脚本（`curl … \| bash`）。拒绝 root 执行，检测 OS，若缺少 `uv` 则安装，提示克隆目标目录，然后通过 `exec bash` 并重新挂载 `/dev/tty` 移交给平台安装脚本，保证管道环境下交互式提示正常工作。| `MUSELAB_NONINTERACTIVE=1` |
 | [`install-linux.sh`](../scripts/install-linux.sh) | 完整的 Linux/WSL2 安装脚本。五个阶段：前置检查 → `uv sync --frozen` → 写入 `.env`（随机 token、端口、归档目录）→ 注册 systemd 用户单元 → 检查/提示 linger。包含 7 个问题的档案配置向导，负责写入 `CLAUDE.md` 与归档子目录骨架。| `MUSELAB_NONINTERACTIVE=1`、`MUSELAB_LOCALE=zh\|en`、`MUSELAB_SKIP_SERVICE=1`、`MUSELAB_NO_BROWSER=1` |
 | [`install-macos.sh`](../scripts/install-macos.sh) | 结构上与 Linux 安装脚本相同，但注册的是 launchd LaunchAgent 而非 systemd 单元。端口冲突检测使用 `lsof` 而非 `ss`；Node 安装优先用 `brew`，失败则回退到 `fnm`。| 同上四个变量 |
@@ -64,7 +64,7 @@ tail -f ~/Library/Logs/muselab/stderr.log
 
 **阶段 1 —— 构建器**（[`Dockerfile:L8-L23`](../Dockerfile#L8)）：基础镜像 `python:3.12-slim`；从 `ghcr.io/astral-sh/uv:0.11.14` 复制 `uv`/`uvx`；通过 `uv sync --frozen --no-dev --no-install-project` 仅安装生产 Python 依赖，BuildKit 层缓存挂载于 `/root/.cache/uv`。
 
-**阶段 2 —— 运行时**（[`Dockerfile:L25-L81`](../Dockerfile#L25)）：全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20（nodesource）与 `@anthropic-ai/claude-code@2.1.156`；从构建器复制预构建的 `.venv`；创建非 root 用户 `muse`（uid 1000，gid 1000）；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`（间隔 30s，超时 5s，启动等待 15s，重试 3 次）。
+**阶段 2 —— 运行时**（[`Dockerfile:L25-L81`](../Dockerfile#L25)）：全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20（nodesource）与 `@anthropic-ai/claude-code@2.1.211`；从构建器复制预构建的 `.venv`；创建非 root 用户 `muse`（uid 1000，gid 1000）；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`（间隔 30s，超时 5s，启动等待 15s，重试 3 次）。
 
 ### docker-compose.yml
 
@@ -203,7 +203,7 @@ CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、
 
 | 包 | 约束 | 原因 |
 |----|------|------|
-| `claude-agent-sdk` | `>=0.2.82,<0.3` | 设置上限是刻意为之：muselab 依赖 SDK 内部工具拒绝列表与 JSONL 转录格式的特定假设，这些不在其公开合同范围内。无上限的 `>=` 可能让一次小版本升级悄悄破坏解析逻辑（[`pyproject.toml:L43-L51`](../pyproject.toml#L43)）。|
+| `claude-agent-sdk` | `>=0.2.120,<0.3` | 设置上限是刻意为之：muselab 依赖 SDK 内部工具拒绝列表与 JSONL 转录格式的特定假设，这些不在其公开合同范围内。无上限的 `>=` 可能让一次小版本升级悄悄破坏解析逻辑（[`pyproject.toml:L43-L51`](../pyproject.toml#L43)）。|
 | `starlette` | `>=1.0.1` | 固定在 fastapi 传递依赖 1.0.0 之上，以保持 pip-audit 通过（PYSEC-2026-161）。|
 | `pyjwt[crypto]` | `>=2.13.0` | 固定在 mcp 传递依赖 2.12.1 之上（PYSEC-2026-175/177/178/179）。|
 

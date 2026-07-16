@@ -21,6 +21,9 @@ api-keys:
 debug: false
 logging-to-file: false
 commercial-mode: false
+# muselab already persists gateway-specific token usage from Claude Agent SDK
+# transcripts. Keep CLIProxyAPI's short-lived, destructive-read usage queue off
+# unless another local collector is actively draining /v0/management/usage-queue.
 usage-statistics-enabled: false
 
 # Keep muselab close to the direct Codex app/CLI experience: do not let the

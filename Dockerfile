@@ -39,7 +39,7 @@ RUN apt-get update && \
     # claude-code pin — keep in lockstep with CLAUDE_CLI_VERSION in
     # scripts/versions.env (the native installers read it from there).
     npm install -g \
-        @anthropic-ai/claude-code@2.1.156 && \
+        @anthropic-ai/claude-code@2.1.211 && \
     apt-get purge -y --auto-remove gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /root/.npm /tmp/*
