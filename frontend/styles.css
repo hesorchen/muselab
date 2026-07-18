@@ -3166,6 +3166,18 @@ pre.text {
   flex-direction: column;
   gap: var(--sp-2);
 }
+.load-later-wrap {
+  display: flex;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding-block: var(--sp-2);
+}
+.load-later-wrap .latest { font-weight: 600; }
+.stream-plain {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
 .msg {
   display: flex;
   flex-direction: column;

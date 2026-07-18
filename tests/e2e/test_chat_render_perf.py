@@ -165,6 +165,7 @@ def _route_windowed_session(page: Page, sid: str, messages: list[dict]) -> list[
                 "offset": offset,
                 "total": total,
                 "has_more": offset > 0,
+                "history_generation": "gen-e2e-1",
             }),
         )
 
@@ -270,7 +271,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
           model: "e2e-model", permission: "bypassPermissions", thinking: true,
         }));
         app.openTabIds = sessionIds.slice();
-        app._MAX_RESIDENT_PANES = 4;
+        app._MAX_RESIDENT_PANES = 2;
         app._residentTabIds = sessionIds.slice(0, 4);
         app.tabState = {};
         for (const [idx, id] of sessionIds.entries()) {
@@ -288,6 +289,8 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             });
           }
           app.tabState[id] = st;
+          app._ensureTabState(id);
+          app._capLiveMessages(st);
         }
         app.currentId = sessionIds[0];
         app.messagesReady = true;
@@ -304,7 +307,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         """() => {
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
-          return panes.length === 1 && panes[0].querySelectorAll(".msg").length === 90;
+          return panes.length === 1 && panes[0].querySelectorAll(".msg").length === 60;
         }""",
         timeout=5000,
     )
@@ -329,7 +332,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
-                    && p.querySelectorAll(".msg").length === 90);
+                    && p.querySelectorAll(".msg").length === 60);
                 }""",
                 arg=expected_tail,
                 timeout=5000,
@@ -352,10 +355,10 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             )
             raise AssertionError(f"target tail not visible: {expected_tail}; diag={diag}") from exc
         snap = _visible_pane_with_text_snapshot(page, expected_tail)
-        assert snap["msgCount"] == 90
+        assert snap["msgCount"] <= 60
         assert expected_tail in snap["text"]
-        assert page.locator(".msg-pane").count() <= 4
-        assert _app_eval(page, "return app.residentPaneIds().length;") <= 4
+        assert page.locator(".msg-pane").count() <= 1
+        assert _app_eval(page, "return app.residentPaneIds().length;") <= 1
 
     _assert_no_browser_errors(page, errors)
 
@@ -391,6 +394,7 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         return {
           messages: st.messages.length,
           earlier: st._earlierMessages.length,
+          later: st._laterMessages.length,
           loadedOffset: st._loadedOffset,
           total: st._total,
           hasMore: st._hasMoreHistory,
@@ -402,26 +406,25 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         sid,
     )
     assert requests and requests[0]["tail"] == 75
-    assert state["messages"] < 75
-    assert state["messages"] <= 75
+    assert state["messages"] <= 60
     assert state["loadedOffset"] == 105
     assert state["total"] == 180
     assert state["hasMore"] is True
-    assert state["resident"] <= 4
+    assert state["resident"] <= 1
     assert "WINDOW_MSG_179" in state["bodyText"]
     assert "WINDOW_MSG_000" not in state["bodyText"]
-    assert page.locator(".msg-pane").count() <= 4
+    assert page.locator(".msg-pane").count() <= 1
     assert page.locator(".msg-pane:visible .msg").count() <= 75
 
-    # Drain the tail-local stash, then force the server-backed older window.
-    # Mobile intentionally uses a smaller load-more batch to keep each tap
-    # responsive, so avoid coupling this regression check to an exact tap count.
-    for _ in range(10):
+    # Traverse all the way through a history larger than the memory cap. The
+    # window must slide backward (evicting far-future bubbles) until message 0
+    # is mounted; the old implementation stopped forever at the first cap.
+    for _ in range(24):
         _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
         page.wait_for_timeout(50)
         if _app_eval(
             page,
-            """return app.messages.some(m => (m.text || "").includes("WINDOW_MSG_100"));""",
+            """return app.messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));""",
         ):
             break
 
@@ -429,7 +432,7 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
           return app.messagesReady === true
-            && app.messages.some(m => (m.text || "").includes("WINDOW_MSG_100"));
+            && app.messages.some(m => (m.text || "").includes("WINDOW_MSG_000"));
         }""",
         timeout=10000,
     )
@@ -440,9 +443,12 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         return {
           messages: st.messages.length,
           earlier: st._earlierMessages.length,
+          later: st._laterMessages.length,
           loadedOffset: st._loadedOffset,
           total: st._total,
           hasMore: st._hasMoreHistory,
+          hasServerLater: st._hasServerLater,
+          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
           ready: app.messagesReady,
           visibleText: Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none")
@@ -452,30 +458,269 @@ def test_mobile_windowed_load_session_pages_older_history(page: Page, backend_ur
         """,
         sid,
     )
-    assert any(req["offset"] == 0 and req["limit"] == 105 for req in requests), requests
+    assert any(req["offset"] == 0 for req in requests), requests
+    assert any("history_generation=gen-e2e-1" in req["url"] for req in requests[1:]), requests
     assert final_state["loadedOffset"] == 0
     assert final_state["total"] == 180
     assert final_state["ready"] is True
     assert final_state["bodyHeight"] > 100
-    assert "WINDOW_MSG_100" in final_state["visibleText"]
+    assert "WINDOW_MSG_000" in final_state["visibleText"]
+    assert final_state["messages"] <= 60
+    assert final_state["cached"] <= 120
+    assert final_state["later"] > 0
+    assert final_state["hasServerLater"] is True
     latest_after_load_earlier = _app_eval(
         page,
         """
+        const st = app._ensureTabState(arg);
         return {
-          latestInMessages: app.messages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
+          latestInMessages: st.messages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
+          latestInLater: st._laterMessages.some(m => (m.text || "").includes("WINDOW_MSG_179")),
           latestInDom: document.querySelector(".chat-body")?.textContent.includes("WINDOW_MSG_179"),
-          ready: app.messagesReady,
+          hasServerLater: st._hasServerLater,
+          ready: st.messagesReady,
         };
         """,
+        sid,
     )
     assert latest_after_load_earlier == {
-        "latestInMessages": True,
-        "latestInDom": True,
+        "latestInMessages": False,
+        "latestInLater": False,
+        "latestInDom": False,
+        "hasServerLater": True,
         "ready": True,
     }
-    assert page.locator(".msg-pane").count() <= 4
-    assert page.locator(".msg-pane:visible .msg").count() <= 100
+    _app_eval(page, "app.returnToLatest(arg); return true;", sid)
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll('.msg-pane'))
+          .filter(p => getComputedStyle(p).display !== 'none')
+          .some(p => p.textContent.includes('WINDOW_MSG_179'))""",
+        timeout=5000,
+    )
+    assert _app_eval(page, "return app._ensureTabState(arg)._laterMessages.length;", sid) == 0
+    assert page.locator(".msg-pane").count() <= 1
+    assert page.locator(".msg-pane:visible .msg").count() <= 60
 
+    _assert_no_browser_errors(page, errors)
+
+
+def test_outline_around_conflict_retries_and_returns_to_real_tail(
+    page: Page, backend_url, auth_token,
+):
+    """A stale outline generation retries its target and preserves full order."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    sid = "perf-around-conflict"
+    target_uuid = "around-target"
+    calls: list[dict] = []
+    around_messages = _make_mixed_messages(85, "AROUND_MSG")
+    around_messages[70] = {
+        "role": "user",
+        "text": "AROUND_TARGET_VISIBLE",
+        "uuid": target_uuid,
+        "ts": 1_700_020_070,
+    }
+    latest_messages = _make_mixed_messages(75, "LATEST_MSG")
+    latest_messages[-1] = {
+        "role": "assistant",
+        "text": "CANONICAL_LATEST_VISIBLE",
+        "html": "<p>CANONICAL_LATEST_VISIBLE</p>",
+        "uuid": "canonical-latest",
+        "ts": 1_700_030_000,
+    }
+
+    def handle(route):
+        qs = parse_qs(urlparse(route.request.url).query)
+        calls.append({key: values[0] for key, values in qs.items()})
+        if "around_uuid" in qs and qs.get("history_generation") == ["gen-old"]:
+            route.fulfill(
+                status=409,
+                content_type="application/json",
+                body=json.dumps({
+                    "detail": {
+                        "error": "history_generation_mismatch",
+                        "history_generation": "gen-new",
+                    },
+                }),
+            )
+            return
+        if "around_uuid" in qs:
+            route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({
+                    "id": sid,
+                    "messages": around_messages,
+                    "offset": 200,
+                    "total": 500,
+                    "has_more": True,
+                    "has_later": True,
+                    "history_generation": "gen-new",
+                    "history_order": "full",
+                }),
+            )
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Perf around conflict",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "messages": latest_messages,
+                "offset": 425,
+                "total": 500,
+                "has_more": True,
+                "has_later": False,
+                "history_generation": "gen-new",
+                "history_order": "normal",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", handle)
+    _login(page, backend_url, auth_token)
+    _bootstrap_session_for_real_load(page, sid, "Perf around conflict")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st.historyGeneration = "gen-old";
+        st._loaded = true;
+        st.messagesReady = true;
+        return true;
+        """,
+        sid,
+    )
+
+    loaded = _app_eval(
+        page,
+        "return app._loadAroundMessage(arg.sid, arg.uuid);",
+        {"sid": sid, "uuid": target_uuid},
+    )
+    assert loaded is True
+    page.wait_for_function(
+        """uuid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          return st.messages.some(m => m.uuid === uuid)
+            && document.querySelector(`.msg[data-uuid="${CSS.escape(uuid)}"]`);
+        }""",
+        arg=target_uuid,
+        timeout=10000,
+    )
+    around_state = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return {
+          mounted: st.messages.length,
+          earlier: st._earlierMessages.length,
+          later: st._laterMessages.length,
+          targetMounted: st.messages.some(m => m.uuid === "around-target"),
+          order: st._historyOrder,
+          hasServerLater: st._hasServerLater,
+        };
+        """,
+        sid,
+    )
+    assert around_state["mounted"] <= 60
+    assert around_state["targetMounted"] is True
+    assert around_state["order"] == "full"
+    assert around_state["hasServerLater"] is True
+    assert len([call for call in calls if "around_uuid" in call]) == 2
+    assert len([call for call in calls if "tail" in call]) == 1
+
+    returned = _app_eval(page, "return app.returnToLatest(arg);", sid)
+    assert returned is True
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          return st._historyOrder === 'normal' && !st._hasServerLater
+            && st.messages.some(m => (m.text || '').includes('CANONICAL_LATEST_VISIBLE'));
+        }""",
+        timeout=10000,
+    )
+    assert len([call for call in calls if "tail" in call]) == 2
+    assert page.locator(".msg-pane:visible .msg").count() <= 60
+    _assert_no_browser_errors(page, errors)
+
+
+def test_bidirectional_cap_preserves_keyed_scroll_anchor(
+    page: Page, backend_url, auth_token,
+):
+    """Top/bottom eviction must not move the surviving reading anchor."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    sid = _app_eval(page, "return app.currentId;")
+    _app_eval(
+        page,
+        """
+        const sid = arg;
+        const st = app._ensureTabState(sid);
+        const make = (prefix, i) => ({
+          role: "assistant", uuid: `${prefix}-uuid-${i}`,
+          _k: `${prefix}-key-${i}`, _noAnim: true,
+          text: `${prefix}-${i} ` + "variable height ".repeat(8 + (i % 5) * 8),
+          html: `<p>${prefix}-${i} ${"variable height ".repeat(8 + (i % 5) * 8)}</p>`,
+        });
+        st.messages.splice(0, st.messages.length,
+          ...Array.from({ length: 60 }, (_, i) => make("mounted", i)));
+        st._earlierMessages = Array.from({ length: 10 }, (_, i) => make("older", i));
+        st._laterMessages = [];
+        st._loadedOffset = 0;
+        st._total = 70;
+        st._hasServerLater = false;
+        st.messagesReady = true;
+        st.messagesLoading = false;
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app._activateTabState(sid);
+        app._promoteResident(sid);
+        app.mobileTab = "chat";
+        return true;
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll('.msg-pane'))
+          .filter(p => getComputedStyle(p).display !== 'none')
+          .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0) === 60""",
+        timeout=10000,
+    )
+    page.evaluate(
+        """() => {
+          const body = document.querySelector('.chat-body');
+          body.scrollTop = Math.min(500, body.scrollHeight - body.clientHeight);
+        }"""
+    )
+    before_older = page.evaluate(
+        """() => document.querySelector(
+          '.msg[data-message-key="mounted-key-0"]').getBoundingClientRect().top"""
+    )
+    _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
+    page.wait_for_timeout(100)
+    after_older = page.evaluate(
+        """() => document.querySelector(
+          '.msg[data-message-key="mounted-key-0"]').getBoundingClientRect().top"""
+    )
+    assert abs(after_older - before_older) < 2
+
+    before_newer = page.evaluate(
+        """() => document.querySelector(
+          '.msg[data-message-key="mounted-key-49"]').getBoundingClientRect().top"""
+    )
+    _app_eval(page, "return app.loadLaterMessages(arg);", sid)
+    page.wait_for_timeout(100)
+    after_newer = page.evaluate(
+        """() => document.querySelector(
+          '.msg[data-message-key="mounted-key-49"]').getBoundingClientRect().top"""
+    )
+    assert abs(after_newer - before_newer) < 2
+    assert page.locator(".msg-pane:visible .msg").count() == 60
     _assert_no_browser_errors(page, errors)
 
 
@@ -767,7 +1012,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
         assert 0 < box["right"] <= layout["viewport"]["width"]
     assert layout["input"]["bottom"] <= layout["toolbar"]["top"] + 2
     assert layout["latest"]["height"] > 0
-    assert page.locator(".msg-pane").count() <= 4
+    assert page.locator(".msg-pane").count() <= 1
     assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
 
     _assert_no_browser_errors(page, errors)
@@ -890,6 +1135,17 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend
         return true;
         """,
     )
+    page.evaluate(
+        """() => {
+          window.__longTasks = [];
+          if (window.PerformanceObserver && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+            window.__longTaskObserver = new PerformanceObserver(list => {
+              for (const e of list.getEntries()) window.__longTasks.push(e.duration);
+            });
+            window.__longTaskObserver.observe({ type: 'longtask', buffered: true });
+          }
+        }"""
+    )
     _app_eval(page, "app.send(); return true;")
     page.wait_for_function("() => window.__fakeStreams && window.__fakeStreams.length === 1")
 
@@ -979,11 +1235,22 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend
             text: "todos updated", truncated: false, is_error: false,
           });
           window.__emitSse("text", { text: finalText });
-          window.__emitSse("done", {
-            total_cost_usd: 0.001,
-            session_usage: { context_used_pct: 10, context_used: 1000, context_limit: 100000 },
-          });
         }"""
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const last = app.messages[app.messages.length - 1];
+          return app.streaming === true && last && last._streamPlain === true
+            && last.text.includes('FINAL_ASSISTANT_HTML_COMPLETE');
+        }""",
+        timeout=10000,
+    )
+    page.evaluate(
+        """() => window.__emitSse("done", {
+          total_cost_usd: 0.001,
+          session_usage: { context_used_pct: 10, context_used: 1000, context_limit: 100000 },
+        })"""
     )
 
     page.wait_for_function(
@@ -1013,8 +1280,29 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend
           && roles.includes("tool_result")
           && last.role === "assistant"
           && last.text.length >= 120000
-          && last.html.length > 0;
+          && last.html.length > 0
+          && !last._streamPlain;
         """,
     )
+    render_stats = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        return {
+          rich: st._streamRichRenderCount,
+          plain: st._streamPlainRenderCount,
+          mounted: Array.from(document.querySelectorAll('.msg-pane'))
+            .filter(p => getComputedStyle(p).display !== 'none')
+            .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0),
+          cached: st.messages.length + st._earlierMessages.length + st._laterMessages.length,
+        };
+        """,
+    )
+    assert render_stats["plain"] >= 1
+    assert render_stats["rich"] <= 8
+    assert render_stats["mounted"] <= 60
+    assert render_stats["cached"] <= 120
+    long_tasks = page.evaluate("() => window.__longTasks || []")
+    assert max(long_tasks or [0]) < 2000, long_tasks
 
     _assert_no_browser_errors(page, errors)

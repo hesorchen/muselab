@@ -781,6 +781,12 @@ def test_classify_stream_error_buckets():
         ("Request timed out", "network", "retry", True),
         ("thinking signature missing", "cross_vendor", "compact_or_fork", True),
         ("Session ID already in use", "session", "retry", True),
+        ("Your input exceeds the context window of this model", "context_window",
+         "compact_or_fork", False),
+        ("maximum context length exceeded", "context_window", "compact_or_fork", False),
+        ("502 unknown provider for model claude-opus-4-8", "model_route",
+         "switch_model", False),
+        ("HTTP 502 upstream temporarily unavailable", "unknown", "retry", True),
         ("something weird", "unknown", "retry", True),
     ]
     for msg, expected_kind, expected_cta, expected_retry in cases:

@@ -588,6 +588,12 @@ def delete_session(sid: str) -> bool:
             p.unlink()
         except OSError:
             pass
+    transcript_index = SESS_DIR / f"{sid}.transcript-index.json"
+    if transcript_index.exists():
+        try:
+            transcript_index.unlink()
+        except OSError:
+            pass
     q = _queue_path(sid)
     if q.exists():
         try:
@@ -661,6 +667,12 @@ def prune_empty_sessions(keep_ids: tuple | list = ()) -> list[str]:
         if q.exists():
             try:
                 q.unlink()
+            except OSError:
+                pass
+        transcript_index = SESS_DIR / f"{sid}.transcript-index.json"
+        if transcript_index.exists():
+            try:
+                transcript_index.unlink()
             except OSError:
                 pass
         try:
@@ -1132,6 +1144,21 @@ def set_queue_paused(sid: str, paused: bool) -> dict:
         data = _load_queue(sid)
         data["paused"] = bool(paused)
         _save_queue(sid, data)
+        return data
+
+
+def pause_queue_if_nonempty(sid: str) -> dict:
+    """Atomically pause ``sid`` only when queued work still exists.
+
+    The interrupt path uses this before asking the SDK to stop. Sharing the
+    queue lock with ``dequeue_message`` closes the race where turn completion
+    could otherwise pop the next item between a separate get/pause pair.
+    """
+    with _QUEUE_LOCK:
+        data = _load_queue(sid)
+        if data["items"] and not data.get("paused"):
+            data["paused"] = True
+            _save_queue(sid, data)
         return data
 
 
