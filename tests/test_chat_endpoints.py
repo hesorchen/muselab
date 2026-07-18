@@ -4,7 +4,12 @@ These hit the FastAPI routes through TestClient with the pool pre-seeded
 with fake clients, so the route logic (3-tuple key handling, disconnect
 fan-out, response shape) runs for real without spawning a CLI.
 """
+import asyncio
+import os
+from types import SimpleNamespace
+
 import pytest
+from claude_agent_sdk import ResultMessage
 
 from tests.conftest import TEST_TOKEN
 
@@ -141,7 +146,58 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     assert "sid-boom" in chat_mod._pending_interrupts
 
 
+def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
+    """The current turn may finish while interrupt() awaits the SDK. Queue
+    state must already be paused then, otherwise its finally block can dequeue
+    and start the next turn after the user pressed Stop."""
+    from backend import sessions as sess
+
+    sid = "sid-queued-stop"
+    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", ""))
+    sess.enqueue_message(sid, "do not auto-run")
+    observed = []
+
+    async def inspect_interrupt():
+        observed.append(sess.get_queue(sid))
+        c.interrupted = True
+
+    c.interrupt = inspect_interrupt
+    response = client.post(
+        f"/api/chat/interrupt?session_id={sid}&token={TEST_TOKEN}")
+
+    assert response.status_code == 200, response.text
+    assert observed and observed[0]["paused"] is True
+    assert observed[0]["items"][0]["text"] == "do not auto-run"
+
+
 # ====== force-stop watchdog (interrupt that the SDK refuses to honor) ======
+
+@pytest.mark.asyncio
+async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
+    sid = "sid-delete-continuation"
+    watcher = asyncio.create_task(asyncio.sleep(60))
+    pump = asyncio.create_task(asyncio.sleep(60))
+    broadcast = chat_mod.TurnBroadcast(sid)
+    broadcast.task = pump
+    chat_mod._task_watchers[sid] = watcher
+    chat_mod._continuation_generations[sid] = 3
+    chat_mod._active_turns[sid] = broadcast
+    chat_mod._recent_turns[sid] = broadcast
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    chat_mod._bg_task_descriptions["task-1"] = "background work"
+
+    chat_mod._clear_session_runtime_state(sid)
+    await asyncio.gather(watcher, pump, return_exceptions=True)
+
+    assert chat_mod._continuation_generations[sid] == 4
+    assert sid not in chat_mod._task_watchers
+    assert sid not in chat_mod._active_turns
+    assert sid not in chat_mod._recent_turns
+    assert sid not in chat_mod._sessions_with_inflight_tasks
+    assert "task-1" not in chat_mod._bg_task_descriptions
+    assert broadcast.cancelled is True
+    assert broadcast.done is True
+
 
 @pytest.mark.asyncio
 async def test_force_stop_tears_down_stuck_turn(chat_mod):
@@ -248,3 +304,116 @@ def test_probe_hits_vendor_endpoint_with_fake_httpx(client, auth, monkeypatch, c
     # The request carried the api key header + ping body.
     assert posted["headers"]["x-api-key"] == "sk-deepseek-abcd1234efgh5678"
     assert posted["json"]["messages"][0]["content"] == "ping"
+
+
+class _FakeCompactClient:
+    def __init__(self, result, totals=(190_000, 190_000)):
+        self.result = result
+        self.totals = iter(totals)
+        self.queries = []
+        self.restored_permission = None
+
+    async def query(self, prompt):
+        self.queries.append(prompt)
+
+    async def receive_response(self):
+        yield self.result
+
+    async def get_context_usage(self):
+        return {"totalTokens": next(self.totals), "maxTokens": 200_000}
+
+    async def set_permission_mode(self, permission):
+        self.restored_permission = permission
+
+
+def _make_compact_session(client):
+    r = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "compact endpoint", "model": "claude-sonnet-4-6"},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypatch):
+    sid = _make_compact_session(client)
+    result = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    fake = _FakeCompactClient(result, totals=(190_000,))
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    key = (sid, "claude-sonnet-4-6", "")
+    chat_mod._client_permission[key] = "default"
+
+    r = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert r.status_code == 409, r.text
+    assert "context window" in r.json()["detail"]
+    assert fake.queries == ["/compact"]
+    assert fake.restored_permission == "default"
+
+
+def test_vendor_fork_uses_vendor_session_store_and_restores_env(
+    chat_mod, client, monkeypatch, tmp_path,
+):
+    from backend import endpoints
+
+    r = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "vendor fork", "model": "codex:gpt-5.6-sol"},
+    )
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+    # Test fixture availability filtering can canonicalize the requested model
+    # to Claude; pin the metadata to the vendor model this regression targets.
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    vendor_dir = tmp_path / "vendor-config"
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", vendor_dir)
+    observed = {}
+
+    def fake_fork(*_args, **_kwargs):
+        observed["config_dir"] = os.environ.get("CLAUDE_CONFIG_DIR")
+        return SimpleNamespace(session_id="11111111-2222-4333-8444-555555555555")
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "original-config")
+    response = client.post(
+        f"/api/chat/sessions/{sid}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"title": "vendor recovery"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert observed["config_dir"] == str(vendor_dir)
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "original-config"
+
+
+def test_native_compact_rejects_success_without_token_drop(chat_mod, client, monkeypatch):
+    sid = _make_compact_session(client)
+    result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=sid,
+    )
+    fake = _FakeCompactClient(result, totals=(190_000, 190_000))
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert r.status_code == 500, r.text
+    assert "did not decrease" in r.json()["detail"]

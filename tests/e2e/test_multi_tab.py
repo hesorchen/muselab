@@ -31,6 +31,20 @@ SEL_TAB_CLOSE = ".chat-tab-close"
 SEL_TAB_NEW = ".chat-tab-new"
 
 
+def _activate_chat_tab(page: Page, sid: str) -> None:
+    page.evaluate(
+        """async ([target]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.activateTab(target);
+        }""",
+        arg=[sid],
+    )
+    page.wait_for_function(
+        "([target]) => document.querySelector('#app')._x_dataStack[0].currentId === target",
+        arg=[sid],
+    )
+
+
 def _login(page: Page, base: str, token: str) -> None:
     page.goto(base)
     # Wait for either the login screen or (if a token is already stored)
@@ -62,8 +76,10 @@ def test_new_and_switch_and_close_tabs(page: Page, backend_url, auth_token):
     expect(page.locator(SEL_TAB)).to_have_count(initial + 2)
 
     # Switch to the first tab.
-    page.locator(SEL_TAB).first.click()
+    page.locator(f"{SEL_TAB} {SEL_TAB_NAME}").first.click()
     expect(page.locator(SEL_TAB_ACTIVE)).to_have_count(1)
+    if page.locator("#jserr").is_visible():
+        pytest.fail(page.locator("#jserr").inner_text())
 
     # Close the active tab via its × button.
     page.locator(f"{SEL_TAB_ACTIVE} {SEL_TAB_CLOSE}").click()
@@ -107,9 +123,226 @@ def test_keyboard_shortcut_ctrl_t_opens_tab(page: Page, backend_url, auth_token)
     expect(page.locator(SEL_TAB)).to_have_count(start + 1)
 
 
-def test_workspace_picker_switches_files_previews_and_sessions_together(
+def test_composer_drafts_are_isolated_between_tabs(page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    textarea = page.locator(".chat-input-textarea")
+    sid_a = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    textarea.fill("draft-a")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'draft-a'")
+
+    page.locator(SEL_TAB_NEW).click()
+    sid_b = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    assert sid_b != sid_a
+    expect(textarea).to_have_value("")
+    textarea.fill("draft-b")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'draft-b'")
+
+    _activate_chat_tab(page, sid_a)
+    expect(textarea).to_have_value("draft-a")
+    _activate_chat_tab(page, sid_b)
+    expect(textarea).to_have_value("draft-b")
+
+
+def test_upload_completion_stays_with_starting_tab(page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    sid_a = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    page.locator(SEL_TAB_NEW).click()
+    sid_b = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    _activate_chat_tab(page, sid_a)
+
+    page.evaluate(
+        """() => {
+          const originalFetch = window.fetch.bind(window);
+          window.__resolveUpload = null;
+          window.fetch = (url, init) => {
+            if (String(url).includes('/api/chat/upload-image')) {
+              return new Promise(resolve => { window.__resolveUpload = resolve; });
+            }
+            return originalFetch(url, init);
+          };
+        }""")
+    page.locator('input[type="file"][x-ref="attachInput"]').set_input_files({
+        "name": "race.txt",
+        "mimeType": "text/plain",
+        "buffer": b"owner-a",
+    })
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.tabState[sid]?.draft.pendingDocs.length === 1
+            && app.tabState[sid].draft.pendingDocs[0].uploading;
+        }""",
+        arg=[sid_a],
+    )
+
+    _activate_chat_tab(page, sid_b)
+    page.evaluate(
+        """() => window.__resolveUpload(new Response(
+          JSON.stringify({id: 'upload-a', kind: 'text'}),
+          {status: 200, headers: {'Content-Type': 'application/json'}}))""")
+    page.wait_for_function(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const doc = app.tabState[sid]?.draft.pendingDocs[0];
+          return doc?.id === 'upload-a' && doc.uploading === false;
+        }""",
+        arg=[sid_a],
+    )
+    state = page.evaluate(
+        """([a, b]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            current: app.currentId,
+            aDocs: app.tabState[a].draft.pendingDocs.length,
+            bDocs: app.tabState[b].draft.pendingDocs.length,
+            visibleDocs: app.pendingDocs.length,
+          };
+        }""",
+        arg=[sid_a, sid_b],
+    )
+    assert state == {"current": sid_b, "aDocs": 1, "bDocs": 0, "visibleDocs": 0}
+
+
+def test_send_upload_wait_is_owned_by_starting_tab(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    sid_a = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    page.locator(SEL_TAB_NEW).click()
+    sid_b = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    _activate_chat_tab(page, sid_a)
+
+    page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.availableModels = [{model: 'fake-model', group: 'test'}];
+          app.input = 'send-a';
+          app.pendingDocs.push({
+            id: null, name: 'slow.txt', kind: 'text', uploading: true, error: false,
+          });
+          app._captureComposerState(sid);
+          window.__sendPromise = app.send();
+        }""",
+        arg=[sid_a],
+    )
+    page.wait_for_function(
+        """([sid]) => document.querySelector('#app')._x_dataStack[0]
+          .tabState[sid]?.draft._sendWaitingForUpload === true""",
+        arg=[sid_a],
+    )
+    _activate_chat_tab(page, sid_b)
+    waiting = page.evaluate(
+        """([a, b]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            root: app._sendWaitingForUpload,
+            a: app.tabState[a].draft._sendWaitingForUpload,
+            b: app.tabState[b].draft._sendWaitingForUpload,
+          };
+        }""",
+        arg=[sid_a, sid_b],
+    )
+    assert waiting == {"root": False, "a": True, "b": False}
+
+    result = page.evaluate(
+        """async ([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const doc = app.tabState[sid].draft.pendingDocs[0];
+          doc.error = true;
+          doc.uploading = false;
+          return await window.__sendPromise;
+        }""",
+        arg=[sid_a],
+    )
+    assert result is False
+    settled = page.evaluate(
+        """([a, b]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return [
+            app.tabState[a].draft._sendWaitingForUpload,
+            app.tabState[b].draft._sendWaitingForUpload,
+            app._sendWaitingForUpload,
+          ];
+        }""",
+        arg=[sid_a, sid_b],
+    )
+    assert settled == [False, False, False]
+
+
+def test_queue_edit_restores_original_tab_during_switch(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    sid_a = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    page.locator(SEL_TAB_NEW).click()
+    sid_b = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    page.locator(".chat-input-textarea").fill("draft-b")
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].input === 'draft-b'")
+    _activate_chat_tab(page, sid_a)
+
+    page.evaluate(
+        """([sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabState[sid].pendingQueue = [{
+            id: 'q1', text: 'queued-a',
+            images: [{id: 'img-a', mime: 'image/png', src: 'data:image/png;base64,AA=='}],
+            docs: [{id: 'doc-a', name: 'a.txt', kind: 'text'}],
+          }];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (url, init) => String(url).includes('/queue/q1')
+            ? Promise.resolve(new Response('{}', {status: 200}))
+            : originalFetch(url, init);
+          window.__queueResolvers = [];
+          app._syncQueueFromServer = () => new Promise(
+            resolve => { window.__queueResolvers.push(resolve); });
+          app.editPendingQueueItem(sid, 0);
+        }""",
+        arg=[sid_a],
+    )
+    page.wait_for_function("() => window.__queueResolvers?.length >= 1")
+    _activate_chat_tab(page, sid_b)
+    page.evaluate("() => window.__queueResolvers[0]()")
+    page.wait_for_function(
+        """([sid]) => document.querySelector('#app')._x_dataStack[0]
+          .tabState[sid]?.draft.input === 'queued-a'""",
+        arg=[sid_a],
+    )
+    state = page.evaluate(
+        """([a, b]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            current: app.currentId,
+            visibleInput: app.input,
+            aInput: app.tabState[a].draft.input,
+            aImages: app.tabState[a].draft.pendingImages.map(x => x.id),
+            aDocs: app.tabState[a].draft.pendingDocs.map(x => x.id),
+            bInput: app.tabState[b].draft.input,
+          };
+        }""",
+        arg=[sid_a, sid_b],
+    )
+    assert state == {
+        "current": sid_b,
+        "visibleInput": "draft-b",
+        "aInput": "queued-a",
+        "aImages": ["img-a"],
+        "aDocs": ["doc-a"],
+        "bInput": "draft-b",
+    }
+
+
+def test_workspace_picker_switches_conversation_and_keeps_archive_surface(
         page: Page, backend_url, auth_token, tmp_path):
-    """A workspace switch restores its files, preview and conversation."""
+    """A workspace switch changes chat cwd without moving the archive root."""
     _login(page, backend_url, auth_token)
     primary = page.evaluate(
         "() => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath()")
@@ -158,23 +391,16 @@ def test_workspace_picker_switches_files_previews_and_sessions_together(
               app.sessions.find(item => item.id === id)?.cwd),
           };
         }""")
-    assert "WORKSPACE_ONLY.md" in state["visible"]
-    assert "README.md" not in state["visible"]
-    assert state["selected"] == ""
+    assert "WORKSPACE_ONLY.md" not in state["visible"]
+    assert "README.md" in state["visible"]
+    assert state["selected"] == "README.md"
     assert state["tabCwds"] and set(state["tabCwds"]) == {str(other)}
     secondary_id = state["currentId"]
 
-    page.locator('.filelist li[data-path="WORKSPACE_ONLY.md"]').click()
-    page.wait_for_function(
-        """() => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          return app.selected === 'WORKSPACE_ONLY.md'
-            && app.rawText.includes('workspace-isolated-preview');
-        }""")
-
     page.locator(".workspace-picker-btn").click()
-    page.locator(
-        f'.workspace-picker-row[title="{primary}"] .workspace-picker-select').click()
+    page.locator(".workspace-picker-row").filter(
+        has=page.get_by_text(primary, exact=True)).locator(
+        ".workspace-picker-select").click()
     page.wait_for_function(
         """([path, sid]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -187,14 +413,15 @@ def test_workspace_picker_switches_files_previews_and_sessions_together(
     )
 
     page.locator(".workspace-picker-btn").click()
-    page.locator(
-        f'.workspace-picker-row[title="{other}"] .workspace-picker-select').click()
+    page.locator(".workspace-picker-row").filter(
+        has=page.get_by_text(str(other), exact=True)).locator(
+        ".workspace-picker-select").click()
     page.wait_for_function(
         """([path, sid]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
           return app.currentWorkspacePath() === path && app.currentId === sid
-            && app.selected === 'WORKSPACE_ONLY.md'
-            && app.rawText.includes('workspace-isolated-preview')
+            && app.selected === 'README.md'
+            && app.rawText.includes('muselab e2e')
             && !app.workspaceSwitching;
         }""",
         arg=[str(other), secondary_id],
@@ -203,15 +430,17 @@ def test_workspace_picker_switches_files_previews_and_sessions_together(
 
     # Remove the registry entry through the UI; project files remain untouched.
     page.locator(".workspace-picker-btn").click()
-    page.locator(
-        f'.workspace-picker-row[title="{primary}"] .workspace-picker-select').click()
+    page.locator(".workspace-picker-row").filter(
+        has=page.get_by_text(primary, exact=True)).locator(
+        ".workspace-picker-select").click()
     page.wait_for_function(
         "([path]) => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath() === path",
         arg=[primary],
     )
     page.locator(".workspace-picker-btn").click()
-    page.locator(
-        f'.workspace-picker-row[title="{other}"] .workspace-picker-remove').click()
+    page.locator(".workspace-picker-row").filter(
+        has=page.get_by_text(str(other), exact=True)).locator(
+        ".workspace-picker-remove").click()
     expect(page.locator(".confirm-modal")).to_be_visible()
     page.locator(".confirm-modal .btn-danger").click()
     page.wait_for_function(

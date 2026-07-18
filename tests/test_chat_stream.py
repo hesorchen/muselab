@@ -8,6 +8,7 @@ assert the SSE frames the frontend depends on (text → tool_use → tool_result
 
 No real network, no real CLI subprocess, no Anthropic API.
 """
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -282,6 +283,54 @@ def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
     assert sid not in chat_mod._active_turns
 
 
+def test_sdk_error_extractors_keep_result_and_assistant_detail(stream_env):
+    chat_mod = stream_env
+    assistant = AssistantMessage(
+        content=[TextBlock(text="API Error: input exceeds the context window")],
+        model="<synthetic>", error="invalid_request",
+    )
+    result = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id="sid",
+        result="502 unknown provider for model claude-opus-4-8",
+        errors=["502 unknown provider for model claude-opus-4-8"],
+        api_error_status=502,
+    )
+
+    a = chat_mod._sdk_assistant_error(assistant)
+    r = chat_mod._sdk_result_error(result)
+    merged = chat_mod._merge_sdk_errors([a, r])
+
+    assert "context window" in a["message"]
+    assert merged["message"].count("502 unknown provider") == 1
+    assert merged["api_error_status"] == 502
+
+
+def test_run_sdk_command_checked_rejects_in_band_result_error(stream_env):
+    chat_mod = stream_env
+    result = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id="sid",
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, prompt):
+            self.queries.append(prompt)
+
+        async def receive_response(self):
+            yield result
+
+    fake = FakeClient()
+    with pytest.raises(chat_mod._SDKCommandError, match="context window"):
+        asyncio.run(chat_mod._run_sdk_command_checked(fake, "/compact"))
+    assert fake.queries == ["/compact"]
+
+
 def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env):
     chat_mod = stream_env
     boundary = chat_mod._TurnResponseBoundary({"old"})
@@ -298,6 +347,74 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(lifecycle) == "forward"
     assert boundary.classify(old_result) == "stale_result"
     assert boundary.classify(error_result) == "current_result"
+
+
+def test_preflight_compact_failure_blocks_original_prompt(stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    fake = _FakeStreamClient([compact_error])
+
+    async def near_limit_context():
+        return {
+            "maxTokens": 200_000,
+            "rawMaxTokens": 200_000,
+            "autoCompactThreshold": 160_000,
+            "totalTokens": 190_000,
+        }
+
+    fake.get_context_usage = near_limit_context
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=must-not-send&model=claude-sonnet-4-6")
+    events = _parse_sse(r.text)
+    error = next(json.loads(d) for e, d in events if e == "error")
+
+    assert fake.queried == ["/compact"]
+    assert error["kind"] == "context_window"
+    assert error["retryable"] is False
+
+
+def test_stream_done_classifies_synthetic_context_error(stream_env, client, monkeypatch):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    messages = [
+        AssistantMessage(
+            content=[TextBlock(text="API Error: Your input exceeds the context window")],
+            model="<synthetic>", error="invalid_request",
+        ),
+        ResultMessage(
+            subtype="error", duration_ms=1, duration_api_ms=1,
+            is_error=True, num_turns=1, session_id=sid,
+            result="API Error: Your input exceeds the context window of this model",
+            api_error_status=400,
+        ),
+    ]
+    fake = _FakeStreamClient(messages)
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=continue&model=claude-sonnet-4-6")
+    events = _parse_sse(r.text)
+    assert not [d for e, d in events if e == "text"], "synthetic error is not assistant text"
+    done = next(json.loads(d) for e, d in events if e == "done")
+    assert done["is_error"] is True
+    assert done["kind"] == "context_window"
+    assert done["cta"] == "compact_or_fork"
+    assert done["retryable"] is False
+    assert "context window" in done["error"]
 
 
 def test_stream_pdf_attachment_persists_path_fallback(stream_env, client, monkeypatch):
@@ -781,6 +898,76 @@ def test_subscribe_broadcast_marks_continuation_consumed(stream_env):
     plain.finish()
     asyncio.run(drain(plain))
     assert plain.continuation_consumed is False
+
+
+def test_broadcast_replay_binary_compaction_handles_100k_deltas(stream_env):
+    """Replay stays exact and O(log n) in envelopes on pathological streams."""
+    import json
+
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(
+        session_id="stress-replay",
+        replay_max_events=128,
+        replay_max_bytes=512_000,
+    )
+    for _ in range(100_000):
+        bc.publish({"event": "text", "data": '{"text":"x"}'})
+
+    assert len(bc.events) <= 20
+    assert sum(
+        len(json.loads(event["data"])["text"])
+        for event in bc.events
+    ) == 100_000
+    assert bc._replay_bytes <= 512_000
+
+
+def test_broadcast_bounds_replay_and_isolates_slow_subscriber(stream_env):
+    import asyncio
+
+    chat_mod = stream_env
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(
+            session_id="stress-subscribers",
+            replay_max_events=1,
+            replay_max_bytes=4096,
+            subscriber_max_events=8,
+            subscriber_max_bytes=4096,
+        )
+        slow = bc.subscribe()
+        fast = bc.subscribe()
+        received = []
+
+        async def consume_fast():
+            while True:
+                event = await fast.get()
+                if event is None:
+                    return
+                received.append(event)
+
+        consumer = asyncio.create_task(consume_fast())
+        for i in range(2_000):
+            bc.publish({
+                "event": "tool_result",
+                "data": '{"id":"%d"}' % i,
+            })
+            await asyncio.sleep(0)
+        bc.finish()
+        await consumer
+
+        slow_first = await slow.get()
+        assert slow_first["event"] == "resync"
+        assert json.loads(slow_first["data"])["reason"] == "slow_subscriber"
+        assert len(received) == 2_000
+        assert bc.events == []
+
+        replay = bc.subscribe()
+        replay_first = await replay.get()
+        assert replay_first["event"] == "resync"
+        assert json.loads(replay_first["data"])["reason"] == "replay_truncated"
+
+    import json
+    asyncio.run(exercise())
 
 
 def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch):

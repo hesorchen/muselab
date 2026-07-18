@@ -37,6 +37,8 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert client is not None
     assert captured["skills"] == "all"
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-test"
+    for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "deepseek-v4-pro"
 
 
 def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path):
@@ -74,6 +76,8 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     # Claude CLI must use the same effective window as the meter and native
     # compact preflight instead of its unrelated built-in 200K default.
     assert captured["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "258400"
+    for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+        assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "gpt-5.5"
 
 
 def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):

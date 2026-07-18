@@ -1685,10 +1685,12 @@
                correct; hidden panes are display:none so their (stale)
                result is never seen. -->
           <template x-for="tid in residentPaneIds()" :key="tid">
-          <div class="msg-pane" x-show="tid === currentId">
-          <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
-                 :data-uuid="m.uuid || ''"
+          <div class="msg-pane" x-show="tid === currentId"
+               :data-tid="tid"
+               x-data="{ get pane(){ return paneState(tid) }, get paneMsgs(){ return paneMessages(tid) } }">
+          <template x-for="(m, i) in paneMsgs" :key="m._k">
+            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
+                 :data-uuid="m.uuid || ''" :data-message-key="m._k"
                  :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
               <!-- compact-summary pill -->
               <template x-if="m._is_compact_summary">
@@ -1772,7 +1774,7 @@
                       <svg x-show="!m._copied"><use href="#i-copy"/></svg>
                       <svg x-show="m._copied"><use href="#i-check"/></svg>
                     </button>
-                    <button x-show="!streaming && !m._editing"
+                    <button x-show="pane && !pane.streaming && !m._editing"
                             @click="startEditMessage(m)" class="icon-btn sm"
                             :title="t('btn.edit')">
                       <svg><use href="#i-edit"/></svg>
@@ -1815,13 +1817,15 @@
                 <div class="asst-msg-wrap">
                   <div class="msg-row">
                     <span class="msg-avatar assistant-avatar"
-                          :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                          :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                           :title="mascotLabel()">
                       <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                     </span>
                     <div class="bubble"
-                         :class="{ 'is-streaming-bubble': streaming && i === messages.length - 1 }"
-                         x-html="m.html || ''"></div>
+                         :class="{ 'is-streaming-bubble': pane && pane.streaming && i === paneMsgs.length - 1 }">
+                      <div x-show="m._streamPlain" class="stream-plain" x-text="m.text || ''"></div>
+                      <div x-show="!m._streamPlain" x-html="m.html || ''"></div>
+                    </div>
                   </div>
                   <!-- Per-bubble footer removed. Time + streaming dots
                        are rendered once per turn in the turn-footer
@@ -1849,24 +1853,24 @@
               <template x-if="m.role === 'thinking'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
-                  <div :class="thinkingClass(i, m)">
+                  <div :class="thinkingClass(i, m, pane, paneMsgs)">
                     <div class="thinking-head"
                          @click.stop="toggleMsgExpanded(m, i)"
                          :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
                       <span class="thinking-chevron">
                         <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                          <path :d="isMsgExpanded(i, m, false, pane, paneMsgs) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
                         </svg>
                       </span>
                       <span class="icon"><svg><use href="#i-brain"/></svg></span>
                       <span class="thinking-label-text">thinking</span>
-                      <span x-show="!isMsgExpanded(i, m)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
+                      <span x-show="!isMsgExpanded(i, m, false, pane, paneMsgs)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
                     </div>
-                    <pre x-show="isMsgExpanded(i, m)" x-text="m.text"></pre>
+                    <pre x-show="isMsgExpanded(i, m, false, pane, paneMsgs)" x-text="m.text"></pre>
                   </div>
                 </div>
               </template>
@@ -1875,7 +1879,7 @@
               <template x-if="m.role === 'tool_use' && m.name === 'TodoWrite'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1907,7 +1911,7 @@
               <template x-if="m.role === 'tool_use' && (m.name === 'Task' || m.name === 'Agent')">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1957,7 +1961,7 @@
               <template x-if="m.role === 'tool_use' && m.name === 'ExitPlanMode'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1991,7 +1995,7 @@
               <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -2074,11 +2078,11 @@
                    filter for. -->
               <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
                 <div class="diff-strip diff-strip-cr"
-                     :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m)) }">
+                     :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m, paneMsgs, tid), pane, paneMsgs) }">
                   <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
                     <span class="thinking-chevron">
                       <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                        <path :d="isMsgExpanded(i, m, isLatestEditTool(i, m)) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                        <path :d="isMsgExpanded(i, m, isLatestEditTool(i, m, paneMsgs, tid), pane, paneMsgs) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
                       </svg>
                     </span>
                     <span class="diff-strip-label" x-text="lang==='zh' ? '改动预览' : 'diff'"></span>
@@ -2091,7 +2095,7 @@
                       </span>
                     </template>
                   </div>
-                  <div x-show="isMsgExpanded(i, m, isLatestEditTool(i, m))" class="diff-body diff-body-cr">
+                  <div x-show="isMsgExpanded(i, m, isLatestEditTool(i, m, paneMsgs, tid), pane, paneMsgs)" class="diff-body diff-body-cr">
                     <template x-for="(op, oi) in editDiffOps(m)" :key="oi">
                       <div :class="'diff-line diff-' + op.op">
                         <span class="diff-sign" x-text="op.op === 'ins' ? '+' : op.op === 'del' ? '−' : op.op === 'sep' ? '⋯' : ' '"></span>
@@ -2112,27 +2116,27 @@
               <template x-if="m.role === 'tool_result' && !shouldHideToolResult(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
-                  <div :class="toolResultClass(i, m)">
+                  <div :class="toolResultClass(i, m, pane, paneMsgs)">
                     <div class="tool-result-head"
                          @click.stop="toggleMsgExpanded(m, i)"
                          :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
                       <span class="thinking-chevron">
                         <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                          <path :d="isMsgExpanded(i, m, false, pane, paneMsgs) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
                         </svg>
                       </span>
-                      <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
-                            x-text="toolResultSummary(m, i)"></span>
+                      <span x-show="!isMsgExpanded(i, m, false, pane, paneMsgs)" class="tool-result-summary"
+                            x-text="toolResultSummary(m, i, paneMsgs)"></span>
                     </div>
                     <!-- Error hint banner — shown for failed tool calls when
                          we can detect a common pattern + give a fix. Only
                          visible when the user explicitly expands the result;
                          collapsed state should stay quiet. -->
-                    <template x-if="m.is_error && errorFixHint(m) && isMsgExpanded(i, m)">
+                    <template x-if="m.is_error && errorFixHint(m) && isMsgExpanded(i, m, false, pane, paneMsgs)">
                       <div class="tool-error-hint">
                         <span class="tool-error-hint-icon">💡</span>
                         <span class="tool-error-hint-text" x-text="errorFixHint(m)"></span>
@@ -2140,7 +2144,7 @@
                     </template>
                     <!-- expanded body: per-tool renderer takes precedence,
                          falls back to plain text for unknown tool types -->
-                    <template x-if="isMsgExpanded(i, m)">
+                    <template x-if="isMsgExpanded(i, m, false, pane, paneMsgs)">
                       <div class="tool-result-body">
                         <!-- Bash: terminal-style w/ stdout / stderr split -->
                         <template x-if="toolResultKind(m) === 'bash'">
@@ -2177,19 +2181,19 @@
                         <!-- WebFetch / WebSearch: card w/ source badge on top -->
                         <template x-if="toolResultKind(m) === 'web'">
                           <div class="web-card">
-                            <template x-if="findToolUseFor(m, i) && webSourceUrl(findToolUseFor(m, i))">
+                            <template x-if="findToolUseFor(m, i, paneMsgs) && webSourceUrl(findToolUseFor(m, i, paneMsgs))">
                               <div class="web-source">
                                 <span class="web-source-icon"
-                                      x-text="webIsUrl(webSourceUrl(findToolUseFor(m, i))) ? '🔗' : '🔍'"></span>
-                                <template x-if="webIsUrl(webSourceUrl(findToolUseFor(m, i)))">
+                                      x-text="webIsUrl(webSourceUrl(findToolUseFor(m, i, paneMsgs))) ? '🔗' : '🔍'"></span>
+                                <template x-if="webIsUrl(webSourceUrl(findToolUseFor(m, i, paneMsgs)))">
                                   <a class="web-source-link"
-                                     :href="webSourceUrl(findToolUseFor(m, i))"
+                                     :href="webSourceUrl(findToolUseFor(m, i, paneMsgs))"
                                      target="_blank" rel="noopener"
-                                     x-text="webSourceDomain(webSourceUrl(findToolUseFor(m, i)))"></a>
+                                     x-text="webSourceDomain(webSourceUrl(findToolUseFor(m, i, paneMsgs)))"></a>
                                 </template>
-                                <template x-if="!webIsUrl(webSourceUrl(findToolUseFor(m, i)))">
+                                <template x-if="!webIsUrl(webSourceUrl(findToolUseFor(m, i, paneMsgs)))">
                                   <span class="web-source-query"
-                                        x-text="webSourceUrl(findToolUseFor(m, i))"></span>
+                                        x-text="webSourceUrl(findToolUseFor(m, i, paneMsgs))"></span>
                                 </template>
                               </div>
                             </template>
@@ -2272,7 +2276,7 @@
               <template x-if="m.role === 'ask_user_question'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -2375,7 +2379,7 @@
               <template x-if="m.role === 'permission_request'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -2429,19 +2433,19 @@
                    messages.length) directly — method calls aren't
                    guaranteed to wire up reactivity inside x-for. -->
               <div class="turn-footer"
-                   x-show="m.role !== 'user' && (i === messages.length - 1 || (messages[i + 1] && messages[i + 1].role === 'user'))"
+                   x-show="m.role !== 'user' && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))"
                    aria-hidden="true">
-                <span x-show="streaming && i === messages.length - 1"
+                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1"
                       class="thinking-dots">
                   <span></span><span></span><span></span>
                 </span>
                 <!-- Elapsed counter next to the streaming dots — kicks in
                      after 1s so fast replies don't flash a "0s" label.
                      Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
-                <span x-show="streaming && i === messages.length - 1 && streamElapsed >= 1"
+                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
                       class="stream-elapsed"
-                      x-text="fmtStreamElapsed(streamElapsed)"></span>
-                <span x-show="m.ts && !(streaming && i === messages.length - 1)"
+                      x-text="fmtStreamElapsed((pane && pane.streamElapsed) || 0)"></span>
+                <span x-show="m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
                 <!-- Total elapsed kept after done so the user can
@@ -2449,7 +2453,7 @@
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts && !(streaming && i === messages.length - 1)"
+                <span x-show="m.elapsed && m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
               </div>
@@ -2457,6 +2461,13 @@
           </template>
           </div>
           </template>
+          <div x-show="messagesReady && hasLaterMessages()" class="load-later-wrap">
+            <button class="load-earlier-btn" @click="loadLaterMessages()"
+                    x-text="lang==='zh' ? '加载较新消息（' + laterMessageCount() + '）' : 'Load newer (' + laterMessageCount() + ')'">
+            </button>
+            <button class="load-earlier-btn latest" @click="returnToLatest()"
+                    x-text="lang==='zh' ? '回到最新' : 'Back to latest'"></button>
+          </div>
           <!-- /P1 per-tab message panes. Siblings below (pending bubble,
                pending queue, banners) stay single-instance with active-tab
                semantics — they read currentId / this.messages / streaming,
@@ -2749,7 +2760,8 @@
                actually gets inlined; unsupported types are rejected with
                a clear toast instead of being hidden in the picker. -->
           <input type="file" x-ref="attachInput"
-                 multiple style="display:none" @change="onAttachPicked($event)" />
+                 multiple style="display:none" :disabled="workspaceSwitching"
+                 @change="onAttachPicked($event)" />
           <!-- No-provider gate banner: when no model is configured the
                composer below is disabled (every send would 401 + lock the
                session to an unreachable model). Point the user at Settings
@@ -2780,7 +2792,7 @@
           <form autocomplete="off" onsubmit="return false" style="display:contents">
           <textarea x-model="input" x-ref="chatInput"
                     rows="1"
-                    :disabled="!availableModels.length"
+                    :disabled="!availableModels.length || workspaceSwitching"
                     class="chat-input-textarea"
                     name="muselab-chat-message"
                     inputmode="text"
@@ -2807,6 +2819,7 @@
                  the running turn). -->
             <button @click="$refs.attachInput.click()"
                     class="chat-toolbar-btn"
+                    :disabled="workspaceSwitching"
                     :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
             </button>
@@ -2972,20 +2985,18 @@
                  shows while streaming. Same shape + size + fill — they
                  read as a sibling pair (blue send / red stop). -->
             <button @click="send()"
-                    :disabled="!availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="workspaceSwitching || !availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
-                    :title="streaming ? t('queue.button_hint') : t('btn.send')">
+                    :title="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
             </button>
-            <button x-show="streaming" @click="stop()" class="btn-danger chat-toolbar-send"
-                    :title="_currentQueueLen() > 0
-                              ? (lang==='zh'
-                                  ? '撤回队尾（队列 ' + _currentQueueLen() + ' 条）'
-                                  : 'Pop last queued (' + _currentQueueLen() + ' waiting)')
-                              : (t('btn.stop') + ' (Esc)')">
+            <button x-show="isTabStreaming(currentId)" @click="stop()"
+                    class="btn-danger chat-toolbar-send chat-toolbar-stop"
+                    :disabled="workspaceSwitching || !!(tabState[currentId] && tabState[currentId]._stopping)"
+                    :title="t('btn.stop') + ' (Esc)'">
               <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
             </button>
           </div>
