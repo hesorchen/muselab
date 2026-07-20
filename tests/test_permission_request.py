@@ -21,6 +21,8 @@ def test_register_and_unregister():
     assert "s1" in perm._always_allow
     perm.unregister_session_queue("s1")
     assert "s1" not in perm._session_queues
+    assert "s1" in perm._always_allow
+    perm.clear_session_permissions("s1")
     assert "s1" not in perm._always_allow
 
 
@@ -125,6 +127,14 @@ async def test_always_allow_caches_subsequent_calls():
     # Second call to same tool+key — should NOT prompt (queue stays empty)
     r2 = await cb("Bash", {"command": "ls /tmp"}, None)
     assert r2.behavior == "allow"
+    assert perm._session_queues[sid].empty()
+
+    # A turn boundary unregisters the prompt queue but the session-level
+    # grant survives and applies after the next turn registers its queue.
+    perm.unregister_session_queue(sid)
+    perm.register_session_queue(sid)
+    r3 = await cb("Bash", {"command": "ls /var/tmp"}, None)
+    assert r3.behavior == "allow"
     assert perm._session_queues[sid].empty()
 
 

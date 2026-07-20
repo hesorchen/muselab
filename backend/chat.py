@@ -64,9 +64,9 @@ from . import permission_request as perm
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
 # params, queue items, tickets) flow into ClaudeAgentOptions / client
-# .set_permission_mode() — a typo'd or stale value would fail the SDK
-# connect (or worse, silently diverge UI state from the real gate), so
-# entry points must normalize through _validate_permission().
+# launch contract — a typo'd or stale value would fail the SDK connect (or
+# worse, silently diverge UI state from the real gate), so entry points must
+# normalize through _validate_permission().
 _VALID_PERMISSION_MODES: frozenset = frozenset(get_args(PermissionMode))
 
 
@@ -360,19 +360,11 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # Clients keyed by (session_id, model, effort).
 _ClientKey = tuple[str, str, str]
 _clients: dict[_ClientKey, ClaudeSDKClient] = {}
-# Tracks the permission_mode currently active on each cached client. SDK
-# doesn't expose a getter, so we shadow what we asked for. Lets a cached
-# client whose mode no longer matches the request swap via
-# client.set_permission_mode() instead of needing a full rebuild.
+# Tracks the permission_mode the cached client was launched with. Permission
+# is launch-sensitive (notably default -> bypassPermissions cannot always be
+# enabled dynamically), so a mismatch rebuilds the runtime instead of trying
+# to mutate it in place.
 _client_permission: dict[_ClientKey, str] = {}
-# Per-client mutable bypass flag, shared by reference with the can_use_tool
-# closure built in permission_request. Switching permission mode on a pooled
-# client (set_permission_mode) must flip this flag so the closure stops/starts
-# auto-allowing tools — otherwise the bypass value baked in at build time
-# leaks across mode switches (2026-05-29 audit). Value is `{"bypass": bool}`;
-# the SAME dict object is captured by the closure, so mutating it here takes
-# effect on the next tool call without a rebuild.
-_bypass_state: dict[_ClientKey, dict] = {}
 
 
 _BROADCAST_REPLAY_MAX_EVENTS = env_int(
@@ -665,6 +657,20 @@ def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
 _client_lru: list[_ClientKey] = []   # (session_id, model, effort)
 _CLIENT_POOL_CAP = env_int("MUSELAB_CLIENT_POOL_CAP", 3, min_value=1)
 _lock = asyncio.Lock()
+
+# Exactly one SDK operation may own a session's CLI stream at a time. The
+# interactive turn mutex only covers /stream turns; scheduler and /compact
+# also call query()/receive_response() and therefore share this lock.
+_session_runtime_locks: dict[str, asyncio.Lock] = {}
+# Session settings can change after a turn reserves `_active_turns[sid]` but
+# before its detached query task starts. Disconnecting in that gap kills the
+# freshly selected client. Mark rebuilds and consume them at the next safe SDK
+# boundary instead.
+_pending_runtime_rebuilds: set[str] = set()
+
+
+def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
+    return _session_runtime_locks.setdefault(session_id, asyncio.Lock())
 
 # ---------------------------------------------------------------------------
 # Cross-turn background tasks (SDK-native run_in_background)
@@ -1608,6 +1614,10 @@ async def _build_and_connect_client(
     env_ovr = endpoints.env_override(model)
     if env_ovr is not None:
         env_ovr = dict(env_ovr)
+        # Isolated vendor config prevents OAuth fallback, but starts with no
+        # project trust state. Without this marker the CLI silently ignores
+        # permissions.allow rules from the workspace settings.
+        endpoints.ensure_vendor_workspace_trusted(workspace_root)
         # Agent/Task's `model` field is intentionally an alias enum
         # (sonnet|opus|haiku|fable), not an arbitrary model ID. Without these
         # CLI-native alias overrides, a subagent launched inside a Codex or
@@ -1730,29 +1740,13 @@ async def _build_and_connect_client(
     # need not appear in _VALID_EFFORT.)
     if effort and effort in _VALID_EFFORT:
         opts_kwargs["effort"] = effort
-    # Wire the SDK's can_use_tool callback UNCONDITIONALLY (2026-05-23).
-    # Two responsibilities:
-    #   1. Per-tool permission prompts (only when permission != bypass).
-    #   2. Routing built-in AskUserQuestion calls to muselab's UI — needed
-    #      ALWAYS, even on bypassPermissions. Without this, when the model
-    #      calls SDK's built-in `AskUserQuestion` (the shorter name —
-    #      models often forget the longer `mcp__muselab__ask_user_question`
-    #      MCP alias), the SDK's default tool handler tries to surface a
-    #      terminal-style prompt that obviously can't render in the web
-    #      UI → user sees "no options to pick" and is stuck waiting.
-    # The `bypass` flag tells the callback to auto-allow everything except
-    # AskUserQuestion, preserving the no-prompts UX while still surfacing
-    # the model's questions.
-    # The bypass flag is a mutable dict captured by reference inside the
-    # can_use_tool closure, then registered under this (sid, model, effort)
-    # key so set_permission_mode can flip it on a cached client without a
-    # rebuild. Register BEFORE connect so the key is live the moment the
-    # client is usable.
-    key = (session_id, model, effort)
-    bypass_state = {"bypass": permission == "bypassPermissions"}
-    _bypass_state[key] = bypass_state
-    opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
-        session_id, bypass_state=bypass_state)
+    # can_use_tool resolves SDK permission prompts; it is not a universal tool
+    # hook. In bypassPermissions the SDK approves tools before consulting the
+    # callback, so wiring it there only creates a false AskUserQuestion promise
+    # plus CanUseToolShadowedWarning noise. Interactive questions use the
+    # dedicated muselab MCP tool in every mode.
+    if permission != "bypassPermissions":
+        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
     try:
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
         await client.connect()
@@ -1976,6 +1970,12 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
 
     effort: "" (SDK adaptive) / "low" / "medium" / "high" / "xhigh" / "max".
     Anything else is ignored — invalid values fall back to the SDK default."""
+    if session_id in _pending_runtime_rebuilds:
+        # Callers that operate a session hold its runtime lock. Consuming the
+        # marker here closes the race where a new turn reserves the active slot
+        # just before the previous turn's cleanup tries to rebuild.
+        await disconnect_client(session_id)
+
     key = (session_id, model, effort)
 
     # Fast path: cache hit. Lock just long enough to read + touch LRU.
@@ -1988,26 +1988,15 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         cached_perm = _client_permission.get(key) if cached is not None else None
 
     if cached is not None:
-        # set_permission_mode runs OUTSIDE _lock — it can take seconds and
-        # we never want sibling requests to wait on it. The cache key is
-        # (sid, model, effort), NOT permission, so swapping permission
-        # doesn't trigger a CLI subprocess rebuild.
+        # Permission is part of the runtime's launch contract even though it
+        # is not part of the storage key. In particular, a process launched in
+        # default mode may reject a later switch to bypassPermissions. Never
+        # return a stale client after a failed control request: replace the
+        # session runtime deterministically.
         if cached_perm != permission:
-            try:
-                await cached.set_permission_mode(permission)
-                _client_permission[key] = permission
-                # Flip the can_use_tool bypass flag to match the new mode.
-                # Without this the closure keeps the bypass value baked in at
-                # build time, so switching bypassPermissions → default would
-                # still auto-allow every tool (permission cards never show).
-                st = _bypass_state.get(key)
-                if st is not None:
-                    st["bypass"] = (permission == "bypassPermissions")
-            except Exception as e:
-                sys.stderr.write(
-                    f"[chat] set_permission_mode {cached_perm}→{permission} "
-                    f"failed for {key}: {type(e).__name__}: {e}\n")
-                sys.stderr.flush()
+            await disconnect_client(session_id)
+            return await get_client(
+                session_id, model, permission, effort=effort)
         return cached
 
     # Cache miss: build a new client OUTSIDE _lock. Per-key creation
@@ -2022,7 +2011,16 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 if key in _client_lru:
                     _client_lru.remove(key)
                 _client_lru.append(key)
+            cached_perm = (
+                _client_permission.get(key) if cached is not None else None)
+
+        # Two callers can race on the same storage key while requesting
+        # different launch modes. The creation lock coalesces them, but the
+        # waiter must still reject the runtime built with the other mode.
+        if cached is not None:
+            if cached_perm == permission:
                 return cached
+            await disconnect_client(session_id)
 
         # Slow path — no awaits hold _lock.
         client = await _build_and_connect_client(
@@ -2072,7 +2070,6 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 old_key = _client_lru.pop(candidate_idx)
                 old_client = _clients.pop(old_key, None)
                 _client_permission.pop(old_key, None)
-                _bypass_state.pop(old_key, None)
                 # Drop the per-key creation lock too — otherwise evicted
                 # keys leak Lock objects in _creation_locks forever
                 # (disconnect_client clears it, but LRU eviction didn't).
@@ -2097,12 +2094,12 @@ async def disconnect_client(session_id: str) -> None:
     exit; we pop dict entries under _lock but do the await OUTSIDE so
     other requests aren't blocked for seconds at a time."""
     to_disconnect: list[ClaudeSDKClient] = []
+    _pending_runtime_rebuilds.discard(session_id)
     async with _lock:
         keys = [k for k in _clients if k[0] == session_id]
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
-            _bypass_state.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -2115,11 +2112,28 @@ async def disconnect_client(session_id: str) -> None:
             pass
 
 
+async def _rebuild_session_runtime(session_id: str) -> None:
+    """Disconnect now, or defer until the active turn reaches a safe boundary."""
+    active = _active_turns.get(session_id)
+    if active is not None and not active.done:
+        _pending_runtime_rebuilds.add(session_id)
+        return
+    async with _session_runtime_lock_for(session_id):
+        # A turn may reserve the session while this coroutine waits for the
+        # mutex. Its get_client() will consume the marker before querying.
+        active = _active_turns.get(session_id)
+        if active is not None and not active.done:
+            _pending_runtime_rebuilds.add(session_id)
+            return
+        await disconnect_client(session_id)
+
+
 # ====== sessions REST ======
 
 class CreateReq(BaseModel):
     name: str | None = None
     model: str | None = None
+    permission: str = ""
     cwd: str = ""
     # Optimistic-create (2026-06-07): the client mints the session UUID up
     # front so the new-chat tab opens with ZERO network wait, then POSTs here
@@ -2432,6 +2446,7 @@ def create_session_api(req: CreateReq) -> dict:
     # 401 forever; the frontend gates chat until a provider exists, and the
     # model is resolved on first send.
     resolved_model = _resolve_default_model(req.model, allow_fallback=False)
+    resolved_permission = _validate_permission(req.permission)
     client_id = (req.id or "").strip()
     if client_id:
         # Optimistic-create path: the client minted this UUID and already
@@ -2453,6 +2468,7 @@ def create_session_api(req: CreateReq) -> dict:
                 client_id,
                 name=req.name or "",
                 model=resolved_model,
+                permission=resolved_permission,
                 auto_named=True,
                 cwd=req.cwd or None,
             )
@@ -2463,6 +2479,7 @@ def create_session_api(req: CreateReq) -> dict:
             meta = sess.create_session(
                 name=req.name or "",
                 model=resolved_model,
+                permission=resolved_permission,
                 cwd=req.cwd or None,
             )
         except ValueError as exc:
@@ -3853,6 +3870,11 @@ def export_session_markdown(sid: str) -> Response:
 
 def _clear_session_runtime_state(sid: str) -> None:
     """Forget detached turn/continuation state owned by a deleted session."""
+    perm.clear_session_permissions(sid)
+    _pending_runtime_rebuilds.discard(sid)
+    runtime_lock = _session_runtime_locks.get(sid)
+    if runtime_lock is not None and not runtime_lock.locked():
+        _session_runtime_locks.pop(sid, None)
     _continuation_generations[sid] = _continuation_generations.get(sid, 0) + 1
     watcher = _task_watchers.pop(sid, None)
     if watcher is not None and not watcher.done():
@@ -4137,6 +4159,7 @@ class SessionPatchReq(BaseModel):
     name: str | None = None
     system_prompt: str | None = None
     model: str | None = None
+    permission: str | None = None
     # SDK-native session tag — written to CLI JSONL so other tools (and
     # manual `claude` CLI runs) see it. Pass empty string to clear.
     tag: str | None = None
@@ -4185,7 +4208,10 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
     if req.system_prompt is not None:
         ok = sess.update_system_prompt(sid, req.system_prompt) or ok
         # System prompt change invalidates cached SDK clients for this session.
-        await disconnect_client(sid)
+        await _rebuild_session_runtime(sid)
+    if req.permission is not None:
+        permission = _validate_permission(req.permission)
+        ok = sess.update_permission(sid, permission) or ok
     if req.effort is not None:
         # Validate against SDK literal set; empty string is a deliberate
         # "clear override" signal so the user can revert to adaptive.
@@ -4202,7 +4228,7 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         if req.effort != cur_effort:
             sess.update_effort(sid, req.effort)
             # The next stream() call picks up the new value via get_session().
-            await disconnect_client(sid)
+            await _rebuild_session_runtime(sid)
         ok = True
     if req.thinking is not None:
         # No-op guard, same rationale as effort: toggling thinking forces a
@@ -4211,7 +4237,7 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         cur_thinking = bool((sess.get_session(sid) or {}).get("thinking", True))
         if bool(req.thinking) != cur_thinking:
             sess.update_thinking(sid, bool(req.thinking))
-            await disconnect_client(sid)
+            await _rebuild_session_runtime(sid)
         ok = True
     if req.model is not None and req.model == ((sess.get_session(sid) or {}).get("model") or ""):
         # No-op: re-selecting the current model would otherwise interrupt a
@@ -4243,72 +4269,13 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
                         f"[chat] interrupt before model swap failed for "
                         f"{sid}: {type(_e).__name__}: {_e}\n")
         sess.update_model(sid, req.model)
-        # SDK-native swap if same provider — `client.set_model()` reuses the
-        # CLI subprocess (and its loaded CLAUDE.md / MCP / system prompt).
-        # Cross-provider switch (e.g. Claude → DeepSeek) needs full rebuild
-        # because env_override / base_url differ.
-        async with _lock:
-            live = [(k, c) for k, c in _clients.items() if k[0] == sid]
-        pa = endpoints.lookup(req.model)
-        same_provider = (
-            len(live) == 1
-            and ((pa is None and endpoints.lookup(live[0][0][1]) is None)
-                 or (pa is not None
-                     and endpoints.lookup(live[0][0][1]) is not None
-                     and endpoints.lookup(live[0][0][1]).prefix == pa.prefix)))
-        if same_provider:
-            (old_key, client) = live[0]
-            try:
-                await client.set_model(endpoints.normalize_model_id(req.model))
-                # Re-validate under _lock — between the snapshot above
-                # and now, another request could have evicted / replaced
-                # _clients[old_key] (eviction from a parallel get_client,
-                # an interrupt, or even a competing model swap). Without
-                # this check we'd silently pop whatever's there now and
-                # leak the original client OR clobber a fresh handle the
-                # next turn just created.
-                snapshot_still_valid = False
-                async with _lock:
-                    if _clients.get(old_key) is client:
-                        snapshot_still_valid = True
-                        _clients.pop(old_key, None)
-                        perm = _client_permission.pop(old_key, "bypassPermissions")
-                        # The client object (and its can_use_tool closure) is
-                        # reused under new_key, so move the shared bypass dict
-                        # too — otherwise a later set_permission_mode can't
-                        # find it to flip the flag.
-                        bstate = _bypass_state.pop(old_key, None)
-                        if old_key in _client_lru:
-                            _client_lru.remove(old_key)
-                        # Preserve the effort dimension when remapping under
-                        # the new model — set_model() keeps the SDK options
-                        # object, which still has the prior effort baked in.
-                        new_key = (sid, req.model, old_key[2], old_key[3])
-                        _clients[new_key] = client
-                        _client_permission[new_key] = perm
-                        if bstate is not None:
-                            _bypass_state[new_key] = bstate
-                        _client_lru.append(new_key)
-                if not snapshot_still_valid:
-                    # Our client is orphaned now (the cache entry was
-                    # replaced under us). Disconnect it so the CLI
-                    # subprocess goes away; next turn will rebuild.
-                    sys.stderr.write(
-                        f"[chat] set_model {old_key[1]}→{req.model} raced "
-                        f"with cache mutation; disconnecting orphan\n")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-            except Exception as e:
-                sys.stderr.write(
-                    f"[chat] set_model {old_key[1]}→{req.model} failed: "
-                    f"{type(e).__name__}: {e}; rebuilding on next turn\n")
-                await disconnect_client(sid)
-        else:
-            # Cross-provider, or no/multiple live clients — disconnect; the
-            # next send() rebuilds with the new model.
-            await disconnect_client(sid)
+        # Model identity participates in several launch-time settings beyond
+        # the top-level --model flag: provider URL/auth, subagent aliases,
+        # context-window override, thinking support, and output limits. The
+        # SDK's set_model() control request updates only the top-level model,
+        # so even a same-provider swap must rebuild the runtime to keep those
+        # values coherent.
+        await _rebuild_session_runtime(sid)
         ok = True
     if not ok:
         raise HTTPException(404, "session not found or no changes")
@@ -5285,6 +5252,14 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
 
 @router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
 async def native_compact_session_api(sid: str) -> dict:
+    async with _session_runtime_lock_for(sid):
+        bc = _active_turns.get(sid)
+        if bc is not None and not bc.done:
+            raise HTTPException(409, "cannot compact while a turn is active")
+        return await _native_compact_session_locked(sid)
+
+
+async def _native_compact_session_locked(sid: str) -> dict:
     """Compact a session using the CLI's native /compact slash command via SDK.
     Lossless — CLI writes compact_boundary + isCompactSummary into the session
     JSONL. Subsequent get_session_messages() returns the summary in place of
@@ -5297,13 +5272,13 @@ async def native_compact_session_api(sid: str) -> dict:
         raise HTTPException(404, "session not found")
     model = (meta.get("model") or "").strip() or MODEL
     effort = (meta.get("effort") or "").strip()
-    # Remember the cached client's CURRENT permission mode (if any) so we can
-    # restore it after compact. Without this, forcing bypassPermissions for
-    # the /compact run permanently leaves a default/plan-mode client stuck in
-    # bypass until it's rebuilt — silently disabling the user's per-tool
-    # permission cards for every subsequent turn on this session.
+    # /compact is a CLI control command, not an agent tool call. Preserve the
+    # current runtime permission instead of escalating to bypassPermissions;
+    # a cold compact uses fail-closed default. This avoids a launch-sensitive
+    # permission transition for an operation that does not need one.
     prior_perm = _client_permission.get((sid, model, effort))
-    client = await get_client(sid, model, "bypassPermissions", effort=effort)
+    client = await get_client(
+        sid, model, prior_perm or "default", effort=effort)
     before_total = 0
     post_compact_usage: dict | None = None
     try:
@@ -5346,21 +5321,6 @@ async def native_compact_session_api(sid: str) -> dict:
                           f"{type(e).__name__}: {e}\n")
         sys.stderr.flush()
         raise HTTPException(500, "native /compact failed — see server log") from None
-    finally:
-        # Restore the pre-compact permission mode so the user's chosen
-        # default/plan/acceptEdits is not silently downgraded to bypass.
-        if prior_perm is not None and prior_perm != "bypassPermissions":
-            try:
-                await client.set_permission_mode(prior_perm)
-                _client_permission[(sid, model, effort)] = prior_perm
-                st = _bypass_state.get((sid, model, effort))
-                if st is not None:
-                    st["bypass"] = (prior_perm == "bypassPermissions")
-            except Exception as e:
-                sys.stderr.write(
-                    f"[chat] restore permission {prior_perm} after compact "
-                    f"failed for sid={sid[:8]}: {type(e).__name__}: {e}\n")
-                sys.stderr.flush()
     # Refresh the cached context-usage snapshot from the now-compacted live
     # client so the meter drops immediately and STAYS dropped. /usage reads
     # _session_usage first; on a miss it falls back to
@@ -5969,7 +5929,6 @@ async def reset(session_id: str | None = None) -> dict:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
-            _bypass_state.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -8228,6 +8187,7 @@ async def _start_turn(
     model: str = "",
     permission: str = "bypassPermissions",
     image_ids: str = "",
+    persist_permission: bool = True,
 ) -> "TurnBroadcast":
     """Reserve + launch a turn as a detached background task; return its
     TurnBroadcast (already inserted into _active_turns and pumping via
@@ -8319,6 +8279,13 @@ async def _start_turn(
         model_to_use = model or MODEL
         sess.update_model(session_id, model_to_use)
 
+    # Permission is a session setting, not a browser-global preference. A
+    # direct request remains authoritative and is persisted for legacy clients
+    # that do not use PATCH. Queue items deliberately replay their enqueue-time
+    # snapshot without rolling the session's newer selection back afterward.
+    if persist_permission:
+        sess.update_permission(session_id, permission)
+
     # Effort is per-session; read from metadata (settable via PATCH). Empty
     # string = SDK adaptive default, which is what the existing behavior was.
     effort_to_use = (s.get("effort") or "").strip()
@@ -8329,10 +8296,16 @@ async def _start_turn(
     # MODE, otherwise this session's slot stays "busy" forever and
     # subsequent sends get rejected.
     try:
-        client = await asyncio.wait_for(
-            get_client(session_id, model_to_use, permission, effort=effort_to_use),
-            timeout=60.0,
-        )
+        # Serialize client creation/replacement with scheduler and /compact.
+        # The active-turn reservation above is visible before we wait here, so
+        # those paths can fail cleanly instead of mutating this runtime.
+        async with _session_runtime_lock_for(session_id):
+            client = await asyncio.wait_for(
+                get_client(
+                    session_id, model_to_use, permission,
+                    effort=effort_to_use),
+                timeout=60.0,
+            )
     except asyncio.TimeoutError:
         async with _lock:
             if _active_turns.get(session_id) is broadcast:
@@ -8730,7 +8703,7 @@ async def _start_turn(
             but filter already-persisted response UUIDs and continue past their
             stale Result until the current query reaches its own terminal.
             """
-            try:
+            async def _run_query() -> None:
                 await _preflight_compact_if_needed()
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
@@ -8786,6 +8759,9 @@ async def _start_turn(
                         f"[chat-stream] dropped stale replay sid={session_id[:8]} "
                         f"messages={replay_dropped}\n")
                     sys.stderr.flush()
+            try:
+                async with _session_runtime_lock_for(session_id):
+                    await _run_query()
             except Exception as e:
                 # Log the full exception type + message + traceback for diagnosis.
                 # SDK transport errors / vendor 401s land here. Without this we
@@ -9742,6 +9718,8 @@ async def _start_turn(
                 sys.stderr.write(f"[activity] finish failed sid={session_id}: {e}\n")
             broadcast.finish()
             _active_turns.pop(session_id, None)
+            if session_id in _pending_runtime_rebuilds:
+                await _rebuild_session_runtime(session_id)
             # Grace-keep: a fast (esp. server-drained) turn can finish + get
             # popped here BEFORE the browser's reconnect SSE attaches. Stash the
             # finished broadcast so a slightly-late reconnect still replays it
@@ -9861,6 +9839,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
             item.get("text", ""),
             permission=perm,
             image_ids=item.get("image_ids", ""),
+            persist_permission=False,
         )
     except _TurnBusy:
         # A manual turn grabbed the slot between our check and the
@@ -10057,4 +10036,15 @@ def providers_list() -> dict:
     # frontend seeds each new chat from this instead of the currently-viewed
     # session's locked model — without it, a new session inherited whatever
     # old tab you happened to be on.
-    return {"models": flat, "default_model": _resolve_default_model("")}
+    try:
+        default_permission = _validate_permission(
+            os.environ.get("MUSELAB_DEFAULT_PERMISSION", "bypassPermissions"))
+    except HTTPException:
+        # A stale hand-edited env value must not leak invalid state into the
+        # selector or the SDK launch contract.
+        default_permission = "bypassPermissions"
+    return {
+        "models": flat,
+        "default_model": _resolve_default_model(""),
+        "default_permission": default_permission,
+    }

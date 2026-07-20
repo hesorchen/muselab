@@ -28,30 +28,36 @@ class _FakeSDKClient:
             raise RuntimeError("interrupt boom")
         self.interrupted = True
 
+    async def set_model(self, _model):
+        raise AssertionError("model changes must rebuild, not call set_model")
+
 
 @pytest.fixture()
 def chat_mod(app_module):
     from backend import chat as chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
-    chat_mod._bypass_state.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._session_runtime_locks.clear()
+    chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._pending_interrupts.clear()
+    chat_mod._active_turns.clear()
     yield chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
-    chat_mod._bypass_state.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._session_runtime_locks.clear()
+    chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._pending_interrupts.clear()
+    chat_mod._active_turns.clear()
 
 
 def _seed(chat_mod, key, client=None):
     client = client or _FakeSDKClient()
     chat_mod._clients[key] = client
     chat_mod._client_permission[key] = "bypassPermissions"
-    chat_mod._bypass_state[key] = {"bypass": True}
     chat_mod._client_lru.append(key)
     return client
 
@@ -92,7 +98,6 @@ def test_reset_all_with_multiple_three_tuple_keys(chat_mod, client):
     assert all(c.disconnected for c in (c1, c2, c3))
     assert chat_mod._clients == {}
     assert chat_mod._client_lru == []
-    assert chat_mod._bypass_state == {}
     assert chat_mod._client_permission == {}
 
 
@@ -101,6 +106,44 @@ def test_reset_all_empty_pool(chat_mod, client):
     r = client.post(f"/api/chat/reset?token={TEST_TOKEN}")
     assert r.status_code == 200, r.text
     assert r.json() == {"ok": True, "reset": []}
+
+
+def test_same_provider_model_switch_rebuilds_client(chat_mod, client):
+    sid = _make_compact_session(client)
+    key = (sid, "claude-sonnet-4-6", "")
+    fake = _seed(chat_mod, key)
+
+    r = client.patch(
+        f"/api/chat/sessions/{sid}",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={"model": "claude-haiku-4-5"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert fake.disconnected is True
+    assert key not in chat_mod._clients
+    assert chat_mod.sess.get_session(sid)["model"] == "claude-haiku-4-5"
+
+
+@pytest.mark.asyncio
+async def test_runtime_rebuild_defers_while_turn_is_reserved(chat_mod):
+    sid = "sid-deferred-rebuild"
+    key = (sid, "claude-sonnet-4-6", "")
+    fake = _seed(chat_mod, key)
+    active = chat_mod.TurnBroadcast(sid)
+    chat_mod._active_turns[sid] = active
+
+    await chat_mod._rebuild_session_runtime(sid)
+
+    assert fake.disconnected is False
+    assert sid in chat_mod._pending_runtime_rebuilds
+
+    active.finish()
+    chat_mod._active_turns.pop(sid, None)
+    await chat_mod._rebuild_session_runtime(sid)
+
+    assert fake.disconnected is True
+    assert sid not in chat_mod._pending_runtime_rebuilds
 
 
 # ====== interrupt ======
@@ -311,7 +354,6 @@ class _FakeCompactClient:
         self.result = result
         self.totals = iter(totals)
         self.queries = []
-        self.restored_permission = None
 
     async def query(self, prompt):
         self.queries.append(prompt)
@@ -321,10 +363,6 @@ class _FakeCompactClient:
 
     async def get_context_usage(self):
         return {"totalTokens": next(self.totals), "maxTokens": 200_000}
-
-    async def set_permission_mode(self, permission):
-        self.restored_permission = permission
-
 
 def _make_compact_session(client):
     r = client.post(
@@ -346,7 +384,10 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
     )
     fake = _FakeCompactClient(result, totals=(190_000,))
 
-    async def fake_get_client(*_args, **_kwargs):
+    observed = {}
+
+    async def fake_get_client(*args, **kwargs):
+        observed["permission"] = args[2] if len(args) > 2 else kwargs.get("permission")
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -360,7 +401,23 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
     assert r.status_code == 409, r.text
     assert "context window" in r.json()["detail"]
     assert fake.queries == ["/compact"]
-    assert fake.restored_permission == "default"
+    assert observed["permission"] == "default"
+
+
+def test_native_compact_rejects_active_turn(chat_mod, client, monkeypatch):
+    sid = _make_compact_session(client)
+    chat_mod._active_turns[sid] = SimpleNamespace(done=False)
+
+    async def should_not_get_client(*_args, **_kwargs):
+        raise AssertionError("compact must stop before touching the SDK")
+
+    monkeypatch.setattr(chat_mod, "get_client", should_not_get_client)
+    r = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert r.status_code == 409, r.text
+    assert "turn is active" in r.json()["detail"]
 
 
 def test_vendor_fork_uses_vendor_session_store_and_restores_env(

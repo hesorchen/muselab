@@ -1,4 +1,5 @@
 """Third-party provider catalog: prefix→endpoint+key dispatch."""
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -213,6 +214,24 @@ def test_env_override_merges_with_os_environ(monkeypatch):
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["HOME"] == "/home/test"
     assert env["ANTHROPIC_BASE_URL"].endswith("/anthropic")
+
+
+def test_vendor_workspace_trust_preserves_cli_config(monkeypatch, tmp_path):
+    ep = _reload_endpoints(monkeypatch, {})
+    vendor_dir = tmp_path / "vendor-config"
+    vendor_dir.mkdir()
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", vendor_dir)
+    cfg = vendor_dir / ".claude.json"
+    cfg.write_text(json.dumps({"feature": {"keep": True}, "projects": {}}))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    ep.ensure_vendor_workspace_trusted(workspace)
+
+    saved = json.loads(cfg.read_text())
+    assert saved["feature"] == {"keep": True}
+    assert saved["projects"][str(workspace.resolve())][
+        "hasTrustDialogAccepted"] is True
 
 
 def test_all_catalog_providers_have_valid_fields(monkeypatch):

@@ -521,6 +521,9 @@ function portal() {
     // not whatever old session you were just looking at. Loaded from the
     // /providers response at boot (and persisted in prefs for instant restore).
     defaultModel: "",
+    // Configured default for NEW sessions. Kept separate from `permission`,
+    // which always mirrors the currently viewed session.
+    defaultPermission: "bypassPermissions",
     permission: "bypassPermissions",
     // Mobile-only: collapses the per-session settings (permission / effort)
     // behind a gear in the composer toolbar so the row stays single-line on
@@ -4582,7 +4585,8 @@ function portal() {
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
         schema: 4,          // v4 decouples conversation cwd from the archive surface
-        model: this.model, defaultModel: this.defaultModel, permission: this.permission,
+        model: this.model, defaultModel: this.defaultModel,
+        permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
@@ -4633,6 +4637,11 @@ function portal() {
         if (p.model) this.model = p.model;
         if (p.defaultModel) this.defaultModel = p.defaultModel;
         if (p.permission) this.permission = p.permission;
+        // Older prefs used `permission` for both roles. Preserve that value as
+        // the new-session default on migration, while session load will still
+        // replace the current selector with the server-authoritative value.
+        if (p.defaultPermission) this.defaultPermission = p.defaultPermission;
+        else if (p.permission) this.defaultPermission = p.permission;
         if (typeof p.activeWorkspace === "string") this.activeWorkspace = p.activeWorkspace;
         if (p.workspaceLastSession && typeof p.workspaceLastSession === "object"
             && !Array.isArray(p.workspaceLastSession)) {
@@ -4722,6 +4731,10 @@ function portal() {
           const d = await r.json();
           this.availableModels = d.models || [];
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
+          if (d.default_permission) {
+            this.defaultPermission = d.default_permission;
+            this.savePrefs();
+          }
           this._ensureValidModel();
           await this._rebindModelSelect();
         }
@@ -5108,6 +5121,57 @@ function portal() {
         if (st[tailKey] === run) st[tailKey] = null;
       }
     },
+    async onPermissionChange() {
+      if (!this.currentId) return false;
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      const seq = ++st._permissionPatchSeq;
+      const value = this.permission || "default";
+      const session = this.sessions.find(s => s.id === sid);
+      const previous = (session && session.permission) || "default";
+      const priorExpected = st._permissionExpected;
+      const expected = {
+        seq, value,
+        fallback: priorExpected ? priorExpected.fallback : previous,
+      };
+      st._permissionExpected = expected;
+      try {
+        const r = await this._serializeTabSettingPatch(
+          st, "_permissionPatchTail", async () => {
+            if (this.tabState[sid] !== st || st._permissionPatchSeq !== seq) return null;
+            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+              method: "PATCH",
+              headers: { ...this.hdr(), "Content-Type": "application/json" },
+              body: JSON.stringify({ permission: value }),
+            });
+          },
+        );
+        if (!r) return false;
+        if (!r.ok) throw new Error(await r.text());
+        if (this.tabState[sid] !== st) return false;
+        const current = this.sessions.find(s => s.id === sid);
+        if (current) current.permission = value;
+        if (st._permissionExpected) {
+          st._permissionExpected.fallback = value;
+          if (st._permissionExpected.seq === seq && st._permissionExpected.echoed) {
+            st._permissionExpected = null;
+          }
+        }
+        if (st._permissionPatchSeq !== seq) return false;
+        if (this.currentId === sid) this.permission = value;
+        this.savePrefs();
+        return true;
+      } catch (_) {
+        if (this.tabState[sid] !== st || st._permissionPatchSeq !== seq) return false;
+        const fallback = expected.fallback;
+        if (st._permissionExpected === expected) st._permissionExpected = null;
+        const current = this.sessions.find(s => s.id === sid);
+        if (current) current.permission = fallback;
+        if (this.currentId === sid) this.permission = fallback;
+        this.toast(this.lang === "zh" ? "权限切换失败" : "Permission switch failed", "error");
+        return false;
+      }
+    },
     async onEffortChange() {
       if (!this.currentId) return false;
       const sid = this.currentId;
@@ -5284,13 +5348,16 @@ function portal() {
         _reconnectTimer: null,
         _canonicalResyncTimer: null,
         _canonicalResyncPending: false,
+        _permissionPatchSeq: 0,
         _effortPatchSeq: 0,
         _thinkingPatchSeq: 0,
         _queueSyncSeq: 0,
         _queueAppliedSeq: 0,
+        _permissionExpected: null,
         _effortExpected: null,
         _thinkingExpected: null,
         _effortPatchTail: null,
+        _permissionPatchTail: null,
         _thinkingPatchTail: null,
         _loaded: false,   // set true after first loadSession populates messages
         _seenUpdated: undefined,
@@ -6207,6 +6274,8 @@ function portal() {
       if (!st) return meta;
       let out = meta;
       const fields = [
+        ["_permissionExpected", "_permissionPatchTail", "permission",
+          value => value || "default"],
         ["_effortExpected", "_effortPatchTail", "effort",
           value => value || ""],
         ["_thinkingExpected", "_thinkingPatchTail", "thinking",
@@ -7022,6 +7091,7 @@ function portal() {
         st._serverActiveObserved = false;
         st._reconcileRetryTimer = null;
         st._reconcilePromise = null;
+        st._permissionPatchSeq = (Number(st._permissionPatchSeq) || 0) + 1;
         st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
         if (this.currentId === id && this.es === ownedEs) {
@@ -7101,6 +7171,7 @@ function portal() {
             keepalive: true,
             body: JSON.stringify({
               id, name: meta.name, model: meta.model || "", cwd: meta.cwd || "",
+              permission: meta.permission || this.defaultPermission || "bypassPermissions",
               open_ids: this.openTabIds || [],
             }),
           });
@@ -7174,6 +7245,7 @@ function portal() {
         id,
         name: prefix + stamp,
         model: seedModel,
+        permission: this.defaultPermission || "bypassPermissions",
         system_prompt: "",
         created_at: ts,
         updated_at: ts,
@@ -9772,6 +9844,9 @@ function portal() {
           // surface the state. The user can wait + reload to see more.
           this._checkActiveTurn(sid);
           if (s.model) this.model = s.model;
+          this.permission = st._permissionExpected
+            ? st._permissionExpected.value
+            : (s.permission || "default");
           // effort defaults to "" (adaptive); always assign so switching from
           // a high-effort tab to a fresh one doesn't leave the old value visible.
           this.effort = s.effort || "";
@@ -10658,6 +10733,10 @@ function portal() {
       );
       this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
       this.settings.draftDefaults = { ...d.defaults };
+      if (d.defaults && d.defaults.permission) {
+        this.defaultPermission = d.defaults.permission;
+        this.savePrefs();
+      }
       // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
       // Desktop: sidebar is always visible, so land on a default tab
       // (provider — the most-used section) and render only that pane.
@@ -11394,6 +11473,10 @@ function portal() {
           const d = await r.json();
           this.availableModels = d.models || [];
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
+          if (d.default_permission) {
+            this.defaultPermission = d.default_permission;
+            this.savePrefs();
+          }
           this._ensureValidModel();
         }
       } catch (e) {
@@ -11692,14 +11775,11 @@ function portal() {
           // newSession() seeds from defaultModel — update it so the change
           // takes effect on the very next new chat without a providers refetch.
           this.defaultModel = newDefaultModel;
-          // Also move the active dropdown to the new default (the original
-          // behavior) so "I changed it" is immediately visible.
-          if (newDefaultModel !== this.model) this.model = newDefaultModel;
           this.savePrefs();
         }
         const newDefaultPerm = this.settings.draftDefaults.permission;
-        if (newDefaultPerm && newDefaultPerm !== this.permission) {
-          this.permission = newDefaultPerm;
+        if (newDefaultPerm && newDefaultPerm !== this.defaultPermission) {
+          this.defaultPermission = newDefaultPerm;
           this.savePrefs();
         }
         // 刷新可用 provider 列表

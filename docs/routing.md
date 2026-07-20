@@ -68,9 +68,11 @@ A session that has run at least one turn is never re-resolved
 
 Each `ClaudeSDKClient` is keyed by `(session_id, model, effort)`
 ([`chat.py:L303`](../backend/chat.py#L303),
-[`chat.py:L1317`](../backend/chat.py#L1317)). **Permission mode is not part of
-the key** — it can be updated in-place via `set_permission_mode()` without
-spawning a new subprocess.
+[`chat.py:L1317`](../backend/chat.py#L1317)). Permission mode is a
+**process-launch contract**, not a dynamic Codex-style policy overlay. It is
+stored separately for the cached runtime; when it changes, muselab drains the
+current SDK operation, disconnects that session's client, and starts a fresh
+Claude Agent SDK runtime with the requested mode.
 
 The pool cap defaults to **3** clients and is configurable via
 `MUSELAB_CLIENT_POOL_CAP`
@@ -82,9 +84,9 @@ sessions.
 
 Under `_lock` (an `asyncio.Lock`), the pool checks `_clients[key]`
 ([`chat.py:L1318-L1349`](../backend/chat.py#L1318-L1349)). On a hit the LRU
-list is updated. If the cached client's permission mode differs from the
-request, `set_permission_mode()` is called **outside** `_lock` (it can take
-seconds) and the shared `_bypass_state` dict is flipped to match.
+list is updated. If the cached client's launch mode differs from the request,
+the cached runtime is discarded and rebuilt. A stale client is never returned
+after a failed in-place permission switch.
 
 ### Cache miss (slow path)
 

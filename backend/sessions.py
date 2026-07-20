@@ -287,6 +287,7 @@ def _merge_sdk_with_index(
         "id": info.session_id,
         "name": name,
         "model": m.get("model", ""),
+        "permission": m.get("permission", ""),
         "system_prompt": m.get("system_prompt", ""),
         # Auto-named flag stays True only if neither SDK custom_title nor
         # an explicit muselab rename has happened yet.
@@ -467,13 +468,16 @@ def create_session(
     model: str = "",
     system_prompt: str = "",
     cwd: str | Path | None = None,
+    permission: str = "",
 ) -> dict:
     return register_session(str(uuid.uuid4()), name=name, model=model,
+                            permission=permission,
                             system_prompt=system_prompt, auto_named=True,
                             cwd=cwd)
 
 
 def register_session(sid: str, *, name: str = "", model: str = "",
+                     permission: str = "",
                      system_prompt: str = "", auto_named: bool = True,
                      message_count: int = 0,
                      cwd: str | Path | None = None) -> dict:
@@ -486,6 +490,7 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "id": sid,
         "name": name or _default_session_name(),
         "model": model,
+        "permission": permission,
         "system_prompt": system_prompt,
         "created_at": now,
         "updated_at": now,
@@ -712,6 +717,18 @@ def update_model(sid: str, model: str) -> None:
                 s["model"] = model
                 _save_index(idx)
                 return
+
+
+def update_permission(sid: str, permission: str) -> bool:
+    """Persist the permission selected for subsequent turns in this session."""
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["permission"] = permission
+                _save_index(idx)
+                return True
+        return False
 
 
 # effort is one of: "" (auto/SDK default) | "low" | "medium" | "high" | "xhigh" | "max"

@@ -561,6 +561,53 @@ def ack_unread() -> int:
 
 # ---------- task execution ----------
 
+
+async def _run_sdk_task_turn(
+    session_id: str, model: str, prompt: str,
+) -> tuple[str, str | None]:
+    """Run one unattended turn under the session-wide SDK mutex."""
+    from .chat import (
+        _active_turns,
+        _session_runtime_lock_for,
+        get_client,
+    )
+
+    reply_text = ""
+    error: str | None = None
+    async with _session_runtime_lock_for(session_id):
+        # Re-check after acquiring: an interactive request may have reserved
+        # the session while this scheduled run was waiting for the mutex.
+        active = _active_turns.get(session_id)
+        if active is not None and not active.done:
+            raise RuntimeError("session is busy with an interactive turn")
+
+        # Unattended runs intentionally use bypassPermissions: no UI is
+        # present to answer a prompt. This is not a sandbox; the process has
+        # the service user's OS authority. Deployments that schedule prompts
+        # over untrusted content must isolate the service account/container or
+        # introduce an explicit non-interactive allow policy.
+        client = await get_client(
+            session_id=session_id,
+            model=model,
+            permission="bypassPermissions",
+        )
+        await client.query(prompt)
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in getattr(msg, "content", []) or []:
+                    if isinstance(block, TextBlock):
+                        reply_text += getattr(block, "text", "") or ""
+            elif isinstance(msg, ResultMessage):
+                if getattr(msg, "is_error", False):
+                    subtype = getattr(msg, "subtype", None) or "error"
+                    errors = getattr(msg, "errors", None) or []
+                    detail = "; ".join(str(e) for e in errors)
+                    error = (f"SDK result error ({subtype})"
+                             + (f": {detail}" if detail else ""))
+                break
+    return reply_text, error
+
+
 async def run_task_now(tid: str) -> bool:
     """Fire-and-forget out-of-schedule run. Returns True if the task exists
     and got scheduled; False if not found. Does NOT advance next_run — this
@@ -596,7 +643,6 @@ async def _execute_task(task: dict) -> None:
         the regular session list. task["session_id"] is overwritten to
         point at the latest run — list_task_history(tid) is the full
         view via history entries."""
-    from .chat import get_client  # local import — avoids startup cycle
     from datetime import datetime
 
     tid = task["id"]
@@ -650,57 +696,12 @@ async def _execute_task(task: dict) -> None:
             # default when task.model is empty.
             from .settings import MODEL as _DEFAULT_MODEL
             model = task.get("model") or _DEFAULT_MODEL
-            # SECURITY — unattended runs use bypassPermissions BY DESIGN.
-            # A scheduled task fires with no human present, so there is no
-            # one to answer a permission prompt; any mode that can block on
-            # can_use_tool would hang the run forever. The cost is that the
-            # agent can run arbitrary Bash (mv / rm / write files) with no
-            # confirmation. The real escalation path is PROMPT INJECTION:
-            # if a scheduled prompt pulls in external content (e.g.
-            # "summarize my latest email / fetch this page"), injected
-            # instructions in that content execute unchecked. Mitigations
-            # already in place: the SDK disallowed_tools blocklist (chat.py)
-            # and the archive-root sandbox. Self-hosters who schedule tasks
-            # that read untrusted external content should keep those prompts
-            # narrow. Do NOT "fix" this by switching to default/acceptEdits
-            # without also giving unattended runs a non-interactive
-            # permission resolver — otherwise scheduled tasks will silently
-            # hang. (See audit E/247.)
-            client = await get_client(
-                session_id=sid,
-                model=model,
-                permission="bypassPermissions",
-            )
-            # SDK 0.2.x AssistantMessage.content is a list of dataclass
-            # blocks (TextBlock / ToolUseBlock / ThinkingBlock / …), NOT
-            # plain dicts — so `block.type` doesn't exist as a string. The
-            # original implementation was checking that string and silently
-            # never matching, which left reply_text empty and made every
-            # push notification say "(no reply)". isinstance check is what
-            # chat.py uses too — mirror it here.
-            await client.query(task["prompt"])
-            async for msg in client.receive_response():
-                if isinstance(msg, AssistantMessage):
-                    for block in getattr(msg, "content", []) or []:
-                        if isinstance(block, TextBlock):
-                            reply_text += getattr(block, "text", "") or ""
-                elif isinstance(msg, ResultMessage):
-                    # The SDK reports turn-level failures (max turns, budget
-                    # exceeded, permission denied, API errors) THROUGH a
-                    # normal ResultMessage with is_error=True — not as an
-                    # exception. Without this check the run was recorded as
-                    # ok and the user saw a "success" entry with whatever
-                    # partial text had streamed.
-                    if getattr(msg, "is_error", False):
-                        _subtype = getattr(msg, "subtype", None) or "error"
-                        _errs = getattr(msg, "errors", None) or []
-                        _detail = "; ".join(str(e) for e in _errs)
-                        error = (f"SDK result error ({_subtype})"
-                                 + (f": {_detail}" if _detail else ""))
-                        sys.stderr.write(
-                            f"[scheduler] task {tid} ({task['name']}) "
-                            f"result is_error: {error}\n")
-                    break
+            reply_text, error = await _run_sdk_task_turn(
+                sid, model, task["prompt"])
+            if error:
+                sys.stderr.write(
+                    f"[scheduler] task {tid} ({task['name']}) "
+                    f"result is_error: {error}\n")
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             sys.stderr.write(f"[scheduler] task {tid} ({task['name']}) failed: {error}\n")

@@ -7,11 +7,12 @@ Two levels:
   - endpoint round-trips against /api/chat/sessions/{sid}/queue
     (GET / POST / DELETE / pause / reorder).
 
-The drain dispatch (_maybe_drain_queue → _start_turn) needs the Claude SDK
-+ a live model, so it isn't unit-tested here — we only cover the queue STATE
-it reads/writes (mirrors how test_scheduler.py leaves _execute_task out).
+The drain dispatch is tested with its SDK turn launcher replaced by a narrow
+fake, keeping queue permission and rollback semantics hermetic.
 """
 from __future__ import annotations
+
+import pytest
 
 
 def _sess(app_module):
@@ -284,3 +285,26 @@ def test_queue_endpoint_requires_auth(client):
     """At least one route enforces the token — no header → 401."""
     r = client.get("/api/chat/sessions/whatever/queue")
     assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_drain_replays_snapshot_without_reverting_session_permission(
+    app_module, monkeypatch,
+):
+    from backend import chat
+
+    sess = _sess(app_module)
+    meta = sess.create_session(permission="plan")
+    sid = meta["id"]
+    sess.enqueue_message(sid, "queued", permission="default")
+    observed = {}
+
+    async def fake_start_turn(session_id, prompt, **kwargs):
+        observed.update(session_id=session_id, prompt=prompt, **kwargs)
+
+    monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+    await chat._maybe_drain_queue(sid)
+
+    assert observed["permission"] == "default"
+    assert observed["persist_permission"] is False
+    assert sess.get_session(sid)["permission"] == "plan"

@@ -4,6 +4,8 @@ Claude SDK + a real model call); we cover the state-management surface
 that fresh mode introduced and the back-compat path for old tasks."""
 from __future__ import annotations
 
+import asyncio
+
 
 def _sched_mod(app_module):
     """Pull the scheduler module out of the reloaded backend.* tree.
@@ -89,6 +91,27 @@ def test_effective_session_mode_respects_explicit_value(app_module):
         {"session_mode": "fresh"}) == "fresh"
     assert sched._effective_session_mode(
         {"session_mode": "reuse"}) == "reuse"
+
+
+def test_sdk_turn_rejects_session_with_interactive_owner(
+    app_module, monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat
+
+    sid = "busy-session"
+    chat._active_turns[sid] = type("Busy", (), {"done": False})()
+
+    async def should_not_get_client(*_args, **_kwargs):
+        raise AssertionError("scheduler must not touch an interactive runtime")
+
+    monkeypatch.setattr(chat, "get_client", should_not_get_client)
+    try:
+        with pytest.raises(RuntimeError, match="interactive turn"):
+            asyncio.run(sched._run_sdk_task_turn(sid, "model", "prompt"))
+    finally:
+        chat._active_turns.pop(sid, None)
+        chat._session_runtime_locks.pop(sid, None)
 
 
 # ---- delete_task ----

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from claude_agent_sdk.types import PermissionMode
 from pydantic import BaseModel, Field, model_validator
 
 from .auth import require_token
@@ -103,7 +104,7 @@ class SettingsIn(BaseModel):
     provider_keys: dict[str, str] | None = None
     # Defaults
     default_model: str | None = None
-    default_permission: str | None = None
+    default_permission: PermissionMode | None = None
     # (Removed 2026-05-28) notify_scheduled / notify_normal —
     # The 4-toggle notification panel collapsed to a single client-side
     # "notify me" switch. Subscription state IS the on/off; no per-class
