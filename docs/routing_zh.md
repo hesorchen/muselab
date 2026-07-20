@@ -42,13 +42,13 @@
 
 ### 缓存键与容量
 
-每个 `ClaudeSDKClient` 的缓存键为 `(session_id, model, effort)`（[`chat.py:L303`](../backend/chat.py#L303)、[`chat.py:L1317`](../backend/chat.py#L1317)）。**权限模式不纳入缓存键** —— 它可以通过 `set_permission_mode()` 原地更新，无需派生新的子进程（fork）。
+每个 `ClaudeSDKClient` 的缓存键为 `(session_id, model, effort)`（[`chat.py:L303`](../backend/chat.py#L303)、[`chat.py:L1317`](../backend/chat.py#L1317)）。权限模式是 **SDK 进程启动契约**，而不是 Codex 风格的动态策略覆盖。权限会单独记录在缓存运行时上；发生变更时，muselab 会等待当前 SDK 操作结束，断开该会话的客户端，再以新模式启动 Claude Agent SDK 运行时。
 
 客户端池（client pool）默认上限为 **3** 个，可通过 `MUSELAB_CLIENT_POOL_CAP` 配置（[`chat.py:L473`](../backend/chat.py#L473)）。每个 CLI 子进程约占 30–50 MB RSS；该上限防止随着用户打开更多会话而无限制地增长内存。
 
 ### 缓存命中（快速路径）
 
-在 `_lock`（一个 `asyncio.Lock`）保护下，客户端池检查 `_clients[key]`（[`chat.py:L1318-L1349`](../backend/chat.py#L1318-L1349)）。命中时更新 LRU 列表。若缓存客户端的权限模式与请求不符，则在 `_lock` **之外**调用 `set_permission_mode()`（可能耗时数秒），并翻转共享的 `_bypass_state` 字典以使之匹配。
+在 `_lock`（一个 `asyncio.Lock`）保护下，客户端池检查 `_clients[key]`（[`chat.py:L1318-L1349`](../backend/chat.py#L1318-L1349)）。命中时更新 LRU 列表。若缓存客户端的启动权限与请求不符，则直接丢弃并重建运行时；系统不会在原地切换权限失败后返回旧客户端。
 
 ### 缓存未命中（慢速路径）
 

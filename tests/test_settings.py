@@ -63,6 +63,15 @@ def test_put_settings_writes_env_and_refreshes(client, auth, monkeypatch, tmp_pa
     assert os.environ["MUSELAB_DEFAULT_MODEL"] == "claude-haiku-4-5-20251001"
 
 
+def test_put_settings_rejects_non_sdk_permission_mode(client, auth):
+    r = client.put(
+        "/api/settings",
+        headers=auth,
+        json={"default_permission": "codex-full-access"},
+    )
+    assert r.status_code == 422
+
+
 def test_put_settings_skips_empty_values(client, auth, monkeypatch, tmp_path):
     """Empty / None provider key = 'don't touch'; existing value preserved."""
     from backend import api_settings as api_s

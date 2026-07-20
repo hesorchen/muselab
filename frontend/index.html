@@ -2848,11 +2848,14 @@
               </template>
             </select>
             <!-- Permission mode -->
-            <select x-model="permission" class="chat-toolbar-select chat-toolbar-permission"
+            <select x-model="permission" @change="onPermissionChange()"
+                    class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
               <option value="bypassPermissions">bypass</option>
               <option value="acceptEdits">acceptEdits</option>
               <option value="default">default</option>
+              <option value="dontAsk">dontAsk</option>
+              <option value="auto">auto</option>
               <option value="plan">plan</option>
             </select>
             <!-- Reasoning effort. Empty = SDK adaptive default (Opus 4.7's
@@ -2893,10 +2896,12 @@
                    @click.outside="composerSettingsOpen = false">
                 <label class="chat-toolbar-more-field">
                   <span x-text="t('set.label.default_permission')"></span>
-                  <select x-model="permission">
+                  <select x-model="permission" @change="onPermissionChange()">
                     <option value="bypassPermissions">bypass</option>
                     <option value="acceptEdits">acceptEdits</option>
                     <option value="default">default</option>
+                    <option value="dontAsk">dontAsk</option>
+                    <option value="auto">auto</option>
                     <option value="plan">plan</option>
                   </select>
                 </label>
@@ -4049,6 +4054,8 @@
               <option value="bypassPermissions" x-text="lang==='zh' ? 'bypass（无提示）' : 'bypass (no prompts)'"></option>
               <option value="acceptEdits">acceptEdits</option>
               <option value="default">default</option>
+              <option value="dontAsk">dontAsk</option>
+              <option value="auto">auto</option>
               <option value="plan">plan</option>
             </select>
           </div>

@@ -113,6 +113,7 @@ _VENDOR_CONFIG_DIR = (
     Path(tempfile.gettempdir())
     / f"muselab-vendor-cli-config-{os.getuid()}"
 )
+_VENDOR_CONFIG_LOCK = threading.Lock()
 
 
 def _vendor_config_dir() -> Path:
@@ -125,6 +126,41 @@ def _vendor_config_dir() -> Path:
     sessions."""
     _VENDOR_CONFIG_DIR.mkdir(exist_ok=True, mode=0o700)
     return _VENDOR_CONFIG_DIR
+
+
+def ensure_vendor_workspace_trusted(workspace: Path) -> None:
+    """Record trust in the isolated vendor CLI config.
+
+    Third-party sessions deliberately cannot reuse the real Claude config
+    because that could leak/fallback to OAuth. The isolation also means the
+    CLI has never seen the workspace trust dialog, so it otherwise ignores
+    project permission allow rules. Preserve every CLI-owned field and add
+    only the standard per-project trust bit.
+    """
+    from .settings import atomic_write_text
+
+    cfg_path = _vendor_config_dir() / ".claude.json"
+    workspace_key = str(workspace.resolve())
+    with _VENDOR_CONFIG_LOCK:
+        try:
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            data = raw if isinstance(raw, dict) else {}
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            data = {}
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            projects = {}
+            data["projects"] = projects
+        current = projects.get(workspace_key)
+        project = dict(current) if isinstance(current, dict) else {}
+        if project.get("hasTrustDialogAccepted") is True:
+            return
+        project["hasTrustDialogAccepted"] = True
+        projects[workspace_key] = project
+        atomic_write_text(
+            cfg_path,
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        )
 
 
 def _resolve_base_url(env_key: str, provider: Provider | None = None) -> str:

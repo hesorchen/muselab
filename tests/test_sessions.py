@@ -8,7 +8,10 @@ flows require a live SDK and are not unit-testable here.
 
 
 def test_session_lifecycle(client, auth):
-    r = client.post("/api/chat/sessions", headers=auth, json={"name": "t1"})
+    r = client.post(
+        "/api/chat/sessions", headers=auth,
+        json={"name": "t1", "permission": "default"},
+    )
     assert r.status_code == 200
     sid = r.json()["id"]
 
@@ -19,17 +22,31 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 200
     s = r.json()
     assert s["name"] == "t1"
+    assert s["permission"] == "default"
     # New session, no SDK turn yet → CLI JSONL doesn't exist → empty messages
     assert s["messages"] == []
 
-    r = client.patch(f"/api/chat/sessions/{sid}", headers=auth, json={"name": "t2"})
+    r = client.patch(
+        f"/api/chat/sessions/{sid}", headers=auth,
+        json={"name": "t2", "permission": "dontAsk"},
+    )
     assert r.status_code == 200
     r = client.get(f"/api/chat/sessions/{sid}", headers=auth)
     assert r.json()["name"] == "t2"
+    assert r.json()["permission"] == "dontAsk"
 
     r = client.delete(f"/api/chat/sessions/{sid}", headers=auth)
     assert r.status_code == 200
     r = client.get(f"/api/chat/sessions/{sid}", headers=auth)
+    assert r.status_code == 404
+
+
+def test_permission_patch_unknown_session_is_404(client, auth):
+    r = client.patch(
+        "/api/chat/sessions/not-a-session",
+        headers=auth,
+        json={"permission": "default"},
+    )
     assert r.status_code == 404
 
 
@@ -185,7 +202,9 @@ def test_usage_endpoint(client, auth):
 def test_providers_endpoint(client, auth):
     r = client.get("/api/chat/providers", headers=auth)
     assert r.status_code == 200
-    models = r.json()["models"]
+    body = r.json()
+    models = body["models"]
+    assert body["default_permission"] == "bypassPermissions"
     # Conftest deletes ANTHROPIC_API_KEY; without claude OAuth either,
     # Claude group must be hidden (regression fix from ba00629).
     from backend import endpoints
@@ -193,6 +212,13 @@ def test_providers_endpoint(client, auth):
         assert not any(m["model"].startswith("claude-") for m in models)
     # DeepSeek hidden because key not set in test env
     assert not any(m["model"].startswith("deepseek-") for m in models)
+
+
+def test_providers_rejects_stale_default_permission(client, auth, monkeypatch):
+    monkeypatch.setenv("MUSELAB_DEFAULT_PERMISSION", "codex-full-access")
+    r = client.get("/api/chat/providers", headers=auth)
+    assert r.status_code == 200
+    assert r.json()["default_permission"] == "bypassPermissions"
 
 
 def test_providers_includes_deepseek_after_key_set(client, auth, monkeypatch):

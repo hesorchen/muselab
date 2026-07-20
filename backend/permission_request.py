@@ -7,12 +7,10 @@ Two responsibilities now share one callback (SDK 0.2.82 routes both through
 1. **Tool approval** (when permission_mode != bypassPermissions):
    surface a permission card, await Allow / Deny / Always.
 
-2. **AskUserQuestion** (always, regardless of permission_mode): SDK's
-   native multiple-choice tool. Detected by `tool_name == "AskUserQuestion"`.
-   We push a question to the SSE channel reusing `ask_user_question`'s
-   queue/Future registry (same UI rendering, same submit endpoint), then
-   return `PermissionResultAllow(updated_input={questions, answers})` per
-   the SDK contract.
+2. **AskUserQuestion** (only when the SDK actually asks): SDK's native
+   multiple-choice tool. In bypass mode the SDK auto-approves tools before
+   this callback, so muselab's reliable interactive surface is the dedicated
+   `mcp__muselab__ask_user_question` tool instead.
 
 "Always allow" works at the muselab session level (in-memory): subsequent calls
 to the same (tool, key) pair bypass the prompt for the rest of this session.
@@ -63,12 +61,21 @@ def register_session_queue(session_id: str) -> asyncio.Queue:
 
 def unregister_session_queue(session_id: str) -> None:
     _session_queues.pop(session_id, None)
-    _always_allow.pop(session_id, None)
     for key in list(_pending.keys()):
         if key[0] == session_id:
             fut = _pending.pop(key, None)
             if fut is not None and not fut.done():
                 fut.cancel()
+
+
+def clear_session_permissions(session_id: str) -> None:
+    """Forget session-scoped grants when the session itself is deleted.
+
+    Queue registration is turn-scoped, while an "always" decision is
+    session-scoped.  Keeping these lifetimes separate makes the UI promise
+    ("always allow for this session") true across multiple turns.
+    """
+    _always_allow.pop(session_id, None)
 
 
 def submit_decision(session_id: str, request_id: str, decision: str,
@@ -181,32 +188,14 @@ async def _handle_ask_user_question(
         updated_input={"questions": questions, "answers": answers})
 
 
-def build_callback_for_session(session_id: str,
-                                bypass_state: dict | None = None):
+def build_callback_for_session(session_id: str):
     """Return an async callable matching the SDK's can_use_tool signature.
 
-    Wired UNCONDITIONALLY now (2026-05-23) — not just when permission_mode
-    requires per-tool prompts. Reason: the SDK routes the built-in
-    `AskUserQuestion` tool calls through `can_use_tool`, so without a
-    callback the model's questions silently vanish on bypassPermissions
-    (the default). The MCP fallback `mcp__muselab__ask_user_question` is
-    great when the model remembers to use that name, but models often
-    forget and call the shorter built-in instead.
-
-    `bypass_state` is a MUTABLE dict `{"bypass": bool}` owned by the caller
-    (chat.get_client). The callback reads `bypass_state["bypass"]` at call
-    time — NOT baked in as a constant — so that switching permission mode on
-    a cached/pooled client (via set_permission_mode) takes effect without
-    rebuilding the closure. When `bypass` is True (permission_mode ==
-    bypassPermissions) every non-AskUserQuestion tool is auto-allowed
-    without showing a permission card; when False, full per-tool prompting.
-    AskUserQuestion is always forwarded to the UI regardless — it's
-    interactive by design. (2026-05-29: previously this captured a constant
-    `bypass`, so switching from bypassPermissions to default left the cached
-    closure unconditionally allowing every tool — permission cards silently
-    failed.)"""
-    if bypass_state is None:
-        bypass_state = {"bypass": False}
+    The callback is installed only for permission modes that can ask. The SDK
+    explicitly does not invoke it for calls already approved by bypass,
+    acceptEdits, allow rules, or whole-tool Skill grants. It is therefore a
+    prompt resolver, not a universal tool gate. Use a PreToolUse hook when an
+    operation must observe every tool call."""
 
     async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], context: Any
@@ -219,14 +208,6 @@ def build_callback_for_session(session_id: str,
         # for the SDK-contract details.
         if tool_name == "AskUserQuestion":
             return await _handle_ask_user_question(session_id, tool_input)
-
-        # Bypass: auto-allow everything else without prompting. This
-        # keeps the "no permission cards" UX promise of bypassPermissions
-        # while still letting AskUserQuestion above route through the UI.
-        # Read the flag LIVE (not a captured constant) so a mode switch on
-        # the pooled client takes effect immediately.
-        if bypass_state.get("bypass"):
-            return PermissionResultAllow(updated_input=tool_input)
 
         # Always-allow cache check. Empty set is falsy, so don't use `or`.
         key = _input_key(tool_name, tool_input)

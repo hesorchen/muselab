@@ -1,8 +1,8 @@
 """Client-pool behavior for chat.get_client / disconnect_client.
 
 These guard the long-lived state the rest of the chat surface depends on:
-the (sid, model, effort) -> ClaudeSDKClient cache plus its four side dicts
-(_client_permission / _bypass_state / _creation_locks / _client_lru).
+the (sid, model, effort) -> ClaudeSDKClient cache plus its side registries
+(_client_permission / _creation_locks / _client_lru).
 
 Production code spawns a real CLI subprocess in _build_and_connect_client;
 we monkeypatch THAT (not get_client) so the cache/LRU/eviction logic under
@@ -14,18 +14,13 @@ import pytest
 
 
 class _FakeSDKClient:
-    """Stands in for ClaudeSDKClient. Records permission-mode flips and
-    disconnects so tests can assert the pool drove them."""
+    """Stands in for ClaudeSDKClient and records disconnects."""
 
     def __init__(self, sid="s", model="m", effort=""):
         self.sid = sid
         self.model = model
         self.effort = effort
-        self.permission_modes: list[str] = []
         self.disconnected = False
-
-    async def set_permission_mode(self, mode):
-        self.permission_modes.append(mode)
 
     async def disconnect(self):
         self.disconnected = True
@@ -38,27 +33,24 @@ def chat_mod(app_module):
     from backend import chat as chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
-    chat_mod._bypass_state.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._session_runtime_locks.clear()
+    chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._sessions_with_inflight_tasks.clear()
     yield chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
-    chat_mod._bypass_state.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._session_runtime_locks.clear()
+    chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._sessions_with_inflight_tasks.clear()
 
 
 def _patch_builder(monkeypatch, chat_mod):
-    """Replace the slow CLI-spawning path with a fake-client factory that
-    ALSO registers the bypass_state dict the same way production does (so
-    the get_client permission-flip path has something to flip)."""
+    """Replace the slow CLI-spawning path with a fake-client factory."""
     async def fake_build(session_id, model, permission, effort):
-        key = (session_id, model, effort)
-        chat_mod._bypass_state[key] = {
-            "bypass": permission == "bypassPermissions"}
         return _FakeSDKClient(session_id, model, effort)
 
     monkeypatch.setattr(chat_mod, "_build_and_connect_client", fake_build)
@@ -102,7 +94,7 @@ def test_different_key_builds_new_client(chat_mod, monkeypatch):
 
 def test_disconnect_client_evicts_entry_and_all_side_dicts(chat_mod, monkeypatch):
     """disconnect_client must remove the pool entry AND _client_permission,
-    _bypass_state, _creation_locks, _client_lru — leaving zero residue."""
+    _creation_locks and _client_lru — leaving zero residue."""
     _patch_builder(monkeypatch, chat_mod)
 
     async def run():
@@ -112,7 +104,6 @@ def test_disconnect_client_evicts_entry_and_all_side_dicts(chat_mod, monkeypatch
         assert key in chat_mod._creation_locks
         assert key in chat_mod._clients
         assert key in chat_mod._client_permission
-        assert key in chat_mod._bypass_state
         assert key in chat_mod._client_lru
 
         await chat_mod.disconnect_client("sid-evict")
@@ -122,49 +113,33 @@ def test_disconnect_client_evicts_entry_and_all_side_dicts(chat_mod, monkeypatch
     assert c.disconnected is True, "evicted client never disconnected"
     assert key not in chat_mod._clients
     assert key not in chat_mod._client_permission
-    assert key not in chat_mod._bypass_state
     assert key not in chat_mod._creation_locks
     assert key not in chat_mod._client_lru
 
 
-def test_permission_switch_flips_shared_bypass_flag_live(chat_mod, monkeypatch):
-    """L244 regression: switching permission mode on a CACHED client via
-    get_client must flip the SAME _bypass_state[key] dict the can_use_tool
-    closure captured by reference — so a bypass→default switch starts
-    actually prompting, and default→bypass stops prompting, WITHOUT a
-    client rebuild."""
+def test_permission_switch_rebuilds_runtime(chat_mod, monkeypatch):
+    """Permission is launch-sensitive, so every mode change replaces the
+    runtime rather than risking a stale or partially-switched client."""
     _patch_builder(monkeypatch, chat_mod)
 
     async def run():
         key = ("sid-flip", "claude-sonnet-4-6", "")
-        # First call: bypassPermissions → bypass flag True.
         c1 = await chat_mod.get_client("sid-flip", "claude-sonnet-4-6", "bypassPermissions")
-        st = chat_mod._bypass_state[key]
-        assert st["bypass"] is True
-
-        # Switch to 'default' on the cached client. Same object back.
         c2 = await chat_mod.get_client("sid-flip", "claude-sonnet-4-6", "default")
-        assert c2 is c1, "permission switch must NOT rebuild the client"
-        # The closure's captured dict was mutated in place.
-        assert st["bypass"] is False, "bypass flag not flipped to False — closure stale"
+        assert c2 is not c1
+        assert c1.disconnected is True
         assert chat_mod._client_permission[key] == "default"
-        # SDK set_permission_mode was actually called with the new mode.
-        assert c1.permission_modes == ["default"]
-
-        # Switch back to bypass — flag flips live again.
         c3 = await chat_mod.get_client("sid-flip", "claude-sonnet-4-6", "bypassPermissions")
-        assert c3 is c1
-        assert st["bypass"] is True
-        assert c1.permission_modes == ["default", "bypassPermissions"]
-        return st
+        assert c3 is not c2
+        assert c2.disconnected is True
+        assert chat_mod._client_permission[key] == "bypassPermissions"
 
     asyncio.run(run())
 
 
 def test_eviction_at_pool_cap_drops_oldest_and_its_side_dicts(chat_mod, monkeypatch):
     """When the LRU exceeds _CLIENT_POOL_CAP, the oldest non-streaming entry
-    is evicted: removed from _clients/_client_permission/_bypass_state/
-    _client_lru and disconnected."""
+    is evicted and removed from every side registry."""
     _patch_builder(monkeypatch, chat_mod)
     monkeypatch.setattr(chat_mod, "_CLIENT_POOL_CAP", 2)
 
@@ -180,7 +155,6 @@ def test_eviction_at_pool_cap_drops_oldest_and_its_side_dicts(chat_mod, monkeypa
     assert a.disconnected is True, "oldest entry not disconnected on eviction"
     assert key_a not in chat_mod._clients
     assert key_a not in chat_mod._client_permission
-    assert key_a not in chat_mod._bypass_state
     assert key_a not in chat_mod._client_lru
     # B and C survive.
     assert ("B", "claude-sonnet-4-6", "") in chat_mod._clients

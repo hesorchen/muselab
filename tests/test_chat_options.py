@@ -36,9 +36,26 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
     assert captured["connected"] is True
     assert client is not None
     assert captured["skills"] == "all"
+    assert "can_use_tool" not in captured
     assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-test"
     for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
         assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "deepseek-v4-pro"
+
+
+def test_non_bypass_runtime_installs_permission_resolver(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-default-permission", "deepseek-v4-pro", "default", ""))
+
+    assert callable(captured["can_use_tool"])
 
 
 def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path):
