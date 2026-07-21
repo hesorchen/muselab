@@ -4126,7 +4126,7 @@ function portal() {
     // ROOT-relative path whose full path ends with the clicked path (same
     // file, just a missing prefix). Caller decides: 0 → not-found toast,
     // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
-    async _findBySuffix(path, name, requestHeaders = this.hdr()) {
+    async _findBySuffix(path, name, requestHeaders = this.fileHdr()) {
       try {
         const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
           { headers: requestHeaders });
@@ -4162,7 +4162,7 @@ function portal() {
     // model output and may not exist — surface the failure as a toast.
     async openByPathToasted(path) {
       const ownerWorkspace = this.fileWorkspacePath();
-      const requestHeaders = this.hdr();
+      const requestHeaders = this.fileHdr();
       // HEAD-equivalent check via list on the parent dir is fragile (binary
       // files, images etc. don't go through /api/files/read). Just delegate
       // to openFile and let it set previewMode='unsupported' / pdf / img,
@@ -4325,8 +4325,8 @@ function portal() {
     },
 
     hdr() {
-      // Global/file requests intentionally omit a workspace header: backend
-      // file APIs then use their safe default, the primary MUSELAB_ROOT.
+      // Global requests are workspace-agnostic. File and conversation requests
+      // add their registered workspace through fileHdr()/conversationHdr().
       return { "X-Auth-Token": this.token };
     },
     conversationHdr(path = "") {
@@ -8765,7 +8765,7 @@ function portal() {
       fd.append("file", file);
       try {
         const r = await fetch("/api/files/upload", {
-          method: "POST", headers: this.hdr(), body: fd,
+          method: "POST", headers: this.fileHdr(), body: fd,
         });
         if (!r.ok) {
           console.warn("[upload]", file.name, "failed:", r.status);
@@ -12022,7 +12022,7 @@ function portal() {
       if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
         + (showHidden ? "&show_hidden=true" : "");
-      const requestHeaders = this.hdr();
+      const requestHeaders = this.fileHdr();
       const promise = (async () => {
         let r;
         try {
@@ -12399,7 +12399,7 @@ function portal() {
       try {
         r = await fetch("/api/files/write", {
           method: "PUT",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path, content: "" }),
         });
       } catch (e) {
@@ -12441,7 +12441,7 @@ function portal() {
       try {
         r = await fetch("/api/files/mkdir", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
         });
       } catch (e) {
@@ -12489,7 +12489,7 @@ function portal() {
       try {
         r = await fetch("/api/files/rename", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ src: n.path, dst: newPath }),
         });
       } catch (e) {
@@ -12537,7 +12537,7 @@ function portal() {
       try {
         r = await fetch("/api/files/copy-bak", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
       } catch (e) {
@@ -12629,7 +12629,7 @@ function portal() {
       try {
         r = await fetch("/api/files/delete", {
           method: "DELETE",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: n.path }),
         });
       } catch (e) {
@@ -12697,7 +12697,7 @@ function portal() {
         && ownerWorkspace === this.fileWorkspacePath();
       this.trash.loading = true;
       try {
-        const r = await fetch("/api/files/trash/list", { headers: this.hdr() });
+        const r = await fetch("/api/files/trash/list", { headers: this.fileHdr() });
         if (!isOwner()) return;
         if (!r.ok) {
           const detail = await r.text();
@@ -12727,7 +12727,7 @@ function portal() {
       try {
         r = await fetch("/api/files/trash/restore", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ trash_id: tid }),
         });
       } catch (e) {
@@ -12777,7 +12777,7 @@ function portal() {
       try {
         r = await fetch("/api/files/trash/purge", {
           method: "DELETE",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ trash_id: tid }),
         });
       } catch (e) {
@@ -12812,7 +12812,7 @@ function portal() {
       try {
         r = await fetch("/api/files/trash/empty", {
           method: "DELETE",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
         });
       } catch (e) {
         if (this._workspaceIsCurrent(ownerWorkspace)) {
@@ -12877,7 +12877,7 @@ function portal() {
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: p }),
           // 404 = already gone — count as done, not a failure.
         }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
@@ -12909,7 +12909,7 @@ function portal() {
       try {
         r = await fetch("/api/files/delete", {
           method: "DELETE",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
         });
       } catch (e) {
@@ -13644,7 +13644,7 @@ function portal() {
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path),
-                              { headers: this.hdr(), signal: controller.signal });
+                              { headers: this.fileHdr(), signal: controller.signal });
         if (_stale()) return false;
         if (r.ok) {
           const body = await r.text();
@@ -13691,7 +13691,7 @@ function portal() {
         // string matrices so the frontend just renders <table>s. No formula
         // evaluation; cells show the last-cached value.
         const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
-                              { headers: this.hdr(), signal: controller.signal });
+                              { headers: this.fileHdr(), signal: controller.signal });
         if (_stale()) return false;
         if (r.ok) {
           const data = await r.json();
@@ -13740,7 +13740,7 @@ function portal() {
         // that the archive-scoped /api/files/read can't reach.
         const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
         const r = await fetch(readUrl, {
-          headers: this.hdr(), signal: controller.signal,
+          headers: this.fileHdr(), signal: controller.signal,
         });
         if (_stale()) return false;
         if (r.ok) {
@@ -13802,7 +13802,7 @@ function portal() {
       try {
         const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
                     + `&offset=${reqOffset}&limit=${this.csvLimit}`;
-        const r = await fetch(url, { headers: this.hdr(), signal: controller.signal });
+        const r = await fetch(url, { headers: this.fileHdr(), signal: controller.signal });
         if (_csvStale()) return false;
         if (r.ok) {
           const data = await r.json();
@@ -14058,7 +14058,7 @@ function portal() {
       if (!path) { this.selectedMeta = null; return; }
       try {
         const r = await fetch("/api/files/stat?path=" + encodeURIComponent(path),
-                              { headers: this.hdr() });
+                              { headers: this.fileHdr() });
         if (!isOwner()) return;
         if (!r.ok) { this.selectedMeta = null; return; }
         const d = await r.json();
@@ -15083,7 +15083,7 @@ function portal() {
       const controller = new AbortController();
       this._fileSearchAbort = controller;
       const readJson = async (url) => {
-        const r = await fetch(url, { headers: this.hdr(), signal: controller.signal });
+        const r = await fetch(url, { headers: this.fileHdr(), signal: controller.signal });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       };
@@ -15198,7 +15198,7 @@ function portal() {
       fd.append("file", file);
       let r;
       try {
-        r = await fetch("/api/files/upload", { method: "POST", headers: this.hdr(), body: fd });
+        r = await fetch("/api/files/upload", { method: "POST", headers: this.fileHdr(), body: fd });
       } catch (e) {
         if (this._workspaceIsCurrent(ownerWorkspace)) {
           this.errToast("upload", String((e && e.message) || e));
@@ -15481,7 +15481,7 @@ function portal() {
       try {
         r = await fetch("/api/files/rename", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ src: srcPath, dst: newPath }),
         });
       } catch (e) {
@@ -15542,7 +15542,7 @@ function portal() {
       const results = await Promise.allSettled(plan.map(p =>
         fetch("/api/files/rename", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ src: p.src, dst: p.dst }),
         }).then(r => (r.ok ? p : Promise.reject(new Error(p.src))))
       ));
@@ -15603,7 +15603,7 @@ function portal() {
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: p }),
           // 404 = already gone (e.g. a child whose parent dir we just trashed
           // in the same batch) — count it as done, not a failure.
@@ -15744,7 +15744,7 @@ function portal() {
       try {
         r = await fetch("/api/files/mkdir", {
           method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: name }),
         });
       } catch (e) {
@@ -16113,7 +16113,7 @@ function portal() {
         let r;
         try {
           r = await fetch("/api/files/read?path=" + encodeURIComponent(targetPath),
-                          { headers: this.hdr() });
+                          { headers: this.fileHdr() });
         } catch (e) {
           if (this._workspaceIsCurrent(ownerWorkspace)
               && this.selected === targetPath) {
@@ -16187,7 +16187,7 @@ function portal() {
         try {
           r = await fetch("/api/files/write", {
             method: "PUT",
-            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            headers: { ...this.fileHdr(), "Content-Type": "application/json" },
             body: JSON.stringify({ path: savePath, content: saveText }),
           });
         } catch (e) {
@@ -16733,7 +16733,7 @@ function portal() {
       try {
         r = await fetch("/api/files/write", {
           method: "PUT",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          headers: { ...this.fileHdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: trimmed, content: "# " + trimmed.replace(/\.md$/, "") + "\n\n" }),
         });
       } catch (e) {
@@ -17092,7 +17092,7 @@ function portal() {
         let d = { entries: [] };
         try {
           const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15",
-                                { headers: this.hdr(), signal: controller.signal });
+                                { headers: this.fileHdr(), signal: controller.signal });
           if (r.ok) d = await r.json();
         } catch (e) {
           if ((e && e.name === "AbortError") || mentionSeq !== this._mentionSeq) return;
@@ -19275,7 +19275,7 @@ function portal() {
       try {
         const r = await fetch(
           "/api/files/search?q=" + encodeURIComponent(q) + "&limit=30",
-          { headers: this.hdr() });
+          { headers: this.fileHdr() });
         if (!isOwner()) return;
         if (!r.ok) { this.palette.fileResults = []; return; }
         const data = await r.json();
