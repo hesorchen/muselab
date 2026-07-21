@@ -397,7 +397,11 @@ def test_workspace_picker_switches_files_preview_and_conversation_together(
     assert state["tabCwds"] and set(state["tabCwds"]) == {str(other)}
     secondary_id = state["currentId"]
 
-    page.locator('.filelist li[data-path="WORKSPACE_ONLY.md"]').click()
+    workspace_file = page.locator('.filelist li[data-path="WORKSPACE_ONLY.md"]')
+    if not workspace_file.is_visible():
+        page.locator(".mobile-tab-bar button").first.click()
+        expect(workspace_file).to_be_visible()
+    workspace_file.click()
     page.wait_for_function(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
@@ -472,6 +476,8 @@ def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
     child.mkdir(parents=True)
     (child / "package.json").write_text('{"name":"nested"}\n', encoding="utf-8")
 
+    page.locator(".mobile-tab-bar button").first.click()
+    expect(page.locator(".workspace-picker-btn")).to_be_visible()
     page.locator(".workspace-picker-btn").click()
     page.locator(".workspace-picker-add").click()
     modal = page.locator(".workspace-browser-modal")
