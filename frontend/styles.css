@@ -2920,8 +2920,8 @@ pre.text {
    escapes the parent .chat-tabs overflow: auto clip. Just bump z-index. */
 .chat-tab-history .session-picker-pop { z-index: 1500; }
 
-/* Application-level workspace picker. It sits between history and the session
-   tabs so the selected directory clearly owns files, preview, and chat. */
+/* Application-level workspace picker. It lives in the files-pane header because
+   the selected directory owns the file tree, preview surface, and chat cwd. */
 .workspace-picker {
   position: relative;
   flex: 0 0 auto;
@@ -3061,7 +3061,14 @@ pre.text {
 @keyframes activity-running-pulse { 0% { transform:scale(.75); opacity:.8; } 75%,100% { transform:scale(1.4); opacity:0; } }
 .activity-center-btn .activity-unread { position:absolute; right:-2px; top:-2px; width:10px; height:10px; border:2px solid var(--c-bg-1); border-radius:var(--r-full); background:var(--c-success); box-sizing:border-box; pointer-events:none; }
 @media (prefers-reduced-motion:reduce) { .activity-center-btn .activity-running::after { animation:none; opacity:0; } }
-.chat-head-workspace { flex:0 1 220px; margin-left:8px; }
+.files-head-workspace {
+  flex: 1 1 120px;
+  min-width: 0;
+  max-width: 180px;
+  margin-left: 6px;
+  border-right: 0;
+}
+.files-head-workspace .workspace-picker-btn { width: 100%; max-width: none; border-radius: var(--r-sm); }
 .activity-modal { width:620px; max-width:calc(100vw - 32px); }
 .activity-summary { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--c-border); color:var(--c-fg-2); font-size:var(--fs-sm); }
 .activity-summary .running { color:var(--c-accent); }
@@ -3082,7 +3089,10 @@ pre.text {
 .activity-row-main strong,.activity-row-main small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .activity-row-main small,.activity-row-side small { color:var(--c-fg-3); font-size:var(--fs-xs); }
 .activity-row-side { flex:0 0 auto; display:flex; flex-direction:column; align-items:flex-end; gap:3px; color:var(--c-fg-2); font-size:var(--fs-xs); }
-@media (max-width:600px) { .chat-head-workspace { flex:1 1 auto; max-width:none; margin-left:2px; } .chat-head-workspace .workspace-picker-btn { width:100%; max-width:150px; } }
+@media (max-width:600px) {
+  .files-head-workspace { flex:1 1 auto; max-width:none; margin-left:2px; }
+  .files-head-workspace .workspace-picker-btn { width:100%; max-width:150px; }
+}
 
 @media (max-width: 600px) {
   .workspace-picker-btn { max-width: 112px; padding-inline: 7px; }

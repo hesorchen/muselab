@@ -470,7 +470,7 @@ function portal() {
       truncated: false, requestSeq: 0,
     },
     workspaceLastSession: {},
-    _loadedPrefsSchema: 4,
+    _loadedPrefsSchema: 5,
     workspaceSurfaces: {},
     _workspaceRuntimeCaches: new Map(),
     _workspaceTreeCacheTimers: new Map(),
@@ -4584,7 +4584,7 @@ function portal() {
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 4,          // v4 decouples conversation cwd from the archive surface
+        schema: 5,          // v5 persists one file/preview surface per workspace
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
@@ -4594,6 +4594,7 @@ function portal() {
         expanded: Array.from(this.expanded),
         activeWorkspace: this.activeWorkspace,
         workspaceLastSession: this.workspaceLastSession,
+        workspaceSurfaces: this.workspaceSurfaces,
         leftOpen: this.leftOpen, rightOpen: this.rightOpen,
         leftWidth: this.leftWidth, rightWidth: this.rightWidth,
         showHidden: this.showHidden,
@@ -6680,7 +6681,7 @@ function portal() {
       return ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
     },
     fileWorkspacePath() {
-      return this.primaryWorkspacePath();
+      return this.currentWorkspacePath();
     },
     currentWorkspacePath() {
       if (this.activeWorkspace) return this.activeWorkspace;
@@ -6908,10 +6909,9 @@ function portal() {
       }
       this.workspaceSwitching = true;
       try {
-        // Workspace selection changes only the conversation cwd. The file tree,
-        // preview tabs and editor remain rooted at primary MUSELAB_ROOT.
-        this.activeWorkspace = path;
-        await this.fetchContextInfo();
+        // A workspace owns the conversation cwd, file tree, preview tabs, and
+        // editor together. Preserve the old surface and restore the target one.
+        await this._changeWorkspaceSurface(path);
         if (!this.workspaceSessions(path).length) await this._pullAllSessions();
         const remembered = this.workspaceLastSession[path];
         const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
@@ -7123,10 +7123,7 @@ function portal() {
       try {
         if (this.activeWorkspace === path) {
           const primary = this.sessionWorkspaces.find(w => w.primary);
-          if (primary) {
-            this.activeWorkspace = primary.path;
-            await this.fetchContextInfo();
-          }
+          if (primary) await this._changeWorkspaceSurface(primary.path);
         }
         const response = await fetch(
           "/api/chat/workspaces?path=" + encodeURIComponent(path),
@@ -7345,8 +7342,7 @@ function portal() {
       const cwd = session && session.cwd;
       if (cwd && cwd !== this.currentWorkspacePath()
           && this.sessionWorkspaces.some(w => w.path === cwd)) {
-        this.activeWorkspace = cwd;
-        this.fetchContextInfo();
+        await this._changeWorkspaceSurface(cwd);
       }
       if (!this.openTabIds.includes(id)) {
         const MAX_TABS = 20;

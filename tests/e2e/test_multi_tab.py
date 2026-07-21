@@ -340,9 +340,9 @@ def test_queue_edit_restores_original_tab_during_switch(
     }
 
 
-def test_workspace_picker_switches_conversation_and_keeps_archive_surface(
+def test_workspace_picker_switches_files_preview_and_conversation_together(
         page: Page, backend_url, auth_token, tmp_path):
-    """A workspace switch changes chat cwd without moving the archive root."""
+    """A workspace switch moves chat, file tree, and preview as one surface."""
     _login(page, backend_url, auth_token)
     primary = page.evaluate(
         "() => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath()")
@@ -391,11 +391,19 @@ def test_workspace_picker_switches_conversation_and_keeps_archive_surface(
               app.sessions.find(item => item.id === id)?.cwd),
           };
         }""")
-    assert "WORKSPACE_ONLY.md" not in state["visible"]
-    assert "README.md" in state["visible"]
-    assert state["selected"] == "README.md"
+    assert "WORKSPACE_ONLY.md" in state["visible"]
+    assert "README.md" not in state["visible"]
+    assert state["selected"] == ""
     assert state["tabCwds"] and set(state["tabCwds"]) == {str(other)}
     secondary_id = state["currentId"]
+
+    page.locator('.filelist li[data-path="WORKSPACE_ONLY.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'WORKSPACE_ONLY.md'
+            && app.rawText.includes('workspace-isolated-preview');
+        }""")
 
     page.locator(".workspace-picker-btn").click()
     page.locator(".workspace-picker-row").filter(
@@ -420,8 +428,8 @@ def test_workspace_picker_switches_conversation_and_keeps_archive_surface(
         """([path, sid]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
           return app.currentWorkspacePath() === path && app.currentId === sid
-            && app.selected === 'README.md'
-            && app.rawText.includes('muselab e2e')
+            && app.selected === 'WORKSPACE_ONLY.md'
+            && app.rawText.includes('workspace-isolated-preview')
             && !app.workspaceSwitching;
         }""",
         arg=[str(other), secondary_id],
