@@ -179,19 +179,24 @@ def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     assert "height: 100dvh" in mobile
 
 
-def test_workspace_switch_changes_conversation_only_and_keeps_archive_surface():
+def test_workspace_switch_moves_files_preview_and_conversation_together():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     start = app.index("async switchWorkspace(path)")
     end = app.index("\n    closeWorkspaceBrowser()", start)
     switch = app[start:end]
 
-    assert "this.activeWorkspace = path" in switch
-    assert "await this.fetchContextInfo()" in switch
-    assert "_changeWorkspaceSurface" not in switch
-    assert "_confirmLoseEdits" not in switch
-    assert "loadRoot()" not in switch
-    assert "loadTrash()" not in switch
-    assert "_clearPreviewState" not in switch
+    assert "await this._changeWorkspaceSurface(path)" in switch
+    assert "return this.currentWorkspacePath()" in app
+    assert "workspaceSurfaces: this.workspaceSurfaces" in app
+    files_start = html.index('<aside class="pane files"')
+    files_end = html.index("</aside>", files_start)
+    chat_start = html.index('<aside class="pane chat"')
+    chat_end = html.index("</aside>", chat_start)
+    assert "files-head-workspace" in html[files_start:files_end]
+    assert "activity-center-btn" in html[files_start:files_end]
+    assert "workspace-picker" not in html[chat_start:chat_end]
+    assert "activity-center-btn" not in html[chat_start:chat_end]
 
 
 def test_session_history_and_workspace_use_distinct_icons():

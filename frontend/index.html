@@ -277,7 +277,49 @@
     <aside class="pane files" :class="{'pane-hidden': !leftOpen}">
       <header class="pane-head">
         <span class="pane-title"><span class="icon"><svg><use href="#i-folder"/></svg></span><span x-text="t('pane.files')"></span></span>
+        <div class="workspace-picker files-head-workspace" @click.outside="workspaceMenuOpen = false">
+          <button class="workspace-picker-btn" type="button"
+                  @click="workspaceMenuOpen = !workspaceMenuOpen"
+                  :disabled="workspaceSwitching" :title="currentWorkspacePath()"
+                  :aria-expanded="workspaceMenuOpen">
+            <svg><use href="#i-folder"/></svg>
+            <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
+            <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
+          </button>
+          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak>
+            <div class="workspace-picker-title">
+              <span x-text="t('workspace.title')"></span>
+              <button type="button" class="workspace-info-btn"
+                      @click.stop="toast(t('workspace.help'), 'info', 7000)"
+                      :title="t('workspace.help')"
+                      :aria-label="t('workspace.help')">
+                <svg><use href="#i-info"/></svg>
+              </button>
+            </div>
+            <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
+              <div class="workspace-picker-row" :class="{ active: workspace.path === currentWorkspacePath() }">
+                <button class="workspace-picker-select" @click="switchWorkspace(workspace.path)">
+                  <span class="workspace-picker-check" x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
+                  <span class="workspace-picker-meta"><strong x-text="workspace.name"></strong><small x-text="workspace.path"></small></span>
+                  <span class="workspace-activity-mini" x-show="workspaceActivity(workspace.path).running || workspaceActivity(workspace.path).unread">
+                    <span class="running" x-show="workspaceActivity(workspace.path).running" x-text="'◌ ' + workspaceActivity(workspace.path).running"></span>
+                    <span class="unread" x-show="workspaceActivity(workspace.path).unread" x-text="'✓ ' + workspaceActivity(workspace.path).unread"></span>
+                  </span>
+                </button>
+                <button class="workspace-picker-remove" x-show="!workspace.primary" @click.stop="removeWorkspace(workspace.path)"><svg><use href="#i-x"/></svg></button>
+              </div>
+            </template>
+            <button class="workspace-picker-add" @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span></button>
+          </div>
+        </div>
         <span class="spacer"></span>
+        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
+                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
+                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
+          <svg><use href="#i-list"/></svg>
+          <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
+          <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
+        </button>
         <button @click="$refs.upload.click()" class="icon-btn files-keep-mobile" :title="t('btn.upload')"><svg><use href="#i-upload"/></svg></button>
         <button @click="mkdirPrompt()" class="icon-btn" :title="t('btn.new_dir')"><svg><use href="#i-folder-plus"/></svg></button>
         <button @click="toggleHidden()" class="icon-btn"
@@ -374,12 +416,12 @@
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
              :class="{ 'drag-over': dragOverRoot }"
-             :title="currentWorkspacePath() || contextInfo.archive_root || ''"
+             :title="fileWorkspacePath() || contextInfo.archive_root || ''"
              @dragover.prevent="onTreeRootDragOver($event)"
              @dragleave="dragOverRoot = false"
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
-          <span class="path" x-text="currentWorkspacePath() || contextInfo.archive_root || '—'"></span>
+          <span class="path" x-text="fileWorkspacePath() || contextInfo.archive_root || '—'"></span>
           <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
                "+" and ctx menu use — both already handle path:'' (root), so
                these are pure entry points, no new write paths. @click.stop
@@ -1066,41 +1108,6 @@
           </span>
           <span x-text="t('pane.chat')"></span>
         </span>
-        <div class="workspace-picker chat-head-workspace" @click.outside="workspaceMenuOpen = false">
-          <button class="workspace-picker-btn" type="button"
-                  @click="workspaceMenuOpen = !workspaceMenuOpen"
-                  :disabled="workspaceSwitching" :title="currentWorkspacePath()"
-                  :aria-expanded="workspaceMenuOpen">
-            <svg><use href="#i-folder"/></svg>
-            <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
-            <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
-          </button>
-          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak>
-            <div class="workspace-picker-title">
-              <span x-text="t('workspace.title')"></span>
-              <button type="button" class="workspace-info-btn"
-                      @click.stop="toast(t('workspace.help'), 'info', 7000)"
-                      :title="t('workspace.help')"
-                      :aria-label="t('workspace.help')">
-                <svg><use href="#i-info"/></svg>
-              </button>
-            </div>
-            <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
-              <div class="workspace-picker-row" :class="{ active: workspace.path === currentWorkspacePath() }">
-                <button class="workspace-picker-select" @click="switchWorkspace(workspace.path)">
-                  <span class="workspace-picker-check" x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
-                  <span class="workspace-picker-meta"><strong x-text="workspace.name"></strong><small x-text="workspace.path"></small></span>
-                  <span class="workspace-activity-mini" x-show="workspaceActivity(workspace.path).running || workspaceActivity(workspace.path).unread">
-                    <span class="running" x-show="workspaceActivity(workspace.path).running" x-text="'◌ ' + workspaceActivity(workspace.path).running"></span>
-                    <span class="unread" x-show="workspaceActivity(workspace.path).unread" x-text="'✓ ' + workspaceActivity(workspace.path).unread"></span>
-                  </span>
-                </button>
-                <button class="workspace-picker-remove" x-show="!workspace.primary" @click.stop="removeWorkspace(workspace.path)"><svg><use href="#i-x"/></svg></button>
-              </div>
-            </template>
-            <button class="workspace-picker-add" @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span></button>
-          </div>
-        </div>
         <span class="spacer"></span>
         <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
              by default, so the "present" state is implicit). When missing,
@@ -1112,14 +1119,6 @@
           <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
           <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
         </span>
-        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
-                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
-                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
-          <svg><use href="#i-list"/></svg>
-          <!-- Two compact state dots: blue = running, green = finished but unread. -->
-          <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
-          <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
-        </button>
         <!-- Skills + MCP drawer toggles. 2026-05-29: 从 chat-input 底 bar 移到
              顶 bar，与其它「能力 / 会话」入口（整理档案、定时任务、命令面板）
              并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
