@@ -484,10 +484,12 @@ def test_bounded_stream_resync_waits_for_canonical_history_without_retry_loop():
     helper = app[helper_start:helper_end]
 
     assert '"cancelled", "resync"' in app
-    assert 'mobile: this._isMobileLayout()' in app
-    assert '"&mobile=" + (this._isMobileLayout() ? "1" : "0")' in app
-    assert 'if (!this._isMobileLayout()) return 80' in app
-    assert 'if (!final && this._isMobileLayout() && acc.length > 32 * 1024)' in app
+    assert 'const streamMobile = this._isMobileLayout()' in app
+    assert 'mobile: streamMobile' in app
+    assert '"&mobile=" + (streamMobile ? "1" : "0")' in app
+    assert 'if (!streamMobile)' in app
+    assert 'if (!final && streamMobile && acc.length > 32 * 1024)' in app
+    assert 'if (streamMobile && reason === "replay_truncated")' in handler
     assert 'streamState._canonicalResyncPending = true' in handler
     assert "this._scheduleCanonicalStreamReload(streamSid, streamState)" in handler
     assert "if (streamState._canonicalResyncPending) return" in error

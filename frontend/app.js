@@ -17854,6 +17854,9 @@ function portal() {
       // from `this.currentId` here. That was the bug.
       const streamSid = sendSid;
       const streamState = sendState;
+      // Transport/render capability is fixed for the lifetime of this stream.
+      // Viewport changes mid-reply must not silently switch replay policy.
+      const streamMobile = this._isMobileLayout();
       const streamSession = this.sessions.find(s => s.id === streamSid);
       const primaryWorkspace = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
       const streamWorkspace = (streamSession && streamSession.cwd) || primaryWorkspace;
@@ -17963,7 +17966,7 @@ function portal() {
             model: sendModel,
             permission: sendPermission,
             image_ids: attachIds.length ? attachIds.join(",") : "",
-            mobile: this._isMobileLayout(),
+            mobile: streamMobile,
           }),
         });
         return tr;
@@ -17977,7 +17980,7 @@ function portal() {
             + "&session_id=" + encodeURIComponent(streamSid)
             + "&model=" + encodeURIComponent(sendModel)
             + "&permission=" + encodeURIComponent(sendPermission)
-            + "&mobile=" + (this._isMobileLayout() ? "1" : "0")
+            + "&mobile=" + (streamMobile ? "1" : "0")
             + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
             + "&token=" + encodeURIComponent(this.token);
         } else {
@@ -18129,10 +18132,14 @@ function portal() {
       // snappy 80ms feel. flushRender() always paints the complete final text
       // on done/close, so stretching never loses content.
       const _renderInterval = () => {
-        // Desktop prioritizes live fidelity: keep rich markdown updates frequent.
-        // The aggressive adaptive throttle is a mobile-only heat/freeze guard.
-        if (!this._isMobileLayout()) return 80;
+        // Desktop always keeps rich markdown, but very long replies still need
+        // a modest cadence increase to avoid reparsing 100+ KiB every 80 ms.
         const n = acc.length;
+        if (!streamMobile) {
+          if (n < 32 * 1024) return 80;
+          if (n < 128 * 1024) return 160;
+          return 320;
+        }
         if (n < 2000) return 80;
         if (n < 8000) return 160;
         if (n < 20000) return 320;
@@ -18157,7 +18164,7 @@ function portal() {
         // Beyond 32 KiB, repeatedly reparsing the full accumulated markdown is
         // quadratic. Keep a safe x-text preview until the segment/done boundary,
         // then perform exactly one final rich render.
-        if (!final && this._isMobileLayout() && acc.length > 32 * 1024) {
+        if (!final && streamMobile && acc.length > 32 * 1024) {
           curBubble._streamPlain = true;
           curBubble.html = "";
           streamState._streamPlainRenderCount++;
@@ -18204,7 +18211,7 @@ function portal() {
         // Mid-stream deferred render (selection cleared): cheap path. The
         // done-handler's flushRender does the full final pass.
         if (ownsCurBubble()) {
-          if (this._isMobileLayout() && acc.length > 32 * 1024) {
+          if (streamMobile && acc.length > 32 * 1024) {
             curBubble._streamPlain = true;
             curBubble.html = "";
             streamState._streamPlainRenderCount++;
@@ -18704,10 +18711,12 @@ function portal() {
         streamState._stallWatch = null;
         streamState.es = null;
         if (this.currentId === streamSid) this.es = null;
-        this.toast(this.lang === "zh"
-          ? "回复数据量较大，完成后会自动从会话记录同步"
-          : "This reply exceeded the live replay window; canonical history will sync when it finishes",
-          "info", 5000);
+        if (streamMobile && reason === "replay_truncated") {
+          this.toast(this.lang === "zh"
+            ? "回复数据量较大，完成后会自动从会话记录同步"
+            : "This reply exceeded the live replay window; canonical history will sync when it finishes",
+            "info", 5000);
+        }
         this._scheduleCanonicalStreamReload(streamSid, streamState);
         // `reason` is intentionally retained for browser diagnostics without
         // changing user-facing retry semantics.

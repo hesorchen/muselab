@@ -401,47 +401,116 @@ def _stream_text_payload(event: dict) -> tuple[str, str] | None:
     return kind, payload["text"]
 
 
-class _TurnSubscriber:
-    """In-process SSE handoff queue for one HTTP reader."""
+class _ReplaySpool:
+    """Append-only replay storage outside the Python heap."""
 
     def __init__(self):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._accepting = True
+        fd, name = tempfile.mkstemp(prefix="muselab-turn-", suffix=".jsonl")
+        self.path = Path(name)
+        self._writer = os.fdopen(fd, "ab", buffering=0)
+        self._count = 0
+        self._closed = False
 
-    async def get(self):
-        return await self._queue.get()
+    def append(self, event: dict) -> None:
+        if self._closed:
+            raise RuntimeError("replay spool is closed")
+        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        self._writer.write(payload.encode("utf-8") + b"\n")
+        self._count += 1
 
-    def qsize(self) -> int:
-        return self._queue.qsize()
+    def open_reader(self):
+        return self.path.open("rb")
 
-    def publish(self, event: dict) -> bool:
-        if not self._accepting:
-            return False
-        self._queue.put_nowait(event)
-        return True
+    def __len__(self) -> int:
+        return self._count
 
-    def replay(self, event: dict) -> bool:
-        # Event data is a JSON string and therefore immutable, but copy the
-        # envelope so later replay coalescing can never mutate queued state.
-        return self.publish(dict(event))
+    def __iter__(self):
+        with self.open_reader() as reader:
+            for line in reader:
+                yield json.loads(line)
 
-    def resync(self, reason: str) -> None:
-        if not self._accepting:
-            return
-        self._accepting = False
-        while not self._queue.empty():
-            with suppress(asyncio.QueueEmpty):
-                self._queue.get_nowait()
-        self._queue.put_nowait({
-            "event": "resync",
-            "data": json.dumps({"reason": reason, "retryable": True}),
-        })
-        self._queue.put_nowait(None)
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return list(self)[index]
+        if index < 0:
+            index += self._count
+        for pos, event in enumerate(self):
+            if pos == index:
+                return event
+        raise IndexError(index)
 
     def close(self) -> None:
-        if self._accepting:
-            self._accepting = False
-            self._queue.put_nowait(None)
+        if self._closed:
+            return
+        self._closed = True
+        self._writer.close()
+        with suppress(OSError):
+            self.path.unlink()
+
+    def __del__(self):
+        with suppress(Exception):
+            self.close()
+
+
+class _TurnSubscriber:
+    """Independent cursor over the broadcast's append-only replay spool."""
+
+    def __init__(self, replay=None, *, resync_reason: str = ""):
+        self._replay = replay
+        self._resync_reason = resync_reason
+        self._wake = asyncio.Event()
+        self._done = False
+
+    async def get(self):
+        if self._resync_reason:
+            reason, self._resync_reason = self._resync_reason, ""
+            return {
+                "event": "resync",
+                "data": json.dumps({"reason": reason, "retryable": True}),
+            }
+        if self._replay is None:
+            return None
+        while True:
+            line = self._replay.readline()
+            if line:
+                return json.loads(line)
+            if self._done:
+                self.close_reader()
+                return None
+            self._wake.clear()
+            # Close the clear/append race: publish() may have written between
+            # the first EOF read and clear(). Recheck before sleeping.
+            line = self._replay.readline()
+            if line:
+                return json.loads(line)
+            if self._done:
+                self.close_reader()
+                return None
+            await self._wake.wait()
+
+    def qsize(self) -> int:
+        return 0
+
+    def publish(self, event: dict) -> bool:
+        if self._done:
+            return False
+        self._wake.set()
+        return True
+
+    def resync(self, reason: str) -> None:
+        self._resync_reason = reason
+        self.close_reader()
+        self._done = True
+        self._wake.set()
+
+    def close(self) -> None:
+        self._done = True
+        self._wake.set()
+
+    def close_reader(self) -> None:
+        if self._replay is not None:
+            self._replay.close()
+            self._replay = None
 
 
 class TurnBroadcast:
@@ -471,14 +540,16 @@ class TurnBroadcast:
     ):
         self.session_id = session_id
         self.model = model
-        self.events: list[dict] = []
+        self.events = _ReplaySpool()
         self.subscribers: set[_TurnSubscriber] = set()
         self.replay_max_events = replay_max_events
         self.replay_max_bytes = replay_max_bytes
-        # Legacy constructor arguments remain accepted for callers/tests, but
-        # live readers are no longer dropped based on burst size. Mobile limits
-        # are enforced against retained replay below.
+        # Legacy constructor arguments remain accepted for callers/tests. The
+        # shared spool no longer has a per-subscriber queue to size.
         _ = subscriber_max_events, subscriber_max_bytes
+        self._compact_kind: str | None = None
+        self._compact_parts: list[str] = []
+        self._compact_chars = 0
         self._replay_bytes = 0
         self.done = False
         # Set True when this turn ended via an explicit user /interrupt (vs.
@@ -524,51 +595,61 @@ class TurnBroadcast:
         self.task: "asyncio.Task | None" = None
 
     def publish(self, event: dict) -> None:
-        # Live readers receive every delta. Reconnect replay keeps the exact
-        # accumulated text while coalescing adjacent token envelopes, avoiding
-        # one Python dict + JSON string per token on very long answers.
-        # Retain the complete compacted turn for desktop reconnects and for
-        # headless queued turns that finish before a browser attaches. Mobile
-        # subscribers enforce their smaller replay window in subscribe().
+        # Live readers tail the same append-only spool as reconnect readers, so
+        # no per-subscriber event queue can grow in memory. Flush each text
+        # delta while readers are attached to preserve the live token cadence;
+        # detached/headless turns batch text into 64 KiB replay chunks.
         current_text = _stream_text_payload(event)
+        if current_text is not None:
+            kind, text = current_text
+            if self._compact_kind not in (None, kind):
+                self._flush_compact_text()
+            if self._compact_kind is None:
+                self._compact_kind = kind
+            self._compact_parts.append(text)
+            self._compact_chars += len(text)
+            if self.subscribers or self._compact_chars >= 64 * 1024:
+                self._flush_compact_text()
+            return
+        self._flush_compact_text()
+        self._append_replay(event)
+
+    def _append_replay(self, event: dict) -> None:
         replay = dict(event)
         self.events.append(replay)
         self._replay_bytes += _broadcast_event_size(replay)
-        # Binary compaction: merge equal-kind adjacent chunks only when
-        # the older chunk is no larger than the newer one. For one-byte
-        # deltas this forms power-of-two chunks, so each byte is copied
-        # O(log n) times instead of repeatedly re-serialising the entire
-        # accumulated answer (the naive adjacent merge is O(n²)).
-        if current_text is not None:
-            while len(self.events) >= 2:
-                left = self.events[-2]
-                right = self.events[-1]
-                left_text = _stream_text_payload(left)
-                right_text = _stream_text_payload(right)
-                if (left_text is None or right_text is None
-                        or left_text[0] != right_text[0]
-                        or len(left_text[1]) > len(right_text[1])):
-                    break
-                merged = {
-                    "event": left_text[0],
-                    "data": json.dumps(
-                        {"text": left_text[1] + right_text[1]},
-                        ensure_ascii=False,
-                    ),
-                }
-                self._replay_bytes -= (
-                    _broadcast_event_size(left)
-                    + _broadcast_event_size(right)
-                )
-                self.events[-2:] = [merged]
-                self._replay_bytes += _broadcast_event_size(merged)
         for subscriber in tuple(self.subscribers):
-            if not subscriber.publish(event):
+            if not subscriber.publish(replay):
                 self.subscribers.discard(subscriber)
+
+    def _flush_compact_text(self) -> None:
+        if self._compact_kind is None:
+            return
+        event = {
+            "event": self._compact_kind,
+            "data": json.dumps({"text": "".join(self._compact_parts)}, ensure_ascii=False),
+        }
+        self._compact_kind = None
+        self._compact_parts = []
+        self._compact_chars = 0
+        self._append_replay(event)
+
+    def replay_count(self) -> int:
+        return len(self.events) + (1 if self._compact_kind is not None else 0)
+
+    def replay_events(self):
+        yield from self.events
+        if self._compact_kind is not None:
+            yield {
+                "event": self._compact_kind,
+                "data": json.dumps(
+                    {"text": "".join(self._compact_parts)}, ensure_ascii=False),
+            }
 
     def finish(self) -> None:
         if self.done:
             return
+        self._flush_compact_text()
         self.done = True
         self.finished_at = time.time()
         for subscriber in tuple(self.subscribers):
@@ -576,21 +657,26 @@ class TurnBroadcast:
         self.subscribers.clear()
         # Keep the compacted replay for late desktop reconnects during the grace TTL.
 
+    def close(self) -> None:
+        for subscriber in tuple(self.subscribers):
+            subscriber.close_reader()
+            subscriber.close()
+        self.subscribers.clear()
+        self.events.close()
+
     def subscribe(self, *, mobile: bool = False) -> _TurnSubscriber:
-        # Count/byte limits apply to the mobile replay window. Live handoff is
-        # unbounded because browser/EventSource backpressure is not reflected in
-        # this in-process queue: a large burst could otherwise discard a mobile
-        # reply even while the browser is actively consuming it.
-        subscriber = _TurnSubscriber()
+        # Readers tail the append-only spool directly. New events wake them, but
+        # are never copied into per-reader queues; a stalled HTTP connection uses
+        # a constant-size cursor while complete desktop replay stays available.
+        self._flush_compact_text()
+        replay_count = len(self.events)
+        subscriber = _TurnSubscriber(self.events.open_reader())
         if mobile and (
-            len(self.events) > self.replay_max_events
+            replay_count > self.replay_max_events
             or self._replay_bytes > self.replay_max_bytes
         ):
             subscriber.resync("replay_truncated")
             return subscriber
-        for event in self.events:
-            if not subscriber.replay(event):
-                return subscriber
         if self.done:
             subscriber.close()
         else:
@@ -599,6 +685,7 @@ class TurnBroadcast:
 
     def unsubscribe(self, subscriber: _TurnSubscriber) -> None:
         self.subscribers.discard(subscriber)
+        subscriber.close_reader()
         subscriber.close()
 
 
@@ -617,24 +704,30 @@ _RECENT_TURN_TTL = env_int("MUSELAB_RECENT_TURN_TTL", 60, min_value=1)
 
 def _remember_recent_turn(session_id: str, broadcast: TurnBroadcast) -> None:
     """Stash a just-finished broadcast for grace-keep reconnect, and sweep
-    any expired entries so the map can't grow unbounded."""
+    any expired entries so replay spool files do not outlive their TTL."""
     now = time.time()
+    previous = _recent_turns.get(session_id)
+    if previous is not None and previous is not broadcast:
+        previous.close()
     _recent_turns[session_id] = broadcast
     for sid in [
         s for s, b in _recent_turns.items()
         if now - b.finished_at > _RECENT_TURN_TTL
     ]:
-        _recent_turns.pop(sid, None)
+        expired = _recent_turns.pop(sid, None)
+        if expired is not None:
+            expired.close()
 
 
 def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
     """Return a still-fresh just-finished broadcast for `session_id`, or None.
-    Evicts the entry if it has aged past the TTL."""
+    Evicts the entry and its replay spool if it has aged past the TTL."""
     b = _recent_turns.get(session_id)
     if b is None:
         return None
     if time.time() - b.finished_at > _RECENT_TURN_TTL:
         _recent_turns.pop(session_id, None)
+        b.close()
         return None
     return b
 # LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
@@ -3737,7 +3830,7 @@ def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
         })
     cur_text_msg: dict | None = None
     cur_thinking_msg: dict | None = None
-    for ev in bc.events:
+    for ev in bc.replay_events():
         kind = ev.get("event") or ""
         data_str = ev.get("data") or "{}"
         try:
@@ -3869,7 +3962,9 @@ def _clear_session_runtime_state(sid: str) -> None:
     task_ids = _sessions_with_inflight_tasks.pop(sid, set())
     for task_id in task_ids:
         _bg_task_descriptions.pop(task_id, None)
-    _recent_turns.pop(sid, None)
+    recent = _recent_turns.pop(sid, None)
+    if recent is not None:
+        recent.close()
     broadcast = _active_turns.pop(sid, None)
     if broadcast is not None:
         task = getattr(broadcast, "task", None)
@@ -9861,14 +9956,13 @@ async def _subscribe_broadcast(
     *,
     mobile: bool = False,
 ):
-    """Yield replay followed by the live tail.
+    """Yield disk-backed replay followed by its live tail.
 
     Mobile readers use a bounded reconnect replay window and receive one
-    explicit ``resync`` event when that window is exceeded. Live handoff stays
-    unbounded for both layouts because queue depth does not represent network
-    backpressure. Desktop readers prioritize completeness: they receive the
-    full compacted turn retained by the broadcast, including turns launched
-    headlessly by the server queue.
+    explicit ``resync`` event when that window is exceeded. Every reader tails
+    the same append-only spool, so a stalled HTTP connection retains only a
+    file cursor rather than an unbounded Python queue. Desktop replay remains
+    complete without duplicating the turn in memory.
     """
     # A subscriber is now attached. For a CONTINUATION broadcast this is the
     # one-and-only reconnect that replays the finished task's card flip +
@@ -9927,7 +10021,7 @@ def session_active_status(sid: str) -> dict:
         "active": True,
         "model": b.model,
         "started_at": b.started_at,
-        "events_so_far": len(b.events),
+        "events_so_far": b.replay_count(),
         # True when this is a HEADLESS CONTINUATION turn opened by the bg-task
         # watcher (no user prompt). The frontend attaches in "continuation"
         # mode — same reconnect SSE, but it must NOT truncate the in-flight
