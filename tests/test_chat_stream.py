@@ -921,8 +921,9 @@ def test_broadcast_replay_binary_compaction_handles_100k_deltas(stream_env):
     assert bc._replay_bytes <= 512_000
 
 
-def test_broadcast_bounds_replay_and_isolates_slow_subscriber(stream_env):
+def test_mobile_bounds_replay_while_desktop_receives_complete_turn(stream_env):
     import asyncio
+    import json
 
     chat_mod = stream_env
 
@@ -934,18 +935,22 @@ def test_broadcast_bounds_replay_and_isolates_slow_subscriber(stream_env):
             subscriber_max_events=8,
             subscriber_max_bytes=4096,
         )
-        slow = bc.subscribe()
-        fast = bc.subscribe()
-        received = []
+        mobile_live = bc.subscribe(mobile=True)
+        desktop_live = bc.subscribe()
+        mobile_received = []
+        desktop_received = []
 
-        async def consume_fast():
+        async def consume(subscriber, target):
             while True:
-                event = await fast.get()
+                event = await subscriber.get()
                 if event is None:
                     return
-                received.append(event)
+                target.append(event)
 
-        consumer = asyncio.create_task(consume_fast())
+        consumers = [
+            asyncio.create_task(consume(mobile_live, mobile_received)),
+            asyncio.create_task(consume(desktop_live, desktop_received)),
+        ]
         for i in range(2_000):
             bc.publish({
                 "event": "tool_result",
@@ -953,21 +958,99 @@ def test_broadcast_bounds_replay_and_isolates_slow_subscriber(stream_env):
             })
             await asyncio.sleep(0)
         bc.finish()
-        await consumer
+        await asyncio.gather(*consumers)
 
-        slow_first = await slow.get()
-        assert slow_first["event"] == "resync"
-        assert json.loads(slow_first["data"])["reason"] == "slow_subscriber"
-        assert len(received) == 2_000
-        assert bc.events == []
+        assert len(mobile_received) == 2_000
+        assert len(desktop_received) == 2_000
+        assert len(bc.events) == 2_000
 
-        replay = bc.subscribe()
-        replay_first = await replay.get()
-        assert replay_first["event"] == "resync"
-        assert json.loads(replay_first["data"])["reason"] == "replay_truncated"
+        mobile_replay = bc.subscribe(mobile=True)
+        mobile_replay_first = await mobile_replay.get()
+        assert mobile_replay_first["event"] == "resync"
+        assert json.loads(mobile_replay_first["data"])["reason"] == "replay_truncated"
 
-    import json
+        desktop_replay = bc.subscribe()
+        replayed = []
+        while True:
+            event = await desktop_replay.get()
+            if event is None:
+                break
+            replayed.append(event)
+        assert replayed == bc.events
+        assert len(replayed) == 2_000
+
     asyncio.run(exercise())
+
+
+def test_headless_turn_replays_complete_output_to_desktop(stream_env):
+    """A queued turn can finish before any browser attaches."""
+    import asyncio
+
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(
+        session_id="headless-desktop-replay",
+        replay_max_events=4,
+        replay_max_bytes=256,
+        subscriber_max_events=2,
+        subscriber_max_bytes=128,
+    )
+    expected = []
+    for i in range(100):
+        event = {"event": "tool_result", "data": '{"id":"%d"}' % i}
+        expected.append(event)
+        bc.publish(event)
+    bc.finish()
+
+    async def collect():
+        subscriber = bc.subscribe()
+        replayed = []
+        while True:
+            event = await subscriber.get()
+            if event is None:
+                return replayed
+            replayed.append(event)
+
+    assert asyncio.run(collect()) == expected
+
+
+def test_stream_ticket_applies_mobile_layout_to_replay(stream_env, client):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    bc = chat_mod.TurnBroadcast(
+        session_id=sid,
+        replay_max_events=1,
+        replay_max_bytes=256,
+    )
+    for i in range(10):
+        bc.publish({"event": "tool_result", "data": '{"id":"%d"}' % i})
+    bc.finish()
+    chat_mod._recent_turns[sid] = bc
+
+    def mint(mobile):
+        response = client.post(
+            "/api/chat/stream/start",
+            headers={"X-Auth-Token": TEST_TOKEN},
+            json={
+                "prompt": "",
+                "session_id": sid,
+                "model": "claude-sonnet-4-6",
+                "mobile": mobile,
+            },
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["ticket"]
+
+    mobile_response = client.get(f"/api/chat/stream?ticket={mint(True)}")
+    mobile_events = _parse_sse(mobile_response.text)
+    resync = next(json.loads(data) for event, data in mobile_events
+                  if event == "resync")
+    assert resync["reason"] == "replay_truncated"
+
+    desktop_response = client.get(f"/api/chat/stream?ticket={mint(False)}")
+    desktop_events = _parse_sse(desktop_response.text)
+    assert sum(event == "tool_result" for event, _ in desktop_events) == 10
+    assert all(event != "resync" for event, _ in desktop_events)
+    chat_mod._recent_turns.pop(sid, None)
 
 
 def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch):

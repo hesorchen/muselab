@@ -816,6 +816,7 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     assert active_requests, "loadSession did not call /active"
     assert ticket_requests and ticket_requests[-1]["prompt"] == ""
     assert ticket_requests[-1]["session_id"] == sid
+    assert ticket_requests[-1]["mobile"] is True
 
     page.evaluate(
         """() => {

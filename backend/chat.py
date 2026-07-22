@@ -402,22 +402,14 @@ def _stream_text_payload(event: dict) -> tuple[str, str] | None:
 
 
 class _TurnSubscriber:
-    """Count- and byte-bounded handoff for one HTTP SSE reader."""
+    """In-process SSE handoff queue for one HTTP reader."""
 
-    def __init__(self, max_events: int, max_bytes: int):
+    def __init__(self):
         self._queue: asyncio.Queue = asyncio.Queue()
-        self._max_events = max_events
-        self._max_bytes = max_bytes
-        self._pending_bytes = 0
         self._accepting = True
 
     async def get(self):
-        item = await self._queue.get()
-        if isinstance(item, tuple) and len(item) == 2:
-            event, size = item
-            self._pending_bytes = max(0, self._pending_bytes - int(size))
-            return event
-        return item
+        return await self._queue.get()
 
     def qsize(self) -> int:
         return self._queue.qsize()
@@ -425,13 +417,7 @@ class _TurnSubscriber:
     def publish(self, event: dict) -> bool:
         if not self._accepting:
             return False
-        size = _broadcast_event_size(event)
-        if (self._queue.qsize() >= self._max_events
-                or self._pending_bytes + size > self._max_bytes):
-            self.resync("slow_subscriber")
-            return False
-        self._pending_bytes += size
-        self._queue.put_nowait((event, size))
+        self._queue.put_nowait(event)
         return True
 
     def replay(self, event: dict) -> bool:
@@ -446,7 +432,6 @@ class _TurnSubscriber:
         while not self._queue.empty():
             with suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
-        self._pending_bytes = 0
         self._queue.put_nowait({
             "event": "resync",
             "data": json.dumps({"reason": reason, "retryable": True}),
@@ -490,10 +475,11 @@ class TurnBroadcast:
         self.subscribers: set[_TurnSubscriber] = set()
         self.replay_max_events = replay_max_events
         self.replay_max_bytes = replay_max_bytes
-        self.subscriber_max_events = subscriber_max_events
-        self.subscriber_max_bytes = subscriber_max_bytes
+        # Legacy constructor arguments remain accepted for callers/tests, but
+        # live readers are no longer dropped based on burst size. Mobile limits
+        # are enforced against retained replay below.
+        _ = subscriber_max_events, subscriber_max_bytes
         self._replay_bytes = 0
-        self._replay_truncated = False
         self.done = False
         # Set True when this turn ended via an explicit user /interrupt (vs.
         # natural completion or error). The server-side queue drain reads it
@@ -541,47 +527,41 @@ class TurnBroadcast:
         # Live readers receive every delta. Reconnect replay keeps the exact
         # accumulated text while coalescing adjacent token envelopes, avoiding
         # one Python dict + JSON string per token on very long answers.
-        if not self._replay_truncated:
-            current_text = _stream_text_payload(event)
-            replay = dict(event)
-            self.events.append(replay)
-            self._replay_bytes += _broadcast_event_size(replay)
-            # Binary compaction: merge equal-kind adjacent chunks only when
-            # the older chunk is no larger than the newer one. For one-byte
-            # deltas this forms power-of-two chunks, so each byte is copied
-            # O(log n) times instead of repeatedly re-serialising the entire
-            # accumulated answer (the naive adjacent merge is O(n²)).
-            if current_text is not None:
-                while len(self.events) >= 2:
-                    left = self.events[-2]
-                    right = self.events[-1]
-                    left_text = _stream_text_payload(left)
-                    right_text = _stream_text_payload(right)
-                    if (left_text is None or right_text is None
-                            or left_text[0] != right_text[0]
-                            or len(left_text[1]) > len(right_text[1])):
-                        break
-                    merged = {
-                        "event": left_text[0],
-                        "data": json.dumps(
-                            {"text": left_text[1] + right_text[1]},
-                            ensure_ascii=False,
-                        ),
-                    }
-                    self._replay_bytes -= (
-                        _broadcast_event_size(left)
-                        + _broadcast_event_size(right)
-                    )
-                    self.events[-2:] = [merged]
-                    self._replay_bytes += _broadcast_event_size(merged)
-            if (len(self.events) > self.replay_max_events
-                    or self._replay_bytes > self.replay_max_bytes):
-                # Never offer a partial tool/result or assistant replay. The
-                # turn continues for live clients; reconnects explicitly wait
-                # for canonical transcript persistence via `resync`.
-                self.events.clear()
-                self._replay_bytes = 0
-                self._replay_truncated = True
+        # Retain the complete compacted turn for desktop reconnects and for
+        # headless queued turns that finish before a browser attaches. Mobile
+        # subscribers enforce their smaller replay window in subscribe().
+        current_text = _stream_text_payload(event)
+        replay = dict(event)
+        self.events.append(replay)
+        self._replay_bytes += _broadcast_event_size(replay)
+        # Binary compaction: merge equal-kind adjacent chunks only when
+        # the older chunk is no larger than the newer one. For one-byte
+        # deltas this forms power-of-two chunks, so each byte is copied
+        # O(log n) times instead of repeatedly re-serialising the entire
+        # accumulated answer (the naive adjacent merge is O(n²)).
+        if current_text is not None:
+            while len(self.events) >= 2:
+                left = self.events[-2]
+                right = self.events[-1]
+                left_text = _stream_text_payload(left)
+                right_text = _stream_text_payload(right)
+                if (left_text is None or right_text is None
+                        or left_text[0] != right_text[0]
+                        or len(left_text[1]) > len(right_text[1])):
+                    break
+                merged = {
+                    "event": left_text[0],
+                    "data": json.dumps(
+                        {"text": left_text[1] + right_text[1]},
+                        ensure_ascii=False,
+                    ),
+                }
+                self._replay_bytes -= (
+                    _broadcast_event_size(left)
+                    + _broadcast_event_size(right)
+                )
+                self.events[-2:] = [merged]
+                self._replay_bytes += _broadcast_event_size(merged)
         for subscriber in tuple(self.subscribers):
             if not subscriber.publish(event):
                 self.subscribers.discard(subscriber)
@@ -594,12 +574,18 @@ class TurnBroadcast:
         for subscriber in tuple(self.subscribers):
             subscriber.close()
         self.subscribers.clear()
-        # Keep only the bounded replay for late reconnects during the grace TTL.
+        # Keep the compacted replay for late desktop reconnects during the grace TTL.
 
-    def subscribe(self) -> _TurnSubscriber:
-        subscriber = _TurnSubscriber(
-            self.subscriber_max_events, self.subscriber_max_bytes)
-        if self._replay_truncated:
+    def subscribe(self, *, mobile: bool = False) -> _TurnSubscriber:
+        # Count/byte limits apply to the mobile replay window. Live handoff is
+        # unbounded because browser/EventSource backpressure is not reflected in
+        # this in-process queue: a large burst could otherwise discard a mobile
+        # reply even while the browser is actively consuming it.
+        subscriber = _TurnSubscriber()
+        if mobile and (
+            len(self.events) > self.replay_max_events
+            or self._replay_bytes > self.replay_max_bytes
+        ):
             subscriber.resync("replay_truncated")
             return subscriber
         for event in self.events:
@@ -7521,6 +7507,7 @@ class StreamStartReq(BaseModel):
     model: str = ""
     permission: str = "bypassPermissions"
     image_ids: str = ""
+    mobile: bool = False
 
 
 @router.post("/stream/start", dependencies=[Depends(require_token)])
@@ -7545,6 +7532,7 @@ def stream_start(req: StreamStartReq) -> dict:
             "model": req.model,
             "permission": permission,
             "image_ids": req.image_ids,
+            "mobile": req.mobile,
         })
     return {"ticket": ticket}
 
@@ -7557,6 +7545,7 @@ async def stream(
     model: str = Query(default=""),
     permission: str = Query(default="bypassPermissions"),
     image_ids: str = Query(default=""),
+    mobile: bool = Query(default=False),
     ticket: str = Query(default=""),
 ):
     # Ticket redemption (preferred path — see _STREAM_TICKETS above). The
@@ -7574,6 +7563,7 @@ async def stream(
         model = params["model"]
         permission = params["permission"]
         image_ids = params["image_ids"]
+        mobile = bool(params.get("mobile", False))
     else:
         # Legacy query-param auth (old clients / manual use).
         from .auth import _token_ok
@@ -7614,7 +7604,7 @@ async def stream(
             recent = _get_recent_turn(session_id)
             if recent is not None:
                 return EventSourceResponse(
-                    _subscribe_broadcast(recent),
+                    _subscribe_broadcast(recent, mobile=mobile),
                     headers=_SSE_HEADERS,
                     ping_message_factory=_sse_ping_event,
                 )
@@ -7622,7 +7612,7 @@ async def stream(
                 yield _error_event("no active turn")
             return EventSourceResponse(_no_active_gen(), headers=_SSE_HEADERS)
         return EventSourceResponse(
-            _subscribe_broadcast(existing),
+            _subscribe_broadcast(existing, mobile=mobile),
             headers=_SSE_HEADERS,
             ping_message_factory=_sse_ping_event,
         )
@@ -7654,7 +7644,7 @@ async def stream(
             yield _error_event(_err_msg)
         return EventSourceResponse(_early_err_gen(), headers=_SSE_HEADERS)
     return EventSourceResponse(
-        _subscribe_broadcast(broadcast),
+        _subscribe_broadcast(broadcast, mobile=mobile),
         headers=_SSE_HEADERS,
         ping_message_factory=_sse_ping_event,
     )
@@ -9866,13 +9856,19 @@ async def _maybe_drain_queue(session_id: str) -> None:
         _notify_queue_paused_on_error(session_id)
 
 
-async def _subscribe_broadcast(broadcast: TurnBroadcast):
-    """Yield bounded replay followed by the live tail.
+async def _subscribe_broadcast(
+    broadcast: TurnBroadcast,
+    *,
+    mobile: bool = False,
+):
+    """Yield replay followed by the live tail.
 
-    ``subscribe()`` synchronously snapshots replay into the subscriber before
-    registering it for live delivery, so asyncio cannot publish into the gap.
-    A truncated replay or slow client receives one explicit ``resync`` event
-    and disconnects; neither condition can block or cancel the model turn.
+    Mobile readers use a bounded reconnect replay window and receive one
+    explicit ``resync`` event when that window is exceeded. Live handoff stays
+    unbounded for both layouts because queue depth does not represent network
+    backpressure. Desktop readers prioritize completeness: they receive the
+    full compacted turn retained by the broadcast, including turns launched
+    headlessly by the server queue.
     """
     # A subscriber is now attached. For a CONTINUATION broadcast this is the
     # one-and-only reconnect that replays the finished task's card flip +
@@ -9881,7 +9877,7 @@ async def _subscribe_broadcast(broadcast: TurnBroadcast):
     # reaction bubbles). Harmless no-op for normal turns.
     if getattr(broadcast, "is_continuation", False):
         broadcast.continuation_consumed = True
-    subscriber = broadcast.subscribe()
+    subscriber = broadcast.subscribe(mobile=mobile)
     try:
         while True:
             ev = await subscriber.get()

@@ -17963,6 +17963,7 @@ function portal() {
             model: sendModel,
             permission: sendPermission,
             image_ids: attachIds.length ? attachIds.join(",") : "",
+            mobile: this._isMobileLayout(),
           }),
         });
         return tr;
@@ -17976,6 +17977,7 @@ function portal() {
             + "&session_id=" + encodeURIComponent(streamSid)
             + "&model=" + encodeURIComponent(sendModel)
             + "&permission=" + encodeURIComponent(sendPermission)
+            + "&mobile=" + (this._isMobileLayout() ? "1" : "0")
             + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
             + "&token=" + encodeURIComponent(this.token);
         } else {
@@ -18127,6 +18129,9 @@ function portal() {
       // snappy 80ms feel. flushRender() always paints the complete final text
       // on done/close, so stretching never loses content.
       const _renderInterval = () => {
+        // Desktop prioritizes live fidelity: keep rich markdown updates frequent.
+        // The aggressive adaptive throttle is a mobile-only heat/freeze guard.
+        if (!this._isMobileLayout()) return 80;
         const n = acc.length;
         if (n < 2000) return 80;
         if (n < 8000) return 160;
@@ -18152,7 +18157,7 @@ function portal() {
         // Beyond 32 KiB, repeatedly reparsing the full accumulated markdown is
         // quadratic. Keep a safe x-text preview until the segment/done boundary,
         // then perform exactly one final rich render.
-        if (!final && acc.length > 32 * 1024) {
+        if (!final && this._isMobileLayout() && acc.length > 32 * 1024) {
           curBubble._streamPlain = true;
           curBubble.html = "";
           streamState._streamPlainRenderCount++;
@@ -18199,7 +18204,7 @@ function portal() {
         // Mid-stream deferred render (selection cleared): cheap path. The
         // done-handler's flushRender does the full final pass.
         if (ownsCurBubble()) {
-          if (acc.length > 32 * 1024) {
+          if (this._isMobileLayout() && acc.length > 32 * 1024) {
             curBubble._streamPlain = true;
             curBubble.html = "";
             streamState._streamPlainRenderCount++;
