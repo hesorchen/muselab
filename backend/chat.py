@@ -933,9 +933,10 @@ MODEL_CONTEXT_LIMITS = {
     "deepseek-chat":                128_000,
     "deepseek-reasoner":            128_000,
     # Zhipu GLM 5 series — 200K context, 128K output cap.
-    "glm-5":                        200_000,
-    "glm-5-air":                    200_000,
-    "glm-4.7":                      200_000,
+    "glm-5.2-internal":              200_000,
+    "glm-5":                         200_000,
+    "glm-5-air":                     200_000,
+    "glm-4.7":                       200_000,
     "glm-4-plus":                   128_000,   # older 4-plus stayed 128K
     # MiniMax — 204_800 exactly, per platform.minimax.io spec.
     "minimax-m2.7":                 204_800,

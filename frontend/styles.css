@@ -3004,6 +3004,23 @@ pre.text {
 }
 .workspace-picker-row:hover,
 .workspace-picker-row.active { background: var(--c-bg-2); }
+.workspace-picker-row.is-dragging { opacity: .55; }
+.workspace-picker-row.is-drag-over { box-shadow: inset 0 0 0 1px var(--c-accent); }
+.workspace-picker-drag {
+  width: 30px;
+  flex: 0 0 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--c-fg-3);
+  cursor: grab;
+  touch-action: none;
+}
+.workspace-picker-drag:active { cursor: grabbing; }
+.workspace-picker-drag:hover { color: var(--c-fg-1); }
+.workspace-picker-drag svg { width: 16px; height: 16px; }
 .workspace-picker-select {
   min-width: 0;
   flex: 1;

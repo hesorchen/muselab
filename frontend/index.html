@@ -123,6 +123,7 @@
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
 <defs>
   <symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></symbol>
+  <symbol id="i-hard-drive" viewBox="0 0 24 24"><line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></symbol>
   <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
   <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
   <symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></symbol>
@@ -193,6 +194,7 @@
   <symbol id="i-gauge" viewBox="0 0 24 24"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
   <!-- List — "configured tasks" section header. -->
   <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-grip-vertical" viewBox="0 0 24 24"><circle cx="9" cy="5" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="19" r="1"/></symbol>
   <!-- History — clock with circular arrow, "recent runs" section header. -->
   <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/><polyline points="12 7 12 12 15 14"/></symbol>
   <!-- ===== Image annotation editor tools (added 2026-05-28) ===== -->
@@ -276,17 +278,20 @@
     <!-- ============ 左：文件树 ============ -->
     <aside class="pane files" :class="{'pane-hidden': !leftOpen}">
       <header class="pane-head">
-        <span class="pane-title"><span class="icon"><svg><use href="#i-folder"/></svg></span><span x-text="t('pane.files')"></span></span>
+        <span class="pane-title"><span class="icon"><svg><use href="#i-file-text"/></svg></span><span x-text="t('pane.files')"></span></span>
         <div class="workspace-picker files-head-workspace" @click.outside="workspaceMenuOpen = false">
           <button class="workspace-picker-btn" type="button"
                   @click="workspaceMenuOpen = !workspaceMenuOpen"
                   :disabled="workspaceSwitching" :title="currentWorkspacePath()"
                   :aria-expanded="workspaceMenuOpen">
-            <svg><use href="#i-folder"/></svg>
+            <svg><use href="#i-hard-drive"/></svg>
             <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
             <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
           </button>
-          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak>
+          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak
+               @pointermove.window="onWorkspacePointerMove($event)"
+               @pointerup.window="onWorkspacePointerUp($event)"
+               @pointercancel.window="onWorkspacePointerUp($event)">
             <div class="workspace-picker-title">
               <span x-text="t('workspace.title')"></span>
               <button type="button" class="workspace-info-btn"
@@ -297,7 +302,19 @@
               </button>
             </div>
             <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
-              <div class="workspace-picker-row" :class="{ active: workspace.path === currentWorkspacePath() }">
+              <div class="workspace-picker-row"
+                   :class="{ active: workspace.path === currentWorkspacePath(), 'is-dragging': workspaceDrag.path === workspace.path, 'is-drag-over': workspaceDrag.overPath === workspace.path }"
+                   :data-workspace-path="workspace.path"
+                   @dragover.prevent="onWorkspaceDragOver(workspace.path)"
+                   @drop.prevent="onWorkspaceDrop($event)">
+                <button type="button" class="workspace-picker-drag" draggable="true"
+                        @dragstart="onWorkspaceDragStart($event, workspace.path)"
+                        @dragend="onWorkspaceDragEnd()"
+                        @pointerdown.stop="onWorkspacePointerDown($event, workspace.path)"
+                        :title="lang==='zh' ? '拖拽排序' : 'Drag to reorder'"
+                        :aria-label="lang==='zh' ? '拖拽排序' : 'Drag to reorder'">
+                  <svg><use href="#i-grip-vertical"/></svg>
+                </button>
                 <button class="workspace-picker-select" @click="switchWorkspace(workspace.path)">
                   <span class="workspace-picker-check" x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
                   <span class="workspace-picker-meta"><strong x-text="workspace.name"></strong><small x-text="workspace.path"></small></span>
@@ -312,14 +329,7 @@
             <button class="workspace-picker-add" @click="addWorkspace()"><svg><use href="#i-folder-plus"/></svg><span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span></button>
           </div>
         </div>
-        <span class="spacer"></span>
-        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
-                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
-                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
-          <svg><use href="#i-list"/></svg>
-          <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
-          <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
-        </button>
+        <!-- 全局任务中心入口已迁至对话区头栏 Skills 左侧 (2026-07-21) -->
         <button @click="$refs.upload.click()" class="icon-btn files-keep-mobile" :title="t('btn.upload')"><svg><use href="#i-upload"/></svg></button>
         <button @click="mkdirPrompt()" class="icon-btn" :title="t('btn.new_dir')"><svg><use href="#i-folder-plus"/></svg></button>
         <button @click="toggleHidden()" class="icon-btn"
@@ -1119,6 +1129,15 @@
           <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
           <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
         </span>
+        <!-- Global task center — moved here from the files header to sit
+             immediately left of the Skills entry (2026-07-21). -->
+        <button class="activity-center-btn" type="button" @click="openActivityCenter()"
+                :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
+                :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
+          <svg><use href="#i-list"/></svg>
+          <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
+          <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
+        </button>
         <!-- Skills + MCP drawer toggles. 2026-05-29: 从 chat-input 底 bar 移到
              顶 bar，与其它「能力 / 会话」入口（整理档案、定时任务、命令面板）
              并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
@@ -1151,26 +1170,6 @@
              Deliberately NOT a "raw edit" button — direct editing of
              CLAUDE.md works (it's just a file) but is a worse UX:
              nobody wants to stare at a 9-section form. -->
-        <!-- 2026-05-23: 「设置档案」按钮已并入「整理档案」。整理档案 workflow
-             现在同时覆盖 archive 整理 + CLAUDE.md profile 补全（curator prompt
-             第 3 步 3b 节）。两个按钮职责重合 + 移动端 toolbar 拥挤，合并为一。
-             历史 startProfileIntake / /sessions/profile-intake 端点保留做向后
-             兼容，外部 API 调用不会断；但 UI 不再暴露独立入口。-->
-        <!-- Organize archive — creates a curator-mode session that walks
-             Muse through scan → suggest → confirm-per-item → execute,
-             AND walks the user through any blank CLAUDE.md profile
-             sections conversationally. Sits next to the scheduled-tasks
-             bell because both are "agent-driven background work" entry
-             points. -->
-        <button @click="startOrganize()" class="icon-btn"
-                :title="lang==='zh' ? '整理档案 — 让 Muse 帮我梳理 archive' : 'Organize — have Muse tidy the archive'"
-                aria-label="Organize archive">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
-               stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/>
-          </svg>
-        </button>
         <!-- Manual hard-refresh escape hatch. When the chat pane gets
              stuck (SSE wedged, Alpine state out of sync after a flaky
              reconnect, etc.), users have no way out except closing the

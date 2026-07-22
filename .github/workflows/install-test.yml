@@ -15,7 +15,11 @@ on:
     branches: [main]
     paths:
       - 'scripts/install-*'
+      - 'scripts/uninstall-macos.sh'
       - 'scripts/quick-install.sh'
+      - 'scripts/templates/**'
+      - 'macos/statusbar/**'
+      - 'frontend/app.js'
       - 'pyproject.toml'
       - 'uv.lock'
       - 'Dockerfile'
@@ -24,7 +28,11 @@ on:
   pull_request:
     paths:
       - 'scripts/install-*'
+      - 'scripts/uninstall-macos.sh'
       - 'scripts/quick-install.sh'
+      - 'scripts/templates/**'
+      - 'macos/statusbar/**'
+      - 'frontend/app.js'
       - 'pyproject.toml'
       - 'uv.lock'
       - 'Dockerfile'
@@ -124,6 +132,11 @@ jobs:
       - name: Run install-macos.sh
         run: bash scripts/install-macos.sh
 
+      - name: Verify status bar helper artifact
+        run: |
+          test -x build/macos/MuseLabStatusBar
+          file build/macos/MuseLabStatusBar
+
       - name: Launch backend in background
         run: |
           set -a; source .env; set +a
@@ -139,6 +152,16 @@ jobs:
           echo "::error::backend never answered /api/health"
           cat backend.log || true
           exit 1
+
+      - name: Verify remote status bar client installer
+        if: runner.os == 'macOS'
+        run: |
+          set -a; source .env; set +a
+          MUSELAB_URL=http://127.0.0.1:8765 \
+          MUSELAB_SKIP_SERVICE=1 \
+            bash scripts/install-macos-statusbar.sh
+          plutil -lint "$HOME/Library/LaunchAgents/com.muselab.statusbar.plist"
+          test "$(stat -f '%Lp' "$HOME/Library/Application Support/muselab/statusbar.env")" = 600
 
       - name: Stop backend
         if: always()

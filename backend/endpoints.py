@@ -233,6 +233,7 @@ CATALOG: tuple[Provider, ...] = (
         env_key="ZHIPUAI_API_KEY",
         display="智谱 GLM",
         models=(
+            ("glm-5.2-internal", "GLM 5.2"),
             ("glm-5.1",      "GLM 5.1"),
             ("glm-5",        "GLM 5"),
             ("glm-5-air",    "GLM 5 Air"),
@@ -391,6 +392,26 @@ CATALOG: tuple[Provider, ...] = (
             ("codex:gpt-5.4",               "GPT-5.4"),
             ("codex:gpt-5.4-mini",          "GPT-5.4 Mini"),
             ("codex:gpt-5.3-codex-spark",   "GPT-5.3 Codex Spark"),
+        ),
+    ),
+    # GPT 直连 — 与「智谱 GLM」相同的 built-in 接入形态：复用既有的
+    # ZHIPUAI_API_KEY 凭据以及 .env 中 ZHIPUAI_BASE_URL 已指向的内部
+    # Anthropic-compatible 统一网关（即 glm-5.2 当前所走的同一通道），
+    # 无需新增任何 *_API_KEY / *_BASE_URL 变量；此处仅声明一组独立的
+    # prefix + model 名，使 picker 能单独展示并由 longest-prefix 路由。
+    Provider(
+        prefix="gpt-",
+        base_url=_DEFAULT_BASE_URLS["ZHIPUAI_API_KEY"],
+        env_key="ZHIPUAI_API_KEY",
+        display="OpenAI",
+        # 后端实为 Codex/GPT 系列：关闭标准 thinking 配置以防部分兼容层
+        # 对该参数报错；放行 per-session reasoning-effort 由网关自行翻译；
+        # 抬高单次最大输出至 128K 以匹配 GPT-Codex 类长输出特征。
+        supports_thinking=False,
+        supports_effort=True,
+        max_output_tokens=128000,
+        models=(
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
         ),
     ),
     # Doubao (字节 Volcengine) deliberately NOT added — only

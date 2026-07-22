@@ -234,6 +234,16 @@ def test_grep_content(client, auth):
     assert any(h["path"] == "README.md" for h in hits)
 
 
+def test_grep_cpp_content(client, auth, temp_root):
+    source = temp_root / "rm_cate_diversity_rule.cpp"
+    source.write_text("class RmCateDiversityRule {};\n")
+
+    r = client.get("/api/files/grep?q=RmCateDiversityRule", headers=auth)
+
+    assert r.status_code == 200
+    assert any(h["path"] == source.name and h["line"] == 1 for h in r.json()["hits"])
+
+
 def test_grep_skips_hidden_by_default(client, auth, temp_root):
     (temp_root / ".secret").write_text("UNIQUE_GREP_TOKEN_xyz\n")
     r = client.get("/api/files/grep?q=UNIQUE_GREP_TOKEN_xyz", headers=auth)

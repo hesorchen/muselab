@@ -179,6 +179,20 @@ def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     assert "height: 100dvh" in mobile
 
 
+def test_workspace_picker_supports_mouse_and_touch_reordering():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert 'class="workspace-picker-drag" draggable="true"' in html
+    assert '@dragstart="onWorkspaceDragStart($event, workspace.path)"' in html
+    assert '@pointerdown.stop="onWorkspacePointerDown($event, workspace.path)"' in html
+    assert '@pointermove.window="onWorkspacePointerMove($event)"' in html
+    assert 'fetch("/api/chat/workspaces/order"' in app
+    assert 'localStorage.setItem("muselab_workspace_order_v1"' in app
+    assert "touch-action: none" in css
+
+
 def test_workspace_switch_moves_files_preview_and_conversation_together():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -423,6 +437,14 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     assert "return false" in failed
     assert "st.messages.length = 0" not in failed
     assert "this.messages = st.messages" not in failed
+
+
+def test_activity_center_groups_failed_tasks_as_recent():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'states: ["waiting_approval", "paused"]' in app
+    assert 'states: ["completed", "failed", "cancelled"], readOnly: true' in app
+    assert 'item.state === "failed"' in app
 
 
 def test_activity_center_uses_two_compact_numberless_status_dots():

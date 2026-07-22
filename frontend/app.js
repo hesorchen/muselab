@@ -464,6 +464,7 @@ function portal() {
     activeWorkspace: "",
     workspaceMenuOpen: false,
     workspaceSwitching: false,
+    workspaceDrag: { path: "", overPath: "", pointerId: null, originalPaths: [] },
     workspaceBrowser: {
       show: false, loading: false, error: "", path: "", name: "", parent: "",
       directories: [], selected: "", registered: false, selectable: false,
@@ -1647,6 +1648,23 @@ function portal() {
       });
     },
 
+    async _openStartupActivityDeeplink() {
+      try {
+        const url = new URL(location.href);
+        if (url.searchParams.get("activity") !== "1") return;
+        await this.openActivityCenter();
+        url.searchParams.delete("activity");
+        history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+      } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
+    },
+
+    async _openStartupSessionDeeplink() {
+      try {
+        const sid = new URL(location.href).searchParams.get("session");
+        if (sid) await this._openSessionFromDeeplink(sid);
+      } catch (_) { /* malformed URL or unavailable browser API — ignore */ }
+    },
+
     // First-load splash + initial fetch sequence. Sets appReady=true once
     // contextInfo + sessions both come back, OR after 8s hard timeout (so
     // a dead backend doesn't leave the user on a splash forever — we surface
@@ -1674,12 +1692,8 @@ function portal() {
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
       // session so the user lands in the conversation they were pinged about
       // (the already-open-tab case is handled via the SW postMessage above).
-      this.initSessions().then(() => {
-        try {
-          const sid = new URLSearchParams(location.search).get("session");
-          if (sid) this._openSessionFromDeeplink(sid);
-        } catch (_) { /* noop */ }
-      });
+      this._openStartupActivityDeeplink();
+      this.initSessions().then(() => this._openStartupSessionDeeplink());
       this.fetchStats();
       // Trash badge state — light fetch (just count), gated by token
       // which is already verified at this point. Fire-and-forget;
@@ -4296,7 +4310,9 @@ function portal() {
         this.loadPrefs();
         await this.fetchSessionWorkspaces();
         await this.loadRoot();
+        this._openStartupActivityDeeplink();
         await this.initSessions();
+        await this._openStartupSessionDeeplink();
         this.fetchStats();
         this.loadTrash();
         // Restore the preview file the user was looking at before refresh.
@@ -4638,11 +4654,13 @@ function portal() {
         if (p.model) this.model = p.model;
         if (p.defaultModel) this.defaultModel = p.defaultModel;
         if (p.permission) this.permission = p.permission;
-        // Older prefs used `permission` for both roles. Preserve that value as
-        // the new-session default on migration, while session load will still
-        // replace the current selector with the server-authoritative value.
+        // Restore ONLY the stored global-default-preference here. Do NOT promote a
+        // leftover per-session `permission` up to the new-session default: doing so
+        // made any single chat once viewed under e.g. "default" leak across reloads
+        // and OVERRIDE what Settings says is the default ("新建会话仍是 default").
+        // The server-authoritative value arrives next via fetchStats() regardless,
+        // so leaving defaultPermission untouched when absent is correct & safe.
         if (p.defaultPermission) this.defaultPermission = p.defaultPermission;
-        else if (p.permission) this.defaultPermission = p.permission;
         if (typeof p.activeWorkspace === "string") this.activeWorkspace = p.activeWorkspace;
         if (p.workspaceLastSession && typeof p.workspaceLastSession === "object"
             && !Array.isArray(p.workspaceLastSession)) {
@@ -6706,20 +6724,39 @@ function portal() {
       return (this.activity.summary.workspaces || []).find(w => w.path === target)
         || { running: 0, unread: 0, attention: 0 };
     },
+    _applySavedWorkspaceOrder(workspaces) {
+      const rows = Array.isArray(workspaces) ? workspaces.slice() : [];
+      try {
+        const saved = JSON.parse(localStorage.getItem("muselab_workspace_order_v1") || "[]");
+        if (!Array.isArray(saved) || !saved.length) return rows;
+        const rank = new Map(saved.map((path, index) => [path, index]));
+        return rows
+          .map((row, index) => ({ row, index }))
+          .sort((a, b) => (rank.get(a.row.path) ?? saved.length + a.index)
+            - (rank.get(b.row.path) ?? saved.length + b.index))
+          .map(item => item.row);
+      } catch (_) { return rows; }
+    },
+    _saveWorkspaceOrder() {
+      try {
+        localStorage.setItem("muselab_workspace_order_v1",
+          JSON.stringify(this.sessionWorkspaces.map(workspace => workspace.path)));
+      } catch (_) {}
+    },
     async fetchSessionWorkspaces() {
       const cacheKey = "muselab_workspace_registry_v1";
       try {
         const cached = JSON.parse(sessionStorage.getItem(cacheKey) || "null");
         if (cached && Array.isArray(cached.workspaces)
             && Date.now() - Number(cached.savedAt || 0) < 10 * 60_000) {
-          this.sessionWorkspaces = cached.workspaces;
+          this.sessionWorkspaces = this._applySavedWorkspaceOrder(cached.workspaces);
         }
       } catch (_) {}
       try {
         const response = await fetch("/api/chat/workspaces", { headers: this.hdr() });
         if (!response.ok) return false;
         const payload = await response.json();
-        this.sessionWorkspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
+        this.sessionWorkspaces = this._applySavedWorkspaceOrder(payload.workspaces);
         try { sessionStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), workspaces: this.sessionWorkspaces })); } catch (_) {}
         const primaryFileRoot = this.primaryWorkspacePath();
         if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
@@ -7106,6 +7143,93 @@ function portal() {
       if (this.tabState[id] === st) delete this.tabState[id];
       this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
       this._clearSessionWarnFlags(id);
+    },
+    _startWorkspaceDrag(path, pointerId = null) {
+      if (this.workspaceSwitching || !this.sessionWorkspaces.some(row => row.path === path)) return false;
+      this.workspaceDrag = {
+        path, overPath: path, pointerId,
+        originalPaths: this.sessionWorkspaces.map(row => row.path),
+      };
+      return true;
+    },
+    _moveWorkspaceDrag(overPath) {
+      const fromPath = this.workspaceDrag.path;
+      if (!fromPath || !overPath || fromPath === overPath) return;
+      const rows = this.sessionWorkspaces.slice();
+      const from = rows.findIndex(row => row.path === fromPath);
+      const to = rows.findIndex(row => row.path === overPath);
+      if (from < 0 || to < 0) return;
+      const [row] = rows.splice(from, 1);
+      rows.splice(to, 0, row);
+      this.sessionWorkspaces = rows;
+      this.workspaceDrag.overPath = overPath;
+    },
+    onWorkspaceDragStart(event, path) {
+      if (!this._startWorkspaceDrag(path)) {
+        event.preventDefault();
+        return;
+      }
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", path);
+      }
+    },
+    onWorkspaceDragOver(path) {
+      this._moveWorkspaceDrag(path);
+    },
+    onWorkspaceDrop(event) {
+      event.preventDefault();
+      this.finishWorkspaceDrag();
+    },
+    onWorkspaceDragEnd() {
+      this.finishWorkspaceDrag();
+    },
+    onWorkspacePointerDown(event, path) {
+      if (event.pointerType === "mouse" || (event.button != null && event.button !== 0)) return;
+      if (!this._startWorkspaceDrag(path, event.pointerId)) return;
+      event.preventDefault();
+    },
+    onWorkspacePointerMove(event) {
+      if (this.workspaceDrag.pointerId !== event.pointerId || !this.workspaceDrag.path) return;
+      event.preventDefault();
+      const row = document.elementFromPoint(event.clientX, event.clientY)
+        ?.closest("[data-workspace-path]");
+      if (row && row.dataset.workspacePath) this._moveWorkspaceDrag(row.dataset.workspacePath);
+    },
+    onWorkspacePointerUp(event) {
+      if (this.workspaceDrag.pointerId !== event.pointerId || !this.workspaceDrag.path) return;
+      this.finishWorkspaceDrag();
+    },
+    async finishWorkspaceDrag() {
+      const drag = this.workspaceDrag;
+      if (!drag.path) return;
+      const currentPaths = this.sessionWorkspaces.map(row => row.path);
+      const changed = currentPaths.some((path, index) => path !== drag.originalPaths[index]);
+      this.workspaceDrag = { path: "", overPath: "", pointerId: null, originalPaths: [] };
+      if (!changed) return;
+
+      this._saveWorkspaceOrder();
+      this.workspaceSwitching = true;
+      try {
+        const response = await fetch("/api/chat/workspaces/order", {
+          method: "PUT",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ paths: currentPaths }),
+        });
+        // The browser preference keeps reordering usable until an older running
+        // backend is restarted and picks up the new persistence endpoint.
+        if (response.status === 404 || response.status === 405) return;
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        this.sessionWorkspaces = this._applySavedWorkspaceOrder(payload.workspaces);
+      } catch (_) {
+        const rows = new Map(this.sessionWorkspaces.map(row => [row.path, row]));
+        this.sessionWorkspaces = drag.originalPaths.map(path => rows.get(path)).filter(Boolean);
+        this._saveWorkspaceOrder();
+        this.toast(this.lang === "zh" ? "工作目录排序保存失败" : "Could not save workspace order", "error");
+      } finally {
+        this.workspaceSwitching = false;
+      }
     },
     async removeWorkspace(path) {
       const entry = this.sessionWorkspaces.find(w => w.path === path);
@@ -9842,7 +9966,12 @@ function portal() {
           if (s.model) this.model = s.model;
           this.permission = st._permissionExpected
             ? st._permissionExpected.value
-            : (s.permission || "default");
+            // 2026-07-21: legacy/blank sessions had no stored permission and fell
+            // through to a hard-coded "default". That value then leaked out via
+            // savePrefs() into the NEXT newly-created chat's starting mode,
+            // overriding the user's configured global default ("新建会话还是
+            // default"). Honor the server-authoritative defaultPermission first.
+            : (s.permission || this.defaultPermission || "default");
           // effort defaults to "" (adaptive); always assign so switching from
           // a high-effort tab to a fresh one doesn't leave the old value visible.
           this.effort = s.effort || "";
@@ -19432,17 +19561,18 @@ function portal() {
     activityGroups() {
       const zh = this.lang === "zh";
       return [
-        { key: "attention", label: zh ? "需要处理" : "Needs attention", states: ["waiting_approval", "paused", "failed"] },
+        { key: "attention", label: zh ? "需要处理" : "Needs attention", states: ["waiting_approval", "paused"] },
         { key: "unread", label: zh ? "待查看结果" : "Results to review", states: ["completed"], unreadOnly: true },
         { key: "running", label: zh ? "进行中" : "Running", states: ["running"] },
-        { key: "recent", label: zh ? "最近完成" : "Recent", states: ["completed", "cancelled"], readOnly: true },
+        { key: "recent", label: zh ? "最近完成" : "Recent", states: ["completed", "failed", "cancelled"], readOnly: true },
       ];
     },
     activityEvents(group) {
       const states = new Set(group.states || []);
       return (this.activity.events || []).filter(item => {
         const unread = !!item.needs_attention && !item.read;
-        return states.has(item.state) && (!group.unreadOnly || unread) && (!group.readOnly || !unread);
+        return states.has(item.state) && (!group.unreadOnly || unread)
+          && (!group.readOnly || !unread || item.state === "failed");
       });
     },
     activityStateLabel(state) {
