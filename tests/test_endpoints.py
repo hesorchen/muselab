@@ -35,7 +35,7 @@ def test_lookup_deepseek(monkeypatch):
 
 def test_lookup_unknown_model(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {})
-    assert ep.lookup("gpt-5") is None
+    assert ep.lookup("unknown-5") is None
     assert ep.lookup("claude-sonnet-4-6") is None  # claude not in catalog
 
 

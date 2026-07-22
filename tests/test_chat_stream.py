@@ -913,10 +913,11 @@ def test_broadcast_replay_compacts_100k_deltas_into_bounded_chunks(stream_env):
     for _ in range(100_000):
         bc.publish({"event": "text", "data": '{"text":"x"}'})
 
+    replay = list(bc.replay_events())
     assert len(bc.events) <= 20
     assert sum(
         len(json.loads(event["data"])["text"])
-        for event in bc.events
+        for event in replay
     ) == 100_000
     assert bc._replay_bytes <= 512_000
 

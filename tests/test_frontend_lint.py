@@ -208,9 +208,9 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     chat_start = html.index('<aside class="pane chat"')
     chat_end = html.index("</aside>", chat_start)
     assert "files-head-workspace" in html[files_start:files_end]
-    assert "activity-center-btn" in html[files_start:files_end]
+    assert "activity-center-btn" not in html[files_start:files_end]
     assert "workspace-picker" not in html[chat_start:chat_end]
-    assert "activity-center-btn" not in html[chat_start:chat_end]
+    assert "activity-center-btn" in html[chat_start:chat_end]
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -222,7 +222,7 @@ def test_session_history_and_workspace_use_distinct_icons():
 
     assert '#i-history' in html[history_start:history_end]
     assert '#i-folder' not in html[history_start:history_end]
-    assert '#i-folder' in html[workspace_start:workspace_end]
+    assert '#i-hard-drive' in html[workspace_start:workspace_end]
 
 
 def test_workspace_file_requests_reject_late_previous_owner_results():
