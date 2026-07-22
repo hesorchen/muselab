@@ -123,6 +123,14 @@ class WorkspaceRegistry:
             self._save(updated)
             self._workspaces = updated
 
+    def reorder(self, paths: list[str]) -> None:
+        with self._lock:
+            if len(paths) != len(self._workspaces) or set(paths) != set(self._workspaces):
+                raise ValueError("workspace order must contain every registered workspace exactly once")
+            updated = {path: self._workspaces[path] for path in paths}
+            self._save(updated)
+            self._workspaces = updated
+
     def browse(self, value: str | Path | None = None) -> dict[str, Any]:
         path = self._browser_path(value)
         with self._lock:
@@ -264,14 +272,16 @@ class WorkspaceRegistry:
         return " · ".join(labels)
 
     def _load(self) -> dict[str, str]:
-        values = {str(self.primary): self.primary.name or str(self.primary)}
+        primary_path = str(self.primary)
+        fallback = {primary_path: self.primary.name or primary_path}
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return values
+            return fallback
         entries = payload.get("workspaces") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
-            return values
+            return fallback
+        values: dict[str, str] = {}
         for item in entries:
             if not isinstance(item, dict):
                 continue
@@ -280,6 +290,8 @@ class WorkspaceRegistry:
             except ValueError:
                 continue
             values[str(path)] = str(item.get("name") or path.name or path).strip()
+        if primary_path not in values:
+            values = {**fallback, **values}
         return values
 
     def _save(self, values: dict[str, str]) -> None:
@@ -315,6 +327,10 @@ class WorkspaceRequest(BaseModel):
     name: str = ""
 
 
+class WorkspaceOrderRequest(BaseModel):
+    paths: list[str]
+
+
 router = APIRouter(prefix="/api/chat/workspaces", tags=["workspaces"])
 
 
@@ -343,6 +359,15 @@ def register_workspace(body: WorkspaceRequest) -> dict[str, Any]:
         return asdict(entry)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.put("/order", dependencies=[Depends(require_token)])
+def reorder_workspaces(body: WorkspaceOrderRequest) -> dict[str, Any]:
+    try:
+        registry.reorder(body.paths)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"workspaces": [asdict(entry) for entry in registry.list()]}
 
 
 @router.delete("", dependencies=[Depends(require_token)])

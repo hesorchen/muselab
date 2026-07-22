@@ -41,6 +41,25 @@ The script will:
 
 If `.env` already exists, the script keeps it (re-running is safe).
 
+## Remote Linux server: menu-bar client only
+
+If MuseLab runs on Linux and this Mac only needs the menu-bar icon, install the
+client helper without installing a second backend:
+
+```bash
+git clone https://github.com/hesorchen/muselab && cd muselab
+MUSELAB_URL=https://muse.example.com bash scripts/install-macos-statusbar.sh
+# Enter the Linux server's MUSELAB_TOKEN at the hidden prompt.
+```
+
+The installer verifies `/api/activity/summary`, stores the URL and token in
+`~/Library/Application Support/muselab/statusbar.env` with mode `600`, and
+starts `com.muselab.statusbar`. The helper polls every 10 seconds; clicking it
+opens the same origin with `/?activity=1`, so the web UI opens the global
+activity center. Use an HTTPS reverse proxy or a trusted VPN such as Tailscale;
+the token grants access to your archive and must not cross an untrusted network
+in plain HTTP.
+
 ## Verify
 
 ```bash

@@ -816,6 +816,7 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     assert active_requests, "loadSession did not call /active"
     assert ticket_requests and ticket_requests[-1]["prompt"] == ""
     assert ticket_requests[-1]["session_id"] == sid
+    assert ticket_requests[-1]["mobile"] is True
 
     page.evaluate(
         """() => {
@@ -1091,10 +1092,20 @@ def test_mobile_keyboard_close_without_viewport_event_restores_full_layout(
     _assert_no_browser_errors(page, errors)
 
 
-def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend_url, auth_token):
+@pytest.mark.parametrize(
+    ("viewport", "expects_plain"),
+    [
+        ({"width": 390, "height": 844}, True),
+        ({"width": 1440, "height": 900}, False),
+    ],
+    ids=["mobile", "desktop"],
+)
+def test_120kb_mixed_sse_stream_renders_final_assistant_html(
+    page: Page, backend_url, auth_token, viewport, expects_plain,
+):
     """Drive the real send()/SSE handlers with a long mixed event stream."""
     errors = _capture_browser_errors(page)
-    page.set_viewport_size({"width": 390, "height": 844})
+    page.set_viewport_size(viewport)
     _install_fake_event_source(page)
     page.route(
         "**/api/chat/stream/start",
@@ -1238,12 +1249,15 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend
         }"""
     )
     page.wait_for_function(
-        """() => {
+        """expectsPlain => {
           const app = document.querySelector('#app')._x_dataStack[0];
           const last = app.messages[app.messages.length - 1];
-          return app.streaming === true && last && last._streamPlain === true
-            && last.text.includes('FINAL_ASSISTANT_HTML_COMPLETE');
+          return app.streaming === true && last
+            && last._streamPlain === expectsPlain
+            && last.text.includes('FINAL_ASSISTANT_HTML_COMPLETE')
+            && (expectsPlain || last.html.includes('FINAL_ASSISTANT_HTML_COMPLETE'));
         }""",
+        arg=expects_plain,
         timeout=10000,
     )
     page.evaluate(
@@ -1298,8 +1312,12 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(page: Page, backend
         };
         """,
     )
-    assert render_stats["plain"] >= 1
-    assert render_stats["rich"] <= 8
+    if expects_plain:
+        assert render_stats["plain"] >= 1
+        assert render_stats["rich"] <= 8
+    else:
+        assert render_stats["plain"] == 0
+        assert render_stats["rich"] >= 1
     assert render_stats["mounted"] <= 60
     assert render_stats["cached"] <= 120
     long_tasks = page.evaluate("() => window.__longTasks || []")

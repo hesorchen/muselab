@@ -32,6 +32,33 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     assert [row["path"] for row in rows] == [str(temp_root.resolve())]
 
 
+def test_reorder_workspaces_persists_complete_order(client, auth, temp_root, tmp_path):
+    first = _make_workspace(tmp_path, "first")
+    second = _make_workspace(tmp_path, "second")
+    for path in (first, second):
+        response = client.post(
+            "/api/chat/workspaces", headers=auth, json={"path": str(path)})
+        assert response.status_code == 200
+
+    paths = [str(second.resolve()), str(temp_root.resolve()), str(first.resolve())]
+    reordered = client.put(
+        "/api/chat/workspaces/order", headers=auth, json={"paths": paths})
+
+    assert reordered.status_code == 200
+    assert [row["path"] for row in reordered.json()["workspaces"]] == paths
+
+    from backend.workspaces import WorkspaceRegistry
+    assert [row.path for row in WorkspaceRegistry(temp_root).list()] == paths
+
+    invalid = client.put(
+        "/api/chat/workspaces/order", headers=auth,
+        json={"paths": [paths[0], paths[0], paths[2]]},
+    )
+    assert invalid.status_code == 400
+    rows = client.get("/api/chat/workspaces", headers=auth).json()["workspaces"]
+    assert [row["path"] for row in rows] == paths
+
+
 def test_workspace_header_and_query_scope_file_access(client, auth, tmp_path):
     other = _make_workspace(tmp_path)
     assert client.post(

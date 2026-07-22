@@ -179,6 +179,20 @@ def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     assert "height: 100dvh" in mobile
 
 
+def test_workspace_picker_supports_mouse_and_touch_reordering():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert 'class="workspace-picker-drag" draggable="true"' in html
+    assert '@dragstart="onWorkspaceDragStart($event, workspace.path)"' in html
+    assert '@pointerdown.stop="onWorkspacePointerDown($event, workspace.path)"' in html
+    assert '@pointermove.window="onWorkspacePointerMove($event)"' in html
+    assert 'fetch("/api/chat/workspaces/order"' in app
+    assert 'localStorage.setItem("muselab_workspace_order_v1"' in app
+    assert "touch-action: none" in css
+
+
 def test_workspace_switch_moves_files_preview_and_conversation_together():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -194,9 +208,9 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     chat_start = html.index('<aside class="pane chat"')
     chat_end = html.index("</aside>", chat_start)
     assert "files-head-workspace" in html[files_start:files_end]
-    assert "activity-center-btn" in html[files_start:files_end]
+    assert "activity-center-btn" not in html[files_start:files_end]
     assert "workspace-picker" not in html[chat_start:chat_end]
-    assert "activity-center-btn" not in html[chat_start:chat_end]
+    assert "activity-center-btn" in html[chat_start:chat_end]
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -208,7 +222,7 @@ def test_session_history_and_workspace_use_distinct_icons():
 
     assert '#i-history' in html[history_start:history_end]
     assert '#i-folder' not in html[history_start:history_end]
-    assert '#i-folder' in html[workspace_start:workspace_end]
+    assert '#i-hard-drive' in html[workspace_start:workspace_end]
 
 
 def test_workspace_file_requests_reject_late_previous_owner_results():
@@ -425,6 +439,14 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     assert "this.messages = st.messages" not in failed
 
 
+def test_activity_center_groups_failed_tasks_as_recent():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'states: ["waiting_approval", "paused"]' in app
+    assert 'states: ["completed", "failed", "cancelled"], readOnly: true' in app
+    assert 'item.state === "failed"' in app
+
+
 def test_activity_center_uses_two_compact_numberless_status_dots():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -462,7 +484,13 @@ def test_bounded_stream_resync_waits_for_canonical_history_without_retry_loop():
     helper = app[helper_start:helper_end]
 
     assert '"cancelled", "resync"' in app
-    assert "streamState._canonicalResyncPending = true" in handler
+    assert 'const streamMobile = this._isMobileLayout()' in app
+    assert 'mobile: streamMobile' in app
+    assert '"&mobile=" + (streamMobile ? "1" : "0")' in app
+    assert 'if (!streamMobile)' in app
+    assert 'if (!final && streamMobile && acc.length > 32 * 1024)' in app
+    assert 'if (streamMobile && reason === "replay_truncated")' in handler
+    assert 'streamState._canonicalResyncPending = true' in handler
     assert "this._scheduleCanonicalStreamReload(streamSid, streamState)" in handler
     assert "if (streamState._canonicalResyncPending) return" in error
     assert "/active" in helper

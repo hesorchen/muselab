@@ -29,6 +29,7 @@ muselab is single-user. One token guards the whole web UI and every API call.
 | `MUSELAB_ROOT` | Absolute path to your archive (native runs) | — | **Yes** (native) |
 | `MUSELAB_HOST` | Interface uvicorn binds to | `127.0.0.1` | No |
 | `MUSELAB_PORT` | Listen port | `8765` | No |
+| `MUSELAB_URL` | Public origin used by the optional remote macOS menu-bar client | local `127.0.0.1:<port>` | No |
 | `MUSELAB_MODEL` | Default model id for new sessions | unset | No — **leave unset** so the UI auto-picks your first configured provider |
 
 > `MUSELAB_ROOT` may not be a bare system path (`/`, `/etc`, `/home`, `/var`, …);

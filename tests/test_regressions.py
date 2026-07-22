@@ -849,11 +849,8 @@ def test_vendor_label_for_known_models(monkeypatch, tmp_path):
     assert _vendor_label_for("qwen3-max")           == "Qwen"
     assert _vendor_label_for("qwen-plus")           == "Qwen"
     assert _vendor_label_for("mimo-v2.5-pro")       == "Xiaomi MiMo"
-    # Unknown / vendor wrapper id — note "kimi-mystery" used to land here
-    # back when Kimi was uncatalogued; after 2026-05-22 it routes to Kimi
-    # (longest-prefix match treats it as a Kimi variant), so the unknown
-    # case is now genuinely-foreign vendors like the gpt-5 line.
-    assert _vendor_label_for("gpt-5")               == "Unknown"
+    # The gpt-* compatibility provider is now catalogued as OpenAI.
+    assert _vendor_label_for("gpt-5")               == "OpenAI"
     assert _vendor_label_for("")                    == "Unknown"
 
 

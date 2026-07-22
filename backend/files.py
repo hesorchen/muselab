@@ -1305,7 +1305,8 @@ SEARCH_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "venv",
 
 GREP_EXTS = {".md", ".markdown", ".txt", ".html", ".htm", ".json", ".yaml", ".yml",
              ".py", ".js", ".ts", ".css", ".sh", ".toml", ".ini", ".csv", ".sql",
-             ".log", ".xml", ".rst", ".tex"}
+             ".log", ".xml", ".rst", ".tex",
+             ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 
 
 MAX_GREP_FILE_SIZE = 1_000_000   # 1MB per file — skip large files

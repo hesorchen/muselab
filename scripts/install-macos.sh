@@ -420,11 +420,26 @@ EOF
   fi
 fi
 
-# ----- 4. LaunchAgent ----------------------------------------------------
+# ----- 4. LaunchAgents ---------------------------------------------------
 PORT="$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]')"
 PORT="${PORT:-8765}"
 
-# MUSELAB_SKIP_SERVICE=1 short-circuits steps 4+5. CI-only escape hatch
+# The menu-bar helper is a tiny native AppKit program. Build it during every
+# install (including CI's service-skip mode) so macOS compiler regressions are
+# caught before the LaunchAgent is written.
+if ! command -v xcrun >/dev/null 2>&1 || ! xcrun --find swiftc >/dev/null 2>&1; then
+  err "Swift compiler not found. Install the Xcode Command Line Tools first:"
+  echo "      xcode-select --install"
+  exit 1
+fi
+STATUSBAR_BUILD_DIR="$REPO/build/macos"
+STATUSBAR_BUILD="$STATUSBAR_BUILD_DIR/MuseLabStatusBar"
+mkdir -p "$STATUSBAR_BUILD_DIR"
+xcrun swiftc -O -framework AppKit -framework Foundation \
+  "$REPO/macos/statusbar/main.swift" -o "$STATUSBAR_BUILD"
+ok "macOS status bar helper built"
+
+# MUSELAB_SKIP_SERVICE=1 short-circuits LaunchAgent registration and startup.
 # (GHA macOS runners can technically register LaunchAgents, but skipping
 # keeps the test focused on the installer logic itself). End users should
 # never set this.
@@ -433,12 +448,20 @@ if [[ "${MUSELAB_SKIP_SERVICE:-0}" == "1" ]]; then
   warn "4/5+5/5 SKIPPED (MUSELAB_SKIP_SERVICE=1) — no LaunchAgent registered"
   warn "  To run muselab manually: uv run python -m backend.main"
 else
-  bold "4/5  Installing LaunchAgent / 注册 LaunchAgent"
+  bold "4/5  Installing LaunchAgents / 注册 LaunchAgents"
   AGENT_DIR="$HOME/Library/LaunchAgents"
   LOG_DIR="$HOME/Library/Logs/muselab"
-  mkdir -p "$AGENT_DIR" "$LOG_DIR"
+  STATUSBAR_INSTALL_DIR="$HOME/Library/Application Support/muselab"
+  STATUSBAR_BINARY="$STATUSBAR_INSTALL_DIR/MuseLabStatusBar"
+  mkdir -p "$AGENT_DIR" "$LOG_DIR" "$STATUSBAR_INSTALL_DIR"
 
   PLIST="$AGENT_DIR/com.muselab.plist"
+  STATUSBAR_PLIST="$AGENT_DIR/com.muselab.statusbar.plist"
+
+  # Stop old copies before replacing their plist or executable.
+  launchctl unload "$STATUSBAR_PLIST" 2>/dev/null || true
+  launchctl unload "$PLIST" 2>/dev/null || true
+  install -m 755 "$STATUSBAR_BUILD" "$STATUSBAR_BINARY"
 
   # Build PATH that the agent will inherit — must include uv's dir and brew dirs so
   # subprocesses (claude CLI, node for MCP) can be found by absolute resolution.
@@ -450,21 +473,27 @@ else
       -e "s|{{PATH_DIRS}}|$PATH_DIRS|g" \
       -e "s|{{HOME_DIR}}|$HOME|g" \
       scripts/templates/com.muselab.plist.tmpl > "$PLIST"
-  ok "plist: $PLIST"
+  sed -e "s|{{STATUS_BAR_BINARY}}|$STATUSBAR_BINARY|g" \
+      -e "s|{{ENV_PATH}}|$REPO/.env|g" \
+      -e "s|{{HOME_DIR}}|$HOME|g" \
+      scripts/templates/com.muselab.statusbar.plist.tmpl > "$STATUSBAR_PLIST"
+  ok "backend plist: $PLIST"
+  ok "status bar plist: $STATUSBAR_PLIST"
 
-  # Reload — unload first in case an old version is loaded
-  launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load -w "$PLIST"
-  # Wait up to 15s for the agent to register
+  launchctl load -w "$STATUSBAR_PLIST"
+  # Wait up to 15s for both agents to register.
   WAITED=0
   while (( WAITED < 15 )); do
-    if launchctl list 2>/dev/null | grep -q com.muselab; then break; fi
+    if launchctl list 2>/dev/null | grep -q 'com.muselab.statusbar' \
+        && launchctl list 2>/dev/null | grep -q 'com.muselab$'; then break; fi
     sleep 1; WAITED=$((WAITED+1))
   done
-  if launchctl list 2>/dev/null | grep -q com.muselab; then
-    ok "agent loaded (took ${WAITED}s)"
+  if launchctl list 2>/dev/null | grep -q 'com.muselab.statusbar' \
+      && launchctl list 2>/dev/null | grep -q 'com.muselab$'; then
+    ok "backend + status bar agents loaded (took ${WAITED}s)"
   else
-    err "agent failed to load in 15s — check $LOG_DIR/stderr.log"
+    err "an agent failed to load in 15s — check $LOG_DIR"
     exit 1
   fi
 
@@ -515,9 +544,10 @@ if (( NEED_CLAUDE_LOGIN )); then
   echo
 fi
 echo  "  Useful commands / 常用命令:"
-echo  "    launchctl list | grep muselab               # check loaded / 查状态"
-echo  "    launchctl kickstart -k gui/\$UID/com.muselab # restart / 重启"
-echo  "    tail -f $LOG_DIR/stderr.log                 # tail logs / 看日志"
+echo  "    launchctl list | grep muselab                         # check loaded / 查状态"
+echo  "    launchctl kickstart -k gui/\$UID/com.muselab          # restart backend / 重启后端"
+echo  "    launchctl kickstart -k gui/\$UID/com.muselab.statusbar # restart menu icon / 重启状态栏"
+echo  "    tail -f $LOG_DIR/stderr.log                           # tail logs / 看日志"
 echo  "    bash scripts/uninstall-macos.sh             # remove autostart / 卸载"
 
 # Auto-open the URL in the user's default browser. Skip via MUSELAB_NO_BROWSER=1.

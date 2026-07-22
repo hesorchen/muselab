@@ -37,6 +37,22 @@ bash scripts/install-macos.sh
 
 如果 `.env` 已存在，脚本会保留不动（可安全重跑）。
 
+## 连接远程 Linux 服务：只安装菜单栏客户端
+
+如果 MuseLab 运行在 Linux，而这台 Mac 只需要菜单栏图标，不必再安装一套后端：
+
+```bash
+git clone https://github.com/hesorchen/muselab && cd muselab
+MUSELAB_URL=https://muse.example.com bash scripts/install-macos-statusbar.sh
+# 在隐藏输入提示中输入 Linux 服务端的 MUSELAB_TOKEN。
+```
+
+安装器会先验证 `/api/activity/summary`，再把 URL 和 token 以 `600` 权限保存到
+`~/Library/Application Support/muselab/statusbar.env`，并启动
+`com.muselab.statusbar`。状态栏每 10 秒轮询一次；点击后会在同一服务地址打开
+`/?activity=1`，网页随即显示全局任务中心。请使用 HTTPS 反向代理或 Tailscale
+等可信 VPN；该 token 可以访问你的档案，不应通过不可信网络的明文 HTTP 传输。
+
 ## 验证
 
 ```bash
