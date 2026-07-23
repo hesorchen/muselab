@@ -1404,6 +1404,18 @@ def _rough_prompt_tokens(text: str) -> int:
     return max(1, len(text) // 3)
 
 
+_CLI_INTERRUPT_MESSAGE_RE = re.compile(
+    r"^\[Request interrupted by user(?: for tool use)?\]$",
+    re.IGNORECASE,
+)
+
+
+def _is_cli_interrupt_message(text: Any) -> bool:
+    """Return True only for Claude CLI's synthetic interrupt transcript row."""
+    return isinstance(text, str) and bool(
+        _CLI_INTERRUPT_MESSAGE_RE.fullmatch(text.strip()))
+
+
 async def _detect_gateway_context_limit(model: str) -> int:
     """Compatibility wrapper returning only the effective integer limit."""
     capability = await _detect_gateway_context_capability(model)
@@ -1432,12 +1444,18 @@ def _is_real_user_prompt(sm: Any) -> bool:
     msg = getattr(sm, "message", None)
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, str):
-        return bool(content.strip())
+        return bool(content.strip()) and not _is_cli_interrupt_message(content)
     if isinstance(content, list):
-        # If any block is non-tool_result (text / image / etc.) → real prompt.
+        # If any meaningful block is non-tool_result (text / image / etc.) →
+        # real prompt. Claude CLI persists Stop as a synthetic user text row;
+        # it is transport metadata, not a human turn.
         for b in content:
-            if isinstance(b, dict) and b.get("type") != "tool_result":
-                return True
+            if not isinstance(b, dict) or b.get("type") == "tool_result":
+                continue
+            if (b.get("type") == "text"
+                    and _is_cli_interrupt_message(b.get("text"))):
+                continue
+            return True
         return False
     # Unknown shape — default to "real" so we don't under-count.
     return True
@@ -2862,6 +2880,11 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
 
         # Simple shape: content is a single string.
         if isinstance(content, str):
+            # Claude CLI persists an explicit Stop as a synthetic user record.
+            # It is not a message the human sent and must not split the visible
+            # assistant/tool run or appear as an English user bubble.
+            if _is_cli_interrupt_message(content):
+                continue
             # Background-task completion record → stamp the launching tool_use
             # card's terminal task_status (durable ✅ across reloads) and DROP
             # the raw XML bubble. The card was emitted by an earlier assistant
@@ -2910,6 +2933,8 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
             # render. Pure-wrapper messages produce empty text + no images
             # → drop the bubble entirely.
             cleaned = _strip_cli_slash_wrapper(text_buf)
+            if _is_cli_interrupt_message(cleaned):
+                cleaned = ""
             if not cleaned and not image_refs:
                 text_buf = ""
                 image_refs = []

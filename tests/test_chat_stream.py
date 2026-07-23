@@ -1300,6 +1300,28 @@ def test_rebuild_failed_status_maps_through():
     assert card["task_status"]["state"] == "failed"
 
 
+def test_rebuild_hides_only_cli_interrupt_user_messages():
+    from backend import chat as chat_mod
+
+    marker_string = _sm(
+        "interrupt-string", "user", "[Request interrupted by user]")
+    marker_list = _sm("interrupt-list", "user", [
+        {"type": "text", "text": "[Request interrupted by user for tool use]"},
+    ])
+    real_user = _sm("real-user", "user", [
+        {"type": "text", "text": "Please explain user interruption handling"},
+    ])
+
+    out = chat_mod._sdk_messages_to_ui(
+        [marker_string, marker_list, real_user], {})
+    assert [m["text"] for m in out if m.get("role") == "user"] == [
+        "Please explain user interruption handling",
+    ]
+    assert chat_mod._is_real_user_prompt(marker_string) is False
+    assert chat_mod._is_real_user_prompt(marker_list) is False
+    assert chat_mod._is_real_user_prompt(real_user) is True
+
+
 # --- GET /api/chat/task-output (serve bg-task .output from /tmp) ---------
 
 def _make_task_output(tmp_path, sid, name="abc.output", body="task stdout\n"):

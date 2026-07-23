@@ -173,10 +173,13 @@ def test_enter_submission_waits_for_ime_composition():
     helper_start = app.index("_claimNonImeEnter(ev)")
     helper_end = app.index("\n    },", helper_start)
     helper = app[helper_start:helper_end]
-    assert "ev.isComposing" in helper
-    assert "ev.keyCode === 229" in helper
-    assert "ev.which === 229" in helper
-    assert 'ev.key === "Process"' in helper
+    ime_start = app.index("_isImeComposingEvent(ev)")
+    ime_end = app.index("\n    },", ime_start)
+    ime = app[ime_start:ime_end]
+    assert "ev.isComposing" in ime
+    assert "ev.keyCode === 229" in ime
+    assert "ev.which === 229" in ime
+    assert 'ev.key === "Process"' in ime
     assert helper.index("return false") < helper.index("ev.preventDefault()")
 
     assert '@keydown.enter="confirmModalOnEnter($event)"' in html
@@ -186,6 +189,27 @@ def test_enter_submission_waits_for_ime_composition():
     assert '@keydown.enter.prevent="commitRenameTab()"' not in html
     assert '@keydown.enter.prevent="pickerCommitInlineRename()"' not in html
     assert '@keydown.enter.prevent.stop="onEnter($event)"' not in html
+
+
+def test_chat_arrow_keys_walk_user_input_history_and_restore_draft():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("_chatInputHistory()")
+    end = app.index("\n    _cancelMentionLookup()", start)
+    history = app[start:end]
+
+    assert "st._earlierMessages" in history
+    assert "st._laterMessages" in history
+    assert 'm.role === "user"' in history
+    assert "draft._historyIndex = index - 1" in history
+    assert "draft._historyIndex = index + 1" in history
+    assert "draft._historyDraft = this.input" in history
+    assert "const originalDraft = draft._historyDraft" in history
+    assert "this._resetChatInputHistory(draft)" in history
+    assert 'this.input.includes("\\n")' in history
+    assert "this._isImeComposingEvent(ev)" in history
+    assert '@keydown.up="onChatArrowUp($event)"' in html
+    assert '@keydown.down="onChatArrowDown($event)"' in html
 
 
 def test_pane_popups_escape_clipping_but_stay_below_global_overlays():
@@ -643,9 +667,18 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "if (!r.ok) throw" in stop
     assert 'String(item).startsWith(sid + "@")' in stop
     assert "const timeout = setTimeout(() => controller.abort(), 15000)" in stop
-    assert "this._retireStaleSessionStream(sid, st)" in stop
-    assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" in stop
+    assert "waitForTerminalEvent = !!st.streaming" in stop
+    assert "this._retireStaleSessionStream(sid, st)" not in stop
+    assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" not in stop
     assert "if (!didInterrupt)" in stop
+    assert "if (!waitForTerminalEvent || !st.streaming)" in stop
+    cancelled_start = app.index('es.addEventListener("cancelled"')
+    cancelled_end = app.index("\n      });", cancelled_start)
+    assert "_markDone(true)" in app[cancelled_start:cancelled_end]
+    mark_done_start = app.index("const _markDone = (cancelled = false)")
+    mark_done_end = app.index("\n      };", mark_done_start)
+    assert "streamState._stopping = false" in app[
+        mark_done_start:mark_done_end]
     assert "this.isTabStreaming(this.currentId)" in app
 
 

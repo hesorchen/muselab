@@ -2987,7 +2987,7 @@
                     @keydown.ctrl.x="onCutLine($event)"
                     @keydown.meta.x="onCutLine($event)"
                     @keydown.up="onChatArrowUp($event)"
-                    @keydown.down="(mentionShow || slashShow) && _navPop(1) && $event.preventDefault()"
+                    @keydown.down="onChatArrowDown($event)"
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
                     @focus="onChatInputFocus($event)"

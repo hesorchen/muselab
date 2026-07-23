@@ -4610,9 +4610,12 @@ function portal() {
     // candidate; it must not also submit the surrounding prompt or rename.
     // `isComposing` is the standard signal, while keyCode/which 229 and
     // key="Process" cover older Safari/WebView and Windows IME variants.
+    _isImeComposingEvent(ev) {
+      return !!(ev && (ev.isComposing || ev.keyCode === 229 || ev.which === 229
+        || ev.key === "Process"));
+    },
     _claimNonImeEnter(ev) {
-      if (!ev || ev.isComposing || ev.keyCode === 229 || ev.which === 229
-          || ev.key === "Process") return false;
+      if (!ev || this._isImeComposingEvent(ev)) return false;
       ev.preventDefault();
       ev.stopPropagation();
       return true;
@@ -5452,6 +5455,8 @@ function portal() {
           input: "",
           pendingImages: [],
           pendingDocs: [],
+          _historyIndex: -1,
+          _historyDraft: "",
           _sendWaitingForUpload: false,
           _uploadControllers: new Set(),
         },
@@ -17881,37 +17886,90 @@ function portal() {
       }
     },
 
+    _chatInputHistory() {
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      const messages = st
+        ? [
+            ...(st._earlierMessages || []),
+            ...(st.messages || []),
+            ...(st._laterMessages || []),
+          ]
+        : (this.messages || []);
+      return messages
+        .filter(m => m && m.role === "user" && typeof m.text === "string"
+          && m.text.length)
+        .map(m => m.text);
+    },
+    _resetChatInputHistory(draft = null) {
+      draft = draft || (this.currentId && this.tabState
+        && this.tabState[this.currentId] && this.tabState[this.currentId].draft);
+      if (!draft) return;
+      draft._historyIndex = -1;
+      draft._historyDraft = "";
+    },
+    _showChatHistoryInput(text, ev) {
+      this.input = text;
+      ev.preventDefault();
+      this.$nextTick(() => {
+        const ta = this.$refs.chatInput;
+        if (!ta) return;
+        ta.focus();
+        const len = this.input.length;
+        ta.setSelectionRange(len, len);
+        this.autoGrow(ta);
+      });
+    },
     onChatArrowUp(ev) {
-      // 1. If a mention/slash popup is open, ↑ navigates it (preserves
-      //    the prior keymap).
+      // Candidate lists own their arrow keys while a CJK IME is composing.
+      if (this._isImeComposingEvent(ev)) return;
+      // 1. If a mention/slash popup is open, ↑ navigates it.
       if (this.mentionShow || this.slashShow) {
         this._navPop(-1);
         ev.preventDefault();
         return;
       }
-      // 2. Empty input → recall the most recent user message so the user
-      //    can edit + re-send (Slack/Cursor/iTerm/zsh style).
-      if (!this.input.trim()) {
-        const msgs = this.messages || [];
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          const m = msgs[i];
-          if (m && m.role === "user" && m.text) {
-            this.input = m.text;
-            ev.preventDefault();
-            this.$nextTick(() => {
-              const ta = this.$refs.chatInput;
-              if (ta) {
-                ta.focus();
-                const len = this.input.length;
-                ta.setSelectionRange(len, len);
-                this.autoGrow(ta);
-              }
-            });
-            return;
-          }
-        }
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      const draft = st && st.draft;
+      const history = this._chatInputHistory();
+      if (!draft || !history.length) return;
+      let index = Number.isInteger(draft._historyIndex)
+        ? draft._historyIndex : -1;
+      // Preserve native caret movement for multiline drafts until history
+      // navigation has explicitly started. Single-line input follows shell
+      // semantics and is restored after the user walks forward with ↓.
+      if (index < 0) {
+        if (this.input.includes("\n")) return;
+        draft._historyDraft = this.input;
+        index = history.length;
       }
-      // Otherwise let the browser handle ↑ (cursor up inside textarea).
+      if (index <= 0) {
+        ev.preventDefault();
+        return;
+      }
+      draft._historyIndex = index - 1;
+      this._showChatHistoryInput(history[draft._historyIndex], ev);
+    },
+    onChatArrowDown(ev) {
+      if (this._isImeComposingEvent(ev)) return;
+      if (this.mentionShow || this.slashShow) {
+        this._navPop(1);
+        ev.preventDefault();
+        return;
+      }
+      const st = this.currentId && this.tabState && this.tabState[this.currentId];
+      const draft = st && st.draft;
+      const index = draft && Number.isInteger(draft._historyIndex)
+        ? draft._historyIndex : -1;
+      if (!draft || index < 0) return;
+      const history = this._chatInputHistory();
+      if (index < history.length - 1) {
+        draft._historyIndex = index + 1;
+        this._showChatHistoryInput(history[draft._historyIndex], ev);
+        return;
+      }
+      const originalDraft = draft._historyDraft || "";
+      this._resetChatInputHistory(draft);
+      this._showChatHistoryInput(originalDraft, ev);
     },
 
     _cancelMentionLookup() {
@@ -17921,6 +17979,9 @@ function portal() {
       this.mentionShow = false;
     },
     onChatInput(ev) {
+      // A real edit forks away from the recalled entry. Programmatic history
+      // navigation updates x-model directly and does not emit an input event.
+      this._resetChatInputHistory();
       const ta = ev.target;
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
@@ -18368,6 +18429,7 @@ function portal() {
       const clearSubmittedComposer = () => {
         if (!ownsSendDraft()) return;
         if (sendDraft.input === composerText) sendDraft.input = "";
+        this._resetChatInputHistory(sendDraft);
         const removeOwned = (items, sent) => {
           for (let i = items.length - 1; i >= 0; i--) {
             if (sent.has(items[i])) items.splice(i, 1);
@@ -18443,6 +18505,7 @@ function portal() {
           }
           if (ownsSendDraft() && sendDraft.input === composerText) {
             sendDraft.input = "";
+            this._resetChatInputHistory(sendDraft);
             if (this.currentId === sendSid) this.input = "";
           }
           this.$nextTick(() => { if (this.currentId === sendSid && this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
@@ -19275,6 +19338,7 @@ function portal() {
       const _markDone = (cancelled = false) => {
         streamState.streaming = false;
         streamState.es = null;
+        streamState._stopping = false;
         streamState._serverActiveObserved = false;
         // If the user is on a different tab when this turn lands, flag
         // unread so the tab strip can show a green dot. Doing it inside
@@ -19674,7 +19738,7 @@ function portal() {
       es.addEventListener("cancelled", () => {
         flushRender();
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        es.close(); _markDone(); _stopTimer();
+        es.close(); _markDone(true); _stopTimer();
         // User explicitly stopped — pause the queue too. Auto-draining
         // here would be surprising (they cancelled for a reason, almost
         // never "just this one but please send the rest"). The paused
@@ -19710,6 +19774,7 @@ function portal() {
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
+      let waitForTerminalEvent = false;
       try {
         const r = await fetch(
           "/api/chat/interrupt?session_id=" + encodeURIComponent(sid),
@@ -19725,6 +19790,12 @@ function portal() {
           item => item === sid || String(item).startsWith(sid + "@"),
         );
         if (this.tabState[sid] !== st) return;
+        // The HTTP response only acknowledges the control request. Keep the
+        // EventSource alive until its cancelled/done event flushes the final
+        // markdown/tool boundary and performs the one authoritative cleanup.
+        // Closing it here used to strand partially rendered blocks and race a
+        // subsequent history reload.
+        waitForTerminalEvent = !!st.streaming;
         if (!didInterrupt) {
           // An empty interrupted list means the SDK client was detached or its
           // best-effort interrupt failed. The backend watchdog is now forcing the
@@ -19735,32 +19806,11 @@ function portal() {
                      "warn", 2500);
           return;
         }
-
-        // Flush selection-deferred text before retiring the EventSource, then use
-        // the shared lifecycle cleanup so reconnect counters/timers cannot leak
-        // into the next turn.
-        if (st._renderStreamingHtml) st._renderStreamingHtml();
-        const now = Date.now();
-        const clockElapsed = st._streamStartedAt
-          ? (now - st._streamStartedAt) / 1000 : 0;
-        const elapsed = Math.max(0, Number(st.streamElapsed) || 0,
-          Number.isFinite(clockElapsed) ? clockElapsed : 0);
-        this._retireStaleSessionStream(sid, st);
-        st._renderStreamingHtml = null;
-        st._pendingHtmlRender = null;
-        for (let i = st.messages.length - 1; i >= 0; i--) {
-          const message = st.messages[i];
-          if (!message) continue;
-          if (message.role === "user") break;
-          if (message.role !== "assistant") continue;
-          if (!message.ts) message.ts = now;
-          if (!message.elapsed && elapsed >= 1) message.elapsed = elapsed;
-          break;
+        if (waitForTerminalEvent) {
+          this.toast(this.lang === "zh" ? "正在中断当前会话…"
+                                        : "Interrupting the current session…",
+                     "warn", 2000);
         }
-        const session = (this.sessions || []).find(s => s.id === sid);
-        if (session) session.active = false;
-        this.toast(this.lang === "zh" ? "已中断当前会话" : "Session interrupted",
-                   "warn", 2000);
       } catch (_e) {
         this.toast(this.lang === "zh"
                     ? "停止失败，当前会话仍在运行"
@@ -19769,7 +19819,9 @@ function portal() {
       } finally {
         clearTimeout(timeout);
         if (this.tabState[sid] === st) {
-          st._stopping = false;
+          // A successfully accepted interrupt stays deduplicated until the
+          // stream's terminal event clears _stopping in _markDone().
+          if (!waitForTerminalEvent || !st.streaming) st._stopping = false;
           this._syncQueueFromServer(sid);
         }
         setTimeout(() => this.refreshSessions(), 800);
