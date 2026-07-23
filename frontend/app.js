@@ -4606,7 +4606,23 @@ function portal() {
       finally { this.dismissToast(t.id); }
     },
 
+    // Enter pressed while a CJK IME is composing confirms the highlighted
+    // candidate; it must not also submit the surrounding prompt or rename.
+    // `isComposing` is the standard signal, while keyCode/which 229 and
+    // key="Process" cover older Safari/WebView and Windows IME variants.
+    _claimNonImeEnter(ev) {
+      if (!ev || ev.isComposing || ev.keyCode === 229 || ev.which === 229
+          || ev.key === "Process") return false;
+      ev.preventDefault();
+      ev.stopPropagation();
+      return true;
+    },
+
     // ===== modal =====
+    confirmModalOnEnter(ev) {
+      if (!this._claimNonImeEnter(ev)) return;
+      if (this.modal.confirm) this.modal.confirm();
+    },
     confirm({ title, body = "", okText, cancelText, danger = false }) {
       // Don't depend on this.t() for default labels — in some call paths
       // (observed 2026-05-28 from deleteSchedTask) `this.t` evaluates to
@@ -7657,6 +7673,10 @@ function portal() {
         if (el) { el.focus(); el.select(); }
       });
     },
+    commitRenameTabOnEnter(ev) {
+      if (!this._claimNonImeEnter(ev)) return;
+      this.commitRenameTab();
+    },
     async commitRenameTab() {
       const id = this.renamingTabId;
       const name = (this.renameDraft || "").trim();
@@ -9342,6 +9362,10 @@ function portal() {
       const el = document.querySelector(
         `.session-picker-rename-input[data-sid="${CSS.escape(sid)}"]`);
       if (el) { el.focus(); el.select(); }
+    },
+    pickerCommitInlineRenameOnEnter(ev) {
+      if (!this._claimNonImeEnter(ev)) return;
+      this.pickerCommitInlineRename();
     },
     async pickerCommitInlineRename() {
       const sid = this.renamingPickerSid;
@@ -18011,9 +18035,10 @@ function portal() {
 
     // ===== chat =====
     onEnter(ev) {
-      // 中文 / 日文 输入法在选词阶段也会触发 Enter (keyCode=229 / isComposing=true)。
-      // 那时不应该当成"发送"，让 IME 自己处理。
-      if (ev.isComposing || ev.keyCode === 229) return;
+      // Leave candidate-confirming Enter entirely to the IME. For a regular
+      // Enter, claim the event here instead of using Alpine's `.prevent`
+      // modifier, which would preventDefault even during composition.
+      if (!this._claimNonImeEnter(ev)) return;
       if (this.mentionShow) { this.pickMention(); return; }
       // Newline-at-cursor for: Shift+Enter, Ctrl+Enter, Meta+Enter, and
       // touch devices (where bare Enter is a newline because send is via
