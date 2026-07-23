@@ -258,6 +258,17 @@ function portal() {
     treeFocusPath: "",
     _treeLoadSeq: 0,
     _childFetches: null,
+    // On-demand filesystem events. The backend shares one native watcher per
+    // active workspace; this page keeps one SSE subscription for its current
+    // workspace and coalesces structural changes before touching Alpine state.
+    _fileEvents: null,
+    _fileEventsWorkspace: "",
+    _fileEventsSeq: 0,
+    _fileEventsTimer: null,
+    _fileEventsPending: null,
+    _fileTreeDirty: false,
+    _fileTreeRefreshBusy: false,
+    _fileEventsVisibilityBound: false,
     dragOver: "",
     // Highlight flag for the sticky root bar while a tree node / OS file is
     // dragged over it (drop = move/upload to archive root).
@@ -1286,6 +1297,7 @@ function portal() {
           this.previewImmersive = false;
           document.body.classList.remove("preview-immersive");
         }
+        if (t === "files") this.$nextTick(() => this._flushFileTreeDirty());
         this.savePrefs();
       });
 
@@ -1844,6 +1856,7 @@ function portal() {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
+      this._startFileEvents();
       this.fetchActivity();
       // Restoring a saved current session means the user is already looking at
       // it; clear any completion that landed before this page loaded.
@@ -6988,6 +7001,7 @@ function portal() {
       if (!path || path === this.activeWorkspace) return true;
       const previous = this.activeWorkspace;
       if (previous) this._captureWorkspaceSurface(previous);
+      this._stopFileEvents(false);
       this._teardownTerminalView();
       this.terminals = [];
 
@@ -7063,6 +7077,9 @@ function portal() {
         );
       }
       this.setMobileTab(keepMobileTab);
+      this._fileTreeDirty = false;
+      this._fileEventsPending = new Map();
+      this._startFileEvents();
       this.savePrefs();
       return true;
     },
@@ -12032,6 +12049,178 @@ function portal() {
     },
 
     // ===== file tree =====
+    _fileTreeIsVisible() {
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") return false;
+      if (this._isMobileLayout()) return this.mobileTab === "files";
+      return !!this.leftOpen && !this.desktopFullPane;
+    },
+    _stopFileEvents(markDirty = false) {
+      ++this._fileEventsSeq;
+      if (this._fileEvents) {
+        try { this._fileEvents.close(); } catch (_) {}
+      }
+      this._fileEvents = null;
+      this._fileEventsWorkspace = "";
+      if (this._fileEventsTimer) clearTimeout(this._fileEventsTimer);
+      this._fileEventsTimer = null;
+      if (markDirty) this._fileTreeDirty = true;
+    },
+    _startFileEvents() {
+      const workspace = this.fileWorkspacePath();
+      if (!this.token || !workspace || typeof EventSource === "undefined") return;
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        this._fileTreeDirty = true;
+        return;
+      }
+      if (this._fileEvents && this._fileEventsWorkspace === workspace) return;
+      this._stopFileEvents(false);
+      const seq = ++this._fileEventsSeq;
+      const params = new URLSearchParams({ token: this.token, workspace });
+      const es = new EventSource(`/api/files/events?${params.toString()}`);
+      this._fileEvents = es;
+      this._fileEventsWorkspace = workspace;
+      this._fileEventsPending = this._fileEventsPending || new Map();
+      const owns = () => seq === this._fileEventsSeq
+        && this._fileEvents === es
+        && this._workspaceIsCurrent(workspace);
+      es.addEventListener("ready", () => {
+        if (!owns()) return;
+        if (this._fileTreeDirty) this._flushFileTreeDirty();
+      });
+      es.addEventListener("changes", (ev) => {
+        if (!owns()) return;
+        let payload;
+        try { payload = JSON.parse(ev.data); } catch (_) { return; }
+        this._queueFileChanges(payload.changes, workspace);
+      });
+      es.addEventListener("resync", () => {
+        if (!owns()) return;
+        this._fileTreeDirty = true;
+        this._flushFileTreeDirty();
+      });
+      es.onerror = () => {
+        if (!owns()) return;
+        // EventSource reconnects itself. Mark the tree dirty because changes
+        // can land in the disconnect gap; the next `ready` re-baselines once.
+        this._fileTreeDirty = true;
+      };
+      if (!this._fileEventsVisibilityBound) {
+        this._fileEventsVisibilityBound = true;
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") {
+            this._stopFileEvents(true);
+          } else {
+            this._startFileEvents();
+          }
+        });
+        window.addEventListener("pagehide", () => this._stopFileEvents(false));
+      }
+    },
+    _queueFileChanges(changes, ownerWorkspace) {
+      if (!this._workspaceIsCurrent(ownerWorkspace) || !Array.isArray(changes)) return;
+      this._fileEventsPending = this._fileEventsPending || new Map();
+      for (const row of changes) {
+        if (!row || typeof row.path !== "string") continue;
+        if (!["added", "modified", "deleted"].includes(row.type)) continue;
+        const path = row.path.replace(/^\/+/, "");
+        if (!path) continue;
+        // External writes should not leave a stale body in the preview cache.
+        // Avoid re-rendering a hidden mobile preview; opening it later will
+        // naturally fetch fresh content after this invalidation.
+        if (row.type === "modified" && path === this.selected) {
+          this._previewCacheDel(path);
+          if (this.editing) {
+            this._previewNeedsReload = path;
+            this.loadSelectedMeta(path);
+          } else if (this.previewSurface === "file"
+              && (!this._isMobileLayout() || this.mobileTab === "preview")) {
+            this._maybeReloadPreview(path, ownerWorkspace);
+          }
+        }
+        if (row.type !== "modified") {
+          this._fileEventsPending.set(`${row.type}\0${path}`, {
+            type: row.type, path,
+          });
+        }
+      }
+      const hasStructural = changes.some(row =>
+        row && (row.type === "added" || row.type === "deleted"));
+      if (!hasStructural) return;
+      if (!this._fileTreeIsVisible()) {
+        this._fileTreeDirty = true;
+        return;
+      }
+      if (this._fileEventsTimer) clearTimeout(this._fileEventsTimer);
+      // Mobile receives the same batched server event but gets a longer UI
+      // debounce so git/npm bursts cost one render, not many small splices.
+      const delay = this._isMobileLayout() ? 650 : 250;
+      this._fileEventsTimer = setTimeout(() => {
+        this._fileEventsTimer = null;
+        this._flushFileChanges(ownerWorkspace);
+      }, delay);
+    },
+    async _flushFileChanges(ownerWorkspace = this.fileWorkspacePath()) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (!this._fileTreeIsVisible()) {
+        this._fileTreeDirty = true;
+        return false;
+      }
+      if (this._fileTreeRefreshBusy) {
+        this._fileTreeDirty = true;
+        return false;
+      }
+      const pending = Array.from((this._fileEventsPending || new Map()).values());
+      this._fileEventsPending = new Map();
+      const structural = pending.filter(row =>
+        row.type === "added" || row.type === "deleted");
+      if (!structural.length) return true;
+      const representativeByParent = new Map();
+      for (const row of structural) {
+        const parent = row.path.split("/").slice(0, -1).join("/");
+        if (!representativeByParent.has(parent)) {
+          representativeByParent.set(parent, row.path);
+        }
+      }
+      this._fileTreeRefreshBusy = true;
+      let ok = true;
+      try {
+        // Root changes require rebuilding the root slice; a large multi-dir
+        // burst is also cheaper as one transactional reload than N subtree
+        // refreshes. loadRoot preserves expanded paths and last-good content.
+        if (representativeByParent.has("") || representativeByParent.size > 6) {
+          ok = await this.reloadTree();
+        } else {
+          const rows = Array.from(representativeByParent.entries())
+            .sort((a, b) => a[0].split("/").length - b[0].split("/").length);
+          for (const [, path] of rows) {
+            const refreshed = await this._refreshParentInTree(path, ownerWorkspace);
+            if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+            if (refreshed === false) ok = false;
+          }
+        }
+      } finally {
+        this._fileTreeRefreshBusy = false;
+      }
+      this._fileTreeDirty = !ok;
+      return ok;
+    },
+    async _flushFileTreeDirty() {
+      if (!this._fileTreeDirty || !this._fileTreeIsVisible()) return false;
+      if (this._fileTreeRefreshBusy) return false;
+      const ownerWorkspace = this.fileWorkspacePath();
+      this._fileTreeRefreshBusy = true;
+      this._fileEventsPending = new Map();
+      let ok = false;
+      try {
+        ok = await this.reloadTree();
+      } finally {
+        this._fileTreeRefreshBusy = false;
+      }
+      if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = !ok;
+      return ok;
+    },
     async loadRoot() {
       const treeSeq = ++this._treeLoadSeq;
       this.treeLoading = true;
@@ -16700,6 +16889,7 @@ function portal() {
       } else {
         this.leftOpen = !this.leftOpen;
       }
+      if (this.leftOpen) this.$nextTick(() => this._flushFileTreeDirty());
       this.savePrefs();
     },
 

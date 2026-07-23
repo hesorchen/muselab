@@ -20,6 +20,7 @@ from .api_push import router as push_router
 from .workspaces import router as workspaces_router
 from .activity_api import router as activity_router
 from .terminal import router as terminal_router
+from .file_events import router as file_events_router
 from .settings import ROOT, PORT, HOST
 
 
@@ -228,10 +229,12 @@ async def _lifespan(app: FastAPI):
     # are cheap; first run can take a few seconds on archives with
     # hundreds of sessions.
     from .terminal import manager as _terminal_manager
+    from .file_events import manager as _file_watch_manager
     await _terminal_manager.start()
     try:
         yield
     finally:
+        await _file_watch_manager.shutdown()
         # PTY workers outlive individual WebSocket connections so refreshes
         # can reattach. They must not outlive the muselab service itself.
         await _terminal_manager.shutdown()
@@ -349,6 +352,7 @@ async def _security_headers(request: Request, call_next):
 
 
 app.include_router(files_router)
+app.include_router(file_events_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
 app.include_router(scheduler_router)

@@ -3175,8 +3175,9 @@
             <button @click="send()"
                     :disabled="workspaceSwitching || !availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
+                    :aria-label="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')"
                     :title="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')">
-              <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
+              <span class="icon"><svg><use href="#i-send"/></svg></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
@@ -3184,8 +3185,9 @@
             <button x-show="isTabStreaming(currentId)" @click="stop()"
                     class="btn-danger chat-toolbar-send chat-toolbar-stop"
                     :disabled="workspaceSwitching || !!(tabState[currentId] && tabState[currentId]._stopping)"
+                    :aria-label="t('btn.stop')"
                     :title="t('btn.stop') + ' (Esc)'">
-              <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
+              <span class="icon"><svg><use href="#i-square"/></svg></span>
             </button>
           </div>
         </div>

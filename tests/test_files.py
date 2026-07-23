@@ -28,6 +28,29 @@ def test_list_subdir(client, auth):
     assert names == {"a.md", "b.txt", "deep"}
 
 
+def test_list_internal_directory_symlink_preserves_logical_paths(
+    client,
+    auth,
+    temp_root,
+):
+    (temp_root / "notes-link").symlink_to(temp_root / "notes", target_is_directory=True)
+
+    response = client.get("/api/files/list?path=notes-link", headers=auth)
+    assert response.status_code == 200
+    paths = {entry["path"] for entry in response.json()["entries"]}
+    assert paths == {
+        "notes-link/a.md",
+        "notes-link/b.txt",
+        "notes-link/deep",
+    }
+
+    nested = client.get("/api/files/list?path=notes-link/deep", headers=auth)
+    assert nested.status_code == 200
+    assert [entry["path"] for entry in nested.json()["entries"]] == [
+        "notes-link/deep/c.py",
+    ]
+
+
 def test_read_markdown(client, auth):
     r = client.get("/api/files/read?path=README.md", headers=auth)
     assert r.status_code == 200

@@ -393,6 +393,14 @@ def list_dir(
         raise HTTPException(status_code=400, detail="not a directory")
     entries: list[dict] = []
     truncated = False
+    # Keep the caller's logical path when `path` traverses a directory
+    # symlink. `target` is the resolved real directory (required for the
+    # containment check), but DirEntry.path therefore points at that real
+    # location too. Returning it made a tree row such as `vendor -> shared`
+    # yield children named `shared/x` instead of `vendor/x`; Alpine then
+    # filtered them as duplicates when the real directory was also visible,
+    # making the symlink look impossible to expand.
+    logical_parent = Path((path or "").strip("/"))
     # Trash dir is always hidden from the file tree (even when
     # show_hidden=true) — it has its own dedicated UI surface; mixing it
     # back into the tree would surface deleted files in a confusing
@@ -428,7 +436,7 @@ def list_dir(
             continue
         entries.append(Entry(
             name=child.name,
-            path=str(Path(child.path).relative_to(root)),
+            path=(logical_parent / child.name).as_posix(),
             is_dir=is_dir,
             size=stat.st_size if not is_dir else 0,
             mtime=stat.st_mtime,

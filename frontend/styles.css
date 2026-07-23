@@ -1498,25 +1498,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
     height: 44px;
     min-width: 44px;
   }
-  .chat-toolbar-send { width: auto; padding: 0 12px; }
+  .chat-toolbar-send { width: 44px; padding: 0; }
   .chat-toolbar-send svg { width: 16px; height: 16px; }
-  /* Show the send label on touch — gives the user a clearer target than
-     a tiny icon. */
-  .chat-toolbar .chat-toolbar-send > span:nth-child(2) {
-    display: inline; margin-left: 6px;
-    font-size: var(--fs-xs); font-weight: var(--fw-medium);
-  }
-  /* During a stream the queue/send action and Stop share one row. Preserve
-     the more important Stop label and collapse only queue/send back to an
-     icon, preventing the model selector from being squeezed to one glyph. */
-  .chat-toolbar.has-stop .chat-toolbar-queue {
-    width: 44px;
-    padding: 0;
-  }
-  .chat-toolbar.has-stop .chat-toolbar-queue > span:nth-child(2) {
-    display: none;
-    margin-left: 0;
-  }
   /* Textarea on touch: no min-height override here. The tighter
      line-height that prevents single-line input from inflating the
      box is set at the END of this file (alongside the iOS anti-zoom
@@ -1534,10 +1517,6 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   .chat-toolbar.has-stop .chat-toolbar-stop {
     width: 44px;
     padding: 0;
-  }
-  .chat-toolbar.has-stop .chat-toolbar-stop > span:nth-child(2) {
-    display: none;
-    margin-left: 0;
   }
 }
 
@@ -6133,10 +6112,6 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .chat-toolbar-send svg { width: 14px; height: 14px; }
 .chat-toolbar-send.btn-danger { background: var(--c-danger); }
 .chat-toolbar-send.btn-danger:hover { background: #b91c2c; }
-/* The Send / Stop label inside the button — hidden by default
-   (icon-only). Use nth-child(2) instead of :last-child because the
-   queue badge is a 3rd <span> sibling that must stay visible. */
-.chat-toolbar-send > span:nth-child(2) { display: none; }
 /* Queue button: full sizing inherits from .chat-toolbar-send +
    .neutral above. This class only carries the position context for
    the absolute-positioned badge below. */
