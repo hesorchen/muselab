@@ -11,13 +11,14 @@ If you redistribute muselab (a fork, a container image, a Show HN
 mirror, etc.), keep this file intact and reproduce the upstream
 license texts when required by the corresponding license.
 
-> Verified: 2026-05-22. Spot-check the upstream repository if you need
+> Verified: 2026-07-23. Spot-check the upstream repository if you need
 > the canonical license text for a specific version.
 
 ## Frontend — vendored under `frontend/vendor/`
 
-These are shipped verbatim (minified) so muselab works with **no build
-step** and runs offline after install.
+These are shipped verbatim (minified) so muselab needs **no frontend build
+step or runtime CDN**. Model and external-tool calls still require their
+configured network access.
 
 | Component | Version family | License | Upstream |
 |---|---|---|---|
@@ -26,16 +27,20 @@ step** and runs offline after install.
 | DOMPurify | v3.x | Apache 2.0 / MPL 2.0 (dual) | <https://github.com/cure53/DOMPurify> |
 | highlight.js | v11.x + language extras + theme CSS | BSD 3-Clause | <https://github.com/highlightjs/highlight.js> |
 | KaTeX (incl. fonts + `auto-render`) | v0.16.x | MIT | <https://github.com/KaTeX/KaTeX> |
-| CodeMirror 6 (`cm/codemirror.min.{js,css}` + `addon/` + `mode/` + `theme/`) | v6.x | MIT | <https://github.com/codemirror/dev> |
+| CodeMirror (`cm/codemirror.min.{js,css}` + `addon/` + `mode/` + `theme/`) | v5.65.16 | MIT | <https://github.com/codemirror/codemirror5> |
 | Mermaid (`mermaid.min.js`, diagram rendering) | v11.x | MIT | <https://github.com/mermaid-js/mermaid> |
+| xterm.js + FitAddon | v6.0.0 / v0.11.0 | MIT | <https://github.com/xtermjs/xterm.js> |
 
 ### License notes
 
-- **Alpine.js, marked, KaTeX, CodeMirror** — MIT. Permission granted to
+- **Alpine.js, marked, KaTeX, CodeMirror, xterm.js** — MIT. Permission granted to
   use, copy, modify, distribute, sublicense, and sell, provided the
   original copyright notice + license text are preserved in
   substantial portions. The notices live inside the minified files
   themselves (header comments) and are not stripped by muselab.
+- **xterm.js** — the terminal renderer and fit addon are vendored under
+  `frontend/vendor/xterm/`; their complete MIT texts are included alongside
+  the scripts.
 - **DOMPurify** — dual-licensed Apache License 2.0 or Mozilla Public
   License 2.0; user picks. muselab uses it under Apache 2.0 (compatible
   with this project's MIT distribution).
@@ -48,7 +53,7 @@ step** and runs offline after install.
 
 These are SKILL.md instruction files (plain text, no compiled code)
 shipped with muselab to give Muse out-of-the-box capabilities.
-The first seven are muselab-native; the four below are community-authored
+The first eight are muselab-native; the remaining four are community-authored
 and included here with attribution.
 
 | Skill | Author / Repo | License | Upstream |
@@ -60,6 +65,7 @@ and included here with attribution.
 | `summary-distiller` | muselab contributors | MIT | this repo |
 | `task-decomposer` | muselab contributors | MIT | this repo |
 | `web-search` | muselab contributors | MIT | this repo |
+| `archive-curator` | muselab contributors | MIT | this repo |
 | `pptx` | tfriedel / claude-office-skills | not specified† | <https://github.com/tfriedel/claude-office-skills> |
 | `csv-analyzer` | coffeefuelbump | not specified† | <https://github.com/coffeefuelbump/csv-data-summarizer-claude-skill> |
 | `translate` | feiskyer | MIT | <https://github.com/feiskyer/claude-code-settings> |
@@ -80,13 +86,17 @@ floor muselab pins.
 
 | Package | License | Upstream |
 |---|---|---|
-| `claude-agent-sdk` (≥ 0.2.82) | MIT | <https://github.com/anthropics/claude-agent-sdk-python> |
-| `fastapi` (≥ 0.136) | MIT | <https://github.com/tiangolo/fastapi> |
-| `uvicorn[standard]` (≥ 0.47) | BSD 3-Clause | <https://github.com/encode/uvicorn> |
-| `python-dotenv` (≥ 1.2) | BSD 3-Clause | <https://github.com/theskumar/python-dotenv> |
-| `python-multipart` (≥ 0.0.28) | Apache 2.0 | <https://github.com/Kludex/python-multipart> |
-| `openpyxl` (≥ 3.1) | MIT | <https://foss.heptapod.net/openpyxl/openpyxl> |
+| `claude-agent-sdk` (≥ 0.2.120, < 0.3) | MIT | <https://github.com/anthropics/claude-agent-sdk-python> |
+| `fastapi` (≥ 0.138.1) | MIT | <https://github.com/tiangolo/fastapi> |
+| `starlette` (≥ 1.3.1) | BSD 3-Clause | <https://github.com/encode/starlette> |
+| `uvicorn[standard]` (≥ 0.49.0) | BSD 3-Clause | <https://github.com/encode/uvicorn> |
+| `python-dotenv` (≥ 1.2.2) | BSD 3-Clause | <https://github.com/theskumar/python-dotenv> |
+| `python-multipart` (≥ 0.0.32) | Apache 2.0 | <https://github.com/Kludex/python-multipart> |
+| `openpyxl` (≥ 3.1.5) | MIT | <https://foss.heptapod.net/openpyxl/openpyxl> |
 | `pywebpush` (≥ 2.0) | MPL 2.0 | <https://github.com/web-push-libs/pywebpush> |
+| `aiohttp` (≥ 3.14.0) | Apache 2.0 | <https://github.com/aio-libs/aiohttp> |
+| `Pillow` (≥ 12.3.0) | HPND | <https://github.com/python-pillow/Pillow> |
+| `PyJWT[crypto]` (≥ 2.13.0) | MIT | <https://github.com/jpadilla/pyjwt> |
 
 `fastapi`, `uvicorn`, and `python-multipart` pull transitive deps
 (`starlette`, `pydantic`, `h11`, `httptools`, `websockets`,
@@ -99,7 +109,7 @@ Not shipped to end users; relevant only if you hack on muselab:
 
 | Package | License |
 |---|---|
-| `pytest`, `pytest-asyncio` | MIT |
+| `pytest`, `pytest-asyncio`, `pytest-playwright` | MIT |
 | `ruff` | MIT |
 
 ## External runtime — required at the install boundary

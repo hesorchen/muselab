@@ -12,14 +12,17 @@
 | 自托管 | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 浏览器访问 | ✅ | ✅ | ✅ | ✅ | ❌ |
 | HTML / PDF / 图片预览 | ✅ | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| 浏览器内真实 PTY 终端 | ✅ 多终端 + Profile | ✅ 多标签 | ❌ | ❌ | n/a（本身运行于终端） |
 | **全模型完整 agent SDK** | ✅ | ⚠️ 主要 Claude | ⚠️ 自有 agent + MCP | ❌ RAG 专用 | ✅ 仅 Claude |
 | 复用 Claude Pro 订阅 | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 代码行数 | ~40 k（后端 + 前端） | 几万 | 几十万 | ~150 k | 闭源 |
 | 安装命令数 | 1（curl \| bash） | 多 | docker compose | docker | brew / npm |
 
 需要 **IDE 完整功能**，推荐 claudecodeui 或 code-server。
 需要 **插件市场**，推荐 LobeChat。
 需要 **基于爬取内容的 RAG**，推荐 AnythingLLM。
+
+muselab 的终端与文件、预览和会话使用同一个工作目录。可以同时保留多个真实 PTY
+会话，并通过 Profile 在新建终端时自动执行固定命令；切换页面不会终止其中的进程。
 
 同类搜索中经常出现的其他名字：
 
@@ -43,6 +46,8 @@
 ## 边界
 
 - 单用户、单 token —— 两人共用即共享全部数据，团队/家庭场景请每人一份实例
-- 不是 IDE：归档目录可以放代码，但不要在这里做软件开发，用 [claudecodeui](https://github.com/siteboon/claudecodeui) 或 [Claude Code](https://github.com/anthropics/claude-code)
+- 不是完整 IDE：内置终端适合在工作目录执行命令和辅助 Agent 工作，但不提供完整的
+  代码导航、调试器与 IDE 插件生态；重度软件开发仍建议使用 claudecodeui 或
+  Claude Code
 - 不是 RAG：归档按需 Read / Grep，不预先向量化；爬虫式文档问答用 [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
-- 不带插件市场：内置 11 个精选技能并自动发现已安装的 Claude Code 插件，但没有应用内 marketplace，如需用 [LobeChat](https://github.com/lobehub/lobe-chat)
+- 不带插件市场：内置 12 个精选技能并自动发现已安装的 Claude Code 插件，但没有应用内 marketplace，如需用 [LobeChat](https://github.com/lobehub/lobe-chat)

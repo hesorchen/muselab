@@ -14,7 +14,7 @@ import pytest
 
 pytest.importorskip("playwright.sync_api",
                     reason="install with: uv add --group dev pytest-playwright")
-from playwright.sync_api import Page, TimeoutError, expect  # noqa: E402
+from playwright.sync_api import Browser, Page, TimeoutError, expect  # noqa: E402
 
 
 SEL_LOGIN = ".login"
@@ -360,6 +360,111 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         assert page.locator(".msg-pane").count() <= 1
         assert _app_eval(page, "return app.residentPaneIds().length;") <= 1
 
+    _assert_no_browser_errors(page, errors)
+
+
+def test_desktop_warm_session_switch_keeps_panes_and_composer_stable(
+    page: Page, backend_url: str, auth_token: str,
+):
+    """Desktop prioritizes instant warm switches without footer/layout jumps."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    session_ids = [f"desktop-warm-{i}" for i in range(4)]
+    payload = {
+        "ids": session_ids,
+        "messages": {
+            sid: _make_mixed_messages(40, f"DESKTOP_WARM_{idx}")
+            for idx, sid in enumerate(session_ids)
+        },
+    }
+    _app_eval(
+        page,
+        """
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.sessions = arg.ids.map((id, index) => ({
+          id, name: `Desktop warm ${index}`, updated_at: Date.now() / 1000 - index,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }));
+        app.openTabIds = arg.ids.slice();
+        app.tabState = {};
+        for (const id of arg.ids) {
+          const st = app._blankTabState();
+          st._loaded = true;
+          st.messages = app._historyEnvelopes(id, arg.messages[id]);
+          st.messagesReady = true;
+          st.messagesLoading = false;
+          st.atBottom = true;
+          app.tabState[id] = st;
+          app._ensureTabState(id);
+        }
+        app.currentId = arg.ids[0];
+        app._residentTabIds = arg.ids.slice();
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app._activateTabState(app.currentId);
+        app._promoteResident(app.currentId);
+        return true;
+        """,
+        payload,
+    )
+    page.wait_for_function(
+        """() => {
+          const panes = Array.from(document.querySelectorAll(".msg-pane"));
+          const visible = panes.filter(
+            pane => getComputedStyle(pane).display !== "none");
+          return panes.length === 4
+            && visible.length === 1
+            && visible[0].querySelectorAll(".msg").length === 40;
+        }"""
+    )
+    before = page.locator(".chat-input").bounding_box()
+    assert before is not None
+
+    switches = page.evaluate(
+        """async ids => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const out = [];
+          for (const id of ids) {
+            const started = performance.now();
+            app.currentId = id;
+            await app.switchSession();
+            await new Promise(resolve =>
+              requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const panes = Array.from(document.querySelectorAll(".msg-pane"));
+            const visible = panes.filter(
+              pane => getComputedStyle(pane).display !== "none");
+            out.push({
+              elapsed: performance.now() - started,
+              resident: app.residentPaneIds().length,
+              panes: panes.length,
+              visible: visible.length,
+              visibleMessages: visible[0]?.querySelectorAll(".msg").length || 0,
+              ready: app.messagesReady,
+              skeleton: getComputedStyle(
+                document.querySelector(".chat-skeleton")).display,
+            });
+          }
+          return out;
+        }""",
+        session_ids[1:] + session_ids[:1],
+    )
+    after = page.locator(".chat-input").bounding_box()
+    assert after is not None
+    assert max(row["elapsed"] for row in switches) < 1000
+    assert all(row["resident"] == 4 for row in switches)
+    assert all(row["panes"] == 4 and row["visible"] == 1 for row in switches)
+    assert all(row["visibleMessages"] == 40 for row in switches)
+    assert all(row["ready"] and row["skeleton"] == "none" for row in switches)
+    assert abs(after["y"] - before["y"]) < 1
+    assert abs(after["height"] - before["height"]) < 1
     _assert_no_browser_errors(page, errors)
 
 
@@ -1090,6 +1195,103 @@ def test_mobile_keyboard_close_without_viewport_event_restores_full_layout(
         }"""
     )
     _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_composer_footer_is_compact_and_never_overflows(
+    browser: Browser, backend_url: str, auth_token: str,
+):
+    """Real touch layout keeps the composer/footer usable at 390px and 320px."""
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        device_scale_factor=2,
+        has_touch=True,
+        is_mobile=True,
+    )
+    page = context.new_page()
+    errors = _capture_browser_errors(page)
+    try:
+        _login(page, backend_url, auth_token)
+        _app_eval(
+            page,
+            """
+            app.mobileTab = "chat";
+            app.availableModels = [{
+              model: "e2e-model-with-a-long-label",
+              label: "E2E model with a long label",
+              group: "e2e",
+              supports_thinking: true,
+            }];
+            app.model = "e2e-model-with-a-long-label";
+            const st = app._ensureTabState(app.currentId);
+            st.streaming = false;
+            app.streaming = false;
+            return true;
+            """,
+        )
+        page.wait_for_function(
+            """() => {
+              const input = document.querySelector(".chat-input-textarea");
+              return input && !input.disabled
+                && getComputedStyle(document.querySelector(".pane.chat")).display !== "none";
+            }"""
+        )
+        page.locator(".chat-input-textarea").fill("footer layout check")
+
+        def composer_metrics():
+            return page.evaluate(
+                """() => {
+                  const pick = selector => document.querySelector(selector);
+                  const box = selector => {
+                    const r = pick(selector).getBoundingClientRect();
+                    return {top: r.top, bottom: r.bottom, width: r.width, height: r.height};
+                  };
+                  const toolbar = pick(".chat-toolbar");
+                  const sendLabel = pick(
+                    ".chat-toolbar-queue > span:nth-child(2)");
+                  return {
+                    composer: box(".chat-input"),
+                    wrapPadding: getComputedStyle(pick(".chat-input-wrap")).paddingTop,
+                    flexShrink: getComputedStyle(pick(".chat-input")).flexShrink,
+                    toolbarOverflow: toolbar.scrollWidth - toolbar.clientWidth,
+                    nav: box(".mobile-tab-bar"),
+                    sendLabelDisplay: getComputedStyle(sendLabel).display,
+                  };
+                }"""
+            )
+
+        idle = composer_metrics()
+        assert idle["wrapPadding"] == "0px"
+        assert idle["flexShrink"] == "0"
+        assert idle["toolbarOverflow"] <= 1
+        assert idle["sendLabelDisplay"] != "none"
+        assert idle["composer"]["height"] <= 120
+        assert idle["composer"]["bottom"] <= idle["nav"]["top"] + 1
+
+        _app_eval(
+            page,
+            """
+            const st = app._ensureTabState(app.currentId);
+            st.streaming = true;
+            app.streaming = true;
+            return true;
+            """,
+        )
+        page.wait_for_function(
+            """() => document.querySelector(".chat-toolbar")
+              .classList.contains("has-stop")"""
+        )
+        busy = composer_metrics()
+        assert busy["toolbarOverflow"] <= 1
+        assert busy["composer"]["bottom"] <= busy["nav"]["top"] + 1
+
+        page.set_viewport_size({"width": 320, "height": 700})
+        page.wait_for_timeout(100)
+        compact = composer_metrics()
+        assert compact["toolbarOverflow"] <= 1
+        assert compact["composer"]["bottom"] <= compact["nav"]["top"] + 1
+        _assert_no_browser_errors(page, errors)
+    finally:
+        context.close()
 
 
 @pytest.mark.parametrize(

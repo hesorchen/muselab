@@ -64,9 +64,29 @@ def backend_url(tmp_path_factory):
         "MUSELAB_TOKEN": TEST_TOKEN,
         "MUSELAB_ROOT": str(root),
         "MUSELAB_PORT": str(port),
+        "MUSELAB_ENV_PATH": str(root / "e2e.env"),
+        "MUSELAB_MODEL": "deepseek-v4-pro",
+        "MUSELAB_DEFAULT_MODEL": "deepseek-v4-pro",
     }
-    env.pop("ANTHROPIC_API_KEY", None)
-    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    # Keep browser tests hermetic across developer machines and fresh CI
+    # runners. backend.settings loads the repository .env at import time, so
+    # explicit empty values prevent local credentials from changing whether
+    # onboarding opens Settings and disables the composer. A non-secret fake
+    # provider keeps UI-only tests in the configured state; no E2E test sends
+    # it to an external API.
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ZHIPUAI_API_KEY",
+        "MINIMAX_API_KEY",
+        "MOONSHOT_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "XIAOMI_MIMO_API_KEY",
+        "QIANFAN_API_KEY",
+        "CODEX_GATEWAY_API_KEY",
+    ):
+        env[key] = ""
+    env["DEEPSEEK_API_KEY"] = "e2e-placeholder-not-a-real-secret"
 
     repo_root = Path(__file__).resolve().parents[2]
     # Never leave a chatty long-running server attached to an unread PIPE.

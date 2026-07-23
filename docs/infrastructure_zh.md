@@ -8,21 +8,21 @@
 
 ## 1. scripts/ 工具箱
 
-所有自动化脚本都在 [`scripts/`](../scripts/) 目录下，每个脚本均为独立的 bash 脚本，从仓库根目录运行。
+所有自动化脚本都在 `scripts/` 目录下，每个脚本均为独立的 bash 脚本，从仓库根目录运行。
 
 | 脚本 | 用途 | 关键环境变量 |
 |------|------|------------|
-| [`versions.env`](../scripts/versions.env) | 固定外部工具版本的唯一真相源（当前为 `CLAUDE_CLI_VERSION="2.1.211"`）。由两个平台安装脚本引用；Dockerfile 中镜像同一版本号，需手动保持同步。| — |
-| [`quick-install.sh`](../scripts/quick-install.sh) | 一行引导脚本（`curl … \| bash`）。拒绝 root 执行，检测 OS，若缺少 `uv` 则安装，提示克隆目标目录，然后通过 `exec bash` 并重新挂载 `/dev/tty` 移交给平台安装脚本，保证管道环境下交互式提示正常工作。| `MUSELAB_NONINTERACTIVE=1` |
-| [`install-linux.sh`](../scripts/install-linux.sh) | 完整的 Linux/WSL2 安装脚本。五个阶段：前置检查 → `uv sync --frozen` → 写入 `.env`（随机 token、端口、归档目录）→ 注册 systemd 用户单元 → 检查/提示 linger。包含 7 个问题的档案配置向导，负责写入 `CLAUDE.md` 与归档子目录骨架。| `MUSELAB_NONINTERACTIVE=1`、`MUSELAB_LOCALE=zh\|en`、`MUSELAB_SKIP_SERVICE=1`、`MUSELAB_NO_BROWSER=1` |
-| [`install-macos.sh`](../scripts/install-macos.sh) | 结构上与 Linux 安装脚本相同，但注册的是 launchd LaunchAgent 而非 systemd 单元。端口冲突检测使用 `lsof` 而非 `ss`；Node 安装优先用 `brew`，失败则回退到 `fnm`。| 同上四个变量 |
-| [`uninstall-linux.sh`](../scripts/uninstall-linux.sh) | 停止并移除 systemd 单元；保留 `.env`、`sessions/` 与归档目录。| — |
-| [`uninstall-macos.sh`](../scripts/uninstall-macos.sh) | 卸载并移除 LaunchAgent plist；数据保留策略与 Linux 版本相同。| — |
-| [`upgrade.sh`](../scripts/upgrade.sh) | 升级 `claude-agent-sdk`（`uv lock --upgrade-package`）和 `claude` CLI（`npm install -g … @latest`），以 `pytest` 做冒烟测试，失败则中止并打印 `git checkout uv.lock pyproject.toml && uv sync` 回滚提示。不自动提交或重启服务，详见 [升级](upgrade_zh.md)。| — |
-| [`doctor.sh`](../scripts/doctor.sh) | 诊断脚本（`set -uo pipefail`，不用 `-e`，以便在部分失败时继续运行）。六项检查：前置依赖 → `.env`/配置 → Python 依赖（`uv sync --frozen`）→ 服务状态 → HTTP + 鉴权探测 → provider API 密钥。阻塞性失败退出码为 1，仅有警告则退出码为 0。| — |
-| [`setup-https.sh`](../scripts/setup-https.sh) | 仅 Linux。在已有安装前增加 Caddy 反向代理，配置 SSE 安全的 `flush_interval -1`、HSTS 与 `ufw` 规则。| — |
-| [`intake.sh`](../scripts/intake.sh) | 独立运行 7 问题 `CLAUDE.md` 档案配置向导。覆写前会备份已有的 `CLAUDE.md`。| — |
-| [`lint.sh`](../scripts/lint.sh) | 对已追踪文件执行四项检查：`backend/` 中不带 `encoding=` 的 `read_text`/`write_text`；前端文件中的 `.thinking` CSS 类冲突；通用 PII 模式（中国手机号、18 位身份证号）；运行时由 `$(whoami)`/`$(basename $HOME)` 构建的维护者身份泄露检测。| `MUSELAB_LEAK_BLACKLIST` |
+| `versions.env` | 固定外部工具版本的唯一真相源。由两个平台安装脚本引用；Dockerfile 中镜像同一版本号，需手动保持同步。| — |
+| `quick-install.sh` | 一行引导脚本（`curl … \| bash`）。拒绝 root 执行，检测 OS，若缺少 `uv` 则安装，提示克隆目标目录，然后通过 `exec bash` 并重新挂载 `/dev/tty` 移交给平台安装脚本，保证管道环境下交互式提示正常工作。| `MUSELAB_NONINTERACTIVE=1` |
+| `install-linux.sh` | 完整的 Linux/WSL2 安装脚本。五个阶段：前置检查 → `uv sync --frozen` → 写入 `.env`（随机 token、端口、归档目录）→ 注册 systemd 用户单元 → 检查/提示 linger。包含 7 个问题的档案配置向导，负责写入 `CLAUDE.md` 与归档子目录骨架。| `MUSELAB_NONINTERACTIVE=1`、`MUSELAB_LOCALE=zh\|en`、`MUSELAB_SKIP_SERVICE=1`、`MUSELAB_NO_BROWSER=1` |
+| `install-macos.sh` | 结构上与 Linux 安装脚本相同，但注册的是 launchd LaunchAgent 而非 systemd 单元。端口冲突检测使用 `lsof` 而非 `ss`；Node 安装优先用 `brew`，失败则回退到 `fnm`。| 同上四个变量 |
+| `uninstall-linux.sh` | 停止并移除 systemd 单元；保留 `.env`、`sessions/` 与归档目录。| — |
+| `uninstall-macos.sh` | 卸载并移除 LaunchAgent plist；数据保留策略与 Linux 版本相同。| — |
+| `upgrade.sh` | 升级 `claude-agent-sdk`（`uv lock --upgrade-package`）和 `claude` CLI（`npm install -g … @latest`），以 `pytest` 做冒烟测试，失败则中止并打印回滚提示。不自动提交或重启服务，详见 [升级](upgrade_zh.md)。| — |
+| `doctor.sh` | 诊断脚本（`set -uo pipefail`，不用 `-e`，以便在部分失败时继续运行）。六项检查：前置依赖 → `.env`/配置 → Python 依赖（`uv sync --frozen`）→ 服务状态 → HTTP + 鉴权探测 → provider API 密钥。阻塞性失败退出码为 1，仅有警告则退出码为 0。| — |
+| `setup-https.sh` | 仅 Linux。在已有安装前增加 Caddy 反向代理，配置 SSE 安全的 `flush_interval -1`、HSTS 与 `ufw` 规则。| — |
+| `intake.sh` | 独立运行 7 问题 `CLAUDE.md` 档案配置向导。覆写前会备份已有的 `CLAUDE.md`。| — |
+| `lint.sh` | 对已追踪文件执行静态检查与隐私泄露检测。| `MUSELAB_LEAK_BLACKLIST` |
 
 ---
 
@@ -30,9 +30,9 @@
 
 ### Linux —— systemd 用户单元
 
-单元文件：`~/.config/systemd/user/muselab.service`（由 [`scripts/templates/muselab.service.tmpl`](../scripts/templates/muselab.service.tmpl) 替换 `{{REPO_PATH}}` 和 `{{UV_PATH}}` 生成）。
+单元文件：`~/.config/systemd/user/muselab.service`（由 `scripts/templates/muselab.service.tmpl` 生成）。
 
-资源上限：`MemoryHigh=2G`、`MemoryMax=4G`、`LimitNOFILE=8192`、`TasksMax=4096`。重启策略：`on-failure`、`RestartSec=10`，5 分钟内最多重启 5 次（[`muselab.service.tmpl:L1-L41`](../scripts/templates/muselab.service.tmpl#L1)）。
+资源上限：`MemoryHigh=2G`、`MemoryMax=4G`、`LimitNOFILE=8192`、`TasksMax=4096`。重启策略：`on-failure`、`RestartSec=10`，5 分钟内最多重启 5 次。
 
 ```bash
 systemctl --user restart muselab
@@ -41,11 +41,11 @@ journalctl --user -u muselab -f
 sudo loginctl enable-linger $USER      # VPS 上保证注销/重启后持续运行
 ```
 
-**VPS 注意事项：** 若未启用 `loginctl enable-linger`，用户单元会在 SSH 会话结束时停止。安装脚本第 5 阶段会在 linger 尚未激活时发出警告（[`install-linux.sh:L456-L466`](../scripts/install-linux.sh#L456)）。
+**VPS 注意事项：** 若未启用 `loginctl enable-linger`，用户单元会在 SSH 会话结束时停止。安装脚本会在 linger 尚未激活时发出警告。
 
 ### macOS —— launchd LaunchAgent
 
-Plist 文件：`~/Library/LaunchAgents/com.muselab.plist`（由 [`scripts/templates/com.muselab.plist.tmpl`](../scripts/templates/com.muselab.plist.tmpl) 生成；label 为 `com.muselab`）。崩溃或非零退出时 `KeepAlive`；`ThrottleInterval=10s`；`HardResourceLimits`：8192 fd，4096 进程。日志：`~/Library/Logs/muselab/stdout.log` 与 `stderr.log`。
+Plist 文件：`~/Library/LaunchAgents/com.muselab.plist`（由 `scripts/templates/com.muselab.plist.tmpl` 生成；label 为 `com.muselab`）。崩溃或非零退出时 `KeepAlive`；`ThrottleInterval=10s`；`HardResourceLimits`：8192 fd，4096 进程。日志：`~/Library/Logs/muselab/stdout.log` 与 `stderr.log`。
 
 ```bash
 launchctl kickstart -k gui/$UID/com.muselab    # 重启
@@ -60,15 +60,15 @@ tail -f ~/Library/Logs/muselab/stderr.log
 
 ### 两阶段构建
 
-[`Dockerfile`](../Dockerfile) 使用两阶段构建以保持最终镜像体积精简：
+`Dockerfile` 使用两阶段构建以保持最终镜像体积精简：
 
-**阶段 1 —— 构建器**（[`Dockerfile:L8-L23`](../Dockerfile#L8)）：基础镜像 `python:3.12-slim`；从 `ghcr.io/astral-sh/uv:0.11.14` 复制 `uv`/`uvx`；通过 `uv sync --frozen --no-dev --no-install-project` 仅安装生产 Python 依赖，BuildKit 层缓存挂载于 `/root/.cache/uv`。
+**阶段 1 —— 构建器：** 基础镜像 `python:3.12-slim`；复制固定版本的 `uv`/`uvx`；通过 `uv sync --frozen --no-dev --no-install-project` 仅安装生产 Python 依赖。
 
-**阶段 2 —— 运行时**（[`Dockerfile:L25-L81`](../Dockerfile#L25)）：全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20（nodesource）与 `@anthropic-ai/claude-code@2.1.211`；从构建器复制预构建的 `.venv`；创建非 root 用户 `muse`（uid 1000，gid 1000）；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`（间隔 30s，超时 5s，启动等待 15s，重试 3 次）。
+**阶段 2 —— 运行时：** 全新 `python:3.12-slim`；安装 `curl`、`git`、Node 20 与固定版本的 Claude Code CLI；从构建器复制预构建的 `.venv`，并复制 `backend/`、`frontend/`、`skills/` 与 `scripts/templates/`；创建非 root 用户 `muse`；暴露端口 8765；声明针对 `/api/health` 的 `HEALTHCHECK`。
 
 ### docker-compose.yml
 
-[`docker-compose.yml`](../docker-compose.yml) 以如下默认值运行单个服务：
+`docker-compose.yml` 以如下默认值运行单个服务：
 
 | Compose 配置 | 默认值 | 覆盖方式 |
 |-------------|--------|---------|
@@ -84,7 +84,7 @@ tail -f ~/Library/Logs/muselab/stderr.log
 
 ### GHCR 多架构镜像
 
-镜像：`ghcr.io/hesorchen/muselab`（[`ci.yml:L207-L214`](../.github/workflows/ci.yml#L207)）
+镜像：`ghcr.io/hesorchen/muselab`
 
 | Tag 规则 | 发布时机 |
 |---------|---------|
@@ -124,11 +124,11 @@ make run
 
 ## 5. 测试套件
 
-**框架：** pytest ≥ 9.0.3，附 pytest-asyncio ≥ 1.3.0。
+**框架：** pytest ≥ 9.1.1，附 pytest-asyncio ≥ 1.4.0。
 
-**目录结构：** `tests/` 下有 ≥ 28 个文件，合计约 7,100 行单元测试与集成测试。E2E 测试位于 `tests/e2e/`，由 `RUN_E2E=1` 环境变量门控。
+**目录结构：** `tests/` 包含单元测试、集成测试与 `tests/e2e/` 下的 Playwright 浏览器回归。测试文件数和代码行数会持续变化，不作为稳定项目指标。E2E 由 `RUN_E2E=1` 环境变量门控。
 
-### 隔离策略（[`tests/conftest.py`](../tests/conftest.py)）
+### 隔离策略
 
 共享 `app_module` fixture 的作用：
 - monkeypatch `MUSELAB_TOKEN`、`MUSELAB_ROOT`、`MUSELAB_PORT=9999`
@@ -143,16 +143,16 @@ make run
 
 | 文件 | 覆盖内容 |
 |------|---------|
-| `test_chat_stream.py`（827 行）| SSE 流式传输、工具调用事件、取消操作 |
-| `test_regressions.py`（758 行）| 跨子系统 bug 回归套件 |
-| `test_scheduler.py`（470 行）| 定时任务运行器 |
-| `test_files.py`（462 行）| 文件浏览器、上传、路径穿越安全 |
-| `test_sessions.py`（354 行）| 会话 CRUD 与索引 |
-| `test_security.py`（153 行）| 鉴权绕过、token 验证 |
+| `test_chat_stream.py` | SSE 流式传输、工具调用事件、取消操作 |
+| `test_regressions.py` | 跨子系统 bug 回归套件 |
+| `test_scheduler.py` | 定时任务运行器 |
+| `test_files.py` | 文件浏览器、上传、路径穿越安全 |
+| `test_sessions.py` | 会话 CRUD 与索引 |
+| `test_security.py` | 鉴权绕过、token 验证 |
 
 ### E2E（Playwright）
 
-`tests/e2e/` 使用 Playwright + Chromium，不包含在默认的 `pytest tests/` 中。需设置 `RUN_E2E=1` 并单独安装 Chromium。当前测试文件（`test_multi_tab.py`）覆盖 tab 生命周期、拖拽重排、后台流式保持和浏览器标题更新。
+`tests/e2e/` 使用 Playwright + Chromium，不包含在默认的 `pytest tests/` 中。需设置 `RUN_E2E=1` 并单独安装 Chromium。当前覆盖多标签页生命周期、文件预览、聊天渲染性能与移动端终端交互。
 
 ---
 
@@ -197,14 +197,14 @@ CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、
 
 ## 7. 打包
 
-**文件：** [`pyproject.toml`](../pyproject.toml) —— `requires-python = ">=3.12"`，MIT 协议。
+**文件：** `pyproject.toml`——`requires-python = ">=3.12"`，MIT 协议。
 
 ### 关键依赖决策
 
 | 包 | 约束 | 原因 |
 |----|------|------|
-| `claude-agent-sdk` | `>=0.2.120,<0.3` | 设置上限是刻意为之：muselab 依赖 SDK 内部工具拒绝列表与 JSONL 转录格式的特定假设，这些不在其公开合同范围内。无上限的 `>=` 可能让一次小版本升级悄悄破坏解析逻辑（[`pyproject.toml:L43-L51`](../pyproject.toml#L43)）。|
-| `starlette` | `>=1.0.1` | 固定在 fastapi 传递依赖 1.0.0 之上，以保持 pip-audit 通过（PYSEC-2026-161）。|
+| `claude-agent-sdk` | `>=0.2.120,<0.3` | 上限是刻意设置的：muselab 依赖 SDK 工具拒绝列表与 JSONL 转录格式的特定假设，跨次版本升级必须显式验证。|
+| `starlette` | `>=1.3.1` | 显式使用已修复安全问题的版本。|
 | `pyjwt[crypto]` | `>=2.13.0` | 固定在 mcp 传递依赖 2.12.1 之上（PYSEC-2026-175/177/178/179）。|
 
 ### uv 用法
@@ -216,4 +216,4 @@ CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、
 | `uv run --with <pkg>` | CI 临时工具（`pytest-cov`、`pip-audit`），不修改冻结锁文件 |
 | `uv run uvicorn …` | 开发服务器与 systemd `ExecStart` |
 
-`uv` 二进制本身固定在 Dockerfile 中的 `0.11.14`（[`Dockerfile:L14`](../Dockerfile#L14)），保证镜像重新构建完全可复现。
+`uv` 二进制版本固定在 Dockerfile 中，保证镜像重新构建可复现；准确版本以 `Dockerfile` 为准。

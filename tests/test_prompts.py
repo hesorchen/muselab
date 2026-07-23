@@ -1,27 +1,11 @@
-"""Tests for the system-prompt surface.
-
-backend/prompts.py turns out to hold only STATIC string constants (the
-curator / profile-intake system prompts + bilingual initial-message dicts) —
-no locale branching, no CLAUDE.md injection. The general default prompt and
-the per-session prompt-composition logic live in backend/chat.py
-(SYSTEM_PROMPT + _build_and_connect_client's `sp` build). The locale knob
-itself is backend.settings.is_chinese_locale().
-
-So this file covers what's genuinely there:
-  - the static prompt constants' structural invariants + golden substrings
-  - the bilingual initial-message dicts (zh vs en branches)
-  - chat.SYSTEM_PROMPT interpolating the archive root + memory dir
-  - the locale selector (is_chinese_locale) driving the zh/en template pick
-    used by _seed_claude_md_and_archive_skeleton
-
-We assert stable substrings / invariants, not full-string equality, but keep
-at least one golden substring per branch so a silent rewrite is caught.
-"""
+"""Prompt ownership: SDK defaults + CLAUDE.md + an on-demand workflow Skill."""
 from __future__ import annotations
+
+import inspect
+from pathlib import Path
 
 
 def _prompts(app_module):
-    """Pull the reloaded prompts module out of the backend.* tree."""
     from backend import prompts
     return prompts
 
@@ -31,69 +15,33 @@ def _chat(app_module):
     return chat
 
 
-# ---------- static prompt constants ----------
-
-def test_curator_prompt_structural_invariants(app_module):
+def test_curator_starter_invokes_skill_in_both_locales(app_module):
     p = _prompts(app_module)
-    sp = p.CURATOR_SYSTEM_PROMPT
-    # Golden substring — a silent rewrite of the persona line trips this.
-    assert "You are Muse acting as an archive curator" in sp
-    # Key section headers of the 5-step workflow.
-    assert "# 5-step workflow" in sp
-    assert "## 1. Scan" in sp
-    assert "# Hard rules" in sp
-    # CLAUDE.md is the one pre-authorized write target.
-    assert "CLAUDE.md" in sp
+    starter = p.CURATOR_INITIAL_MESSAGE
+    assert set(starter) == {"zh", "en"}
+    assert all("archive-curator skill" in text for text in starter.values())
+    assert any("一" <= c <= "鿿" for c in starter["zh"])
+    assert not any("一" <= c <= "鿿" for c in starter["en"])
 
 
-def test_profile_intake_prompt_structural_invariants(app_module):
-    p = _prompts(app_module)
-    sp = p.PROFILE_INTAKE_SYSTEM_PROMPT
-    assert "You are Muse helping the user fill out their CLAUDE.md profile" in sp
-    assert "# Workflow" in sp
-    assert "# Hard rules" in sp
-    # Surgical-edit invariant the prompt repeatedly insists on.
-    assert "surgical Edits only" in sp
-
-
-def test_initial_messages_have_both_locales(app_module):
-    p = _prompts(app_module)
-    for d in (p.CURATOR_INITIAL_MESSAGE, p.PROFILE_INTAKE_INITIAL_MESSAGE):
-        assert set(d) == {"zh", "en"}
-        # zh value carries CJK, en value has none — cheap branch check.
-        # (en may include typographic punctuation like an em-dash, so we
-        # test "no CJK" rather than strict ASCII.)
-        assert any("一" <= c <= "鿿" for c in d["zh"])
-        assert not any("一" <= c <= "鿿" for c in d["en"])
-
-
-def test_curator_initial_message_golden(app_module):
-    p = _prompts(app_module)
-    assert "archive" in p.CURATOR_INITIAL_MESSAGE["en"]
-    assert "archive" in p.CURATOR_INITIAL_MESSAGE["zh"]
-
-
-# ---------- chat.SYSTEM_PROMPT (the general default) ----------
-
-def test_system_prompt_injects_archive_root(app_module, temp_root):
-    """The default prompt interpolates the live ROOT path so the model knows
-    where the archive lives. Per conftest, ROOT == temp_root."""
+def test_chat_does_not_define_or_pass_a_muselab_system_prompt(app_module):
     chat = _chat(app_module)
-    assert str(temp_root) in chat.SYSTEM_PROMPT
-    # Golden persona substring.
-    assert "You are Muse, a personal assistant running inside muselab" in chat.SYSTEM_PROMPT
-    # The CLAUDE.md-precedence section is present in the default prompt.
-    assert "# When the user has a CLAUDE.md" in chat.SYSTEM_PROMPT
+    assert not hasattr(chat, "SYSTEM_PROMPT")
+    source = inspect.getsource(chat._build_and_connect_client)
+    assert "system_prompt=" not in source
+    assert '"system_prompt"' not in source
+    assert 'setting_sources=["user", "project", "local"]' in source
+    assert '"type": "local"' in source
+    assert '"path": str(Path(__file__).resolve().parent.parent)' in source
 
 
-def test_system_prompt_references_memory_dir(app_module):
-    """The memory-dir path is derived from ROOT (cli-encoded) and surfaced in
-    the prompt so the model writes long-term memory to the right place."""
-    chat = _chat(app_module)
-    assert chat._MEMORY_DIR_PATH in chat.SYSTEM_PROMPT
-    # ROOT is set in conftest → cli-encoded projects path, not the fallback.
-    assert chat._MEMORY_DIR_PATH.endswith("/memory/")
-    assert "~/.claude/projects/" in chat._MEMORY_DIR_PATH
+def test_archive_curator_skill_has_native_workflow(app_module):
+    skill = (Path(__file__).parents[1] / "skills" / "archive-curator" / "SKILL.md")
+    text = skill.read_text(encoding="utf-8")
+    assert "name: archive-curator" in text
+    assert "## Workflow" in text
+    assert "CLAUDE.md" in text
+    assert "Do not execute an archive mutation until the user confirms" in text
 
 
 # ---------- is_chinese_locale drives the template pick ----------

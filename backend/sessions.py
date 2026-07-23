@@ -10,7 +10,7 @@ SDK is invoked with ``resume=<sid>``. That file holds:
   - tool sidechains for subagents
 
 muselab keeps a small sidecar of metadata the CLI doesn't track:
-  - session-level: name, model, custom system_prompt, auto_named flag,
+  - session-level: name, model, permission, auto_named flag,
     created_at/updated_at
   - per-message annotations keyed by message UUID:
       cost (per-turn USD), model (badge), images (uploaded base64),
@@ -38,7 +38,7 @@ from typing import Any
 
 # SDK-native session enumeration. CLI's JSONL is the truth for transcript +
 # last-modified + custom_title; muselab index.json is the truth for
-# model / system_prompt / auto_named flag and for "pre-first-query" sessions
+# model / permission / auto_named flag and for "pre-first-query" sessions
 # (CLI doesn't create the JSONL until the first query, but UI needs to show
 # the session immediately after create_session).
 from claude_agent_sdk import list_sessions as sdk_list_sessions
@@ -288,7 +288,6 @@ def _merge_sdk_with_index(
         "name": name,
         "model": m.get("model", ""),
         "permission": m.get("permission", ""),
-        "system_prompt": m.get("system_prompt", ""),
         # Auto-named flag stays True only if neither SDK custom_title nor
         # an explicit muselab rename has happened yet.
         "auto_named": (m.get("auto_named", True)
@@ -346,7 +345,7 @@ def toggle_pin(sid: str) -> bool:
         # a minimal entry to hold the pin flag.
         now = time.time()
         idx.append({
-            "id": sid, "name": "", "model": "", "system_prompt": "",
+            "id": sid, "name": "", "model": "",
             "created_at": now, "updated_at": now,
             "message_count": 0, "auto_named": True, "pinned": True,
         })
@@ -369,7 +368,7 @@ def set_pin(sid: str, val: bool) -> bool:
         # No muselab index entry yet — create a minimal stub.
         now = time.time()
         idx.append({
-            "id": sid, "name": "", "model": "", "system_prompt": "",
+            "id": sid, "name": "", "model": "",
             "created_at": now, "updated_at": now,
             "message_count": 0, "auto_named": True, "pinned": bool(val),
         })
@@ -453,6 +452,10 @@ def _build_sessions_list() -> list[dict]:
             if s.get("cwd") and not workspace_registry.contains(s.get("cwd")):
                 continue
             row = dict(s)
+            # Legacy muselab releases persisted per-session system prompts.
+            # Keep the inert key on disk for non-destructive compatibility,
+            # but never expose or execute it.
+            row.pop("system_prompt", None)
             row.setdefault("cwd", str(ROOT))
             out.append(row)
     # Sort: pinned sessions first (descending), then by updated_at desc.
@@ -466,19 +469,17 @@ def _build_sessions_list() -> list[dict]:
 def create_session(
     name: str = "",
     model: str = "",
-    system_prompt: str = "",
     cwd: str | Path | None = None,
     permission: str = "",
 ) -> dict:
     return register_session(str(uuid.uuid4()), name=name, model=model,
                             permission=permission,
-                            system_prompt=system_prompt, auto_named=True,
-                            cwd=cwd)
+                            auto_named=True, cwd=cwd)
 
 
 def register_session(sid: str, *, name: str = "", model: str = "",
                      permission: str = "",
-                     system_prompt: str = "", auto_named: bool = True,
+                     auto_named: bool = True,
                      message_count: int = 0,
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
@@ -491,7 +492,6 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "name": name or _default_session_name(),
         "model": model,
         "permission": permission,
-        "system_prompt": system_prompt,
         "created_at": now,
         "updated_at": now,
         "message_count": message_count,
@@ -506,7 +506,9 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         # ids would break list dedupe and x-for :key bindings on the frontend.
         existing = next((s for s in idx if s.get("id") == sid), None)
         if existing is not None:
-            return existing
+            public_existing = dict(existing)
+            public_existing.pop("system_prompt", None)
+            return public_existing
         idx.append(meta)
         _save_index(idx)
     try:
@@ -521,7 +523,7 @@ def get_session_meta(sid: str) -> dict | None:
     transcript), use chat.py's combined read path that pulls from SDK.
 
     Merges SDK truth (custom_title, last_modified, created_at, tag) with
-    muselab index (model, system_prompt, auto_named). Falls back to
+    muselab index (model, permission, auto_named). Falls back to
     index-only if SDK can't see the session (e.g. CLI hasn't created
     the JSONL yet) or if SDK is unavailable.
 
@@ -548,9 +550,14 @@ def get_session_meta(sid: str) -> dict | None:
             sys.stderr.write(
                 f"[sessions] sdk_get_session_info({sid}, {workspace}) failed: "
                 f"{type(e).__name__}: {e}\n")
-    meta = (_merge_sdk_with_index(info, m or {}, workspace)
-            if info is not None else ({**m, "cwd": str(m.get("cwd") or ROOT)}
-                                      if m is not None else None))
+    if info is not None:
+        meta = _merge_sdk_with_index(info, m or {}, workspace)
+    elif m is not None:
+        meta = {**m, "cwd": str(m.get("cwd") or ROOT)}
+        # Read-only compatibility for indexes written by older releases.
+        meta.pop("system_prompt", None)
+    else:
+        meta = None
     if meta is not None:
         if len(_META_CACHE) >= _META_CACHE_MAX and sid not in _META_CACHE:
             _META_CACHE.pop(next(iter(_META_CACHE)), None)
@@ -760,18 +767,6 @@ def update_thinking(sid: str, enabled: bool) -> None:
                 s["thinking"] = bool(enabled)
                 _save_index(idx)
                 return
-
-
-def update_system_prompt(sid: str, system_prompt: str) -> bool:
-    with _INDEX_LOCK:
-        idx = _load_index()
-        for s in idx:
-            if s["id"] == sid:
-                s["system_prompt"] = system_prompt
-                s["updated_at"] = time.time()
-                _save_index(idx)
-                return True
-        return False
 
 
 # ============================================================================
@@ -1017,7 +1012,7 @@ def set_message_count(sid: str, message_count: int,
         # No index entry yet — create a minimal stub carrying the count.
         now = time.time()
         stub = {
-            "id": sid, "name": "", "model": "", "system_prompt": "",
+            "id": sid, "name": "", "model": "",
             "created_at": now, "updated_at": now,
             "message_count": message_count, "auto_named": True,
         }

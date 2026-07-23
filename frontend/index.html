@@ -607,12 +607,15 @@
           <svg x-show="leftOpen && desktopFullPane !== 'preview'"><use href="#i-chevron-left"/></svg>
           <svg x-show="!leftOpen || desktopFullPane === 'preview'"><use href="#i-chevron-right"/></svg>
         </button>
-        <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
+        <span class="pane-title"
+              x-text="previewSurface==='terminal' && activeTerminal()
+                ? activeTerminal().name
+                : (selected ? selected.split('/').pop() : t('pane.preview'))"></span>
         <!-- File path + last-modified strip. Fills the gap between the title
              and the action icons; when no file is open it's empty but still
              flex:1, so it doubles as the old `.spacer`. Light/muted styling. -->
         <div class="pane-fileinfo" x-cloak>
-          <template x-if="selected">
+          <template x-if="previewSurface==='file' && selected">
             <div class="pane-fileinfo-row">
               <span class="pane-fileinfo-path" :title="selected" x-text="selected"></span>
               <span class="pane-fileinfo-mtime"
@@ -623,11 +626,31 @@
               </span>
             </div>
           </template>
+          <template x-if="previewSurface==='terminal' && activeTerminal()">
+            <div class="pane-fileinfo-row">
+              <span class="terminal-status-dot"
+                    :class="activeTerminal().status"></span>
+              <span class="pane-fileinfo-path"
+                    :title="activeTerminal().cwd"
+                    x-text="activeTerminal().cwd"></span>
+              <span class="pane-fileinfo-mtime"
+                    x-show="terminalConnection!=='connected'"
+                    x-text="terminalConnection==='connecting'
+                      ? (lang==='zh'?'正在连接…':'Connecting…')
+                      : (terminalConnection==='reconnecting'
+                          ? (lang==='zh'?'正在重连…':'Reconnecting…')
+                          : (terminalConnection==='error'
+                              ? (lang==='zh'?'连接失败':'Connection failed')
+                              : (activeTerminal().status==='exited'
+                                  ? ((lang==='zh'?'已退出 · ':'Exited · ') + activeTerminal().exit_code)
+                                  : '')))"></span>
+            </div>
+          </template>
         </div>
         <!-- Preview zoom (browser-like −/percentage/+). Shown only for the
              zoomable modes (md/text/img/xlsx/csv/html); pdf has native zoom.
              Click the percentage to reset to 100%. -->
-        <div class="preview-zoom" x-show="previewZoomable()">
+        <div class="preview-zoom" x-show="previewSurface==='file' && previewZoomable()">
           <button class="preview-zoom-btn" @click="zoomPreviewOut()"
                   :disabled="previewZoom <= PREVIEW_ZOOM_MIN"
                   :title="lang==='zh' ? '缩小' : 'Zoom out'"
@@ -640,7 +663,7 @@
                   :title="lang==='zh' ? '放大' : 'Zoom in'"
                   :aria-label="lang==='zh' ? '放大' : 'Zoom in'">+</button>
         </div>
-        <button x-show="selected && !editing && (previewMode==='md' || previewMode==='text')"
+        <button x-show="previewSurface==='file' && selected && !editing && (previewMode==='md' || previewMode==='text')"
                 @click="togglePreviewFind()" class="icon-btn preview-keep-mobile"
                 :class="{ active: previewFind.open }"
                 :title="lang==='zh' ? '搜索内容' : 'Find in file'"
@@ -648,19 +671,117 @@
                 :aria-pressed="previewFind.open">
           <svg><use href="#i-search"/></svg>
         </button>
-        <button x-show="selected" @click="reloadPreview()" class="icon-btn preview-keep-mobile"
+        <div class="terminal-manager" x-show="terminalEnabled"
+             @click.outside="terminalManagerOpen=false">
+          <button class="icon-btn terminal-manager-btn preview-keep-mobile"
+                  @click="terminalManagerOpen=!terminalManagerOpen"
+                  :class="{active: terminalManagerOpen}"
+                  :title="lang==='zh'?'终端管理':'Terminal manager'">
+            <span class="terminal-glyph">&gt;_</span>
+            <span class="terminal-count" x-show="terminals.length" x-text="terminals.length"></span>
+          </button>
+          <div class="terminal-manager-backdrop" x-show="terminalManagerOpen" x-cloak
+               @click="terminalManagerOpen=false"></div>
+          <div class="terminal-manager-pop" x-show="terminalManagerOpen" x-cloak
+               x-transition.opacity.duration.120ms>
+            <div class="terminal-manager-head">
+              <strong x-text="lang==='zh'?'终端':'Terminals'"></strong>
+              <button class="btn-primary btn-compact terminal-create-btn"
+                      @click="createTerminal($refs.terminalProfileSelect.value)"
+                      :disabled="terminalCreating || (terminalLimits && terminals.filter(t=>t.status==='running').length >= terminalLimits.max_sessions)"
+                      x-text="terminalCreating
+                        ? (lang==='zh'?'创建中…':'Creating…')
+                        : (lang==='zh'?'+ 新建终端':'+ New terminal')"></button>
+              <button class="terminal-manager-dismiss"
+                      @click="terminalManagerOpen=false"
+                      :aria-label="lang==='zh'?'关闭终端列表':'Close terminal list'">×</button>
+            </div>
+            <div class="terminal-launch-row">
+              <select x-ref="terminalProfileSelect"
+                      class="terminal-profile-select" x-model="terminalProfileId"
+                      @change="_terminalProfilePrefLoaded=true; _scheduleSavePrefs()"
+                      :title="lang==='zh'?'新终端使用的 Profile':'Profile for the new terminal'">
+                <option value="" x-text="lang==='zh'?'普通 Shell':'Plain shell'"></option>
+                <template x-for="profile in terminalProfiles" :key="profile.id">
+                  <option :value="profile.id"
+                          x-text="profile.name + (profile.is_default ? (lang==='zh'?'（默认）':' (default)') : '')"></option>
+                </template>
+              </select>
+              <button class="terminal-profile-action"
+                      @click="editSelectedTerminalProfile()"
+                      :disabled="!terminalProfileId"
+                      :title="lang==='zh'?'编辑当前 Profile':'Edit current profile'">✎</button>
+              <button class="terminal-profile-action" @click="editTerminalProfile()"
+                      :title="lang==='zh'?'新建 Profile':'New profile'">＋</button>
+            </div>
+            <div class="terminal-profile-editor" x-show="terminalProfileEditor.show" x-cloak>
+              <input x-ref="terminalProfileName"
+                     x-model="terminalProfileEditor.name"
+                     maxlength="80"
+                     :placeholder="lang==='zh'?'Profile 名称，例如 Dev Server':'Profile name, e.g. Dev Server'">
+              <textarea x-model="terminalProfileEditor.command"
+                        maxlength="8192" rows="3"
+                        :placeholder="lang==='zh'?'启动命令，例如 npm run dev':'Startup command, e.g. npm run dev'"></textarea>
+              <label class="terminal-profile-default">
+                <input type="checkbox" x-model="terminalProfileEditor.is_default">
+                <span x-text="lang==='zh'?'设为默认 Profile':'Use as default profile'"></span>
+              </label>
+              <div class="terminal-profile-editor-actions">
+                <button class="btn-danger btn-compact"
+                        x-show="terminalProfileEditor.id"
+                        :disabled="terminalProfileEditor.saving"
+                        @click="deleteTerminalProfile()"
+                        x-text="lang==='zh'?'删除':'Delete'"></button>
+                <span class="spacer"></span>
+                <button class="btn-ghost btn-compact" @click="cancelTerminalProfileEdit()"
+                        :disabled="terminalProfileEditor.saving"
+                        x-text="lang==='zh'?'取消':'Cancel'"></button>
+                <button class="btn-primary btn-compact" @click="saveTerminalProfile()"
+                        :disabled="terminalProfileEditor.saving || !terminalProfileEditor.name.trim() || !terminalProfileEditor.command.trim()"
+                        x-text="terminalProfileEditor.saving
+                          ? (lang==='zh'?'保存中…':'Saving…')
+                          : (lang==='zh'?'保存 Profile':'Save profile')"></button>
+              </div>
+            </div>
+            <div class="terminal-manager-empty" x-show="!terminals.length"
+                 x-text="lang==='zh'?'当前工作目录还没有终端':'No terminals in this workspace'"></div>
+            <template x-for="term in terminals" :key="term.id">
+              <div class="terminal-manager-row"
+                   :class="{active: previewSurface==='terminal' && activeTerminalId===term.id}"
+                   @click="openTerminal(term.id)">
+                <span class="terminal-status-dot" :class="term.status"></span>
+                <span class="terminal-manager-main">
+                  <span class="terminal-manager-name" x-text="term.name"></span>
+                  <span class="terminal-manager-profile"
+                        x-text="term.profile_name
+                          ? (lang==='zh'?'Profile：':'Profile: ') + term.profile_name
+                          : (lang==='zh'?'普通 Shell':'Plain shell')"></span>
+                  <span class="terminal-manager-cwd" x-text="term.cwd"></span>
+                </span>
+                <button class="terminal-row-action" @click.stop="renameTerminal(term)"
+                        :title="lang==='zh'?'重命名':'Rename'">✎</button>
+                <button class="terminal-row-action danger" @click.stop="closeTerminal(term.id)"
+                        :title="lang==='zh'?'关闭':'Close'">×</button>
+              </div>
+            </template>
+            <button class="terminal-close-all" x-show="terminals.length"
+                    @click="terminateAllTerminals()"
+                    x-text="lang==='zh'?'关闭全部终端':'Close all terminals'"></button>
+          </div>
+        </div>
+        <button x-show="previewSurface==='file' && selected" @click="reloadPreview()" class="icon-btn preview-keep-mobile"
                 :title="lang==='zh' ? '刷新预览' : 'Reload preview'"
                 :aria-label="lang==='zh' ? '刷新预览' : 'Reload preview'">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
         </button>
-        <button x-show="selected && isEditable(selected)" @click="toggleEdit()" class="icon-btn"
+        <button x-show="previewSurface==='file' && selected && isEditable(selected)" @click="toggleEdit()" class="icon-btn"
                 @mouseenter="_loadCodemirror().catch(()=>{})" @focus="_loadCodemirror().catch(()=>{})"
                 :title="editing ? t('btn.preview') : t('btn.edit')">
           <svg x-show="!editing"><use href="#i-edit"/></svg>
           <svg x-show="editing"><use href="#i-eye"/></svg>
         </button>
-        <button x-show="editing" @click="saveEdit()" class="btn-primary btn-compact" x-text="t('btn.save')"></button>
-        <button x-show="selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
+        <button x-show="previewSurface==='file' && editing" @click="saveEdit()" class="btn-primary btn-compact" x-text="t('btn.save')"></button>
+        <button x-show="previewSurface==='file' && selected" @click="insertFileMention(selected)" class="icon-btn preview-keep-mobile" :title="t('btn.at_mention')"><svg><use href="#i-at"/></svg></button>
         <!-- Desktop fullscreen toggle (hidden on mobile via .pane-fullscreen-btn
              @media in styles.css). Click → preview pane takes whole viewport;
              click again to restore the 3-column layout. -->
@@ -682,7 +803,7 @@
         </button>
       </header>
       <!-- Tab bar (VSCode-style multi-file) -->
-      <div class="tab-bar" x-show="tabs.length">
+      <div class="tab-bar" x-show="tabs.length || terminals.length">
         <!-- Open-tabs quick picker — fixed at the left edge, OUTSIDE the
              horizontally-scrolling .tab-bar-list (same structure as the chat
              pane's history button). Keeping it out of the scroll container
@@ -699,9 +820,20 @@
                class="session-picker-pop tab-picker-pop"
                :style="editorTabPickerStyle"
                role="listbox">
+            <template x-for="term in terminals" :key="'terminal-'+term.id">
+              <div class="session-picker-row"
+                   :class="{ active: previewSurface==='terminal' && activeTerminalId===term.id }"
+                   @click="editorTabPickerOpen=false; openTerminal(term.id)"
+                   role="option"
+                   :title="term.cwd">
+                <span class="terminal-status-dot" :class="term.status"></span>
+                <span class="terminal-glyph">&gt;_</span>
+                <span class="ellipsis" x-text="term.name"></span>
+              </div>
+            </template>
             <template x-for="t in tabs" :key="t.path">
               <div class="session-picker-row"
-                   :class="{ active: selected === t.path }"
+                   :class="{ active: previewSurface==='file' && selected === t.path }"
                    @click="pickEditorTab(t.path)"
                    role="option"
                    :title="t.path">
@@ -713,8 +845,20 @@
         </div>
         <!-- Scrolling tab strip — only this part overflows horizontally. -->
         <div class="tab-bar-list">
+        <template x-for="term in terminals" :key="'terminal-'+term.id">
+          <div class="tab terminal-tab"
+               :class="{active: previewSurface==='terminal' && activeTerminalId===term.id}"
+               @click="openTerminal(term.id)"
+               :title="term.cwd">
+            <span class="terminal-status-dot" :class="term.status"></span>
+            <span class="terminal-glyph">&gt;_</span>
+            <span class="tab-name" x-text="term.name"></span>
+            <button class="tab-close" @click.stop="closeTerminal(term.id)"
+                    :title="lang==='zh'?'关闭终端':'Close terminal'">×</button>
+          </div>
+        </template>
         <template x-for="t in tabs" :key="t.path">
-          <div :class="'tab' + (selected===t.path ? ' active' : '') + (t.preview ? ' preview' : '') + (previewDragOverPath===t.path ? ' drag-over' : '')"
+          <div :class="'tab' + (previewSurface==='file' && selected===t.path ? ' active' : '') + (t.preview ? ' preview' : '') + (previewDragOverPath===t.path ? ' drag-over' : '')"
                :draggable="isPointerDevice"
                :data-path="t.path"
                @dragstart="onPreviewTabDragStart($event, t.path)"
@@ -787,12 +931,39 @@
       </button>
 
       <div class="preview-body" x-ref="previewBody"
-           :class="{ 'drag-hover': previewDragHover || osFileDragging }"
+           :class="{ 'drag-hover': previewSurface==='file' && (previewDragHover || osFileDragging),
+                     'terminal-active': previewSurface==='terminal' }"
            @scroll.passive="onPreviewViewportScroll()"
            @dragover.prevent="previewDragHover = true"
            @dragenter.prevent="previewDragHover = true"
            @dragleave.prevent="previewDragHover = false"
            @drop.prevent="onPreviewDrop($event)">
+        <div class="terminal-surface" x-show="previewSurface==='terminal'" x-cloak>
+          <div class="terminal-host" x-ref="terminalHost"></div>
+          <div class="terminal-connection-banner"
+               x-show="terminalConnection==='connecting' || terminalConnection==='reconnecting' || terminalConnection==='error'">
+            <span class="spinner-sm" x-show="terminalConnection!=='error'"></span>
+            <span x-text="terminalConnection==='error'
+              ? (lang==='zh'?'终端连接失败':'Terminal connection failed')
+              : (terminalConnection==='reconnecting'
+                  ? (lang==='zh'?'连接中断，正在重连…':'Connection lost, reconnecting…')
+                  : (lang==='zh'?'正在连接终端…':'Connecting terminal…'))"></span>
+          </div>
+          <div class="terminal-mobile-keys">
+            <button @click="terminalCopy()" x-text="lang==='zh'?'复制':'Copy'"></button>
+            <button @click="terminalPaste()" x-text="lang==='zh'?'粘贴':'Paste'"></button>
+            <button data-terminal-key="backslash"
+                    :aria-label="lang==='zh'?'输入反斜杠':'Type backslash'"
+                    @click="terminalMobileKey('\\')">\</button>
+            <button @click="terminalMobileKey('\u0003')">Ctrl+C</button>
+            <button @click="terminalMobileKey('\u001b')">Esc</button>
+            <button @click="terminalMobileKey('\t')">Tab</button>
+            <button @click="terminalMobileKey('\u001b[D')">←</button>
+            <button @click="terminalMobileKey('\u001b[A')">↑</button>
+            <button @click="terminalMobileKey('\u001b[B')">↓</button>
+            <button @click="terminalMobileKey('\u001b[C')">→</button>
+          </div>
+        </div>
         <!-- Drag overlay — visible during any OS file drag (osFileDragging is
              set by document-level listeners in init()) so it covers the
              HTML preview iframe / image element and intercepts the drop.
@@ -801,7 +972,7 @@
              pointer-events: auto (in styles.css) makes the overlay the
              real drop target whenever it's visible. -->
         <div class="preview-drop-overlay"
-             x-show="previewDragHover || osFileDragging"
+             x-show="previewSurface==='file' && (previewDragHover || osFileDragging)"
              x-transition.opacity
              @dragover.prevent
              @drop.prevent="onPreviewDrop($event); previewDragHover = false; osFileDragging = false; _dragCounter = 0">
@@ -817,7 +988,7 @@
              toggle button is hidden elsewhere. Case-insensitive keyword search;
              ↑/↓ cycle hits, the ≣ button reveals a context-snippet results
              list, Esc closes. -->
-        <div class="preview-find" x-show="previewFind.open && !editing" x-cloak
+        <div class="preview-find" x-show="previewSurface==='file' && previewFind.open && !editing" x-cloak
              @keydown.escape.stop="closePreviewFind()">
           <div class="preview-find-bar">
             <svg class="preview-find-icon" viewBox="0 0 24 24" width="14" height="14"
@@ -854,7 +1025,7 @@
             </template>
           </div>
         </div>
-        <div x-show="editing" class="editor-wrap" :class="'editor-view-' + editorView">
+        <div x-show="previewSurface==='file' && editing" class="editor-wrap" :class="'editor-view-' + editorView">
           <!-- View switch: only markdown files get the live preview. The split
                pane renders mdRender(buffer) live as you type (debounced). -->
           <div class="editor-toolbar" x-show="editorIsMd">
@@ -890,7 +1061,7 @@
         <!-- Loading state — shown briefly between selecting a new file and the
              fetch completing. Without this, fast clicks across tabs left the
              previous file's content visible while the new one loaded. -->
-        <div x-show="!editing && previewMode==='loading'" class="preview-loading">
+        <div x-show="previewSurface==='file' && !editing && previewMode==='loading'" class="preview-loading">
           <span class="spinner-lg"></span>
           <span class="preview-loading-text"
                 x-text="lang==='zh' ? '加载中…' : 'Loading…'"></span>
@@ -902,11 +1073,11 @@
              That's how the raw <pre> below leaked under the rendered markdown
              (2026-06-26 user report: md preview dumping its own source). Object
              form uses style.setProperty per key and leaves display alone. -->
-        <div x-show="!editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd" :style="{ zoom: previewZoom }" @click="onPreviewImgClick($event)"></div>
-        <pre x-show="!editing && previewMode==='text' && rawText" class="text" :style="{ zoom: previewZoom }"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
+        <div x-show="previewSurface==='file' && !editing && previewMode==='md' && rawText" class="markdown" x-html="renderedMd" :style="{ zoom: previewZoom }" @click="onPreviewImgClick($event)"></div>
+        <pre x-show="previewSurface==='file' && !editing && previewMode==='text' && rawText" class="text" :style="{ zoom: previewZoom }"><code :class="'language-' + previewLang" x-text="rawText"></code></pre>
         <!-- 0-byte / empty file: a blank md/text pane is indistinguishable from
              "still loading" or "render broke". Show an explicit placeholder. -->
-        <div x-show="!editing && (previewMode==='md' || previewMode==='text') && selected && !rawText" class="empty">
+        <div x-show="previewSurface==='file' && !editing && (previewMode==='md' || previewMode==='text') && selected && !rawText" class="empty">
           <span class="icon"><svg><use href="#i-file"/></svg></span>
           <div class="empty-title" x-text="lang==='zh' ? '空文件' : 'Empty file'"></div>
           <div class="empty-hint" x-text="lang==='zh' ? '该文件没有内容。' : 'This file has no content.'"></div>
@@ -922,7 +1093,7 @@
              same "reflow & fill, show more, smaller" result on every engine.
              (2026-06-26 user report: html preview zoom gutters on mobile.) -->
         <template x-for="entry in htmlPreviewFrames" :key="entry.path">
-          <iframe x-show="!editing && previewMode==='html' && selected===entry.path"
+          <iframe x-show="previewSurface==='file' && !editing && previewMode==='html' && selected===entry.path"
                   :src="rawUrl(entry.path, {preview:true})"
                   :data-preview-html-path="entry.path"
                   :style="previewZoom === 1 ? {} : { transform: 'scale(' + previewZoom + ')', transformOrigin: 'top left', width: 'calc(100% / ' + previewZoom + ')', height: 'calc(100% / ' + previewZoom + ')' }"
@@ -932,14 +1103,14 @@
         <!-- Use template x-if (not x-show) so the <img> isn't even in the DOM
              when not active — :src="" would otherwise resolve to the page URL
              and fire a spurious resource-load-failed error in console. -->
-        <template x-if="!editing && previewMode==='img' && selected">
+        <template x-if="previewSurface==='file' && !editing && previewMode==='img' && selected">
           <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''"
                class="preview-img" :style="'zoom:' + previewZoom"
                @load="onPreviewContentLoad('img')"
                @error="onPreviewImageError()" />
         </template>
-        <iframe x-show="!editing && previewMode==='pdf'"
-                :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
+        <iframe x-show="previewSurface==='file' && !editing && previewMode==='pdf'"
+                :src="previewSurface==='file' && previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
                 x-ref="pdfFrame"
                 @load="onPreviewFrameLoad('pdf')"
                 class="frame"></iframe>
@@ -948,7 +1119,7 @@
              500 rows × 50 cols per sheet and 20 sheets; truncation surfaces
              as a small banner below the table. Formulas are NOT evaluated —
              cells show the last-cached value from the spreadsheet app. -->
-        <div x-show="!editing && previewMode==='xlsx'" class="xlsx-preview">
+        <div x-show="previewSurface==='file' && !editing && previewMode==='xlsx'" class="xlsx-preview">
           <div class="xlsx-tabs" x-show="xlsxSheets.length > 1">
             <template x-for="sh in xlsxSheets" :key="sh.name">
               <button class="xlsx-tab"
@@ -1005,7 +1176,7 @@
 
         <!-- CSV preview — same table style as xlsx, but with pagination
              since CSV files in the wild are often million-row exports. -->
-        <div x-show="!editing && previewMode==='csv'" class="xlsx-preview csv-preview">
+        <div x-show="previewSurface==='file' && !editing && previewMode==='csv'" class="xlsx-preview csv-preview">
           <div class="csv-toolbar">
             <button class="btn-text sm" @click="csvPrevPage()"
                     :disabled="csvOffset === 0 || csvLoading"
@@ -1056,7 +1227,7 @@
                x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
         </div>
 
-        <div x-show="!editing && previewMode==='unsupported'" class="empty">
+        <div x-show="previewSurface==='file' && !editing && previewMode==='unsupported'" class="empty">
           <span class="icon"><svg><use href="#i-file"/></svg></span>
           <!-- previewError set ⇒ a READ failed (404/413/403/…): show the real
                reason. null ⇒ genuinely-unsupported file type: keep the original
@@ -1078,7 +1249,7 @@
             </div>
           </template>
         </div>
-        <div x-show="!selected" class="brand-empty">
+        <div x-show="previewSurface==='file' && !selected" class="brand-empty">
           <span class="muse-mascot lg" :class="{'greet': mascotGreet}" @click="cycleMascot()">
             <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
           </span>
@@ -1138,8 +1309,17 @@
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
         </button>
+        <!-- Mobile chat-header shortcut. The terminal itself remains a preview
+             surface; this switches panes and opens the full terminal manager. -->
+        <button class="icon-btn chat-terminal-btn" x-show="terminalEnabled"
+                @click="openTerminalManagerFromChat()"
+                :title="lang==='zh' ? '终端' : 'Terminal'"
+                :aria-label="lang==='zh' ? '打开终端列表' : 'Open terminal list'">
+          <span class="terminal-glyph">&gt;_</span>
+          <span class="terminal-count" x-show="terminals.length" x-text="terminals.length"></span>
+        </button>
         <!-- Skills + MCP drawer toggles. 2026-05-29: 从 chat-input 底 bar 移到
-             顶 bar，与其它「能力 / 会话」入口（整理档案、定时任务、命令面板）
+             顶 bar，与其它「能力 / 会话」入口（定时任务、命令面板）
              并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
              与「这一轮怎么发」直接相关的控件。两者都回答「这个会话有哪些能力
              可用」，放顶 bar 更符合其全局属性，也给移动端底 bar 腾出空间。-->
@@ -1159,17 +1339,9 @@
           <svg><use href="#i-plug"/></svg>
         </button>
 
-        <!-- Set up / refresh profile — opens a dedicated chat session
-             where Muse walks the user through CLAUDE.md interactively,
-             one or two questions at a time, Edit-ing the file as
-             answers come in. Distinct from the ctx-chip warning: the
-             chip flags the missing state, this button is the
-             always-available "let's update my profile with Muse"
-             entry point.
-
-             Deliberately NOT a "raw edit" button — direct editing of
-             CLAUDE.md works (it's just a file) but is a worse UX:
-             nobody wants to stare at a 9-section form. -->
+        <!-- Profile setup is available from the empty-chat CTA or by trying
+             archive-curator in the Skills drawer. There is intentionally no
+             persistent "Organize archive" header button. -->
         <!-- Manual hard-refresh escape hatch. When the chat pane gets
              stuck (SSE wedged, Alpine state out of sync after a flaky
              reconnect, etc.), users have no way out except closing the
@@ -1293,7 +1465,7 @@
 
       <!-- Tab strip — like VS Code Claude. Each tab is an open session;
            click switches, double-click renames inline, right-click opens
-           the context menu (rename / edit prompt / close / delete).
+           the context menu (rename / close / export Markdown / delete).
            The picker on the right is the "history" entry point: clicking a
            row promotes that session into a tab. -->
       <!-- Two-container layout: .chat-tabs-list scrolls horizontally when tabs
@@ -1492,8 +1664,6 @@
              @keydown.escape.window="closeTabMenu()">
           <button @click="menuRename(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '重命名' : 'Rename'"></button>
-          <button @click="menuEditPrompt(tabCtxMenu && tabCtxMenu.id)"
-                  x-text="lang==='zh' ? '编辑 system prompt' : 'Edit system prompt'"></button>
           <button @click="menuClose(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '关闭 tab' : 'Close tab'"></button>
           <button @click="menuExportMarkdown(tabCtxMenu && tabCtxMenu.id)"
@@ -2811,7 +2981,8 @@
                     @click="onChatInputClick($event)"
                     :placeholder="t('chat.placeholder')"></textarea>
           </form>
-          <div class="chat-toolbar">
+          <div class="chat-toolbar"
+               :class="{ 'has-stop': isTabStreaming(currentId) }">
             <!-- Attach button — enabled while streaming too, so attachments
                  can be added to a queued message (upload is independent of
                  the running turn). -->

@@ -2,138 +2,122 @@
 
 > [简体中文](architecture_zh.md)
 
-```mermaid
-flowchart TB
-  subgraph Browser["Browser · ~27k LOC vanilla HTML + Alpine.js + CSS"]
-    F[📁 files] --- P[📄 preview + tabs] --- C[💬 chat + multi-model]
-  end
-  Browser ==>|HTTP / SSE| BE
-  subgraph BE["Backend · FastAPI ~14k LOC"]
-    A["/api/files/*<br/>safe-resolve · read/write/grep"]
-    B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model, effort)"]
-  end
-  BE ==> SDK[Claude Agent SDK<br/>spawns claude CLI subprocess]
-  SDK -->|claude-* models| CL[Claude<br/>Pro / Max OAuth]
-  SDK -->|env override per request| V[Anthropic-compatible endpoints]
-  V --> DS[DeepSeek]
-  V --> GL[Zhipu GLM]
-  V --> MM[MiniMax]
-  V --> KM[Kimi]
-  V --> QW[Qwen]
-  V --> XM[Xiaomi MiMo]
-  V --> QF[Baidu Qianfan (ERNIE)]
-  V --> CG[GPT / Codex Gateway<br/>Codex / GPT OAuth]
+muselab is a self-hosted workspace with no frontend build step. The browser owns file, preview, terminal, and session interaction; FastAPI owns authentication, persistent state, and real-time transport; every model call goes through the Claude Agent SDK.
 
-  class CL,CG subscriptionOauth
-  classDef subscriptionOauth fill:#FFF3CD,stroke:#D97706,stroke-width:2px,color:#111827
+```text
+Browser
+├── File tree and global search
+├── File previews, editor, and real PTY terminals
+├── Workspaces, sessions, queues, and activity center
+└── Settings, providers, Skills, MCP, and scheduled tasks
+        │
+        ├── HTTP / ticket SSE
+        └── ticket WebSocket
+                │
+FastAPI
+├── Files / Workspaces / Preview
+├── Chat / Sessions / Replay spool / Attachments
+├── Terminals / Profiles / PTY workers
+├── Scheduler / Push / Activity
+└── Settings / Providers / MCP / Skills
+                │
+Claude Agent SDK → claude CLI
+├── Claude OAuth
+└── Anthropic-compatible providers
 ```
 
 ## Key design decisions
 
-- **SDK over raw API.** Claude Agent SDK (same engine as Claude Code), so MCP / Skills / Subagents / plan mode / `CLAUDE.md` auto-load behave uniformly across providers. New providers: see [add-provider.md](add-provider.md).
+- **The SDK is the only model path.** Tool use, MCP, Skills, Subagents, plan mode, and `CLAUDE.md` come from the Claude Agent SDK. muselab does not create a parallel agent or system-prompt layer.
+- **Native instruction ownership.** Persistent identity, response style, personal context, and durable rules belong in the SDK-discovered `CLAUDE.md` hierarchy. Reusable workflows belong in Skills. Tool behavior belongs in tool descriptions and permission enforcement.
+- **Workspace binding.** `MUSELAB_ROOT` is the default workspace and additional local directories may be registered. Files, previews, terminals, and new-session cwd follow the active workspace; every session stores its own cwd.
+- **Whole-file input.** The assistant reads complete files on demand through Read, Grep, Edit, and related tools. muselab does not pre-embed or chunk the archive.
+- **Third-party provider isolation.** Each third-party provider receives per-request `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, and an isolated `CLAUDE_CONFIG_DIR`, preventing fallback to the wrong account.
+- **No frontend build step.** The browser runs the HTML, JavaScript, and CSS directly. Browser dependencies are vendored under `frontend/vendor/`.
+- **Short-lived tickets for real-time connections.** Chat obtains a one-time SSE ticket through an authenticated POST. Terminals obtain a one-time WebSocket ticket. Prompts and long-lived tokens do not enter real-time connection URLs.
+- **Disconnects do not stop work.** Chat turns write to a disk replay spool so browsers can resume from a cursor. Terminals retain a bounded output buffer and permit reconnects after briefly leaving the surface.
 
-- **Per-session `env=` override.** Third-party providers are wired by setting `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + an isolated `CLAUDE_CONFIG_DIR` ([`backend/endpoints.py:L851`](../backend/endpoints.py#L851)). The last one blocks the CLI from silently falling back to Pro OAuth and routing third-party traffic through your Anthropic account — the full mechanism is in [Model routing § env injection](routing.md#3-third-party-env-injection).
+## Runtime layout
 
-- **No build step.** Edit `frontend/`, refresh the browser. Vetted third-party libs live in `vendor/` (licenses in [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)); installation never touches npm.
+```text
+muselab/
+├── backend/
+│   ├── main.py                    # lifecycle and route mounting
+│   ├── chat.py                    # agent turns, SSE, queues, background work
+│   ├── sessions.py                # session index and sidecars
+│   ├── files.py                   # file operations, preview data, trash
+│   ├── workspaces.py              # workspace registration and selection
+│   ├── terminal.py                # terminal API, profiles, connection manager
+│   ├── terminal_worker.py         # PTY child process
+│   ├── endpoints.py               # provider catalog and connection settings
+│   ├── scheduler.py               # scheduled task runner
+│   ├── push.py                    # Web Push and VAPID
+│   ├── activity.py                # persisted activity-center state
+│   ├── transcript_index.py        # transcript index
+│   └── api_*.py                   # domain API routers
+├── frontend/
+│   ├── index.html
+│   ├── app.js
+│   ├── styles.css
+│   ├── i18n/
+│   └── vendor/
+├── skills/                        # bundled Skills
+├── scripts/                       # install, upgrade, diagnostics, templates
+├── docs/                          # user and public technical docs
+├── .claude/docs/                  # maintainer docs
+├── .env                           # instance configuration and secrets
+└── sessions/                      # session metadata, queues, attachments
 
-- **Client cache keyed by `(session_id, model, effort)`** ([`backend/chat.py:L303`](../backend/chat.py#L303)). Switching model or reasoning effort lands on its own pooled client; each assistant message stores its own `model` field so badges stay accurate after reload. Pool cap, LRU rules: [Model routing § client pool](routing.md#2-the-client-pool).
+$MUSELAB_ROOT/
+├── CLAUDE.md                      # default-workspace instructions and context
+├── user files
+├── .muselab/
+│   ├── workspaces.json
+│   ├── scheduler.json
+│   ├── activity.json
+│   ├── terminal_profiles.json
+│   ├── vapid.json
+│   └── push_subs.json
+└── .muselab-dustbin/
 
-- **Whole-file as the unit of input.** `MUSELAB_ROOT` is the default workspace and additional directories may be registered explicitly. Each session stays bound to one workspace; its root-level `CLAUDE.md` auto-loads on every turn. The assistant reaches files via Read / Grep / Edit on demand — no pre-embedding.
-
-## Directory map
-
-Two kinds of roots matter at runtime: the **repo** (code + per-install state)
-and one or more **workspaces** (`MUSELAB_ROOT` plus explicitly registered local
-directories). They are deliberately separate so you can back up or move your
-data without touching the install.
-
+<another-registered-workspace>/
+├── CLAUDE.md
+├── user files
+└── .muselab-dustbin/
 ```
-muselab/                      # repo root
-├── backend/                  # FastAPI app (~14k LOC)
-│   ├── main.py               # app factory, uvicorn entry, route mounting
-│   ├── auth.py               # X-Auth-Token guard (header or ?token=)
-│   ├── chat.py               # /api/chat/* — SDK client pool, SSE turn loop
-│   ├── endpoints.py          # provider catalog + per-request env wiring
-│   ├── files.py              # /api/files/* — safe-resolve read/write/grep
-│   ├── workspaces.py         # registered roots + bounded server folder picker
-│   ├── sessions.py           # session index + sidecar + queue (repo/sessions/)
-│   ├── scheduler.py          # asyncio cron loop → <archive>/.muselab/scheduler.json
-│   ├── push.py               # Web Push / VAPID → <archive>/.muselab/
-│   ├── api_settings.py       # /api/settings — hot-rewrites .env + os.environ
-│   └── prompts.py            # system-prompt assembly
-├── frontend/                 # vanilla HTML + Alpine.js + CSS (~27k LOC, no build)
-│   ├── index.html  app.js  styles.css
-│   ├── i18n/                 # EN/ZH UI strings
-│   └── vendor/               # vetted third-party libs (see THIRD_PARTY_LICENSES.md)
-├── scripts/                  # install / upgrade / uninstall / doctor / https
-├── skills/                   # bundled Claude skills
-├── docs/                     # this folder
-├── .env                      # ← per-install config + secrets (gitignored)
-└── sessions/                 # ← session metadata, sidecars, queues (gitignored)
 
-$MUSELAB_ROOT/                # default workspace — YOUR files, outside the repo
-├── CLAUDE.md                 # auto-loads every conversation
-├── health/ work/ money/ …    # whatever subdirs you create
-└── .muselab/                 # scheduler.json · workspaces.json · push state
+Repository state, the default workspace, and additional workspaces are separate backup units. Conversation transcripts belong to the Claude CLI. Claude sessions normally live under its standard configuration directory, while third-party-provider sessions may live under isolated configuration roots. muselab's `sessions/` stores layered metadata such as name, cwd, model, cost, attachments, and queue.
 
-<registered-workspace>/       # optional additional workspace
-├── CLAUDE.md                 # instructions for sessions bound to this cwd
-└── .muselab-dustbin/         # this workspace's recoverable file trash
-```
+## A chat turn
 
-The actual conversation transcripts are owned by the Claude CLI, not muselab:
-they live under `~/.claude/projects/<cwd-key>/<session-id>.jsonl`. muselab's
-`sessions/` only holds the metadata layered on top (names, per-message model
-badge, cost, uploaded attachments). See
-[Data & backup](data-and-backup.md) for the full back-up list.
+1. The browser calls `POST /api/chat/stream/start` with `X-Auth-Token`, sending the prompt, session, model, permission, effort, and attachment parameters.
+2. The backend validates the session and workspace, then issues a short-lived, single-use ticket.
+3. The browser opens SSE with that ticket. The old query form exists only as compatibility for older backends.
+4. The backend obtains or creates an SDK client for the session, model, and reasoning settings, using the session-bound workspace as cwd.
+5. The SDK loads `CLAUDE.md`, Skills, and MCP, then runs the tool and model loop.
+6. Events are written to the replay spool and streamed to the browser. A reconnect can resume from its cursor.
+7. The Claude CLI persists the transcript while muselab updates sidecars, usage, activity state, and notifications.
 
-## A request, end to end
+By default, the UI forks a non-empty session when switching to an incompatible model, avoiding cross-provider thinking-signature failures. The backend API still allows an explicit session-model update, so API callers own the compatibility risk.
 
-A chat turn is one Server-Sent Events (SSE) stream:
+## A terminal connection
 
-1. **Browser → backend.** `GET /api/chat/stream` with the prompt, session id
-   and chosen `model` as query parameters
-   ([`backend/chat.py:L5043`](../backend/chat.py#L5043)). The auth token rides
-   as `?token=` because `EventSource` cannot set headers
-   ([Security model § authentication](backend-security.md#authentication)).
-2. **Model resolution & lock.** The session is locked to one model
-   (`sessions.py`). The first turn pins it; later turns reuse it so a
-   conversation never mixes vendors mid-stream (cross-vendor *thinking
-   signatures* don't transfer). A session created before any provider existed
-   self-heals to a configured model on its first real send.
-3. **Client pool.** `chat.py` fetches or spawns a `ClaudeSDKClient` keyed by
-   `(session_id, model, effort)`. For a third-party model it sets
-   `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + an **isolated**
-   `CLAUDE_CONFIG_DIR` so the CLI can't fall back to your Pro OAuth and bill the
-   wrong account.
-4. **Agent loop.** The SDK spawns the `claude` CLI subprocess, which runs the
-   full loop — tool calls (Read/Grep/Edit/Bash), MCP servers, skills, plan mode
-   — against the session's registered workspace as the working directory.
-5. **Backend → browser (SSE).** Tokens, tool-call events, and a final `done`
-   event stream back. The turn is published through a `TurnBroadcast`, so a
-   browser disconnect never kills the reply — reconnecting replays the buffer
-   ([Model routing § SSE turn loop](routing.md#4-the-sse-turn-loop)). The
-   frontend renders incrementally; each assistant message records its own
-   `model` so badges stay correct after reload.
-6. **Persistence.** The CLI appends the transcript to its JSONL; muselab writes
-   the sidecar (cost, model, attachments). If the turn was long and Web Push is
-   configured, a completion notification fires even with the tab closed.
+1. The user creates a terminal in the active workspace and may choose a profile that runs a startup command.
+2. The backend creates an independent PTY worker and passes only a safe environment allowlist to the terminal process.
+3. The browser obtains a short-lived, single-use WebSocket ticket, then connects over a same-origin WebSocket.
+4. The backend keeps a bounded in-memory output buffer for replay. Processes end after retention limits or service restart.
 
-Scheduled runs ([scheduler.md](scheduler.md)) take the same path from step 3,
-minus a human — they run unattended with the full permission set.
+A terminal is a real shell running as the service user. It is not constrained by the Files API workspace boundary. Expose muselab only to trusted users.
 
-## Going deeper
-
-This page is the map. Each subsystem has its own page with source-linked
-detail:
+## Subsystem documentation
 
 | Page | Covers |
 |---|---|
-| [Model routing & chat loop](routing.md) | model resolution, client pool, env injection, every SSE event type |
-| [Session internals](backend-sessions.md) | index, sidecars, message queue, attachments, fork, restart recovery |
-| [Files API](backend-files.md) | all `/api/files/*` endpoints, `safe_resolve`, trash |
-| [Security model](backend-security.md) | auth, settings surface, billing isolation, known limitations |
-| [Frontend internals](frontend.md) | no-build SPA, rendering pipeline, SSE client, i18n, service worker |
-| [Skills](skills.md) | bundled skills, discovery, adding your own |
-| [Infrastructure](infrastructure.md) | scripts, systemd/launchd, Docker, tests, CI/CD |
-| [Glossary](glossary.md) | every muselab term of art, defined once |
+| [Model routing and chat loop](routing.md) | provider resolution, client lifecycle, replay, and SSE |
+| [Session internals](backend-sessions.md) | index, sidecars, queue, attachments, fork, and recovery |
+| [Files API](backend-files.md) | file endpoints, path boundaries, and trash |
+| [Terminal](terminal.md) | PTY, profiles, connections, mobile behavior, and security |
+| [Security model](backend-security.md) | authentication, permission surface, provider isolation, and limitations |
+| [Frontend](frontend.md) | workspace state, rendering, performance, and PWA |
+| [Skills](skills.md) | bundled Skills, discovery, and custom extensions |
+| [Infrastructure](infrastructure.md) | installation, services, Docker, testing, and releases |

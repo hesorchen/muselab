@@ -19,6 +19,7 @@ from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
 from .workspaces import router as workspaces_router
 from .activity_api import router as activity_router
+from .terminal import router as terminal_router
 from .settings import ROOT, PORT, HOST
 
 
@@ -79,6 +80,9 @@ _ASSET_VERSION_CANDIDATES = (
     # Split-out modules so editing only translations / data still bumps the
     # stamp and forces clients to refetch.
     FRONTEND / "i18n" / "index.js", FRONTEND / "data" / "constants.js",
+    FRONTEND / "vendor" / "xterm" / "xterm.js",
+    FRONTEND / "vendor" / "xterm" / "xterm.css",
+    FRONTEND / "vendor" / "xterm" / "addon-fit.js",
 )
 # Cache: {computed_version_string} keyed by the max-mtime we last saw. index()
 # / manifest / meta each called _asset_version() (5 stat()s + a max()) on
@@ -223,7 +227,14 @@ async def _lifespan(app: FastAPI):
     # written by the old algorithm. Gated by a sentinel file so reruns
     # are cheap; first run can take a few seconds on archives with
     # hundreds of sessions.
-    yield
+    from .terminal import manager as _terminal_manager
+    await _terminal_manager.start()
+    try:
+        yield
+    finally:
+        # PTY workers outlive individual WebSocket connections so refreshes
+        # can reattach. They must not outlive the muselab service itself.
+        await _terminal_manager.shutdown()
 
 
 async def _backfill_turn_counts() -> None:
@@ -344,6 +355,7 @@ app.include_router(scheduler_router)
 app.include_router(push_router)
 app.include_router(workspaces_router)
 app.include_router(activity_router)
+app.include_router(terminal_router)
 
 
 @functools.lru_cache(maxsize=1)
@@ -588,7 +600,13 @@ def meta() -> dict:
     # served with — a mismatch means the user's PWA / Safari tab is
     # running stale JS (common when "restart" only resumed a backgrounded
     # tab without re-fetching HTML), and the client should hard-reload.
-    return {"root": str(ROOT), "asset_version": _asset_version(), **_detect_versions()}
+    from .terminal import ENABLED as terminal_enabled
+    return {
+        "root": str(ROOT),
+        "asset_version": _asset_version(),
+        "terminal_enabled": terminal_enabled,
+        **_detect_versions(),
+    }
 
 
 @app.get("/api/health")

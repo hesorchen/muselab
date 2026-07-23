@@ -87,6 +87,34 @@ def test_latest_file_open_owns_preview_and_network_failure_exits_loading(
     assert result["offlineTitle"]
 
 
+def test_terminal_surface_clicking_last_selected_file_tab_returns_to_file(
+        page: Page, backend_url, auth_token):
+    """The file underneath terminal remains selected but must still be clickable."""
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabs = [];
+          app._clearPreviewState();
+          await app.openFile({path: 'notes/a.md', name: 'a.md'});
+          await app.openFile({path: 'README.md', name: 'README.md'});
+          app.previewSurface = 'terminal';
+          await app.$nextTick();
+        }"""
+    )
+    last_tab = page.locator('.pane.preview .tab[data-path="README.md"]')
+    expect(last_tab).to_be_visible()
+    last_tab.click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.previewSurface === 'file'
+            && app.selected === 'README.md'
+            && app.previewMode === 'md';
+        }"""
+    )
+
+
 def test_rapid_csv_switch_aborts_old_page_and_commits_latest(page: Page,
                                                               backend_url,
                                                               auth_token):
