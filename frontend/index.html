@@ -276,7 +276,11 @@
        :data-mobile-tab="mobileTab" :data-desktop-full="desktopFullPane">
 
     <!-- ============ 左：文件树 ============ -->
-    <aside class="pane files" :class="{'pane-hidden': !leftOpen}">
+    <aside class="pane files"
+           :class="{
+             'pane-hidden': !leftOpen,
+             'pane-floating-layer': workspaceMenuOpen
+           }">
       <header class="pane-head">
         <span class="pane-title"><span class="icon"><svg><use href="#i-file-text"/></svg></span><span x-text="t('pane.files')"></span></span>
         <div class="workspace-picker files-head-workspace" @click.outside="workspaceMenuOpen = false">
@@ -595,7 +599,11 @@
     <div class="resizer" :class="{'pane-hidden': !leftOpen}" @mousedown="startResize('left', $event)"></div>
 
     <!-- ============ 中：预览 ============ -->
-    <section class="pane preview">
+    <section class="pane preview"
+             :class="{
+               'pane-floating-layer': terminalManagerOpen
+                 || editorTabPickerOpen || !!previewTabCtxMenu
+             }">
       <header class="pane-head">
         <button @click="toggleFilesPane()" class="icon-btn"
                 :title="desktopFullPane === 'preview'
@@ -1280,7 +1288,13 @@
     <div class="resizer" :class="{'pane-hidden': !rightOpen}" @mousedown="startResize('right', $event)"></div>
 
     <!-- ============ 右：chat ============ -->
-    <aside class="pane chat" :class="{'pane-hidden': !rightOpen}">
+    <aside class="pane chat"
+           :class="{
+             'pane-hidden': !rightOpen,
+             'pane-floating-layer': sessionPickerOpen || !!tabCtxMenu
+               || ctxBreakdown.show || composerSettingsOpen
+               || mentionShow || slashShow
+           }">
       <header class="pane-head">
         <span class="pane-title">
           <span class="muse-mascot sm" :class="{'greet': mascotGreet, 'is-streaming': streaming}"
@@ -1553,7 +1567,7 @@
                            :data-sid="s.id"
                            x-model="pickerRenameDraft"
                            @click.stop
-                           @keydown.enter.prevent="pickerCommitInlineRename()"
+                           @keydown.enter="pickerCommitInlineRenameOnEnter($event)"
                            @keydown.escape.prevent="pickerCancelInlineRename()"
                            @blur="pickerCommitInlineRename()" />
                     <button class="session-picker-rename-ok"
@@ -1634,7 +1648,7 @@
                      x-show="renamingTabId === tid"
                      @click.stop @dblclick.stop
                      @blur="commitRenameTab()"
-                     @keydown.enter.prevent="commitRenameTab()"
+                     @keydown.enter="commitRenameTabOnEnter($event)"
                      @keydown.escape.prevent="cancelRenameTab()" />
               <!-- Kebab menu — only shown on mobile (CSS @media). Desktop uses
                    right-click which mobile browsers don't reliably synthesize. -->
@@ -2968,12 +2982,12 @@
                     autocapitalize="sentences" spellcheck="false"
                     enterkeyhint="enter"
                     data-1p-ignore="" data-lpignore="true" data-form-type="other"
-                    @keydown.enter.prevent.stop="onEnter($event)"
+                    @keydown.enter="onEnter($event)"
                     @keydown.escape="mentionShow=false; slashShow=false"
                     @keydown.ctrl.x="onCutLine($event)"
                     @keydown.meta.x="onCutLine($event)"
                     @keydown.up="onChatArrowUp($event)"
-                    @keydown.down="(mentionShow || slashShow) && _navPop(1) && $event.preventDefault()"
+                    @keydown.down="onChatArrowDown($event)"
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
                     @focus="onChatInputFocus($event)"
@@ -4791,7 +4805,7 @@
         <div x-show="modal.body" x-text="modal.body"></div>
         <input x-show="modal.input !== null" x-model="modal.input"
                :placeholder="modal.placeholder || ''"
-               x-ref="modalInput" @keydown.enter="modal.confirm?.()" />
+               x-ref="modalInput" @keydown.enter="confirmModalOnEnter($event)" />
         <div x-show="modal.choices && modal.choices.length" class="modal-choices">
           <template x-for="(c, ci) in (modal.choices || [])" :key="ci">
             <button type="button" class="modal-choice" @click="modal.pick && modal.pick(c.value)">

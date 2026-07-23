@@ -166,6 +166,89 @@ def test_primary_mobile_surfaces_keep_native_touch_scrolling():
     assert "touch-action: pan-y" not in contract
 
 
+def test_enter_submission_waits_for_ime_composition():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    helper_start = app.index("_claimNonImeEnter(ev)")
+    helper_end = app.index("\n    },", helper_start)
+    helper = app[helper_start:helper_end]
+    ime_start = app.index("_isImeComposingEvent(ev)")
+    ime_end = app.index("\n    },", ime_start)
+    ime = app[ime_start:ime_end]
+    assert "ev.isComposing" in ime
+    assert "ev.keyCode === 229" in ime
+    assert "ev.which === 229" in ime
+    assert 'ev.key === "Process"' in ime
+    assert helper.index("return false") < helper.index("ev.preventDefault()")
+
+    assert '@keydown.enter="confirmModalOnEnter($event)"' in html
+    assert '@keydown.enter="commitRenameTabOnEnter($event)"' in html
+    assert '@keydown.enter="pickerCommitInlineRenameOnEnter($event)"' in html
+    assert '@keydown.enter="onEnter($event)"' in html
+    assert '@keydown.enter.prevent="commitRenameTab()"' not in html
+    assert '@keydown.enter.prevent="pickerCommitInlineRename()"' not in html
+    assert '@keydown.enter.prevent.stop="onEnter($event)"' not in html
+
+
+def test_chat_arrow_keys_walk_user_input_history_and_restore_draft():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("_chatInputHistory()")
+    end = app.index("\n    _cancelMentionLookup()", start)
+    history = app[start:end]
+
+    assert "st._earlierMessages" in history
+    assert "st._laterMessages" in history
+    assert 'm.role === "user"' in history
+    assert "draft._historyIndex = index - 1" in history
+    assert "draft._historyIndex = index + 1" in history
+    assert "draft._historyDraft = this.input" in history
+    assert "const originalDraft = draft._historyDraft" in history
+    assert "this._resetChatInputHistory(draft)" in history
+    assert 'this.input.includes("\\n")' in history
+    assert "this._isImeComposingEvent(ev)" in history
+    assert '@keydown.up="onChatArrowUp($event)"' in html
+    assert '@keydown.down="onChatArrowDown($event)"' in html
+
+
+def test_pane_popups_escape_clipping_but_stay_below_global_overlays():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    files_start = html.index('<aside class="pane files"')
+    files_end = html.index("<header", files_start)
+    files = html[files_start:files_end]
+    assert "'pane-floating-layer': workspaceMenuOpen" in files
+
+    preview_start = html.index('<section class="pane preview"')
+    preview_end = html.index("<header", preview_start)
+    preview = html[preview_start:preview_end]
+    for state in ("terminalManagerOpen", "editorTabPickerOpen",
+                  "previewTabCtxMenu"):
+        assert state in preview
+
+    chat_start = html.index('<aside class="pane chat"')
+    chat_end = html.index("<header", chat_start)
+    chat = html[chat_start:chat_end]
+    for state in ("sessionPickerOpen", "tabCtxMenu", "ctxBreakdown.show",
+                  "composerSettingsOpen", "mentionShow", "slashShow"):
+        assert state in chat
+
+    layer_start = css.index(".pane.pane-floating-layer")
+    layer_end = css.index("}", layer_start)
+    layer = css[layer_start:layer_end]
+    assert "z-index: 150" in layer
+    assert "overflow: visible" in layer
+
+    # Pane-local floating content must clear navigation, while every true
+    # application overlay remains above it.
+    assert "height: 48px !important; z-index: 100" in css
+    assert "position: fixed; inset: 0; z-index: 200" in css
+    assert "position: fixed; z-index: 800" in css
+    assert "position: fixed; inset: 0; z-index: 900" in css
+
+
 def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -584,9 +667,18 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "if (!r.ok) throw" in stop
     assert 'String(item).startsWith(sid + "@")' in stop
     assert "const timeout = setTimeout(() => controller.abort(), 15000)" in stop
-    assert "this._retireStaleSessionStream(sid, st)" in stop
-    assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" in stop
+    assert "waitForTerminalEvent = !!st.streaming" in stop
+    assert "this._retireStaleSessionStream(sid, st)" not in stop
+    assert "if (st._renderStreamingHtml) st._renderStreamingHtml()" not in stop
     assert "if (!didInterrupt)" in stop
+    assert "if (!waitForTerminalEvent || !st.streaming)" in stop
+    cancelled_start = app.index('es.addEventListener("cancelled"')
+    cancelled_end = app.index("\n      });", cancelled_start)
+    assert "_markDone(true)" in app[cancelled_start:cancelled_end]
+    mark_done_start = app.index("const _markDone = (cancelled = false)")
+    mark_done_end = app.index("\n      };", mark_done_start)
+    assert "streamState._stopping = false" in app[
+        mark_done_start:mark_done_end]
     assert "this.isTabStreaming(this.currentId)" in app
 
 
@@ -877,6 +969,7 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "terminal-manager-pop" in html
     assert 'class="terminal-manager-backdrop"' in html
     assert 'class="terminal-manager-dismiss"' in html
+    assert "'pane-floating-layer': terminalManagerOpen" in html
     assert 'class="icon-btn chat-terminal-btn"' in html
     assert 'class="icon-btn terminal-manager-btn preview-keep-mobile"' in html
     assert 'data-terminal-key="backslash"' in html
@@ -884,6 +977,11 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert ".pane.chat .pane-head .chat-terminal-btn { display: inline-flex; }" in css
     assert ".pane.preview > .pane-head > .btn-primary { display: none; }" in css
     assert ".pane.preview .pane-head .btn-primary { display: none; }" not in css
+    layer_start = css.index(".pane.pane-floating-layer")
+    layer_end = css.index("}", layer_start)
+    layer = css[layer_start:layer_end]
+    assert "z-index: 150" in layer
+    assert "overflow: visible" in layer
     assert ".terminal-host .xterm-viewport { touch-action: none; }" in css
     mobile_sheet = css[css.index(".terminal-manager-backdrop {",
                                  css.index("@media", css.index("Real PTY terminal preview"))):]
@@ -900,8 +998,9 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert '@click="createTerminal($refs.terminalProfileSelect.value)"' in html
     assert 'class="terminal-manager-profile"' in html
     assert 'x-model="terminalProfileEditor.command"' in html
-    preview_head = html[html.index('<section class="pane preview">'):
-                        html.index('<div class="tab-bar"', html.index('<section class="pane preview">'))]
+    preview_start = html.index('<section class="pane preview"')
+    preview_head = html[preview_start:
+                        html.index('<div class="tab-bar"', preview_start)]
     assert preview_head.index('href="#i-search"') < preview_head.index(
         'class="terminal-manager"') < preview_head.index('@click="reloadPreview()"')
     assert "lang==='zh'?'已连接':'Connected'" not in preview_head

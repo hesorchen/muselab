@@ -9991,6 +9991,20 @@ html[data-theme="eyecare"] .tool-error-hint {
   box-shadow: 0 0 0 2px color-mix(in srgb, #4fbd78 18%, transparent);
 }
 .terminal-status-dot.exited { background: var(--c-fg-4); }
+/* `.pane` normally clips descendants so content cannot spill into neighbouring
+   columns. Dropdowns and context sheets are the exception. Their own z-index
+   cannot escape that clipping, so the owning pane temporarily becomes a
+   stacking context with visible overflow while one is open.
+
+   Keep this at 150: it clears resizers (10) and the mobile tab bar (100), but
+   stays below every application-level overlay (drawers/palette start at 200,
+   context menus at 800, modals at 900). This avoids fixing one pane popup by
+   accidentally placing the whole pane above a real modal. */
+.pane.pane-floating-layer {
+  position: relative;
+  z-index: 150;
+  overflow: visible;
+}
 .terminal-manager { position: relative; flex-shrink: 0; }
 .terminal-manager-btn { position: relative; gap: 3px; width: auto; min-width: 28px; }
 .chat-terminal-btn { display: none; position: relative; gap: 3px; width: auto; min-width: 28px; }
