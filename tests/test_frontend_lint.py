@@ -908,7 +908,7 @@ def test_long_stream_switches_to_plain_preview_and_final_rich_render():
     chat_input = css[composer_start:css.index("}", composer_start)]
     assert "flex-shrink: 0" in chat_input
     assert ".chat-input-wrap { padding: 0; }" in css
-    assert ".chat-toolbar.has-stop .chat-toolbar-queue" in css
+    assert ".chat-toolbar.has-stop .chat-toolbar-ring" in css
     assert ".chat-toolbar-rl { display: none !important; }" in css
     assert ":class=\"{ 'has-stop': isTabStreaming(currentId) }\"" in html
 
@@ -1147,3 +1147,44 @@ def test_diff_surfaces_use_theme_tokens_and_readable_edges():
     assert theme_switch.index("highlight-theme.css") < (
         theme_switch.index("highlight-theme-light.css")
     )
+
+
+def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert "new EventSource(`/api/files/events?${params.toString()}`)" in app
+    assert "this._fileEventsWorkspace === workspace" in app
+    assert 'es.addEventListener("changes"' in app
+    assert 'es.addEventListener("resync"' in app
+    assert "this._workspaceIsCurrent(ownerWorkspace)" in app
+    assert "this._refreshParentInTree(path, ownerWorkspace)" in app
+    assert "const delay = this._isMobileLayout() ? 650 : 250" in app
+    assert 'document.visibilityState !== "visible"' in app
+    assert "this._stopFileEvents(true)" in app
+    assert 'if (t === "files") this.$nextTick(() => this._flushFileTreeDirty())' in app
+
+
+def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    assert "this._attachCopyBtn(el);" in app
+    assert 'btn.className = "code-copy-btn"' in app
+    assert "await navigator.clipboard.writeText(raw)" in app
+    assert 'document.execCommand("copy")' in app
+    assert "pre.has-copy-btn .code-copy-btn" in css
+    assert "@media (hover: none)" in css
+
+
+def test_chat_send_and_stop_buttons_are_icon_only_but_accessible():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    toolbar_start = html.index('class="btn-primary chat-toolbar-send chat-toolbar-queue"')
+    toolbar_end = html.index("</button>", html.index(
+        'class="btn-danger chat-toolbar-send chat-toolbar-stop"', toolbar_start,
+    )) + len("</button>")
+    buttons = html[toolbar_start:toolbar_end]
+    assert 'x-text="t(\'btn.send\')"' not in buttons
+    assert 'x-text="t(\'btn.stop\')"' not in buttons
+    assert ':aria-label="_isBusy(currentId) ? t(\'queue.button_hint\') : t(\'btn.send\')"' in buttons
+    assert ':aria-label="t(\'btn.stop\')"' in buttons
+    assert ".chat-toolbar-send { width: 44px; padding: 0; }" in css
+    assert ".chat-toolbar-send > span:nth-child(2)" not in css

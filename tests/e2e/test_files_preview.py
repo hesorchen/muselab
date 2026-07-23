@@ -30,6 +30,54 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def test_external_file_changes_refresh_tree_without_manual_reload(
+        page: Page, backend_url, auth_token):
+    """Direct API mutations stand in for Agent/terminal writes and deletes."""
+    _login(page, backend_url, auth_token)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._fileEvents && app._fileEvents.readyState === EventSource.OPEN;
+        }""",
+        timeout=5000,
+    )
+    created = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const response = await fetch('/api/files/write', {
+            method: 'PUT',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({path: 'watch-live.txt', content: 'live\\n'}),
+          });
+          return response.ok;
+        }"""
+    )
+    assert created
+    page.wait_for_function(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .visible.some(node => node.path === 'watch-live.txt')""",
+        timeout=5000,
+    )
+
+    deleted = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const response = await fetch('/api/files/delete', {
+            method: 'DELETE',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({path: 'watch-live.txt'}),
+          });
+          return response.ok;
+        }"""
+    )
+    assert deleted
+    page.wait_for_function(
+        """() => !document.querySelector('#app')._x_dataStack[0]
+          .visible.some(node => node.path === 'watch-live.txt')""",
+        timeout=5000,
+    )
+
+
 def test_latest_file_open_owns_preview_and_network_failure_exits_loading(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
