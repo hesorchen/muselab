@@ -19,10 +19,10 @@ automatically.
 
 ## Bundled skills
 
-Muselab ships 11 skills out of the box. The first seven are muselab-native
+Muselab ships 12 skills out of the box. The first eight are muselab-native
 (MIT); the last four are community-contributed and included with
-attribution — see [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md#L47-L73) for
-upstream URLs and license details.
+attribution — see `THIRD_PARTY_LICENSES.md` for upstream URLs and license
+details.
 
 | Skill | What it does | Origin | External deps |
 |---|---|---|---|
@@ -33,25 +33,26 @@ upstream URLs and license details.
 | `citation-formatter` | Converts DOIs, arXiv IDs, PubMed IDs, and raw text into APA 7 / IEEE / GB/T 7714 / BibTeX; fetches authoritative metadata when possible | muselab-native | `WebFetch` or `mcp__fetch__fetch` (optional) |
 | `task-decomposer` | Turns a vague goal into an ordered task list with size estimates, a Definition of Done, critical-path steps, and flagged unknowns | muselab-native | none |
 | `summary-distiller` | Picks the right summary shape (TL;DR, key points, structured, action items) based on source type; preserves numbers, names, and dates verbatim | muselab-native | none |
-| `pptx` | Generates PowerPoint files by writing and running inline Python with `python-pptx` via the Bash tool | [community](../THIRD_PARTY_LICENSES.md#L63) | `python-pptx` (`pip install python-pptx`) |
-| `csv-analyzer` | Loads a CSV with `pandas`, profiles column types, generates conditional charts (PNG), outputs a complete analysis in one response | [community](../THIRD_PARTY_LICENSES.md#L64) | `pandas`; `matplotlib`/`seaborn` optional |
-| `translate` | Three-stage internal pipeline (literal → issue identification → polished reinterpretation); outputs final Chinese text only, preserving technical terms | [community](../THIRD_PARTY_LICENSES.md#L65) | none |
-| `meeting-notes` | Extracts decisions, action items (with owners and due dates), and next steps from raw notes or transcripts using four ready-made templates | [community](../THIRD_PARTY_LICENSES.md#L66) | none |
+| `archive-curator` | Scans and organizes the personal archive, proposes changes before mutation, and fills meaningful `CLAUDE.md` gaps conversationally | muselab-native | none |
+| `pptx` | Generates PowerPoint files by writing and running inline Python with `python-pptx` via the Bash tool | community | `python-pptx` (`pip install python-pptx`) |
+| `csv-analyzer` | Loads a CSV with `pandas`, profiles column types, generates conditional charts (PNG), outputs a complete analysis in one response | community | `pandas`; `matplotlib`/`seaborn` optional |
+| `translate` | Three-stage internal pipeline (literal → issue identification → polished reinterpretation); outputs final Chinese text only, preserving technical terms | community | none |
+| `meeting-notes` | Extracts decisions, action items (with owners and due dates), and next steps from raw notes or transcripts using four ready-made templates | community | none |
 
 ---
 
 ## How discovery works
 
-Skill discovery is controlled by two parameters passed to
-`ClaudeAgentOptions` in [`backend/chat.py`](../backend/chat.py):
+Skill discovery is controlled by SDK-native options passed to
+`ClaudeAgentOptions`:
 
-**`setting_sources`** ([`chat.py:L944`](../backend/chat.py#L944)):
+**`setting_sources`:**
 
 ```python
 setting_sources=["user", "project", "local"]
 ```
 
-This tells the SDK to load CLAUDE.md, memory files, and skills from three
+This tells the SDK to load `CLAUDE.md` and Claude configuration from three
 scopes:
 
 | Scope | Resolves to |
@@ -60,37 +61,38 @@ scopes:
 | `project` | the archive `cwd` (see below) |
 | `local` | `.claude/` inside `cwd` |
 
-**`cwd` is the archive root** ([`chat.py:L902`](../backend/chat.py#L902),
-[`backend/settings.py:L188-L194`](../backend/settings.py#L188-L194)):
+**`cwd` is the active workspace:**
 
 ```python
-cwd=str(ROOT)   # ROOT comes from MUSELAB_ROOT in .env
+cwd=str(workspace_root)
 ```
 
-The SDK's `local` scope therefore resolves the bundled `skills/` directory
-from the muselab repo (which is the checkout that contains your `.env`).
-Output files produced by skills such as `pptx` or `csv-analyzer` land in
-the archive root unless you specify an explicit path.
-
-**`skills="all"`** ([`chat.py:L961`](../backend/chat.py#L961)):
+Because the active workspace is not the muselab checkout, muselab also passes
+its repository as a local SDK plugin:
 
 ```python
-if not is_third_party and not skills_off:
+plugins=[{"type": "local", "path": "<muselab-repo>"}]
+```
+
+That plugin exposes the bundled `skills/` directory in every workspace.
+Output files produced by skills such as `pptx` or `csv-analyzer` still land
+in the active workspace unless you specify an explicit path.
+
+**`skills="all"`:**
+
+```python
+if not skills_off:
     opts_kwargs["skills"] = "all"
 ```
 
-When this flag is set, the SDK loads every discoverable `SKILL.md` and
-makes it available to the model. There is no copy or symlink step — the
-bundled `skills/` directory is served directly from the repo checkout.
+When this flag is set, the SDK loads discoverable `SKILL.md` files for every
+provider. There is no copy or symlink step: bundled skills are exposed by the
+local plugin.
 
-**UI listing.** The `GET /api/settings/skills` endpoint
-([`api_settings.py:L1129-L1143`](../backend/api_settings.py#L1129-L1143))
-independently enumerates skills for the frontend from three paths:
-the repo's `skills/` (project scope), `~/.claude/skills/` (user scope),
-and `~/.claude/plugins/marketplaces/*/plugins/*/skills/` (plugin scope).
-Both `SKILL.md` and `skill.md` filenames are accepted
-([`api_settings.py:L1077`](../backend/api_settings.py#L1077)). This listing
-is read-only — it has no effect on what the model actually uses at runtime.
+**UI listing.** The `GET /api/settings/skills` endpoint independently
+enumerates bundled, user-global, and installed-plugin skills for the frontend.
+Both `SKILL.md` and `skill.md` filenames are accepted. This listing is
+read-only and has no effect on what the model uses at runtime.
 
 ---
 
@@ -103,8 +105,8 @@ is read-only — it has no effect on what the model actually uses at runtime.
 | `<muselab-repo>/skills/your-skill/SKILL.md` | project | muselab only |
 | `~/.claude/skills/your-skill/SKILL.md` | user | muselab + all Claude Code projects |
 
-When two skills share the same name, the project-scope skill takes
-precedence over the user-scope one at runtime.
+Repository skills are plugin-qualified internally, so they can coexist with a
+user-global skill of the same short name.
 
 ### Required structure
 
@@ -123,7 +125,7 @@ description: "USE WHEN ... — one sentence describing the trigger and capabilit
 ```
 
 The body is free-form Markdown that the model reads on every invocation —
-keep it concise. Recommended practices (from [`skills/README.md`](../skills/README.md)):
+keep it concise. Recommended practices are listed in `skills/README.md`:
 
 - Start `description` with `"USE WHEN ..."` — this is the primary signal
   the model uses to select a skill.
@@ -149,35 +151,16 @@ launchctl kickstart -k "gui/$(id -u)/com.muselab"
 
 ---
 
-## Caveats
+## Kill switch
 
-### Skills are disabled on third-party providers
-
-When a session uses a third-party model (DeepSeek, GLM / ZhipuAI, MiniMax,
-and others detected by `endpoints.is_third_party()`), muselab omits
-`skills="all"` from the SDK options entirely
-([`chat.py:L958-L961`](../backend/chat.py#L958-L961)). The code comment
-explains the reason directly:
-
-> "third-party vendors (DeepSeek / GLM / MiniMax) often time out or 400 on
-> the bigger payload"
-
-Skills are injected into the system prompt as additional content; the
-enlarged payload reliably triggers timeouts or HTTP 400 responses from
-several vendors. Rather than failing silently mid-conversation, muselab
-disables skills for all third-party sessions. See [routing.md](routing.md)
-and [providers.md](providers.md) for more on the third-party environment.
-
-### Kill switch
-
-To disable skills even for Claude models, set the following in your `.env`:
+Skills are enabled for every provider by default. To disable them globally,
+set the following in your `.env`:
 
 ```
 MUSELAB_DISABLE_SKILLS=1
 ```
 
-Accepted values: `1`, `true`, `yes` (case-insensitive)
-([`chat.py:L959`](../backend/chat.py#L959)).
+Accepted values: `1`, `true`, `yes` (case-insensitive).
 
 ---
 

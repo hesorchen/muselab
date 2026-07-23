@@ -13,14 +13,19 @@ your use case, or whether one of the alternatives is a better match.
 | Self-hosted | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Browser access | ✅ | ✅ | ✅ | ✅ | ❌ |
 | HTML / PDF / image preview | ✅ | ⚠️ | ⚠️ | ⚠️ | ❌ |
+| Real PTY terminal in browser | ✅ multi-terminal + profiles | ✅ multi-tab | ❌ | ❌ | n/a (runs in your terminal) |
 | **Full agent SDK on every model** | ✅ | ⚠️ Claude-mostly | ⚠️ own agent + MCP | ❌ RAG focus | ✅ Claude only |
 | Reuse Claude Pro subscription | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Lines of code | ~40 k (back + front) | tens of k | hundreds of k | ~150 k | closed |
 | Install command count | 1 (curl \| bash) | many | docker compose | docker | brew / npm |
 
 For **IDE breadth**, consider claudecodeui or code-server.
 For a **plugin marketplace**, consider LobeChat.
 For **chat over crawled documents**, consider AnythingLLM.
+
+muselab terminals share the same working directory as files, previews, and
+conversations. Multiple real PTY sessions can stay alive at once, while
+profiles run a fixed command whenever a terminal is created. Switching pages
+does not stop their processes.
 
 Other names that often come up in the same search:
 
@@ -54,13 +59,14 @@ muselab is to your archive what Claude Code is to your codebase.
 
 - Single-user, single-token — two people sharing one instance share
   everything; for team/family use, deploy one instance per person
-- Not an IDE — code can live in the archive but development work belongs
-  in [claudecodeui](https://github.com/siteboon/claudecodeui) or
-  [Claude Code](https://github.com/anthropics/claude-code)
+- Not a full IDE — the built-in terminal is useful for commands and
+  agent-assisted work in the active workspace, but muselab does not provide
+  full code navigation, debugging, or an IDE extension ecosystem. Use
+  claudecodeui or Claude Code for heavyweight software development
 - Not a RAG service — files are read on demand via Read / Grep, never
   pre-embedded; for crawl-style document chat use
   [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
-- No plugin marketplace — 11 curated skills ship out of the box and
+- No plugin marketplace — 12 curated skills ship out of the box and
   external Claude Code plugins are auto-discovered, but there's no
   in-app store; use [LobeChat](https://github.com/lobehub/lobe-chat)
   if you need one

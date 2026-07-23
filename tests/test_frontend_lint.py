@@ -149,6 +149,23 @@ def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
     assert html.count("@click=\"setMobileTab('") == 3
 
 
+def test_primary_mobile_surfaces_keep_native_touch_scrolling():
+    css = (FRONTEND / "styles.css").read_text()
+    marker = "contract explicit on every primary mobile surface."
+    start = css.index(marker)
+    end = css.index("}", css.index(".terminal-manager-pop", start))
+    contract = css[start:end]
+
+    for selector in (".filelist", ".preview-body:not(.terminal-active)",
+                     ".chat-body", ".terminal-manager-pop"):
+        assert selector in contract
+    assert "min-height: 0" in contract
+    assert "overflow-y: auto" in contract
+    assert "-webkit-overflow-scrolling: touch" in contract
+    assert "touch-action: manipulation" in contract
+    assert "touch-action: pan-y" not in contract
+
+
 def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -634,19 +651,17 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert "this.tabState[ownerSid] !== ownerState" in image_gen
 
 
-def test_queue_edit_and_prompt_menu_do_not_borrow_active_composer():
+def test_queue_edit_does_not_borrow_active_composer_and_prompt_menu_is_removed():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     queue_start = app.index("async editPendingQueueItem")
     queue_edit = app[queue_start:app.index("async resumeQueueDrain", queue_start)]
-    menu_start = app.index("async menuEditPrompt")
-    menu_edit = app[menu_start:app.index("async menuClose", menu_start)]
 
     assert "draft.input = text" in queue_edit
     assert "draft.pendingImages.splice" in queue_edit
     assert "draft.pendingDocs.splice" in queue_edit
     assert "if (sid !== this.currentId) return" not in queue_edit
-    assert "await this.editSessionPrompt(id)" in menu_edit
-    assert "this.currentId =" not in menu_edit
+    assert "menuEditPrompt" not in app
+    assert "editSessionPrompt" not in app
 
 
 def test_tab_disposal_aborts_uploads_and_drops_memory_only_draft():
@@ -721,9 +736,13 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "_hasServerLater: false" in blank
     assert "_laterMessages: []" in blank
     assert "_nextLiveKey: 1" in blank
-    assert "_mountedMessageCap() { return this._isMobileLayout() ? 60 : 120; }" in app
-    assert "_historyCacheCap() { return this._isMobileLayout() ? 120 : 240; }" in app
-    assert "const budget = this._isMobileLayout() ? 1 : 2" in app
+    assert "_mountedMessageCap() { return this._isMobileLayout() ? 60 : 300; }" in app
+    assert "_historyCacheCap() { return this._isMobileLayout() ? 120 : 800; }" in app
+    assert "const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES" in app
+    assert "_MAX_RESIDENT_PANES: 4" in app
+    assert "? (_coldEarly ? 8 : 15)" in app
+    assert ": (_coldEarly ? 30 : 60)" in app
+    assert "if (this._isMobileLayout() && histLen > 60 && shouldFollow)" in app
     assert "if (cst && cst.streaming) continue" not in app
     assert '"&history_generation="' in app
     assert "if (r.status === 409)" in app
@@ -777,6 +796,7 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
 def test_long_stream_switches_to_plain_preview_and_final_rich_render():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     assert "acc.length > 32 * 1024" in app
     assert "curBubble._streamPlain = true" in app
@@ -788,3 +808,243 @@ def test_long_stream_switches_to_plain_preview_and_final_rich_render():
     assert 'x-show="!m._streamPlain" x-html="m.html || \'\'"' in html
     assert "if (this.atBottom) this.scrollToBottom(false)" in app
     assert "if (this.atBottom) this._capLiveMessages" not in app
+    assert "const maxChunk = this._isMobileLayout() ? 4 : 12" in app
+    assert "const frameBudgetMs = this._isMobileLayout() ? 6 : 12" in app
+    assert "performance.now() - started >= frameBudgetMs" in app
+    composer_start = css.index(
+        ".chat-input {", css.index("VSCode-Claude style bottom input area"))
+    chat_input = css[composer_start:css.index("}", composer_start)]
+    assert "flex-shrink: 0" in chat_input
+    assert ".chat-input-wrap { padding: 0; }" in css
+    assert ".chat-toolbar.has-stop .chat-toolbar-queue" in css
+    assert ".chat-toolbar-rl { display: none !important; }" in css
+    assert ":class=\"{ 'has-stop': isTabStreaming(currentId) }\"" in html
+
+
+def test_terminal_preview_has_local_renderer_and_management_wiring():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    vendor = FRONTEND / "vendor" / "xterm"
+
+    for filename in ("xterm.js", "xterm.css", "addon-fit.js",
+                     "xterm-LICENSE.txt", "addon-fit-LICENSE.txt"):
+        assert (vendor / filename).is_file()
+    assert "async createTerminal(profileId)" in app
+    assert "async renameTerminal(row)" in app
+    assert "async closeTerminal(id" in app
+    assert "async terminateAllTerminals()" in app
+    assert "async saveTerminalProfile()" in app
+    assert "async deleteTerminalProfile()" in app
+    assert "openTerminalManagerFromChat()" in app
+    assert "terminalMobileKey(text)" in app
+    assert "this._terminalSend(text)" in app
+    assert "_terminalDataIsMouseReport(data)" in app
+    assert "_terminalHandleInput(data, term = this._terminal)" in app
+    assert 'term.buffer?.active?.type !== "alternate"' in app
+    assert '"\\x1b[?1000l\\x1b[?1002l\\x1b[?1003l\\x1b[?1005l"' in app
+    assert "let replayActive = false" in app
+    assert "let replayWritesPending = 0" in app
+    assert "if (replayActive || replayWritesPending) return" in app
+    assert 'message.type === "replay_start"' in app
+    assert 'message.type === "replay_end"' in app
+    assert "if (this._terminal) this._terminal.focus()" in app
+    assert "_attachTerminalTouchScroll(host, term)" in app
+    assert 'host.addEventListener("touchmove", onMove, captureActive)' in app
+    assert "capture: true, passive: false" in app
+    assert "if (event.cancelable) event.preventDefault()" in app
+    assert "event.stopPropagation()" in app
+    assert "term.scrollLines(lines)" in app
+    assert "this._terminalSuppressMouseUntil = performance.now() + 500" in app
+    assert "this._terminalSuppressMouseUntil = performance.now() + 800" in app
+    assert "if (this._terminalTouchCleanup) this._terminalTouchCleanup()" in app
+    assert "TERMINAL_SCROLLBACK_MOBILE: 3000" in app
+    assert "TERMINAL_SCROLLBACK_DESKTOP: 10000" in app
+    assert "? this.TERMINAL_SCROLLBACK_MOBILE" in app
+    assert "cursorBlink: true" in app
+    assert 'cursorStyle: "bar"' in app
+    assert "minimumContrastRatio: 4.5" in app
+    assert "term.parser.registerCsiHandler(" in app
+    assert '{ final: "q", intermediates: " " }' in app
+    assert "term.options.cursorBlink = true" in app
+    assert "term.onWriteParsed(" in app
+    assert 'path === this.selected && this.previewSurface === "file"' in app
+    assert "profile_id: selectedProfileId" in app
+    assert "const select = this.$refs.terminalProfileSelect" in app
+    assert "new WebSocket(" in app
+    assert "ticketResponse.data.ticket" in app
+    assert 'x-ref="terminalHost"' in html
+    assert "terminal-manager-pop" in html
+    assert 'class="terminal-manager-backdrop"' in html
+    assert 'class="terminal-manager-dismiss"' in html
+    assert 'class="icon-btn chat-terminal-btn"' in html
+    assert 'class="icon-btn terminal-manager-btn preview-keep-mobile"' in html
+    assert 'data-terminal-key="backslash"' in html
+    assert "@click=\"terminalMobileKey('\\\\')\"" in html
+    assert ".pane.chat .pane-head .chat-terminal-btn { display: inline-flex; }" in css
+    assert ".pane.preview > .pane-head > .btn-primary { display: none; }" in css
+    assert ".pane.preview .pane-head .btn-primary { display: none; }" not in css
+    assert ".terminal-host .xterm-viewport { touch-action: none; }" in css
+    mobile_sheet = css[css.index(".terminal-manager-backdrop {",
+                                 css.index("@media", css.index("Real PTY terminal preview"))):]
+    assert "position: fixed; inset: 0; z-index: 1790" in mobile_sheet
+    assert "position: fixed; top: auto; left: 0; right: 0; bottom: 0" in mobile_sheet
+    assert "max-height: min(78dvh, 680px)" in mobile_sheet
+    manager = html[html.index('<div class="terminal-manager"'):
+                   html.index('<button x-show="previewSurface', html.index('<div class="terminal-manager"'))]
+    assert manager.index("terminal-manager-head") < manager.index("terminal-launch-row")
+    assert manager.index("terminal-create-btn") < manager.index("terminal-launch-row")
+    assert "lang==='zh'?'+ 新建终端':'+ New terminal'" in manager
+    assert 'x-model="terminalProfileId"' in html
+    assert 'x-ref="terminalProfileSelect"' in html
+    assert '@click="createTerminal($refs.terminalProfileSelect.value)"' in html
+    assert 'class="terminal-manager-profile"' in html
+    assert 'x-model="terminalProfileEditor.command"' in html
+    preview_head = html[html.index('<section class="pane preview">'):
+                        html.index('<div class="tab-bar"', html.index('<section class="pane preview">'))]
+    assert preview_head.index('href="#i-search"') < preview_head.index(
+        'class="terminal-manager"') < preview_head.index('@click="reloadPreview()"')
+    assert "lang==='zh'?'已连接':'Connected'" not in preview_head
+    assert 'x-show="terminalConnection!==\'connected\'"' in preview_head
+
+
+def test_terminal_ansi_palettes_are_distinct_and_readable():
+    """Light terminal themes must not regress to pale dark-mode ANSI colors."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    palette_start = app.index("const TERMINAL_ANSI_THEMES")
+    palette_end = app.index("\n});", palette_start)
+    source = app[palette_start:palette_end]
+    expected = {
+        "black", "brightBlack", "red", "brightRed", "green", "brightGreen",
+        "yellow", "brightYellow", "blue", "brightBlue", "magenta",
+        "brightMagenta", "cyan", "brightCyan", "white", "brightWhite",
+    }
+    palettes: dict[str, dict[str, str]] = {}
+    for theme in ("dark", "light", "eyecare"):
+        match = re.search(
+            rf"{theme}: Object\.freeze\(\{{(.*?)\}}\),",
+            source,
+            re.S,
+        )
+        assert match, f"missing terminal ANSI palette for {theme}"
+        colors = dict(re.findall(
+            r'(\w+): "(#[0-9a-fA-F]{6})"',
+            match.group(1),
+        ))
+        assert set(colors) == expected
+        palettes[theme] = colors
+
+    assert palettes["dark"] != palettes["light"] != palettes["eyecare"]
+    backgrounds = {"light": "#ffffff", "eyecare": "#f5f0e0"}
+
+    def luminance(hex_color: str) -> float:
+        channels = [
+            int(hex_color[index:index + 2], 16) / 255
+            for index in (1, 3, 5)
+        ]
+        linear = [
+            value / 12.92 if value <= 0.04045
+            else ((value + 0.055) / 1.055) ** 2.4
+            for value in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(first: str, second: str) -> float:
+        lighter, darker = sorted(
+            (luminance(first), luminance(second)),
+            reverse=True,
+        )
+        return (lighter + 0.05) / (darker + 0.05)
+
+    for theme, background in backgrounds.items():
+        failures = {
+            name: round(contrast(color, background), 2)
+            for name, color in palettes[theme].items()
+            if contrast(color, background) < 4.5
+        }
+        assert not failures, f"{theme} ANSI colors below 4.5:1: {failures}"
+
+    terminal_rule = css[css.index(".preview-body.terminal-active"):
+                        css.index("}", css.index(".preview-body.terminal-active"))]
+    assert "background: var(--c-bg-0)" in terminal_rule
+    assert "selectionForeground:" in app
+    assert "cursorAccent: background" in app
+    assert "extendedAnsi[22 - 16]" in app
+    assert "extendedAnsi[52 - 16]" in app
+    assert 'if (this.theme !== "dark")' in app
+    assert 'value("--c-diff-add-bg")' in app
+    assert 'value("--c-diff-del-bg")' in app
+
+
+def test_diff_surfaces_use_theme_tokens_and_readable_edges():
+    """Diff rows should be calm solid washes, not dark-theme alpha overlays."""
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    expected = {
+        "dark": {
+            "add_bg": "#193125", "add_edge": "#4ade80",
+            "del_bg": "#351f24", "del_edge": "#f87171",
+        },
+        "light": {
+            "add_bg": "#c7e5d0", "add_edge": "#1f6333",
+            "del_bg": "#f2c9c6", "del_edge": "#8d3333",
+        },
+        "eyecare": {
+            "add_bg": "#c6d8b8", "add_edge": "#355d31",
+            "del_bg": "#dfb9aa", "del_edge": "#6f3629",
+        },
+    }
+
+    def luminance(hex_color: str) -> float:
+        channels = [
+            int(hex_color[index:index + 2], 16) / 255
+            for index in (1, 3, 5)
+        ]
+        linear = [
+            value / 12.92 if value <= 0.04045
+            else ((value + 0.055) / 1.055) ** 2.4
+            for value in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(first: str, second: str) -> float:
+        lighter, darker = sorted(
+            (luminance(first), luminance(second)),
+            reverse=True,
+        )
+        return (lighter + 0.05) / (darker + 0.05)
+
+    for theme, colors in expected.items():
+        assert contrast(colors["add_edge"], colors["add_bg"]) >= 4.5, theme
+        assert contrast(colors["del_edge"], colors["del_bg"]) >= 4.5, theme
+        for name, value in colors.items():
+            token = name.replace("_", "-")
+            assert f"--c-diff-{token}: {value}" in css
+
+    assert ".diff-ins { background: var(--c-diff-add-bg); }" in css
+    assert ".diff-del { background: var(--c-diff-del-bg); }" in css
+    assert "border-left: 3px solid var(--c-diff-add-edge)" in css
+    assert "border-left: 3px solid var(--c-diff-del-edge)" in css
+    deleted_text = css[css.index(".diff-del .diff-text"):
+                       css.index("}", css.index(".diff-del .diff-text"))]
+    assert "color: var(--c-fg-1)" in deleted_text
+    assert "line-through" not in deleted_text
+    assert 'html[data-theme="light"] .diff-body-cr .diff-line.diff-ins' not in css
+
+    # Fenced Markdown `diff` blocks are a separate highlight.js path from the
+    # Edit tool card above. Both must use the same theme tokens.
+    assert ".markdown pre code.hljs .hljs-addition" in css
+    assert ".bubble pre code.hljs .hljs-addition" in css
+    assert "background-color: var(--c-diff-add-bg) !important" in css
+    assert ".markdown pre code.hljs .hljs-deletion" in css
+    assert ".bubble pre code.hljs .hljs-deletion" in css
+    assert "background-color: var(--c-diff-del-bg) !important" in css
+
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    theme_start = app.index("const link = document.getElementById(\"hljs-theme\")")
+    theme_end = app.index("// CodeMirror:", theme_start)
+    theme_switch = app[theme_start:theme_end]
+    assert 'this.theme === "dark"' in theme_switch
+    assert theme_switch.index("highlight-theme.css") < (
+        theme_switch.index("highlight-theme-light.css")
+    )

@@ -86,6 +86,9 @@ Container     = "https://github.com/hesorchen/muselab/pkgs/container/muselab"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    # Browser regressions cover Alpine rendering races and trusted mobile
+    # touch gestures that static source assertions cannot exercise.
+    "pytest-playwright>=0.7.0",
     # Pinned alongside dev deps so `scripts/lint.sh` and CI both have a
     # deterministic ruff version. Without this each dev / CI run pulled
     # latest via `uv run --with ruff`, occasionally causing rule churn.

@@ -9,7 +9,7 @@
   <a href="README_en.md"><img src="https://img.shields.io/badge/lang-English-red" alt="English"></a>
 </p>
 
-<p align="center"><strong>muselab 是一个基于 Claude Agent SDK 构建的自托管 AI 个人工作台</strong></p>
+<p align="center"><strong>muselab 是一个基于 Claude Agent SDK 构建的自托管 Agent 工作台</strong></p>
 
 <p align="center"><em>Muse 来自希腊神话中的缪斯女神，象征灵感、艺术与知识。</em></p>
 
@@ -35,12 +35,13 @@
 | | |
 |---|---|
 | **复用已有订阅额度** | Claude 走 OAuth 复用 Pro / Max；GPT 通过本地 Codex Gateway 复用 Codex / GPT Plus / Pro|
-| **完整的用户上下文** | 不断累积的个人档案，越用越懂你，产生 context 复利 |
+| **完整的用户上下文** | 不断累积的用户上下文，越用越懂你，产生 context 复利 |
 | **领先的 Agent Harness** | 基于 Claude Agent SDK 构建，具备工具调用、Skills、MCP 扩展等 Agent 能力|
-| **灵活切换的基座模型** | Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE / Codex Gateway 等 9 类模型提供方一键切换 |
-| **跨领域交叉分析** | 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
+| **灵活切换的基座模型** | Claude、OpenAI、Codex Gateway、DeepSeek、GLM、MiniMax、Kimi、Qwen、MiMo、ERNIE 等内置提供方一键切换，也可添加 Anthropic-compatible 自定义提供方 |
+| **跨领域交叉分析** | 项目开发 ✖️ 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
 | **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
-| **多工作目录与多会话** | 文件树、预览标签和会话按工作目录一起切换，每个目录保留自己的浏览状态 |
+| **多工作目录与多会话** | 文件树、预览标签、终端和会话与工作目录一起切换，每个目录保存工作状态 |
+| **真实多终端** | 在预览区直接运行 PTY 终端，按工作目录管理、重命名和切换；可在新建终端时自动执行固定命令 |
 | **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
 
 ## 快速开始
@@ -96,20 +97,23 @@ Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带
 ## 实用细节
 
 - **现代文件树** —— 现代化的文件操作，拖拽上传、模糊搜索、重命名、回收站
-- **连续预览体验** —— Markdown、文本、表格和 HTML 切换后恢复上次阅读位置；最近 4 个 HTML 保留活动页面状态
+- **文件与终端双预览面** —— Markdown、文本、表格和 HTML 恢复上次阅读位置；真实 PTY 终端支持多实例、Profile 与移动端操作
 - **工作目录隔离** —— 可登记并切换多个本地目录，文件、预览、会话标签和新会话 cwd 作为一个整体切换
+- **会话工作台** —— 多会话标签、置顶与搜索、后台流式回复、持久消息队列、上下文用量与回合耗时
+- **全局搜索** —— 文件名、文件内容、会话、历史消息和常用操作统一检索
+- **编辑与预览** —— Markdown 编辑、分屏预览、页内查找、缩放和 HTML 活动页面状态保留
 - **会话自动同步** —— 移动端休眠或 SSE 静默断开后自动探测、重连并补齐最终消息
 - **多模式多主题** —— 亮色 / 暗色 / 护眼，自选主题色
 - **中英双语** —— 一键切换，不刷新页面
 - **消息队列** —— Muse 思考时继续发送消息，消息队列依次执行，不错过每一个灵感
-- **定时任务** —— 创建夜晚定时任务，早上醒来查看结果
+- **任务与通知** —— 定时任务、后台任务、活动中心与 Web Push 统一反馈执行结果
 
 ## 文档
 
 **[📚 完整文档索引](docs/README_zh.md)**
 
 - **上手：** [快速入门](docs/quickstart_zh.md) · [Linux 安装](docs/install-linux_zh.md) · [macOS 安装](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
-- **使用：** [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
+- **使用：** [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [终端](docs/terminal_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
 - **模型：** [Providers](docs/providers_zh.md) · [Codex Gateway](docs/codex-gateway_zh.md) · [接入新 provider](docs/add-provider_zh.md) · [模型路由](docs/routing_zh.md)
 - **内部机制：** [架构](docs/architecture_zh.md) · [会话](docs/backend-sessions_zh.md) · [Files API](docs/backend-files_zh.md) · [安全模型](docs/backend-security_zh.md) · [前端](docs/frontend_zh.md) · [基础设施](docs/infrastructure_zh.md)
 - **参考：** [配置](docs/configuration_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [排错](docs/troubleshooting_zh.md) · [词汇表](docs/glossary_zh.md)

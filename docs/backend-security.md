@@ -1,146 +1,88 @@
-# Security Model
+# Backend security model
 
-> [简体中文](backend-security_zh.md)
+> [中文](backend-security_zh.md)
 
-This page describes muselab's security architecture: how authentication tokens flow through the system, what the filesystem containment layer does, which settings can be changed at runtime and which cannot, how third-party model providers are isolated from your Anthropic account, and the network posture defaults. For the vulnerability-reporting policy and operator hardening checklist, see [../SECURITY.md](../SECURITY.md).
-
----
-
-## Threat model
-
-muselab is a **single-user, self-hosted, localhost-first** application. There are no user accounts, no role-based access control, and no multi-tenancy. Whoever holds `MUSELAB_TOKEN` can read, write, upload, and delete any file under `MUSELAB_ROOT`, and can drive a Claude Agent SDK session running with `permission_mode="bypassPermissions"` and `cwd=MUSELAB_ROOT`. The practical implication is that a leaked token is equivalent to remote shell access scoped to the archive directory. The design deliberately accepts this: muselab is an AI archive manager, not a sandbox. The mitigations are operational — run as a dedicated unprivileged user, keep the token long and random, put a TLS reverse proxy in front, never expose port 8765 to the public internet.
-
----
+muselab is a single-user application. One shared token protects the UI and API, but it is not a fine-grained authorization system: anyone holding it should be treated as having every capability available to the muselab service user.
 
 ## Authentication
 
-### Token source and minimum length
+- `MUSELAB_TOKEN` must contain at least 16 characters; startup fails when it is missing or too short.
+- Normal API calls prefer the `X-Auth-Token` header.
+- A small set of browser-navigation resources accept `?token=`, including downloads, raw previews, and persisted attachments.
+- Token checks use constant-time comparison.
+- `GET /api/health` and rate-limited browser error reporting are public; business APIs require authentication by default.
 
-`MUSELAB_TOKEN` is read from the environment (with a fallback to the deprecated `PORTAL_TOKEN`) at module import time in [`backend/settings.py:L195`](../backend/settings.py#L195). A minimum length of **16 characters** is enforced at startup: if the token is absent or shorter than 16 chars, the server raises `RuntimeError` and refuses to start ([`backend/settings.py:L229-L235`](../backend/settings.py#L229-L235)).
+Query parameters can enter browser history and proxy logs. muselab filters tokens from its own access log, but the reverse proxy must also redact them. Any non-local deployment requires HTTPS.
 
-### Constant-time comparison
+## One-time SSE ticket
 
-All token checks use [`hmac.compare_digest()`](../backend/auth.py#L7-L19) rather than Python's `==` operator. String equality in Python short-circuits at the first mismatched byte, leaking matched-prefix length via response timing over a LAN. `hmac.compare_digest` runs in time proportional to the longer of the two inputs regardless of where they diverge ([`backend/auth.py:L7-L19`](../backend/auth.py#L7-L19)).
+Sending a message uses two requests:
 
-### Three dependency variants
+1. `POST /api/chat/stream/start` authenticates with a header and carries the prompt, session, model, permission, attachment IDs, and mobile flag in JSON.
+2. The backend returns a single-use ticket valid for 60 seconds; the browser connects to `GET /api/chat/stream?ticket=...`.
 
-Three FastAPI dependencies handle different transport constraints ([`backend/auth.py:L22-L54`](../backend/auth.py#L22-L54)):
+The ticket is removed from memory on first redemption, keeping the prompt and long-lived token out of the SSE URL. The legacy `GET /stream?token=...` query form remains only for old-client compatibility and should not be used by new integrations.
 
-| Dependency | Used by | Token accepted from |
+## Terminal WebSocket ticket
+
+Real terminals use a separate two-step exchange:
+
+1. An authenticated request calls `POST /api/terminals/{terminal_id}/ticket`.
+2. The backend returns a single-use ticket valid for 30 seconds. The browser presents both `muselab-terminal-v1` and the ticket as WebSocket subprotocols.
+
+Only a SHA-256 digest of the ticket is stored. Redemption is bound to the terminal ID; when a WebSocket `Origin` is present, its host must match the request `Host`. The long-lived token is never placed in the WebSocket URL.
+
+## Authority boundaries
+
+### Files API
+
+Every Files API request is bound to the default or a registered workspace. Paths are normalized and must remain inside the selected root; symlink targets must also stay inside it. Sensitive names, NUL bytes, and direct writes into the dustbin are rejected.
+
+Workspace registration is not service-user isolation. Register only directories you intend to expose through the UI.
+
+### Agent and terminal
+
+The Files API path boundary does **not** constrain Agent tools or real terminals:
+
+- Agent Bash, Read, Write, and related tools run according to the selected SDK permission mode.
+- Preview terminals are real Unix PTYs and can access paths outside the workspace with the muselab service user's OS authority.
+- Terminal processes receive a minimal environment and do not inherit `MUSELAB_TOKEN` or provider API keys. This reduces credential exposure but does not restrict filesystem permissions.
+
+Set `MUSELAB_TERMINAL_ENABLED=0` when terminals are not needed. On production or shared machines, run muselab as a dedicated unprivileged user and use containers, VMs, or OS permissions for real isolation.
+
+## Provider credential isolation
+
+CLI subprocesses for non-Anthropic providers receive a minimal full environment replacement, not a merge with the parent environment. It contains only process, proxy, and TLS variables plus the selected provider's endpoint and credentials.
+
+`CLAUDE_CONFIG_DIR` points to a per-OS-user temporary directory and any Claude OAuth credential found there is removed. This prevents third-party requests from silently falling back to Anthropic. Other provider keys and `MUSELAB_TOKEN` are not passed to that subprocess.
+
+## Settings writes
+
+The settings API writes only explicitly allowlisted fields. Deployment-level values such as `MUSELAB_TOKEN`, `MUSELAB_ROOT`, and `PATH` cannot be changed through the UI.
+
+- API keys are masked in responses.
+- A value containing the mask marker cannot overwrite a real key.
+- CR and LF are stripped to prevent `.env` line injection.
+- `.env` uses a temporary file and atomic replacement; hot-reloadable values are also updated in the current process.
+
+## HTTP defenses
+
+Every response sets:
+
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: SAMEORIGIN`
+- `Referrer-Policy: same-origin`
+
+Raw HTML and SVG previews use isolated responses with a strict CSP. The main UI does not have a global strict CSP because it uses Alpine inline directives.
+
+## Threat model and deployment guidance
+
+| Risk | Effective impact | Mitigation |
 |---|---|---|
-| `require_token` | Most `/api/files/*`, `/api/settings/*`, `/api/meta`, `/api/presence` | `X-Auth-Token` header only |
-| `require_token_query` | `/api/files/raw`, `/api/files/download` | `?token=` query param only |
-| `require_token_header_or_query` | Chat SSE stream (`/api/chat/stream`) | Either header or `?token=` |
+| Token disclosure | Sessions, workspaces, Agent, settings, and real terminals become accessible, effectively granting remote service-user operations | Use a long random token, HTTPS, proxy-log redaction, and a dedicated service user |
+| Malicious preview | HTML or SVG can contain active content | Keep preview CSP and isolation headers enabled |
+| Malicious attachment or page | Prompt injection can steer the Agent | Use stricter permissions for external content and do not auto-approve high-risk actions |
+| Upgrade endpoint | An authenticated user can trigger install scripts for fixed packages | Block the endpoint at the reverse proxy if online upgrade is not needed |
+| Multiple workers | In-memory tickets, rate limits, active turns, and terminal registries are not shared | Use the default single-worker deployment |
 
-The query-param variants exist because browsers cannot send custom headers for `<iframe src>` and `EventSource` connections. Image previews that need authorization are fetched with `X-Auth-Token` and rendered as blob URLs, so the global token is not placed in image URLs. `fetch()` calls can use headers and do so in preference to the query param; the query-param path remains as a fallback for iframe downloads and copied links ([`backend/auth.py:L33-L54`](../backend/auth.py#L33-L54)).
-
-### Unauthenticated routes
-
-The following routes require no token:
-
-| Route | Reason |
-|---|---|
-| `GET /api/health` | Liveness probe for Docker / k8s / Caddy `health_uri` ([`backend/main.py:L529-L535`](../backend/main.py#L529-L535)) |
-| `POST /api/log/client-error` | Browser error capture before auth is established; rate-limited to 30/min per IP ([`backend/main.py:L582-L622`](../backend/main.py#L582-L622)) |
-| `GET /`, `/static/*`, `/sw.js`, `/robots.txt`, `/static/assets/manifest.webmanifest` | HTML shell, frontend assets, PWA manifest — no private data |
-
----
-
-## Filesystem containment
-
-Every file operation in muselab's files API passes through `safe_resolve()` before any filesystem call. This function blocks path traversal (`../../etc/passwd`), symlink escapes (by resolving the target path and checking it falls inside `ROOT`), NUL-byte injection, and access to credential-shaped filenames (`.env*`, `id_rsa`, `*.pem`, `credentials.json`, and 30+ other patterns) — even with a valid token. `MUSELAB_ROOT` itself is forbidden from pointing at system paths (`/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot`), enforced at startup.
-
-Full details, including the complete `SENSITIVE_NAMES` and `SENSITIVE_SUFFIX` blocklists and the `allow_sensitive=True` exceptions for trash restore, are documented in [backend-files.md](backend-files.md) (see the `safe_resolve` section).
-
----
-
-## Settings surface
-
-### What `PUT /api/settings` can change
-
-The settings write endpoint ([`backend/api_settings.py:L275-L404`](../backend/api_settings.py#L275-L404)) accepts a strictly typed `SettingsIn` body and applies a **name whitelist** before touching `.env`. Writable fields are:
-
-| Field | Env var(s) written |
-|---|---|
-| `anthropic_api_key` / `deepseek_api_key` / `zhipuai_api_key` / `minimax_api_key` | Corresponding `*_API_KEY` vars |
-| `provider_keys` (dict) | Any name in the provider catalog's `env_key` set, or matching `^MUSELAB_PROVIDER_[A-Z0-9_]+_API_KEY$` |
-| `default_model` | `MUSELAB_DEFAULT_MODEL` + `MUSELAB_MODEL` (kept in sync) |
-| `default_permission` | `MUSELAB_DEFAULT_PERMISSION` |
-| `provider_disabled` | `MUSELAB_DISABLED_PROVIDERS` |
-
-Names that are not in the whitelist are **silently dropped** — `PATH`, `MUSELAB_TOKEN`, `MUSELAB_ROOT`, and any arbitrary env var cannot be written through this endpoint ([`backend/api_settings.py:L309-L311`](../backend/api_settings.py#L309-L311)).
-
-### What can never be changed via API
-
-- `MUSELAB_TOKEN` — not in any whitelist; changing the auth token from within an authed session would be a privilege-escalation surface.
-- `MUSELAB_ROOT` — changing the root directory at runtime could silently redirect file operations.
-- `PATH` or any other process environment variable not in the whitelist.
-
-### Masked-value rejection
-
-`GET /api/settings` returns provider API keys masked (`first4•••last4`, using U+2022 BULLET). Any value containing `•` submitted to `PUT /api/settings` is **rejected without writing**, preventing a frontend bug from accidentally round-tripping masked display values back over real keys ([`backend/api_settings.py:L319-L324`](../backend/api_settings.py#L319-L324)).
-
-### Atomic `.env` rewrite
-
-Settings changes are written atomically via `tempfile.mkstemp` + `os.replace` ([`backend/api_settings.py:L163-L173`](../backend/api_settings.py#L163-L173)). CR/LF characters are stripped from values before writing to prevent newline-injection attacks that could split a value into extra `KEY=VALUE` lines on the next `load_dotenv` ([`backend/api_settings.py:L129-L133`](../backend/api_settings.py#L129-L133)). `os.environ` is updated in-process immediately after the file write so changes take effect without a restart.
-
----
-
-## Billing isolation for third-party models
-
-When muselab routes a session to a third-party provider (DeepSeek, GLM, MiniMax, Kimi, Qwen, MiMo, Qianfan), it builds a **minimal allowlisted environment** and passes it to the Claude CLI subprocess as a **full replacement** — not a merge — of the process environment ([`backend/endpoints.py:L851-L930`](../backend/endpoints.py#L851-L930)).
-
-The substitution sets exactly:
-
-```
-ANTHROPIC_BASE_URL       = <vendor endpoint>
-ANTHROPIC_API_KEY        = <vendor key>      # x-api-key header
-ANTHROPIC_AUTH_TOKEN     = <vendor key>      # belt-and-suspenders Bearer
-CLAUDE_CODE_OAUTH_TOKEN  = ""                # kills OAuth fallback
-CLAUDE_OAUTH_TOKEN       = ""                # kills OAuth fallback
-CLAUDE_CONFIG_DIR        = <isolated tmp dir>
-```
-
-Plus a short allowlist of process basics (`PATH`, `HOME`, `USER`, locale, proxy, TLS-CA vars) — nothing else.
-
-**Why `CLAUDE_CONFIG_DIR` isolation prevents silent Anthropic billing.** The Claude CLI prefers `~/.claude/.credentials.json` (Pro OAuth) over `ANTHROPIC_API_KEY`. Without isolation, a DeepSeek session would send the Claude OAuth token to `api.deepseek.com`, get a 401 from DeepSeek, and then silently fall back to `api.anthropic.com` — billing your Claude Pro account. Pointing `CLAUDE_CONFIG_DIR` at a per-user temp directory (`/tmp/muselab-vendor-cli-config-<uid>/`) that contains no credentials file forces the CLI to use the injected API key. Any leaked credentials file in that directory is deleted on each call ([`backend/endpoints.py:L879-L887`](../backend/endpoints.py#L879-L887)).
-
-**Why the minimal allowlist prevents key exfiltration.** The CLI subprocess runs `bypassPermissions` and is internet-capable. Inheriting the full environment would expose `MUSELAB_TOKEN` and every other provider's `*_API_KEY` to an agent that could exfiltrate them via a Bash tool call (`echo $MUSELAB_TOKEN`). The allowlist ensures the subprocess only sees what it needs to connect to the vendor ([`backend/endpoints.py:L895-L910`](../backend/endpoints.py#L895-L910)).
-
-See also [routing.md](routing.md) for provider catalog and model-resolution details.
-
----
-
-## Network posture
-
-**Binding address.** muselab binds to `127.0.0.1` (loopback only) by default. The comment in [`backend/settings.py:L206-L209`](../backend/settings.py#L206-L209) explicitly notes that LAN binding would be a footgun for the default single-user install. Override to `0.0.0.0` in `.env` (`MUSELAB_HOST`) only for LAN / VPS / Docker scenarios where you have a TLS terminator in front.
-
-**Response headers.** The `_security_headers` middleware ([`backend/main.py:L299-L331`](../backend/main.py#L299-L331)) attaches three headers to every response via `setdefault` (endpoint-specific headers can override):
-
-| Header | Value | Purpose |
-|---|---|---|
-| `X-Content-Type-Options` | `nosniff` | Prevents MIME sniffing of file previews |
-| `Referrer-Policy` | `same-origin` | Prevents token leakage via `Referer` on cross-origin navigation |
-| `X-Frame-Options` | `SAMEORIGIN` | Blocks external-site framing of the UI |
-
-**No global CSP.** The UI uses Alpine.js inline directives (`x-on:`, `@click`, `:class`) and multiple inline `<script>` tags. A strict CSP would require per-request nonces or eval allowances; the maintenance cost is not justified for a single-user app. HTML/SVG files served via `/api/files/raw` *do* get a per-response strict CSP ([`backend/files.py:L694-L704`](../backend/files.py#L694-L704)).
-
-**No built-in HSTS.** `Strict-Transport-Security` is only meaningful over HTTPS. muselab normally runs at `127.0.0.1` without TLS; HSTS on plaintext localhost would confuse reverse-proxy setups. Operators should set HSTS at the reverse proxy layer.
-
-**Reverse-proxy log caveat.** muselab's own access logger strips `token=` from URLs via `_TokenFilter` ([`backend/main.py:L23-L62`](../backend/main.py#L23-L62)), but a reverse proxy records the raw URL. Configure your proxy to redact the `token` query parameter — examples for nginx and Caddy are in [../SECURITY.md](../SECURITY.md).
-
----
-
-## Known limitations
-
-| Limitation | Impact | Mitigation |
-|---|---|---|
-| **Single-user, no RBAC** | Token possession grants full archive access; no per-user or per-directory scoping | Run for one trusted user only; treat token as a root credential |
-| **No per-request rate limiting** (most endpoints) | A valid token can flood the server; upload size is capped (100 MB) but request rate is not | Place Caddy or nginx in front with global rate limits if exposed to more than one user ([SECURITY.md](../SECURITY.md)) |
-| **Upgrade endpoint is token-gated RCE by design** | `POST /api/settings/upgrade` runs `uv` and `npm` subprocesses; package installs run arbitrary scripts ([`backend/api_settings.py:L1367-L1388`](../backend/api_settings.py#L1367-L1388)) | Token already grants equivalent access; package names are fixed literals, not user-supplied. Block `POST /api/settings/upgrade` at reverse proxy if you want to remove the surface |
-| **No multi-worker support** | Rate-limit buckets (`_CLIENT_ERR_BUCKETS`) are in-process only; a multi-worker deployment would silently skip limits ([`backend/main.py:L554-L556`](../backend/main.py#L554-L556)) | Use single-worker deployment (default) |
-| **Token in reverse-proxy logs** | SSE and download endpoints use `?token=` query params; muselab strips them locally but upstream proxies record the raw URL | Configure proxy log format to redact `token` — see [../SECURITY.md](../SECURITY.md) for nginx and Caddy examples |
-
----
-
-*Related pages: [configuration.md](configuration.md) · [routing.md](routing.md) · [backend-files.md](backend-files.md) · [../SECURITY.md](../SECURITY.md)*
+See the repository-root `SECURITY.md` for deployment details.

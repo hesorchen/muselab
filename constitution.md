@@ -10,12 +10,12 @@
 > intent lives in per-change specs; product roadmap and known issues live on
 > [GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
-- **Version:** 1.0.0
+- **Version:** 2.0.0
 - **Ratified:** 2026-05-31
-- **Last amended:** 2026-05-31
+- **Last amended:** 2026-07-23
 - **Derived from:** `docs/architecture.md`,
   `CONTRIBUTING.md`, `SECURITY.md`, `pyproject.toml`, and the backend/frontend
-  source as of 2026-05-31.
+  source as of 2026-07-23.
 
 Normative keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119.
 
@@ -44,15 +44,16 @@ Skills, Subagents, plan mode, and `CLAUDE.md` auto-load behave uniformly across
 every provider. New capabilities MUST be expressed through SDK-native mechanisms
 rather than bypassing the SDK.
 
-### P4 — The archive belongs to the user; the repo never touches it
-Two roots are permanently separate (see §2). Code MUST NOT write its own state
-into the user's archive except under the reserved `<ARCHIVE>/.muselab/` path,
-and MUST NOT require anything inside the archive to install, upgrade, or move.
+### P4 — Workspaces belong to the user; the repo never touches them
+The install root and workspace roots remain separate (see §2). Code MUST NOT
+write its own state into a user workspace except under the default workspace's
+reserved `<MUSELAB_ROOT>/.muselab/` path and each workspace's recoverable
+trash. Installation, upgrade, and migration MUST NOT depend on user files.
 
 ### P5 — Whole-file as the unit of input
 The assistant reaches user files on demand via Read / Grep / Edit. muselab MUST
-NOT pre-embed, pre-index, or RAG-chunk the user's archive. Context comes from
-the auto-loaded root `CLAUDE.md` plus on-demand tool reads.
+NOT pre-embed, pre-index, or RAG-chunk user workspaces. Context comes from the
+SDK-discovered `CLAUDE.md` hierarchy for the active cwd plus on-demand reads.
 
 ### P6 — Personal data is radioactive in shipped artifacts
 This is an open-source repo. No real personal data MAY appear in code, docs,
@@ -66,14 +67,16 @@ throwaway archive directory.
 These are non-negotiable structural facts. A change that violates one is an
 architecture change and MUST amend this constitution (see §8) before landing.
 
-### A1 — Two roots, deliberately separate
+### A1 — Install root and workspace roots stay separate
 | Root | What | Backups |
 |---|---|---|
 | **repo** (`muselab/`) | code + per-install state (`.env`, `sessions/`) | with the install |
-| **archive** (`MUSELAB_ROOT`) | the user's own files | independently, without touching the install |
+| **default workspace** (`MUSELAB_ROOT`) | user files + `.muselab/` application state | independently, without touching the install |
+| **other registered workspaces** | additional user files and workspace trash | separately |
 
-`backend/settings.py` owns `ROOT` (the archive). The archive's root `CLAUDE.md`
-auto-loads on every conversation.
+`backend/settings.py` owns `ROOT` (the default workspace), while
+`backend/workspaces.py` manages other registered roots. Each session stores its
+cwd and the SDK discovers `CLAUDE.md` from the corresponding hierarchy.
 
 ### A2 — Layered backend, one router per concern
 The backend is FastAPI, mounted in `backend/main.py`. Each domain is one module
@@ -87,11 +90,15 @@ shape rather than growing a god-module:
 | `chat.py` | `/api/chat/*` — SDK client pool + SSE turn loop |
 | `endpoints.py` | provider `CATALOG` + per-request env wiring |
 | `files.py` | `/api/files/*` — safe-resolve read/write/grep + dustbin |
-| `sessions.py` | session index, sidecars, queue |
+| `workspaces.py` | workspace registration, selection, and directory boundaries |
+| `sessions.py` | session index, cwd, sidecars, queue |
+| `terminal.py` / `terminal_worker.py` | `/api/terminals/*`, profiles, WebSocket tickets, and PTY workers |
 | `scheduler.py` / `api_scheduler.py` | asyncio cron loop + its API |
 | `push.py` / `api_push.py` | Web Push / VAPID + its API |
+| `activity.py` / `activity_api.py` | activity-center state + its API |
+| `transcript_index.py` | transcript index |
 | `api_settings.py` | `/api/settings` — hot-rewrite `.env` + `os.environ` |
-| `prompts.py` | system-prompt assembly |
+| `prompts.py` | short starter messages for built-in workflows |
 | `ask_user_question.py` | in-process `muselab` MCP server |
 | `permission_request.py` | tool-permission round-trip |
 | `settings.py` | `ROOT` / `PORT` / `HOST`, `atomic_write_text`, `env_int` |
@@ -103,17 +110,20 @@ The isolated config dir is mandatory: it blocks the CLI from silently falling
 back to Pro OAuth and billing third-party traffic to the user's Anthropic
 account. Any new provider path MUST preserve all three.
 
-### A4 — Client pool keyed by `(session_id, model, effort)`, LRU cap 3
-`chat.py` pools `ClaudeSDKClient` instances on exactly this key
-(`_CLIENT_POOL_CAP = 3`). Each assistant message stores its own `model` so
-badges stay accurate after reload. Changing the pool key or cap is an
-architecture change (it interacts with MCP spawning — see A6).
+### A4 — Client pool keyed by `(session_id, model, effort)`
+`chat.py` pools `ClaudeSDKClient` instances on exactly this key. The default LRU
+cap is 3 and may be adjusted through supported runtime configuration. Each
+assistant message stores its own `model` so badges stay accurate after reload.
+Changing the pool key is an architecture change (it interacts with MCP
+spawning — see A6).
 
-### A5 — A session is locked to one model
-The first real turn pins the session's model; later turns reuse it. A
-conversation MUST NOT mix vendors mid-stream — cross-vendor thinking-block
-signatures do not transfer and produce unrecoverable `400` errors. Sessions
-created before a provider existed self-heal to a configured model on first send.
+### A5 — The UI protects model continuity by default
+The first real turn establishes the session model. For a non-empty session, the
+frontend MUST fork when switching to an incompatible model, avoiding
+cross-vendor thinking-block signatures that can produce unrecoverable `400`
+errors. The management API MAY explicitly update a session model, but callers
+own transcript-compatibility risk. Sessions created before a provider existed
+self-heal to a configured model on first send.
 
 ### A6 — MCP: attribute-driven, gated, default-zero
 - The shipped default configures **zero** user MCP servers; connectors are
@@ -138,19 +148,27 @@ key) → Skill (a folder with `SKILL.md` + optional assets, progressive
 disclosure). New extensions MUST be classified by this rule.
 
 ### A8 — Transcripts are owned by the CLI, not muselab
-Conversation transcripts live under `~/.claude/projects/<cwd-key>/<id>.jsonl`,
-owned by the Claude CLI. muselab's `sessions/` holds only the sidecar metadata
-layered on top (name, per-message model badge, cost, attachments). muselab MUST
-NOT duplicate or fork ownership of the transcript itself.
+Conversation transcripts are owned by the Claude CLI. Claude sessions normally
+use its default configuration root, while third-party-provider sessions may use
+isolated configuration roots. muselab's `sessions/` holds only the sidecar
+metadata layered on top (name, cwd, per-message model badge, cost, attachments).
+muselab MUST NOT duplicate or fork ownership of the transcript itself.
+
+### A9 — Native instruction ownership
+muselab MUST NOT inject a global or per-session custom system prompt. Persistent
+identity, response preferences, and personal context belong in the
+SDK-discovered `CLAUDE.md` hierarchy. Reusable task workflows belong in Skills,
+and tool-specific behavior belongs in tool descriptions and enforced permission
+configuration. UI starter prompts MAY invoke those native capabilities without
+creating another instruction layer.
 
 ---
 
 ## 3. Technology Stack & Constraints
 
 - **Language/runtime:** Python `>=3.12`. Dependency + venv management via `uv`.
-- **Web:** FastAPI on `starlette>=1.0.1` (pinned above the CVE'd 1.0.0), served
-  by `uvicorn[standard]`.
-- **Agent:** `claude-agent-sdk>=0.2.82` — the only path to the model. No direct
+- **Web:** FastAPI on `starlette>=1.3.1`, served by `uvicorn[standard]`.
+- **Agent:** `claude-agent-sdk>=0.2.120,<0.3` — the only path to the model. No direct
   `anthropic` SDK / raw HTTP to model endpoints in app code.
 - **Frontend:** vanilla HTML + Alpine.js v3 + CSS. No framework, no build (P2).
 - **Persistence:** flat files (JSON sidecars, JSONL transcripts owned by CLI).
@@ -197,13 +215,16 @@ convention.
 (Authoritative detail in `SECURITY.md`; these are the constitution-level
 invariants that code reviews and specs MUST enforce.)
 
-- **Auth on every request.** Every API request carries `X-Auth-Token` (header or
-  `?token=`). No endpoint MAY be added without going through `require_token` /
-  `require_token_query`.
-- **Path traversal is closed.** All archive file access MUST resolve through the
-  safe-resolve logic in `files.py` and stay within `ROOT`. Write/upload/rename/
-  copy MUST refuse the `.muselab-dustbin/` path (`_guard_not_trash`); deletes are
-  soft (move to dustbin), with restore/purge as separate endpoints.
+- **Auth on every request.** Normal APIs use `X-Auth-Token`. Browser real-time
+  connections MUST first obtain a short-lived, single-use ticket through an
+  authenticated request; compatibility query tokens are reserved for resource
+  requests that cannot send headers. New endpoints MUST NOT bypass the
+  corresponding authentication dependency.
+- **Files API path traversal is closed.** Every browser file path MUST resolve
+  through the safe-resolve logic in `files.py` and stay within the selected
+  registered workspace. Write/upload/rename/copy MUST refuse the
+  `.muselab-dustbin/` path (`_guard_not_trash`); deletes are soft (move to
+  dustbin), with restore/purge as separate endpoints.
 - **No secret leakage in logs.** The uvicorn access-log `token=` redaction
   filter (`_TokenFilter` in `main.py`) MUST stay in place; new log surfaces that
   could carry tokens/keys MUST be scrubbed the same way.
@@ -213,7 +234,11 @@ invariants that code reviews and specs MUST enforce.)
 - **Local HTTP servers** MUST bind `127.0.0.1`, validate `Origin`
   (DNS-rebinding), and require a token. Prefer remote HTTP connectors over `npx`
   commands (fewer supply-chain risks).
-- **Least privilege.** Filesystem-style access stays scoped to the data dir.
+- **Permission boundaries MUST be described accurately.** Files API access is
+  restricted to the selected registered workspace. Agent tools and real
+  terminals run with service-user permissions and MUST NOT be described as the
+  same path sandbox. Terminals MUST use same-origin checks, single-use tickets,
+  and a safe environment allowlist.
 - **No secrets** in code, commits, or test fixtures. `.env` and `sessions/`
   remain gitignored and MUST NOT be added.
 
@@ -240,12 +265,12 @@ form):
 
 ## 7. Scope Boundaries (Non-Goals)
 
-muselab is a **personal-archive assistant**, not a generic AI platform. The
+muselab is a **personal-workspace assistant**, not a generic AI platform. The
 following MUST be declined absent an explicit constitution amendment:
 
 - A build step of any kind (violates P2).
-- A document-RAG / crawled-content pipeline over the archive (violates P5).
-- Generic chat-UI features outside the personal-archive scope (plugin
+- A document-RAG / crawled-content pipeline over user workspaces (violates P5).
+- Generic chat-UI features outside the personal-workspace scope (plugin
   marketplace, etc.).
 - OpenAI-only protocol providers (violates §3 / A3).
 - Presetting heavy/developer-only or write/trade-capable MCP servers by default
@@ -270,6 +295,16 @@ following MUST be declined absent an explicit constitution amendment:
 - **Drift check:** when reverse-engineered understanding contradicts this
   document, treat the contradiction as a finding — fix the code, or amend the
   doc with rationale. Never silently let them diverge.
+
+---
+
+## 9. Amendment history
+
+- **2.0.0 (2026-07-23):** Replaced the single-archive model with registered
+  workspaces; added the real terminal, short-lived real-time tickets, and
+  Activity modules; defined model continuity as frontend fork-by-default with
+  an explicit management-API override; and fixed native instruction ownership
+  across CLAUDE.md, Skills, and tool permissions.
 
 ---
 

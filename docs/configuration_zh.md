@@ -2,112 +2,132 @@
 
 > [English](configuration.md)
 
-所有设置都在仓库的 `.env` 文件里。安装器会创建它；你可以手动编辑，或在应用内的 **设置** 面板里改大部分值（设置面板会热更新 `.env` *并同时* 更新运行中的进程 —— 无需重启）。手动改 `.env` **需要** 重启，因为进程只在启动时读一次文件。
+muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 
-起始模板见 `.env.example`。
+1. **部署环境**：`.env` 和进程环境，决定监听地址、默认工作目录、凭据与资源上限。
+2. **应用配置文件**：provider、MCP、工作目录和终端 Profile 等 JSON 文件。
+3. **持久化运行状态**：会话、调度、Activity、Push 和生图任务。
+4. **浏览器偏好**：语言、布局、打开的 Tab 等本地 UI 状态。
 
-## 鉴权
+手动修改 `.env` 后应重启服务。设置面板保存的 provider key、默认模型和默认权限会原子更新 `MUSELAB_ENV_PATH` 指向的文件与当前进程，通常无需重启。设置面板不会开放 token、根目录或监听地址。
 
-muselab 是单用户的。一个 token 保护整个 Web UI 和每一次 API 调用。
-
-- token 是 `.env` 里的 `MUSELAB_TOKEN`。用 `grep MUSELAB_TOKEN .env` 找它。
-- 浏览器以 `X-Auth-Token` header 发送（缓存在 `localStorage["muselab_token"]`）；链接也接受 `?token=` 查询参数。
-- 至少 16 个字符 —— 否则后端拒绝启动。安装器用 `openssl rand -hex 32` 生成随机 token。
-
-## 核心设置
-
-| 变量 | 作用 | 默认 | 必填 |
-|---|---|---|---|
-| `MUSELAB_TOKEN` | Web UI / API 鉴权 token | 随机（安装器生成） | **是** —— ≥16 字符 |
-| `MUSELAB_ROOT` | 归档目录的绝对路径（原生部署） | —— | **是**（原生部署） |
-| `MUSELAB_HOST` | uvicorn 绑定的网络接口 | `127.0.0.1` | 否 |
-| `MUSELAB_PORT` | 监听端口 | `8765` | 否 |
-| `MUSELAB_URL` | 可选远程 macOS 菜单栏客户端访问的公网 origin | 本机 `127.0.0.1:<端口>` | 否 |
-| `MUSELAB_MODEL` | 新会话的默认模型 id | 未设置 | 否 —— **建议留空**，让 UI 自动选你配的第一个 provider |
-
-> `MUSELAB_ROOT` 不能是裸系统路径（`/`、`/etc`、`/home`、`/var` 等）；后端会拒绝，避免把整块磁盘交给 agent。
-
-`MUSELAB_ROOT` 是默认工作目录。通过 token 鉴权后，可在工作目录选择器中登记其他已存在目录；文件 API、预览标签、可见会话和新会话 `cwd` 会随当前目录整体切换。只登记允许 service 用户暴露的目录；登记表保存在 `$MUSELAB_ROOT/.muselab/workspaces.json`。
-
-## Provider 密钥
-
-至少配一个。Anthropic 走 `claude login`（Pro/Max OAuth），无需密钥。其余都是 API key。这些也能在设置面板里配。
-
-| Provider | API-key 环境变量 | 默认 base URL | base URL 覆盖 |
-|---|---|---|---|
-| Anthropic（Claude） | `ANTHROPIC_API_KEY`（或 `claude login`） | api.anthropic.com | —— |
-| DeepSeek | `DEEPSEEK_API_KEY` | api.deepseek.com/anthropic | `DEEPSEEK_BASE_URL` |
-| 智谱 GLM | `ZHIPUAI_API_KEY` | open.bigmodel.cn/api/anthropic | `ZHIPUAI_BASE_URL` |
-| MiniMax（国内） | `MINIMAX_API_KEY` | api.minimaxi.com/anthropic | `MINIMAX_BASE_URL` |
-| MiniMax（国际） | `MINIMAX_INTL_API_KEY` | api.minimax.io/anthropic | —— |
-| Kimi / Moonshot | `MOONSHOT_API_KEY` | api.moonshot.cn/anthropic | `MOONSHOT_BASE_URL` |
-| Qwen / DashScope | `DASHSCOPE_API_KEY` | dashscope.aliyuncs.com/apps/anthropic | `DASHSCOPE_BASE_URL` |
-| 小米 MiMo | `XIAOMI_MIMO_API_KEY` | api.xiaomimimo.com/anthropic | `XIAOMI_MIMO_BASE_URL` |
-| 百度 ERNIE（千帆） | `QIANFAN_API_KEY` | qianfan.baidubce.com/anthropic | `QIANFAN_BASE_URL` |
-| Codex Gateway | `CODEX_GATEWAY_API_KEY` | 127.0.0.1:8317 | `CODEX_GATEWAY_BASE_URL` |
-
-注意：
-- **MiniMax 国内与国际用不同的密钥。** `minimaxi.com` 的 key 在 `minimax.io` 上会 401，反之亦然 —— 配与你账户匹配的那个。
-- **Qwen** 国内与国际端点共用 `DASHSCOPE_API_KEY`；国际变体在 UI 里按模型选择。
-- 你自己在设置里添加的 provider，密钥名为 `MUSELAB_PROVIDER_<SLUG>_API_KEY`。
-- **Codex Gateway** 是本地 Anthropic 兼容 sidecar。这里的 token 只用于 gateway；muselab 不保存 Codex OAuth 凭据。
-- **生图** 与聊天 provider 分离。默认 `MUSELAB_IMAGE_PROVIDER=auto`：如果配置了
-  `OPENAI_IMAGE_API_KEY`（或复用 `OPENAI_API_KEY`）就走 OpenAI Image API。本机
-  Codex `$imagegen` 必须显式 opt-in：仅在可信 localhost 实例上设置
-  `MUSELAB_IMAGE_PROVIDER=codex_imagegen` 与 `CODEX_IMAGEGEN_ENABLED=true`。如果你的
-  本地网关暴露 OpenAI-compatible image endpoint，可把 `OPENAI_IMAGE_BASE_URL` 指向
-  对应 `/v1`，并使用 `openai` provider。
-
-接入列表之外的 Anthropic 兼容端点，见 [add-provider_zh.md](add-provider_zh.md)。
-
-## 可选调优
-
-全部可选；未设置时用合理默认。
+## 必需与网络设置
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `MUSELAB_PROMPT_CACHE_TTL` | Claude prompt 缓存 TTL（`1h` / `5m` / 空=CLI 默认） | `1h` |
-| `MUSELAB_BUDGET_USD` | 月度软预算 —— 仅 UI 角标提示，不硬性中断 | `0`（关闭） |
-| `MUSELAB_MAX_UPLOAD_MB` | 单次上传大小上限（MiB） | `100` |
-| `MUSELAB_IMAGE_PROVIDER` | Composer 生图后端（`auto`、`openai`、`codex_imagegen`） | `auto` |
-| `OPENAI_IMAGE_API_KEY` | Composer GPT Image 工具使用的 API key | 未设置 |
-| `OPENAI_IMAGE_BASE_URL` | 生图使用的 OpenAI-compatible `/v1` base URL | `https://api.openai.com/v1` |
-| `MUSELAB_IMAGE_GENERATION_TIMEOUT` | 生图超时时间（秒） | `180` |
-| `CODEX_IMAGEGEN_ENABLED` | `MUSELAB_IMAGE_PROVIDER=codex_imagegen` 或 `auto` 无图片 API key 时，是否允许本机 Codex `$imagegen` | `false` |
-| `CODEX_IMAGEGEN_TIMEOUT_SECONDS` | 本机 Codex 生图超时时间（秒） | `300` |
-| `MUSELAB_MAX_TURNS` | 每会话最大回合数（0 = 不限） | `0` |
-| `MUSELAB_THINKING_BUDGET` | 扩展思考 token 预算（0 = 关） | `10000` |
-| `MUSELAB_CLIENT_POOL_CAP` | 保活的 SDK client 池大小 | `3` |
-| `MUSELAB_DISABLED_PROVIDERS` | 要隐藏的 provider 模型 id（逗号分隔） | 空 |
-| `MUSELAB_DISABLE_SKILLS` | 关闭内置 skills（`1`/`true`） | 关 |
-| `MUSELAB_PRUNE_EMPTY_SESSIONS` | 自动删除无消息的空会话（`true`） | `false` |
-| `MUSELAB_TRASH_TTL_DAYS` | 软删除文件在 `.muselab-dustbin/` 保留天数（0 = 永久） | `30` |
-| `MUSELAB_VAPID_SUBJECT` | Web-push VAPID `sub` 声明（一个 `mailto:`） | `mailto:noreply@muselab.dev` |
-| `MUSELAB_DEFAULT_PERMISSION` | 默认权限模式 | `bypassPermissions` |
+| `MUSELAB_TOKEN` | UI 与 API 的共享鉴权 token，至少 16 字符 | 必填 |
+| `MUSELAB_ROOT` | 主工作目录，也是 `.muselab` 全局状态的根目录 | 原生部署必填 |
+| `MUSELAB_HOST` | uvicorn 监听接口 | `127.0.0.1` |
+| `MUSELAB_PORT` | 监听端口 | `8765` |
+| `MUSELAB_URL` | 可选远程客户端使用的公开 HTTPS origin | 本机 origin |
+| `MUSELAB_ENV_PATH` | 设置 API 读写的 `.env` 路径；测试或特殊部署使用 | `<repo>/.env` |
+| `MUSELAB_MODEL` | 新会话默认模型；未设置时使用内置 Claude 默认值 | `claude-sonnet-4-6` |
+| `MUSELAB_DEFAULT_MODEL` | 设置面板保存的默认模型，与 `MUSELAB_MODEL` 同步 | `claude-sonnet-4-6` |
+| `MUSELAB_DEFAULT_PERMISSION` | 新会话默认 SDK 权限模式 | `bypassPermissions` |
 
-> VAPID **密钥** 不是环境变量 —— 它们在磁盘上生成于 `<archive>/.muselab/vapid.json`。只有上面的 subject 可配置。
+`MUSELAB_ROOT` 必须存在。`/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等系统级根路径会被拒绝；用户自己的 home 或其子目录可以使用。
 
-## 仅 Docker
+## 多工作区
 
-由 `docker-compose.yml` 读取，后端**不读**：
+主目录之外的工作目录通过 UI 注册，保存在：
+
+```text
+$MUSELAB_ROOT/.muselab/workspaces.json
+```
+
+切换工作目录会同步切换文件树、预览、终端初始目录和新会话 `cwd`。会话历史会扫描所有已登记目录。注册目录并不创建操作系统隔离，只应登记愿意交给服务用户和 Web UI 的路径。
+
+## Provider
+
+Claude 可使用 `claude login` 或 `ANTHROPIC_API_KEY`。内置 Anthropic-compatible provider 使用以下 key：
+
+| Provider | Key | 可选 endpoint 覆盖 |
+|---|---|---|
+| DeepSeek | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` |
+| 智谱 GLM／内置 OpenAI 分组 | `ZHIPUAI_API_KEY` | `ZHIPUAI_BASE_URL` |
+| MiniMax 国内 | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL` |
+| MiniMax 国际 | `MINIMAX_INTL_API_KEY` | provider 配置 |
+| Kimi | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` |
+| Qwen 国内 | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` |
+| Qwen 国际 | `DASHSCOPE_API_KEY` | `DASHSCOPE_INTL_BASE_URL` |
+| Xiaomi MiMo | `XIAOMI_MIMO_API_KEY` | `XIAOMI_MIMO_BASE_URL` |
+| 百度千帆 | `QIANFAN_API_KEY` | `QIANFAN_BASE_URL` |
+| Codex Gateway | `CODEX_GATEWAY_API_KEY` | `CODEX_GATEWAY_BASE_URL` |
+
+MiniMax 国内与国际 key 不通用；Qwen 两个区域分组共用 key、使用不同 endpoint。模型与分组会随版本变化，设置面板和 `/api/chat/providers` 是当前事实来源。
+
+设置面板对内置 provider 的修改、自定义 provider 和删除状态保存在 `<repo>/provider_overrides.json`。MCP server 配置保存在 `<repo>/mcp.json`。自定义 provider key 使用 `MUSELAB_PROVIDER_<SLUG>_API_KEY`。
+
+## 生图
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `ARCHIVE_DIR` | 挂载到容器 `/data` 的宿主机目录 | `./data` |
-| `CLAUDE_HOME` | 宿主机 `~/.claude`（OAuth 凭证）路径 | `${HOME}/.claude` |
-| `MUSELAB_BIND` | 发布端口绑定的宿主机接口 | `127.0.0.1` |
+| `MUSELAB_IMAGE_PROVIDER` | `auto`、`openai` 或 `codex_imagegen` | `auto` |
+| `OPENAI_IMAGE_API_KEY` | OpenAI Image API key；未设置时可复用 `OPENAI_API_KEY` | 空 |
+| `OPENAI_IMAGE_BASE_URL` | OpenAI-compatible `/v1` base URL | `https://api.openai.com/v1` |
+| `MUSELAB_IMAGE_GENERATION_TIMEOUT` | API 生图超时秒数 | `180` |
+| `CODEX_IMAGEGEN_ENABLED` | 是否允许启动本机 Codex 生图进程 | `false` |
+| `CODEX_IMAGEGEN_TIMEOUT_SECONDS` | 本机 Codex 生图超时 | `300` |
 
-## 仅安装期
+本机 Codex 生图只适用于可信实例。持久化任务与图片位于 `$MUSELAB_ROOT/.muselab/imagegen/`。
 
-由安装脚本读取，运行中的后端**不读**：
+## 资源与行为调优
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `MUSELAB_NONINTERACTIVE` | 全取默认值，跳过所有交互 | `0` |
-| `MUSELAB_LOCALE` | intake 引导 + 预置 `CLAUDE.md` 的语言 | 自动（`LANG`） |
+| `MUSELAB_PROMPT_CACHE_TTL` | Claude prompt cache TTL | `1h` |
+| `MUSELAB_BUDGET_USD` | 月度 UI 软预算，不会硬中断 | `0` |
+| `MUSELAB_MAX_UPLOAD_MB` | Files API 单文件上传上限 MiB | `100` |
+| `MUSELAB_MAX_TURNS` | 每会话最大回合数，`0` 表示不额外限制 | `0` |
+| `MUSELAB_THINKING_BUDGET` | 扩展思考 token 预算 | `10000` |
+| `MUSELAB_CLIENT_POOL_CAP` | 保活 SDK client 数量 | `3` |
+| `MUSELAB_RECENT_TURN_TTL` | 已结束回合供重连接回的秒数 | `60` |
+| `MUSELAB_STREAM_REPLAY_MAX_EVENTS` | 移动端最大 replay 事件数，超过后 resync | `512` |
+| `MUSELAB_STREAM_REPLAY_MAX_BYTES` | 移动端最大 replay 字节数，超过后 resync | `2097152` |
+| `MUSELAB_DISABLED_PROVIDERS` | 隐藏的稳定 provider ID，逗号分隔 | 空 |
+| `MUSELAB_DISABLE_SKILLS` | 禁用 Skills | `0` |
+| `MUSELAB_PRUNE_EMPTY_SESSIONS` | 清理满足严格条件的空会话 | `false` |
+| `MUSELAB_TRASH_TTL_DAYS` | 回收站保留天数，`0` 表示永久 | `30` |
+| `MUSELAB_VAPID_SUBJECT` | Web Push VAPID subject | `mailto:noreply@muselab.dev` |
 
-运行中的后端从 `LANG` / `LC_ALL` 判断语言，而非 `MUSELAB_LOCALE`。
+VAPID keypair 不是环境变量，会自动生成在 `$MUSELAB_ROOT/.muselab/vapid.json`。
 
-## 把 muselab 暴露到 localhost 之外
+## 真实终端
 
-`MUSELAB_HOST`（以及 Docker 的 `MUSELAB_BIND`）默认 `127.0.0.1` 是一道安全底线：公网与你的归档之间唯一的屏障就是那个 token。若把任一项设为 `0.0.0.0`，请在前面架一层带 HTTPS 的反向代理 —— 见 [手机端 / HTTPS](mobile_zh.md) 与 `scripts/setup-https.sh`。
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `MUSELAB_TERMINAL_ENABLED` | 启用真实 PTY 终端 | `1` |
+| `MUSELAB_TERMINAL_SHELL` | shell 可执行文件 | `$SHELL`，再回退 bash/zsh/sh |
+| `MUSELAB_TERMINAL_MAX_SESSIONS` | 同时保留的终端上限，范围 1–32 | `8` |
+| `MUSELAB_TERMINAL_BUFFER_BYTES` | 每终端断线回放上限，范围 64 KiB–16 MiB | `2097152` |
+| `MUSELAB_TERMINAL_DETACHED_TTL` | 运行中且无人连接的终端回收秒数 | `1800` |
+| `MUSELAB_TERMINAL_EXITED_TTL` | 已退出终端保留在列表的秒数 | `3600` |
+
+终端以服务用户真实权限运行，初始目录是当前工作目录，不是文件 API 沙箱。shell 环境只保留基本系统变量，不包含 muselab token 或 provider key。
+
+Profile 保存在 `$MUSELAB_ROOT/.muselab/terminal_profiles.json`，在所有工作目录间共享。`profile_id` 未指定时使用默认 Profile；显式空字符串表示启动纯 shell。命令会在交互式 shell 启动后自动执行，不应在命令中保存密码或 API key。
+
+## Docker Compose
+
+以下变量由 `docker-compose.yml` 使用，不是后端业务配置：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `ARCHIVE_DIR` | 挂载到容器 `/data` 的宿主目录 | `./data` |
+| `CLAUDE_HOME` | 宿主机 Claude CLI 配置目录 | `${HOME}/.claude` |
+| `MUSELAB_BIND` | 宿主机发布端口绑定地址 | `127.0.0.1` |
+
+## 安装期
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `MUSELAB_NONINTERACTIVE` | 安装脚本采用默认值并跳过交互 | `0` |
+| `MUSELAB_LOCALE` | 安装引导与初始模板语言 | 从 `LANG` 自动判断 |
+| `MUSELAB_SKIP_SERVICE` | 只安装文件与依赖，不注册或启动 systemd／launchd 服务 | `0` |
+| `MUSELAB_NO_BROWSER` | 安装完成后不自动打开浏览器 | `0` |
+
+运行中的语言偏好由浏览器保存；后端模板选择参考 `LANG`、`LC_ALL` 与 `LC_MESSAGES`。
+
+## 对外暴露
+
+`MUSELAB_HOST` 和 Docker 的 `MUSELAB_BIND` 默认仅监听 localhost。改为 `0.0.0.0` 时，必须使用 HTTPS 反向代理、防火墙和独立低权限服务用户。真实终端使 token 泄露的影响远大于只读笔记站点。

@@ -2,108 +2,122 @@
 
 > [English](architecture.md)
 
-```mermaid
-flowchart TB
-  subgraph Browser["浏览器 · ~27k 行 原生 HTML + Alpine.js + CSS"]
-    F[📁 文件] --- P[📄 预览 + 多 tab] --- C[💬 chat + 多模型]
-  end
-  Browser ==>|HTTP / SSE| BE
-  subgraph BE["后端 · FastAPI ~14k 行"]
-    A["/api/files/*<br/>safe-resolve · 读写 · grep"]
-    B["/api/chat/*<br/>ClaudeSDKClient 池<br/>per (session, model, effort)"]
-  end
-  BE ==> SDK[Claude Agent SDK<br/>启动 claude CLI 子进程]
-  SDK -->|claude-* 模型| CL[Claude<br/>Pro / Max OAuth]
-  SDK -->|per-request env override| V[Anthropic 兼容端点]
-  V --> DS[DeepSeek]
-  V --> GL[智谱 GLM]
-  V --> MM[MiniMax]
-  V --> KM[Kimi]
-  V --> QW[Qwen]
-  V --> XM[小米 MiMo]
-  V --> QF[百度千帆（ERNIE）]
-  V --> CG[GPT / Codex Gateway<br/>Codex / GPT OAuth]
+muselab 是一个无前端构建步骤的自托管工作台。浏览器负责文件、预览、终端和会话交互；FastAPI 负责鉴权、持久状态与实时传输；所有模型调用统一经过 Claude Agent SDK。
 
-  class CL,CG subscriptionOauth
-  classDef subscriptionOauth fill:#FFF3CD,stroke:#D97706,stroke-width:2px,color:#111827
+```text
+浏览器
+├── 文件树与全局搜索
+├── 文件预览、编辑器与真实 PTY 终端
+├── 多工作区、多会话、队列与活动中心
+└── 设置、Providers、Skills、MCP、定时任务
+        │
+        ├── HTTP / ticket SSE
+        └── ticket WebSocket
+                │
+FastAPI
+├── Files / Workspaces / Preview
+├── Chat / Sessions / Replay spool / Attachments
+├── Terminals / Profiles / PTY workers
+├── Scheduler / Push / Activity
+└── Settings / Providers / MCP / Skills
+                │
+Claude Agent SDK → claude CLI
+├── Claude OAuth
+└── Anthropic-compatible providers
 ```
 
-## 关键设计决策
+## 关键设计
 
-- **SDK 而非 raw API。** 用 Claude Agent SDK（Claude Code 同款引擎），MCP / Skills / Subagent / plan 模式 / `CLAUDE.md` 自动加载跨厂商行为一致。接入新提供商见 [add-provider_zh.md](add-provider_zh.md)。
+- **SDK 是唯一模型入口。** 工具调用、MCP、Skills、Subagent、plan mode 与 `CLAUDE.md` 均由 Claude Agent SDK 提供。muselab 不建立另一套 Agent 或 system prompt 体系。
+- **原生指令归属。** 持久身份、回复风格、个人背景与长期规则放在 SDK 自动发现的 `CLAUDE.md` 层级；可复用工作流放在 Skills；工具行为由工具描述和权限配置约束。
+- **工作区绑定。** `MUSELAB_ROOT` 是默认工作区，也可登记其他本地目录。文件面板、预览、终端和新会话 cwd 随当前工作区切换；每个会话保存自己的 cwd。
+- **整文件输入。** 助手通过 Read、Grep、Edit 等工具按需读取完整文件，不预先向量化或切块。
+- **第三方 Provider 隔离。** 每个第三方 Provider 按请求设置 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` 与隔离的 `CLAUDE_CONFIG_DIR`，避免 CLI 回退到错误账户。
+- **无前端构建步骤。** HTML、JavaScript 和 CSS 由浏览器直接运行；第三方浏览器库 vendored 在 `frontend/vendor/`。
+- **实时连接使用短期 ticket。** Chat 先通过带 header 鉴权的 POST 获取一次性 SSE ticket；终端先获取一次性 WebSocket ticket。prompt 与长期 token 不进入实时连接 URL。
+- **断线不终止任务。** Chat 回合写入磁盘 replay spool；浏览器重连后从 cursor 继续。终端保留有界输出缓冲，并在短时离开页面后允许重新连接。
 
-- **会话级 env 覆盖。** 第三方提供商通过设置 `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + 隔离的 `CLAUDE_CONFIG_DIR`（[`backend/endpoints.py:L851`](../backend/endpoints.py#L851)）接入。最后一项防止 CLI 静默回退到 Pro OAuth 并将第三方流量计入 Anthropic 账单 —— 完整机制详见[模型路由 § env 注入](routing_zh.md#3-第三方环境注入env-injection)。
+## 运行目录
 
-- **无构建步骤。** 改 `frontend/` 后刷新浏览器即可。审过的第三方库在 `vendor/`（许可证见 [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)），安装不涉及 npm。
+```text
+muselab/
+├── backend/
+│   ├── main.py                    # 应用生命周期与路由挂载
+│   ├── chat.py                    # Agent 回合、SSE、队列和后台任务
+│   ├── sessions.py                # 会话索引与 sidecar
+│   ├── files.py                   # 文件读写、预览数据和回收站
+│   ├── workspaces.py              # 工作区登记与选择
+│   ├── terminal.py                # 终端 API、Profile 与连接管理
+│   ├── terminal_worker.py         # PTY 子进程
+│   ├── endpoints.py               # Provider catalog 与连接参数
+│   ├── scheduler.py               # 定时任务执行器
+│   ├── push.py                    # Web Push 与 VAPID
+│   ├── activity.py                # 活动中心持久状态
+│   ├── transcript_index.py        # transcript 索引
+│   └── api_*.py                   # 各领域 API router
+├── frontend/
+│   ├── index.html
+│   ├── app.js
+│   ├── styles.css
+│   ├── i18n/
+│   └── vendor/
+├── skills/                        # 随应用提供的 Skills
+├── scripts/                       # 安装、升级、诊断与模板
+├── docs/                          # 用户与公开技术文档
+├── .claude/docs/                  # 维护者文档
+├── .env                           # 实例配置与密钥
+└── sessions/                      # 会话元数据、队列与附件
 
-- **客户端按 `(session_id, model, effort)` 缓存**（[`backend/chat.py:L303`](../backend/chat.py#L303)）。切换模型或推理强度（effort）各自命中独立 client；每条助手消息存自己的 `model` 字段，刷新后气泡标识仍准确。池上限与 LRU 规则见[模型路由 § 客户端池](routing_zh.md#2-客户端池client-pool)。
+$MUSELAB_ROOT/
+├── CLAUDE.md                      # 默认工作区指令与个人上下文
+├── 用户文件
+├── .muselab/
+│   ├── workspaces.json
+│   ├── scheduler.json
+│   ├── activity.json
+│   ├── terminal_profiles.json
+│   ├── vapid.json
+│   └── push_subs.json
+└── .muselab-dustbin/
 
-- **整文件作为输入单元。** `MUSELAB_ROOT` 是默认工作目录，也可显式登记其他目录。每个会话固定绑定一个工作目录，其根级 `CLAUDE.md` 每轮自动加载。助手通过 Read / Grep / Edit 工具按需访问，不预先向量化。
-
-## 目录地图
-
-运行时有两类根目录：**仓库**（代码 + 每个安装实例的状态）和一个或多个**工作目录**（`MUSELAB_ROOT` 加显式登记的本地目录）。两者刻意分开，所以你备份或迁移数据时不必动安装本身。
-
+<其他已登记工作区>/
+├── CLAUDE.md
+├── 用户文件
+└── .muselab-dustbin/
 ```
-muselab/                      # 仓库根目录
-├── backend/                  # FastAPI 应用（约 14k 行）
-│   ├── main.py               # app 工厂、uvicorn 入口、路由挂载
-│   ├── auth.py               # X-Auth-Token 鉴权（header 或 ?token=）
-│   ├── chat.py               # /api/chat/* —— SDK client 池、SSE 回合循环
-│   ├── endpoints.py          # provider 目录 + 按请求注入 env
-│   ├── files.py              # /api/files/* —— safe-resolve 读写 grep
-│   ├── workspaces.py         # 已登记根目录 + 有边界的服务器目录选择器
-│   ├── sessions.py           # 会话索引 + sidecar + 队列（repo/sessions/）
-│   ├── scheduler.py          # asyncio 定时循环 → <archive>/.muselab/scheduler.json
-│   ├── push.py               # Web Push / VAPID → <archive>/.muselab/
-│   ├── api_settings.py       # /api/settings —— 热更新 .env + os.environ
-│   └── prompts.py            # 系统 prompt 组装
-├── frontend/                 # 原生 HTML + Alpine.js + CSS（约 27k 行，无构建）
-│   ├── index.html  app.js  styles.css
-│   ├── i18n/                 # 中英 UI 文案
-│   └── vendor/               # 审过的第三方库（见 THIRD_PARTY_LICENSES.md）
-├── scripts/                  # 安装 / 升级 / 卸载 / doctor / https
-├── skills/                   # 内置 Claude skills
-├── docs/                     # 当前目录
-├── .env                      # ← 每个实例的配置 + 密钥（已 gitignore）
-└── sessions/                 # ← 会话元数据、sidecar、队列（已 gitignore）
 
-$MUSELAB_ROOT/                # 默认工作目录 —— 你的文件，在仓库之外
-├── CLAUDE.md                 # 每次对话自动加载
-├── health/ work/ money/ …    # 你自己建的任意子目录
-└── .muselab/                 # scheduler.json · workspaces.json · 推送状态
+仓库状态、默认工作区和其他工作区是不同的备份单元。对话 transcript 由 Claude CLI 所有；Claude 会话通常在其配置目录下，第三方 Provider 会话可能在隔离的配置目录下。muselab 的 `sessions/` 保存名称、cwd、模型、成本、附件和队列等叠加元数据。
 
-<已登记工作目录>/             # 可选的其他工作目录
-├── CLAUDE.md                 # 绑定该 cwd 的会话指令
-└── .muselab-dustbin/         # 该工作目录自己的可恢复回收站
-```
+## 对话回合
 
-实际的对话记录归 Claude CLI 所有，不在 muselab 里：它们存在 `~/.claude/projects/<cwd-key>/<session-id>.jsonl`。muselab 的 `sessions/` 只保存叠加在上面的元数据（会话名、每条消息的模型标识、成本、上传的附件）。完整备份清单见 [数据与备份](data-and-backup_zh.md)。
+1. 浏览器以 `X-Auth-Token` 调用 `POST /api/chat/stream/start`，提交 prompt、session、model、permission、effort 和附件等回合参数。
+2. 后端校验会话与工作区，签发短期、单次使用的 ticket。
+3. 浏览器用 ticket 建立 SSE；旧版 query 方式只用于兼容旧后端。
+4. 后端按会话、模型与推理参数取得或建立 SDK client，并以会话绑定工作区作为 cwd。
+5. SDK 加载 `CLAUDE.md`、Skills 与 MCP，运行工具和模型循环。
+6. 事件写入 replay spool 并流向浏览器；断线后可按 cursor 补发。
+7. Claude CLI 持久化 transcript，muselab 更新 sidecar、用量、活动状态和通知。
 
-## 一个请求的完整链路
+UI 默认在非空会话切换不兼容模型时 fork 新会话，避免跨 Provider thinking signature 冲突。后端 API 仍允许显式更新会话模型，因此 API 调用者需要自行承担上下文兼容性。
 
-一次对话回合就是一条服务器发送事件（SSE）流：
+## 终端链路
 
-1. **浏览器 → 后端。** `GET /api/chat/stream`，将 prompt、session id 和选定的 `model` 作为查询参数传入（[`backend/chat.py:L5043`](../backend/chat.py#L5043)）。鉴权 token 以 `?token=` 形式传递，因为 `EventSource` 无法设置 header（见[安全模型 § 鉴权](backend-security_zh.md#鉴权)）。
-2. **模型解析与锁定。** 会话锁定到单一模型（`sessions.py`）。首回合锁定，后续回合复用它，所以一段对话永远不会中途混用厂商（跨厂商的 *thinking signature* 不通用）。在任何 provider 配置之前建的会话，会在首次真正发送时自动适配到一个已配置的模型。
-3. **Client 池。** `chat.py` 按 `(session_id, model, effort)` 取或新建一个 `ClaudeSDKClient`。第三方模型会设置 `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + 一个**隔离的** `CLAUDE_CONFIG_DIR`，防止 CLI 回退到你的 Pro OAuth、把费用误计到错误账户。
-4. **Agent 循环。** SDK 启动 `claude` CLI 子进程，以会话绑定的已登记工作目录作为 cwd 跑完整循环 —— 工具调用（Read/Grep/Edit/Bash）、MCP server、skills、plan 模式。
-5. **后端 → 浏览器（SSE）。** token、工具调用事件、最后一个 `done` 事件流式返回。回合通过 `TurnBroadcast` 广播，浏览器断连不会杀掉回复 —— 重连后会回放缓冲区（[模型路由 § SSE 回合循环](routing_zh.md#4-sse-回合循环)）。前端增量渲染；每条助手消息记录自己的 `model`，刷新后气泡标识仍准确。
-6. **持久化。** CLI 把对话追加到它的 JSONL；muselab 写 sidecar（成本、模型、附件）。若回合较长且配了 Web Push，完成时即使标签页关闭也会推送通知。
+1. 用户在当前工作区新建终端，可选择 Profile 自动执行启动命令。
+2. 后端创建独立 PTY worker，并只向终端进程传递安全环境变量集合。
+3. 浏览器取得短期、单次使用的 WebSocket ticket，再以同源 WebSocket 连接。
+4. 后端在内存中维护有界输出缓冲；页面暂时离开后可重放，超过保留时间或服务重启后进程会终止。
 
-定时任务（见 [定时任务](scheduler_zh.md)）从第 3 步起走同一条链路，只是没有人 —— 它们以完整权限集无人值守运行。
+终端是真实的服务用户 shell，不受 Files API 的工作区路径边界约束。只应把 muselab 暴露给可信用户。
 
-## 深入了解
-
-本页是全局地图。每个子系统都有独立页面，附带源码链接：
+## 子系统文档
 
 | 页面 | 内容 |
 |---|---|
-| [模型路由与对话循环](routing_zh.md) | 模型解析、客户端池、env 注入、每种 SSE 事件类型 |
-| [会话内部机制](backend-sessions_zh.md) | 索引、sidecar、消息队列、附件、fork、重启恢复 |
-| [Files API](backend-files_zh.md) | 所有 `/api/files/*` 端点、`safe_resolve`、回收站 |
-| [安全模型](backend-security_zh.md) | 鉴权、settings 暴露面、计费隔离、已知局限 |
-| [前端内部机制](frontend_zh.md) | 无构建 SPA、渲染管线、SSE 客户端、i18n、service worker |
-| [Skills](skills_zh.md) | 内置 skills、发现机制、自定义添加 |
-| [基础设施](infrastructure_zh.md) | scripts、systemd/launchd、Docker、测试、CI/CD |
-| [术语表](glossary_zh.md) | muselab 所有专有术语的统一定义 |
+| [模型路由与对话循环](routing_zh.md) | Provider 解析、client 生命周期、replay 与 SSE |
+| [会话机制](backend-sessions_zh.md) | 索引、sidecar、队列、附件、fork 与恢复 |
+| [Files API](backend-files_zh.md) | 文件接口、路径边界与回收站 |
+| [终端](terminal_zh.md) | PTY、Profile、连接、移动端与安全边界 |
+| [安全模型](backend-security_zh.md) | 鉴权、权限面、Provider 隔离与已知限制 |
+| [前端](frontend_zh.md) | 工作台状态、渲染、性能与 PWA |
+| [Skills](skills_zh.md) | 内置 Skills、发现机制与自定义扩展 |
+| [基础设施](infrastructure_zh.md) | 安装、服务、Docker、测试与发布 |

@@ -48,8 +48,13 @@ RUN_E2E=1 .venv/bin/python -m pytest tests/e2e/ -v
 | 拖动 tab 重排序 | HTML5 drag & drop 完成顺序变更 |
 | 刷新后预览 tab 持久化 | localStorage previewPath 恢复 |
 | 浏览器 tab 标题 | document.title 反映当前 session + 流式 ● 前缀 |
+| PC 长会话热切换 | 4 个 resident pane、无 skeleton 闪烁、composer 不跳动 |
+| 移动端会话 footer | 390px / 320px、空闲 / 流式均不溢出，发送键和底栏可见 |
+| 长流式渲染 | PC 保持富文本体验，移动端限制 DOM 与重渲染频率 |
+| 移动端终端 | bottom sheet、新建按钮、可信触摸手势驱动 scrollback |
 
-具体实现见 `test_multi_tab.py`，新增场景沿用同一模式。
+具体实现见 `test_multi_tab.py`、`test_chat_render_perf.py` 和
+`test_terminal_mobile.py`，新增场景沿用同一模式。
 
 ## 备注
 

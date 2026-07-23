@@ -1,178 +1,89 @@
 # Session internals
 
-> [简体中文](backend-sessions_zh.md)
+> [中文](backend-sessions_zh.md)
 
-This page describes how muselab stores and manages chat sessions: the two-layer
-store shared with the Claude CLI, the session index and sidecar files, the
-server-side message queue, attachment handling, session forking, and restart
-recovery.
+This page describes session ownership, storage, queues, attachments, forks, and restart recovery. See [Model routing and turn loop](routing.md) for streaming and reconnect behavior.
 
-Related reading: [Architecture](architecture.md) · [Data & backup](data-and-backup.md) · [Scheduler](scheduler.md)
+## Two-layer storage
 
----
+Claude CLI and muselab jointly own each session:
 
-## 1. Two-layer store & ownership
+```text
+~/.claude/projects/<cwd-key>/<sid>.jsonl
+    Claude-provider messages, tool calls, and compaction boundaries
 
-Every session is jointly owned by **the Claude CLI** and **muselab**. The two
-layers never overlap — each owns a distinct set of facts.
+<system-temp>/muselab-vendor-cli-config-<uid>/projects/<cwd-key>/<sid>.jsonl
+    Isolated CLI transcripts for third-party providers
 
-```
-~/.claude/projects/<cwd-key>/          CLI owns this tree
-└── <sid>.jsonl                        ← transcript (messages, tool calls, compact boundaries)
+<repo>/sessions/
+├── index.json
+├── <sid>.sidecar.json
+├── <sid>.queue.json
+└── active_turns/<sid>.json
 
-muselab/sessions/                      muselab owns this tree
-├── index.json                         ← session list + display metadata
-├── <sid>.sidecar.json                 ← per-message annotations + context meter
-├── <sid>.queue.json                   ← server-side message queue (only when non-empty)
-└── active_turns/<sid>.json            ← in-flight turn sentinel (deleted on clean finish)
-
-$MUSELAB_ROOT/.muselab-attach/<sid>/   muselab owns this tree (in the archive)
-└── <original-filename>                ← persisted attachment originals
+$MUSELAB_ROOT/.muselab-attach/<sid>/
+    image and PDF originals persisted by muselab
 ```
 
-`<cwd-key>` is derived via the SDK's `project_key_for_directory(ROOT)` — for
-example `/home/alice/archive` → `-home-alice-archive`.
-([`backend/chat.py:L99-L113`](../backend/chat.py#L99-L113))
+- CLI JSONL is the source of truth for conversation content. Claude and
+  third-party providers use different configuration roots. The third-party
+  root is under the system temporary directory and may be cleaned by the OS, so
+  back it up before migration or temporary-directory cleanup.
+- `sessions/index.json` holds muselab-specific display and runtime settings.
+- A sidecar holds per-message cost, model, time, attachment, and context annotations.
+- A queue file holds pending messages.
+- Attachments live under the primary `MUSELAB_ROOT`, even when the session belongs to another registered workspace.
 
-For third-party vendor models (DeepSeek, GLM, MiniMax, Kimi, Qwen, MiMo) the
-CLI uses an isolated config dir under `/tmp/muselab-vendor-cli-config-<uid>/`
-instead of `~/.claude/`. ([`backend/chat.py:L69-L97`](../backend/chat.py#L69-L97))
+Every layer uses the same session UUID.
 
-**What lives where:**
+## Multiple workspaces
 
-| Fact | Owner | Location |
-|------|-------|----------|
-| Conversation transcript (messages, tool calls, compact boundaries) | CLI | `~/.claude/projects/<cwd-key>/<sid>.jsonl` |
-| `custom_title` / `aiTitle` (Haiku-generated after each turn) | CLI | same JSONL |
-| `last_modified`, `created_at`, `first_prompt`, `tag` | CLI | same JSONL |
-| Session display name, `model`, `system_prompt`, `auto_named`, `pinned`, `effort`, `thinking` | muselab | `sessions/index.json` |
-| Sessions created in the UI but not yet sent | muselab | `sessions/index.json` only (no JSONL exists yet) |
-| Per-message cost, model badge, timestamps, attachment refs | muselab | `sessions/<sid>.sidecar.json` |
-| Server-side pending messages | muselab | `sessions/<sid>.queue.json` |
-| Attachment originals (full-res) | muselab | `$MUSELAB_ROOT/.muselab-attach/<sid>/` |
+Each index row stores a `cwd`. The Claude SDK starts in that directory, and its JSONL lives in the corresponding CLI project directory.
 
-The **same UUID** (`sid`) is the key in every layer — there is no translation
-table. ([`backend/sessions.py:L80-L81`](../backend/sessions.py#L80-L81),
-[`backend/chat.py:L116-L127`](../backend/chat.py#L116-L127))
+The session list scans every registered workspace and merges those results with the global index. Legacy rows without `cwd` belong to the primary `MUSELAB_ROOT`. Removing a workspace does not silently move its local session metadata to another root.
 
----
+New interactive, forked, and scheduled sessions persist an explicit `cwd`. Existing model history is not automatically migrated across providers because thinking signatures may be incompatible.
 
-## 2. The session index
+## Session index
 
-`sessions/index.json` is a JSON array. Each entry represents one session and
-carries the facts the CLI does not track.
-([`backend/sessions.py:L75-L77`](../backend/sessions.py#L75-L77))
+Primary fields in `sessions/index.json`:
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `id` | string (UUID v4) | Primary key; matches the CLI JSONL filename |
-| `name` | string | Display name; may be a first-line snippet or user-set title |
-| `model` | string | Empty string means "use the configured default" |
-| `system_prompt` | string | Per-session override; empty = muselab default |
-| `created_at` | float (Unix seconds) | SDK's `created_at` is in ms and divided by 1000 during merge |
-| `updated_at` | float (Unix seconds) | Derived from `last_modified` (ms→s); bumped by every `bump_session()` call |
-| `message_count` | int | All SDK message frames; updated after each turn |
-| `turn_count` | int | User-typed prompts only (excludes tool-result sidechain frames) |
-| `auto_named` | bool | `true` until the user renames or a substantive first message becomes the title |
-| `pinned` | bool | Pinned sessions sort to top; not stored in the CLI JSONL |
-| `effort` | string | `""` / `"low"` / `"medium"` / `"high"` / `"xhigh"` / `"max"`; empty = SDK adaptive |
-| `thinking` | bool | Extended thinking on/off; defaults to `true` |
+| Field | Meaning |
+|---|---|
+| `id` | Session UUID, also the CLI JSONL filename |
+| `name` | UI title |
+| `model` | Locked model; empty means resolve a default on the first turn |
+| `permission` | SDK permission mode |
+| `cwd` | Owning workspace |
+| `created_at`, `updated_at` | Unix seconds |
+| `message_count`, `turn_count` | Message frames and real user turns |
+| `pinned`, `auto_named` | Pin and automatic-title state |
+| `effort`, `thinking` | Reasoning effort and extended-thinking switch |
 
-([`backend/sessions.py:L194-L238`](../backend/sessions.py#L194-L238),
-[`backend/sessions.py:L342-L374`](../backend/sessions.py#L342-L374))
+Session listing supports pagination, search, forced inclusion of open tabs, and ETags so unchanged polls return `304`. Internal writes invalidate the cache immediately; external Claude CLI writes can appear after a short cache window.
 
-`tag` and `first_prompt` are **not** stored in `index.json`; they are merged
-from `SDKSessionInfo` at read time.
-([`backend/sessions.py:L228-L229`](../backend/sessions.py#L228-L229))
+## Sidecar
 
-`list_sessions()` merges the SDK's JSONL scan with `index.json`. Sessions that
-exist only in `index.json` (no JSONL yet) are appended at the end so they
-appear in the picker immediately after creation.
-([`backend/sessions.py:L318-L334`](../backend/sessions.py#L318-L334))
+`<sid>.sidecar.json` does not duplicate conversation content. Its top-level data includes:
 
-The list is cached for 30 seconds (`_LIST_CACHE_TTL_S = 30.0`). Any
-muselab-internal mutation (create, rename, delete, pin, bump) calls
-`invalidate_sessions_cache()` immediately via `_save_index`, so UI-driven
-changes are visible at once; only external `claude --resume` writes wait for
-the TTL. ([`backend/sessions.py:L129-L163`](../backend/sessions.py#L129-L163))
+- `messages`: per-message annotations keyed by CLI message UUID.
+- `context_max_tokens`: context capacity measured by the SDK.
+- `pending_attachments`: attachment bundles waiting for a message UUID.
 
----
+Common annotations include `cost`, `model`, `ts`, `elapsed_s`, `images`, and `docs`. Index and sidecar writes use separate process locks and temporary-file atomic replacement.
 
-## 3. Sidecar files
+## Server-side message queue
 
-Each session has up to three files in `sessions/`:
-
-| Filename | Purpose |
-|----------|---------|
-| `<sid>.sidecar.json` | Per-message annotations: cost, model badge, timestamps, attachment refs, context meter |
-| `<sid>.queue.json` | Server-side message queue (only present when non-empty or paused) |
-| `<sid>.json` | **Legacy** — pre-2026-05-17 full transcript store; no longer written |
-
-([`backend/sessions.py:L80-L81`](../backend/sessions.py#L80-L81),
-[`backend/sessions.py:L761-L762`](../backend/sessions.py#L761-L762),
-[`backend/sessions.py:L26`](../backend/sessions.py#L26))
-
-### Sidecar top-level schema
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `messages` | object (UUID → annotation) | Per-message annotations keyed by message UUID matching the CLI JSONL |
-| `context_max_tokens` | int or null | SDK-measured `maxTokens` for the context meter denominator; persisted so it survives restarts without a live turn |
-| `pending_attachments` | array | Transient upload queue before message UUID is known (see §5) |
-
-([`backend/sessions.py:L174-L183`](../backend/sessions.py#L174-L183),
-[`backend/sessions.py:L576-L607`](../backend/sessions.py#L576-L607))
-
-### Per-message annotation fields
-
-Each entry in `messages` is keyed by the **message UUID** from the CLI JSONL:
-
-| Field | Attached to | Description |
-|-------|-------------|-------------|
-| `cost` | assistant turn | Per-turn USD cost computed from `ResultMessage` token counts |
-| `model` | assistant turn | Model ID that produced this reply (shown as a badge in the UI) |
-| `ts` | assistant turn | Unix seconds when the annotation was written |
-| `elapsed_s` | assistant turn | Wall-clock seconds the turn took to stream |
-| `images` | user message | Uploaded images consumed by this message (thumbnail URL; base64 not stored here) |
-| `docs` | user message | Uploaded documents consumed by this message |
-
-([`backend/sessions.py:L556-L573`](../backend/sessions.py#L556-L573))
-
-The sidecar is written **only** for annotations — the transcript itself is the
-CLI JSONL's job. After every turn, `chat.py` calls `bump_session()` (index
-update) and `set_message_annotation()` (sidecar update) independently.
-([`backend/sessions.py:L19-L23`](../backend/sessions.py#L19-L23))
-
-All sidecar reads and writes are serialized by `_SIDECAR_LOCK` to prevent
-lost updates when two operations interleave in FastAPI's thread pool.
-All index reads and writes are serialized by `_INDEX_LOCK` for the same reason.
-All writes use `atomic_write_text()` (temp-file + `os.replace()`) so no file
-is ever torn by a crash mid-write.
-([`backend/sessions.py:L101-L123`](../backend/sessions.py#L101-L123))
-
----
-
-## 4. The message queue
-
-muselab maintains a **server-side FIFO message queue** per session. When the
-user submits a prompt while a turn is already in progress, the new message is
-enqueued rather than dropped. The drain loop pops the head and starts the next
-turn automatically when the current one finishes — even if no browser is
-attached.
-
-([`backend/sessions.py:L738-L757`](../backend/sessions.py#L738-L757),
-[`backend/chat.py:L6633`](../backend/chat.py#L6633),
-[`backend/chat.py:L6739-L6770`](../backend/chat.py#L6739-L6770))
-
-### `<sid>.queue.json` shape
+An active turn does not discard later messages. They enter `<sid>.queue.json` and the backend drains them after the current turn, even when no browser remains connected.
 
 ```json
 {
   "items": [
     {
-      "id": "q-<8-hex>",
-      "text": "<user message text>",
-      "image_ids": "<comma-separated upload ids>",
+      "id": "q-1234abcd",
+      "text": "next message",
+      "image_ids": "a1,b2",
+      "permission": "default",
       "enqueued_at": 1718000000000
     }
   ],
@@ -180,173 +91,55 @@ attached.
 }
 ```
 
-([`backend/sessions.py:L747-L756`](../backend/sessions.py#L747-L756),
-[`backend/sessions.py:L800-L816`](../backend/sessions.py#L800-L816))
+- Maximum depth is 10 per session.
+- Order is FIFO by default and can be reordered or edited.
+- The permission mode is captured when the item is queued.
+- Errors, user questions, and explicit interruption pause the queue.
+- A failed start race restores the item to the head.
+- An empty, unpaused queue removes its file.
+- `image_ids` reference staged attachments with a 10-minute TTL. An old queued item may lose its attachments, while its text still sends.
 
-### Queue mechanics
+## Attachments
 
-- **Max depth:** 10 items (`_QUEUE_MAX = 10`). An 11th enqueue returns
-  `{"ok": false, "error": "queue_full"}`.
-  ([`backend/sessions.py:L758`](../backend/sessions.py#L758),
-  [`backend/sessions.py:L806-L807`](../backend/sessions.py#L806-L807))
-- **FIFO drain:** `dequeue_message()` pops the head; `reorder_queue()` allows
-  reordering before drain.
-  ([`backend/sessions.py:L819-L880`](../backend/sessions.py#L819-L880))
-- **Auto-pause on error:** The `paused` flag is set to `true` when a queued
-  turn errors, times out, or is cancelled. Auto-drain stops until the user
-  resumes. ([`backend/sessions.py:L858-L865`](../backend/sessions.py#L858-L865))
-- **File lifecycle:** The queue file is deleted when `items` is empty and
-  `paused` is `false`, to avoid accumulating empty files.
-  ([`backend/sessions.py:L783-L791`](../backend/sessions.py#L783-L791))
-- **Re-queue on race loss:** If the drain trigger loses a concurrency race or
-  fails to start a turn, the item is re-inserted at the head via `requeue_head`
-  so nothing is silently dropped.
-  ([`backend/sessions.py:L831-L840`](../backend/sessions.py#L831-L840))
-- **Attachment TTL caveat:** `image_ids` in queue items reference the
-  in-memory `_image_store` (10-minute TTL). If a queued turn is delayed past
-  that TTL, its attachments are sent as text-only.
-  ([`backend/sessions.py:L754-L757`](../backend/sessions.py#L754-L757))
+`POST /api/chat/upload-image` keeps its historical name but accepts:
 
----
+- PNG, JPEG, GIF, and WebP;
+- PDF;
+- Markdown, text, CSV, JSON, YAML, source code, and related text formats;
+- XLSX-family workbooks.
 
-## 5. Attachments
+Before send, uploads live in memory for 10 minutes. The store is capped at 48 items or about 256 MiB; each file is capped at 10 MiB and inline text at 200 KiB. A backend restart loses staged but unsent uploads.
 
-### In-memory staging
+On send:
 
-Uploads land in an in-memory store before they are bound to a message:
+- Images become SDK image blocks and originals are saved under `$MUSELAB_ROOT/.muselab-attach/<sid>/<attachment-id>.<ext>`.
+- PDFs become document blocks and also get a local copy so compatible providers can read them through tools.
+- Text and workbooks are converted to bounded text and added to the prompt.
+- Chat bubbles use small thumbnails; originals are served by `GET /api/chat/attachments/{sid}/{filename}?token=...`.
 
-1. `POST /api/chat/upload-image` receives a multipart file.
-2. The file is classified as `image` (png/jpg/gif/webp), `pdf`, `text`, or
-   `xlsx`.
-3. Stored in `_image_store[aid]` with a randomly generated `aid`.
-4. TTL: **10 minutes** (`_IMAGE_TTL_S = 600`).
-   ([`backend/chat.py:L4647-L4648`](../backend/chat.py#L4647-L4648))
-5. Budget caps: max 48 entries or 256 MB total; oldest evicted first.
-   Per-file max: 10 MB raw; text files max 200 KB.
-   ([`backend/chat.py:L4649-L4680`](../backend/chat.py#L4649-L4680))
+The SDK writes the user-message UUID later, so muselab first stores metadata in `pending_attachments` and binds it FIFO to the next matching user message. This queue is capped at 50 bundles and entries older than 24 hours are pruned.
 
-**All staged uploads are lost on backend restart** — the in-memory store is
-not persisted. Re-attaching is the expected recovery path.
+## Forking and deletion
 
-### Persistence to the archive
+`POST /api/chat/sessions/{sid}/fork` copies either the full session or the transcript through `up_to_message_id`. The fork receives new session and message UUIDs and inherits the source model and workspace. Historical-message editing is implemented by forking before that message and sending the edited text.
 
-When an upload is consumed by a turn, the original file is saved to disk:
+Deleting a session also removes:
 
-```
-$MUSELAB_ROOT/.muselab-attach/<sid>/<original-filename>
-```
+- its CLI JSONL from the owning workspace;
+- index, sidecar, queue, and active-turn sentinel data;
+- transcript index and attachment directory;
+- in-memory clients, replay registries, temporary spools, and background-task state.
 
-This survives restarts and is served via
-`GET /api/chat/sessions/{sid}/attachment/{filename}?token=...` for lightbox
-display. ([`backend/chat.py:L1479-L1493`](../backend/chat.py#L1479-L1493))
+## Restart recovery
 
-### Pending attachment queue (pre-UUID binding)
+Starting a turn writes `sessions/active_turns/<sid>.json`; normal completion removes it. If the process is killed, startup marks leftover rows as interrupted and lets the user decide whether to resend. muselab does not spend tokens by retrying automatically.
 
-The SDK writes the user-message JSONL record asynchronously, so the message
-UUID is not known at upload time. muselab uses a `pending_attachments` list in
-the sidecar as a staging area:
+| State | Behavior after restart |
+|---|---|
+| Session list | Merged from the index and CLI JSONL across registered workspaces |
+| Context capacity | Restored from the sidecar |
+| Server queue | Restored from the queue file and drained by a later turn |
+| Unsent attachments | Lost and must be uploaded again |
+| Active turn | Offered as interrupted; not rerun automatically |
 
-1. At upload time, `append_pending_attachments(sid, images, docs)` appends a
-   `{"ts", "images", "docs"}` bundle. Max 50 entries; entries older than 24
-   hours are pruned on each call.
-   ([`backend/sessions.py:L622-L661`](../backend/sessions.py#L622-L661))
-2. When `GET /sessions/{sid}` encounters a user message with inline image refs
-   but no annotation, `consume_one_pending_attachments(sid, msg_uuid)` pops the
-   oldest bundle and promotes it to a permanent `messages[msg_uuid]` annotation.
-   ([`backend/sessions.py:L664-L686`](../backend/sessions.py#L664-L686))
-
-After binding, the user-message annotation holds:
-
-```json
-{
-  "images": [{"thumb": "<160px base64>", "url": "/api/chat/sessions/<sid>/attachment/<filename>?token=..."}],
-  "docs":   [{"name": "<filename>", "text": "<content>"}]
-}
-```
-
----
-
-## 6. Fork & edit-a-message
-
-`POST /api/chat/sessions/{sid}/fork` creates a branch from any point in the
-conversation. ([`backend/chat.py:L3898-L3933`](../backend/chat.py#L3898-L3933))
-
-1. The SDK's `fork_session()` copies the CLI JSONL transcript up to the
-   specified `up_to_message_id` into a new JSONL with a fresh `new_sid` and
-   new message UUIDs.
-2. muselab calls `register_session(new_sid, ...)` to add the fork to
-   `index.json`. The fork inherits `model` and `system_prompt` from the source.
-   ([`backend/sessions.py:L342-L374`](../backend/sessions.py#L342-L374))
-3. The fork is immediately visible in the session picker.
-
-The primary use-case is **message editing**: when the user edits a previous
-message, the UI forks at the preceding assistant message and then re-sends the
-revised text into the new branch.
-
----
-
-## 7. Restart recovery
-
-### Active-turn sidecars
-
-At turn-start, a small sentinel file is written to
-`sessions/active_turns/<sid>.json`:
-
-```json
-{
-  "sid": "<session-id>",
-  "user_text": "<full user prompt>",
-  "user_text_preview": "<first line, max 200 chars>",
-  "model": "<model id>",
-  "started_at": 1718000000.0
-}
-```
-
-The file is deleted on clean turn completion (success, error, or timeout). If
-muselab is killed mid-turn, the file persists.
-
-([`backend/chat.py:L513-L606`](../backend/chat.py#L513-L606))
-
-### Startup scan
-
-At process startup, `_scan_interrupted_turns_at_startup()` reads any leftover
-`active_turns/*.json` files and stores them in `_interrupted_at_startup`. On
-the next browser connection, a **toast** surfaces for each unfinished turn,
-showing the prompt preview and model. The user decides whether to re-send.
-
-**muselab deliberately does not auto-resume.** Auto-resuming would spend tokens
-on prompts the user may have already abandoned or decided to rephrase.
-([`backend/chat.py:L582-L606`](../backend/chat.py#L582-L606))
-
-### Other restart behavior
-
-| State | Behavior |
-|-------|----------|
-| Session list | Rebuilt from `index.json` + SDK JSONL scan; no warm-up needed |
-| Context meter denominator | Persisted in `context_max_tokens` inside each sidecar; correct immediately without a live turn ([`backend/sessions.py:L576-L607`](../backend/sessions.py#L576-L607)) |
-| Staged uploads (`_image_store`) | **Lost** — in-memory only; user re-attaches |
-| Pending queue items | Persisted in `<sid>.queue.json`; drain resumes once a turn is sent |
-| List cache | Cold on restart; first request pays the full JSONL scan (~400 ms on large archives); subsequent calls hit the 30 s TTL cache |
-
----
-
-## File layout summary
-
-```
-muselab/sessions/
-├── index.json                   session list (names, model, pinned, …)
-├── <sid>.sidecar.json           per-message cost / model / attachments + context meter
-├── <sid>.queue.json             server-side queue (absent when empty & not paused)
-└── active_turns/
-    └── <sid>.json               in-flight turn sentinel (deleted on clean finish)
-
-~/.claude/projects/<cwd-key>/
-└── <sid>.jsonl                  transcript — CLI's sole property
-
-$MUSELAB_ROOT/.muselab-attach/
-└── <sid>/
-    └── <filename>               persisted attachment originals
-```
-
-See [Data & backup](data-and-backup.md) for which of these paths to include
-in a backup and how to restore them on a new machine.
+See [Data and backup](data-and-backup.md) for migration paths.

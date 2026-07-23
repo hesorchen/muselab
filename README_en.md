@@ -9,7 +9,7 @@
   <a href="README.md"><img src="https://img.shields.io/badge/lang-中文-red" alt="中文"></a>
 </p>
 
-<p align="center"><strong>muselab is a self-hosted AI personal workspace built on the Claude Agent SDK.</strong></p>
+<p align="center"><strong>muselab is a self-hosted agent workspace built on the Claude Agent SDK.</strong></p>
 
 <p align="center"><em>Muse comes from the Muses of Greek mythology, goddesses of inspiration, art, and knowledge.</em></p>
 
@@ -34,12 +34,14 @@
 
 | | |
 |---|---|
+| **Reuse existing subscriptions** | Claude uses Pro / Max through OAuth; GPT can reuse Codex / GPT Plus / Pro through a local Codex Gateway |
 | **Complete user context** | Your personal archive keeps accumulating; the more you use it, the better Muse understands you, creating compounding context |
 | **Leading Agent Harness** | Built on the Claude Agent SDK, with agent capabilities such as tool use, Skills, and MCP extensions |
-| **Switchable foundation models** | One-click switching across 9 provider families: Claude (OAuth) / GPT via local Codex Gateway / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE |
+| **Switchable foundation models** | Switch among built-in Claude, OpenAI, Codex Gateway, DeepSeek, GLM, MiniMax, Kimi, Qwen, MiMo, and ERNIE providers, or add an Anthropic-compatible custom provider |
 | **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
 | **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
 | **Multiple workspaces and sessions** | File trees, preview tabs, and sessions switch together by working directory, each retaining its own browsing state |
+| **Real multi-terminal workspace** | Run PTY terminals directly in preview, organize and rename them per workspace, and use profiles to run fixed startup commands |
 | **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
 
 ## Quick start
@@ -95,20 +97,23 @@ Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How
 ## Practical details
 
 - **Modern file tree** — Modern file operations: drag-and-drop upload, fuzzy search, rename, and trash
-- **Continuous previews** — Markdown, text, spreadsheets, and HTML restore their reading position; the four most recent HTML reports keep their live page state
+- **Files and terminals in one preview surface** — Markdown, text, spreadsheets, and HTML restore their reading position; real PTY terminals support multiple instances, profiles, and mobile controls
 - **Workspace isolation** — Register multiple local directories and switch files, previews, session tabs, and new-session cwd as one surface
+- **Session workspace** — Multi-session tabs, pinning and search, background streaming, persistent queues, context usage, and turn timing
+- **Global search** — Search file names, file contents, sessions, message history, and common actions from one place
+- **Editing and previewing** — Markdown editing, split preview, find-in-preview, zoom, and retained live HTML page state
 - **Self-healing sessions** — After mobile suspension or a silent SSE drop, muselab probes, reconnects, and pulls the final message automatically
 - **Multiple modes and themes** — Light / dark / eye-care themes, with your own accent color
 - **Bilingual UI** — Switch between English and Chinese in one click, without refreshing the page
 - **Message queue** — Keep sending messages while Muse thinks; the queue runs them in order so no idea is lost
-- **Scheduled tasks** — Create overnight tasks and check the results when you wake up
+- **Tasks and notifications** — Scheduled jobs, background work, the activity center, and Web Push report results in one flow
 
 ## Docs
 
 **[📚 Full documentation index](docs/README.md)**
 
 - **Get started:** [Quick start](docs/quickstart.md) · [Linux install](docs/install-linux.md) · [macOS install](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
-- **Usage:** [Personalize CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
+- **Usage:** [Personalize CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Terminal](docs/terminal.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
 - **Models:** [Providers](docs/providers.md) · [Codex Gateway](docs/codex-gateway.md) · [Add a provider](docs/add-provider.md) · [Model routing](docs/routing.md)
 - **Internals:** [Architecture](docs/architecture.md) · [Sessions](docs/backend-sessions.md) · [Files API](docs/backend-files.md) · [Security model](docs/backend-security.md) · [Frontend](docs/frontend.md) · [Infrastructure](docs/infrastructure.md)
 - **Reference:** [Configuration](docs/configuration.md) · [Data & backup](docs/data-and-backup.md) · [Troubleshooting](docs/troubleshooting.md) · [Glossary](docs/glossary.md)

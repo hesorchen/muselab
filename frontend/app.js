@@ -175,6 +175,46 @@ function _rawMsg(m) {
 const _HTML_ESCAPE_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 const _FILE_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit", "MultiEdit"]);
 
+// xterm's 16 ANSI colors need separate palettes for light backgrounds.
+// Reusing the dark palette made bright white literally white-on-white and
+// left green/yellow/cyan output below 2:1 in light/eyecare. These palettes
+// keep the hue relationships familiar while making every ANSI foreground
+// color in both light themes at least 4.5:1 against the terminal background.
+// Dark `black` intentionally stays near the background: ANSI color 0 is also
+// commonly used as a background by full-screen terminal applications.
+const TERMINAL_ANSI_THEMES = Object.freeze({
+  dark: Object.freeze({
+    black: "#1b1d23", brightBlack: "#747c89",
+    red: "#e06c75", brightRed: "#ff7b86",
+    green: "#98c379", brightGreen: "#b4e391",
+    yellow: "#e5c07b", brightYellow: "#f4d58d",
+    blue: "#61afef", brightBlue: "#78c3ff",
+    magenta: "#c678dd", brightMagenta: "#df8ef3",
+    cyan: "#56b6c2", brightCyan: "#70d2dc",
+    white: "#d7dae0", brightWhite: "#ffffff",
+  }),
+  light: Object.freeze({
+    black: "#1a1d22", brightBlack: "#5c6470",
+    red: "#b42318", brightRed: "#d92d20",
+    green: "#166534", brightGreen: "#15803d",
+    yellow: "#854d0e", brightYellow: "#a15c07",
+    blue: "#1d4ed8", brightBlue: "#2563eb",
+    magenta: "#7e22ce", brightMagenta: "#9333ea",
+    cyan: "#0e7490", brightCyan: "#087f94",
+    white: "#5c6470", brightWhite: "#1a1d22",
+  }),
+  eyecare: Object.freeze({
+    black: "#3d3526", brightBlack: "#6b6050",
+    red: "#9f2d20", brightRed: "#b83a2a",
+    green: "#2f6a2f", brightGreen: "#3f773f",
+    yellow: "#75470a", brightYellow: "#8a5208",
+    blue: "#315a8c", brightBlue: "#3d6594",
+    magenta: "#743b78", brightMagenta: "#87488b",
+    cyan: "#2f686b", brightCyan: "#397477",
+    white: "#6b6050", brightWhite: "#3d3526",
+  }),
+});
+
 function portal() {
   return {
     // ===== auth =====
@@ -265,6 +305,36 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // Real workspace terminals are first-class preview surfaces. The backend
+    // owns PTY lifetime; this browser only attaches to the active terminal,
+    // so switching files/workspaces never stops the shell.
+    terminalEnabled: false,
+    terminals: [],
+    terminalLimits: null,
+    terminalProfiles: [],
+    terminalProfileId: "",
+    terminalProfileEditor: {
+      show: false, id: "", name: "", command: "", is_default: false, saving: false,
+    },
+    terminalCreating: false,
+    _terminalProfilesLoaded: false,
+    _terminalProfilePrefLoaded: false,
+    terminalManagerOpen: false,
+    previewSurface: "file",
+    activeTerminalId: "",
+    terminalConnection: "idle",
+    terminalExitCode: null,
+    _terminal: null,
+    _terminalFit: null,
+    _terminalSocket: null,
+    _terminalResizeObserver: null,
+    _terminalTouchCleanup: null,
+    _terminalSuppressMouseUntil: 0,
+    _terminalReconnectTimer: null,
+    _terminalConnectSeq: 0,
+    _terminalLoadPromise: null,
+    TERMINAL_SCROLLBACK_MOBILE: 3000,
+    TERMINAL_SCROLLBACK_DESKTOP: 10000,
     // Keep a bounded set of live HTML browsing contexts. Switching back to a
     // recent report preserves its DOM, script state and scroll position.
     htmlPreviewFrames: [],
@@ -496,9 +566,10 @@ function portal() {
     // bubbles from tabState[id].messages (data always survives; only the DOM is
     // dropped). _MAX_RESIDENT_PANES caps the set.
     _residentTabIds: [],
-    // Strict DOM budget. Mobile retains only the visible pane; desktop may keep
-    // one warm neighbour. Streaming in a hidden tab keeps its data/SSE but not DOM.
-    _MAX_RESIDENT_PANES: 2,
+    // Mobile retains only the visible pane. Desktop keeps a wider working set so
+    // normal tab switching is a pure x-show flip instead of a bubble rebuild.
+    // Streaming in a hidden tab keeps its data/SSE even after its DOM is evicted.
+    _MAX_RESIDENT_PANES: 4,
     renamingTabId: "",   // session id whose name is currently being inline-edited
     renameDraft: "",     // current value of the inline rename <input>
     tabCtxMenu: null,    // {id, x, y} for the right-click tab menu, or null
@@ -992,6 +1063,14 @@ function portal() {
 
     // ===== init =====
     onGlobalKeyDown(ev) {
+      // The PTY owns its complete keyboard surface. In particular Ctrl+K,
+      // Ctrl+W, Ctrl+T and Ctrl+Tab are meaningful terminal input and must not
+      // be stolen by muselab's global palette/chat shortcuts.
+      const focused = document.activeElement;
+      if (this.previewSurface === "terminal"
+          && focused && focused.closest && focused.closest(".terminal-host")) {
+        return;
+      }
       // ---- Command palette ----
       // Cmd/Ctrl+K from anywhere opens it. While open, palette owns
       // ↑/↓/Enter; everything else falls through to the input.
@@ -1688,6 +1767,7 @@ function portal() {
       // paths are relative and must never flash content from the primary root.
       await this.fetchSessionWorkspaces();
       this.loadRoot();
+      this.fetchTerminals({ restore: true });
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
       // session so the user lands in the conversation they were pinged about
@@ -1719,7 +1799,7 @@ function portal() {
       }
       // Same preview-file restore that login() does — covers the
       // already-authed boot path (page refresh with saved token).
-      if (this._pendingPreviewSelected) {
+      if (this._pendingPreviewSelected && this.previewSurface !== "terminal") {
         const path = this._pendingPreviewSelected;
         this._pendingPreviewSelected = null;
         // Preserve the restored tab's preview/pinned state — restoring the
@@ -1980,6 +2060,7 @@ function portal() {
         // cached, no placeholder).
         try {
           const meta = await r.clone().json();
+          this.terminalEnabled = !!(meta && meta.terminal_enabled);
           const remoteVer = meta && meta.asset_version;
           if (remoteVer && !this._appVersionReloadFired) {
             const localVer = (document.querySelector(
@@ -2010,6 +2091,7 @@ function portal() {
           // Also refresh sessions / context — they may be stale post-restart
           this.refreshSessions();
           this.fetchContextInfo();
+          if (this.terminalEnabled) this.fetchTerminals();
         } else {
           this.connState = "ok";
         }
@@ -2267,11 +2349,13 @@ function portal() {
       document.documentElement.setAttribute("data-theme", this.theme);
       const link = document.getElementById("hljs-theme");
       if (link) {
-        // Eyecare reuses the dark hljs theme — its softer contrast fits
-        // the warm paper background better than the high-contrast light theme.
-        link.href = this.theme === "light"
-          ? "/static/vendor/highlight-theme-light.css"
-          : "/static/vendor/highlight-theme.css";
+        // Eyecare is still a light-background theme. Reusing the dark syntax
+        // sheet put GitHub-dark addition/deletion fills (#033a16/#67060c)
+        // and pale token text on warm paper, producing the giant red/green
+        // slabs seen in Markdown diff summaries.
+        link.href = this.theme === "dark"
+          ? "/static/vendor/highlight-theme.css"
+          : "/static/vendor/highlight-theme-light.css";
       }
       // CodeMirror: use default (light) theme for both light and eyecare
       // since material-darker is too harsh on warm backgrounds.
@@ -2497,6 +2581,7 @@ function portal() {
       this.applyTheme();
       this.applyAccent();   // 派生色对深浅敏感，重算
       this._setLS("muselab_theme", this.theme);
+      if (this._terminal) this._terminal.options.theme = this._terminalTheme();
     },
 
     // 色彩小工具
@@ -4310,6 +4395,7 @@ function portal() {
         this.loadPrefs();
         await this.fetchSessionWorkspaces();
         await this.loadRoot();
+        this.fetchTerminals({ restore: true });
         this._openStartupActivityDeeplink();
         await this.initSessions();
         await this._openStartupSessionDeeplink();
@@ -4318,7 +4404,7 @@ function portal() {
         // Restore the preview file the user was looking at before refresh.
         // openFile is idempotent on tabs[] (won't duplicate); if the file
         // no longer exists we silently no-op (no toast — refresh restoration).
-        if (this._pendingPreviewSelected) {
+        if (this._pendingPreviewSelected && this.previewSurface !== "terminal") {
           const path = this._pendingPreviewSelected;
           this._pendingPreviewSelected = null;
           // Preserve the restored tab's preview/pinned state (see _bootApp).
@@ -4600,13 +4686,16 @@ function portal() {
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 5,          // v5 persists one file/preview surface per workspace
+        schema: 7,          // v7 remembers the selected terminal profile
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
+        previewSurface: this.previewSurface,
+        activeTerminalId: this.activeTerminalId,
+        terminalProfileId: this.terminalProfileId,
         expanded: Array.from(this.expanded),
         activeWorkspace: this.activeWorkspace,
         workspaceLastSession: this.workspaceLastSession,
@@ -4684,6 +4773,14 @@ function portal() {
           this.tabs = p.previewTabs.map(t => this._previewTabSnapshot(t));
         }
         if (typeof p.previewSelected === "string") this._pendingPreviewSelected = p.previewSelected;
+        if (p.previewSurface === "terminal") this.previewSurface = "terminal";
+        if (typeof p.activeTerminalId === "string") {
+          this.activeTerminalId = p.activeTerminalId;
+        }
+        if (typeof p.terminalProfileId === "string") {
+          this.terminalProfileId = p.terminalProfileId;
+          this._terminalProfilePrefLoaded = true;
+        }
         // Stash the mobile tab choice in a "pending" slot — actually applying
         // it has to wait until after _bootApp's openFile(previewSelected)
         // restoration runs, because openFile force-switches to "preview" on
@@ -6104,7 +6201,7 @@ function portal() {
     // pane set re-evaluates exactly when either changes; :key="tid" keeps stable
     // panes from rebuilding.
     residentPaneIds() {
-      const budget = this._isMobileLayout() ? 1 : 2;
+      const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
       const list = (this._residentTabIds || []).filter(Boolean);
       const ordered = this.currentId
         ? [this.currentId, ...list.filter(id => id !== this.currentId)]
@@ -6641,7 +6738,6 @@ function portal() {
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
         if ((x.effort || "") !== (y.effort || "")) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
-        if ((x.system_prompt || "") !== (y.system_prompt || "")) return false;
         if ((x.cwd || "") !== (y.cwd || "")) return false;
       }
       return true;
@@ -6846,6 +6942,8 @@ function portal() {
         [cwd]: {
           previewTabs: (this.tabs || []).map(t => this._previewTabSnapshot(t)),
           previewSelected: this.selected || "",
+          previewSurface: this.previewSurface,
+          activeTerminalId: this.activeTerminalId || "",
           expanded: Array.from(this.expanded || []),
           showHidden: !!this.showHidden,
           openFilesCollapsed: !!this.openFilesCollapsed,
@@ -6869,6 +6967,8 @@ function portal() {
       if (!path || path === this.activeWorkspace) return true;
       const previous = this.activeWorkspace;
       if (previous) this._captureWorkspaceSurface(previous);
+      this._teardownTerminalView();
+      this.terminals = [];
 
       // Invalidate owner-scoped file operations before changing the header.
       // Relative paths such as README.md repeat across projects, so late
@@ -6924,9 +7024,17 @@ function portal() {
 
       const selected = typeof surface.previewSelected === "string"
         ? surface.previewSelected : "";
-      const refresh = Promise.allSettled([this.loadRoot(), this.loadTrash(), this.fetchContextInfo()]);
+      this.previewSurface = surface.previewSurface === "terminal" ? "terminal" : "file";
+      this.activeTerminalId = typeof surface.activeTerminalId === "string"
+        ? surface.activeTerminalId : "";
+      const terminalRefresh = this.fetchTerminals({ restore: true });
+      const refresh = Promise.allSettled([
+        this.loadRoot(), this.loadTrash(), this.fetchContextInfo(), terminalRefresh,
+      ]);
       if (!runtime) await refresh;
-      if (selected && this.tabs.some(t => t.path === selected)) {
+      else if (this.previewSurface === "terminal") await terminalRefresh;
+      if (this.previewSurface === "file"
+          && selected && this.tabs.some(t => t.path === selected)) {
         const tab = this.tabs.find(t => t.path === selected);
         await this.openFile(
           { path: selected, name: tab.name || selected.split("/").pop() },
@@ -7367,7 +7475,6 @@ function portal() {
         name: prefix + stamp,
         model: seedModel,
         permission: this.defaultPermission || "bypassPermissions",
-        system_prompt: "",
         created_at: ts,
         updated_at: ts,
         message_count: 0,
@@ -7447,8 +7554,7 @@ function portal() {
       if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
       this._fetchTabUsage(meta.id);
       this.savePrefs();
-      // Auto-send the curator's initial prompt — the system prompt tells
-      // Muse to begin the 5-step workflow on first message.
+      // Auto-send the short Skill invocation returned by the backend.
       const lang = this.lang === "en" ? "en" : "zh";
       const initialMsg = (meta.initial_message && meta.initial_message[lang])
         || meta.initial_message?.zh || "开始";
@@ -9381,12 +9487,6 @@ function portal() {
       if (!this.openTabIds.includes(id)) await this.openTab(id);
       this.startRenameTab(id);
     },
-    async menuEditPrompt(id) {
-      this.closeTabMenu();
-      // Target the requested session directly. Temporarily changing currentId
-      // would activate the wrong composer owner while the prompt modal awaits.
-      await this.editSessionPrompt(id);
-    },
     async menuClose(id) { this.closeTabMenu(); await this.closeChatTab(id); },
     menuExportMarkdown(id) {
       this.closeTabMenu();
@@ -9473,14 +9573,14 @@ function portal() {
         const shouldFollow = !stCur || stCur.atBottom !== false;
         this.atBottom = shouldFollow;
         const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
-        // Heavy history → keep the bubbles display:none'd for one frame
+        // On mobile, heavy history keeps the bubbles display:none'd for one frame
         // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
         // messagesReady=false) so the tab-bar flip + a loading skeleton PAINT
         // immediately with ZERO bubble layout. Then reveal on the next frame —
         // the (unavoidable) layout of N bubbles now happens AFTER the switch is
         // already on screen, so the click feels instant with a brief loading
-        // state (acceptable per product). Small tabs lay out in a couple ms, so
-        // skip the skeleton to avoid a needless flicker.
+        // state. Desktop favours visual continuity and keeps warm panes visible;
+        // the wider resident set makes these switches a direct x-show flip.
         // Guard the deferred callbacks against a rapid re-switch: if the user
         // tabs away again before the next frame, the stale callback must not
         // flip messagesReady / scroll / highlight for a tab that's no longer
@@ -9499,7 +9599,7 @@ function portal() {
         // suppressed during it, so the default cap is cheap in the common case
         // while still landing correctly on tall histories.
         const settle = () => this._restoreChatPosition(target);
-        if (histLen > 60 && shouldFollow) {
+        if (this._isMobileLayout() && histLen > 60 && shouldFollow) {
           stCur.messagesReady = false;
           this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
           this._afterPaint(() => {
@@ -9745,7 +9845,7 @@ function portal() {
         const _mobileEarly = this._isMobileLayout();
         const _initialLoadEarly = _mobileEarly
           ? (_coldEarly ? 8 : 15)
-          : (_coldEarly ? 12 : 18);
+          : (_coldEarly ? 30 : 60);
         const FETCH_TAIL = _initialLoadEarly * 5;
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const controller = new AbortController();
@@ -10067,10 +10167,9 @@ function portal() {
     // (mtime, size), making repeat/preload loads cheap.
     _scheduleIdlePreload() {
       if (this._isMobileLayout()) return;
-      // Background preload runs on ALL layouts (desktop + mobile). It was
-      // previously desktop-only to avoid iOS dropping the keyboard on the
-      // first composer tap (an off-screen loadSession landing mid-tap); that
-      // gate was removed by request so mobile tab switches are instant too.
+      // Desktop can spend idle CPU/network warming open sessions. Mobile skips
+      // this entirely so background parsing cannot contend with the composer,
+      // soft keyboard, or a live stream.
       if (this._idlePreloadScheduled) return;
       this._idlePreloadScheduled = true;
       const run = () => { this._idlePreloadScheduled = false; this._idlePreloadStep(); };
@@ -10122,7 +10221,7 @@ function portal() {
     // fix. st.messages is the SAME array Alpine watches (bound via
     // this.messages = st.messages just before this call), so each push reacts.
     async _revealMessagesChunked(sid, st, visible) {
-      const CH = this._isMobileLayout() ? 4 : 6;
+      const CH = this._isMobileLayout() ? 4 : 15;
       let i = 0;
       while (i < visible.length) {
         // Tab was closed+reopened mid-reveal (a fresh st replaced ours, or it
@@ -10163,7 +10262,7 @@ function portal() {
       const renderOne = (m) => {
         if (m && m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
       };
-      const CH = 5;
+      const CH = this._isMobileLayout() ? 4 : 12;
       let i = 0;
       while (i < head.length) {
         // Tab closed+reopened → a fresh st owns this session now; drop out.
@@ -10283,8 +10382,8 @@ function portal() {
       this._capHistoryCache(st);
       return target[target.length - 1];
     },
-    _mountedMessageCap() { return this._isMobileLayout() ? 60 : 120; },
-    _historyCacheCap() { return this._isMobileLayout() ? 120 : 240; },
+    _mountedMessageCap() { return this._isMobileLayout() ? 60 : 300; },
+    _historyCacheCap() { return this._isMobileLayout() ? 120 : 800; },
     _capMountedWindow(st, direction = "newer", anchorUuid = "") {
       const cap = this._mountedMessageCap();
       if (!st || !st.messages || st.messages.length <= cap) {
@@ -10376,26 +10475,12 @@ function portal() {
     // them on demand, prepend to messages[]. Critical: preserve scroll
     // position so the user's current viewport doesn't jump when older
     // content unfolds above.
-    LOAD_MORE_BATCH: 40,
+    LOAD_MORE_BATCH: 80,
     // How many older bubbles to pull from the server in one backend page
     // when the in-memory stash runs dry (see _fetchOlderWindow). Larger
     // than LOAD_MORE_BATCH so several "Load earlier" clicks are served from
     // memory between network round-trips.
-    HISTORY_PAGE: 120,
-    // Absolute in-memory ceiling across messages[] + _earlierMessages. Once
-    // hit we stop paging older windows from the server (full history stays
-    // in the JSONL); historyTruncated() then surfaces the "not everything is
-    // reachable" hint. Bounds memory on pathological thousands-of-bubbles
-    // sessions even if the user keeps clicking "Load earlier".
-    MAX_IN_MEMORY: 240,
-    // Live-session DOM ceiling. loadSession's INITIAL_LOAD / MAX caps
-    // only apply when (re)entering a session — NOTHING trims messages[] while
-    // a session is actively chatted in, so a long coding session grows DOM
-    // nodes without bound and OOM-crashes mobile WebViews (desktop has the
-    // headroom to mask it). Before each new user turn _capLiveMessages evicts
-    // the oldest rendered bubbles back into the _earlierMessages stash so
-    // "Load earlier" can page them back in. Mobile uses a tighter ceiling.
-    LIVE_MESSAGE_CAP: 120,
+    HISTORY_PAGE: 240,
     // Reactivity ping: bumped whenever refreshOutlineFromBackend writes
     // new data. outlineMessages() reads it so Alpine knows to re-render
     // the msg-outline-modal when async fetch completes. Without this,
@@ -10629,7 +10714,7 @@ function portal() {
       // (marked + DOMPurify + KaTeX per message froze the click for ~hundreds
       // of ms on long histories). The bubbles aren't in the DOM yet (prepend
       // happens after), so yielding here just spreads CPU, no visible reflow.
-      const RENDER_CHUNK = 8;
+      const RENDER_CHUNK = this._isMobileLayout() ? 4 : 16;
       for (let j = 0; j < batch.length; j += RENDER_CHUNK) {
         const end = Math.min(j + RENDER_CHUNK, batch.length);
         for (let k = j; k < end; k++) {
@@ -10810,30 +10895,6 @@ function portal() {
         body: JSON.stringify({ name }),
       });
       if (r.ok) { await this.refreshSessions(); this.toast(this.t("toast.renamed"), "success"); }
-    },
-
-    async editSessionPrompt(sid = this.currentId) {
-      const cur = this.sessions.find(x => x.id === sid);
-      if (!cur) return;
-      // 取最新（含 system_prompt）
-      const r0 = await fetch("/api/chat/sessions/" + cur.id, { headers: this.hdr() });
-      const full = r0.ok ? await r0.json() : { system_prompt: "" };
-      const prompt = await this.prompt({
-        title: this.lang === "zh"
-          ? "本会话 system prompt（留空 = 用默认）"
-          : "Per-session system prompt (empty = use default)",
-        body: this.lang === "zh"
-          ? "会拼在 muselab 默认 system prompt 前。改后下一条消息生效。"
-          : "Prepended to muselab's default system prompt. Takes effect on the next message.",
-        value: full.system_prompt || "",
-      });
-      if (prompt === null) return;
-      const r = await fetch("/api/chat/sessions/" + cur.id, {
-        method: "PATCH",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ system_prompt: prompt }),
-      });
-      if (r.ok) this.toast(this.t("toast.saved"), "success");
     },
 
     // ===== settings modal =====
@@ -13630,8 +13691,685 @@ function portal() {
     },
     previewFindNext() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active + 1); },
     previewFindPrev() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active - 1); },
+
+    // ===== workspace terminals =====
+    activeTerminal() {
+      return this.terminals.find(row => row.id === this.activeTerminalId) || null;
+    },
+    async fetchTerminals({ restore = false } = {}) {
+      const owner = this.currentWorkspacePath();
+      if (!owner || !this.token) return;
+      const { ok, status, data } = await this.api("/api/terminals", {
+        headers: this.fileHdr(),
+      });
+      if (!this._workspaceIsCurrent(owner)) return;
+      if (!ok) {
+        if (status === 403 || status === 404) {
+          this.terminalEnabled = false;
+          this.terminals = [];
+        }
+        return;
+      }
+      this.terminalEnabled = true;
+      this.terminals = Array.isArray(data.terminals) ? data.terminals : [];
+      this.terminalLimits = data.limits || null;
+      this.terminalProfiles = Array.isArray(data.profiles) ? data.profiles : [];
+      const profileExists = this.terminalProfiles.some(
+        row => row.id === this.terminalProfileId);
+      if (this.terminalProfileId && !profileExists) {
+        this.terminalProfileId = data.default_profile_id || "";
+      } else if (!this._terminalProfilesLoaded && !this._terminalProfilePrefLoaded) {
+        this.terminalProfileId = data.default_profile_id || "";
+      }
+      this._terminalProfilesLoaded = true;
+      const activeExists = this.terminals.some(row => row.id === this.activeTerminalId);
+      if (!activeExists && this.previewSurface === "terminal") {
+        this.previewSurface = "file";
+        this.activeTerminalId = "";
+        this._teardownTerminalView();
+      }
+      if (restore && this.previewSurface === "terminal" && activeExists) {
+        await this.openTerminal(this.activeTerminalId);
+      }
+    },
+    async createTerminal(profileId) {
+      if (!this.terminalEnabled || this.terminalCreating) return;
+      // Read the native select value at click time. Mobile browsers can commit
+      // their picker value one event turn later than Alpine's x-model update;
+      // relying only on terminalProfileId could therefore create the previous
+      // (usually default) profile even though the UI showed another selection.
+      const select = this.$refs.terminalProfileSelect;
+      const selectedProfileId = typeof profileId === "string"
+        ? profileId
+        : (select ? String(select.value || "") : String(this.terminalProfileId || ""));
+      if (selectedProfileId
+          && !this.terminalProfiles.some(row => row.id === selectedProfileId)) {
+        this.toast(this.lang === "zh"
+          ? "所选终端 Profile 已不存在，请重新选择。"
+          : "The selected terminal profile no longer exists. Choose another one.",
+        "error");
+        await this.fetchTerminals();
+        return;
+      }
+      this.terminalProfileId = selectedProfileId;
+      this._terminalProfilePrefLoaded = true;
+      this._scheduleSavePrefs();
+      this.terminalCreating = true;
+      try {
+        const { ok, data, error } = await this.api("/api/terminals", {
+          method: "POST",
+          headers: this.fileHdr(),
+          json: { rows: 30, cols: 100, profile_id: selectedProfileId },
+        });
+        if (!ok) {
+          this.toast((this.lang === "zh" ? "新建终端失败：" : "Could not create terminal: ")
+            + (error || ""), "error");
+          return;
+        }
+        this.terminals = [...this.terminals, data];
+        this.terminalManagerOpen = false;
+        await this.openTerminal(data.id);
+      } finally {
+        this.terminalCreating = false;
+      }
+    },
+    editTerminalProfile(profile = null) {
+      this.terminalProfileEditor = {
+        show: true,
+        id: profile ? profile.id : "",
+        name: profile ? profile.name : "",
+        command: profile ? profile.command : "",
+        is_default: profile ? !!profile.is_default : !this.terminalProfiles.length,
+        saving: false,
+      };
+      this.$nextTick(() => {
+        const input = this.$refs.terminalProfileName;
+        if (input) input.focus();
+      });
+    },
+    editSelectedTerminalProfile() {
+      const profile = this.terminalProfiles.find(
+        row => row.id === this.terminalProfileId);
+      if (profile) this.editTerminalProfile(profile);
+    },
+    cancelTerminalProfileEdit() {
+      this.terminalProfileEditor = {
+        show: false, id: "", name: "", command: "", is_default: false, saving: false,
+      };
+    },
+    async saveTerminalProfile() {
+      const draft = this.terminalProfileEditor;
+      const name = String(draft.name || "").trim();
+      const command = String(draft.command || "").trim();
+      if (!name || !command || draft.saving) return;
+      draft.saving = true;
+      const path = draft.id
+        ? `/api/terminals/profiles/${encodeURIComponent(draft.id)}`
+        : "/api/terminals/profiles";
+      const { ok, data, error } = await this.api(path, {
+        method: draft.id ? "PATCH" : "POST",
+        headers: this.hdr(),
+        json: { name, command, is_default: !!draft.is_default },
+      });
+      draft.saving = false;
+      if (!ok) {
+        this.toast((this.lang === "zh" ? "保存 Profile 失败：" : "Could not save profile: ")
+          + (error || ""), "error");
+        return;
+      }
+      const exists = this.terminalProfiles.some(row => row.id === data.id);
+      this.terminalProfiles = exists
+        ? this.terminalProfiles.map(row => row.id === data.id ? data : {
+            ...row, is_default: data.is_default ? false : row.is_default,
+          })
+        : [
+            ...this.terminalProfiles.map(row => ({
+              ...row, is_default: data.is_default ? false : row.is_default,
+            })),
+            data,
+          ];
+      this.terminalProfileId = data.id;
+      this._terminalProfilePrefLoaded = true;
+      this.cancelTerminalProfileEdit();
+      this._scheduleSavePrefs();
+    },
+    async deleteTerminalProfile() {
+      const draft = this.terminalProfileEditor;
+      if (!draft.id || draft.saving) return;
+      const yes = await this.confirm({
+        title: this.lang === "zh" ? "删除终端 Profile？" : "Delete terminal profile?",
+        body: this.lang === "zh"
+          ? `“${draft.name}”将从 Profile 列表中移除，已运行的终端不受影响。`
+          : `“${draft.name}” will be removed. Running terminals are unaffected.`,
+        okText: this.lang === "zh" ? "删除" : "Delete",
+        danger: true,
+      });
+      if (!yes) return;
+      draft.saving = true;
+      const { ok, error } = await this.api(
+        `/api/terminals/profiles/${encodeURIComponent(draft.id)}`, {
+          method: "DELETE",
+          headers: this.hdr(),
+        });
+      draft.saving = false;
+      if (!ok) {
+        this.toast((this.lang === "zh" ? "删除 Profile 失败：" : "Could not delete profile: ")
+          + (error || ""), "error");
+        return;
+      }
+      this.terminalProfiles = this.terminalProfiles.filter(row => row.id !== draft.id);
+      if (draft.is_default && this.terminalProfiles.length) {
+        this.terminalProfiles = this.terminalProfiles.map((row, index) => ({
+          ...row, is_default: index === 0,
+        }));
+      }
+      if (this.terminalProfileId === draft.id) {
+        const fallback = this.terminalProfiles.find(row => row.is_default)
+          || this.terminalProfiles[0];
+        this.terminalProfileId = fallback ? fallback.id : "";
+      }
+      this.cancelTerminalProfileEdit();
+      this._scheduleSavePrefs();
+    },
+    async renameTerminal(row) {
+      if (!row) return;
+      const name = await this.prompt({
+        title: this.lang === "zh" ? "重命名终端" : "Rename terminal",
+        value: row.name || "",
+        placeholder: this.lang === "zh" ? "终端名称" : "Terminal name",
+      });
+      if (name == null || !String(name).trim()) return;
+      const { ok, data, error } = await this.api(`/api/terminals/${row.id}`, {
+        method: "PATCH",
+        headers: this.fileHdr(),
+        json: { name: String(name).trim() },
+      });
+      if (!ok) {
+        this.toast((this.lang === "zh" ? "重命名失败：" : "Rename failed: ")
+          + (error || ""), "error");
+        return;
+      }
+      this.terminals = this.terminals.map(item => item.id === row.id ? data : item);
+      this._scheduleSavePrefs();
+    },
+    async closeTerminal(id, { confirm = true } = {}) {
+      const row = this.terminals.find(item => item.id === id);
+      if (!row) return;
+      if (confirm) {
+        const yes = await this.confirm({
+          title: this.lang === "zh" ? "关闭终端？" : "Close terminal?",
+          body: this.lang === "zh"
+            ? `将终止“${row.name}”中正在运行的进程。`
+            : `This stops the process running in “${row.name}”.`,
+          okText: this.lang === "zh" ? "终止并关闭" : "Stop and close",
+          danger: true,
+        });
+        if (!yes) return;
+      }
+      const { ok, error } = await this.api(`/api/terminals/${id}`, {
+        method: "DELETE",
+        headers: this.fileHdr(),
+      });
+      if (!ok) {
+        this.toast((this.lang === "zh" ? "关闭失败：" : "Close failed: ")
+          + (error || ""), "error");
+        return;
+      }
+      const oldIndex = this.terminals.findIndex(item => item.id === id);
+      this.terminals = this.terminals.filter(item => item.id !== id);
+      if (this.activeTerminalId === id) {
+        this._teardownTerminalView();
+        const next = this.terminals[Math.min(oldIndex, this.terminals.length - 1)];
+        if (next) await this.openTerminal(next.id);
+        else {
+          this.activeTerminalId = "";
+          this.previewSurface = "file";
+          if (this.selected) this.switchTab(this.selected);
+        }
+      }
+      this._scheduleSavePrefs();
+    },
+    async terminateAllTerminals() {
+      if (!this.terminals.length) return;
+      const yes = await this.confirm({
+        title: this.lang === "zh" ? "关闭全部终端？" : "Close all terminals?",
+        body: this.lang === "zh"
+          ? `将终止当前工作目录中的 ${this.terminals.length} 个终端进程。`
+          : `This stops ${this.terminals.length} terminal processes in this workspace.`,
+        okText: this.lang === "zh" ? "全部终止" : "Stop all",
+        danger: true,
+      });
+      if (!yes) return;
+      const { ok, error } = await this.api("/api/terminals/terminate-all", {
+        method: "POST",
+        headers: this.fileHdr(),
+      });
+      if (!ok) {
+        this.toast((this.lang === "zh" ? "操作失败：" : "Operation failed: ")
+          + (error || ""), "error");
+        return;
+      }
+      this._teardownTerminalView();
+      this.terminals = [];
+      this.activeTerminalId = "";
+      this.previewSurface = "file";
+      this.terminalManagerOpen = false;
+      this._scheduleSavePrefs();
+    },
+    async _loadTerminalLib() {
+      if (window.Terminal && window.FitAddon) return;
+      if (this._terminalLoadPromise) return this._terminalLoadPromise;
+      const inject = (src) => new Promise((resolve, reject) => {
+        const selector = src.endsWith(".css")
+          ? `link[href="${src}"]` : `script[src="${src}"]`;
+        if (document.querySelector(selector)) {
+          const started = Date.now();
+          (function wait() {
+            if (src.endsWith(".css")
+                || (window.Terminal && (!src.includes("fit") || window.FitAddon))) {
+              resolve();
+            } else if (Date.now() - started > 5000) {
+              reject(new Error("terminal asset load timeout"));
+            } else {
+              setTimeout(wait, 50);
+            }
+          })();
+          return;
+        }
+        const node = src.endsWith(".css")
+          ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
+          : Object.assign(document.createElement("script"), { src });
+        node.onload = resolve;
+        node.onerror = () => reject(new Error("load failed: " + src));
+        document.head.appendChild(node);
+      });
+      this._terminalLoadPromise = (async () => {
+        await Promise.all([
+          inject("/static/vendor/xterm/xterm.css"),
+          inject("/static/vendor/xterm/xterm.js"),
+        ]);
+        await inject("/static/vendor/xterm/addon-fit.js");
+        if (!window.Terminal || !window.FitAddon) {
+          throw new Error("terminal library globals missing");
+        }
+      })().catch(error => {
+        this._terminalLoadPromise = null;
+        throw error;
+      });
+      return this._terminalLoadPromise;
+    },
+    _terminalTheme() {
+      const css = getComputedStyle(document.documentElement);
+      const value = name => css.getPropertyValue(name).trim();
+      const background = value("--c-bg-0") || "#0f1115";
+      const ansi = TERMINAL_ANSI_THEMES[this.theme]
+        || TERMINAL_ANSI_THEMES.dark;
+      // Codex CLI renders full-width diff rows with xterm-256color background
+      // indexes 22 (deep green) and 52 (deep red). Those defaults are designed
+      // for a dark terminal and become giant dark slabs in light/eyecare.
+      // xterm's extendedAnsi array starts at color 16, so remap just those two
+      // semantic slots to muselab's theme-aware Diff washes. Sparse entries
+      // fall back to xterm's defaults for every unrelated 256-color value.
+      const extendedAnsi = [];
+      if (this.theme !== "dark") {
+        extendedAnsi[22 - 16] = value("--c-diff-add-bg") || "#c7e5d0";
+        extendedAnsi[52 - 16] = value("--c-diff-del-bg") || "#f2c9c6";
+      }
+      return {
+        background,
+        foreground: value("--c-fg-0") || "#e8eaf0",
+        cursor: value("--c-accent") || "#6093ff",
+        cursorAccent: background,
+        selectionBackground: value("--c-selection-bg") || "#2f66d0",
+        selectionForeground: value("--c-selection-fg") || "#ffffff",
+        selectionInactiveBackground: value("--c-accent-soft")
+          || "rgba(96,147,255,.14)",
+        extendedAnsi,
+        ...ansi,
+      };
+    },
+    _terminalSend(text) {
+      const socket = this._terminalSocket;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(new TextEncoder().encode(text));
+    },
+    _terminalDataIsMouseReport(data) {
+      if (typeof data !== "string" || !data) return false;
+      // SGR / SGR-pixels, urxvt and legacy X10 mouse reports. A stale xterm
+      // mouse mode makes readline display fragments such as "2;276;" after
+      // the escape prefix and final byte have been interpreted.
+      return /^(?:(?:\x1b\[<\d+;\d+;\d+[Mm])|(?:\x1b\[\d+;\d+;\d+M)|(?:\x1b\[M[\s\S]{3}))+$/
+        .test(data);
+    },
+    _terminalHandleInput(data, term = this._terminal) {
+      if (!this._terminalDataIsMouseReport(data)) {
+        this._terminalSend(data);
+        return;
+      }
+      const touchScrollActive = performance.now() < this._terminalSuppressMouseUntil;
+      const normalBuffer = !term || term.buffer?.active?.type !== "alternate";
+      if (!touchScrollActive && !normalBuffer) {
+        this._terminalSend(data);
+        return;
+      }
+      if (normalBuffer && term) {
+        // Full-screen TUIs normally use the alternate buffer. If mouse
+        // tracking survives after they return to the normal shell buffer,
+        // disable the local modes as well as dropping the triggering report.
+        term.write(
+          "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l"
+          + "\x1b[?1006l\x1b[?1015l\x1b[?1016l",
+        );
+      }
+    },
+    terminalMobileKey(text) {
+      // Mobile keyboard layouts often hide "\" (or replace it with a
+      // locale-specific symbol). Send accessory-key input straight to the PTY,
+      // then restore xterm's hidden textarea so normal typing can continue.
+      this._terminalSend(text);
+      this.$nextTick(() => requestAnimationFrame(() => {
+        if (this._terminal) this._terminal.focus();
+      }));
+    },
+    openTerminalManagerFromChat() {
+      if (!this.terminalEnabled) return;
+      this.setMobileTab("preview");
+      // Defer opening past the originating chat-header click. Otherwise the
+      // preview manager's @click.outside sees that same click and immediately
+      // closes the popup before the newly-visible pane paints.
+      this.$nextTick(() => requestAnimationFrame(() => {
+        if (this.mobileTab === "preview") this.terminalManagerOpen = true;
+      }));
+    },
+    _attachTerminalTouchScroll(host, term) {
+      if (!host || !term || !this._isMobileLayout()) return;
+      if (this._terminalTouchCleanup) this._terminalTouchCleanup();
+      let lastY = null;
+      let startX = null;
+      let startY = null;
+      let remainder = 0;
+      let claimed = false;
+      const linePx = Math.max(
+        10, Number(term.options.fontSize || 13) * Number(term.options.lineHeight || 1.2));
+      const reset = () => {
+        lastY = null;
+        startX = null;
+        startY = null;
+        remainder = 0;
+        claimed = false;
+      };
+      const onStart = event => {
+        if (event.touches.length !== 1) return reset();
+        const touch = event.touches[0];
+        lastY = touch.clientY;
+        startX = touch.clientX;
+        startY = touch.clientY;
+        remainder = 0;
+        claimed = false;
+      };
+      const onMove = event => {
+        if (lastY == null || event.touches.length !== 1) return;
+        const touch = event.touches[0];
+        const nextY = touch.clientY;
+        if (!claimed) {
+          const dx = Math.abs(touch.clientX - startX);
+          const dy = Math.abs(nextY - startY);
+          if (dy < 6 || dy <= dx) return;
+          claimed = true;
+        }
+        this._terminalSuppressMouseUntil = performance.now() + 500;
+        // Own vertical terminal gestures before xterm's document-level gesture
+        // listener or WebKit can consume them. The old passive/rAF fallback
+        // frequently never received a usable scroll delta in iOS PWA mode.
+        if (event.cancelable) event.preventDefault();
+        event.stopPropagation();
+        remainder += lastY - nextY;
+        lastY = nextY;
+        const lines = remainder > 0
+          ? Math.floor(remainder / linePx)
+          : Math.ceil(remainder / linePx);
+        if (!lines) return;
+        remainder -= lines * linePx;
+        term.scrollLines(lines);
+      };
+      const onEnd = event => {
+        // Mobile browsers synthesize a mouse press/release after touchend.
+        // When a TUI has enabled mouse tracking, xterm encodes that synthetic
+        // click as SGR coordinates (for example ESC[<0;189;334M). Suppress
+        // that delayed pair for taps as well as claimed scroll gestures.
+        if (lastY != null) {
+          this._terminalSuppressMouseUntil = performance.now() + 800;
+        }
+        if (claimed) {
+          if (event.cancelable) event.preventDefault();
+          event.stopPropagation();
+        }
+        reset();
+      };
+      const capturePassive = { capture: true, passive: true };
+      const captureActive = { capture: true, passive: false };
+      host.addEventListener("touchstart", onStart, capturePassive);
+      host.addEventListener("touchmove", onMove, captureActive);
+      host.addEventListener("touchend", onEnd, captureActive);
+      host.addEventListener("touchcancel", onEnd, captureActive);
+      this._terminalTouchCleanup = () => {
+        host.removeEventListener("touchstart", onStart, true);
+        host.removeEventListener("touchmove", onMove, true);
+        host.removeEventListener("touchend", onEnd, true);
+        host.removeEventListener("touchcancel", onEnd, true);
+        this._terminalTouchCleanup = null;
+      };
+    },
+    async openTerminal(id, { reconnect = false } = {}) {
+      const row = this.terminals.find(item => item.id === id);
+      if (!row) return;
+      this._teardownTerminalView();
+      const seq = ++this._terminalConnectSeq;
+      this.activeTerminalId = id;
+      this.previewSurface = "terminal";
+      this.terminalManagerOpen = false;
+      this.terminalConnection = "connecting";
+      this.terminalExitCode = row.exit_code;
+      if (this._isMobileLayout()) this.setMobileTab("preview");
+      this._scheduleSavePrefs();
+      try {
+        await this._loadTerminalLib();
+        if (seq !== this._terminalConnectSeq || this.activeTerminalId !== id) return;
+        await this.$nextTick();
+        const host = this.$refs.terminalHost;
+        if (!host) throw new Error("terminal host missing");
+        host.replaceChildren();
+        const term = new window.Terminal({
+          cursorBlink: true,
+          cursorStyle: "bar",
+          convertEol: false,
+          allowProposedApi: false,
+          scrollback: this._isMobileLayout()
+            ? this.TERMINAL_SCROLLBACK_MOBILE
+            : this.TERMINAL_SCROLLBACK_DESKTOP,
+          fontFamily: getComputedStyle(document.documentElement)
+            .getPropertyValue("--font-mono").trim() || "monospace",
+          fontSize: this._isMobileLayout() ? 13 : 14,
+          lineHeight: 1.2,
+          // ANSI 16 colors are curated above; this also protects arbitrary
+          // 256-color / truecolor foregrounds emitted by third-party TUIs.
+          // xterm caches adjusted pairs, keeping the mobile rendering cost low.
+          minimumContrastRatio: 4.5,
+          theme: this._terminalTheme(),
+        });
+        // Shells and full-screen terminal apps may emit DECSCUSR with an even
+        // parameter (2/4/6), which asks xterm to replace cursorBlink with a
+        // steady cursor. Preserve the requested shape but always choose its
+        // blinking variant. Also undo DEC mode 12 resets after a parsed batch.
+        term.parser.registerCsiHandler(
+          { final: "q", intermediates: " " },
+          params => {
+            const style = Number(params?.[0] || 0);
+            term.options.cursorStyle = style === 1 || style === 2
+              ? "block"
+              : style === 3 || style === 4 ? "underline" : "bar";
+            term.options.cursorBlink = true;
+            return true;
+          },
+        );
+        term.onWriteParsed(() => {
+          if (!term.options.cursorBlink) term.options.cursorBlink = true;
+        });
+        const fit = new window.FitAddon.FitAddon();
+        term.loadAddon(fit);
+        term.open(host);
+        this._terminal = term;
+        this._terminalFit = fit;
+        this._attachTerminalTouchScroll(host, term);
+        let replayActive = false;
+        let replayWritesPending = 0;
+        const sendSize = () => {
+          if (!this._terminal || !this._terminalSocket) return;
+          try { fit.fit(); } catch (_) {}
+          if (this._terminalSocket.readyState === WebSocket.OPEN) {
+            this._terminalSocket.send(JSON.stringify({
+              type: "resize", rows: term.rows, cols: term.cols,
+            }));
+          }
+        };
+        this._terminalResizeObserver = new ResizeObserver(() => sendSize());
+        this._terminalResizeObserver.observe(host);
+        term.onData(data => {
+          // Replaying historical output can re-run old DA/DSR/OSC queries.
+          // xterm answers them through onData, but the original process is no
+          // longer waiting; forwarding the reply makes readline show fragments
+          // such as "0;276;0c". Suppress input only while replay is parsing.
+          if (replayActive || replayWritesPending) return;
+          this._terminalHandleInput(data, term);
+        });
+        term.onResize(() => sendSize());
+        term.attachCustomKeyEventHandler(event => {
+          if (event.type !== "keydown") return true;
+          const key = String(event.key || "").toLowerCase();
+          const copy = key === "c"
+            && (event.metaKey || (event.ctrlKey && event.shiftKey));
+          const paste = key === "v"
+            && (event.metaKey || (event.ctrlKey && event.shiftKey));
+          if (copy) {
+            this.terminalCopy();
+            return false;
+          }
+          if (paste) {
+            this.terminalPaste();
+            return false;
+          }
+          return true;
+        });
+        term.focus();
+
+        const ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
+          method: "POST",
+          headers: this.fileHdr(),
+        });
+        if (!ticketResponse.ok) throw new Error(ticketResponse.error || "ticket failed");
+        if (seq !== this._terminalConnectSeq) return;
+        const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(
+          `${scheme}//${location.host}/api/terminals/${encodeURIComponent(id)}/ws`,
+          [ticketResponse.data.protocol, ticketResponse.data.ticket],
+        );
+        socket.binaryType = "arraybuffer";
+        this._terminalSocket = socket;
+        socket.onopen = () => {
+          if (seq !== this._terminalConnectSeq) return;
+          this.terminalConnection = "connected";
+          sendSize();
+          term.focus();
+        };
+        socket.onmessage = event => {
+          if (seq !== this._terminalConnectSeq) return;
+          if (typeof event.data !== "string") {
+            const isReplay = replayActive;
+            if (isReplay) replayWritesPending += 1;
+            term.write(new Uint8Array(event.data), isReplay ? () => {
+              replayWritesPending = Math.max(0, replayWritesPending - 1);
+            } : undefined);
+            return;
+          }
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === "ready" && message.terminal) {
+              this.terminals = this.terminals.map(item =>
+                item.id === id ? message.terminal : item);
+            } else if (message.type === "replay_start") {
+              replayActive = true;
+            } else if (message.type === "replay_end") {
+              replayActive = false;
+            } else if (message.type === "exit") {
+              this.terminalConnection = "exited";
+              this.terminalExitCode = message.exit_code;
+              this.terminals = this.terminals.map(item => item.id === id
+                ? { ...item, status: "exited", exit_code: message.exit_code } : item);
+            }
+          } catch (_) {}
+        };
+        socket.onclose = () => {
+          if (seq !== this._terminalConnectSeq) return;
+          this._terminalSocket = null;
+          const latest = this.terminals.find(item => item.id === id);
+          if (this.previewSurface === "terminal" && this.activeTerminalId === id
+              && latest && latest.status === "running") {
+            this.terminalConnection = "reconnecting";
+            clearTimeout(this._terminalReconnectTimer);
+            this._terminalReconnectTimer = setTimeout(
+              () => this.openTerminal(id, { reconnect: true }), reconnect ? 2200 : 1000);
+          } else if (this.terminalConnection !== "exited") {
+            this.terminalConnection = "disconnected";
+          }
+        };
+        socket.onerror = () => {
+          if (seq === this._terminalConnectSeq) this.terminalConnection = "reconnecting";
+        };
+      } catch (error) {
+        if (seq !== this._terminalConnectSeq) return;
+        this.terminalConnection = "error";
+        this.toast((this.lang === "zh" ? "终端连接失败：" : "Terminal connection failed: ")
+          + error.message, "error");
+      }
+    },
+    _teardownTerminalView() {
+      ++this._terminalConnectSeq;
+      clearTimeout(this._terminalReconnectTimer);
+      this._terminalReconnectTimer = null;
+      if (this._terminalResizeObserver) this._terminalResizeObserver.disconnect();
+      this._terminalResizeObserver = null;
+      if (this._terminalTouchCleanup) this._terminalTouchCleanup();
+      this._terminalSuppressMouseUntil = 0;
+      const socket = this._terminalSocket;
+      this._terminalSocket = null;
+      if (socket) {
+        socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+        try { socket.close(1000, "surface changed"); } catch (_) {}
+      }
+      if (this._terminal) {
+        try { this._terminal.dispose(); } catch (_) {}
+      }
+      this._terminal = null;
+      this._terminalFit = null;
+      this.terminalConnection = "idle";
+    },
+    terminalCopy() {
+      const text = this._terminal && this._terminal.getSelection();
+      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    },
+    async terminalPaste() {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) this._terminalSend(text);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "无法读取剪贴板" : "Could not read clipboard", "warn");
+      }
+    },
+
     async openFile(n, opts = {}) {
       if (!n || !n.path) return false;
+      if (this.previewSurface === "terminal") this._teardownTerminalView();
+      this.previewSurface = "file";
       // Clicking / double-clicking the file that already owns the editor is a
       // focus or pin gesture, not a request to throw the buffer away and read
       // it again. The old path guard only prompted for a *different* file, but
@@ -14013,7 +14751,10 @@ function portal() {
     async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
 
     async switchTab(path) {
-      if (!path || path === this.selected) return true;
+      if (!path || (path === this.selected && this.previewSurface === "file")) return true;
+      // A terminal overlays the last selected file without clearing
+      // `selected`. Clicking that same (usually rightmost) file tab must still
+      // route through openFile so the preview surface leaves terminal mode.
       // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容。
       // Preserve the tab's preview/pinned state: a single-click to view a
       // preview tab must NOT pin it (only a double-click / edit does). Pass
@@ -14432,12 +15173,24 @@ function portal() {
       const yieldToLoop = window.requestAnimationFrame
         ? (fn) => window.requestAnimationFrame(fn)
         : (fn) => setTimeout(fn, 16);
-      const CHUNK = 8;
+      // Keep each highlight pump within a layout-specific frame budget.
+      // Desktop can finish a cold code-heavy conversation in fewer frames;
+      // phones yield sooner so scrolling, typing and the soft keyboard remain
+      // responsive even when auto-detection hits an expensive block.
+      const maxChunk = this._isMobileLayout() ? 4 : 12;
+      const frameBudgetMs = this._isMobileLayout() ? 6 : 12;
       let i = 0;
       return new Promise((resolve) => {
         const pump = () => {
-          const end = Math.min(i + CHUNK, nodes.length);
-          for (; i < end; i++) this._highlightOne(nodes[i]);
+          const started = performance.now();
+          const end = Math.min(i + maxChunk, nodes.length);
+          for (; i < end; i++) {
+            this._highlightOne(nodes[i]);
+            if (performance.now() - started >= frameBudgetMs) {
+              i++;
+              break;
+            }
+          }
           if (i < nodes.length) yieldToLoop(pump);
           else resolve(runArtifacts());
         };
@@ -16913,10 +17666,10 @@ function portal() {
     },
 
     // 2026-05-23: startProfileIntake removed — 「设置档案」按钮已合并入
-    // 「整理档案」(startOrganize). 整理档案 workflow 现在同时覆盖 archive
-    // 整理 + CLAUDE.md profile 补全（见 backend/prompts.py CURATOR_SYSTEM_PROMPT
-    // 第 3 步 3b 节）。后端 /sessions/profile-intake 端点保留向后兼容，
-    // 现在 forward 到 /sessions/organize.
+    // 「整理档案」(startOrganize). 整理档案 workflow 现在由
+    // archive-curator Skill 同时覆盖 archive 整理和 CLAUDE.md profile
+    // 补全。后端 /sessions/profile-intake 端点保留向后兼容，forward 到
+    // /sessions/organize。
 
     // 2026-05-24: showWelcomeCard / dismissWelcome removed.
     // The pre-setup "what is muselab + 3 steps" card was replaced by the

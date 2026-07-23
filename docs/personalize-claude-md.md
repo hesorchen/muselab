@@ -6,8 +6,10 @@ Muse is a single assistant — it understands the user's health, daily
 activities, finances, relationships, and life as a whole. It does not
 switch personas by topic; every response is informed by the full context.
 
-To support this, Muse reads the `CLAUDE.md` at the root of the archive
-on every startup. This file is the user's autobiographical brief to Muse.
+The Claude Agent SDK discovers `CLAUDE.md` from the active working directory.
+It can hold both the user's autobiographical brief and durable instructions for
+Muse's identity, response style, memory boundaries, and tool-use rules. muselab
+does not inject another global or per-session system prompt.
 
 **Important**: the template is neutral across life stages — students,
 employees, freelancers, full-time parents, retirees, founders — all are
@@ -17,18 +19,23 @@ accommodated. Delete sections that do not apply; do not force-fill.
 
 ## How to generate this file
 
-### Chat-driven intake — "Organize archive" button (recommended)
+### Chat-driven intake with the `archive-curator` Skill (recommended)
 
-Click the **Organize archive** button in the top bar (curator mode).
-Muse opens a session, scans the archive's current state, and walks through
-the still-empty sections of `CLAUDE.md` — one question at a time, saving
-each answer via `Edit`. Any section can be skipped by saying "skip" or
-"not now". Sensitive sections (money / health) are handled more gently —
-Muse asks for rough orders of magnitude first, with exact figures
-only if offered voluntarily.
+Open **Skills** from the chat header, find `archive-curator`, click
+**Try this**, and send the prefilled prompt. You can also tell Muse directly:
+"Use the `archive-curator` skill to organize my archive and complete
+`CLAUDE.md`."
 
-If `CLAUDE.md` doesn't exist yet, an orange "no archive" chip appears in
-the top bar; clicking it lands on the same workflow.
+The Skill scans the archive's current state and walks through the still-empty
+sections of `CLAUDE.md` — one question at a time, saving each answer via
+`Edit`. Any section can be skipped by saying "skip" or "not now". Sensitive
+sections (money / health) are handled more gently: Muse asks for rough orders
+of magnitude first, with exact figures only if offered voluntarily.
+
+For an empty archive, a new chat also shows **Open CLAUDE.md and fill it
+together**; that action starts the same workflow. If `CLAUDE.md` does not
+exist, an orange **no archive** chip appears in the chat header; click it to
+see the file location and setup instructions.
 
 ### Use the installer (alternative, less interactive)
 
@@ -48,8 +55,8 @@ The first run of `scripts/install-{linux,macos}` offers to:
 4. Tell you which originals to drop into which directory next
 
 Skipping intake is acceptable — press Enter on every question to continue.
-The remaining sections can be completed any time via the top-bar
-"Organize archive" button.
+You can invoke `archive-curator` again from Skills at any time to complete the
+remaining sections.
 
 ### Manual
 
@@ -69,14 +76,15 @@ done
 
 ---
 
-## The 6 sections of the template
+## Template structure
 
-CLAUDE.md is a deliberately bare skeleton — it's loaded into Muse's
-context on every conversation, so it carries no filling instructions or
-option lists, only fields.
+CLAUDE.md enters Muse's context on every conversation, so it should remain
+short, explicit, and maintainable. The template contains a durable working
+agreement followed by six personal-context sections.
 
 | Section | What to put |
 |---------|-------------|
+| **Muse working agreement** | Identity / response style / memory and sources of truth / tool-use rules |
 | **1. Who I am** | Name / birth year / lives in / languages / household |
 | **2. What I'm mainly doing** | Life stage (one line) / main activity / how long / goal this year / big decision this year |
 | **3. Money** | Income source / asset-liability scale / current focus / risk tolerance |
@@ -130,13 +138,14 @@ any particular life stage:
 - `people/`, not `family/` (also fits solo / unmarried / friend-only circles)
 - "What you do most of the week", not "What's your job?"
 
-### Behavioral commitments live with each subdirectory, not in CLAUDE.md
+### Durable behavioral commitments belong in CLAUDE.md
 
-Domain-specific constraints (health: cite guidelines, no diagnosis; money:
-no price predictions; etc.) live in each subdirectory's `README.md`
-(e.g. `health/README.md`, `money/README.md`). Muse reads those when it
-enters the corresponding directory. CLAUDE.md itself stays a bare-bones
-fact sheet about you.
+Cross-domain, durable instructions belong in `CLAUDE.md`: Muse's identity,
+response style, which files are authoritative, when to read source material,
+and how to state uncertainty. Domain-specific constraints may remain in each
+subdirectory's `README.md`, such as evidence rules for health records or risk
+boundaries for financial material. Both are discovered natively by the Claude
+Agent SDK; muselab does not maintain a second prompt layer.
 
 ---
 

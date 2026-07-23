@@ -1,146 +1,88 @@
-# 安全模型
+# 后端安全模型
 
 > [English](backend-security.md)
 
-本页介绍 muselab 的安全架构：鉴权 token 如何在系统中流转、文件系统隔离层的作用机制、哪些设置可以在运行时修改而哪些不可以、第三方模型提供商如何与 Anthropic 账户隔离，以及默认的网络策略。漏洞报告政策和运维加固清单请参阅 [../SECURITY.md](../SECURITY.md)。
-
----
-
-## 威胁模型
-
-muselab 是一个**单用户、自托管、优先本地访问**的应用。它没有用户账户系统，没有基于角色的访问控制（RBAC），也不支持多租户。持有 `MUSELAB_TOKEN` 的人可以读取、写入、上传和删除 `MUSELAB_ROOT` 下的任意文件，并且能够驱动一个以 `permission_mode="bypassPermissions"` 和 `cwd=MUSELAB_ROOT` 运行的 Claude Agent SDK 会话。实际含义是：token 泄露等同于获得了归档目录范围内的远程 shell 访问权限。这是设计上的权衡取舍——muselab 是 AI 归档管理器，不是沙箱。缓解措施属于运维层面：以专用的低权限用户运行、使用足够长且随机的 token、在前面放一个 TLS 反向代理、永远不要将 8765 端口暴露到公网。
-
----
+muselab 是单用户应用。一个共享 token 保护 UI 与 API，但该 token 不是细粒度权限系统：获得 token 的人应被视为获得了 muselab 服务用户能够执行的全部操作。
 
 ## 鉴权
 
-### Token 来源与最短长度
+- `MUSELAB_TOKEN` 至少 16 个字符；缺失或过短时服务拒绝启动。
+- 普通 API 优先使用 `X-Auth-Token` header。
+- 必须由浏览器直接导航的少数资源接受 `?token=`，例如下载、原始预览和持久化附件。
+- token 比较使用恒定时间比较。
+- `GET /api/health` 和限速后的浏览器错误上报不要求 token；业务 API 默认全部要求鉴权。
 
-`MUSELAB_TOKEN` 在模块导入时从环境变量读取（向后兼容已废弃的 `PORTAL_TOKEN`），位于 [`backend/settings.py:L195`](../backend/settings.py#L195)。启动时强制要求**最短 16 字符**：如果 token 不存在或长度不足 16 字符，服务器会抛出 `RuntimeError` 并拒绝启动（[`backend/settings.py:L229-L235`](../backend/settings.py#L229-L235)）。
+查询参数可能进入浏览器历史与代理日志。muselab 自身会清理访问日志中的 token，但反向代理也必须配置脱敏。公网部署必须使用 HTTPS。
 
-### 恒定时间比较
+## SSE 一次性 ticket
 
-所有 token 校验使用 [`hmac.compare_digest()`](../backend/auth.py#L7-L19) 而非 Python 的 `==` 运算符。Python 的字符串相等判断在遇到第一个不匹配字节时就会短路，通过局域网响应时间可以泄露已匹配的前缀长度。`hmac.compare_digest` 的运行时间与两个输入中较长者的长度成正比，与首个差异位置无关（[`backend/auth.py:L7-L19`](../backend/auth.py#L7-L19)）。
+浏览器发送消息时采用两步流程：
 
-### 三种依赖变体
+1. `POST /api/chat/stream/start` 使用 header 鉴权，并在 JSON body 中提交 prompt、会话、模型、权限、附件 ID 和移动端标记。
+2. 后端返回一个有效期 60 秒、单次使用的 ticket；浏览器再连接 `GET /api/chat/stream?ticket=...`。
 
-三个 FastAPI 依赖项处理不同的传输约束（[`backend/auth.py:L22-L54`](../backend/auth.py#L22-L54)）：
+ticket 首次兑换时立即从内存删除，因此 prompt 和长期 token 不进入 SSE URL。旧版 `GET /stream?token=...` 查询参数形式仅为兼容旧客户端保留，不应作为新集成方式。
 
-| 依赖项 | 使用方 | Token 接受来源 |
-|--------|--------|---------------|
-| `require_token` | 大多数 `/api/files/*`、`/api/settings/*`、`/api/meta`、`/api/presence` | 仅 `X-Auth-Token` header |
-| `require_token_query` | `/api/files/raw`、`/api/files/download` | 仅 `?token=` 查询参数 |
-| `require_token_header_or_query` | Chat SSE 流（`/api/chat/stream`） | header 或 `?token=` 均可 |
+## 终端 WebSocket ticket
 
-查询参数变体的存在是因为浏览器无法为 `<iframe src>` 与 `EventSource` 连接发送自定义 header。需要鉴权的图片预览会用 `X-Auth-Token` fetch 图片字节，再渲染为 blob URL，因此不会把全局 token 放进图片 URL。`fetch()` 调用可以使用 header 且优先这样做；查询参数路径作为 iframe 下载和复制链接的备用方案保留（[`backend/auth.py:L33-L54`](../backend/auth.py#L33-L54)）。
+真实终端采用独立的两步鉴权：
 
-### 无需鉴权的路由
+1. 已鉴权请求调用 `POST /api/terminals/{terminal_id}/ticket`。
+2. 后端返回 30 秒有效、单次使用的 ticket；浏览器通过 WebSocket subprotocol 同时发送 `muselab-terminal-v1` 与该 ticket。
 
-以下路由无需 token：
+服务端只保存 ticket 的 SHA-256 摘要，兑换时绑定终端 ID；请求带有 WebSocket `Origin` 时，还会校验其与请求 `Host` 一致。浏览器不会把长期 token 放入 WebSocket URL。
 
-| 路由 | 原因 |
-|------|------|
-| `GET /api/health` | Docker / k8s / Caddy `health_uri` 存活探针（[`backend/main.py:L529-L535`](../backend/main.py#L529-L535)） |
-| `POST /api/log/client-error` | 在鉴权建立前捕获浏览器错误；每 IP 限速 30 次/分钟（[`backend/main.py:L582-L622`](../backend/main.py#L582-L622)） |
-| `GET /`、`/static/*`、`/sw.js`、`/robots.txt`、`/static/assets/manifest.webmanifest` | HTML 外壳、前端资源、PWA 清单文件 —— 不含私人数据 |
+## 权限边界
 
----
+### 文件 API
 
-## 文件系统隔离
+文件 API 的每个请求绑定默认或已登记工作目录。路径会规范化并验证仍位于选中目录内；符号链接目标也必须留在边界内。敏感文件名、NUL 字节和对回收站内部的直接写入会被拒绝。
 
-muselab Files API 的每个文件操作在进行任何文件系统调用前都经过 `safe_resolve()`。该函数屏蔽路径穿越（`../../etc/passwd`）、符号链接逃逸（通过解析目标路径并检查其是否在 `ROOT` 下）、NUL 字节注入，以及对形如凭据的文件名（`.env*`、`id_rsa`、`*.pem`、`credentials.json` 及 30 余种其他模式）的访问——即使持有有效 token 也不例外。`MUSELAB_ROOT` 本身禁止指向系统路径（`/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot`），在启动时强制检查。
+工作目录注册并不是服务用户权限隔离。只应登记愿意通过 Web UI 暴露的目录。
 
-完整细节，包括 `SENSITIVE_NAMES` 和 `SENSITIVE_SUFFIX` 的完整屏蔽列表以及回收站还原的 `allow_sensitive=True` 例外情况，请参阅 [backend-files_zh.md](backend-files_zh.md)（见 `safe_resolve` 章节）。
+### Agent 与终端
 
----
+文件 API 的路径边界**不适用于** Agent 工具或真实终端：
 
-## 设置接口
+- Agent 的 Bash、Read、Write 等工具依照当前 SDK 权限模式运行。
+- 预览区终端是真实 Unix PTY，能以 muselab 服务用户权限访问工作目录之外的路径。
+- 终端进程使用最小环境白名单，不继承 `MUSELAB_TOKEN` 或 provider API key；这能减少凭据泄露，但不能限制文件系统权限。
 
-### `PUT /api/settings` 可修改的内容
+若不需要真实终端，设置 `MUSELAB_TERMINAL_ENABLED=0`。生产或共享机器应使用专门的低权限系统用户运行 muselab，并依赖容器、虚拟机或操作系统权限建立真正隔离。
 
-设置写入接口（[`backend/api_settings.py:L275-L404`](../backend/api_settings.py#L275-L404)）接受严格类型化的 `SettingsIn` 请求体，并在写入 `.env` 前应用**字段名白名单**。可写字段如下：
+## Provider 凭据隔离
 
-| 字段 | 写入的环境变量 |
-|------|--------------|
-| `anthropic_api_key` / `deepseek_api_key` / `zhipuai_api_key` / `minimax_api_key` | 对应的 `*_API_KEY` 变量 |
-| `provider_keys`（dict） | 提供商目录 `env_key` 集合中的任意名称，或匹配 `^MUSELAB_PROVIDER_[A-Z0-9_]+_API_KEY$` 的名称 |
-| `default_model` | `MUSELAB_DEFAULT_MODEL` + `MUSELAB_MODEL`（保持同步） |
-| `default_permission` | `MUSELAB_DEFAULT_PERMISSION` |
-| `provider_disabled` | `MUSELAB_DISABLED_PROVIDERS` |
+非 Anthropic provider 的 CLI 子进程收到一份最小化的完整环境替换，而不是父进程环境的合并副本。环境只包含进程运行、代理和 TLS 所需变量，以及当前 provider 的 endpoint 和凭据。
 
-不在白名单中的字段会被**静默丢弃** —— `PATH`、`MUSELAB_TOKEN`、`MUSELAB_ROOT` 以及任何任意环境变量都无法通过此接口写入（[`backend/api_settings.py:L309-L311`](../backend/api_settings.py#L309-L311)）。
+`CLAUDE_CONFIG_DIR` 指向按系统用户隔离的临时目录，并清除可能出现的 Claude OAuth 凭据，避免第三方请求静默回退到 Anthropic。其他 provider 的 key 与 `MUSELAB_TOKEN` 不会传入该子进程。
 
-### 永远无法通过 API 修改的内容
+## 设置写入
 
-- `MUSELAB_TOKEN` —— 不在任何白名单中；在已认证的会话内修改鉴权 token 会产生权限提升面。
-- `MUSELAB_ROOT` —— 运行时修改根目录可能静默地将文件操作重定向到意外位置。
-- `PATH` 或其他任何不在白名单中的进程环境变量。
+设置 API 只允许写入明确白名单中的字段。`MUSELAB_TOKEN`、`MUSELAB_ROOT`、`PATH` 等部署级变量不能从 UI 修改。
 
-### 脱敏值拒绝写入
+- API key 返回前会脱敏。
+- 包含脱敏符号的值不会覆盖真实 key。
+- 值中的 CR/LF 会被移除，防止 `.env` 换行注入。
+- `.env` 通过临时文件和原子替换写入；可热更新的值会同步到当前进程。
 
-`GET /api/settings` 返回的提供商 API key 经过脱敏处理（`first4•••last4`，使用 U+2022 BULLET 符号）。向 `PUT /api/settings` 提交的任何包含 `•` 的值都会被**拒绝而不写入**，防止前端 bug 将脱敏后的展示值意外回传并覆盖真实 key（[`backend/api_settings.py:L319-L324`](../backend/api_settings.py#L319-L324)）。
+## HTTP 防护
 
-### `.env` 原子重写
+所有响应设置：
 
-设置变更通过 `tempfile.mkstemp` + `os.replace` 原子写入（[`backend/api_settings.py:L163-L173`](../backend/api_settings.py#L163-L173)）。写入前会从值中去除 CR/LF 字符，防止换行注入攻击——攻击者可能通过在值中插入换行，在下次 `load_dotenv` 时将一个值拆分成多行 `KEY=VALUE`（[`backend/api_settings.py:L129-L133`](../backend/api_settings.py#L129-L133)）。文件写入后立即在进程内更新 `os.environ`，使变更无需重启即可生效。
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: SAMEORIGIN`
+- `Referrer-Policy: same-origin`
 
----
+HTML 与 SVG 原始预览使用隔离响应和严格 CSP。主 UI 由于 Alpine 内联指令没有启用全局严格 CSP。
 
-## 第三方模型的计费隔离
+## 威胁模型与部署建议
 
-当 muselab 将会话路由到第三方提供商（DeepSeek、GLM、MiniMax、Kimi、Qwen、MiMo、千帆）时，会构建一个**最小白名单环境**，并以**完全替换**（而非合并）的方式传给 Claude CLI 子进程（[`backend/endpoints.py:L851-L930`](../backend/endpoints.py#L851-L930)）。
+| 风险 | 实际影响 | 建议 |
+|---|---|---|
+| token 泄露 | 可操作会话、工作目录、Agent、设置和真实终端，等价于获得服务用户级远程操作能力 | 使用长随机 token、HTTPS、代理日志脱敏和独立服务用户 |
+| 恶意预览文件 | HTML/SVG 可能主动执行内容 | 保持预览 CSP，不关闭隔离头 |
+| 恶意附件或网页 | 可能通过 prompt injection 操纵 Agent | 对外部内容使用更严格权限，不自动批准高风险操作 |
+| 升级接口 | 已鉴权用户可触发固定包的安装脚本 | 不需要在线升级时在反向代理阻断该端点 |
+| 多 worker | 内存 ticket、限速桶、活动回合和终端注册表不会跨 worker 共享 | 使用默认单 worker 部署 |
 
-替换后的环境精确包含以下内容：
-
-```
-ANTHROPIC_BASE_URL       = <厂商端点>
-ANTHROPIC_API_KEY        = <厂商 key>      # x-api-key header
-ANTHROPIC_AUTH_TOKEN     = <厂商 key>      # 双保险 Bearer
-CLAUDE_CODE_OAUTH_TOKEN  = ""              # 终止 OAuth 回退
-CLAUDE_OAUTH_TOKEN       = ""              # 终止 OAuth 回退
-CLAUDE_CONFIG_DIR        = <隔离的临时目录>
-```
-
-再加上一份简短的进程基础变量白名单（`PATH`、`HOME`、`USER`、locale、代理、TLS CA 变量）—— 其他一概不传。
-
-**`CLAUDE_CONFIG_DIR` 隔离为何能防止 Anthropic 被静默计费。** Claude CLI 优先使用 `~/.claude/.credentials.json`（Pro OAuth）而非 `ANTHROPIC_API_KEY`。如果不隔离，一个 DeepSeek 会话会把 Claude OAuth token 发到 `api.deepseek.com`，收到 401 后静默回退到 `api.anthropic.com`——将费用计到你的 Claude Pro 账户。将 `CLAUDE_CONFIG_DIR` 指向一个不含凭据文件的、每用户独立的临时目录（`/tmp/muselab-vendor-cli-config-<uid>/`），强制 CLI 使用注入的 API key。该目录下任何泄露的凭据文件在每次调用时都会被删除（[`backend/endpoints.py:L879-L887`](../backend/endpoints.py#L879-L887)）。
-
-**最小白名单环境为何能防止 key 外泄。** CLI 子进程以 `bypassPermissions` 运行且能访问互联网。如果继承完整的父进程环境，`MUSELAB_TOKEN` 和每个提供商的 `*_API_KEY` 都会暴露给 agent，后者可能通过 Bash 工具调用（`echo $MUSELAB_TOKEN`）将其外泄。白名单确保子进程只能看到连接该厂商所必需的信息（[`backend/endpoints.py:L895-L910`](../backend/endpoints.py#L895-L910)）。
-
-提供商目录和模型解析细节另见 [routing_zh.md](routing_zh.md)。
-
----
-
-## 网络策略
-
-**绑定地址。** muselab 默认绑定到 `127.0.0.1`（仅本地回环）。[`backend/settings.py:L206-L209`](../backend/settings.py#L206-L209) 中的注释明确指出，对于默认的单用户安装场景，绑定到 LAN 地址是一个陷阱。仅在有 TLS 终止代理的 LAN / VPS / Docker 场景下，才通过 `.env` 中的 `MUSELAB_HOST` 覆盖为 `0.0.0.0`。
-
-**响应头。** `_security_headers` 中间件（[`backend/main.py:L299-L331`](../backend/main.py#L299-L331)）通过 `setdefault` 为每个响应附加以下三个 header（接口自己设置的 header 优先级更高）：
-
-| Header | 值 | 用途 |
-|--------|-----|------|
-| `X-Content-Type-Options` | `nosniff` | 防止对文件预览进行 MIME 嗅探 |
-| `Referrer-Policy` | `same-origin` | 防止跨域导航时通过 `Referer` 泄露 token |
-| `X-Frame-Options` | `SAMEORIGIN` | 阻止外部网站将 UI 嵌入 iframe |
-
-**不设全局 CSP。** UI 使用了 Alpine.js 内联指令（`x-on:`、`@click`、`:class`）和多个内联 `<script>` 标签。严格 CSP 需要为每个请求生成 nonce 或允许 eval，维护成本对单用户应用来说不划算。通过 `/api/files/raw` 提供的 HTML/SVG 文件*会*获得一个针对该响应的严格 CSP（[`backend/files.py:L694-L704`](../backend/files.py#L694-L704)）。
-
-**不内置 HSTS。** `Strict-Transport-Security` 只在 HTTPS 下有意义。muselab 通常在 `127.0.0.1` 上以明文运行；在明文 localhost 上启用 HSTS 会让反向代理配置产生混乱。运维人员应在反向代理层设置 HSTS。
-
-**反向代理日志注意事项。** muselab 自身的访问日志会通过 `_TokenFilter`（[`backend/main.py:L23-L62`](../backend/main.py#L23-L62)）从 URL 中去除 `token=` 参数，但反向代理会记录原始 URL。请配置你的代理对 `token` 查询参数进行脱敏处理——nginx 和 Caddy 的示例见 [../SECURITY.md](../SECURITY.md)。
-
----
-
-## 已知局限
-
-| 局限 | 影响 | 缓解措施 |
-|------|------|----------|
-| **单用户，无 RBAC** | 持有 token 即可完全访问归档；无法按用户或目录划分权限 | 仅为一名受信任的用户运行；将 token 视同 root 凭据 |
-| **大多数接口无每请求限速** | 有效 token 可以洪泛服务器；上传大小有上限（100 MB），但请求频率没有 | 若暴露给多个用户，在前面放置带全局限速的 Caddy 或 nginx（参考 [SECURITY.md](../SECURITY.md)） |
-| **升级接口在设计上是 token 门控的 RCE** | `POST /api/settings/upgrade` 会运行 `uv` 和 `npm` 子进程；包安装会执行任意脚本（[`backend/api_settings.py:L1367-L1388`](../backend/api_settings.py#L1367-L1388)） | token 本就授予了等效的访问权限；包名是固定字面量，非用户输入。若要消除该攻击面，在反向代理处屏蔽 `POST /api/settings/upgrade` |
-| **不支持多 worker** | 限速桶（`_CLIENT_ERR_BUCKETS`）仅在进程内；多 worker 部署会静默绕过限制（[`backend/main.py:L554-L556`](../backend/main.py#L554-L556)） | 使用单 worker 部署（默认设置） |
-| **Token 出现在反向代理日志中** | SSE 和下载接口使用 `?token=` 查询参数；muselab 本地会去除，但上游代理会记录原始 URL | 配置代理日志格式脱敏 `token` 字段 —— 参考 [../SECURITY.md](../SECURITY.md) 中的 nginx 和 Caddy 示例 |
-
----
-
-*相关页面：[configuration_zh.md](configuration_zh.md) · [routing_zh.md](routing_zh.md) · [backend-files_zh.md](backend-files_zh.md) · [../SECURITY.md](../SECURITY.md)*
+另见项目根目录的 `SECURITY.md`。
