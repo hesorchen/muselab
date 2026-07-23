@@ -376,7 +376,20 @@ def test_mobile_html_restore_overrides_report_smooth_scroll(
           return app.selected === 'smooth-preview.html' && app.previewMode === 'html';
         }"""
     )
-    frame = page.frame(url=lambda url: "smooth-preview.html" in url)
+    iframe = page.locator(
+        'iframe[data-preview-html-path="smooth-preview.html"]',
+    )
+    expect(iframe).to_be_visible(timeout=5000)
+    page.wait_for_function(
+        """() => {
+          const frame = document.querySelector(
+            'iframe[data-preview-html-path="smooth-preview.html"]');
+          return frame && frame.src.includes('smooth-preview.html');
+        }""",
+        timeout=5000,
+    )
+    handle = iframe.element_handle()
+    frame = handle.content_frame() if handle else None
     assert frame is not None
     frame.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(300)

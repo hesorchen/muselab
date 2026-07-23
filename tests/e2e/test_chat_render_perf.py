@@ -1246,15 +1246,24 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
                     return {top: r.top, bottom: r.bottom, width: r.width, height: r.height};
                   };
                   const toolbar = pick(".chat-toolbar");
-                  const sendLabel = pick(
-                    ".chat-toolbar-queue > span:nth-child(2)");
+                  const send = pick(".chat-toolbar-queue");
+                  const stop = pick(".chat-toolbar-stop");
+                  const textLabelCount = button => Array.from(button.children)
+                    .filter(child => !child.classList.contains("icon")
+                      && !child.classList.contains("chat-toolbar-queue-badge"))
+                    .length;
                   return {
                     composer: box(".chat-input"),
                     wrapPadding: getComputedStyle(pick(".chat-input-wrap")).paddingTop,
                     flexShrink: getComputedStyle(pick(".chat-input")).flexShrink,
                     toolbarOverflow: toolbar.scrollWidth - toolbar.clientWidth,
                     nav: box(".mobile-tab-bar"),
-                    sendLabelDisplay: getComputedStyle(sendLabel).display,
+                    sendWidth: send.getBoundingClientRect().width,
+                    sendLabelCount: textLabelCount(send),
+                    sendAria: send.getAttribute("aria-label") || "",
+                    stopWidth: stop.getBoundingClientRect().width,
+                    stopLabelCount: textLabelCount(stop),
+                    stopAria: stop.getAttribute("aria-label") || "",
                   };
                 }"""
             )
@@ -1263,7 +1272,9 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
         assert idle["wrapPadding"] == "0px"
         assert idle["flexShrink"] == "0"
         assert idle["toolbarOverflow"] <= 1
-        assert idle["sendLabelDisplay"] != "none"
+        assert idle["sendWidth"] == 44
+        assert idle["sendLabelCount"] == 0
+        assert idle["sendAria"]
         assert idle["composer"]["height"] <= 120
         assert idle["composer"]["bottom"] <= idle["nav"]["top"] + 1
 
@@ -1282,6 +1293,9 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
         )
         busy = composer_metrics()
         assert busy["toolbarOverflow"] <= 1
+        assert busy["stopWidth"] == 44
+        assert busy["stopLabelCount"] == 0
+        assert busy["stopAria"]
         assert busy["composer"]["bottom"] <= busy["nav"]["top"] + 1
 
         page.set_viewport_size({"width": 320, "height": 700})
