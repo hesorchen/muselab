@@ -34,7 +34,6 @@
 - [安全模型](backend-security_zh.md) —— 鉴权、账单隔离与已知局限
 - [前端内部机制](frontend_zh.md) —— 无构建 SPA、渲染流水线、SSE 客户端、service worker
 - [终端](terminal_zh.md) —— 终端生命周期、连接协议、Profile 和安全边界
-- [MCP 架构](mcp-architecture_zh.md) —— 连接器策略与三层模型
 - [基础设施](infrastructure_zh.md) —— 脚本、服务、Docker、测试、CI/CD
 
 ## 参考

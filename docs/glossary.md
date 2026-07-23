@@ -32,7 +32,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **longest-prefix routing** — The algorithm muselab uses to map a model ID to its provider. `lookup(model)` in `backend/endpoints.py` sorts all provider prefixes longest-first and returns the first match, case-insensitively. Colon-tagged prefixes (e.g. `qwen-intl:`) are normalised before the model ID is sent to the vendor so the vendor never sees the routing tag.
 
-**MCP (Model Context Protocol)** — A standard for attaching external tool servers to the agent. muselab surfaces MCP configuration at `Settings → MCP` and merges its own `mcp.json` with Claude Code's global configs. The `ask_user_question` MCP tool is handled specially: muselab does not block it, instead re-routing it through an in-process queue so the browser can display the question inline. See [`mcp-architecture.md`](mcp-architecture.md).
+**MCP (Model Context Protocol)** — A standard for attaching external tool servers to the agent. muselab surfaces MCP configuration at `Settings → MCP` and merges its own `mcp.json` with Claude Code's global configs. The `ask_user_question` MCP tool is handled specially: muselab does not block it, instead re-routing it through an in-process queue so the browser can display the question inline.
 
 **message queue** — A per-session FIFO queue (`sessions/<sid>.queue.json`) that holds prompts submitted while a turn is already running. The drain loop starts the next turn automatically when the current one finishes. Max depth is 10. The queue auto-pauses if a turn errors or is cancelled. See [`backend-sessions.md — The message queue`](backend-sessions.md).
 

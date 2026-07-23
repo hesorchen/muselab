@@ -40,8 +40,6 @@ Implementation guides — start at [Architecture](architecture.md) for the map.
   client, service worker
 - [Terminal](terminal.md) — lifecycle, connection protocol, Profiles, and
   security boundary
-- [MCP architecture](mcp-architecture.md) — connector strategy and the
-  three-layer model
 - [Infrastructure](infrastructure.md) — scripts, services, Docker, tests, CI/CD
 
 ## Reference

@@ -32,7 +32,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **longest-prefix routing（最长前缀路由）** — muselab 用于将模型 ID 映射到其提供商的算法。`backend/endpoints.py` 中的 `lookup(model)` 将所有提供商前缀按长度降序排列，返回第一个匹配项（不区分大小写）。冒号标记的前缀（如 `qwen-intl:`）在将模型 ID 发送给提供商前会被规范化，提供商永远看不到路由标签。
 
-**MCP（Model Context Protocol，模型上下文协议）** — 将外部工具服务器附加到 agent 的标准。muselab 在「设置 → MCP」中暴露 MCP 配置，并将自身的 `mcp.json` 与 Claude Code 的全局配置合并。`ask_user_question` MCP 工具受到特殊处理：muselab 不会阻塞它，而是通过进程内队列重新路由，以便浏览器能在行内显示问题。参见 [`mcp-architecture.md`](mcp-architecture.md)。
+**MCP（Model Context Protocol，模型上下文协议）** — 将外部工具服务器附加到 agent 的标准。muselab 在「设置 → MCP」中暴露 MCP 配置，并将自身的 `mcp.json` 与 Claude Code 的全局配置合并。`ask_user_question` MCP 工具受到特殊处理：muselab 不会阻塞它，而是通过进程内队列重新路由，以便浏览器能在行内显示问题。
 
 **message queue（消息队列）** — 每会话的 FIFO 队列（`sessions/<sid>.queue.json`），在一个回合已在运行时暂存提交的 prompt。当前回合完成后，排空循环自动启动下一个回合。最大深度为 10。若回合出错或被取消，队列自动暂停。参见 [`backend-sessions.md — The message queue`](backend-sessions.md)。
 
