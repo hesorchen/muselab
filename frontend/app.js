@@ -250,6 +250,13 @@ function portal() {
     // ===== file tree =====
     visible: [], expanded: new Set(), childCache: {}, treeLoading: false,
     treeError: "",
+    // The logical tree can contain thousands of rows, but mounting every row
+    // through Alpine's x-for makes reconciliation super-linear (500 rows can
+    // already take seconds on a small mobile device). Keep the full logical
+    // list for selection / expansion semantics and only mount the viewport
+    // window plus a small overscan buffer.
+    fileTreeViewport: { start: 0, end: 80 },
+    _fileTreeScrollRAF: null,
     selected: "",
     // The row that owns keyboard/copy/paste focus in the file tree. Keep this
     // separate from `selected`, which is the file whose body is rendered in
@@ -12554,6 +12561,84 @@ function portal() {
       if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = !ok;
       return ok;
     },
+    _fileTreeRowHeight() {
+      // Must match .filelist row min-height in styles.css. Coarse pointers use
+      // the larger touch target even when the viewport is desktop-sized.
+      return window.matchMedia && window.matchMedia("(pointer: coarse)").matches
+        ? 40 : 22;
+    },
+    _syncFileTreeViewport(list = this.$refs && this.$refs.fileList) {
+      if (!list) return;
+      const total = this.visible.length;
+      const rowHeight = this._fileTreeRowHeight();
+      const overscan = this._isMobileLayout() ? 8 : 16;
+      const first = Math.max(0, Math.floor(list.scrollTop / rowHeight));
+      const count = Math.max(1, Math.ceil(list.clientHeight / rowHeight));
+      const start = Math.max(0, first - overscan);
+      const end = Math.min(total, first + count + overscan);
+      const current = this.fileTreeViewport || {};
+      if (current.start !== start || current.end !== end) {
+        this.fileTreeViewport = { start, end };
+      }
+    },
+    onFileTreeScroll(ev) {
+      if (this._fileTreeScrollRAF) return;
+      const list = ev.currentTarget;
+      this._fileTreeScrollRAF = requestAnimationFrame(() => {
+        this._fileTreeScrollRAF = null;
+        this._syncFileTreeViewport(list);
+      });
+    },
+    _scheduleFileTreeViewportSync(resetScroll = false) {
+      this.$nextTick(() => {
+        const list = this.$refs && this.$refs.fileList;
+        if (!list) return;
+        if (resetScroll) list.scrollTop = 0;
+        this._syncFileTreeViewport(list);
+      });
+    },
+    fileTreeWindowRows() {
+      const total = this.visible.length;
+      const viewport = this.fileTreeViewport || { start: 0, end: 80 };
+      const start = Math.max(0, Math.min(Number(viewport.start) || 0, total));
+      const end = Math.max(start, Math.min(Number(viewport.end) || 80, total));
+      return this.visible.slice(start, end);
+    },
+    fileTreeTopSpacer() {
+      const start = Math.min(
+        Math.max(0, Number(this.fileTreeViewport && this.fileTreeViewport.start) || 0),
+        this.visible.length,
+      );
+      return start * this._fileTreeRowHeight();
+    },
+    fileTreeBottomSpacer() {
+      const end = Math.min(
+        Math.max(0, Number(this.fileTreeViewport && this.fileTreeViewport.end) || 0),
+        this.visible.length,
+      );
+      return Math.max(0, this.visible.length - end) * this._fileTreeRowHeight();
+    },
+    _positionFileTreePath(path, block = "nearest") {
+      const list = this.$refs && this.$refs.fileList;
+      const idx = this.visible.findIndex(node => node.path === path);
+      if (!list || idx < 0) return false;
+      const rowHeight = this._fileTreeRowHeight();
+      const rowTop = idx * rowHeight;
+      const rowBottom = rowTop + rowHeight;
+      const viewTop = list.scrollTop;
+      const viewBottom = viewTop + list.clientHeight;
+      let nextTop = viewTop;
+      if (block === "center") {
+        nextTop = rowTop - Math.max(0, (list.clientHeight - rowHeight) / 2);
+      } else if (rowTop < viewTop) {
+        nextTop = rowTop;
+      } else if (rowBottom > viewBottom) {
+        nextTop = rowBottom - list.clientHeight;
+      }
+      list.scrollTop = Math.max(0, nextTop);
+      this._syncFileTreeViewport(list);
+      return true;
+    },
     async loadRoot() {
       const treeSeq = ++this._treeLoadSeq;
       this.treeLoading = true;
@@ -12617,6 +12702,7 @@ function portal() {
       this.visible = nextVisible;
       this.expanded = nextExpanded;
       this._pendingExpanded = null;
+      this._scheduleFileTreeViewportSync();
       if (nestedRefreshFailed) {
         this.toast(this.lang === "zh"
           ? "部分目录刷新失败，已保留上次内容"
@@ -12661,6 +12747,7 @@ function portal() {
         if (p.startsWith(path + "/")) this.expanded.delete(p);
       }
       this.expanded = new Set(this.expanded);
+      this._scheduleFileTreeViewportSync();
       // Invalidate the parent dir's cache so a manual collapse+expand
       // (or a future restore-into-this-parent) refetches truth from
       // disk. Both showHidden=true|false variants since we don't know
@@ -12742,6 +12829,7 @@ function portal() {
         }
       }
       this.expanded = new Set(this.expanded);
+      this._scheduleFileTreeViewportSync();
       return true;
     },
     async fetchChildren(path, opts = {}) {
@@ -12822,11 +12910,26 @@ function portal() {
         return true;
       });
     },
-    toggleHidden() {
+    async toggleHidden() {
+      const hadExpanded = this.expanded.size > 0;
       this.showHidden = !this.showHidden;
+      // A hidden-file filter changes every expanded directory. Replaying the
+      // full expanded tree here used to issue one request per directory and
+      // then mount the combined result in a single Alpine update — the exact
+      // click that froze large workspaces. Collapse once and lazily reload
+      // children as the user opens the directories they actually need.
+      this.expanded = new Set();
+      this._pendingExpanded = [];
+      this.childCache = {};
       this.savePrefs();
-      this.reloadTree();
-      this.toast(this.t(this.showHidden ? "toast.hidden_shown" : "toast.hidden_hidden"), "info", 1500);
+      this._scheduleFileTreeViewportSync(true);
+      const ok = await this.loadRoot();
+      if (!ok) return false;
+      const key = this.showHidden
+        ? (hadExpanded ? "toast.hidden_shown_collapsed" : "toast.hidden_shown")
+        : (hadExpanded ? "toast.hidden_hidden_collapsed" : "toast.hidden_hidden");
+      this.toast(this.t(key), "info", hadExpanded ? 2500 : 1500);
+      return true;
     },
     async onNodeClick(ev, n) {
       // ---- Desktop multi-select modifiers ----
@@ -13043,6 +13146,7 @@ function portal() {
       ];
       this.expanded.add(n.path);
       this.expanded = new Set(this.expanded);
+      this._scheduleFileTreeViewportSync();
       return true;
     },
     collapse(n) {
@@ -13058,6 +13162,7 @@ function portal() {
         if (p === n.path || p.startsWith(n.path + "/")) this.expanded.delete(p);
       }
       this.expanded = new Set(this.expanded);
+      this._scheduleFileTreeViewportSync();
     },
     // ===== context menu =====
     openCtxMenu(ev, n) {
@@ -15364,28 +15469,25 @@ function portal() {
       parts.pop();   // drop the filename, keep only directory chain
       const dirPath = parts.join("/");
       if (dirPath) await this.expandPath(dirPath);
-      // Two nextTicks: first to let the mobileTab/searchMode toggles flush
-      // and the filelist-wrap become visible, second to let any final
-      // splice from expandPath render before we query.
+      // With a virtualized tree the target row may intentionally not exist in
+      // DOM yet. Position the logical row first; updating the viewport window
+      // mounts it on the following tick.
       this.$nextTick(() => this.$nextTick(() => {
-        const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
-        const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
-        if (!el) return;
-        // Background mode: nearest (no animation if already on-screen)
-        // keeps the operation invisible. Interactive: center it.
-        el.scrollIntoView({
-          block: interactive ? "center" : "nearest",
-          behavior: "smooth",
+        this._positionFileTreePath(path, interactive ? "center" : "nearest");
+        this.$nextTick(() => {
+          const sel = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
+          const el = document.querySelector(`.filelist li[data-path="${sel}"]`);
+          if (!el) return;
+          if (!interactive) return;
+          // Pulse highlight — independent of `sel` class so it fires even
+          // when this isn't the active tab. Restart by removing+adding so
+          // rapid re-reveals still trigger the animation.
+          el.classList.remove("reveal-pulse");
+          // Force reflow so the next add restarts the animation.
+          void el.offsetWidth;
+          el.classList.add("reveal-pulse");
+          setTimeout(() => el.classList.remove("reveal-pulse"), 1600);
         });
-        if (!interactive) return;
-        // Pulse highlight — independent of `sel` class so it fires even
-        // when this isn't the active tab. Restart by removing+adding so
-        // rapid re-reveals still trigger the animation.
-        el.classList.remove("reveal-pulse");
-        // Force reflow so the next add restarts the animation.
-        void el.offsetWidth;
-        el.classList.add("reveal-pulse");
-        setTimeout(() => el.classList.remove("reveal-pulse"), 1600);
       }));
     },
     closeTab(path) {

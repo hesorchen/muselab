@@ -334,7 +334,7 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
 
     trash = method("async loadTrash()", "\n    openTrashModal()")
     meta = method("async loadSelectedMeta(path)", "\n    // Format a unix-seconds")
-    children = method("async fetchChildren(path, opts = {})", "\n    toggleHidden()")
+    children = method("async fetchChildren(path, opts = {})", "\n    async toggleHidden()")
     upload = method("async _syncUploadedFiles(", "\n    onPreviewTabDragStart")
     save = method("async saveEdit()", "\n    // ===== @ mention")
     palette = method("async _fetchPaletteFiles()", "\n    // Build the item list")
@@ -354,6 +354,34 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
         "this._previewCacheDel(savePath)")
     assert "const requestSeq = ++this._paletteFileSeq" in palette
     assert "requestSeq === this._paletteFileSeq" in palette
+
+
+def test_file_tree_uses_a_bounded_viewport_window():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert "fileTreeViewport: { start: 0, end: 80 }" in app
+    assert "fileTreeWindowRows()" in app
+    assert "onFileTreeScroll(ev)" in app
+    assert '_positionFileTreePath(path, block = "nearest")' in app
+    assert 'x-for="n in fileTreeWindowRows()"' in html
+    assert '@scroll.passive="onFileTreeScroll($event)"' in html
+    assert html.count("filelist-virtual-spacer") == 2
+    assert ".filelist li.filelist-virtual-spacer" in css
+
+
+def test_hidden_toggle_collapses_before_reloading_root():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async toggleHidden()")
+    method = app[start:app.index("\n    async onNodeClick", start)]
+
+    collapse = method.index("this.expanded = new Set()")
+    load = method.index("await this.loadRoot()")
+    assert collapse < load
+    assert "this._pendingExpanded = []" in method
+    assert "this.childCache = {}" in method
+    assert "this._scheduleFileTreeViewportSync(true)" in method
 
 
 def test_context_upload_remembers_the_workspace_that_opened_picker():

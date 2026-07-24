@@ -339,6 +339,7 @@
         <button @click="mkdirPrompt()" class="icon-btn" :title="t('btn.new_dir')"><svg><use href="#i-folder-plus"/></svg></button>
         <button @click="toggleHidden()" class="icon-btn"
                 :class="showHidden ? 'active' : ''"
+                :disabled="treeLoading"
                 :title="showHidden ? t('btn.hide_hidden') : t('btn.show_hidden')">
           <svg><use href="#i-eye"/></svg>
         </button>
@@ -463,9 +464,13 @@
             </button>
           </span>
         </div>
-      <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())"
+      <ul class="filelist" x-ref="fileList"
+          x-init="_attachPTR($el, () => reloadTree()); $nextTick(() => _syncFileTreeViewport($el))"
+          @scroll.passive="onFileTreeScroll($event)"
           @mousedown="onMarqueeStart($event)">
-        <template x-for="n in visible" :key="n.path">
+        <li class="filelist-virtual-spacer" aria-hidden="true"
+            :style="`height:${fileTreeTopSpacer()}px`"></li>
+        <template x-for="n in fileTreeWindowRows()" :key="n.path">
           <li :class="{file: !n.is_dir, dir: n.is_dir, sel: isRowSelected(n), 'drag-over': dragOver===n.path}"
               :style="`padding-left:${10 + n.depth*14}px; --depth: ${n.depth}`"
               :data-path="n.path"
@@ -511,6 +516,8 @@
             <span class="size" x-show="!n.is_dir" x-text="fmtSize(n.size)"></span>
           </li>
         </template>
+        <li class="filelist-virtual-spacer" aria-hidden="true"
+            :style="`height:${fileTreeBottomSpacer()}px`"></li>
         <li class="filelist-status" x-show="treeLoading && !visible.length"
             aria-live="polite">
           <span class="spinner-sm"></span>

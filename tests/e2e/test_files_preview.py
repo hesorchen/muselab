@@ -620,6 +620,101 @@ def test_tree_refresh_restores_all_expanded_branches(page: Page,
     }
 
 
+def test_large_file_tree_mounts_only_the_viewport_window(page: Page,
+                                                         backend_url,
+                                                         auth_token):
+    """Ten thousand logical rows must not become ten thousand Alpine nodes."""
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const started = performance.now();
+          app.visible = Array.from({length: 10000}, (_, i) => ({
+            path: `large/file-${String(i).padStart(5, '0')}.txt`,
+            name: `file-${String(i).padStart(5, '0')}.txt`,
+            is_dir: false, size: i, mtime: 1, depth: 1,
+          }));
+          app.fileTreeViewport = {start: 0, end: 80};
+          app._scheduleFileTreeViewportSync(true);
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const list = app.$refs.fileList;
+          const firstMounted = list.querySelectorAll(':scope > li[data-path]').length;
+          list.scrollTop = list.scrollHeight;
+          app._syncFileTreeViewport(list);
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          return {
+            elapsed: performance.now() - started,
+            logical: app.visible.length,
+            mounted: list.querySelectorAll(':scope > li[data-path]').length,
+            firstMounted,
+            lastMounted: !!list.querySelector(
+              'li[data-path="large/file-09999.txt"]'),
+          };
+        }"""
+    )
+    assert result["logical"] == 10000
+    assert 1 <= result["firstMounted"] <= 120
+    assert 1 <= result["mounted"] <= 120
+    assert result["lastMounted"] is True
+    assert result["elapsed"] < 5000
+
+
+def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
+                                                            backend_url,
+                                                            auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const realFetch = window.fetch;
+          const calls = [];
+          window.fetch = (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/list') {
+              calls.push(parsed.searchParams.get('path') || '');
+              return Promise.resolve(new Response(JSON.stringify({
+                entries: [{
+                  path: '.hidden-root', name: '.hidden-root',
+                  is_dir: false, size: 1, mtime: 1,
+                }],
+                truncated: false,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            return realFetch(url, init);
+          };
+          app.showHidden = false;
+          app.expanded = new Set(['alpha', 'alpha/deep', 'beta']);
+          app._pendingExpanded = Array.from(app.expanded);
+          app.visible = [
+            {path: 'alpha', name: 'alpha', is_dir: true, depth: 0},
+            {path: 'alpha/deep', name: 'deep', is_dir: true, depth: 1},
+            {path: 'beta', name: 'beta', is_dir: true, depth: 0},
+          ];
+          try {
+            const ok = await app.toggleHidden();
+            return {
+              ok, calls, showHidden: app.showHidden,
+              expanded: Array.from(app.expanded),
+              paths: app.visible.map(node => node.path),
+              scrollTop: app.$refs.fileList.scrollTop,
+            };
+          } finally {
+            window.fetch = realFetch;
+          }
+        }"""
+    )
+    assert result == {
+        "ok": True,
+        "calls": [""],
+        "showHidden": True,
+        "expanded": [],
+        "paths": [".hidden-root"],
+        "scrollTop": 0,
+    }
+
+
 def test_directory_remap_and_delete_update_descendant_preview_state(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
