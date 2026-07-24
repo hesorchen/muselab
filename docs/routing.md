@@ -37,7 +37,8 @@ Anthropic uses the normal Claude CLI login or key environment. Other providers r
 - process, locale, proxy, and TLS variables required for execution;
 - the selected provider's base URL and key;
 - cleared Claude OAuth fallback variables;
-- a per-OS-user isolated temporary `CLAUDE_CONFIG_DIR`;
+- a per-user durable, isolated `CLAUDE_CONFIG_DIR` under
+  `${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli`;
 - no `MUSELAB_TOKEN` and no keys for other providers.
 
 This supports Anthropic-compatible endpoints while reducing credential crossover and silent fallback to Anthropic.

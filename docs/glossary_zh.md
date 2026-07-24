@@ -18,7 +18,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **CLAUDE.md** — 位于归档根目录的纯文本 Markdown 文件。Claude Agent SDK 在每次对话时自动将其作为上下文加载，使其成为个性化 Muse 行为的主要渠道。参见 [`personalize-claude-md.md`](personalize-claude-md.md)。
 
-**CLAUDE_CONFIG_DIR isolation（CLAUDE_CONFIG_DIR 隔离）** — 对于第三方提供商，muselab 将 `CLAUDE_CONFIG_DIR` 设置为每用户的临时目录（`$(tmpdir)/muselab-vendor-cli-config-<uid>/`），其中不含 `credentials.json`。这可防止 CLI 静默回退到 Claude Pro OAuth，避免将第三方流量计入你的 Anthropic 账单。参见 [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md)。
+**CLAUDE_CONFIG_DIR isolation（CLAUDE_CONFIG_DIR 隔离）** — 对于第三方提供商，muselab 将 `CLAUDE_CONFIG_DIR` 设置为持久的每用户状态目录（`${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/`），其中不含 `credentials.json`。这既可防止 CLI 静默回退到 Claude Pro OAuth、避免将第三方流量计入你的 Anthropic 账单，也能跨重启保留第三方会话。参见 [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md)。
 
 **client pool（客户端池）** — 活跃 `ClaudeSDKClient` 实例的内存缓存，以 `(session_id, model, effort)` 为键。默认容量为 3 个条目（可通过 `MUSELAB_CLIENT_POOL_CAP` 配置）；超出上限时按最近最少使用（LRU）策略淘汰，但有活跃回合或后台任务进行中的条目除外。参见 [`routing.md — The Client Pool`](routing.md)。
 

@@ -37,7 +37,8 @@ Anthropic 使用正常 Claude CLI 登录或密钥环境。其他 provider 获取
 - 保留进程运行、locale、代理和 TLS 所需变量；
 - 注入当前 provider 的 base URL 与 key；
 - 清空 Claude OAuth 回退变量；
-- 使用按系统用户隔离的临时 `CLAUDE_CONFIG_DIR`；
+- 使用持久且按用户隔离的 `CLAUDE_CONFIG_DIR`，默认位于
+  `~/.local/state/muselab/vendor-cli`（设置 `XDG_STATE_HOME` 时随之调整）；
 - 不传入 `MUSELAB_TOKEN` 或其他 provider 的 key。
 
 这样既支持 Anthropic-compatible endpoint，也降低凭据串用和静默回退到 Anthropic 的风险。

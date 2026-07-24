@@ -146,6 +146,43 @@ async def test_runtime_rebuild_defers_while_turn_is_reserved(chat_mod):
     assert sid not in chat_mod._pending_runtime_rebuilds
 
 
+@pytest.mark.asyncio
+async def test_runtime_rebuild_defers_while_background_watcher_owns_client(
+        chat_mod):
+    sid = "sid-watcher-rebuild"
+    key = (sid, "claude-sonnet-4-6", "")
+    fake = _seed(chat_mod, key)
+    watcher = asyncio.create_task(asyncio.sleep(60))
+    chat_mod._task_watchers[sid] = watcher
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    try:
+        await chat_mod._rebuild_session_runtime(sid)
+        assert fake.disconnected is False
+        assert sid in chat_mod._pending_runtime_rebuilds
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+    await chat_mod._rebuild_session_runtime(sid)
+    assert fake.disconnected is True
+    assert sid not in chat_mod._pending_runtime_rebuilds
+
+
+def test_session_list_marks_detached_background_work_active(chat_mod, client):
+    sid = _make_compact_session(client)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    try:
+        response = client.get(
+            "/api/chat/sessions", headers={"X-Auth-Token": TEST_TOKEN})
+        assert response.status_code == 200, response.text
+        row = next(s for s in response.json()["sessions"] if s["id"] == sid)
+        assert row["active"] is True
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+
 # ====== interrupt ======
 
 def test_interrupt_no_live_client(chat_mod, client):
@@ -228,6 +265,8 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
     chat_mod._recent_turns[sid] = broadcast
     chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
     chat_mod._bg_task_descriptions["task-1"] = "background work"
+    chat_mod._background_turn_started_at[sid] = 1_700_000_000
+    chat_mod._background_origin_turn_id[sid] = "origin-turn"
 
     chat_mod._clear_session_runtime_state(sid)
     await asyncio.gather(watcher, pump, return_exceptions=True)
@@ -237,6 +276,8 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
     assert sid not in chat_mod._active_turns
     assert sid not in chat_mod._recent_turns
     assert sid not in chat_mod._sessions_with_inflight_tasks
+    assert sid not in chat_mod._background_turn_started_at
+    assert sid not in chat_mod._background_origin_turn_id
     assert "task-1" not in chat_mod._bg_task_descriptions
     assert broadcast.cancelled is True
     assert broadcast.done is True

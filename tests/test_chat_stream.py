@@ -569,6 +569,33 @@ class _FakeWatchClient:
             yield m
 
 
+class _BatchedWatchClient:
+    """A watcher client whose stream ends once before an explicit query.
+
+    This mirrors the real failure mode: the terminal TaskNotification is
+    delivered, receive_messages() reaches EOF, then a new query opens a fresh
+    response stream containing the assistant reaction and ResultMessage.
+    """
+
+    def __init__(self, batches):
+        self._batches = list(batches)
+        self.queries = []
+        self._receive_count = 0
+
+    async def query(self, prompt_or_gen):
+        items = []
+        async for item in prompt_or_gen:
+            items.append(item)
+        self.queries.append(items)
+
+    async def receive_messages(self):
+        index = self._receive_count
+        self._receive_count += 1
+        batch = self._batches[index] if index < len(self._batches) else []
+        for message in batch:
+            yield message
+
+
 def test_settle_background_task_dedups(stream_env):
     """Two observers (in-turn dispatch + cross-turn watcher) can both see the
     same terminal notification; _settle unpins exactly ONCE — the first caller
@@ -593,9 +620,8 @@ def test_settle_background_task_dedups(stream_env):
 
 
 def test_merge_session_inflight_recovers_orphaned_task(stream_env):
-    """Spec §13 orphan bug: a task launched in a prior turn whose watcher got
-    cancelled by an intervening turn must be re-covered at turn end even though
-    this turn's local inflight_tasks doesn't contain it. _merge_session_inflight
+    """Watcher replacement must retain every session-level task even when this
+    turn's local inflight_tasks doesn't contain it. _merge_session_inflight
     unions the turn-local launches with the session-level pin set."""
     chat_mod = stream_env
     sid = "sid-orphan"
@@ -641,6 +667,9 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
 
     sid = "sid-watch"
     chat_mod._sessions_with_inflight_tasks[sid] = {"task_9"}
+    origin_started_at = 1_700_000_100.5
+    chat_mod._background_turn_started_at[sid] = origin_started_at
+    chat_mod._background_origin_turn_id[sid] = "origin-user-turn"
     notif = TaskNotificationMessage(
         subtype="task_notification", data={}, task_id="task_9",
         status="completed", output_file="/tmp/o.md", summary="done",
@@ -666,6 +695,8 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         bc = chat_mod._recent_turns.get(sid)
         assert bc is not None, "continuation broadcast not grace-kept"
         assert bc.is_continuation is True
+        assert bc.started_at == origin_started_at
+        assert bc.parent_turn_id == "origin-user-turn"
         kinds = [e.get("event") for e in bc.events]
         assert "task_notification" in kinds, f"no card flip: {kinds}"
         assert "text" in kinds, f"no reaction text: {kinds}"
@@ -682,6 +713,133 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         # All pending settled → pin released, client reclaimable.
         assert sid not in chat_mod._sessions_with_inflight_tasks
         assert sid not in chat_mod._task_watchers
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._background_turn_started_at.pop(sid, None)
+        chat_mod._background_origin_turn_id.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._recent_turns.pop(sid, None)
+
+
+def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(stream_env):
+    """A completed task must not silently end with only its notification.
+
+    When the CLI closes the notification stream before auto-continuing, the
+    watcher sends one metadata-only resume query and drains its fresh response
+    through the terminal ResultMessage.
+    """
+    import asyncio
+
+    chat_mod = stream_env
+    sid = "sid-watch-explicit-resume"
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task_resume"}
+    notif = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="task_resume",
+        status="completed", output_file="/tmp/result.md", summary="done",
+        uuid="u-resume", session_id=sid, tool_use_id="tu-resume")
+    reaction = AssistantMessage(
+        content=[TextBlock(text="最终汇总已经完成。")],
+        model="claude-sonnet-4-6", usage={})
+    result = ResultMessage(
+        subtype="success", duration_ms=100, duration_api_ms=80,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={})
+    fake_client = _BatchedWatchClient([
+        [notif],
+        [reaction, result],
+    ])
+    sidecar_turn = chat_mod.TurnBroadcast(
+        session_id=sid, model="claude-sonnet-4-6")
+    sidecar_turn.user_text = "完成调研报告"
+    chat_mod._write_active_turn_sidecar(sidecar_turn)
+
+    async def run():
+        await chat_mod._watch_inflight_tasks(
+            sid, fake_client, {"task_resume": "research"})
+
+    try:
+        asyncio.run(run())
+        assert len(fake_client.queries) == 1
+        sent = fake_client.queries[0][0]
+        assert sent["type"] == "user"
+        assert sent["isMeta"] is True
+        assert "provide the final response" in sent["message"]["content"]
+
+        bc = chat_mod._recent_turns.get(sid)
+        assert bc is not None
+        kinds = [event.get("event") for event in bc.events]
+        assert kinds.count("task_notification") == 1
+        assert "text" in kinds
+        done = json.loads(bc.events[-1]["data"])
+        assert bc.events[-1]["event"] == "done"
+        assert not done.get("is_error")
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert not chat_mod._active_turn_path(sid).exists()
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._recent_turns.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+def test_active_turn_sidecar_survives_detached_background_gap(stream_env):
+    """A main Result is not clean completion while its watcher is alive."""
+    import asyncio
+
+    chat_mod = stream_env
+    sid = "sid-sidecar-background-gap"
+    turn = chat_mod.TurnBroadcast(
+        session_id=sid, model="claude-sonnet-4-6")
+    turn.user_text = "生成最终报告"
+    chat_mod._write_active_turn_sidecar(turn)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task_gap"}
+
+    async def run():
+        blocker = asyncio.create_task(asyncio.sleep(60))
+        chat_mod._task_watchers[sid] = blocker
+        try:
+            assert chat_mod._delete_active_turn_sidecar_if_idle(sid) is False
+            assert chat_mod._active_turn_path(sid).exists()
+        finally:
+            blocker.cancel()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+    try:
+        asyncio.run(run())
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
+def test_watcher_marks_incomplete_if_explicit_resume_also_ends(stream_env):
+    """A second EOF is an explicit incomplete state, never silent success."""
+    import asyncio
+
+    chat_mod = stream_env
+    sid = "sid-watch-resume-incomplete"
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task_incomplete"}
+    notif = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="task_incomplete",
+        status="completed", output_file=None, summary="done",
+        uuid="u-incomplete", session_id=sid, tool_use_id="tu-incomplete")
+    fake_client = _BatchedWatchClient([[notif], []])
+
+    async def run():
+        await chat_mod._watch_inflight_tasks(
+            sid, fake_client, {"task_incomplete": "research"})
+
+    try:
+        asyncio.run(run())
+        assert len(fake_client.queries) == 1
+        bc = chat_mod._recent_turns.get(sid)
+        assert bc is not None
+        done = json.loads(bc.events[-1]["data"])
+        assert done["is_error"] is True
+        assert done["kind"] == "background_continuation_incomplete"
+        assert "没有生成最终答复" in done["error"]
     finally:
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
         chat_mod._task_watchers.pop(sid, None)
@@ -844,6 +1002,7 @@ def test_active_surfaces_grace_kept_continuation(stream_env, client):
         d = r.json()
         assert d["active"] is True, d
         assert d["continuation"] is True, d
+        assert d["turn_id"] == cont.turn_id
 
         # Once a reconnect subscriber has consumed it, /active must stop
         # advertising it — otherwise the 8s poller re-reconnects every tick
@@ -868,6 +1027,55 @@ def test_active_surfaces_grace_kept_continuation(stream_env, client):
         assert r.json()["active"] is False, r.json()
     finally:
         chat_mod._recent_turns.pop(sid, None)
+
+
+def test_active_reports_background_reader_as_busy_not_attachable(
+    stream_env, client,
+):
+    """The gap after ResultMessage is still a live logical turn.
+
+    There is no continuation broadcast to attach to until a task settles, but
+    the frontend must keep its footer active and queue follow-up input.
+    """
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    original_started_at = 1_700_123_456.25
+    chat_mod._background_turn_started_at[sid] = original_started_at
+    chat_mod._background_origin_turn_id[sid] = "origin-turn"
+    try:
+        r = client.get(
+            f"/api/chat/sessions/{sid}/active",
+            headers={"X-Auth-Token": TEST_TOKEN},
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["active"] is True
+        assert data["background"] is True
+        assert data["attachable"] is False
+        assert data["continuation"] is False
+        assert data["background_tasks_pending"] == 1
+        assert data["started_at"] == original_started_at
+        assert data["turn_id"] == "origin-turn"
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._background_turn_started_at.pop(sid, None)
+        chat_mod._background_origin_turn_id.pop(sid, None)
+
+
+def test_start_turn_rejects_while_background_reader_owns_session(
+    stream_env, client,
+):
+    """A follow-up must not consume the prior task's auto-continuation."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    try:
+        with pytest.raises(chat_mod._TurnBusy):
+            asyncio.run(chat_mod._start_turn(sid, "new user prompt"))
+        assert sid not in chat_mod._active_turns
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
 
 
 def test_subscribe_broadcast_marks_continuation_consumed(stream_env):
@@ -1054,10 +1262,8 @@ def test_headless_turn_replays_complete_output_to_desktop(stream_env):
         subscriber_max_events=2,
         subscriber_max_bytes=128,
     )
-    expected = []
     for i in range(100):
         event = {"event": "tool_result", "data": '{"id":"%d"}' % i}
-        expected.append(event)
         bc.publish(event)
     bc.finish()
 
@@ -1070,7 +1276,60 @@ def test_headless_turn_replays_complete_output_to_desktop(stream_env):
                 return replayed
             replayed.append(event)
 
-    assert asyncio.run(collect()) == expected
+    replayed = asyncio.run(collect())
+    payloads = [json.loads(event["data"]) for event in replayed]
+    assert [payload["id"] for payload in payloads] == [
+        str(i) for i in range(100)
+    ]
+    assert {payload["turn_id"] for payload in payloads} == {bc.turn_id}
+    assert [payload["event_seq"] for payload in payloads] == list(range(1, 101))
+
+
+def test_turn_broadcast_stamps_stable_identity_and_sequence(stream_env):
+    chat_mod = stream_env
+    bc = chat_mod.TurnBroadcast(session_id="turn-protocol")
+    bc.parent_turn_id = "parent-turn"
+    bc.publish({"event": "thinking", "data": '{"text":"a"}'})
+    bc.publish({"event": "tool_use", "data": '{"name":"Read"}'})
+    bc.finish()
+
+    payloads = [json.loads(event["data"]) for event in bc.events]
+    assert [payload["event_seq"] for payload in payloads] == [1, 2]
+    assert all(payload["turn_id"] == bc.turn_id for payload in payloads)
+    assert all(payload["parent_turn_id"] == "parent-turn" for payload in payloads)
+
+
+def test_reconnect_turn_id_mismatch_resyncs_instead_of_attaching(
+        stream_env, client):
+    """A late reconnect for A must never consume newer turn B's replay."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    bc = chat_mod.TurnBroadcast(session_id=sid)
+    bc.publish({"event": "text", "data": '{"text":"turn B"}'})
+    chat_mod._active_turns[sid] = bc
+    try:
+        response = client.post(
+            "/api/chat/stream/start",
+            headers={"X-Auth-Token": TEST_TOKEN},
+            json={
+                "prompt": "",
+                "session_id": sid,
+                "turn_id": "stale-turn-A",
+            },
+        )
+        assert response.status_code == 200, response.text
+        ticket = response.json()["ticket"]
+        streamed = client.get(f"/api/chat/stream?ticket={ticket}")
+        events = _parse_sse(streamed.text)
+        payload = next(json.loads(data) for event, data in events
+                       if event == "resync")
+        assert payload["reason"] == "turn_changed"
+        assert payload["requested_turn_id"] == "stale-turn-A"
+        assert payload["current_turn_id"] == bc.turn_id
+        assert all(event != "text" for event, _ in events)
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        bc.close()
 
 
 def test_stream_ticket_applies_mobile_layout_to_replay(stream_env, client):

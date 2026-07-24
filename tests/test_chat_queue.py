@@ -308,3 +308,32 @@ async def test_drain_replays_snapshot_without_reverting_session_permission(
     assert observed["permission"] == "default"
     assert observed["persist_permission"] is False
     assert sess.get_session(sid)["permission"] == "plan"
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_until_background_reader_releases_session(
+    app_module, monkeypatch,
+):
+    """Queued follow-ups stay queued while the previous turn's task watcher
+    owns the SDK stream."""
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    sess.enqueue_message(sid, "follow-up")
+    starts = []
+
+    async def fake_start_turn(*args, **kwargs):
+        starts.append((args, kwargs))
+
+    monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+    chat._sessions_with_inflight_tasks[sid] = {"task-1"}
+    try:
+        await chat._maybe_drain_queue(sid)
+    finally:
+        chat._sessions_with_inflight_tasks.pop(sid, None)
+
+    assert starts == []
+    assert [item["text"] for item in sess.get_queue(sid)["items"]] == [
+        "follow-up"
+    ]

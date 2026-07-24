@@ -426,6 +426,35 @@ def test_silent_stream_recovers_without_manual_refresh():
     assert "this._recoverStalledStream(streamSid)" in app
 
 
+def test_stream_reconnect_is_pinned_to_backend_turn_identity():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    send_start = app.index("async send(opts = {})")
+    send_end = app.index("\n    async stop()", send_start)
+    send = app[send_start:send_end]
+
+    assert "const expectedTurnId = isReconnect" in send
+    assert "turn_id: expectedTurnId" in send
+    assert '"&turn_id=" + encodeURIComponent(expectedTurnId)' in send
+    assert "streamState.es !== es" in send
+    assert "ownedTurnId !== eventTurnId" in send
+    assert "eventSeq <= (Number(streamState.lastEventSeq) || 0)" in send
+    assert "sessionId: streamSid" in send
+    assert "turnId: d.turn_id || streamState.activeTurnId || \"\"" in send
+
+
+def test_interrupted_turn_is_dismissed_only_after_open():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _checkInterruptedTurns()")
+    end = app.index("\n    // 10s heartbeat", start)
+    recovery = app[start:end]
+
+    click_at = recovery.index("onClick: async () =>")
+    open_at = recovery.index("await this.openTab(turn.sid)", click_at)
+    dismiss_at = recovery.index("/dismiss", open_at)
+    assert click_at < open_at < dismiss_at
+    assert recovery.count("/dismiss") == 1
+
+
 def test_mobile_keyboard_watchdog_clears_stale_pwa_viewport_inset():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("_mobileKeyboardInset()")
@@ -704,11 +733,38 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     cancelled_start = app.index('es.addEventListener("cancelled"')
     cancelled_end = app.index("\n      });", cancelled_start)
     assert "_markDone(true)" in app[cancelled_start:cancelled_end]
-    mark_done_start = app.index("const _markDone = (cancelled = false)")
+    mark_done_start = app.index(
+        "const _markDone = (cancelled = false, backgroundPending = false)")
     mark_done_end = app.index("\n      };", mark_done_start)
     assert "streamState._stopping = false" in app[
         mark_done_start:mark_done_end]
     assert "this.isTabStreaming(this.currentId)" in app
+
+
+def test_background_task_gap_keeps_composer_busy_and_footer_running():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    assert "backgroundActive: false" in app
+    assert "backgroundTaskCount: 0" in app
+    assert "st.backgroundActive || st.compacting" in app
+    assert "st.streaming || st.backgroundActive || st.compacting" in app
+    assert "d.background && d.attachable === false" in app
+    assert "background_tasks_pending" in app
+    assert "_stopTimer(backgroundPending > 0)" in app
+    assert "pane.streaming || pane.backgroundActive" in html
+    assert "class=\"background-task-strip\"" in html
+    assert "isTabRunning(tid)" in html
+    assert "isTabBackgroundActive(tid)" in html
+    assert "background-task-strip" in css
+    assert '"chat.background_running": "后台任务运行中"' in i18n
+    assert "if (streamState.es === es) streamState.es = null" in app
+    assert "d.background && d.attachable === false" in app
+    assert "continuation: !!d.continuation" in app
+    assert "(m.role === 'assistant' && m.uuid)" in html
+    assert 'x-show="m.role === \'assistant\' && m.uuid' in html
 
 
 def test_attachment_uploads_have_deadlines_and_never_log_filenames():
