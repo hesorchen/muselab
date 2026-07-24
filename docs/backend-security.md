@@ -54,7 +54,7 @@ Set `MUSELAB_TERMINAL_ENABLED=0` when terminals are not needed. On production or
 
 CLI subprocesses for non-Anthropic providers receive a minimal full environment replacement, not a merge with the parent environment. It contains only process, proxy, and TLS variables plus the selected provider's endpoint and credentials.
 
-`CLAUDE_CONFIG_DIR` points to a per-OS-user temporary directory and any Claude OAuth credential found there is removed. This prevents third-party requests from silently falling back to Anthropic. Other provider keys and `MUSELAB_TOKEN` are not passed to that subprocess.
+`CLAUDE_CONFIG_DIR` points to a per-OS-user temporary directory and any Claude OAuth credential found there is removed. This prevents third-party requests from silently falling back to Anthropic. Only `~/.claude/skills/` is mapped into the isolated root so user Skills remain available; settings, hooks, plugins, credentials, and other provider keys stay isolated. `MUSELAB_TOKEN` is not passed to that subprocess.
 
 ## Settings writes
 

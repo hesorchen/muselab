@@ -59,6 +59,66 @@ def test_env_override_present(monkeypatch):
     assert env["CLAUDE_OAUTH_TOKEN"] == ""
 
 
+def test_vendor_config_exposes_only_live_user_skills(monkeypatch, tmp_path):
+    user_home = tmp_path / "home"
+    user_skill = user_home / ".claude" / "skills" / "research"
+    user_skill.mkdir(parents=True)
+    skill_md = user_skill / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: research\ndescription: test\n---\noriginal\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(user_home))
+    ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "sk-test"})
+    vendor_dir = tmp_path / "vendor-config"
+    vendor_dir.mkdir()
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", vendor_dir)
+
+    env = ep.env_override("deepseek-v4-pro")
+
+    assert env is not None
+    assert env["CLAUDE_CONFIG_DIR"] == str(vendor_dir)
+    vendor_skills = vendor_dir / "skills"
+    assert vendor_skills.is_symlink()
+    assert vendor_skills.resolve() == (user_home / ".claude" / "skills").resolve()
+    assert (vendor_skills / "research" / "SKILL.md").read_text(
+        encoding="utf-8",
+    ).endswith("original\n")
+    # The mapping is live rather than a stale copy.
+    skill_md.write_text(
+        "---\nname: research\ndescription: test\n---\nupdated\n",
+        encoding="utf-8",
+    )
+    assert (vendor_skills / "research" / "SKILL.md").read_text(
+        encoding="utf-8",
+    ).endswith("updated\n")
+    # Only skills are bridged; credentials and settings stay isolated.
+    assert not (vendor_dir / ".credentials.json").exists()
+    assert not (vendor_dir / "settings.json").exists()
+
+
+def test_vendor_skill_bridge_preserves_real_isolated_directory(
+    monkeypatch,
+    tmp_path,
+):
+    user_home = tmp_path / "home"
+    (user_home / ".claude" / "skills").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(user_home))
+    ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": "sk-test"})
+    vendor_dir = tmp_path / "vendor-config"
+    vendor_skills = vendor_dir / "skills"
+    vendor_skills.mkdir(parents=True)
+    marker = vendor_skills / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", vendor_dir)
+
+    ep.env_override("deepseek-v4-pro")
+
+    assert vendor_skills.is_dir()
+    assert not vendor_skills.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
 def test_is_third_party(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {})
     assert ep.is_third_party("deepseek-v4-pro")

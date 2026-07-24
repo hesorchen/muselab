@@ -70,6 +70,8 @@ if not skills_off:
 
 设置该标志后，SDK 会为所有 provider 加载可发现的 `SKILL.md`。无需复制或创建符号链接——内置 `skills/` 通过本地 plugin 直接提供。
 
+第三方 Provider 仍使用隔离的 `CLAUDE_CONFIG_DIR`，防止 Claude OAuth 凭据泄漏或被错误回退使用。muselab 只把 `~/.claude/skills/` 映射进隔离目录，因此用户 Skills 与 Claude 模型保持一致，而凭据、settings、hooks、plugins 和会话记录仍然隔离。
+
 **UI 列表。** `GET /api/settings/skills` 独立地为前端枚举仓库内置、
 用户全局和已安装 plugin 中的 skill。`SKILL.md` 和 `skill.md` 两种文件名
 均被接受。该列表为只读，不影响模型在运行时实际使用的内容。
