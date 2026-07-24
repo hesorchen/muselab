@@ -26,7 +26,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **extended thinking / thinking signature** — The reasoning trace produced by Claude when `ThinkingConfigEnabled` is active. The thinking block is streamed via `thinking` SSE events. Signatures are opaque tokens that must not be modified; muselab locks a session to a single model to avoid cross-vendor signature corruption. For Opus 4.7+, `display="summarized"` is required to get plaintext thinking blocks rather than signatures-only. See [`routing.md — budget_tokens and display`](routing.md).
 
-**fork** — A copy of a session's transcript up to a chosen message UUID, stored under a new session ID. Used internally to implement message editing (the UI forks at the previous assistant turn, then re-sends). Both the JSONL and the `sessions/index.json` entry are created for the fork. See [`backend-sessions.md — Fork & edit-a-message`](backend-sessions.md).
+**fork** — An explicit user action that copies a full session transcript, or the transcript through a chosen completed turn, under a new session ID. The new branch records its source relationship and receives remapped message UUIDs. Editing a historical message is a resend in the current session; switching models creates an empty session. See [`backend-sessions.md — Forking and deletion`](backend-sessions.md).
 
 **legacy session self-heal** — If a session was created before any provider was configured, it gets locked to the `MODEL` constant. When the user later configures only a third-party provider, every send 401s. On the next send, muselab detects that the locked model's provider is unavailable and the session has no on-disk JSONL (never ran), then re-resolves the model. Sessions that already have history are never re-resolved. See [`routing.md — Legacy-session self-heal`](routing.md).
 
@@ -36,7 +36,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **message queue** — A per-session FIFO queue (`sessions/<sid>.queue.json`) that holds prompts submitted while a turn is already running. The drain loop starts the next turn automatically when the current one finishes. Max depth is 10. The queue auto-pauses if a turn errors or is cancelled. See [`backend-sessions.md — The message queue`](backend-sessions.md).
 
-**model continuity** — After the first successful turn, the model ID is written to `sessions/index.json`. For a non-empty session, the frontend forks when switching to an incompatible model, preventing cross-provider thinking-signature corruption. The management API may still update the model and disconnect the cached client; callers own transcript-compatibility risk. See [`routing.md`](routing.md).
+**model continuity** — After the first successful turn, the model ID is written to `sessions/index.json`. For a non-empty session, the frontend creates a separate empty session when switching models, preventing cross-provider thinking-signature corruption. The management API may still update the model and disconnect the cached client; callers own transcript-compatibility risk. See [`routing.md`](routing.md).
 
 **no-build frontend** — The frontend is served as plain HTML + JavaScript + CSS with no bundler, compiler, or `npm install` required. Vetted third-party libraries are checked in under `frontend/vendor/`; some warm during browser idle time while Mermaid, xterm.js, and similar features remain on demand. See [`architecture.md`](architecture.md).
 
@@ -58,7 +58,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **sensitive-filename blocklist** — Two sets in `backend/files.py` (`SENSITIVE_NAMES` and `SENSITIVE_SUFFIX`) covering credential files, private keys, shell history, and `.env` variants. Any path matching these is rejected with HTTP 403 by `safe_resolve` unless `allow_sensitive=True` is explicitly passed (used only by trash-restore and copy-bak). See [`backend-security.md — Filesystem containment`](backend-security.md).
 
-**session** — The top-level unit of a conversation. A session has a UUID shared by the muselab index entry, sidecar file, CLI JSONL, and message queue. It stores cwd, model, permission, effort, and thinking settings; the frontend forks by default for an incompatible model switch. See [`backend-sessions.md`](backend-sessions.md).
+**session** — The top-level unit of a conversation. A session has a UUID shared by the muselab index entry, sidecar file, CLI JSONL, and message queue. It stores cwd, model, permission, effort, and thinking settings; explicit forks additionally record their source session. See [`backend-sessions.md`](backend-sessions.md).
 
 **session index** — The file `sessions/index.json` (inside the repo, not a workspace). It is muselab's source of truth for per-session metadata that the CLI does not track: cwd, model, permission mode, effort, thinking toggle, pinned state, and auto-named flag. CLI JSONL owns the transcript; Claude and third-party providers may use different configuration roots. See [`backend-sessions.md`](backend-sessions.md).
 

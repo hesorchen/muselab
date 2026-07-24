@@ -121,7 +121,7 @@ The SDK writes the user-message UUID later, so muselab first stores metadata in 
 
 ## Forking and deletion
 
-`POST /api/chat/sessions/{sid}/fork` copies either the full session or the transcript through `up_to_message_id`. The fork receives new session and message UUIDs and inherits the source model and workspace. Historical-message editing is implemented by forking before that message and sending the edited text.
+`POST /api/chat/sessions/{sid}/fork` copies either the full session or the transcript through `up_to_message_id`. The fork receives new session and message UUIDs, inherits the source model, workspace, permission, effort, and thinking settings, and records its source-session relationship. The tab menu forks the full conversation; the action below a completed turn forks through that turn. Historical-message editing remains a resend in the current session and does not fork. Switching models from a non-empty conversation creates a separate empty session rather than copying the transcript.
 
 Deleting a session also removes:
 

@@ -493,7 +493,7 @@ def test_session_setting_writes_keep_their_tab_owner_and_order():
     assert '"_thinkingPatchTail"' in thinking
 
 
-def test_model_fork_keeps_workspace_and_does_not_hijack_a_new_active_tab():
+def test_model_switch_new_session_keeps_workspace_and_does_not_hijack_active_tab():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async onModelChange()")
     end = app.index("\n    // ===== Effort knob", start)
@@ -503,6 +503,35 @@ def test_model_fork_keeps_workspace_and_does_not_hijack_a_new_active_tab():
     assert "const ownerWorkspace = this.currentWorkspacePath()" in model
     assert "name: \"\", model: newM, cwd: ownerWorkspace" in model
     assert "this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid" in model
+
+
+def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert '@click="menuFork(tabCtxMenu && tabCtxMenu.id)"' in html
+    assert '@click.stop="forkConversation(tid, m.uuid)"' in html
+    assert 'class="fork-origin-banner"' in html
+    assert 'x-text="currentForkSource().name"' in html
+
+    start = app.index("async forkConversation(id, upToMessageId = \"\")")
+    end = app.index("\n    async menuFork", start)
+    fork = app[start:end]
+    assert "/api/chat/sessions/${encodeURIComponent(id)}/fork" in fork
+    assert "up_to_message_id: upToMessageId || null" in fork
+    assert "const st = this._ensureTabState(newId)" in fork
+    assert "await this.openTab(newId)" in fork
+
+    model_start = app.index("async onModelChange()")
+    model_end = app.index("\n    // ===== Effort knob", model_start)
+    edit_start = app.index("commitEditMessage(m)")
+    edit_end = app.index("\n    },", edit_start)
+    assert "/fork" not in app[model_start:model_end]
+    assert "/fork" not in app[edit_start:edit_end]
+
+    assert ".turn-fork-btn" in css
+    assert ".fork-origin-banner" in css
 
 
 def test_history_jump_keeps_the_session_that_owned_the_click():

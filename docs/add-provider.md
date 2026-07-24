@@ -186,8 +186,9 @@ subscription's included quota.
 
 **Q: Can one session switch vendors mid-conversation?**
 A: No. If the current session already has messages, switching the model
-prompts a confirmation and forks a new session that uses the chosen model;
-the original is kept in history. Empty sessions switch in place. This
+prompts a confirmation and creates an empty session that uses the chosen model;
+the original is kept in history and its transcript is not copied. Empty
+sessions switch in place. This
 avoids cross-vendor thinking-signature drift and inaccessible `tool_use`
 context — see the "Switching model mid-conversation" section in
 [providers.md](providers.md).

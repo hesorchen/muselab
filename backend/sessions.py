@@ -320,6 +320,12 @@ def _merge_sdk_with_index(
         # thinking on/off — default True so existing sessions keep reasoning.
         "effort": m.get("effort", ""),
         "thinking": bool(m.get("thinking", True)),
+        # Fork lineage is muselab-only metadata. The SDK owns the copied
+        # transcript but does not expose the source relationship when listing
+        # sessions, so keep a lightweight backlink for the UI.
+        "forked_from": m.get("forked_from", ""),
+        "forked_from_name": m.get("forked_from_name", ""),
+        "forked_from_message_id": m.get("forked_from_message_id", ""),
         # Every conversation is bound to the directory the Claude SDK was
         # started in.  Keep it in the sidecar so history, files and previews
         # switch as one workspace instead of silently falling back to ROOT.
@@ -481,6 +487,12 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      permission: str = "",
                      auto_named: bool = True,
                      message_count: int = 0,
+                     turn_count: int | None = None,
+                     effort: str = "",
+                     thinking: bool = True,
+                     forked_from: str = "",
+                     forked_from_name: str = "",
+                     forked_from_message_id: str = "",
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
@@ -495,9 +507,20 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "created_at": now,
         "updated_at": now,
         "message_count": message_count,
+        "turn_count": (
+            turn_count
+            if turn_count is not None
+            else max(0, message_count // 2)
+        ),
         "auto_named": auto_named,
+        "effort": effort,
+        "thinking": bool(thinking),
         "cwd": str(workspace),
     }
+    if forked_from:
+        meta["forked_from"] = forked_from
+        meta["forked_from_name"] = forked_from_name
+        meta["forked_from_message_id"] = forked_from_message_id
     with _INDEX_LOCK:
         idx = _load_index()
         # Idempotent: if this id is already registered (client retry / keepalive

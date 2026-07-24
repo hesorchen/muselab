@@ -98,7 +98,7 @@ $MUSELAB_ROOT/
 6. 事件写入 replay spool 并流向浏览器；断线后可按 cursor 补发。
 7. Claude CLI 持久化 transcript，muselab 更新 sidecar、用量、活动状态和通知。
 
-UI 默认在非空会话切换不兼容模型时 fork 新会话，避免跨 Provider thinking signature 冲突。后端 API 仍允许显式更新会话模型，因此 API 调用者需要自行承担上下文兼容性。
+非空会话切换模型时，UI 会创建一个空会话并保留原会话，避免跨 Provider thinking signature 冲突。后端 API 仍允许显式更新会话模型，因此 API 调用者需要自行承担上下文兼容性。
 
 ## 终端链路
 

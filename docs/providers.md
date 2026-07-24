@@ -48,11 +48,11 @@ Codex access to the public internet.
 ## Switching model mid-conversation
 
 If the current session already has messages, the dropdown opens a confirm
-modal and forks a fresh session with the new model — the original is kept
-in history. Empty sessions switch in place (no fork). The fork avoids
-cross-vendor thinking-signature drift, which causes silent breakage when
-one provider's signed thinking blocks are sent back to a different
-provider.
+modal and creates an empty session with the new model — the original is kept
+in history and its transcript is not copied. Empty sessions switch in place.
+Starting from a blank transcript avoids cross-vendor thinking-signature drift,
+which causes silent breakage when one provider's signed thinking blocks are
+sent back to a different provider.
 
 Each assistant message stores its own `model` field, so badges remain
 accurate even after a page reload that re-renders the whole transcript.

@@ -5405,22 +5405,47 @@ class ForkReq(BaseModel):
 
 @router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
 def fork_session_api(sid: str, req: ForkReq) -> dict:
-    """Branch a session at an arbitrary message UUID. SDK copies the JSONL
-    transcript up to that point into a fresh session file with new UUIDs;
-    muselab mirrors the new sid into index.json so it surfaces in the
-    picker immediately. Use case: user edits one of their messages — UI
-    forks at the previous assistant message, then resends the new text."""
+    """Branch a session at an arbitrary persisted message boundary.
+
+    The SDK copies the JSONL into a fresh session and remaps its UUID chain.
+    muselab adds UI lineage plus the source session's runtime preferences.
+    Message editing remains a separate "reuse text and resend" interaction;
+    it does not call this endpoint.
+    """
     src_meta = sess.get_session_meta(sid)
     if src_meta is None:
         raise HTTPException(404, "session not found")
+    active = _active_turns.get(sid)
+    if active is not None and not active.done:
+        raise HTTPException(409, "cannot fork while a turn is active")
+    if _sessions_with_inflight_tasks.get(sid):
+        raise HTTPException(
+            409,
+            "cannot fork while background tasks are still running",
+        )
     source_model = (src_meta.get("model") or MODEL).strip()
+    source_name = (src_meta.get("name") or "会话").strip()
+    requested_title = (req.title or "").strip()
+    new_name = requested_title or (
+        f"{source_name} · {'分支' if is_chinese_locale() else 'Fork'}"
+    )
+    forked_count = (
+        0
+        if req.up_to_message_id
+        else int(src_meta.get("message_count") or 0)
+    )
+    forked_turns = (
+        0
+        if req.up_to_message_id
+        else int(src_meta.get("turn_count") or 0)
+    )
     try:
         with _session_config_dir(source_model):
             result = sdk_fork_session(
                 sid,
                 directory=str(sess.session_workspace(sid)),
                 up_to_message_id=req.up_to_message_id,
-                title=req.title,
+                title=new_name,
             )
     except FileNotFoundError:
         raise HTTPException(404, "source transcript not found")
@@ -5432,15 +5457,25 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         sys.stderr.flush()
         raise HTTPException(500, "fork failed — see server log") from None
     new_sid = result.session_id
-    new_name = req.title or ((src_meta.get("name") or "会话") + " (分支)")
-    sess.register_session(
+    meta = sess.register_session(
         new_sid,
         name=new_name,
         model=src_meta.get("model") or MODEL,
+        permission=src_meta.get("permission") or "",
         auto_named=False,
+        message_count=forked_count,
+        turn_count=forked_turns,
+        effort=src_meta.get("effort") or "",
+        thinking=src_meta.get("thinking") is not False,
+        forked_from=sid,
+        forked_from_name=source_name,
+        forked_from_message_id=req.up_to_message_id or "",
         cwd=src_meta.get("cwd") or str(ROOT),
     )
-    return {"session_id": new_sid, "name": new_name}
+    return {
+        **meta,
+        "session_id": new_sid,
+    }
 
 
 class BudgetReq(BaseModel):

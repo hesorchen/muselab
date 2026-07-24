@@ -98,7 +98,10 @@ Repository state, the default workspace, and additional workspaces are separate 
 6. Events are written to the replay spool and streamed to the browser. A reconnect can resume from its cursor.
 7. The Claude CLI persists the transcript while muselab updates sidecars, usage, activity state, and notifications.
 
-By default, the UI forks a non-empty session when switching to an incompatible model, avoiding cross-provider thinking-signature failures. The backend API still allows an explicit session-model update, so API callers own the compatibility risk.
+When switching models from a non-empty session, the UI creates a new empty
+session and leaves the original untouched, avoiding cross-provider
+thinking-signature failures. The backend API still allows an explicit
+session-model update, so API callers own the compatibility risk.
 
 ## A terminal connection
 

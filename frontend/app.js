@@ -587,6 +587,7 @@ function portal() {
                           // (kept separate from the file-tree's `ctxMenu` which
                           //  has a different shape — overlapping names crash
                           //  Alpine when one side reads .show on the other's null)
+    forkingSessionId: "",
     // Per-tab runtime state. Keyed by session id. Each entry is a "snapshot"
     // of {messages, sessionUsage, streaming, es, streamingModel, ...} that the
     // active tab mirrors into root state (this.messages, this.es, etc.) via
@@ -5138,7 +5139,7 @@ function portal() {
         const r = await fetch("/api/chat/sessions", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
-          // open_ids: same open-tab protection as newSession() (this model-fork
+          // open_ids: same open-tab protection as newSession() (model switching
           // also creates a session, which triggers the empty-session recycler).
           body: JSON.stringify({
             name: "", model: newM, cwd: ownerWorkspace,
@@ -5152,7 +5153,7 @@ function portal() {
         }
         const meta = await r.json();
         await this.refreshSessions();
-        // Model-fork creates a brand-new session — wire it up as a tab the
+        // Model switching creates a brand-new empty session — wire it up as a tab the
         // same way newSession() does (tabState + openTabIds + activate).
         const newSt = this._ensureTabState(meta.id);
         newSt.messages.length = 0;
@@ -6773,6 +6774,9 @@ function portal() {
         if ((x.effort || "") !== (y.effort || "")) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
         if ((x.cwd || "") !== (y.cwd || "")) return false;
+        if ((x.forked_from || "") !== (y.forked_from || "")) return false;
+        if ((x.forked_from_name || "") !== (y.forked_from_name || "")) return false;
+        if ((x.forked_from_message_id || "") !== (y.forked_from_message_id || "")) return false;
       }
       return true;
     },
@@ -7757,6 +7761,34 @@ function portal() {
     tabTitle(tid) {
       const s = this.sessions.find(x => x.id === tid);
       return s ? (s.name || "") : "";
+    },
+    currentForkSource() {
+      const current = this.sessions.find(s => s.id === this.currentId);
+      const sourceId = current && current.forked_from;
+      if (!sourceId) return null;
+      const source = this.sessions.find(s => s.id === sourceId);
+      return {
+        id: sourceId,
+        name: (source && source.name)
+          || current.forked_from_name
+          || (this.lang === "zh" ? "源会话" : "Source conversation"),
+      };
+    },
+    async openForkSource() {
+      const source = this.currentForkSource();
+      if (!source) return;
+      if (!this.sessions.find(s => s.id === source.id)) {
+        await this._pullSessionList(false, source.id);
+      }
+      if (!this.sessions.find(s => s.id === source.id)) {
+        this.toast(
+          this.lang === "zh" ? "源会话已不存在" : "Source conversation no longer exists",
+          "warn",
+          2500,
+        );
+        return;
+      }
+      await this.openTab(source.id);
     },
     // <title> driver — wired via x-effect on the root #app element. Re-runs
     // whenever any read reactive (currentId / sessions / streaming) changes.
@@ -9525,6 +9557,99 @@ function portal() {
       }, 0);
     },
     closeTabMenu() { this.tabCtxMenu = null; },
+    canForkSession(id) {
+      return !!id
+        && !this.workspaceSwitching
+        && !this.forkingSessionId
+        && !this.isTabStreaming(id);
+    },
+    async forkConversation(id, upToMessageId = "") {
+      if (!this.canForkSession(id)) {
+        if (id && this.isTabStreaming(id)) {
+          this.toast(
+            this.lang === "zh"
+              ? "等当前回复完成后再 Fork"
+              : "Wait for the current reply to finish before forking",
+            "warn",
+            2500,
+          );
+        }
+        return null;
+      }
+      const source = this.sessions.find(s => s.id === id);
+      if (!source) return null;
+      const suffix = this.lang === "zh" ? "分支" : "Fork";
+      const title = `${source.name || (this.lang === "zh" ? "会话" : "Conversation")} · ${suffix}`;
+      this.forkingSessionId = id;
+      let response;
+      try {
+        response = await fetch(
+          `/api/chat/sessions/${encodeURIComponent(id)}/fork`,
+          {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              up_to_message_id: upToMessageId || null,
+              title,
+            }),
+          },
+        );
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const payload = await response.json();
+            detail = String(payload && payload.detail || "");
+          } catch (_) {}
+          const message = response.status === 409
+            ? (this.lang === "zh"
+              ? "等当前回复或后台任务完成后再 Fork"
+              : "Wait for the active turn or background task to finish")
+            : (/no messages/i.test(detail)
+              ? (this.lang === "zh" ? "空会话无法 Fork" : "An empty conversation cannot be forked")
+              : (this.lang === "zh" ? "Fork 对话失败" : "Could not fork conversation"));
+          this.toast(message, "error", 3500);
+          return null;
+        }
+        const payload = await response.json();
+        const newId = payload.id || payload.session_id;
+        if (!newId) throw new Error("fork response missing session id");
+        const meta = {
+          ...payload,
+          id: newId,
+          active: false,
+          cwd: payload.cwd || source.cwd || this.currentWorkspacePath(),
+        };
+        this.sessions = [
+          meta,
+          ...this.sessions.filter(session => session.id !== newId),
+        ];
+        this._sessionsEtag = "";
+        const st = this._ensureTabState(newId);
+        st._loaded = false;
+        await this.openTab(newId);
+        this.toast(
+          upToMessageId
+            ? (this.lang === "zh" ? "已从这里创建分支" : "Forked from this point")
+            : (this.lang === "zh" ? "已 Fork 对话" : "Conversation forked"),
+          "success",
+          2200,
+        );
+        return meta;
+      } catch (error) {
+        this.toast(
+          this.lang === "zh" ? "Fork 对话失败" : "Could not fork conversation",
+          "error",
+          3500,
+        );
+        return null;
+      } finally {
+        if (this.forkingSessionId === id) this.forkingSessionId = "";
+      }
+    },
+    async menuFork(id) {
+      this.closeTabMenu();
+      return await this.forkConversation(id);
+    },
     async menuRename(id) {
       this.closeTabMenu();
       // Inline rename input lives inside the tab DOM, so the tab must be open
