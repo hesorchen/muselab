@@ -14,8 +14,10 @@ Adding a new provider:
 from __future__ import annotations
 import copy
 import json
+import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 from dataclasses import dataclass, replace
@@ -104,28 +106,205 @@ _BASE_URL_ENV_BY_KEY: dict[str, str] = {
 }
 
 
-# Per-OS-user path so multiple muselab installs on the same host (e.g. a
-# real user + a `muselab` test user) don't collide. Earlier this was a
-# single shared `/tmp/muselab-vendor-cli-config`, so whichever user
-# created it first locked the others out with PermissionError on Read,
-# which then surfaced as a 504 on the chat SSE stream.
-_VENDOR_CONFIG_DIR = (
+_LOG = logging.getLogger(__name__)
+
+
+def _default_vendor_config_dir() -> Path:
+    """Return the durable per-user state root for the isolated vendor CLI."""
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    base = (
+        Path(state_home).expanduser()
+        if state_home
+        else Path.home() / ".local" / "state"
+    )
+    return base / "muselab" / "vendor-cli"
+
+
+# Third-party transcripts, tasks, and shell snapshots are durable state, not
+# disposable cache. Keep them under XDG_STATE_HOME while preserving the old
+# per-OS-user temp path solely as a one-time migration source.
+_VENDOR_CONFIG_DIR = _default_vendor_config_dir()
+_LEGACY_VENDOR_CONFIG_DIR = (
     Path(tempfile.gettempdir())
     / f"muselab-vendor-cli-config-{os.getuid()}"
 )
-_VENDOR_CONFIG_LOCK = threading.Lock()
+_VENDOR_CONFIG_LOCK = threading.RLock()
+
+
+def _path_exists(path: Path) -> bool:
+    """Like Path.exists(), but also treat a broken symlink as occupied."""
+    return path.exists() or path.is_symlink()
+
+
+def _merge_newer_jsonl(source: Path, destination: Path) -> bool:
+    """Append unique records from a newer legacy JSONL.
+
+    This covers the narrow rolling-restart race where the old process writes a
+    final record after its config directory has moved. Invalid, older, or
+    non-file conflicts are left untouched for archival.
+    """
+    if (
+        source.suffix != ".jsonl"
+        or source.is_symlink()
+        or destination.is_symlink()
+        or not source.is_file()
+        or not destination.is_file()
+    ):
+        return False
+    try:
+        if source.stat().st_mtime_ns <= destination.stat().st_mtime_ns:
+            return False
+        source_lines = [line for line in source.read_bytes().splitlines() if line.strip()]
+        destination_data = destination.read_bytes()
+        destination_lines = {
+            line for line in destination_data.splitlines() if line.strip()
+        }
+        for line in source_lines:
+            json.loads(line)
+        missing = [line for line in source_lines if line not in destination_lines]
+        if missing:
+            prefix = (
+                b""
+                if not destination_data or destination_data.endswith(b"\n")
+                else b"\n"
+            )
+            with destination.open("ab") as handle:
+                handle.write(prefix + b"\n".join(missing) + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        source.unlink()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _recover_newer_jsonl_conflicts(target: Path) -> None:
+    conflict_root = target / ".migration-conflicts"
+    if not conflict_root.is_dir() or conflict_root.is_symlink():
+        return
+    for source in conflict_root.rglob("*.jsonl"):
+        destination = target / source.relative_to(conflict_root)
+        _merge_newer_jsonl(source, destination)
+    for directory in sorted(
+        (path for path in conflict_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    try:
+        conflict_root.rmdir()
+    except OSError:
+        pass
+
+
+def _merge_legacy_vendor_state(
+    source: Path,
+    target: Path,
+    conflict_root: Path,
+    relative: Path = Path(),
+) -> None:
+    """Move legacy state without overwriting durable files.
+
+    Conflicts are preserved under ``.migration-conflicts`` in the durable root
+    so no user state remains dependent on temporary-directory retention.
+    """
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.name == ".credentials.json":
+            # OAuth material must never enter the third-party config root.
+            if child.is_symlink() or child.is_file():
+                child.unlink(missing_ok=True)
+            continue
+        if not _path_exists(destination):
+            shutil.move(str(child), str(destination))
+            continue
+        if (
+            child.is_dir()
+            and not child.is_symlink()
+            and destination.is_dir()
+            and not destination.is_symlink()
+        ):
+            _merge_legacy_vendor_state(
+                child,
+                destination,
+                conflict_root,
+                relative / child.name,
+            )
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+            continue
+        if _merge_newer_jsonl(child, destination):
+            continue
+        conflict = conflict_root / relative / child.name
+        if not _path_exists(conflict):
+            conflict.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.move(str(child), str(conflict))
+
+
+def _remove_vendor_credentials(config_dir: Path) -> None:
+    credential = config_dir / ".credentials.json"
+    if credential.is_symlink() or credential.is_file():
+        credential.unlink(missing_ok=True)
 
 
 def _vendor_config_dir() -> Path:
-    """Returns the isolated config dir used by third-party providers. Shared
-    across all three-party sessions FOR THE CURRENT OS USER — it has no
+    """Return the durable isolated config dir used by third-party providers.
+
+    On first access, migrate the former temp-directory state. If both roots
+    contain data, only missing paths move; durable-state collisions win and
+    conflicting legacy files move under ``.migration-conflicts`` for manual
+    recovery.
+
+    Shared across all third-party sessions FOR THE CURRENT OS USER — it has no
     .credentials.json, so the CLI subprocess cannot fall back to Pro OAuth
     and send the wrong token to vendor.
 
     chat.py also reads from here when loading session messages for vendor
     sessions."""
-    _VENDOR_CONFIG_DIR.mkdir(exist_ok=True, mode=0o700)
-    return _VENDOR_CONFIG_DIR
+    target = _VENDOR_CONFIG_DIR
+    legacy = _LEGACY_VENDOR_CONFIG_DIR
+    with _VENDOR_CONFIG_LOCK:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        same_path = target.resolve(strict=False) == legacy.resolve(strict=False)
+        if not same_path and legacy.is_dir() and not legacy.is_symlink():
+            try:
+                if not _path_exists(target):
+                    shutil.move(str(legacy), str(target))
+                elif target.is_dir() and not target.is_symlink():
+                    _merge_legacy_vendor_state(
+                        legacy,
+                        target,
+                        target / ".migration-conflicts",
+                    )
+                    try:
+                        legacy.rmdir()
+                    except OSError:
+                        _LOG.warning(
+                            "Legacy vendor CLI state still has conflicts at %s",
+                            legacy,
+                        )
+            except OSError:
+                _LOG.exception(
+                    "Could not migrate vendor CLI state from %s to %s",
+                    legacy,
+                    target,
+                )
+                if legacy.is_dir() and not _path_exists(target):
+                    _remove_vendor_credentials(legacy)
+                    return legacy
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            target.chmod(0o700)
+        except OSError:
+            _LOG.warning("Could not set vendor CLI state permissions on %s", target)
+        _remove_vendor_credentials(target)
+        _recover_newer_jsonl_conflicts(target)
+        return target
 
 
 def ensure_vendor_user_skills() -> Path:

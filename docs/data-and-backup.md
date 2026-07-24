@@ -29,7 +29,7 @@ Back up each registered workspace as needed:
 - its user files;
 - its own `.muselab-dustbin/`;
 - its CLI JSONL outside the workspace: Claude under `~/.claude/projects/`,
-  third-party providers under the isolated temporary configuration root.
+  third-party providers under the isolated persistent state root.
 
 Global state remains only under the primary `MUSELAB_ROOT/.muselab/`; it is not copied into every workspace.
 
@@ -51,13 +51,20 @@ Source code, `.venv/`, dependency caches, build output, and logs can be restored
 | `~/.claude/projects/<cwd-key>/*.jsonl` | Real conversation transcripts for each workspace |
 | `~/.claude/.credentials.json` | Claude Pro/Max OAuth login |
 | Other files under `~/.claude/` | User-level CLAUDE.md, Skills, permissions, and CLI preferences |
-| `<system-temp>/muselab-vendor-cli-config-<uid>/projects/` | Isolated third-party-provider transcripts; the OS may clean this directory |
+| `${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/` | Isolated third-party-provider transcripts, tasks, and CLI state |
 
 If you only use Claude, the simplest safe approach is to back up all of
 `~/.claude/`. If you use third-party providers, also back up the isolated
-`projects/` directory or those transcripts will not be present in the
+`vendor-cli/` state directory or those transcripts will not be present in the
 `~/.claude/` backup. If credentials are not migrated, run `claude login` again
 on the new machine.
+
+On first startup after upgrading, muselab automatically moves the former
+`<system-temp>/muselab-vendor-cli-config-<uid>/` state into the persistent
+directory. Existing persistent files are never overwritten; any conflicting
+legacy files are preserved under `vendor-cli/.migration-conflicts/` for manual
+recovery. The one exception is a valid, newer JSONL tail written by the old
+process during a rolling restart: unique records are appended safely.
 
 ## Ephemeral or unnecessary state
 
@@ -66,7 +73,6 @@ on the new machine.
 | Running and exited terminal sessions | Process-local; only profiles are durable |
 | SSE replay spools | OS temporary files used only for same-process reconnect |
 | Staged, unsent attachments | Memory-only with a 10-minute TTL |
-| Isolated third-party-provider configuration except `projects/` | Recreated automatically; the `projects/` transcripts must be backed up |
 | SDK clients, rate-limit buckets, and memory caches | Rebuilt after startup |
 | Open tabs, layout, and some UI preferences | Browser localStorage; migrate browser data separately if needed |
 

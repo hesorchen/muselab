@@ -12,7 +12,7 @@ Claude CLI and muselab jointly own each session:
 ~/.claude/projects/<cwd-key>/<sid>.jsonl
     Claude-provider messages, tool calls, and compaction boundaries
 
-<system-temp>/muselab-vendor-cli-config-<uid>/projects/<cwd-key>/<sid>.jsonl
+${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects/<cwd-key>/<sid>.jsonl
     Isolated CLI transcripts for third-party providers
 
 <repo>/sessions/
@@ -27,8 +27,7 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 
 - CLI JSONL is the source of truth for conversation content. Claude and
   third-party providers use different configuration roots. The third-party
-  root is under the system temporary directory and may be cleaned by the OS, so
-  back it up before migration or temporary-directory cleanup.
+  root is persistent user state and should be included in backups.
 - `sessions/index.json` holds muselab-specific display and runtime settings.
 - A sidecar holds per-message cost, model, time, attachment, and context annotations.
 - A queue file holds pending messages.

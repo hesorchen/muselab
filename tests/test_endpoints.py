@@ -1,5 +1,6 @@
 """Third-party provider catalog: prefix→endpoint+key dispatch."""
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -19,6 +20,13 @@ def _reload_endpoints(monkeypatch, env: dict):
     # Keep catalog tests hermetic: a developer's local provider_overrides.json
     # (gitignored runtime state) must not change built-in routing assertions.
     monkeypatch.setattr(ep, "OVERRIDES_PATH", Path(tempfile.mkdtemp()) / "provider_overrides.json")
+    isolated_root = Path(tempfile.mkdtemp())
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", isolated_root / "vendor-cli")
+    monkeypatch.setattr(
+        ep,
+        "_LEGACY_VENDOR_CONFIG_DIR",
+        isolated_root / "legacy-vendor-cli",
+    )
     ep._OVERRIDES_CACHE = None
     ep._CATALOG_CACHE = None
     ep._SORTED_CATALOG_CACHE = None
@@ -95,6 +103,113 @@ def test_vendor_config_exposes_only_live_user_skills(monkeypatch, tmp_path):
     # Only skills are bridged; credentials and settings stay isolated.
     assert not (vendor_dir / ".credentials.json").exists()
     assert not (vendor_dir / "settings.json").exists()
+
+
+def test_vendor_config_migrates_legacy_state_without_oauth(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    transcript = legacy / "projects" / "workspace" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    (legacy / ".credentials.json").write_text("secret", encoding="utf-8")
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    resolved = ep._vendor_config_dir()
+
+    assert resolved == target
+    assert (target / "projects" / "workspace" / "session.jsonl").read_text(
+        encoding="utf-8",
+    ) == '{"type":"user"}\n'
+    assert not (target / ".credentials.json").exists()
+    assert not legacy.exists()
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_vendor_config_merge_preserves_durable_conflicts(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    (legacy / "projects").mkdir(parents=True)
+    (target / "projects").mkdir(parents=True)
+    (legacy / "projects" / "same.jsonl").write_text("legacy", encoding="utf-8")
+    (target / "projects" / "same.jsonl").write_text("durable", encoding="utf-8")
+    (legacy / "projects" / "missing.jsonl").write_text("move", encoding="utf-8")
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    ep._vendor_config_dir()
+
+    assert (target / "projects" / "same.jsonl").read_text(
+        encoding="utf-8",
+    ) == "durable"
+    assert (target / "projects" / "missing.jsonl").read_text(
+        encoding="utf-8",
+    ) == "move"
+    assert (
+        target / ".migration-conflicts" / "projects" / "same.jsonl"
+    ).read_text(
+        encoding="utf-8",
+    ) == "legacy"
+    assert not legacy.exists()
+
+
+def test_vendor_config_uses_legacy_root_if_migration_fails(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    legacy.mkdir()
+    (legacy / "projects").mkdir()
+    (legacy / ".credentials.json").write_text("secret", encoding="utf-8")
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    def fail_move(_source, _target):
+        raise OSError("simulated cross-device failure")
+
+    monkeypatch.setattr(ep.shutil, "move", fail_move)
+
+    assert ep._vendor_config_dir() == legacy
+    assert (legacy / "projects").is_dir()
+    assert not (legacy / ".credentials.json").exists()
+    assert not target.exists()
+
+
+def test_vendor_config_merges_newer_jsonl_tail(
+    monkeypatch,
+    tmp_path,
+):
+    ep = _reload_endpoints(monkeypatch, {})
+    legacy = tmp_path / "legacy-vendor-config"
+    target = tmp_path / "state" / "muselab" / "vendor-cli"
+    old_file = legacy / "projects" / "same.jsonl"
+    new_file = target / "projects" / "same.jsonl"
+    old_file.parent.mkdir(parents=True)
+    new_file.parent.mkdir(parents=True)
+    first = b'{"type":"user","uuid":"one"}\n'
+    tail = b'{"type":"assistant","uuid":"two"}\n'
+    new_file.write_bytes(first)
+    old_file.write_bytes(first + tail)
+    os.utime(new_file, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(old_file, ns=(2_000_000_000, 2_000_000_000))
+    monkeypatch.setattr(ep, "_VENDOR_CONFIG_DIR", target)
+    monkeypatch.setattr(ep, "_LEGACY_VENDOR_CONFIG_DIR", legacy)
+
+    ep._vendor_config_dir()
+
+    assert new_file.read_bytes() == first + tail
+    assert not legacy.exists()
+    assert not (target / ".migration-conflicts").exists()
 
 
 def test_vendor_skill_bridge_preserves_real_isolated_directory(

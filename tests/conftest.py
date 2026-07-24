@@ -92,6 +92,12 @@ def app_module(monkeypatch, temp_root, tmp_path):
     # change default-model resolution, provider lists, or auth status behavior.
     from backend import endpoints as ep_mod
     monkeypatch.setattr(ep_mod, "OVERRIDES_PATH", tmp_path / "provider_overrides.json")
+    monkeypatch.setattr(ep_mod, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cli")
+    monkeypatch.setattr(
+        ep_mod,
+        "_LEGACY_VENDOR_CONFIG_DIR",
+        tmp_path / "legacy-vendor-cli",
+    )
     ep_mod._OVERRIDES_CACHE = None
     ep_mod._CATALOG_CACHE = None
     ep_mod._SORTED_CATALOG_CACHE = None

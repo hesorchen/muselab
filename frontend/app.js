@@ -577,6 +577,10 @@ function portal() {
     // bubbles from tabState[id].messages (data always survives; only the DOM is
     // dropped). _MAX_RESIDENT_PANES caps the set.
     _residentTabIds: [],
+    // Recency is tracked separately from the DOM-facing resident id list.
+    // Reordering an Alpine keyed x-for physically moves entire message panes;
+    // keeping membership stable makes desktop warm switches a pure x-show.
+    _residentTabLru: [],
     // Mobile retains only the visible pane. Desktop keeps a wider working set so
     // normal tab switching is a pure x-show flip instead of a bubble rebuild.
     // Streaming in a hidden tab keeps its data/SSE even after its DOM is evicted.
@@ -1934,10 +1938,9 @@ function portal() {
     // whether the prompt is worth rephrasing. Frontend just surfaces the
     // sid + preview; user decides.
     //
-    // We dismiss on the backend immediately after toasting (regardless of
-    // whether the user clicks the action). The point is "tell the user
-    // once" — if they let the toast fade, they've still been notified, and
-    // re-nagging on every restart would be annoying.
+    // The breadcrumb is dismissed only after the user opens it. A persistent
+    // toast that disappears from backend state before the user acts is not
+    // recovery — it is another silent-loss path.
     async _checkInterruptedTurns() {
       let resp;
       try {
@@ -1959,12 +1962,16 @@ function portal() {
           : `Last turn interrupted (${ago}): ${truncated}`;
         this.toast(msg, "warn", 0, {
           label: this.lang === "zh" ? "打开" : "Open",
-          onClick: () => { this.openTab(turn.sid).catch(() => {}); },
+          onClick: async () => {
+            try {
+              await this.openTab(turn.sid);
+              if (this.currentId !== turn.sid) return;
+              await fetch(`/api/chat/interrupted-turns/${turn.sid}/dismiss`, {
+                method: "POST", headers: this.hdr(),
+              });
+            } catch (_) { /* keep the durable breadcrumb for next boot */ }
+          },
         });
-        // Mark dismissed on backend — see method docstring for rationale.
-        fetch(`/api/chat/interrupted-turns/${turn.sid}/dismiss`, {
-          method: "POST", headers: this.hdr(),
-        }).catch(() => { /* best-effort */ });
       }
     },
 
@@ -3967,6 +3974,33 @@ function portal() {
     _mdRenderUncached(text, opts = {}) {
       if (!text) return "";
       const streaming = !!opts.streaming;
+      // Huge plain-prose answers do not need a full marked → DOMPurify →
+      // detached-DOM pipeline. On modest desktops a 120 KiB paragraph could
+      // block the main thread for 2–3 seconds even though there was no markup
+      // to interpret. Keep rich rendering for content that actually contains
+      // Markdown/HTML/math structure; otherwise escape once and preserve line
+      // breaks. This is both safe (no raw HTML enters the result) and visually
+      // equivalent for ordinary prose.
+      if (text.length >= 64 * 1024) {
+        const hasRichSyntax = /```|~~~|`|\[[^\]]+\]\(|<\/?[A-Za-z][^>]*>|\*\*|__|~~|\$\$|\\\(|\\\[|(^|\n)\s{0,3}(?:#{1,6}\s|>\s|[-+*]\s|\d+[.)]\s)/m.test(text);
+        if (!hasRichSyntax) {
+          const visibleLimit = 48 * 1024;
+          const head = this.escape(text.slice(0, visibleLimit));
+          const renderLines = value => value
+            .replace(/\r?\n\r?\n+/g, "</p><p>")
+            .replace(/\r?\n/g, "<br>");
+          if (text.length > visibleLimit) {
+            const tail = this.escape(text.slice(visibleLimit));
+            const label = this.lang === "zh"
+              ? `展开剩余 ${Math.ceil((text.length - visibleLimit) / 1024)} KB`
+              : `Show remaining ${Math.ceil((text.length - visibleLimit) / 1024)} KB`;
+            return `<div class="long-answer-preview"><p>${renderLines(head)}</p></div>`
+              + `<details class="long-answer-rest"><summary>${label}</summary>`
+              + `<div><p>${renderLines(tail)}</p></div></details>`;
+          }
+          return "<p>" + renderLines(head) + "</p>";
+        }
+      }
       // Streaming-friendly preprocess: close any unclosed ``` or ~~~ fenced
       // code blocks before handing to marked. Without this, while the model
       // is mid-codeblock the parser sees `<lang>\n<content>` with no closer
@@ -5483,6 +5517,16 @@ function portal() {
                          context_limit_is_estimate: true,
                          context_is_estimate: true },
         streaming: false,
+        // Main ResultMessage may arrive while SDK-native background Agent/Bash
+        // tasks keep running. This is a busy state without a live SSE until a
+        // task settlement opens a continuation broadcast.
+        backgroundActive: false,
+        backgroundTaskCount: 0,
+        // Exact backend turn currently owned by this tab. Session id is not
+        // sufficient: a reconnect for turn A must never attach to newer B.
+        activeTurnId: "",
+        parentTurnId: "",
+        lastEventSeq: 0,
         es: null,
         // Deduplicate stop taps while the interrupt request is in flight.
         _stopping: false,
@@ -5599,6 +5643,9 @@ function portal() {
       if (st._hasServerLater === undefined) st._hasServerLater = false;
       if (st._fetchingLater === undefined) st._fetchingLater = false;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
+      if (st.activeTurnId === undefined) st.activeTurnId = "";
+      if (st.parentTurnId === undefined) st.parentTurnId = "";
+      if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
       return st;
     },
 
@@ -5613,11 +5660,12 @@ function portal() {
     _isBusy(sid) {
       if (!sid) return false;
       const st = this.tabState[sid];
-      return !!(this.isTabStreaming(sid) || (st && st.compacting));
+      return !!(this.isTabStreaming(sid)
+        || (st && (st.backgroundActive || st.compacting)));
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
-      if (st && (st.streaming || st.compacting)) return true;
+      if (st && (st.streaming || st.backgroundActive || st.compacting)) return true;
       const session = (this.sessions || []).find(s => s.id === sid);
       if (!session || !session.active) return false;
       // session.active is a polled cache and can remain true for one response
@@ -5630,7 +5678,12 @@ function portal() {
           headers: this.hdr(), signal: controller.signal,
         });
         if (!r.ok) return true; // conservative on an unknown server state
-        const active = !!(await r.json()).active;
+        const status = await r.json();
+        const active = !!status.active;
+        if (st && status.background) {
+          this._setBackgroundTaskActive(
+            sid, active, status.started_at, status.background_tasks_pending);
+        }
         if (!active && session) session.active = false;
         return active;
       } catch (_) {
@@ -5808,26 +5861,42 @@ function portal() {
       await this._syncQueueFromServer(sid);
       const st = this.tabState[sid];
       const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
-      let active = false, startedAt = 0, uText = "", uImages = [], uDocs = [];
+      let active = false, startedAt = 0, turnId = "";
+      let uText = "", uImages = [], uDocs = [];
       let continuation = false;
+      let background = false, attachable = true, backgroundTaskCount = 0;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/active",
                                { headers: this.hdr() });
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
+          turnId = d.turn_id || "";
           continuation = !!d.continuation;
+          background = !!d.background;
+          attachable = d.attachable !== false;
+          backgroundTaskCount = Math.max(
+            0, Number(d.background_tasks_pending) || 0);
           uText = d.user_text || "";
           uImages = d.user_images || [];
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      if (active && background && !attachable) {
+        if (st) st._draining = false;
+        if (st && turnId) st.activeTurnId = turnId;
+        this._setBackgroundTaskActive(
+          sid, true, startedAt, backgroundTaskCount);
+        this._ensureBgContPoller(sid);
+        return;
+      }
       if (active && continuation && !this.streaming && this.currentId === sid) {
         // The slot holds a bg-task continuation turn, not a queued item. Hand
         // it to the continuation poller (no user bubble, no truncation) instead
         // of the queue-drain reconnect below.
         if (st) st._draining = false;
-        this.send({ reconnect: true, continuation: true, startedAt });
+        this.send({ reconnect: true, continuation: true, sessionId: sid,
+                    turnId, startedAt });
         return;
       }
       if (active && !this.streaming && this.currentId === sid) {
@@ -5840,25 +5909,36 @@ function portal() {
         // symptom: "发了四条，只剩一条" — only the first send's bubble showed.
         // Push the bubble here, before send({reconnect}) truncates+replays, so
         // the freshly-drained prompt renders live. Guard against the reload
-        // case (loadSession already rebuilt this bubble): skip if the last
-        // user message already matches this turn's prompt.
-        const msgs = (st && st.messages) || [];
-        let lastUserText = null;
+        // case (loadSession already rebuilt this bubble): adopt an unlabelled
+        // matching tail bubble. Identity, not text, is the durable dedupe key:
+        // two queued turns are allowed to contain identical prompts.
+        const msgs = st ? this._allPaneMessages(st) : [];
+        let lastUser = null;
         for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "user") { lastUserText = msgs[i].text || ""; break; }
+          if (msgs[i].role === "user") { lastUser = msgs[i]; break; }
         }
-        if ((uText || uImages.length || uDocs.length) && lastUserText !== uText) {
+        let turnUser = turnId
+          ? msgs.find(m => m && m.role === "user" && m._turnId === turnId)
+          : null;
+        if (!turnUser && turnId && lastUser && !lastUser._turnId
+            && (lastUser.text || "") === uText) {
+          lastUser._turnId = turnId;
+          turnUser = lastUser;
+        }
+        if ((uText || uImages.length || uDocs.length) && !turnUser) {
           this._capLiveMessages(st);
-          this._appendLiveMessage(st, {
+          turnUser = this._appendLiveMessage(st, {
             role: "user",
             text: uText,
             images: uImages,
             docs: uDocs,
+            _turnId: turnId,
           });
           this.atBottom = true;
           this.scrollToBottom(true);
         }
-        this.send({ reconnect: true, startedAt });
+        if (st && turnId) st.activeTurnId = turnId;
+        this.send({ reconnect: true, sessionId: sid, turnId, startedAt });
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
       }
@@ -5879,6 +5959,51 @@ function portal() {
     // 'running' bg-task card, poll /active and attach in continuation mode the
     // moment the watcher's broadcast appears. Self-stops once no running card
     // remains (the task settled → card flipped) or after a hard cap.
+    _setBackgroundTaskActive(sid, active, startedAt = 0, pendingCount = null) {
+      const st = sid && this.tabState[sid];
+      if (!st) return;
+      st.backgroundActive = !!active;
+      if (active) {
+        const count = Number(pendingCount);
+        if (Number.isFinite(count)) {
+          st.backgroundTaskCount = Math.max(1, Math.floor(count));
+        } else if (!st.backgroundTaskCount) {
+          st.backgroundTaskCount = 1;
+        }
+        if (!st._streamStartedAt) {
+          st._streamStartedAt = startedAt ? Number(startedAt) * 1000 : Date.now();
+        }
+        if (!st._streamTimer) {
+          st._streamTimer = setInterval(() => {
+            const elapsed = Math.max(
+              0, (Date.now() - (st._streamStartedAt || Date.now())) / 1000);
+            st.streamElapsed = elapsed;
+            if (this.currentId === sid) this.streamElapsed = elapsed;
+          }, 1000);
+        }
+        st.streamElapsed = Math.max(
+          0, (Date.now() - st._streamStartedAt) / 1000);
+        if (this.currentId === sid) {
+          this._streamStartedAt = st._streamStartedAt;
+          this._streamTimer = st._streamTimer;
+          this.streamElapsed = st.streamElapsed;
+        }
+        return;
+      }
+      // A live continuation still owns the timer. Its terminal handler will
+      // call this again after streaming flips false.
+      if (st.streaming || st.es) return;
+      st.backgroundTaskCount = 0;
+      if (st._streamTimer) clearInterval(st._streamTimer);
+      st._streamTimer = null;
+      st._streamStartedAt = 0;
+      st.streamElapsed = 0;
+      if (this.currentId === sid) {
+        this._streamTimer = null;
+        this._streamStartedAt = 0;
+        this.streamElapsed = 0;
+      }
+    },
     _bgHasRunningCard(sid) {
       const st = this.tabState[sid];
       if (!st || !st.messages) return false;
@@ -5889,15 +6014,22 @@ function portal() {
     _ensureBgContPoller(sid) {
       this._bgContPollers = this._bgContPollers || {};
       if (this._bgContPollers[sid]) return;          // already polling
-      if (!this._bgHasRunningCard(sid)) return;       // nothing to wait for
+      const bgState = this.tabState[sid];
+      if (!this._bgHasRunningCard(sid)
+          && !(bgState && bgState.backgroundActive)) return;
       // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (1800s): at an
       // 8s cadence that's ~225 ticks. Prevents an interval lingering forever if
       // the user navigates away and the running card never resolves on the FE.
       let ticksLeft = 230;
       const tick = async () => {
         if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
-        // Card settled (flipped to done/failed) → done waiting.
-        if (!this._bgHasRunningCard(sid)) { this._stopBgContPoller(sid); return; }
+        const ownerState = this.tabState[sid];
+        // Card settled and the server no longer reports a detached watcher.
+        if (!this._bgHasRunningCard(sid)
+            && !(ownerState && ownerState.backgroundActive)) {
+          this._stopBgContPoller(sid);
+          return;
+        }
         // Tab hidden → skip the network work entirely (same battery/radio
         // rationale as _pingHealth). The card badge isn't visible anyway;
         // the next visible tick reconciles. ticksLeft still counts down so
@@ -5921,22 +6053,31 @@ function portal() {
                                  { headers: this.hdr() });
           if (r.ok) {
             const d = await r.json();
+            if (d.background && d.active) {
+              this._setBackgroundTaskActive(
+                sid, true, d.started_at, d.background_tasks_pending);
+            } else if (!d.active) {
+              this._setBackgroundTaskActive(sid, false);
+            }
             if (d.active && d.continuation && !this.streaming
                 && this.currentId === sid) {
               // Dedup: /active surfaces a finished continuation from the
               // server's _recent_turns for the full 60s TTL, so if ANOTHER
               // bg task keeps this poller alive the same continuation would
               // be re-reconnected every 8s → duplicate reaction bubbles. Key
-              // on the continuation's started_at (unique epoch per broadcast)
+              // on the continuation's immutable turn_id. started_at is the
+              // originating turn's epoch and is intentionally shared by every
+              // continuation, so it is not a valid identity.
               // and replay each one at most once. The normal single-task case
               // self-stops on the card flip and never reaches a second tick,
               // but this makes the multi-task case safe too.
               this._consumedConts = this._consumedConts || {};
-              const ckey = sid + ":" + d.started_at;
+              const ckey = sid + ":" + (d.turn_id || d.started_at);
               if (!this._consumedConts[ckey]) {
                 this._consumedConts[ckey] = true;
                 contFound = true;
                 this.send({ reconnect: true, continuation: true,
+                             sessionId: sid, turnId: d.turn_id || "",
                              startedAt: d.started_at });
               }
             }
@@ -6238,10 +6379,15 @@ function portal() {
     residentPaneIds() {
       const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
       const list = (this._residentTabIds || []).filter(Boolean);
-      const ordered = this.currentId
-        ? [this.currentId, ...list.filter(id => id !== this.currentId)]
-        : list;
-      return ordered.slice(0, budget);
+      if (this._isMobileLayout()) {
+        return this.currentId ? [this.currentId] : list.slice(0, 1);
+      }
+      const stable = list.slice(0, budget);
+      if (this.currentId && !stable.includes(this.currentId)) {
+        if (stable.length >= budget) stable.pop();
+        stable.push(this.currentId);
+      }
+      return stable;
     },
     // [resident-panes] LRU bookkeeping. Promote `tid` to most-recently-used, then
     // evict panes past _MAX_RESIDENT_PANES from the LRU end — but NEVER evict the
@@ -6251,17 +6397,37 @@ function portal() {
     // future rebuilt DOM re-runs syntax highlight.
     _promoteResident(tid) {
       if (!tid) return;
-      const list = (this._residentTabIds || []).filter(x => x !== tid);
-      list.unshift(tid);   // MRU at the front
       const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES;
-      while (list.length > budget) {
-        const cand = list.pop();
+      let residents = Array.from(new Set(
+        (this._residentTabIds || []).filter(Boolean)));
+      let lru = (this._residentTabLru || []).filter(
+        x => residents.includes(x) && x !== tid);
+      // Bootstrap recency for state created before this field existed and for
+      // deterministic browser fixtures that seed resident ids directly.
+      for (const id of residents) {
+        if (id !== tid && !lru.includes(id)) lru.push(id);
+      }
+      lru.unshift(tid);
+      if (!residents.includes(tid)) residents.push(tid);
+      while (residents.length > budget) {
+        const cand = [...lru].reverse().find(
+          id => id !== tid && id !== this.currentId && residents.includes(id));
+        if (!cand) break;
+        residents = residents.filter(id => id !== cand);
+        lru = lru.filter(id => id !== cand);
         const cst = this.tabState && this.tabState[cand];
         // DOM residency is independent from stream ownership. Hidden streams keep
         // mutating their tab state through SSE and rebuild when activated.
         if (cst) cst._highlighted = false;
       }
-      this._residentTabIds = list;
+      this._residentTabLru = lru;
+      // Avoid touching the x-for dependency when membership did not change.
+      // Assignment itself makes Alpine reconcile every pane even if the ids
+      // are semantically equal.
+      if (residents.length !== (this._residentTabIds || []).length
+          || residents.some((id, i) => id !== this._residentTabIds[i])) {
+        this._residentTabIds = residents;
+      }
     },
 
     async initSessions(options = {}) {
@@ -6317,6 +6483,7 @@ function portal() {
       // tabs lazy-mount on first switch (rebuild path), so a multi-tab restore
       // doesn't pay to render every pane up front.
       this._residentTabIds = [this.currentId];
+      this._residentTabLru = [this.currentId];
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
@@ -6537,6 +6704,21 @@ function portal() {
 
           if (d.active) {
             st._serverActiveObserved = true;
+            if (d.background && d.attachable === false) {
+              try { if (st.es) st.es.close(); } catch (_) {}
+              if (st._stallWatch) clearInterval(st._stallWatch);
+              st._stallWatch = null;
+              st.es = null;
+              st.streaming = false;
+              if (sid === this.currentId) {
+                this.es = null;
+                this.streaming = false;
+              }
+              this._setBackgroundTaskActive(
+                sid, true, d.started_at, d.background_tasks_pending);
+              this._ensureBgContPoller(sid);
+              return true;
+            }
             const silenceMs = Date.now() - (Number(st._lastSseActivity)
               || Number(st._streamStartedAt) || Date.now());
             const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
@@ -6557,6 +6739,7 @@ function portal() {
             await this.send({
               reconnect: true,
               sessionId: sid,
+              turnId: d.turn_id || st.activeTurnId || "",
               startedAt: d.started_at,
             });
             return true;
@@ -6650,6 +6833,8 @@ function portal() {
         st._stallWatch = null;
       }
       st.streaming = false;
+      st.backgroundActive = false;
+      st.backgroundTaskCount = 0;
       st._draining = false;
       st._reconnectAttempts = 0;
       st._serverActiveObserved = false;
@@ -7269,6 +7454,8 @@ function portal() {
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
         st.es = null;
         st.streaming = false;
+        st.backgroundActive = false;
+        st.backgroundTaskCount = 0;
         st._streamTimer = null;
         st._stallWatch = null;
         st._reconnectTimer = null;
@@ -7292,6 +7479,7 @@ function portal() {
       if (this._prefetching) delete this._prefetching[id];
       if (this.tabState[id] === st) delete this.tabState[id];
       this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
+      this._residentTabLru = (this._residentTabLru || []).filter(x => x !== id);
       this._clearSessionWarnFlags(id);
     },
     _startWorkspaceDrag(path, pointerId = null) {
@@ -7735,6 +7923,13 @@ function portal() {
       const s = this.sessions.find(x => x.id === tid);
       return !!(s && s.active);
     },
+    isTabBackgroundActive(tid) {
+      const st = this.tabState[tid];
+      return !!(st && st.backgroundActive);
+    },
+    isTabRunning(tid) {
+      return this.isTabBackgroundActive(tid) || this.isTabStreaming(tid);
+    },
     isTabUnread(tid) {
       // True when this tab's most recent turn finished while the user was
       // on a different tab AND they haven't activated this tab since.
@@ -7750,7 +7945,7 @@ function portal() {
       // already flipped false. The old `!st.streaming`-only guard let the
       // green "done" dot light up alongside the accent "in-progress" dot in
       // exactly those windows (2026-05-30 both-dots bug report).
-      if (this.isTabStreaming(tid)) return false;
+      if (this.isTabRunning(tid)) return false;
       const st = this.tabState[tid];
       return !!(st && st.unread);
     },
@@ -9859,6 +10054,14 @@ function portal() {
         if (!r.ok) return;
         const d = await r.json();
         if (this.tabState[sid] !== st) return;
+        if (d.active && d.background && d.attachable === false) {
+          st._serverActiveObserved = true;
+          if (d.turn_id) st.activeTurnId = d.turn_id;
+          this._setBackgroundTaskActive(
+            sid, true, d.started_at, d.background_tasks_pending);
+          this._ensureBgContPoller(sid);
+          return;
+        }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
           // Reconnect any time the backend says there's an active turn.
@@ -9873,10 +10076,15 @@ function portal() {
           // reload / tab-switch / SSE re-subscribe to an in-flight turn).
           // continuation: a bg-task watcher's headless turn — attach in
           // continuation mode so we DON'T truncate the launching card.
-          this.send({ reconnect: true, sessionId: sid, startedAt: d.started_at,
+          this.send({ reconnect: true, sessionId: sid,
+                       turnId: d.turn_id || "", startedAt: d.started_at,
                        continuation: !!d.continuation });
           return;
         }
+        this._setBackgroundTaskActive(sid, false);
+        st.activeTurnId = "";
+        st.parentTurnId = "";
+        st.lastEventSeq = 0;
         // No active turn. The server drains the queue on its own when a turn
         // finishes; on a fresh load with no turn running, dormant items (e.g.
         // left after a process restart, which intentionally does NOT auto-
@@ -18782,6 +18990,21 @@ function portal() {
       // card lives there and the replayed task_notification needs to flip it
       // to ✅done. The continuation's events APPEND after the existing cards.
       const isContinuation = isReconnect && !!opts.continuation;
+      const expectedTurnId = isReconnect
+        ? (opts.turnId || sendState.activeTurnId || "")
+        : "";
+      // A normal reconnect rebuilds its in-flight suffix from replay, so its
+      // sequence checkpoint resets. Continuation reconnects append and retain
+      // their checkpoint only when retrying the exact same continuation.
+      if (!isReconnect || !isContinuation
+          || sendState.activeTurnId !== expectedTurnId) {
+        sendState.lastEventSeq = 0;
+      }
+      if (expectedTurnId) sendState.activeTurnId = expectedTurnId;
+      if (!isReconnect) {
+        sendState.activeTurnId = "";
+        sendState.parentTurnId = "";
+      }
       // Resumed mode: _drainPendingQueue popped a previously-enqueued
       // message and asked us to send it. Pull text + attachments from
       // the item (NOT from this.input / this.pendingImages — those may
@@ -18849,6 +19072,7 @@ function portal() {
       // exits naturally with a red-border chip the user can remove + retry.
       // The send button stays disabled (_sendWaitingForUpload) so a double-
       // tap can't enqueue a second send while we wait.
+      let sentUserBubble = null;
       if (!isReconnect) {
         // For resumed items use their own snapshot; otherwise use the composer
         // snapshot captured before any await. Never drift to another tab's
@@ -18938,7 +19162,7 @@ function portal() {
         // Trim the live backlog before growing it again — keeps long
         // sessions from ballooning the DOM past the mobile crash point.
         this._capLiveMessages(sendState);
-        this._appendLiveMessage(sendState, {
+        sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
           images: readyImages.map(im => ({
             preview: im.preview,
@@ -19078,7 +19302,10 @@ function portal() {
       // Fresh (non-reconnect) sends always start at now.
       let _streamStartMs;
       if (isReconnect) {
-        if (opts.startedAt) _streamStartMs = opts.startedAt * 1000;
+        if (isContinuation && streamState.backgroundActive
+            && streamState._streamStartedAt) {
+          _streamStartMs = streamState._streamStartedAt;
+        } else if (opts.startedAt) _streamStartMs = opts.startedAt * 1000;
         else if (streamState._streamStartedAt) _streamStartMs = streamState._streamStartedAt;
         else _streamStartMs = Date.now();
       } else {
@@ -19119,6 +19346,7 @@ function portal() {
           body: JSON.stringify({
             prompt: text,
             session_id: streamSid,
+            turn_id: expectedTurnId,
             model: sendModel,
             permission: sendPermission,
             image_ids: attachIds.length ? attachIds.join(",") : "",
@@ -19134,6 +19362,7 @@ function portal() {
           url = "/api/chat/stream"
             + "?prompt=" + encodeURIComponent(text)
             + "&session_id=" + encodeURIComponent(streamSid)
+            + "&turn_id=" + encodeURIComponent(expectedTurnId)
             + "&model=" + encodeURIComponent(sendModel)
             + "&permission=" + encodeURIComponent(sendPermission)
             + "&mobile=" + (streamMobile ? "1" : "0")
@@ -19188,13 +19417,55 @@ function portal() {
       // trigger only costs a reconnect, never data.
       streamState._lastSseActivity = Date.now();
       const _bumpSse = (ev) => {
+        // An older EventSource may deliver one final buffered event after a
+        // reconnect replaced it. It no longer owns this tab state.
+        if (streamState.es !== es) {
+          if (ev && ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+          return;
+        }
         streamState._lastSseActivity = Date.now();
+        if (ev && ev.type !== "ping") {
+          let meta = null;
+          try { meta = JSON.parse(ev.data); } catch (_) {}
+          const eventTurnId = meta && meta.turn_id ? String(meta.turn_id) : "";
+          const eventSeq = Number(meta && meta.event_seq);
+          if (eventTurnId) {
+            const ownedTurnId = streamState.activeTurnId || expectedTurnId;
+            if (ownedTurnId && ownedTurnId !== eventTurnId) {
+              // ABA protection: this transport was minted for another turn.
+              // Never let even one event render under the wrong user message.
+              if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+              streamState._canonicalResyncPending = true;
+              streamState._canonicalResyncReason = "turn_changed";
+              try { es.close(); } catch (_) {}
+              if (streamState.es === es) streamState.es = null;
+              if (this.currentId === streamSid && this.es === es) this.es = null;
+              this._scheduleCanonicalStreamReload(streamSid, streamState);
+              return;
+            }
+            if (!streamState.activeTurnId) {
+              streamState.activeTurnId = eventTurnId;
+              if (sentUserBubble) sentUserBubble._turnId = eventTurnId;
+            }
+            if (meta.parent_turn_id) {
+              streamState.parentTurnId = String(meta.parent_turn_id);
+            }
+            if (Number.isFinite(eventSeq) && eventSeq > 0) {
+              if (eventSeq <= (Number(streamState.lastEventSeq) || 0)) {
+                if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+                return;
+              }
+              streamState.lastEventSeq = eventSeq;
+            }
+          }
+        }
         if (ev && ev.type !== "ping" && ev.type !== "error") {
           streamState._serverActiveObserved = true;
         }
       };
       ["text", "thinking", "tool_use", "tool_result", "task_started",
-       "task_progress", "task_notification", "rate_limit", "ping",
+       "task_progress", "task_notification", "rate_limit",
+       "ask_user_question", "permission_request", "ping",
        "done", "error", "cancelled", "resync"].forEach(
         t => es.addEventListener(t, _bumpSse));
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
@@ -19626,8 +19897,8 @@ function portal() {
 
         _scrollIfActive();
       });
-      const _stopTimer = () => {
-        if (streamState._streamTimer) {
+      const _stopTimer = (keepBackgroundElapsed = false) => {
+        if (!keepBackgroundElapsed && streamState._streamTimer) {
           clearInterval(streamState._streamTimer);
           streamState._streamTimer = null;
         }
@@ -19637,6 +19908,7 @@ function portal() {
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
         }
+        if (keepBackgroundElapsed) return;
         streamState.streamElapsed = 0;
         if (this.currentId === streamSid) {
           this._streamTimer = null;
@@ -19650,11 +19922,22 @@ function portal() {
       // cancellation flag (user clicked stop). For those, suppress the
       // green-dot unread indicator — the user knows they cancelled, an
       // "attention!" dot would imply something new arrived.
-      const _markDone = (cancelled = false) => {
+      const _markDone = (cancelled = false, backgroundPending = false) => {
         streamState.streaming = false;
         streamState.es = null;
         streamState._stopping = false;
         streamState._serverActiveObserved = false;
+        if (!(Number(backgroundPending) > 0 && !cancelled)) {
+          streamState.activeTurnId = "";
+          streamState.parentTurnId = "";
+          streamState.lastEventSeq = 0;
+        }
+        this._setBackgroundTaskActive(
+          streamSid,
+          Number(backgroundPending) > 0 && !cancelled,
+          streamState._streamStartedAt / 1000,
+          backgroundPending,
+        );
         // If the user is on a different tab when this turn lands, flag
         // unread so the tab strip can show a green dot. Doing it inside
         // _markDone covers every termination path (done / error /
@@ -19794,7 +20077,12 @@ function portal() {
         // after being cancelled before reload.
         const continuationFinalText = isContinuation && ownsCurBubble()
           ? (curBubble.text || "") : "";
-        es.close(); _markDone(!!d.cancelled); _stopTimer();
+        const backgroundPending = !d.cancelled
+          ? Math.max(0, Number(d.background_tasks_pending) || 0)
+          : 0;
+        es.close();
+        _markDone(!!d.cancelled, backgroundPending);
+        _stopTimer(backgroundPending > 0);
         if (isContinuation && !d.cancelled) {
           this._reconcileCompletedContinuation(
             streamSid, streamState, continuationFinalText,
@@ -19956,6 +20244,11 @@ function portal() {
         // Always close the old ES — leaving it triggers the browser's own
         // auto-reconnect (every ~3 s) on top of ours, which would race.
         try { es.close(); } catch (_) {}
+        // Detach the closed transport without changing the logical busy state.
+        // send({ reconnect:true }) refuses while an ES handle is present, even
+        // when that EventSource is already CLOSED.
+        if (streamState.es === es) streamState.es = null;
+        if (this.currentId === streamSid && this.es === es) this.es = null;
 
         if (attempts > MAX_ATTEMPTS) {
           // Given up. Surface manual retry UI.
@@ -20016,35 +20309,50 @@ function portal() {
               streamState._reconnectAttempts = 0;
               return;
             }
+            if (d.background && d.attachable === false) {
+              // Main ResultMessage landed while this transport was down, but
+              // its SDK background task still owns the session reader. There
+              // is no broadcast to attach to yet: preserve the running footer
+              // and let the continuation poller discover the next broadcast.
+              _markDone(false, true);
+              _stopTimer(true);
+              this._ensureBgContPoller(streamSid);
+              streamState._reconnectAttempts = 0;
+              return;
+            }
             // Re-subscribe via the existing reconnect plumbing.
             // streaming flag must be cleared first or send() bails as
             // "already streaming."
             streamState.streaming = false;
-            this.streaming = false;
+            if (this.currentId === streamSid) this.streaming = false;
             // Anchor the elapsed timer to the backend turn's real start so
             // the footer resumes from the true start, not from reconnect.
-            this.send({ reconnect: true, startedAt: d.started_at });
+            this.send({ reconnect: true, sessionId: streamSid,
+                        turnId: d.turn_id || streamState.activeTurnId || "",
+                        startedAt: d.started_at,
+                        continuation: !!d.continuation });
           } catch (_e) {
             // Probe failed — try again on next error tick (counter will
-            // continue incrementing until MAX_ATTEMPTS). Force a fresh
-            // error event by manufacturing one: easiest is to schedule
-            // another setTimeout that mimics this branch but bypasses
-            // the EventSource. Cheaper: just bump the counter and let
-            // the next real error fire normally. Bail here.
-            _markDone(); _stopTimer();
+            // continue incrementing until MAX_ATTEMPTS). Do NOT mark the
+            // turn done while a retry is still scheduled: that used to hide
+            // the running footer and temporarily unlock the composer even
+            // though the server-side turn was still alive.
             if (attempts >= MAX_ATTEMPTS) {
+              _markDone(); _stopTimer();
               this.toast(this.lang === "zh"
                           ? "和 Muse 的连接断开了，重试一下"
                           : "Lost connection to Muse — try again",
                           "error");
               if (!isContinuation) markUserFailed();
             } else {
-              // Schedule next retry ourselves since no new ES error will fire.
+              // Schedule next retry ourselves since the old EventSource is
+              // closed and no new transport error will fire.
               setTimeout(() => {
                 if (this.currentId !== streamSid) return;
                 streamState.streaming = false;
-                this.streaming = false;
-                this.send({ reconnect: true });
+                if (this.currentId === streamSid) this.streaming = false;
+                this.send({ reconnect: true, sessionId: streamSid,
+                            turnId: streamState.activeTurnId || "" });
               }, 800 * Math.pow(2, attempts));
             }
           }

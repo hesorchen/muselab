@@ -29,7 +29,7 @@ muselab 没有数据库，但状态并不只在一个目录。完整迁移需要
 - 用户文件；
 - 该目录自己的 `.muselab-dustbin/`；
 - 对应的 CLI JSONL 不在工作目录本身：Claude 位于 `~/.claude/projects/`，
-  第三方 Provider 位于隔离的临时配置根。
+  第三方 Provider 位于隔离的持久状态根。
 
 全局状态仍只放在主 `MUSELAB_ROOT/.muselab/`，不会复制到每个工作目录。
 
@@ -51,11 +51,17 @@ muselab 没有数据库，但状态并不只在一个目录。完整迁移需要
 | `~/.claude/projects/<cwd-key>/*.jsonl` | 各工作目录的真实对话记录 |
 | `~/.claude/.credentials.json` | Claude Pro/Max OAuth 登录 |
 | `~/.claude/` 其他配置 | 用户级 CLAUDE.md、Skills、权限和 CLI 偏好 |
-| `<系统临时目录>/muselab-vendor-cli-config-<uid>/projects/` | 第三方 Provider 的隔离 transcript；可能被系统清理 |
+| `${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/` | 第三方 Provider 的隔离 transcript、任务和 CLI 状态 |
 
 只使用 Claude 时，最简单的做法是安全备份整个 `~/.claude/`。使用第三方 Provider
-时还必须备份对应的隔离 `projects/`，否则这些会话的正文不会包含在 `~/.claude/`
-备份中。如果不迁移凭据，可以在新机器重新执行 `claude login`。
+时还必须备份对应的 `vendor-cli/` 状态目录，否则这些会话的正文不会包含在
+`~/.claude/` 备份中。如果不迁移凭据，可以在新机器重新执行 `claude login`。
+
+升级后的首次启动会把旧
+`<系统临时目录>/muselab-vendor-cli-config-<uid>/` 自动迁移到持久目录。已有的
+持久文件不会被覆盖；若存在同路径冲突，旧文件会保存在
+`vendor-cli/.migration-conflicts/` 供手动恢复。唯一例外是滚动重启时旧进程补写的
+有效、更新 JSONL 尾部；其中不重复的记录会安全追加到持久副本。
 
 ## 不持久化或无需迁移
 
@@ -64,7 +70,6 @@ muselab 没有数据库，但状态并不只在一个目录。完整迁移需要
 | 正在运行或已退出的终端会话 | 只存在于当前后端进程；Profile 才是持久化配置 |
 | SSE replay spool | 操作系统临时文件，只服务当前进程的断线重连 |
 | 尚未发送的附件暂存 | 仅在内存中，TTL 为 10 分钟 |
-| 第三方 Provider 隔离根中除 `projects/` 外的配置 | 可重建；`projects/` transcript 需要备份 |
 | SDK client、限速桶和内存缓存 | 启动后自动重建 |
 | 浏览器打开的 Tab、布局和部分偏好 | 存在浏览器 localStorage，需要单独迁移浏览器数据 |
 

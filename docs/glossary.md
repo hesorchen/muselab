@@ -18,7 +18,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **CLAUDE.md** — A plain-text Markdown file at the root of the archive. The Claude Agent SDK auto-loads it as context on every conversation, making it the primary channel for personalising Muse's behaviour. See [`personalize-claude-md.md`](personalize-claude-md.md).
 
-**CLAUDE_CONFIG_DIR isolation** — For third-party providers, muselab sets `CLAUDE_CONFIG_DIR` to a per-user temp directory (`$(tmpdir)/muselab-vendor-cli-config-<uid>/`) that contains no `credentials.json`. This prevents the CLI from silently falling back to Claude Pro OAuth and routing third-party traffic through your Anthropic account. See [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md).
+**CLAUDE_CONFIG_DIR isolation** — For third-party providers, muselab sets `CLAUDE_CONFIG_DIR` to persistent per-user state (`${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/`) that contains no `credentials.json`. This prevents the CLI from silently falling back to Claude Pro OAuth and routing third-party traffic through your Anthropic account while retaining vendor transcripts across restarts. See [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md).
 
 **client pool** — The in-memory cache of live `ClaudeSDKClient` instances, keyed by `(session_id, model, effort)`. Default capacity is 3 entries (configurable via `MUSELAB_CLIENT_POOL_CAP`); least-recently-used entries are evicted when the cap is exceeded, except for entries with an active turn or in-flight background task. See [`routing.md — The Client Pool`](routing.md).
 

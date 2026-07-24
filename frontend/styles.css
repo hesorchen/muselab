@@ -2876,6 +2876,10 @@ pre.text {
   flex-shrink: 0;
   animation: tab-pulse 1.4s ease-in-out infinite;
 }
+.chat-tab-stream-dot.is-background {
+  background: var(--c-warn);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--c-warn) 55%, transparent);
+}
 @keyframes tab-pulse {
   0%, 100% { opacity: 0.4; transform: scale(0.85); }
   50%      { opacity: 1;   transform: scale(1); }
@@ -3259,6 +3263,20 @@ pre.text {
   overflow-wrap: anywhere;
   font: inherit;
 }
+.long-answer-rest {
+  margin-top: var(--sp-2);
+  color: var(--c-fg-1);
+}
+.long-answer-rest > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--c-accent);
+  font-size: var(--fs-sm);
+  user-select: none;
+}
+.long-answer-rest > div {
+  margin-top: var(--sp-2);
+}
 .msg {
   display: flex;
   flex-direction: column;
@@ -3275,6 +3293,16 @@ pre.text {
      The heavy work (mdRender + hljs) already runs at load regardless of this,
      so eager rendering just lets the browser paint the bounded window up front
      instead of stuttering every scroll. */
+}
+/* Desktop keeps several warm conversation panes mounted for instant tab
+   switches. Lay out only the visible slice of a newly revealed history;
+   off-screen bubbles use the per-message intrinsic height estimate already
+   written inline. Phones stay eager because their sequential touch scrolling
+   is more sensitive to on-demand realization and they retain only one pane. */
+@media (min-width: 769px) and (pointer: fine) {
+  .msg-pane .msg {
+    content-visibility: auto;
+  }
 }
 /* Paged-in history bubbles ("Load earlier" / live-cap restore) mount as a
    batch of 20+ at once. Each .msg would play the msg-in entrance animation on
@@ -3810,6 +3838,11 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   font-size: var(--fs-xs);
   color: var(--c-fg-3);
   letter-spacing: 0.3px;
+}
+.background-task-footer-label {
+  color: var(--c-warn);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
 }
 .thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
 .thinking-dots span:nth-child(3) { animation-delay: 0.30s; }
@@ -6168,6 +6201,51 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-2xs); font-weight: 600; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
   box-sizing: border-box;
+}
+
+/* Explicit detached-task state between the main ResultMessage and the SDK's
+   later task settlement. The old UI left only the generic three-dot footer,
+   which looked indistinguishable from a stuck reply. */
+.background-task-strip {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 8px 4px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--c-warn) 38%, transparent);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--c-warn) 10%, transparent);
+  color: var(--c-fg-1);
+  font-size: var(--fs-sm);
+}
+.background-task-strip-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: var(--c-warn);
+  animation: tab-pulse 1.4s ease-in-out infinite;
+}
+.background-task-strip-label {
+  color: var(--c-fg-0);
+  font-weight: var(--fw-medium);
+}
+.background-task-strip-hint { color: var(--c-fg-3); }
+.background-task-strip-elapsed {
+  margin-left: auto;
+  color: var(--c-fg-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+@media (max-width: 480px) {
+  .background-task-strip {
+    margin: 6px 2px;
+    padding: 7px 10px;
+    gap: var(--sp-1);
+    font-size: var(--fs-xs);
+  }
+  .background-task-strip-hint { display: none; }
 }
 
 /* Queued message bubbles — user messages waiting to dispatch after the

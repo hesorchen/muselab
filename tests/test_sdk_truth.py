@@ -14,7 +14,7 @@ def test_cli_encode_cwd_delegates_to_sdk():
     for p in ("/home/alice",
               "/home/a_b.c/x",
               "/home/用户/笔记",   # unicode: hand-rolled drifted here
-              "/tmp/muselab-vendor-cli-config-1000/projects"):
+              "/home/alice/.local/state/muselab/vendor-cli/projects"):
         assert _cli_encode_cwd(p) == project_key_for_directory(p)
 
 

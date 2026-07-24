@@ -113,11 +113,11 @@ def _cli_project_roots() -> list[Path]:
 
     1. ``~/.claude/projects`` — default root used by Claude (Pro OAuth /
        Anthropic API key).
-    2. ``<tmp>/muselab-vendor-cli-config-<uid>/projects`` — vendor-isolated
-       root used when muselab routes the CLI subprocess to a third-party
-       Anthropic-compatible endpoint (DeepSeek / GLM / MiniMax / Kimi /
-       Qwen / MiMo).  See ``endpoints.env_override`` for the isolation
-       rationale. Path is per-OS-user to avoid multi-user collision.
+    2. ``${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects`` —
+       durable vendor-isolated root used when muselab routes the CLI
+       subprocess to a third-party Anthropic-compatible endpoint (DeepSeek /
+       GLM / MiniMax / Kimi / Qwen / MiMo). See ``endpoints.env_override`` for
+       the isolation rationale.
 
     Callers reading transcripts MUST walk both. Forgetting the vendor
     root has caused real bugs across the codebase — vendor sessions
@@ -559,6 +559,17 @@ class TurnBroadcast:
         # purpose, almost never "just this one, send the rest."
         self.cancelled = False
         self.started_at = time.time()
+        # Immutable identity for this exact assistant turn. Session id alone
+        # cannot distinguish the classic ABA race where turn A finishes and
+        # turn B starts before a reconnect for A reaches the server.
+        self.turn_id = str(uuid.uuid4())
+        # Headless background-task continuations are separate turns, linked to
+        # the user turn that launched the task for observability and recovery.
+        self.parent_turn_id: str = ""
+        # Strictly increasing within this broadcast. Replayed and live events
+        # carry the same sequence so clients can discard duplicate delivery
+        # without guessing from event content.
+        self._event_seq = 0
         # Set in finish(). Used by the _recent_turns grace-keep map to TTL-evict
         # broadcasts that ended a while ago.
         self.finished_at: float = 0.0
@@ -616,6 +627,17 @@ class TurnBroadcast:
 
     def _append_replay(self, event: dict) -> None:
         replay = dict(event)
+        self._event_seq += 1
+        try:
+            payload = json.loads(replay.get("data") or "{}")
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            payload.setdefault("turn_id", self.turn_id)
+            payload.setdefault("event_seq", self._event_seq)
+            if self.parent_turn_id:
+                payload.setdefault("parent_turn_id", self.parent_turn_id)
+            replay["data"] = json.dumps(payload, ensure_ascii=False)
         self.events.append(replay)
         self._replay_bytes += _broadcast_event_size(replay)
         for subscriber in tuple(self.subscribers):
@@ -766,10 +788,18 @@ def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
 #       Presence here exempts the session's clients from LRU eviction.
 #   _task_watchers: session_id -> the detached asyncio.Task doing the reading.
 # Single-reader invariant: a watcher and a live turn must never read the same
-# client stream concurrently. A new turn cancels the watcher (handoff) before
-# it starts reading; the watcher only runs in the gap between turns.
+# client stream concurrently. While a watcher owns the stream, new user input
+# remains queued; the next turn starts only after the watcher has delivered the
+# task settlement + auto-continuation and released the reader.
 _sessions_with_inflight_tasks: dict[str, set[str]] = {}
 _task_watchers: dict[str, asyncio.Task] = {}
+# Original user-turn start (epoch seconds) retained across the detached gap and
+# every headless continuation. `/active` returns it after a page refresh so the
+# footer timer keeps counting from the real turn start instead of restarting.
+_background_turn_started_at: dict[str, float] = {}
+# Originating user-turn identity retained across the watcher gap. Every
+# continuation gets its own turn_id and exposes this value as parent_turn_id.
+_background_origin_turn_id: dict[str, str] = {}
 # Monotonic per-session ownership token for detached continuation readers.
 # Cancelling a task is cooperative, so a replaced watcher can receive one more
 # message before CancelledError lands. Generation checks keep that stale reader
@@ -791,11 +821,25 @@ _CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 60, min_value=5)
 _STOPPED_CONTINUATION_GRACE = env_int(
     "MUSELAB_STOPPED_CONTINUATION_GRACE", 5, min_value=1)
 # task_id -> description, surviving across the turn that started the task. The
-# per-turn inflight_tasks dict is local to a turn; if a NEW turn happens to
-# drain a buffered terminal notification (handoff race), it has no description
-# for that task_id. This module-level cache keeps the label correct across the
-# handoff. Populated on TaskStarted, consumed+removed on settle.
+# per-turn inflight_tasks dict is local to a turn. This module-level cache keeps
+# the label available to the detached watcher and across watcher replacement.
+# Populated on TaskStarted, consumed+removed on settle.
 _bg_task_descriptions: dict[str, str] = {}
+
+
+def _session_has_live_watcher(session_id: str) -> bool:
+    watcher = _task_watchers.get(session_id)
+    return watcher is not None and not watcher.done()
+
+
+def _session_runtime_busy(session_id: str) -> bool:
+    """One authoritative busy boundary for turns and detached task readers."""
+    active = _active_turns.get(session_id)
+    return bool(
+        (active is not None and not active.done)
+        or _sessions_with_inflight_tasks.get(session_id)
+        or _session_has_live_watcher(session_id)
+    )
 
 
 def _terminal_task_update(msg: TaskUpdatedMessage) -> dict | None:
@@ -876,6 +920,7 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
                 "user_text_preview": preview,
                 "model": bc.model,
                 "started_at": bc.started_at,
+                "turn_id": bc.turn_id,
             }, ensure_ascii=False),
         )
     except Exception as e:
@@ -895,6 +940,23 @@ def _delete_active_turn_sidecar(sid: str) -> None:
             p.unlink()
     except Exception:
         pass
+
+
+def _delete_active_turn_sidecar_if_idle(sid: str) -> bool:
+    """Delete the crash breadcrumb only after the whole logical turn is idle.
+
+    A main ResultMessage is not terminal when SDK background tasks are still
+    owned by a detached watcher. Keeping the sidecar through that gap lets a
+    process restart surface the turn as interrupted instead of leaving a
+    transcript that silently ends at TaskNotification/thinking.
+    """
+    if _sessions_with_inflight_tasks.get(sid):
+        return False
+    watcher = _task_watchers.get(sid)
+    if watcher is not None and not watcher.done():
+        return False
+    _delete_active_turn_sidecar(sid)
+    return True
 
 
 def _scan_interrupted_turns_at_startup() -> dict[str, dict]:
@@ -2112,15 +2174,13 @@ async def disconnect_client(session_id: str) -> None:
 
 async def _rebuild_session_runtime(session_id: str) -> None:
     """Disconnect now, or defer until the active turn reaches a safe boundary."""
-    active = _active_turns.get(session_id)
-    if active is not None and not active.done:
+    if _session_runtime_busy(session_id):
         _pending_runtime_rebuilds.add(session_id)
         return
     async with _session_runtime_lock_for(session_id):
         # A turn may reserve the session while this coroutine waits for the
         # mutex. Its get_client() will consume the marker before querying.
-        active = _active_turns.get(session_id)
-        if active is not None and not active.done:
+        if _session_runtime_busy(session_id):
             _pending_runtime_rebuilds.add(session_id)
             return
         await disconnect_client(session_id)
@@ -2264,6 +2324,14 @@ def list_sessions_api(
         sid for sid, bc in _active_turns.items()
         if bc is not None and not bc.done
     }
+    active_sids.update(
+        sid for sid, task_ids in _sessions_with_inflight_tasks.items()
+        if task_ids
+    )
+    active_sids.update(
+        sid for sid, watcher in _task_watchers.items()
+        if watcher is not None and not watcher.done()
+    )
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
     sessions = []
@@ -3879,6 +3947,8 @@ def _clear_session_runtime_state(sid: str) -> None:
     watcher = _task_watchers.pop(sid, None)
     if watcher is not None and not watcher.done():
         watcher.cancel()
+    _background_turn_started_at.pop(sid, None)
+    _background_origin_turn_id.pop(sid, None)
     task_ids = _sessions_with_inflight_tasks.pop(sid, set())
     for task_id in task_ids:
         _bg_task_descriptions.pop(task_id, None)
@@ -7548,6 +7618,9 @@ _STREAM_TICKETS_LOCK = threading.Lock()
 class StreamStartReq(BaseModel):
     prompt: str = ""
     session_id: str
+    # Empty for a new turn. Reconnects pin the exact server turn they observed
+    # via /sessions/{sid}/active so they can never attach to a newer turn.
+    turn_id: str = ""
     model: str = ""
     permission: str = "bypassPermissions"
     image_ids: str = ""
@@ -7573,6 +7646,7 @@ def stream_start(req: StreamStartReq) -> dict:
         _STREAM_TICKETS[ticket] = (now + _STREAM_TICKET_TTL_S, {
             "prompt": req.prompt,
             "session_id": req.session_id,
+            "turn_id": req.turn_id,
             "model": req.model,
             "permission": permission,
             "image_ids": req.image_ids,
@@ -7586,6 +7660,7 @@ async def stream(
     prompt: str = Query(default=""),
     token: str = Query(default=""),
     session_id: str = Query(default=""),
+    turn_id: str = Query(default=""),
     model: str = Query(default=""),
     permission: str = Query(default="bypassPermissions"),
     image_ids: str = Query(default=""),
@@ -7604,6 +7679,7 @@ async def stream(
         params = entry[1]
         prompt = params["prompt"]
         session_id = params["session_id"]
+        turn_id = params.get("turn_id", "")
         model = params["model"]
         permission = params["permission"]
         image_ids = params["image_ids"]
@@ -7647,6 +7723,18 @@ async def stream(
             # of silently requiring a manual refresh.
             recent = _get_recent_turn(session_id)
             if recent is not None:
+                if turn_id and recent.turn_id != turn_id:
+                    async def _recent_changed_gen():
+                        yield {
+                            "event": "resync",
+                            "data": json.dumps({
+                                "reason": "turn_changed",
+                                "requested_turn_id": turn_id,
+                                "current_turn_id": recent.turn_id,
+                            }),
+                        }
+                    return EventSourceResponse(
+                        _recent_changed_gen(), headers=_SSE_HEADERS)
                 return EventSourceResponse(
                     _subscribe_broadcast(recent, mobile=mobile),
                     headers=_SSE_HEADERS,
@@ -7655,6 +7743,18 @@ async def stream(
             async def _no_active_gen():
                 yield _error_event("no active turn")
             return EventSourceResponse(_no_active_gen(), headers=_SSE_HEADERS)
+        if turn_id and existing.turn_id != turn_id:
+            async def _active_changed_gen():
+                yield {
+                    "event": "resync",
+                    "data": json.dumps({
+                        "reason": "turn_changed",
+                        "requested_turn_id": turn_id,
+                        "current_turn_id": existing.turn_id,
+                    }),
+                }
+            return EventSourceResponse(
+                _active_changed_gen(), headers=_SSE_HEADERS)
         return EventSourceResponse(
             _subscribe_broadcast(existing, mobile=mobile),
             headers=_SSE_HEADERS,
@@ -7894,13 +7994,11 @@ async def _watch_inflight_tasks(
     Drains client.receive_messages() until every pending task settles + its
     continuation closes, or the watch times out.
 
-    SINGLE-READER INVARIANT: this runs only in the gap between turns. A new turn
-    on the same session cancels this watcher (see _start_turn handoff) BEFORE
-    its own receive_response() reads the same stream, so the two never race. A
-    new turn's busy-check ALSO rejects while a continuation broadcast occupies
-    _active_turns[sid] — so the handoff cancel only happens when no continuation
-    is open (cont is None). On cancellation we KEEP the pins; the new turn
-    drains the buffered notification and settles it via the in-turn dispatch."""
+    SINGLE-READER INVARIANT: this runs only between ordinary user turns. New
+    input is rejected by _start_turn and retained in the durable queue until
+    this watcher has delivered every settlement + auto-continuation. This is
+    deliberately stricter than cancelling the watcher: cancellation could
+    leave an old continuation buffered for the next user turn to misattribute."""
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
 
@@ -7916,6 +8014,9 @@ async def _watch_inflight_tasks(
         if not _owns_generation():
             return
         b = TurnBroadcast(session_id=session_id, model="")
+        b.started_at = _background_turn_started_at.get(
+            session_id, b.started_at)
+        b.parent_turn_id = _background_origin_turn_id.get(session_id, "")
         b.is_continuation = True
         async with _lock:
             if not _owns_generation():
@@ -7925,7 +8026,17 @@ async def _watch_inflight_tasks(
                 return   # a live turn raced in — defer to it
             _active_turns[session_id] = b
         cont = b
-        cont_state = {"tool_use_names": {}, "streamed": []}
+        cont_state = {
+            "tool_use_names": {},
+            "streamed": [],
+            # Claude Code normally reacts to a terminal TaskNotification
+            # automatically. Some provider/CLI combinations persist the
+            # notification and then close receive_messages() before that
+            # reaction starts. In that case the watcher explicitly nudges the
+            # same SDK session once; this flag prevents an infinite retry loop.
+            "explicit_resume_requested": False,
+            "incomplete_error": None,
+        }
 
     async def _close_continuation(cancelled: bool = False) -> None:
         """Emit a terminal `done`, finish the broadcast, drop it from
@@ -7933,20 +8044,89 @@ async def _watch_inflight_tasks(
         and grace-keep it for a slightly-late FE reconnect."""
         nonlocal cont, cont_state
         b = cont
+        state = cont_state
         cont = None
         cont_state = None
         if b is None:
             return
-        b.publish({"event": "done", "data": json.dumps({
+        incomplete_error = (state or {}).get("incomplete_error")
+        done_payload = {
             "cancelled": cancelled,
             "model": b.model,
             "continuation": True,
-        })})
+            "background_tasks_pending": len(pending),
+        }
+        if incomplete_error:
+            done_payload.update({
+                "is_error": True,
+                "error": incomplete_error,
+                "kind": "background_continuation_incomplete",
+                "cta": "retry",
+                "retryable": True,
+            })
+        b.publish({"event": "done", "data": json.dumps(done_payload)})
         b.finish()
         async with _lock:
             if _active_turns.get(session_id) is b:
                 _active_turns.pop(session_id, None)
         _remember_recent_turn(session_id, b)
+
+    async def _request_explicit_resume(reason: str) -> bool:
+        """Ask the existing SDK session to finish the originating request.
+
+        Claude Code normally starts this turn itself after a completed
+        TaskNotification. A stream EOF or grace timeout before ResultMessage
+        means that auto-resume was missed. Send one metadata-only user record
+        so it is available to the live model but excluded from normal
+        transcript rendering/conversation counts by the SDK's `isMeta`
+        semantics.
+        """
+        if (pending or cont is None or cont_state is None
+                or last_settle_status == "stopped"
+                or cont_state["explicit_resume_requested"]):
+            return False
+        cont_state["explicit_resume_requested"] = True
+
+        async def _meta_prompt():
+            yield {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<system-reminder>All background tasks from the "
+                        "previous turn have finished. Continue the original "
+                        "user request now: incorporate the task results, "
+                        "complete any remaining work, and provide the final "
+                        "response. Do not merely report task status."
+                        "</system-reminder>"
+                    ),
+                },
+                "parent_tool_use_id": None,
+                "isMeta": True,
+            }
+
+        try:
+            sys.stderr.write(
+                f"[chat] task watcher: auto-continuation missing "
+                f"sid={session_id[:8]} ({reason}); requesting explicit resume\n")
+            await client.query(_meta_prompt())
+            return True
+        except Exception as e:
+            cont_state["incomplete_error"] = (
+                "后台任务已经完成，但最终答复续接失败。请发送“继续”让 Muse "
+                f"完成上一轮。（{type(e).__name__}）"
+            )
+            sys.stderr.write(
+                f"[chat] task watcher: explicit resume failed "
+                f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
+            return False
+
+    def _mark_incomplete() -> None:
+        if cont_state is not None and not cont_state.get("incomplete_error"):
+            cont_state["incomplete_error"] = (
+                "后台任务已经完成，但没有生成最终答复。请发送“继续”让 Muse "
+                "完成上一轮。"
+            )
 
     msg_iter = client.receive_messages().__aiter__()
     # Status of the most recent settle. A USER-STOPPED task almost never
@@ -7976,10 +8156,20 @@ async def _watch_inflight_tasks(
                     else:
                         msg = await msg_iter.__anext__()
                 except StopAsyncIteration:
+                    if await _request_explicit_resume("message stream ended"):
+                        msg_iter = client.receive_messages().__aiter__()
+                        continue
+                    if (not pending and cont is not None
+                            and last_settle_status != "stopped"):
+                        _mark_incomplete()
                     break
                 except asyncio.TimeoutError:
-                    # Grace elapsed with no auto-continue (rare). Close the
-                    # open continuation and stop — all tasks already settled.
+                    if await _request_explicit_resume("continuation grace elapsed"):
+                        msg_iter = client.receive_messages().__aiter__()
+                        continue
+                    if (not pending and cont is not None
+                            and last_settle_status != "stopped"):
+                        _mark_incomplete()
                     break
 
                 if not _owns_generation():
@@ -8116,10 +8306,9 @@ async def _watch_inflight_tasks(
                         for ev in _render_continuation_message(msg, cont_state):
                             cont.publish(ev)
     except asyncio.CancelledError:
-        # Handoff to a new turn (or shutdown). By the busy-check invariant cont
-        # is None here (a continuation in _active_turns would have rejected the
-        # new turn before it reached the handoff). Keep the pins; the new turn
-        # settles the still-pending tasks. Don't await during cancellation.
+        # Shutdown or explicit watcher replacement. Keep pins so a replacement
+        # watcher can continue ownership; ordinary new turns never cancel a
+        # live watcher.
         raise
     except asyncio.TimeoutError:
         sys.stderr.write(
@@ -8146,23 +8335,43 @@ async def _watch_inflight_tasks(
             f"[chat] task watcher exit sid={session_id[:8]} "
             f"pending_left={sorted(pending)}\n")
         # Only clear the registry slot if it still points at us (a fresh
-        # watcher may have replaced it after a handoff).
+        # watcher may have replaced it).
         if _task_watchers.get(session_id) is asyncio.current_task():
             _task_watchers.pop(session_id, None)
+            # User messages submitted while background tasks were running stay
+            # in the durable queue. Advance only after this watcher and its
+            # final continuation fully release the SDK reader; otherwise a new
+            # turn can consume the previous task's auto-continue response and
+            # render it under the new user prompt.
+            if (_owns_generation()
+                    and not _sessions_with_inflight_tasks.get(session_id)):
+                _background_turn_started_at.pop(session_id, None)
+                _background_origin_turn_id.pop(session_id, None)
+                if session_id in _pending_runtime_rebuilds:
+                    try:
+                        await _rebuild_session_runtime(session_id)
+                    except Exception as e:
+                        sys.stderr.write(
+                            f"[chat] post-task runtime rebuild failed "
+                            f"sid={session_id}: {e}\n")
+                try:
+                    await _maybe_drain_queue(session_id)
+                except Exception as e:
+                    sys.stderr.write(
+                        f"[chat] post-task queue drain failed "
+                        f"sid={session_id}: {e}\n")
+        if (_owns_generation()
+                and not _sessions_with_inflight_tasks.get(session_id)):
+            _delete_active_turn_sidecar_if_idle(session_id)
 
 
 def _merge_session_inflight(
     session_id: str, turn_inflight: dict[str, dict],
 ) -> dict[str, dict]:
     """Union THIS turn's launches with EVERY unsettled task pinned for the
-    session, so the cross-turn watcher re-covers tasks orphaned by an
-    intervening turn (spec §13 orphan bug).
+    session, so watcher replacement never orphans an already-pinned task.
 
-    A task launched in a prior turn had its watcher cancelled by a later turn's
-    _handoff_task_watcher; if that later turn never re-registered it in its
-    turn-local inflight_tasks, no watcher would cover the next idle gap. Merging
-    the session-level pin set (`_sessions_with_inflight_tasks`) re-covers them —
-    descriptions for prior-turn tasks come from the cross-turn cache. Already
+    Descriptions for prior-turn tasks come from the cross-turn cache. Already
     settled tasks aren't in the pin set, so this never resurrects a finished one.
     """
     merged = dict(turn_inflight)
@@ -8179,6 +8388,9 @@ def _spawn_task_watcher(
     session_id: str,
     client: ClaudeSDKClient,
     inflight: dict[str, dict],
+    *,
+    started_at: float | None = None,
+    origin_turn_id: str = "",
 ) -> None:
     """Start (or replace) the cross-turn watcher for a session whose just-ended
     turn left background tasks in flight."""
@@ -8189,6 +8401,10 @@ def _spawn_task_watcher(
     old = _task_watchers.get(session_id)
     if old is not None and not old.done():
         old.cancel()
+    if started_at is not None:
+        _background_turn_started_at.setdefault(session_id, float(started_at))
+    if origin_turn_id:
+        _background_origin_turn_id.setdefault(session_id, origin_turn_id)
     generation = _continuation_generations.get(session_id, 0) + 1
     _continuation_generations[session_id] = generation
     sys.stderr.write(
@@ -8199,20 +8415,19 @@ def _spawn_task_watcher(
 
 
 async def _handoff_task_watcher(session_id: str) -> None:
-    """A new turn is about to read this session's client stream. Cancel any
-    cross-turn watcher first so the two aren't single-reader on the same stream
-    at once, and wait for it to fully stop. The pins stay (the watcher's
-    CancelledError path keeps them) so the client isn't evicted in the gap; the
-    new turn's in-turn dispatch settles the buffered notification."""
-    _continuation_generations[session_id] = (
-        _continuation_generations.get(session_id, 0) + 1)
-    watcher = _task_watchers.pop(session_id, None)
+    """Clear a completed watcher before a new turn reads the client stream.
+
+    A live watcher is a logic error here: _start_turn's atomic busy check must
+    keep the user message queued until that watcher exits. Never cancel it,
+    because doing so can hand its buffered auto-continuation to the new turn.
+    """
+    watcher = _task_watchers.get(session_id)
     if watcher is not None and not watcher.done():
-        watcher.cancel()
-        # gather(return_exceptions=True) absorbs the watcher's CancelledError
-        # without raising it here, while still propagating cancellation of THIS
-        # task if we ourselves get cancelled mid-await.
-        await asyncio.gather(watcher, return_exceptions=True)
+        raise _TurnBusy()
+    _task_watchers.pop(session_id, None)
+    if not _sessions_with_inflight_tasks.get(session_id):
+        _background_turn_started_at.pop(session_id, None)
+        _background_origin_turn_id.pop(session_id, None)
 
 
 async def _start_turn(
@@ -8273,6 +8488,16 @@ async def _start_turn(
             # tearing it down). Rather than bounce the user's resend with
             # "previous turn still running", wait below for the slot to free.
             draining = cur
+        elif (_sessions_with_inflight_tasks.get(session_id)
+              or (session_id in _task_watchers
+                  and not _task_watchers[session_id].done())):
+            # A detached task watcher is the sole reader of this session's SDK
+            # stream until every background task and its auto-continuation
+            # settle. Starting a user turn here used to cancel that watcher,
+            # then drain the old continuation as if it answered the new prompt.
+            # Keep the one-session/one-reader invariant and let the caller
+            # enqueue instead.
+            raise _TurnBusy()
         else:
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -8292,6 +8517,17 @@ async def _start_turn(
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
+    # Clear a completed watcher defensively. A live watcher must never be
+    # cancelled here: it still owns the stream and its continuation belongs to
+    # the previous turn.
+    try:
+        await _handoff_task_watcher(session_id)
+    except _TurnBusy:
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+        raise
     # Defensive: clear any stale "user cancelled" flag carried over from
     # a previous turn on this session. Normally consumed by the prior
     # turn's ResultMessage handler, but if that handler never reached
@@ -8378,12 +8614,6 @@ async def _start_turn(
         await asyncio.to_thread(_activity.start, session_id, summary=prompt)
     except Exception as e:
         sys.stderr.write(f"[activity] start failed sid={session_id}: {e}\n")
-
-    # Cross-turn background-task handoff: if a prior turn on this session left
-    # a watcher draining the (now shared) client stream, cancel it before we
-    # read so we don't double-read. Buffered TaskNotifications it hadn't drained
-    # are delivered to this turn's receive_response() and settled in-turn.
-    await _handoff_task_watcher(session_id)
 
     # Pull attachments from the in-memory store; build content blocks for the
     # SDK. Consume them — same attachment won't be re-sent on retry.
@@ -9570,6 +9800,14 @@ async def _start_turn(
                     round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
                     if _budget_usd() > 0 else 0
                 ),
+                # Main ResultMessage can arrive while SDK-native background
+                # Agent/Bash tasks continue. The browser keeps the turn footer
+                # alive and queues follow-ups until their detached watcher
+                # completes, preventing old continuation text from appearing
+                # beneath a newer user message.
+                "background_tasks_pending": len(
+                    _merge_session_inflight(session_id, inflight_tasks)
+                ),
             })}
 
         # event_gen is now driven by a detached background task (see
@@ -9659,7 +9897,13 @@ async def _start_turn(
             # docstring for the spec §13 orphan-bug rationale.
             merged_inflight = _merge_session_inflight(session_id, inflight_tasks)
             if merged_inflight:
-                _spawn_task_watcher(session_id, client, merged_inflight)
+                _spawn_task_watcher(
+                    session_id,
+                    client,
+                    merged_inflight,
+                    started_at=broadcast.started_at,
+                    origin_turn_id=broadcast.turn_id,
+                )
         except asyncio.CancelledError:
             # Hard cancel (task cancelled / 30-min timeout cancel) — mark so
             # the queue drain pauses rather than charging ahead.
@@ -9761,11 +10005,11 @@ async def _start_turn(
             # (full events + done sentinel) instead of seeing "no active turn"
             # and silently dropping the rendered content until a manual refresh.
             _remember_recent_turn(session_id, broadcast)
-            # Turn reached a terminal state (success / error / timeout) inside
-            # this process — drop the persistence breadcrumb so startup scan
-            # doesn't surface it as "interrupted." Only an actual process death
-            # (OOM kill / SIGKILL / power loss) leaves the sidecar on disk.
-            _delete_active_turn_sidecar(session_id)
+            # Main ResultMessage is terminal only when no detached background
+            # task watcher still owns the logical turn. Keep the breadcrumb
+            # through that gap so a restart after TaskNotification but before
+            # the final model reaction is surfaced as interrupted.
+            _delete_active_turn_sidecar_if_idle(session_id)
             # Server-side queue drain (Option B). Now that _active_turns no
             # longer holds this sid, advance the queue:
             #   - errored → pause the queue (don't cascade failures headlessly;
@@ -9853,6 +10097,10 @@ async def _maybe_drain_queue(session_id: str) -> None:
     item is restored to the queue head so nothing is dropped. A start failure
     additionally pauses the queue (mirrors the turn-errored policy)."""
     if session_id in _active_turns and not _active_turns[session_id].done:
+        return
+    watcher = _task_watchers.get(session_id)
+    if (_sessions_with_inflight_tasks.get(session_id)
+            or (watcher is not None and not watcher.done())):
         return
     item = sess.dequeue_message(session_id)
     if item is None:
@@ -9965,9 +10213,37 @@ def session_active_status(sid: str) -> dict:
                 and not getattr(recent, "continuation_consumed", False)):
             b = recent
         else:
+            watcher = _task_watchers.get(sid)
+            background_pending = len(
+                _sessions_with_inflight_tasks.get(sid, ()))
+            if (background_pending
+                    or (watcher is not None and not watcher.done())):
+                # Busy but not attachable: the watcher is waiting for a task
+                # notification and there is no TurnBroadcast to replay yet.
+                # Frontends must keep the footer alive + queue new input, but
+                # must not open an empty-prompt reconnect (that would receive
+                # "no active turn"). A later continuation flips attachable.
+                return {
+                    "active": True,
+                    "attachable": False,
+                    "background": True,
+                    "continuation": False,
+                    "turn_id": _background_origin_turn_id.get(sid, ""),
+                    "parent_turn_id": "",
+                    "started_at": _background_turn_started_at.get(sid, 0),
+                    "events_so_far": 0,
+                    "background_tasks_pending": background_pending,
+                    "user_text": "",
+                    "user_images": [],
+                    "user_docs": [],
+                }
             return {"active": False}
     return {
         "active": True,
+        "attachable": True,
+        "background": False,
+        "turn_id": b.turn_id,
+        "parent_turn_id": b.parent_turn_id,
         "model": b.model,
         "started_at": b.started_at,
         "events_so_far": b.replay_count(),

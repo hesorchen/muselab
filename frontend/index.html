@@ -1536,8 +1536,11 @@
                          same synchronous tick as the click). -->
                     <!-- Streaming / unread dots — mirrors tab-strip behavior -->
                     <span class="chat-tab-stream-dot picker-status-dot"
-                          x-show="renamingPickerSid !== s.id && isTabStreaming(s.id)"
-                          :title="lang==='zh' ? '正在生成…' : 'Streaming…'"></span>
+                          :class="{ 'is-background': isTabBackgroundActive(s.id) }"
+                          x-show="renamingPickerSid !== s.id && isTabRunning(s.id)"
+                          :title="isTabBackgroundActive(s.id)
+                            ? t('chat.background_running')
+                            : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
                     <span class="chat-tab-unread-dot picker-status-dot"
                           x-show="renamingPickerSid !== s.id && isTabUnread(s.id)"
                           :title="lang==='zh' ? '有新回复' : 'New reply ready'"></span>
@@ -1629,8 +1632,11 @@
                  @auxclick="onTabAuxClick($event, tid)"
                  :title="tabTitle(tid)">
               <span class="chat-tab-stream-dot"
-                    x-show="isTabStreaming(tid)"
-                    :title="lang==='zh' ? '该会话正在生成…' : 'Streaming…'"></span>
+                    :class="{ 'is-background': isTabBackgroundActive(tid) }"
+                    x-show="isTabRunning(tid)"
+                    :title="isTabBackgroundActive(tid)
+                      ? t('chat.background_running')
+                      : (lang==='zh' ? '该会话正在生成…' : 'Streaming…')"></span>
               <!-- Green dot when the tab finished a turn while you were
                    elsewhere. Sibling to the streaming dot but mutually
                    exclusive — streaming has priority since "still running"
@@ -2631,18 +2637,28 @@
                    messages.length) directly — method calls aren't
                    guaranteed to wire up reactivity inside x-for. -->
               <div class="turn-footer"
-                   x-show="m.role !== 'user' && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))">
-                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1"
+                   x-show="m.role !== 'user'
+                     && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))
+                     && (
+                       (pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)
+                       || m.ts
+                       || m.elapsed
+                       || (m.role === 'assistant' && m.uuid)
+                     )">
+                <span x-show="pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1"
                       class="thinking-dots">
                   <span></span><span></span><span></span>
                 </span>
+                <span x-show="pane && pane.backgroundActive && i === paneMsgs.length - 1"
+                      class="background-task-footer-label"
+                      x-text="t('chat.background_running')"></span>
                 <!-- Elapsed counter next to the streaming dots — kicks in
                      after 1s so fast replies don't flash a "0s" label.
                      Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
-                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
+                <span x-show="pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
                       class="stream-elapsed"
                       x-text="fmtStreamElapsed((pane && pane.streamElapsed) || 0)"></span>
-                <span x-show="m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
+                <span x-show="m.ts && !(pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
                 <!-- Total elapsed kept after done so the user can
@@ -2650,12 +2666,12 @@
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
+                <span x-show="m.elapsed && m.ts && !(pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
                 <button class="turn-fork-btn"
                         type="button"
-                        x-show="m.uuid && !(pane && pane.streaming)"
+                        x-show="m.role === 'assistant' && m.uuid && !(pane && (pane.streaming || pane.backgroundActive))"
                         :disabled="forkingSessionId === tid || isTabStreaming(tid)"
                         @click.stop="forkConversation(tid, m.uuid)"
                         :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
@@ -2722,6 +2738,23 @@
                replying (or while a compact was running). They auto-drain on
                the next done event / compact-finally / activateTab. Faded
                + dashed border distinguishes them from real user bubbles. -->
+          <div x-show="tabState[currentId] && tabState[currentId].backgroundActive"
+               class="background-task-strip"
+               role="status"
+               aria-live="polite">
+            <span class="background-task-strip-dot" aria-hidden="true"></span>
+            <span class="background-task-strip-label"
+                  x-text="((tabState[currentId] && tabState[currentId].backgroundTaskCount) || 1) > 1
+                    ? t('chat.background_running_count', {
+                        count: (tabState[currentId] && tabState[currentId].backgroundTaskCount) || 1
+                      })
+                    : t('chat.background_running')"></span>
+            <span class="background-task-strip-hint"
+                  x-text="'· ' + t('chat.background_queue_hint')"></span>
+            <span class="background-task-strip-elapsed"
+                  x-show="streamElapsed >= 1"
+                  x-text="'· ' + fmtStreamElapsed(streamElapsed)"></span>
+          </div>
           <template x-for="(q, qi) in (tabState[currentId] && tabState[currentId].pendingQueue || [])"
                     :key="q.id">
             <div class="msg user queued">
@@ -2802,6 +2835,7 @@
                         && tabState[currentId].pendingQueue
                         && tabState[currentId].pendingQueue.length
                         && !streaming
+                        && !(tabState[currentId].backgroundActive)
                         && !(tabState[currentId].compacting)
                         && !(tabState[currentId]._draining)"
                class="queue-paused-banner">

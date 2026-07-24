@@ -12,7 +12,7 @@
 ~/.claude/projects/<cwd-key>/<sid>.jsonl
     Claude Provider 的消息、工具调用和压缩边界
 
-<系统临时目录>/muselab-vendor-cli-config-<uid>/projects/<cwd-key>/<sid>.jsonl
+${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects/<cwd-key>/<sid>.jsonl
     第三方 Provider 的隔离 CLI transcript
 
 <repo>/sessions/
@@ -26,7 +26,7 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 ```
 
 - CLI JSONL 是对话正文的事实来源。Claude 与第三方 Provider 使用不同配置根；
-  第三方根位于系统临时目录，可能被操作系统清理，迁移或清理临时目录前应单独备份。
+  第三方根属于持久用户状态，应纳入备份。
 - `sessions/index.json` 保存 muselab 专属的展示和运行设置。
 - sidecar 保存逐消息费用、模型、时间、附件和上下文容量等标注。
 - queue 文件保存待处理消息。
