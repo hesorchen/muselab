@@ -119,7 +119,7 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 
 ## 分支与删除
 
-`POST /api/chat/sessions/{sid}/fork` 可复制完整会话，或复制到 `up_to_message_id` 为止。新分支获得新的会话和消息 UUID，继承源会话的模型与工作目录。历史消息编辑就是“在前一条助手消息处分支，再发送修改文本”。
+`POST /api/chat/sessions/{sid}/fork` 可复制完整会话，或复制到 `up_to_message_id` 为止。新分支获得新的会话和消息 UUID，继承源会话的模型、工作目录、权限、effort 与 thinking 设置，并记录来源会话关系。标签页菜单用于 Fork 完整对话，每个已完成回合下方的操作用于 Fork 到该回合。历史消息编辑仍是在当前会话中重新发送，不会 Fork；非空会话切换模型则创建独立的空会话，不复制对话记录。
 
 删除会话会一并清理：
 

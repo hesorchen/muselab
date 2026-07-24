@@ -253,6 +253,104 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
     )
 
 
+def test_mobile_completed_turn_can_fork_from_that_point(
+    page: Page, backend_url, auth_token,
+):
+    """The point-fork action stays tappable and sends the completed turn UUID."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    sid = "perf-fork-source"
+    fork_sid = "perf-fork-result"
+    boundary = "fork-boundary-assistant"
+    requests: list[dict] = []
+
+    def handle_fork(route):
+        requests.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": fork_sid,
+                "session_id": fork_sid,
+                "name": "Fork source · 分支",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "cwd": "",
+                "forked_from": sid,
+                "forked_from_name": "Fork source",
+                "forked_from_message_id": boundary,
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/fork", handle_fork)
+    _login(page, backend_url, auth_token)
+    _bootstrap_session_for_real_load(page, sid, "Fork source")
+    _app_eval(
+        page,
+        """
+        const source = app.sessions[0];
+        source.message_count = 2;
+        source.turn_count = 1;
+        const st = app._ensureTabState(arg.sid);
+        st._loaded = true;
+        st.messages = [
+          {
+            role: "user", text: "FORK_SOURCE_USER",
+            uuid: "fork-source-user", ts: 1700020000,
+            _k: "fork-source-user", _noAnim: true,
+          },
+          {
+            role: "assistant", text: "FORK_SOURCE_ASSISTANT",
+            html: "<p>FORK_SOURCE_ASSISTANT</p>",
+            uuid: arg.boundary, ts: 1700020001,
+            _k: arg.boundary, _noAnim: true,
+          },
+        ];
+        app._activateTabState(arg.sid);
+        app.openTab = async id => {
+          if (!app.openTabIds.includes(id)) app.openTabIds.push(id);
+          app.currentId = id;
+          const forkState = app._ensureTabState(id);
+          forkState._loaded = true;
+          forkState.messages = [];
+          app._activateTabState(id);
+        };
+        return true;
+        """,
+        {"sid": sid, "forkSid": fork_sid, "boundary": boundary},
+    )
+
+    action = page.locator(".msg-pane:visible .turn-fork-btn:visible")
+    expect(action).to_be_visible(timeout=3000)
+    box = action.bounding_box()
+    assert box is not None and box["width"] >= 30 and box["height"] >= 30
+    action.click()
+    page.wait_for_function(
+        """expected => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return app.currentId === expected;
+        }""",
+        arg=fork_sid,
+    )
+    assert requests
+    assert requests[0]["up_to_message_id"] == boundary
+    assert requests[0]["title"] == "Fork source · Fork"
+    lineage = _app_eval(
+        page,
+        """
+        const forked = app.sessions.find(s => s.id === arg);
+        return forked && {
+          source: forked.forked_from,
+          boundary: forked.forked_from_message_id,
+        };
+        """,
+        fork_sid,
+    )
+    assert lineage == {"source": sid, "boundary": boundary}
+    _assert_no_browser_errors(page, errors)
+
+
 def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, auth_token):
     """Switch repeatedly between long resident chat panes on a mobile viewport."""
     errors = _capture_browser_errors(page)

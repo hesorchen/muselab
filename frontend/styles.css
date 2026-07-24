@@ -3181,6 +3181,11 @@ pre.text {
   color: var(--c-fg-0); cursor: pointer;
 }
 .tab-ctx-menu button:hover { background: var(--c-bg-2); }
+.tab-ctx-menu button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: transparent;
+}
 .tab-ctx-menu button.danger { color: var(--c-danger); }
 .tab-ctx-menu button.danger:hover { background: var(--c-danger); color: #fff; }
 .tab-ctx-menu hr { border: none; border-top: 1px solid var(--c-border); margin: 4px 0; }
@@ -3743,12 +3748,50 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   gap: var(--sp-2);
   min-height: 18px;            /* avoid layout jitter when dots → time */
 }
+.turn-fork-btn {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 1px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--c-fg-4);
+  cursor: pointer;
+  opacity: 0.62;
+  transition: color var(--t-fast), background var(--t-fast), opacity var(--t-fast);
+}
+.turn-fork-btn svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.turn-fork-btn:hover {
+  color: var(--c-accent-fg);
+  background: var(--c-accent-soft);
+  opacity: 1;
+}
+.turn-fork-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
 @media (max-width: 480px) {
   /* avatar shrinks to 26px on phones (see .msg-avatar @ media block),
      keep the footer aligned by matching that gutter — 26 + 8 gap = 34. */
   .turn-footer {
     padding: 2px 0 3px 34px;
     min-height: 14px;
+  }
+  .turn-fork-btn {
+    width: 30px;
+    height: 30px;
   }
 }
 
@@ -9071,6 +9114,41 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   gap: 6px;
   padding: 10px 16px;
   margin-bottom: var(--sp-2);
+}
+.fork-origin-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 8px 16px 2px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.fork-origin-banner svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.fork-origin-banner button {
+  max-width: min(360px, 62vw);
+  padding: 2px 7px;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--r-full);
+  background: var(--c-bg-2);
+  color: var(--c-fg-2);
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.fork-origin-banner button:hover {
+  background: var(--c-accent-soft);
+  color: var(--c-accent-fg);
 }
 .load-earlier-btn {
   font-size: var(--fs-sm);

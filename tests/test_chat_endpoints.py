@@ -456,6 +456,90 @@ def test_vendor_fork_uses_vendor_session_store_and_restores_env(
     assert os.environ["CLAUDE_CONFIG_DIR"] == "original-config"
 
 
+def test_fork_inherits_session_settings_and_records_lineage(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={
+            "name": "source chat",
+            "model": "claude-sonnet-4-6",
+            "permission": "plan",
+        },
+    )
+    assert source.status_code == 200, source.text
+    sid = source.json()["id"]
+    chat_mod.sess.update_effort(sid, "high")
+    chat_mod.sess.update_thinking(sid, False)
+    chat_mod.sess.bump_session(sid, message_count=12, turn_count=3)
+    new_sid = "11111111-2222-4333-8444-555555555555"
+    boundary = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_fork_session",
+        lambda *_args, **_kwargs: SimpleNamespace(session_id=new_sid),
+    )
+    response = client.post(
+        f"/api/chat/sessions/{sid}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"up_to_message_id": boundary, "title": "source chat · 分支"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == new_sid
+    assert body["session_id"] == new_sid
+    assert body["name"] == "source chat · 分支"
+    assert body["permission"] == "plan"
+    assert body["effort"] == "high"
+    assert body["thinking"] is False
+    # A point-in-time fork starts with unknown presentation counts. The
+    # existing session-read self-heal fills the exact values on first open
+    # without making the fork request scan the new transcript twice.
+    assert body["message_count"] == 0
+    assert body["turn_count"] == 0
+    assert body["forked_from"] == sid
+    assert body["forked_from_name"] == "source chat"
+    assert body["forked_from_message_id"] == boundary
+    assert body["cwd"] == source.json()["cwd"]
+
+
+def test_fork_rejects_active_source_session(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "busy source"},
+    )
+    assert source.status_code == 200, source.text
+    sid = source.json()["id"]
+    chat_mod._active_turns[sid] = SimpleNamespace(done=False)
+    called = False
+
+    def fake_fork(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return SimpleNamespace(
+            session_id="11111111-2222-4333-8444-555555555555",
+        )
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    response = client.post(
+        f"/api/chat/sessions/{sid}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert called is False
+
+
 def test_native_compact_rejects_success_without_token_drop(chat_mod, client, monkeypatch):
     sid = _make_compact_session(client)
     result = ResultMessage(

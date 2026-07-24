@@ -26,7 +26,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **extended thinking / thinking signature（扩展思考 / 思考签名）** — `ThinkingConfigEnabled` 激活时 Claude 产生的推理轨迹。thinking 块通过 `thinking` SSE 事件流式传输。签名是不可修改的不透明令牌；muselab 将会话锁定到单一模型以避免跨提供商的签名损坏。对于 Opus 4.7+，需要 `display="summarized"` 才能获得纯文本 thinking 块，而非仅有签名。参见 [`routing.md — budget_tokens and display`](routing.md)。
 
-**fork（派生）** — 将会话记录截至某条消息 UUID 的副本，以新会话 ID 存储。内部用于实现消息编辑（UI 在上一条助手回合处派生，然后重新发送）。JSONL 和 `sessions/index.json` 条目均会为派生会话创建。参见 [`backend-sessions.md — Fork & edit-a-message`](backend-sessions.md)。
+**fork（派生）** — 用户显式发起的操作：将完整会话记录，或截至某个已完成回合的记录，以新会话 ID 存储。新分支会记录来源关系，消息 UUID 会重新映射。历史消息编辑是在当前会话中重新发送；切换模型则创建空会话。参见 [`backend-sessions_zh.md — 分支与删除`](backend-sessions_zh.md)。
 
 **legacy session self-heal（旧会话自愈）** — 若某个会话在配置任何提供商之前创建，它会被锁定到 `MODEL` 常量。当用户后来只配置了第三方提供商时，每次发送都会收到 401 错误。下次发送时，muselab 会检测到被锁定模型的提供商不可用且会话在磁盘上没有 JSONL 文件（从未运行过），然后重新解析模型。已有历史记录的会话永远不会被重新解析。参见 [`routing.md — Legacy-session self-heal`](routing.md)。
 
@@ -36,7 +36,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **message queue（消息队列）** — 每会话的 FIFO 队列（`sessions/<sid>.queue.json`），在一个回合已在运行时暂存提交的 prompt。当前回合完成后，排空循环自动启动下一个回合。最大深度为 10。若回合出错或被取消，队列自动暂停。参见 [`backend-sessions.md — The message queue`](backend-sessions.md)。
 
-**model continuity（模型连续性）** — 第一次成功回合后，模型 ID 写入 `sessions/index.json`。前端在非空会话切换不兼容模型时默认 fork 新会话，防止跨提供商 thinking signature 损坏；管理 API 仍可显式修改模型并断开缓存的 client，调用者需要自行承担 transcript 兼容性风险。参见 [`routing.md`](routing.md)。
+**model continuity（模型连续性）** — 第一次成功回合后，模型 ID 写入 `sessions/index.json`。非空会话切换模型时，前端创建独立的空会话，防止跨提供商 thinking signature 损坏；管理 API 仍可显式修改模型并断开缓存的 client，调用者需要自行承担 transcript 兼容性风险。参见 [`routing.md`](routing.md)。
 
 **no-build frontend（无构建前端）** — 前端以纯 HTML + JavaScript + CSS 提供服务，无需打包工具、编译器或 `npm install`。经过审查的第三方库已提交至 `frontend/vendor/`；部分在浏览器空闲时预热，Mermaid 与 xterm.js 等保持按需加载。参见 [`architecture_zh.md`](architecture_zh.md)。
 
@@ -58,7 +58,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **sensitive-filename blocklist（敏感文件名黑名单）** — `backend/files.py` 中的两个集合（`SENSITIVE_NAMES` 和 `SENSITIVE_SUFFIX`），涵盖凭据文件、私钥、shell 历史记录和 `.env` 变体。匹配这些规则的路径会被 `safe_resolve` 以 HTTP 403 拒绝，除非明确传入 `allow_sensitive=True`（仅用于回收站还原和备份复制）。参见 [`backend-security.md — Filesystem containment`](backend-security.md)。
 
-**session（会话）** — 对话的顶级单元。一个会话拥有一个 UUID，该 UUID 由 muselab 索引条目、sidecar 文件、CLI JSONL 和消息队列文件共用。会话保存 cwd、模型、权限、effort 和思考设置；前端在不兼容模型切换时默认 fork。参见 [`backend-sessions.md`](backend-sessions.md)。
+**session（会话）** — 对话的顶级单元。一个会话拥有一个 UUID，该 UUID 由 muselab 索引条目、sidecar 文件、CLI JSONL 和消息队列文件共用。会话保存 cwd、模型、权限、effort 和思考设置；显式 Fork 的会话还会保存来源关系。参见 [`backend-sessions_zh.md`](backend-sessions_zh.md)。
 
 **session index（会话索引）** — 文件 `sessions/index.json`（位于仓库内，而非工作区中）。它是 muselab 对于 CLI 未追踪的每会话元数据的真相源：cwd、模型、权限模式、effort、thinking 开关、置顶状态和自动命名标志。对话记录由 CLI JSONL 持有；Claude 与第三方 Provider 可能使用不同的配置根。参见 [`backend-sessions.md`](backend-sessions.md)。
 
