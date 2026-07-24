@@ -1816,6 +1816,16 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   transition: background var(--t-fast);
   position: relative;
 }
+.filelist li.filelist-virtual-spacer {
+  display: block;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  pointer-events: none;
+  transition: none;
+}
+.filelist li.filelist-virtual-spacer:hover { background: transparent; }
 .filelist li.filelist-status {
   min-height: 96px;
   padding: var(--sp-5) var(--sp-4);
