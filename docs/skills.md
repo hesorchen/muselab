@@ -89,6 +89,12 @@ When this flag is set, the SDK loads discoverable `SKILL.md` files for every
 provider. There is no copy or symlink step: bundled skills are exposed by the
 local plugin.
 
+Third-party providers still use an isolated `CLAUDE_CONFIG_DIR` to prevent
+Claude OAuth credentials from leaking or being used as a fallback. muselab
+maps only `~/.claude/skills/` into that isolated root, so user Skills behave
+the same as with Claude models while credentials, settings, hooks, plugins,
+and transcripts remain isolated.
+
 **UI listing.** The `GET /api/settings/skills` endpoint independently
 enumerates bundled, user-global, and installed-plugin skills for the frontend.
 Both `SKILL.md` and `skill.md` filenames are accepted. This listing is

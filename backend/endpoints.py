@@ -128,6 +128,41 @@ def _vendor_config_dir() -> Path:
     return _VENDOR_CONFIG_DIR
 
 
+def ensure_vendor_user_skills() -> Path:
+    """Expose only user Skills inside the isolated vendor CLI config.
+
+    ``CLAUDE_CONFIG_DIR`` deliberately moves third-party sessions away from
+    the real ``~/.claude`` so they cannot read Claude OAuth credentials.
+    Unfortunately the CLI resolves user-scope Skills relative to that same
+    config root, which used to make ``~/.claude/skills`` disappear whenever a
+    non-Claude model was selected.
+
+    A directory symlink preserves the native user-scope layout and keeps skill
+    scripts/assets live without copying the rest of ``~/.claude``. Settings,
+    credentials, plugins, hooks, and transcripts remain isolated. The target
+    may not exist yet; keeping a broken directory link is intentional so a
+    later ``~/.claude/skills`` creation becomes visible automatically.
+    """
+    user_skills = (Path.home() / ".claude" / "skills").resolve(strict=False)
+    vendor_skills = _vendor_config_dir() / "skills"
+    with _VENDOR_CONFIG_LOCK:
+        if vendor_skills.is_symlink():
+            if vendor_skills.resolve(strict=False) == user_skills:
+                return vendor_skills
+            # This exact path is muselab-owned compatibility state. Replace a
+            # stale link but never remove a real directory a user may have
+            # intentionally populated inside the isolated config.
+            vendor_skills.unlink()
+        if vendor_skills.exists():
+            return vendor_skills
+        try:
+            vendor_skills.symlink_to(user_skills, target_is_directory=True)
+        except FileExistsError:
+            # Another request won the race between exists() and symlink_to().
+            pass
+    return vendor_skills
+
+
 def ensure_vendor_workspace_trusted(workspace: Path) -> None:
     """Record trust in the isolated vendor CLI config.
 
@@ -1032,6 +1067,7 @@ def env_override(model: str) -> dict[str, str] | None:
     # providers we redirect the CLI to a throwaway CLAUDE_CONFIG_DIR with no
     # credentials.json — forcing it to fall back to env-based auth.
     isolated_cfg = _vendor_config_dir()
+    ensure_vendor_user_skills()
     # Make sure NO credentials file leaks in.
     cred = isolated_cfg / ".credentials.json"
     if cred.exists():
