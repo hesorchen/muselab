@@ -86,6 +86,129 @@ def test_workspace_header_and_query_scope_file_access(client, auth, tmp_path):
     assert primary.status_code == 404
 
 
+def test_nested_workspace_can_browse_symlink_into_registered_primary(
+    client,
+    auth,
+    temp_root,
+):
+    shared = temp_root / "shared"
+    shared.mkdir()
+    (shared / "linked.txt").write_text("through-link\n", encoding="utf-8")
+    nested = temp_root / "agent_workspaces"
+    nested.mkdir()
+    (nested / "project-link").symlink_to(shared, target_is_directory=True)
+
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(nested)},
+    )
+    assert registered.status_code == 200
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(nested.resolve()), safe=""),
+    }
+
+    listing = client.get(
+        "/api/files/list?path=project-link",
+        headers=workspace_headers,
+    )
+    assert listing.status_code == 200
+    assert listing.json()["entries"] == [{
+        "name": "linked.txt",
+        "path": "project-link/linked.txt",
+        "is_dir": False,
+        "size": len("through-link\n"),
+        "mtime": (shared / "linked.txt").stat().st_mtime,
+    }]
+
+    opened = client.get(
+        "/api/files/read?path=project-link/linked.txt",
+        headers=workspace_headers,
+    )
+    assert opened.status_code == 200
+    assert opened.text == "through-link\n"
+
+    metadata = client.get(
+        "/api/files/stat?path=project-link/linked.txt",
+        headers=workspace_headers,
+    )
+    assert metadata.status_code == 200
+    assert metadata.json()["path"] == "project-link/linked.txt"
+
+    saved = client.put(
+        "/api/files/write",
+        headers=workspace_headers,
+        json={"path": "project-link/linked.txt", "content": "updated\n"},
+    )
+    assert saved.status_code == 200
+    assert (shared / "linked.txt").read_text(encoding="utf-8") == "updated\n"
+
+    created = client.post(
+        "/api/files/mkdir",
+        headers=workspace_headers,
+        json={"path": "project-link/generated"},
+    )
+    assert created.status_code == 200
+    assert created.json()["path"] == "project-link/generated"
+
+    renamed = client.post(
+        "/api/files/rename",
+        headers=workspace_headers,
+        json={
+            "src": "project-link/generated",
+            "dst": "project-link/renamed",
+        },
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["path"] == "project-link/renamed"
+    assert (shared / "renamed").is_dir()
+
+    removed = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=workspace_headers,
+        json={"path": "project-link/renamed"},
+    )
+    assert removed.status_code == 200
+    assert removed.json()["manifest"]["original_path"] == "project-link/renamed"
+    restored = client.post(
+        "/api/files/trash/restore",
+        headers=workspace_headers,
+        json={"trash_id": removed.json()["trash_id"]},
+    )
+    assert restored.status_code == 200
+    assert (shared / "renamed").is_dir()
+
+
+def test_nested_workspace_cannot_traverse_directly_into_registered_primary(
+    client,
+    auth,
+    temp_root,
+):
+    shared = temp_root / "shared"
+    shared.mkdir()
+    (shared / "blocked.txt").write_text("not-through-link\n", encoding="utf-8")
+    nested = temp_root / "agent_workspaces"
+    nested.mkdir()
+    assert client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(nested)},
+    ).status_code == 200
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(nested.resolve()), safe=""),
+    }
+
+    response = client.get(
+        "/api/files/read?path=../shared/blocked.txt",
+        headers=workspace_headers,
+    )
+    assert response.status_code == 400
+    assert "not-through-link" not in response.text
+
+
 def test_session_cwd_must_be_registered_and_is_returned(client, auth, tmp_path):
     other = _make_workspace(tmp_path)
     unregistered = tmp_path / "not-registered"

@@ -15,7 +15,10 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
 from .settings import ROOT, atomic_write_text, env_int
-from .workspaces import resolve_workspace_root as _workspace_root
+from .workspaces import (
+    registry as workspace_registry,
+    resolve_workspace_root as _workspace_root,
+)
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -62,12 +65,17 @@ def _guard_not_trash(target: Path, root: Path | None = None) -> None:
     files inside .muselab-dustbin, corrupting the soft-delete bookkeeping
     (orphan payloads, manifest mismatch). Apply the same guard everywhere
     for consistency."""
-    trash_root = _trash_dir(root)
-    if target == trash_root or trash_root in target.parents:
-        raise HTTPException(
-            status_code=400,
-            detail="cannot write inside the dustbin — use /trash/* endpoints",
-        )
+    roots = {_root_or_default(root), *workspace_registry.paths()}
+    for workspace in roots:
+        try:
+            trash_root = (workspace / TRASH_DIR_NAME).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if target == trash_root or trash_root in target.parents:
+            raise HTTPException(
+                status_code=400,
+                detail="cannot write inside the dustbin — use /trash/* endpoints",
+            )
 
 
 def _ensure_trash_dir(root: Path | None = None) -> Path:
@@ -112,7 +120,11 @@ def _dir_size(p: Path) -> int:
     return total
 
 
-def _move_to_trash(target: Path, root: Path | None = None) -> dict:
+def _move_to_trash(
+    target: Path,
+    root: Path | None = None,
+    original_rel: str | None = None,
+) -> dict:
     """Move `target` into the trash, write a manifest, return it.
     Caller is responsible for ensuring `target` exists + is inside ROOT.
     Same-filesystem rename, so atomic + cheap regardless of payload size."""
@@ -120,7 +132,10 @@ def _move_to_trash(target: Path, root: Path | None = None) -> dict:
     trash = _ensure_trash_dir(root)
     tid = _gen_trash_id()
     payload = trash / tid
-    original_rel = str(target.relative_to(root))
+    if original_rel is None:
+        original_rel = str(target.relative_to(root))
+    else:
+        original_rel = _logical_relative_path(original_rel).as_posix()
     target.rename(payload)
     is_dir = payload.is_dir()
     try:
@@ -331,6 +346,34 @@ def _is_sensitive(p: Path) -> bool:
     return False
 
 
+def _logical_relative_path(rel: str) -> Path:
+    """Return a normalized workspace-relative path without following links.
+
+    A resolved target may legitimately leave the selected workspace through a
+    symlink, so containment cannot distinguish that case from ``../`` after
+    resolution. Reject parent traversal lexically first; with no ``..``
+    component, a later escape can only have happened through a symlink.
+    """
+    logical = Path((rel or "").lstrip("/"))
+    if any(part == ".." for part in logical.parts):
+        raise HTTPException(status_code=400, detail="path escapes root")
+    return logical
+
+
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _inside_registered_workspace(target: Path) -> bool:
+    for workspace in workspace_registry.paths():
+        try:
+            if _inside(target, workspace.resolve()):
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
 def safe_resolve(
     rel: str,
     allow_sensitive: bool = False,
@@ -341,12 +384,13 @@ def safe_resolve(
 
     Defends against:
       - `../../etc/passwd` style traversal (resolve() + ROOT-prefix check)
-      - **Symlink escape**: a symlink inside ROOT pointing to /etc/shadow would
-        previously slip through because `.resolve()` follows symlinks. We
-        explicitly check the resolved target is still under ROOT.
+      - **Symlink escape**: links may target another registered workspace, but
+        never an unregistered filesystem area such as ``/etc``.
+      - `..` traversal, including attempts to jump directly into another
+        registered workspace instead of following an actual symlink.
       - `.env`, `id_rsa`, `*.pem` etc. (SENSITIVE_SUFFIX / SENSITIVE_NAMES)."""
     root = _root_or_default(root)
-    rel = (rel or "").lstrip("/")
+    logical = _logical_relative_path(rel)
     # NUL byte in a path raises ValueError from (root / rel) and FastAPI
     # converts that to a 500 with a traceback that leaks internal module
     # paths. Reject early as 400. Same for any string that Python's path
@@ -355,12 +399,12 @@ def safe_resolve(
         raise HTTPException(status_code=400, detail="invalid path")
     # First-pass resolve (follows symlinks → catches symlink escape):
     try:
-        target = (root / rel).resolve()
+        target = (root / logical).resolve()
     except (ValueError, OSError):
         raise HTTPException(status_code=400, detail="invalid path") from None
     # The selected root itself might be a symlink target; compare real paths.
     root_real = root.resolve()
-    if root_real != target and root_real not in target.parents:
+    if not _inside(target, root_real) and not _inside_registered_workspace(target):
         raise HTTPException(status_code=400, detail="path escapes root")
     # Block by name regardless of whether the file already exists, so the API
     # can neither read nor write `.env` / private-key shaped paths.
@@ -400,7 +444,7 @@ def list_dir(
     # yield children named `shared/x` instead of `vendor/x`; Alpine then
     # filtered them as duplicates when the real directory was also visible,
     # making the symlink look impossible to expand.
-    logical_parent = Path((path or "").strip("/"))
+    logical_parent = _logical_relative_path(path)
     # Trash dir is always hidden from the file tree (even when
     # show_hidden=true) — it has its own dedicated UI surface; mixing it
     # back into the tree would surface deleted files in a confusing
@@ -748,7 +792,7 @@ def stat_file(path: str, root: Path = Depends(_workspace_root)) -> dict:
         raise HTTPException(status_code=404, detail="not found") from None
     is_dir = target.is_dir()
     return {
-        "path": str(target.relative_to(root)),
+        "path": _logical_relative_path(path).as_posix(),
         "name": target.name,
         "is_dir": is_dir,
         "size": 0 if is_dir else st.st_size,
@@ -1034,7 +1078,14 @@ async def upload(
                             status_code=409,
                             detail=f"a directory named {safe_name!r} already exists here",
                         )
-                    trashed = _move_to_trash(dest, root)
+                    logical_dest = (
+                        _logical_relative_path(path) / safe_name
+                    ).as_posix()
+                    trashed = _move_to_trash(
+                        dest,
+                        root,
+                        original_rel=logical_dest,
+                    )
                 tmp_path.rename(dest)
                 return trashed
         trashed = await asyncio.to_thread(_finalize)
@@ -1046,7 +1097,7 @@ async def upload(
         raise
     return {
         "ok": True,
-        "path": str(dest.relative_to(root)),
+        "path": (_logical_relative_path(path) / safe_name).as_posix(),
         "size": dest.stat().st_size,
         # Non-null when an existing same-name file was moved to trash so the
         # frontend can surface "replaced (old version in trash)".
@@ -1075,12 +1126,7 @@ def delete(
     target = safe_resolve(req.path, root=root)
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
-    trash_root = _trash_dir(root)
-    if target == trash_root or trash_root in target.parents:
-        raise HTTPException(
-            status_code=400,
-            detail="cannot delete trash via /delete — use /trash/purge or /trash/empty",
-        )
+    _guard_not_trash(target, root)
     if permanent:
         # ignore_errors mirrors the soft-delete _purge_one path. A
         # permission / busy-file error here previously bubbled up as a 500
@@ -1093,7 +1139,7 @@ def delete(
             except OSError:
                 pass
         return {"ok": True, "permanent": True}
-    manifest = _move_to_trash(target, root)
+    manifest = _move_to_trash(target, root, original_rel=req.path)
     return {"ok": True, "permanent": False,
             "trash_id": manifest["trash_id"], "manifest": manifest}
 
@@ -1198,7 +1244,7 @@ def mkdir(req: MkdirReq, root: Path = Depends(_workspace_root)) -> dict:
     target = safe_resolve(req.path, root=root)
     _guard_not_trash(target, root)
     target.mkdir(parents=True, exist_ok=True)
-    return {"ok": True, "path": str(target.relative_to(root))}
+    return {"ok": True, "path": _logical_relative_path(req.path).as_posix()}
 
 
 class RenameReq(BaseModel):
@@ -1222,7 +1268,7 @@ def rename(req: RenameReq, root: Path = Depends(_workspace_root)) -> dict:
             raise HTTPException(status_code=409, detail="destination already exists")
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-    return {"ok": True, "path": str(dst.relative_to(root))}
+    return {"ok": True, "path": _logical_relative_path(req.dst).as_posix()}
 
 
 # ============================================================
@@ -1283,7 +1329,12 @@ def copy_bak(req: CopyBakReq, root: Path = Depends(_workspace_root)) -> dict:
     _guard_not_trash(dst, root)
     # safe_resolve the final path so the anti-traversal guard fires for
     # the destination too.
-    dst_rel = str(dst.relative_to(root))
+    logical_parent = (
+        _logical_relative_path(req.dst_dir)
+        if req.dst_dir
+        else _logical_relative_path(req.src).parent
+    )
+    dst_rel = (logical_parent / new_name).as_posix()
     safe_resolve(dst_rel, allow_sensitive=True, root=root)
     # The appended `.bak[.N]` suffix means `_is_sensitive` (exact-name /
     # suffix match) never fires on the destination — `secrets.env.bak`
