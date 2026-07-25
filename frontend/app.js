@@ -257,6 +257,9 @@ function portal() {
     // window plus a small overscan buffer.
     fileTreeViewport: { start: 0, end: 80 },
     _fileTreeScrollRAF: null,
+    // Measured row height for the virtual scroller. 0 = "remeasure on next
+    // read"; see _fileTreeRowHeight / _invalidateFileTreeRowHeight.
+    _fileTreeRowHeightCache: 0,
     selected: "",
     // The row that owns keyboard/copy/paste focus in the file tree. Keep this
     // separate from `selected`, which is the file whose body is rendered in
@@ -412,6 +415,11 @@ function portal() {
     PREVIEW_ZOOM_MIN: 0.5,
     PREVIEW_ZOOM_MAX: 3,
     PREVIEW_ZOOM_STEP: 0.1,
+    // Concise chat mode — declared here (not just assigned in init) so Alpine
+    // owns it from the first render and the x-if gates that read it don't
+    // evaluate against undefined on the initial paint. Restored from
+    // localStorage in init(); see conciseHidesToolUse().
+    conciseChat: false,
     // Compact orchestration: the per-tab `compacting` flag (see
     // _blankTabState) marks the window where the CLI is busy summarising
     // *that session's* history. User messages typed during compact go into
@@ -422,7 +430,10 @@ function portal() {
     // SDK get_context_usage() breakdown popup. Shows per-category token
     // counts (system prompt / tools / memory files / messages / mcp / skills)
     // so the user can see which slice is using their context window.
-    ctxBreakdown: { show: false, loading: false, data: null, error: "" },
+    // `data` is the raw SDK get_context_usage() payload; `view` is the
+    // normalised render model built by _ctxBuildView (see there for the SDK
+    // quirks it exists to absorb). Templates read `view`, never `data`.
+    ctxBreakdown: { show: false, loading: false, data: null, view: null, error: "" },
     // Per-category expansion state inside the breakdown popup. Keyed by
     // category name from SDK; only categories that map to a sub-list
     // (memoryFiles / mcpTools / agents) actually expand.
@@ -504,6 +515,10 @@ function portal() {
     activity: {
       show: false, loading: false, events: [],
       summary: { running: 0, unread: 0, attention: 0, workspaces: [] },
+      // group key -> true when the user asked to see past the row cap.
+      expanded: {},
+      // Selected group keys. Empty array = no filter = show every group.
+      filter: [],
     },
     _activityEtags: {},
     _activityFetchPromises: {},
@@ -1469,6 +1484,12 @@ function portal() {
         const z = parseFloat(localStorage.getItem("muselab_preview_zoom"));
         if (!Number.isNaN(z)) this.previewZoom = this._clampPreviewZoom(z);
       }
+      // Concise chat mode. Per-DEVICE (localStorage, like preview zoom), not
+      // per-session: the problem it solves is "the phone screen is small", so
+      // the same session read from a desktop should stay fully detailed.
+      // Default off — it removes the only surface on which you can catch the
+      // agent touching a file you didn't expect.
+      this.conciseChat = localStorage.getItem("muselab_concise_chat") === "1";
       // Vibration / push prefs come from localStorage (per-device) so a
       // shared muselab between a desktop + phone keeps independent
       // settings — your phone can vibrate; the desktop tab silently
@@ -1661,7 +1682,12 @@ function portal() {
         vv.addEventListener("resize", () => this._syncMobileKeyboardViewport());
         vv.addEventListener("scroll", () => this._syncMobileKeyboardViewport());
       }
-      window.addEventListener("resize", () => this._reconcileMobileViewport());
+      window.addEventListener("resize", () => {
+        // A resize can flip the (pointer: coarse) / width breakpoints that
+        // decide row padding, so the cached row height is no longer trusted.
+        this._invalidateFileTreeRowHeight();
+        this._reconcileMobileViewport();
+      });
       document.addEventListener("focusout", () => this._reconcileMobileViewport());
       window.addEventListener("focus", () => this._reconcileMobileViewport());
       window.addEventListener("pageshow", () => this._reconcileMobileViewport());
@@ -3570,6 +3596,7 @@ function portal() {
       st._laterMessages = [];
       st._loadedOffset = Number.isInteger(data.offset) ? data.offset : 0;
       st._total = Number.isInteger(data.total) ? data.total : win.length;
+      st._preTotal = Number.isInteger(data.pre_total) ? data.pre_total : 0;
       st.historyGeneration = data.history_generation || st.historyGeneration || "";
       st._historyOrder = data.history_order === "normal" ? "normal" : "full";
       st._hasServerLater = !!data.has_later;
@@ -5312,6 +5339,29 @@ function portal() {
         .filter(level => this._effortAllowed(level, model))
         .map(level => ({ value: level, labelKey: "effort." + (level || "auto") }));
     },
+    // Label for the 📦 compact-in-progress bubble. An auto-compact rides the
+    // turn's own stream, so streamElapsed (already ticking once a second) is
+    // its elapsed time to within a second — and showing it is the whole point:
+    // the silent version of this bubble ran 9m19s before failing. The manual
+    // compact has no stream and no ticker, so it stays a bare label.
+    compactPendingLabel() {
+      const zh = this.lang === "zh";
+      const base = zh ? "压缩对话中…" : "Compacting conversation…";
+      const st = this.tabState[this.currentId];
+      if (!st || !st._compactStartedAt) return base;
+      const secs = st.streamElapsed || 0;
+      if (secs < 2) return base;
+      return base + " · " + this.fmtStreamElapsed(secs);
+    },
+    // The i18n option labels are self-describing ("Effort · high") because the
+    // DESKTOP control is a bare inline select with no field label next to it.
+    // Inside the mobile settings panel the field IS labelled "Effort", so the
+    // prefix printed the word twice in adjacent lines. Strip it at render
+    // rather than forking six keys × two languages — the separator is fixed
+    // and generated in one place above, so this can't drift out of sync.
+    effortOptLabel(opt) {
+      return String(this.t(opt.labelKey) || "").replace(/^Effort\s·\s/, "");
+    },
     async _serializeTabSettingPatch(st, tailKey, work) {
       const prior = st[tailKey] || Promise.resolve();
       const run = Promise.resolve(prior).catch(() => {}).then(work);
@@ -5635,6 +5685,14 @@ function portal() {
         // so earlierMessageCount() can show how many older messages exist
         // beyond what's in memory.
         _total: 0,
+        // Server `pre_total`: bubbles stranded BEFORE the root of the chain we
+        // are reading — i.e. everything from before a `/compact` (or a fork).
+        // They are not counted in `_total` and not reachable by decrementing
+        // `_loadedOffset`, because they sit in a different order (full) whose
+        // coordinates don't line up with normal's. Non-zero here is the only
+        // signal that "Load earlier" still has somewhere to go once
+        // `_loadedOffset` hits 0; _switchToFullOrder() does the crossing.
+        _preTotal: 0,
         // True while an async backend older-window fetch is in flight, so
         // rapid "Load earlier" clicks don't fire duplicate requests.
         _fetchingOlder: false,
@@ -8048,6 +8106,13 @@ function portal() {
       if (!m) return true;
       const k = this._msgKey(i, m);
       if (k in this._expandedMsgs) return this._expandedMsgs[k];
+      // A compact summary opts out of every default-open rule below. It is a
+      // static artifact, not a live block — but it DOES sit last in the pane
+      // from the moment the compact lands until the first muse-side msg of the
+      // next turn arrives, so the "streaming last block" rule would unfurl
+      // 10-20k chars over the running turn. Only an explicit tap (handled
+      // above) opens it.
+      if (m._is_compact_summary) return false;
       // Explicit caller hint (e.g. diff strip wants to be open by default)
       // overrides the default-collapsed behavior. Caller still respects
       // user's explicit toggle (the _expandedMsgs check above).
@@ -8057,14 +8122,30 @@ function portal() {
       const streaming = paneState ? !!paneState.streaming : !!this.streaming;
       return streaming && i === msgs.length - 1;
     },
-    toggleMsgExpanded(m, i) {
+    // `defaultOpen` MUST mirror whatever the caller passed to isMsgExpanded()
+    // for the same message. Without it the toggle reads the wrong "current"
+    // state for anything that renders open by default (the compact summary),
+    // computes !false === true, writes "expanded" over an already-expanded
+    // block — and the first tap visibly does nothing.
+    toggleMsgExpanded(m, i, defaultOpen = false) {
       if (!m) return;
       const idx = (i ?? (this.messages || []).indexOf(m));
       const k = this._msgKey(idx, m);
-      const cur = this.isMsgExpanded(idx, m);
+      const cur = this.isMsgExpanded(idx, m, defaultOpen);
       const newState = !cur;
       // Spread-assign so Alpine sees the replacement and re-evaluates.
       this._expandedMsgs = { ...this._expandedMsgs, [k]: newState };
+    },
+    // Rendered markdown for a /compact summary body. Cached onto the message
+    // because the summary runs 10-20k chars and x-html re-evaluates on every
+    // Alpine tick — re-parsing that on each keystroke in the composer was not
+    // an option. It can't be filled by loadSession's render pass either: that
+    // pass only touches `role === "assistant"` bubbles, and the compact
+    // summary arrives from the CLI JSONL with role "user".
+    compactSummaryHtml(m) {
+      if (!m) return "";
+      if (!m._compactHtml) m._compactHtml = this.mdRender(m.text || "");
+      return m._compactHtml;
     },
     toolResultClass(i, m, paneState = null, paneMsgs = null) {
       let cls = "tool-result";
@@ -8321,9 +8402,39 @@ function portal() {
     // "Task #N created successfully" similarly. Failed cases (is_error
     // true) are NEVER hidden — the user needs to see what broke + the
     // errorFixHint banner attached to the same result.
+    // Concise chat mode: drop the file-plumbing cards, keep the conversation.
+    // Exactly three classes go (user-selected 2026-07-26, by pointing at them
+    // in a screenshot): the generic tool bubble (Read / Bash / Grep / Edit…),
+    // its 改动预览 diff strip, and the tool_result. Everything that carries
+    // content or needs an action stays — TodoWrite, Task/Agent, the Task* log
+    // lines, ExitPlanMode's plan card, ask_user_question, permission_request.
+    //
+    // Failures are never hidden. That is not a new rule for this mode; it is
+    // shouldHideToolResult's existing invariant, and it is what keeps concise
+    // mode from turning a broken turn into an unexplained silence.
+    toggleConciseChat() {
+      this.conciseChat = !this.conciseChat;
+      try {
+        localStorage.setItem("muselab_concise_chat",
+                             this.conciseChat ? "1" : "0");
+      } catch {}
+      // The hidden cards were occupying real height; without this the viewport
+      // lands somewhere arbitrary in the middle of the now-shorter transcript.
+      this.$nextTick(() => this.scrollToBottom(true));
+    },
+    conciseHidesToolUse(m) {
+      if (!this.conciseChat || !m || m.role !== "tool_use") return false;
+      if (m.is_error) return false;
+      if (["TodoWrite", "Task", "Agent", "ExitPlanMode"].includes(m.name)) {
+        return false;
+      }
+      if (this.isTaskTool(m)) return false;
+      return true;
+    },
     shouldHideToolResult(m) {
       if (!m) return false;
       if (m.is_error) return false;  // never hide failures
+      if (this.conciseChat) return true;
       const kind = this.toolResultKind(m);
       if (kind === "task") return true;
       const name = m.tool_name || "";
@@ -8382,6 +8493,10 @@ function portal() {
         case "ask_user_question":
           return true;
         case "tool_use": {
+          // Concise mode first: this mirrors the x-if gates in index.html, and
+          // a wrapper left visible around a body that no longer renders is the
+          // 30-40px blank-gap bug this whole method exists to prevent.
+          if (this.conciseHidesToolUse(m)) return false;
           // TodoWrite / Task|Agent / ExitPlanMode always render their own card.
           if (m.name === "TodoWrite" || m.name === "Task" || m.name === "Agent"
               || m.name === "ExitPlanMode") return true;
@@ -8908,13 +9023,17 @@ function portal() {
 
     async showCtxBreakdown() {
       if (!this.currentId) return;
-      this.ctxBreakdown = { show: true, loading: true, data: null, error: "" };
+      this.ctxBreakdown = { show: true, loading: true, data: null, view: null, error: "" };
       this.ctxExpanded = {};
       const { ok, data, error, status } = await this.api(
         `/api/chat/context-breakdown/${this.currentId}`);
       this.ctxBreakdown.loading = false;
       if (ok && data) {
         this.ctxBreakdown.data = data;
+        // Normalise ONCE per response rather than on every Alpine re-render:
+        // the view splits categories and pre-sorts every drill-down list, and
+        // x-for would otherwise rebuild those arrays on each reactive pass.
+        this.ctxBreakdown.view = this._ctxBuildView(data);
       } else {
         // 409 = no live client yet (session hasn't streamed a turn).
         this.ctxBreakdown.error = status === 409
@@ -8924,22 +9043,153 @@ function portal() {
           : (error || (this.lang === "zh" ? "查询失败" : "Fetch failed"));
       }
     },
-    // % of maxTokens used by this category — drives both the stacked bar
-    // at the top of the popup and the per-row inline bar.
+    // % of maxTokens used by this category — drives the stacked bar at the
+    // top of the popup and the per-row % column.
     ctxCategoryPct(cat) {
       const max = (this.ctxBreakdown.data && this.ctxBreakdown.data.maxTokens) || 0;
       if (!max || !cat || !cat.tokens) return 0;
       return Math.min(100, (cat.tokens / max) * 100);
     },
-    // Pick a category color. SDK populates cat.color for known categories;
-    // fall back to a stable hash-based hue for everything else so the bar
-    // segments stay distinct.
+    // Share-of-window as text, replacing the per-row bar. Variable precision
+    // because the categories span four orders of magnitude: rounding the
+    // whole column to integers would print "0%" for Skills (79 tokens) and
+    // "0%" for System tools (10.3K) alike, which is exactly the flattening
+    // the bars already did. Sub-0.1% collapses to "<0.1%" rather than
+    // "0.04%" — at that size the only fact worth conveying is "negligible".
+    ctxPctLabel(cat) {
+      const p = this.ctxCategoryPct(cat);
+      if (!p) return "0%";
+      if (p < 0.1) return "<0.1%";
+      if (p < 10) return p.toFixed(1) + "%";
+      return Math.round(p) + "%";
+    },
+    // get_context_usage() returns `color` as a Claude Code THEME TOKEN NAME
+    // ("promptBorder", "inactive", "claude", "warning",
+    // "purple_FOR_SUBAGENTS_ONLY"), NOT a CSS color. The old code returned it
+    // verbatim, so every swatch and every bar got `background: promptBorder`
+    // — an invalid declaration the browser silently drops. Net effect: the
+    // stacked bar and all six row bars rendered completely blank, and the
+    // hashed-hue fallback below could never fire because `cat.color` is
+    // always truthy. Map the tokens onto our own themed palette instead.
+    ctxColorTokens: {
+      promptBorder: "var(--c-accent)",
+      inactive: "var(--c-fg-3)",
+      claude: "#d97757",
+      warning: "var(--c-warn)",
+      // The SDK really does ship this name. Purple is right for Messages;
+      // the shouty suffix is theirs, not a signal to skip the mapping.
+      purple_FOR_SUBAGENTS_ONLY: "#a78bfa",
+      success: "var(--c-success)",
+      error: "var(--c-danger)",
+      text: "var(--c-fg-1)",
+      secondaryText: "var(--c-fg-2)",
+    },
+    // Pick a category color: known SDK theme token → our palette; a literal
+    // CSS color (should the SDK ever start sending one) passes through; and
+    // anything unrecognised gets a stable hash-based hue so new categories
+    // still render as distinct segments instead of disappearing.
     ctxCategoryColor(cat) {
-      if (cat && cat.color) return cat.color;
+      const raw = (cat && cat.color) || "";
+      if (raw && this.ctxColorTokens[raw]) return this.ctxColorTokens[raw];
+      if (raw && this._isCssColor(raw)) return raw;
       const n = (cat && cat.name) || "?";
       let h = 0;
       for (let i = 0; i < n.length; i++) h = (h * 31 + n.charCodeAt(i)) >>> 0;
       return `hsl(${h % 360}, 55%, 55%)`;
+    },
+    _isCssColor(v) {
+      try {
+        if (window.CSS && CSS.supports) return CSS.supports("color", v);
+      } catch (_e) {}
+      // No CSS.supports → only trust shapes that can't be a bare token name.
+      return /^(#|rgba?\(|hsla?\(|var\()/.test(v);
+    },
+    // Split the SDK's flat `categories` array into what the popup can honestly
+    // render. Three quirks it absorbs, each verified against a live response
+    // (totalTokens 84835, maxTokens 200000):
+    //
+    //  1. "Free space" is in `categories`, but it is the REMAINDER, not usage.
+    //     Rendering it as a peer made it the single largest bar (57% of the
+    //     window), flattening every real category — while restating what the
+    //     "84.8K / 200K" header already says. It becomes the unfilled part of
+    //     the stack instead, plus one footer row.
+    //  2. "(deferred)" rows (MCP tools 4.3K, System tools 3.9K) are NOT part
+    //     of totalTokens. Summing all categories gave 208,235 against a
+    //     200,000 window — the 8,235 overflow is exactly those two, so the
+    //     stack overflowed its track by 4%. The SDK's own `gridRows` (the data
+    //     behind the CLI's /context square grid) omits them: its 100 cells
+    //     cover only System prompt / System tools / Memory files / Skills /
+    //     Messages / Free space. They stay visible — deferred tool schemas are
+    //     budget we SAVED and worth seeing — but in their own section, out of
+    //     the stack, and labelled as uncounted.
+    //  3. Drill-down arrays use inconsistent shapes: memoryFiles keys the name
+    //     as `path` (not `name`), and skills is an OBJECT wrapping
+    //     `skillFrontmatter`. The template read `item.name` for all of them,
+    //     so expanding Memory files — the 2nd largest real row — produced 14
+    //     rows of blank labels. Normalised to {label, title, meta, tokens}.
+    _ctxBuildView(data) {
+      const cats = Array.isArray(data && data.categories) ? data.categories : [];
+      const used = [], deferred = [];
+      let freeTokens = 0;
+      for (const c of cats) {
+        const name = String((c && c.name) || "");
+        if (/free\s*space/i.test(name)) { freeTokens += Number(c.tokens) || 0; continue; }
+        if (/\(\s*deferred\s*\)/i.test(name)) { deferred.push(c); continue; }
+        used.push(c);
+      }
+      const sum = list => list.reduce((a, c) => a + (Number(c.tokens) || 0), 0);
+      const children = {};
+      for (const c of used.concat(deferred)) {
+        const kids = this._ctxChildrenFor(data, c.name);
+        if (kids.length) children[c.name] = kids;
+      }
+      return {
+        used, deferred, freeTokens,
+        usedTotal: sum(used),
+        deferredTotal: sum(deferred),
+        children,
+      };
+    },
+    // Map a category name to its normalised drill-down list. Match is fuzzy
+    // (lowercased, separators stripped) because the SDK may localise labels.
+    // Sorted big-first: a 50-entry skill list is only useful if the rows that
+    // actually cost something are at the top.
+    _ctxChildrenFor(data, name) {
+      const key = String(name || "").toLowerCase().replace(/[\s_()-]/g, "");
+      let raw = [];
+      if (key.includes("memory")) {
+        raw = (data.memoryFiles || []).map(f => {
+          const path = String(f.path || f.name || "");
+          const parts = path.split("/").filter(Boolean);
+          return {
+            label: parts.slice(-2).join("/") || path,
+            title: path,
+            meta: f.type || "",
+            tokens: Number(f.tokens) || 0,
+          };
+        });
+      } else if (key.includes("mcp")) {
+        raw = (data.mcpTools || []).map(t => ({
+          // Strip the mcp__<server>__ prefix — it's already in `meta`, and on
+          // a phone the prefix eats the whole column.
+          label: String(t.name || "").replace(/^mcp__[^_]+__/, "") || String(t.name || ""),
+          title: t.name || "",
+          meta: t.serverName || "",
+          tokens: Number(t.tokens) || 0,
+        }));
+      } else if (key.includes("skill")) {
+        const sk = data.skills || {};
+        raw = (sk.skillFrontmatter || []).map(s => ({
+          label: s.name || "", title: s.name || "",
+          meta: s.source || "", tokens: Number(s.tokens) || 0,
+        }));
+      } else if (key.includes("agent")) {
+        raw = (data.agents || []).map(a => ({
+          label: a.name || "", title: a.name || "",
+          meta: a.source || "", tokens: Number(a.tokens) || 0,
+        }));
+      }
+      return raw.filter(x => x.label).sort((a, b) => b.tokens - a.tokens);
     },
     ctxFormatTokens(n) {
       if (!n) return "0";
@@ -8962,18 +9212,13 @@ function portal() {
         ? (this.lang === "zh" ? "（估算）" : " (estimate)") : "";
       return `${used} · ${this.lang === "zh" ? "窗口" : "window"}：${limitSource}${estimated}`;
     },
-    // Map a category name to its detailed sub-list. SDK returns
-    // memoryFiles / mcpTools / agents as separate top-level arrays; we
-    // surface them under whichever category row carries the same totals.
-    // Match is fuzzy (lowercased + stripped of separators) since the SDK
-    // labels may localize the category name.
+    // Drill-down rows for a category. Prebuilt by _ctxBuildView so repeated
+    // Alpine passes reuse one array (a fresh array per render would defeat
+    // x-for keying and re-sort 50 skills on every reactive tick).
     ctxRowChildren(name) {
-      const data = this.ctxBreakdown.data || {};
-      const key = String(name || "").toLowerCase().replace(/[\s_-]/g, "");
-      if (key.includes("memory")) return data.memoryFiles || [];
-      if (key.includes("mcp")) return data.mcpTools || [];
-      if (key.includes("agent")) return data.agents || [];
-      return [];
+      const view = (this.ctxBreakdown && this.ctxBreakdown.view) || null;
+      if (!view) return [];
+      return view.children[name] || [];
     },
     ctxToggleRow(name) {
       if (!this.ctxRowChildren(name).length) return;
@@ -9025,8 +9270,8 @@ function portal() {
         windowMeta.push(`${this.lang === "zh" ? "可配置上限" : "configurable max"} ${this.ctxFormatTokens(ceiling)}`);
       }
       const hint = this.lang === "zh"
-        ? "（点击压缩 · 右键看拆分）"
-        : "(click to compact · right-click for breakdown)";
+        ? "（点击查看拆分，压缩入口在弹层里）"
+        : "(click for breakdown — Compact lives in that popup)";
       const meta = windowMeta.length ? ` · ${windowMeta.join(" · ")}` : "";
       return `${used_s} / ${limit_s} (${pct}%) · ${modelLabel}\n${usedSource} · ${limitSource}${meta}\n${hint}`;
     },
@@ -10439,6 +10684,7 @@ function portal() {
         // no-window responses report offset 0 (whole chain in hand).
         st._loadedOffset = Number.isInteger(s.offset) ? s.offset : 0;
         st._total = Number.isInteger(s.total) ? s.total : all.length;
+        st._preTotal = Number.isInteger(s.pre_total) ? s.pre_total : 0;
         // Trimming may evict the oldest cached bubbles and advance the cursor,
         // so it must run after the response coordinate has been installed.
         // A canonical load is anchored at the newest end. If the selected
@@ -10946,7 +11192,13 @@ function portal() {
       ownerState._laterMessages = [];
       ownerState._loadedOffset = 0;
       ownerState.historyGeneration = "";
+      // Conflict recovery drops back to normal order by design: the chain was
+      // rewritten under us, so a full-order cursor is stale. A reader who had
+      // crossed into pre-compact history gets returned to the live tail and
+      // has to cross again — loadSession() repopulates _preTotal so the
+      // button is there waiting.
       ownerState._historyOrder = "normal";
+      ownerState._preTotal = 0;
       ownerState._hasServerLater = false;
       return this.loadSession(sid, { quiet: sid === this.currentId });
     },
@@ -10996,6 +11248,7 @@ function portal() {
         st._earlierMessages = win.concat(st._earlierMessages || []);
         st._loadedOffset = Number.isInteger(data.offset) ? data.offset : newOffset;
         if (Number.isInteger(data.total)) st._total = data.total;
+        if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
@@ -11047,6 +11300,7 @@ function portal() {
         const win = this._historyEnvelopes(sid, data.messages || []);
         st._laterMessages = (st._laterMessages || []).concat(win);
         if (Number.isInteger(data.total)) st._total = data.total;
+        if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
@@ -11085,6 +11339,42 @@ function portal() {
       // Clamp so a pathological estimate can't itself become a big jump.
       return Math.max(64, Math.min(h, 4000));
     },
+    // Cross from the post-/compact chain (normal order) into the transcript's
+    // real beginning (full order), landing at the coordinate the reader is
+    // already looking at.
+    //
+    // Deliberately NOT `_loadedOffset += pre_total` with `&full=1`: full order
+    // keeps the sidechain / team / meta records that normal filters out, so
+    // the two orders interleave rather than translate — any arithmetic across
+    // them mis-seats the window by however many subagent turns happen to sit
+    // in the range. Instead we hand the server a uuid and let it report the
+    // exact full-order offset back, reusing the same around_uuid path the
+    // outline's jump-to-pre-compact-prompt has been driving all along.
+    async _switchToFullOrder(sid) {
+      sid = sid || this.currentId;
+      if (!sid) return false;
+      const st = this._ensureTabState(sid);
+      if (!this._preCompactReachable(st)) return false;
+      // Anchor on the OLDEST bubble we hold: after the swap everything newly
+      // revealed lands above it, which is what "load earlier" should feel like.
+      const anchor = (this._allPaneMessages(st) || []).find(m => m && m.uuid);
+      if (!anchor) return false;
+      const anchorUuid = anchor.uuid;
+      const ok = await this._loadAroundMessage(sid, anchorUuid);
+      if (!ok || this.tabState[sid] !== st) return false;
+      // _loadAroundMessage replaces the mounted window, so without re-anchoring
+      // the viewport the reader gets teleported mid-transcript. Jump-to-start
+      // (not centred, no highlight flash) keeps the message they were reading
+      // at the fold with the recovered history stacked above it.
+      this.$nextTick(() => {
+        if (this.tabState[sid] !== st || sid !== this.currentId) return;
+        const body = this.$refs && this.$refs.chatBody;
+        const el = body && body.querySelector(
+          `.msg[data-uuid="${CSS.escape(anchorUuid)}"]`);
+        if (el) el.scrollIntoView({ block: "start" });
+      });
+      return true;
+    },
     async loadEarlierMessages(sid) {
       sid = sid || this.currentId;
       if (!sid) return;
@@ -11099,6 +11389,16 @@ function portal() {
       if (st._loadingEarlier) return;
       st._loadingEarlier = true;
       try {
+      // Exhausted this order (nothing stashed, offset at 0) but the chain we
+      // are reading isn't the transcript's start — cross orders instead of
+      // reporting "no more". One click = one crossing; the swap itself brings
+      // the older window in, so we're done for this press.
+      if ((!st._earlierMessages || !st._earlierMessages.length)
+          && !(st._loadedOffset > 0)
+          && this._preCompactReachable(st)) {
+        await this._switchToFullOrder(sid);
+        return;
+      }
       // Stash empty but server holds older history → page a window in first.
       if ((!st._earlierMessages || !st._earlierMessages.length)
           && st._loadedOffset > 0) {
@@ -11106,8 +11406,9 @@ function portal() {
       }
       if (!st._earlierMessages || !st._earlierMessages.length) {
         // Nothing local and nothing (more) on the server: recompute flags
-        // so the button hides itself.
-        st._hasMoreHistory = st._loadedOffset > 0;
+        // so the button hides itself. Pre-chain history counts as "more" —
+        // hiding the button here would strand it behind an unreachable state.
+        st._hasMoreHistory = st._loadedOffset > 0 || this._preCompactReachable(st);
         return;
       }
       // Take from the END of the earlier stash (those are the messages
@@ -11264,7 +11565,19 @@ function portal() {
       // The bounded cache is a sliding window: reaching its size cap no longer
       // blocks older paging because the far-future side is evicted on demand.
       if (st._earlierMessages && st._earlierMessages.length) return true;
-      return st._loadedOffset > 0;
+      if (st._loadedOffset > 0) return true;
+      // Sitting at offset 0 of a chain that itself starts partway into the
+      // transcript (post-/compact). Nothing is "earlier" in THIS order, but
+      // _switchToFullOrder can cross into the order where there is.
+      return this._preCompactReachable(st);
+    },
+    // True iff stranded pre-chain history exists and we haven't crossed into
+    // it yet. Once _historyOrder is "full" those bubbles are inside _total and
+    // ordinary offset paging owns them, so the predicate must go quiet or the
+    // button would never turn off at the true start of history.
+    _preCompactReachable(st) {
+      if (!st) return false;
+      return st._historyOrder !== "full" && (st._preTotal || 0) > 0;
     },
     earlierMessageCount(sid) {
       sid = sid || this.currentId;
@@ -11272,9 +11585,11 @@ function portal() {
       const st = this.tabState[sid];
       if (!st) return 0;
       // Older messages = those still on the server (before our window) plus
-      // those held in the in-memory stash.
+      // those held in the in-memory stash, plus anything stranded before this
+      // chain's root (pre-/compact) that we haven't crossed into yet.
       const stash = st._earlierMessages ? st._earlierMessages.length : 0;
-      return (st._loadedOffset || 0) + stash;
+      const pre = this._preCompactReachable(st) ? (st._preTotal || 0) : 0;
+      return (st._loadedOffset || 0) + stash + pre;
     },
     historyTruncated(sid) {
       sid = sid || this.currentId;
@@ -12582,10 +12897,28 @@ function portal() {
       return ok;
     },
     _fileTreeRowHeight() {
-      // Must match .filelist row min-height in styles.css. Coarse pointers use
-      // the larger touch target even when the viewport is desktop-sized.
+      // MEASURED from a live row, not hard-coded. The old constants (40 touch /
+      // 22 desktop) were the CSS `min-height`, but padding and line-height push
+      // the real box taller — a touch row measures ~48px, not 40. That 8px
+      // per-row error compounds through the virtual scroller: 100 rows of tree
+      // put the spacers 800px out of sync with reality, so scrolling landed on
+      // the wrong slice. Fall back to the CSS floor only before first paint.
+      if (this._fileTreeRowHeightCache > 0) return this._fileTreeRowHeightCache;
+      const list = this.$refs && this.$refs.fileList;
+      const row = list && list.querySelector(
+        "li:not(.filelist-virtual-spacer):not(.filelist-status)");
+      const measured = row ? row.getBoundingClientRect().height : 0;
+      if (measured > 0) {
+        this._fileTreeRowHeightCache = measured;
+        return measured;
+      }
       return window.matchMedia && window.matchMedia("(pointer: coarse)").matches
         ? 40 : 22;
+    },
+    // Invalidated on resize / zoom / font-size change — anything that can
+    // reflow a row. Cheap to recompute (one getBoundingClientRect).
+    _invalidateFileTreeRowHeight() {
+      this._fileTreeRowHeightCache = 0;
     },
     _syncFileTreeViewport(list = this.$refs && this.$refs.fileList) {
       if (!list) return;
@@ -14745,16 +15078,6 @@ function portal() {
       this._terminalSend(text);
       this.$nextTick(() => requestAnimationFrame(() => {
         if (this._terminal) this._terminal.focus();
-      }));
-    },
-    openTerminalManagerFromChat() {
-      if (!this.terminalEnabled) return;
-      this.setMobileTab("preview");
-      // Defer opening past the originating chat-header click. Otherwise the
-      // preview manager's @click.outside sees that same click and immediately
-      // closes the popup before the newly-visible pane paints.
-      this.$nextTick(() => requestAnimationFrame(() => {
-        if (this.mobileTab === "preview") this.terminalManagerOpen = true;
       }));
     },
     _attachTerminalSelectionCopy(host, term) {
@@ -20133,6 +20456,32 @@ function portal() {
         };
         this.rlBadge = this.rateLimitWorst();
       });
+      // Backend preflight auto-compact. Drives the SAME per-tab `compacting`
+      // flag the manual compact button sets, so the 📦 bubble, the ctx-meter
+      // shimmer and the "busy" checks all light up identically — the user
+      // shouldn't have to know whether a compact was their idea or the
+      // backend's. Written on streamState (not `this`) so a background tab's
+      // compact doesn't animate the tab you're looking at.
+      es.addEventListener("compact_progress", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        if (!streamState) return;
+        if (d.phase === "start") {
+          streamState.compacting = true;
+          streamState._compactStartedAt = Date.now();
+          if (streamSid === this.currentId) {
+            this.toast(this.lang === "zh"
+              ? `上下文 ${Math.round((d.used || 0) / 1000)}K，自动压缩中…`
+              : `Context ${Math.round((d.used || 0) / 1000)}K — auto-compacting…`,
+              "info", 4000);
+          }
+        } else if (d.phase === "end") {
+          streamState.compacting = false;
+          streamState._compactStartedAt = 0;
+          // Failure is terminal for the turn — the `error` event lands next
+          // and owns the toast. Don't double-report here.
+        }
+      });
       es.addEventListener("ask_user_question", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
@@ -20207,6 +20556,12 @@ function portal() {
         streamState.es = null;
         streamState._stopping = false;
         streamState._serverActiveObserved = false;
+        // Belt-and-braces for the auto-compact bubble: a turn that dies inside
+        // /compact (transport drop, 10-min timeout) may never deliver the
+        // phase:"end" event, and a 📦 bubble spinning forever on an idle tab
+        // would read as "still working" and block the queue's busy check.
+        streamState.compacting = false;
+        streamState._compactStartedAt = 0;
         if (!(Number(backgroundPending) > 0 && !cancelled)) {
           streamState.activeTurnId = "";
           streamState.parentTurnId = "";
@@ -21335,20 +21690,86 @@ function portal() {
     },
     activityGroups() {
       const zh = this.lang === "zh";
+      // Grouped strictly by STATE, in the order the user has to act on them.
+      // Read/unread deliberately no longer decides the group: it used to, and
+      // a finished task jumped from "results to review" into "recent" the
+      // moment you glanced at it — items moving under the cursor makes the
+      // list impossible to build any spatial memory of. Unread is shown
+      // in-row instead (see .activity-row.is-unread).
       return [
-        { key: "attention", label: zh ? "需要处理" : "Needs attention", states: ["waiting_approval", "paused"] },
-        { key: "unread", label: zh ? "待查看结果" : "Results to review", states: ["completed"], unreadOnly: true },
-        { key: "running", label: zh ? "进行中" : "Running", states: ["running"] },
-        { key: "recent", label: zh ? "最近完成" : "Recent", states: ["completed", "failed", "cancelled"], readOnly: true },
+        { key: "attention", label: zh ? "待决策" : "Awaiting decision", states: ["waiting_approval"] },
+        // Failure used to live under a heading that read "Recent" — a failed
+        // task is not a completed one, and burying it there is why the filter
+        // below needed a special case to keep unread failures visible at all.
+        { key: "failed", label: zh ? "运行失败" : "Failed", states: ["failed"] },
+        // Paused is an interrupted run, not an outcome, so it belongs here
+        // rather than under a heading that asks the user for a decision.
+        { key: "running", label: zh ? "进行中" : "Running", states: ["running", "paused"] },
+        { key: "done", label: zh ? "已结束" : "Finished", states: ["completed", "cancelled"] },
       ];
     },
-    activityEvents(group) {
+    // Rows shown per group before "show all". A durable cross-workspace
+    // ledger accumulates hundreds of finished tasks, and an uncapped list
+    // buries the two groups that need action under the one that does not.
+    ACTIVITY_GROUP_CAP: 5,
+    activityAllEvents(group) {
       const states = new Set(group.states || []);
-      return (this.activity.events || []).filter(item => {
-        const unread = !!item.needs_attention && !item.read;
-        return states.has(item.state) && (!group.unreadOnly || unread)
-          && (!group.readOnly || !unread || item.state === "failed");
-      });
+      return (this.activity.events || []).filter(item => states.has(item.state));
+    },
+    activityEvents(group) {
+      const all = this.activityAllEvents(group);
+      if (this.activity.expanded[group.key]) return all;
+      return all.slice(0, this.ACTIVITY_GROUP_CAP);
+    },
+    activityHiddenCount(group) {
+      return Math.max(
+        0, this.activityAllEvents(group).length - this.ACTIVITY_GROUP_CAP);
+    },
+    toggleActivityGroup(key) {
+      this.activity.expanded[key] = !this.activity.expanded[key];
+    },
+    // Header-chip count. Deliberately computed from the loaded events rather
+    // than from `activity.summary`: the backend summary only reports
+    // running/unread/attention, which is exactly why the header used to show
+    // two numbers while the body showed four groups. Counting client-side
+    // keeps the two in sync with no API change.
+    activityGroupCount(group) {
+      return this.activityAllEvents(group).length;
+    },
+    activityVisibleGroups() {
+      const groups = this.activityGroups();
+      const on = this.activity.filter || [];
+      if (!on.length) return groups;
+      return groups.filter(g => on.includes(g.key));
+    },
+    // Multi-select, not radio. The chips read as a filter bar, and a filter bar
+    // that silently drops your previous pick when you add a second one is the
+    // kind of thing you only notice after wondering where the failures went.
+    // Empty selection === show everything (no "all" chip needed).
+    isActivityFilterOn(key) {
+      return (this.activity.filter || []).includes(key);
+    },
+    toggleActivityFilter(key) {
+      const on = (this.activity.filter || []).slice();
+      const at = on.indexOf(key);
+      if (at >= 0) on.splice(at, 1);
+      else on.push(key);
+      // Replace the array rather than mutate: Alpine v3 doesn't deep-wrap
+      // array contents, so an in-place splice on the nested `activity.filter`
+      // wouldn't re-run the `:class` bindings.
+      this.activity.filter = on;
+    },
+    clearActivityFilter() {
+      this.activity.filter = [];
+    },
+    // Unread-in-this-group count. Drives the chip's colour: a group only earns
+    // its warning/danger tint while something in it is UNACKED. Opening an
+    // event acks it (openActivityEvent → POST /ack), so a failure you've
+    // already looked at stops shouting — previously the red dot was keyed to
+    // "group is non-empty", which meant it never went away.
+    activityGroupUnread(group) {
+      return this.activityAllEvents(group)
+        .filter(x => x && x.needs_attention && !x.read).length;
     },
     activityStateLabel(state) {
       const zh = this.lang === "zh";

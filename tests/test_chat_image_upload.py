@@ -3,6 +3,8 @@ import base64
 import io
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import TEST_TOKEN
 
 
@@ -54,13 +56,75 @@ def test_upload_accepts_pdf(client, auth):
     assert r.json()["kind"] == "pdf"
 
 
-def test_upload_text_too_large_returns_413(client, auth, monkeypatch):
+def test_upload_large_text_accepted_and_kept_raw(client, auth, monkeypatch):
+    """Text attachments are persisted to disk and referenced by path, never
+    pasted into the prompt — so the old 200 KB 413 (which existed purely to
+    protect the context window) is gone. Only _IMAGE_MAX_BYTES still applies.
+
+    The raw bytes must be retained on the store entry: that's what gets
+    written to disk at send-time, and re-encoding the decoded str would
+    silently normalise line endings / BOM."""
     from backend import chat
     monkeypatch.setattr(chat, "_TEXT_MAX_BYTES", 50)
     big = b"x" * 200
     files = {"file": ("big.txt", io.BytesIO(big), "text/plain")}
     r = client.post("/api/chat/upload-image", files=files, headers=auth)
-    assert r.status_code == 413
+    assert r.status_code == 200, r.text
+    entry = chat._image_store[r.json()["id"]]
+    assert entry["kind"] == "text"
+    assert entry["raw"] == big
+
+
+def test_upload_xlsx_keeps_original_bytes_and_kind(client, auth):
+    """xlsx must NOT be flipped to kind=text any more. The original workbook
+    is persisted alongside a plain-text transcription — Read can't open the
+    zip container, and the transcription loses formulas / sheet structure, so
+    the pair is what makes the attachment actually usable."""
+    openpyxl = pytest.importorskip("openpyxl")
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "hello"
+    buf = io.BytesIO()
+    wb.save(buf)
+    raw = buf.getvalue()
+    files = {"file": ("book.xlsx", io.BytesIO(raw),
+                      "application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet")}
+    r = client.post("/api/chat/upload-image", files=files, headers=auth)
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "xlsx"
+    from backend import chat
+    entry = chat._image_store[r.json()["id"]]
+    assert entry["raw"] == raw
+    assert "hello" in entry["text"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    # POSIX traversal: Path.name already reduces this to the basename.
+    ("../../etc/passwd", "passwd"),
+    # Windows-style separators arriving on Linux survive Path.name, so they
+    # have to be replaced explicitly.
+    ("..\\..\\windows\\system32", "windows_system32"),
+    ("  spaced name.md ", "spaced_name.md"),
+    (".hidden", "hidden"),
+    # Shell metacharacters: everything before the last `/` is dropped as a
+    # directory part, the rest is neutralised.
+    ("rm -rf /; echo pwned.txt", "echo_pwned.txt"),
+    ("季度报表.xlsx", "季度报表.xlsx"),
+    ("", "file"),
+])
+def test_safe_attach_name(raw, expected):
+    """Filenames come straight from the client and become a path component."""
+    from backend import chat
+    assert chat._safe_attach_name(raw) == expected
+
+
+def test_safe_attach_name_truncates_on_bytes_not_chars():
+    """ext4/APFS cap each path component at 255 BYTES. A CJK name is 3
+    bytes/char, so a char-based truncation would still blow the limit."""
+    from backend import chat
+    out = chat._safe_attach_name("报" * 200 + ".txt")
+    assert len(out.encode("utf-8")) <= chat._ATTACH_NAME_MAX
+    assert out.endswith(".txt")
 
 
 def test_upload_text_rejects_non_utf8(client, auth):

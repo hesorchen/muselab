@@ -170,6 +170,71 @@ def test_normal_chain_matches_sdk_leaf_rules_and_full_keeps_file_order(tmp_path)
     assert index["bubble_prefix"]["normal"][-1] == 4
 
 
+def _compacted_entries():
+    """Pre-compact turns, then the disconnected root /compact writes.
+
+    The summary's parent is a `system` record whose own parentUuid is None, so
+    walking parents back from the leaf stops AT the summary and never reaches
+    u1..a2 — which is exactly why they fall out of the normal order.
+    """
+    return [
+        _entry("u1", "user", "old one"),
+        _entry("a1", "assistant", "old reply", "u1"),
+        _entry("u2", "user", "old two"),
+        _entry("a2", "assistant", "old reply two", "u2"),
+        _entry("sys", "system", "boundary", None, subtype="compact_boundary"),
+        _entry("c1", "user", "summary", "sys", isCompactSummary=True),
+        _entry("u3", "user", "after compact", "c1"),
+        _entry("a3", "assistant", "after reply", "u3"),
+    ]
+
+
+def test_pre_chain_bubbles_counts_stranded_pre_compact_history(tmp_path):
+    transcript = tmp_path / "compacted.jsonl"
+    index_path = tmp_path / "compacted.index.json"
+    _append(transcript, *_compacted_entries())
+    index = ti.ensure_index("compacted", transcript, index_path, _describe)
+    records = index["records"]
+    # The visible chain starts at the summary; four bubbles precede it.
+    assert [records[i]["uuid"] for i in index["orders"]["normal"]] == [
+        "c1", "u3", "a3",
+    ]
+    assert index["bubble_prefix"]["normal"][-1] == 3
+    assert ti.pre_chain_bubbles(index) == 4
+
+
+def test_pre_chain_bubbles_ignores_sidechain_only_divergence(tmp_path):
+    """A subagent turn makes full longer than normal WITHOUT stranding history.
+
+    This is the case that kills the naive `full_total - normal_total`: the
+    difference is 1 here, but nothing is unreachable and the button must
+    stay hidden.
+    """
+    transcript = tmp_path / "sidechain.jsonl"
+    index_path = tmp_path / "sidechain.index.json"
+    _append(
+        transcript,
+        _entry("u1", "user", "root"),
+        _entry("a1", "assistant", "reply", "u1"),
+        _entry("side", "assistant", "subagent", "u1", isSidechain=True),
+        _entry("u2", "user", "next", "a1"),
+        _entry("a2", "assistant", "leaf", "u2"),
+    )
+    index = ti.ensure_index("sidechain", transcript, index_path, _describe)
+    full_total = index["bubble_prefix"]["full"][-1]
+    normal_total = index["bubble_prefix"]["normal"][-1]
+    assert full_total - normal_total == 1          # the trap
+    assert ti.pre_chain_bubbles(index) == 0        # the answer
+
+
+def test_pre_chain_bubbles_zero_on_empty_transcript(tmp_path):
+    transcript = tmp_path / "empty.jsonl"
+    index_path = tmp_path / "empty.index.json"
+    transcript.write_text("", encoding="utf-8")
+    index = ti.ensure_index("empty", transcript, index_path, _describe)
+    assert ti.pre_chain_bubbles(index) == 0
+
+
 def test_same_sid_build_is_single_flight(tmp_path):
     transcript = tmp_path / "concurrent.jsonl"
     index_path = tmp_path / "concurrent.index.json"
@@ -238,6 +303,40 @@ def test_window_endpoint_matches_full_oracle_and_adds_stable_keys(
     assert body["has_later"] is True
     assert body["history_generation"]
     assert len({m["_key"] for m in body["messages"]}) == len(body["messages"])
+
+
+def test_endpoint_reports_pre_total_and_zeroes_it_in_full_order(
+    client, auth, app_module, tmp_path,
+):
+    """`pre_total` is what makes "Load earlier" appear on a compacted session.
+
+    The normal-order tail reports offset 0 / total 3 — by every pre-existing
+    signal the client is looking at the whole conversation. `pre_total` is the
+    only thing that says otherwise. Once the client crosses into full order
+    those bubbles are inside `total`, so the field has to go quiet or the
+    button would never switch off at the real start.
+    """
+    from backend import chat as chat_mod
+    sid, _ = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, _compacted_entries())
+
+    normal = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 10})
+    assert normal.status_code == 200, normal.text
+    body = normal.json()
+    assert body["history_order"] == "normal"
+    assert body["offset"] == 0
+    assert body["has_more"] is False       # nothing earlier IN THIS ORDER…
+    assert body["pre_total"] == 4          # …but four bubbles are stranded
+
+    full = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth,
+        params={"tail": 10, "full": 1})
+    assert full.status_code == 200, full.text
+    full_body = full.json()
+    assert full_body["history_order"] == "full"
+    assert full_body["total"] == body["total"] + 4
+    assert full_body["pre_total"] == 0
 
 
 def test_cross_window_tool_context_task_status_generation_and_around(

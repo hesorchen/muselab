@@ -271,7 +271,16 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
     try:
         _login(page, backend_url, auth_token)
 
-        terminal_entry = page.locator(".chat-terminal-btn")
+        # The terminal is a preview-pane surface, and since 2026-07-25 the
+        # preview header holds its ONLY entry point (the chat-header duplicate
+        # was removed). Switch panes the way the mobile tab bar would, then use
+        # that button.
+        page.evaluate(
+            """() => {
+              document.querySelector("#app")._x_dataStack[0].setMobileTab("preview");
+            }"""
+        )
+        terminal_entry = page.locator(".terminal-manager-btn")
         expect(terminal_entry).to_be_visible()
         terminal_entry.click()
 

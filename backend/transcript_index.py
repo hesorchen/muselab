@@ -394,6 +394,46 @@ def record_indices_for_bubble_window(
     return order_ids[first:last], start - prefix[first], total
 
 
+def pre_chain_bubbles(index: dict[str, Any]) -> int:
+    """Full-order bubbles sitting BEFORE the start of the normal chain.
+
+    After a `/compact`, compaction writes a fresh root: the summary's parent is
+    a `system` record with parentUuid=None, so the pre-compact turns live on a
+    genuinely disconnected branch. The normal order (parentUuid walk back from
+    the leaf) therefore *starts* at the summary, `total` collapses to the
+    post-compact slice, `offset` is 0 — and the client's "Load earlier" button,
+    which keys off `offset > 0`, never appears. The older turns are still on
+    disk and still in `orders["full"]`; they're just unreachable from the chat
+    pane.
+
+    This returns how many full-order bubbles are stranded that way, which the
+    client uses both as the "is there anything back there" predicate and as the
+    count it shows on the button.
+
+    Deliberately NOT `full_total - normal_total`: `full` keeps sidechain /
+    team / meta records that `normal` filters out, so the two orders are not a
+    simple translation of each other — the difference is non-zero for any
+    session that merely used a subagent, and the arithmetic would mis-seat the
+    window. Anchoring on where the visible chain actually begins is exact, and
+    falls out to 0 for an uncompacted session (`normal[0] is full[0]`). Forked
+    sessions, whose rewired parentUuid chain also bypasses earlier records,
+    get the correct non-zero answer for free.
+    """
+    normal = index["orders"]["normal"]
+    if not normal:
+        return 0
+    full = index["orders"]["full"]
+    prefix = index["bubble_prefix"]["full"]
+    try:
+        pos = full.index(normal[0])
+    except ValueError:
+        # normal[0] absent from full only if duplicate-uuid dedup kept a
+        # different occurrence (full keeps the first, normal resolves the
+        # last). Degrade to "nothing stranded" rather than guess an offset.
+        return 0
+    return prefix[pos]
+
+
 def record_indices_around_uuid(
     index: dict[str, Any],
     uuid_value: str,

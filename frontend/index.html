@@ -166,7 +166,14 @@
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
   <symbol id="i-msg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
   <symbol id="i-at" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></symbol>
-  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <!-- 2026-07-25: `i-cog` was deleted — its path was character-for-character
+       identical to `i-settings`, so one glyph was standing for two different
+       ideas. Real settings surfaces now use `i-settings`; the composer's
+       per-turn parameter popover uses `i-sliders` below, which is what it
+       actually does (adjust permission / effort for THIS turn, not configure
+       the app). -->
+  <!-- Lucide sliders-horizontal. Reads as "tune the knobs for this turn". -->
+  <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="21" y1="4" x2="14" y2="4"/><line x1="10" y1="4" x2="3" y2="4"/><line x1="21" y1="12" x2="12" y2="12"/><line x1="8" y1="12" x2="3" y2="12"/><line x1="21" y1="20" x2="16" y2="20"/><line x1="12" y1="20" x2="3" y2="20"/><line x1="14" y1="2" x2="14" y2="6"/><line x1="8" y1="10" x2="8" y2="14"/><line x1="16" y1="18" x2="16" y2="22"/></symbol>
   <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
   <symbol id="i-file-search" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="14 2 14 8 20 8"/><circle cx="11" cy="14" r="2"/><path d="m13 16 2 2"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
@@ -1326,19 +1333,18 @@
         <button class="activity-center-btn" type="button" @click="openActivityCenter()"
                 :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
                 :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
-          <svg><use href="#i-list"/></svg>
+          <!-- Inbox, not the generic list glyph: `i-list` also marks the tab
+               picker and the scheduler section, so three unrelated surfaces
+               were sharing one shape. An inbox says "things arrived for you". -->
+          <svg><use href="#i-inbox"/></svg>
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
         </button>
-        <!-- Mobile chat-header shortcut. The terminal itself remains a preview
-             surface; this switches panes and opens the full terminal manager. -->
-        <button class="icon-btn chat-terminal-btn" x-show="terminalEnabled"
-                @click="openTerminalManagerFromChat()"
-                :title="lang==='zh' ? '终端' : 'Terminal'"
-                :aria-label="lang==='zh' ? '打开终端列表' : 'Open terminal list'">
-          <span class="terminal-glyph">&gt;_</span>
-          <span class="terminal-count" x-show="terminals.length" x-text="terminals.length"></span>
-        </button>
+        <!-- 2026-07-25: removed the mobile-only terminal shortcut that used to
+             sit here. The terminal is a preview-pane surface and the preview
+             header already carries `.terminal-manager-btn`, so this was a
+             second button for the same thing — competing for the scarcest row
+             in the mobile UI. Entry point is now the preview header only. -->
         <!-- Skills + MCP drawer toggles. 2026-05-29: 从 chat-input 底 bar 移到
              顶 bar，与其它「能力 / 会话」入口（定时任务、命令面板）
              并列；底 bar 只留 attach / 模型 / 权限 / effort / context ring 等
@@ -1434,54 +1440,124 @@
              x-text="lang==='zh' ? '查询中…' : 'Loading…'"></div>
         <div x-show="ctxBreakdown.error && !ctxBreakdown.loading"
              class="ctx-breakdown-body err" x-text="ctxBreakdown.error"></div>
-        <template x-if="ctxBreakdown.data && !ctxBreakdown.loading">
+        <template x-if="ctxBreakdown.view && !ctxBreakdown.loading">
           <div class="ctx-breakdown-body">
             <div class="ctx-breakdown-summary"
                  x-text="((ctxBreakdown.data.totalTokens||0)/1000).toFixed(1) + 'K / ' + ((ctxBreakdown.data.maxTokens||0)/1000).toFixed(0) + 'K (' + (ctxBreakdown.data.percentage||0).toFixed(1) + '%)'"></div>
             <div class="ctx-breakdown-summary"
                  x-text="ctxBreakdownAccuracyLabel()"></div>
-            <!-- Stacked bar — shows each category as a colored segment so the
-                 user can eyeball "where did 50K go" at a glance. -->
+            <!-- Stacked bar — one segment per OCCUPIED category, width relative
+                 to maxTokens. The unfilled remainder of the track IS the free
+                 space, so "Free space" is deliberately not a segment: as a peer
+                 it was the largest bar in the popup and squashed everything
+                 real. Deferred rows are excluded too — they aren't in
+                 totalTokens and used to overflow the track by 4%. -->
             <div class="ctx-breakdown-stack">
-              <template x-for="cat in (ctxBreakdown.data.categories || [])" :key="cat.name">
+              <template x-for="cat in ctxBreakdown.view.used" :key="cat.name">
                 <div class="ctx-breakdown-stack-seg"
                      :style="`width: ${ctxCategoryPct(cat)}%; background: ${ctxCategoryColor(cat)}`"
                      :title="cat.name + ' · ' + ctxFormatTokens(cat.tokens)"></div>
               </template>
             </div>
-            <template x-for="cat in (ctxBreakdown.data.categories || [])" :key="cat.name">
-              <div class="ctx-breakdown-row"
-                   :class="{ expandable: ctxRowChildren(cat.name).length, expanded: ctxExpanded[cat.name] }"
-                   @click="ctxToggleRow(cat.name)">
-                <span class="ctx-breakdown-swatch"
-                      :style="`background: ${ctxCategoryColor(cat)}`"></span>
-                <span class="ctx-breakdown-name" x-text="cat.name"></span>
-                <span class="ctx-breakdown-bar">
-                  <span class="ctx-breakdown-bar-fill"
-                        :style="`width: ${ctxCategoryPct(cat)}%; background: ${ctxCategoryColor(cat)}`"></span>
-                </span>
-                <span class="ctx-breakdown-tokens"
-                      x-text="ctxFormatTokens(cat.tokens)"></span>
-                <span class="ctx-breakdown-caret"
-                      x-show="ctxRowChildren(cat.name).length"
-                      x-text="ctxExpanded[cat.name] ? '▾' : '▸'"></span>
-              </div>
-              <template x-if="ctxExpanded[cat.name] && ctxRowChildren(cat.name).length">
-                <div class="ctx-breakdown-sub">
-                  <template x-for="item in ctxRowChildren(cat.name)" :key="item.name + '-' + item.tokens">
-                    <div class="ctx-breakdown-subrow">
-                      <span class="ctx-breakdown-subname" x-text="item.name"></span>
-                      <span class="ctx-breakdown-subtokens"
-                            x-text="ctxFormatTokens(item.tokens)"></span>
-                    </div>
-                  </template>
+            <template x-for="cat in ctxBreakdown.view.used" :key="cat.name">
+              <div>
+                <div class="ctx-breakdown-row"
+                     :class="{ expandable: ctxRowChildren(cat.name).length, expanded: ctxExpanded[cat.name] }"
+                     @click="ctxToggleRow(cat.name)">
+                  <span class="ctx-breakdown-swatch"
+                        :style="`background: ${ctxCategoryColor(cat)}`"></span>
+                  <span class="ctx-breakdown-name" :title="cat.name" x-text="cat.name"></span>
+                  <span class="ctx-breakdown-tokens"
+                        x-text="ctxFormatTokens(cat.tokens)"></span>
+                  <span class="ctx-breakdown-pct" x-text="ctxPctLabel(cat)"></span>
+                  <span class="ctx-breakdown-caret"
+                        x-show="ctxRowChildren(cat.name).length"
+                        x-text="ctxExpanded[cat.name] ? '▾' : '▸'"></span>
                 </div>
-              </template>
+                <template x-if="ctxExpanded[cat.name] && ctxRowChildren(cat.name).length">
+                  <div class="ctx-breakdown-sub">
+                    <template x-for="item in ctxRowChildren(cat.name)" :key="item.title + '-' + item.tokens">
+                      <div class="ctx-breakdown-subrow" :title="item.title">
+                        <span class="ctx-breakdown-subname" x-text="item.label"></span>
+                        <span class="ctx-breakdown-submeta" x-show="item.meta" x-text="item.meta"></span>
+                        <span class="ctx-breakdown-subtokens"
+                              x-text="ctxFormatTokens(item.tokens)"></span>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </template>
+            <!-- Remainder, stated once as a plain figure. No swatch —
+                 it isn't a slice of anything, it's what's left of the track
+                 above. -->
+            <div class="ctx-breakdown-row free">
+              <span class="ctx-breakdown-name"
+                    x-text="lang==='zh' ? '剩余' : 'Free space'"></span>
+              <span class="ctx-breakdown-tokens"
+                    x-text="ctxFormatTokens(ctxBreakdown.view.freeTokens)"></span>
+              <span class="ctx-breakdown-pct"
+                    x-text="ctxPctLabel({ tokens: ctxBreakdown.view.freeTokens })"></span>
+              <span class="ctx-breakdown-caret"></span>
+            </div>
+            <!-- Deferred tool schemas: real budget, but budget NOT spent —
+                 absent from totalTokens and from the SDK's own gridRows. Kept
+                 visible (it's what ToolSearch buys us) and kept clearly
+                 separate so it can't be read as occupancy. -->
+            <template x-if="ctxBreakdown.view.deferred.length">
+              <div class="ctx-breakdown-deferred">
+                <div class="ctx-breakdown-deferred-head"
+                     x-text="(lang==='zh' ? '未计入（按需加载，已省下 ' : 'Not counted (loaded on demand, saves ')
+                             + ctxFormatTokens(ctxBreakdown.view.deferredTotal)
+                             + (lang==='zh' ? '）' : ')')"></div>
+                <template x-for="cat in ctxBreakdown.view.deferred" :key="cat.name">
+                  <div>
+                    <div class="ctx-breakdown-row deferred"
+                         :class="{ expandable: ctxRowChildren(cat.name).length, expanded: ctxExpanded[cat.name] }"
+                         @click="ctxToggleRow(cat.name)">
+                      <span class="ctx-breakdown-swatch hollow"
+                            :style="`border-color: ${ctxCategoryColor(cat)}`"></span>
+                      <span class="ctx-breakdown-name" :title="cat.name" x-text="cat.name"></span>
+                      <span class="ctx-breakdown-tokens"
+                            x-text="ctxFormatTokens(cat.tokens)"></span>
+                      <!-- No % here on purpose: deferred tokens are not in
+                           totalTokens, so a share-of-window figure would be
+                           read as occupancy. Empty span keeps the column
+                           aligned with the counted rows above. -->
+                      <span class="ctx-breakdown-pct"></span>
+                      <span class="ctx-breakdown-caret"
+                            x-show="ctxRowChildren(cat.name).length"
+                            x-text="ctxExpanded[cat.name] ? '▾' : '▸'"></span>
+                    </div>
+                    <template x-if="ctxExpanded[cat.name] && ctxRowChildren(cat.name).length">
+                      <div class="ctx-breakdown-sub">
+                        <template x-for="item in ctxRowChildren(cat.name)" :key="item.title + '-' + item.tokens">
+                          <div class="ctx-breakdown-subrow" :title="item.title">
+                            <span class="ctx-breakdown-subname" x-text="item.label"></span>
+                            <span class="ctx-breakdown-submeta" x-show="item.meta" x-text="item.meta"></span>
+                            <span class="ctx-breakdown-subtokens"
+                                  x-text="ctxFormatTokens(item.tokens)"></span>
+                          </div>
+                        </template>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
             </template>
             <div class="ctx-breakdown-hint"
                  x-text="lang==='zh' ? '说明：tools / system prompt 是 Claude Code CLI 内置；memoryFiles 是 CLAUDE.md union；messages 含所有历史 + tool_result' : 'Note: tools / system_prompt are CLI built-in; memoryFiles is CLAUDE.md union; messages include full history + tool results'"></div>
           </div>
         </template>
+        <!-- Compact lives here now that the ring itself opens this popup.
+             Outside the x-if so it stays reachable when the breakdown failed
+             to load — a 409 ("send a message first") is exactly the moment a
+             long session might still want compacting. -->
+        <div class="ctx-breakdown-actions">
+          <button class="btn-ghost sm"
+                  @click="ctxBreakdown.show = false; runCompact()"
+                  x-text="lang==='zh' ? '压缩对话…' : 'Compact session…'"></button>
+        </div>
       </div>
 
       <!-- Tab strip — like VS Code Claude. Each tab is an open session;
@@ -1823,10 +1899,56 @@
             <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, paneMsgs) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
                  :data-uuid="m.uuid || ''" :data-message-key="m._k"
                  :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
-              <!-- compact-summary pill -->
+              <!-- Per-message wall-clock (`mts`, backend). Deliberately NOT on
+                   by default: an agentic turn is 30+ tool cards, and stamping
+                   every one of them costs more attention than it returns —
+                   the turn separator already answers "when" at the granularity
+                   anyone actually asks it. It appears only once you EXPAND a
+                   card, i.e. at the moment you're inspecting that specific
+                   step and its time is a real question. Live-streamed cards
+                   have no mts until the post-turn reconcile reloads canonical
+                   history; absent time simply renders nothing. -->
+              <div class="msg-time"
+                   x-show="m.mts
+                           && (m.role === 'tool_use' || m.role === 'tool_result'
+                               || m.role === 'thinking')
+                           && isMsgExpanded(i, m, false, pane, paneMsgs)"
+                   x-text="m.mts ? fmtTurnTime(m.mts) : ''"></div>
+              <!-- compact-summary pill + the summary itself.
+                   The pill used to be the ONLY thing rendered for this
+                   message — the summary body was dropped on the floor by
+                   both the user- and assistant-branch `!m._is_compact_summary`
+                   guards below. On a freshly-compacted session that is
+                   catastrophic: the SDK's post-compact view contains exactly
+                   ONE bubble (the summary), so the whole chat rendered as a
+                   lone pill over an empty screen while promising "摘要在下面".
+                   2026-07-25 user report: "啥也没有".
+                   That report was fixed by TWO changes at once — rendering the
+                   body at all, and defaulting it open while it was the pane's
+                   last bubble. The second one turned out to be the wrong half:
+                   a 10-20k-char summary unfurled on entry buries the actual
+                   conversation, and the "last bubble" test stays true through
+                   the whole next turn (nothing is appended until the first
+                   muse-side msg lands), so a running turn reads as a wall of
+                   summary. Collapsed by default now; the dead-end feel is
+                   handled by the state-tracking label below, which says
+                   "点击查看摘要" instead of promising a body that isn't there. -->
               <template x-if="m._is_compact_summary">
-                <div class="compact-summary-pill">
-                  <span x-text="lang==='zh' ? '📦 上方对话已压缩 · 以下为摘要' : '📦 Conversation compacted · summary below'"></span>
+                <div class="compact-summary-block">
+                  <button type="button" class="compact-summary-pill"
+                          @click="toggleMsgExpanded(m, i, false)"
+                          :aria-expanded="isMsgExpanded(i, m, false, pane, paneMsgs) ? 'true' : 'false'">
+                    <!-- Label tracks the open state: promising "摘要在下面" while
+                         collapsed is what made the old pill read as a dead end. -->
+                    <span x-text="isMsgExpanded(i, m, false, pane, paneMsgs)
+                                    ? (lang==='zh' ? '📦 上方对话已压缩 · 以下为摘要' : '📦 Conversation compacted · summary below')
+                                    : (lang==='zh' ? '📦 上方对话已压缩 · 点击查看摘要' : '📦 Conversation compacted · tap to read summary')"></span>
+                    <span class="compact-summary-caret"
+                          x-text="isMsgExpanded(i, m, false, pane, paneMsgs) ? '▾' : '▸'"></span>
+                  </button>
+                  <div class="compact-summary-body"
+                       x-show="isMsgExpanded(i, m, false, pane, paneMsgs)"
+                       x-html="compactSummaryHtml(m)"></div>
                 </div>
               </template>
 
@@ -2123,7 +2245,7 @@
               </template>
 
               <!-- default tool bubble -->
-              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
+              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m) && !conciseHidesToolUse(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
                         :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
@@ -2207,7 +2329,10 @@
                    nesting two roots in one x-if silently drops the second.
                    The role guard here recovers what the parent x-if used to
                    filter for. -->
-              <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
+              <!-- The diff strip is a SECOND x-if on the same tool_use message,
+                   so it needs its own concise gate — the generic bubble's gate
+                   above does not cover it. -->
+              <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content) && !conciseHidesToolUse(m)">
                 <div class="diff-strip diff-strip-cr"
                      :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m, paneMsgs, tid), pane, paneMsgs) }">
                   <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
@@ -2563,26 +2688,26 @@
                    tracks reactive deps (m.role / messages[i+1].role /
                    messages.length) directly — method calls aren't
                    guaranteed to wire up reactivity inside x-for. -->
+              <!-- Doubles as the TURN SEPARATOR. A session is otherwise one
+                   seamless stream of near-identical cards with no mark for
+                   "a turn ended here" — scrolling 300 messages on a phone,
+                   there is nothing to orient against. This row already sat at
+                   exactly the right place (the tail of every turn) and already
+                   carried the one fact worth anchoring to (the time), so it
+                   becomes the boundary rather than adding a second element.
+                   The streaming dots moved OUT of here to .turn-running-bar:
+                   they were only visible when you happened to be scrolled to
+                   the bottom, and keeping both would pulse two sets of dots
+                   ~20px apart. -->
               <div class="turn-footer"
                    x-show="m.role !== 'user'
                      && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))
                      && (
-                       (pane && pane.streaming && i === paneMsgs.length - 1)
-                       || m.ts
+                       m.ts
                        || m.elapsed
-                       || (m.role === 'assistant' && m.uuid)
+                       || (m.role === 'assistant' && m.uuid && !(pane && pane.streaming))
                      )">
-                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1"
-                      class="thinking-dots">
-                  <span></span><span></span><span></span>
-                </span>
-                <!-- Elapsed counter next to the streaming dots — kicks in
-                     after 1s so fast replies don't flash a "0s" label.
-                     Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
-                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
-                      class="stream-elapsed"
-                      x-text="fmtStreamElapsed((pane && pane.streamElapsed) || 0)"></span>
-                <span x-show="m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
+                <span x-show="m.ts"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
                 <!-- Total elapsed kept after done so the user can
@@ -2590,7 +2715,7 @@
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
+                <span x-show="m.elapsed && m.ts"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
                 <button class="turn-fork-btn"
@@ -2605,6 +2730,37 @@
               </div>
             </div>
           </template>
+          <!-- Running indicator, pinned to the bottom of the SCROLL VIEWPORT
+               rather than trailing the last message. An agentic turn can run
+               for dozens of blocks, and the only two "still working" cues used
+               to be (a) the pulsing avatar, which sits on the turn's FIRST
+               message and is long scrolled off-screen, and (b) the dots in the
+               turn-footer under the very last message, which you only see if
+               you happen to be scrolled to the bottom. Anywhere else in a long
+               turn the chat is an undifferentiated wall of tool cards with no
+               state and no time (2026-07-25 report). Sticky keeps the answer
+               on screen at every scroll position; it's inside the pane so each
+               resident tab carries its own. -->
+          <!-- Suppressed while the "Muse 正在思考…" pending bubble is up: that
+               bubble already carries dots + model + elapsed, and the sticky bar
+               parks itself ~20px under it, so the user sees the SAME three
+               facts twice (2026-07-25 screenshot: "运行中 · 9m27s · Opus 5" over
+               "Muse 正在思考… · Opus 5 · 9m27s"). The pending bubble's own
+               condition is "no muse-side msg yet" — mirror it inverted here so
+               exactly one of the two is ever visible. -->
+          <div class="turn-running-bar"
+               x-show="pane && pane.streaming
+                       && paneMsgs.length
+                       && paneMsgs[paneMsgs.length - 1].role !== 'user'"
+               x-cloak>
+            <span class="thinking-dots"><span></span><span></span><span></span></span>
+            <span class="turn-running-label"
+                  x-text="(lang==='zh' ? '运行中' : 'Running')
+                          + (pane && pane.streamElapsed >= 1
+                              ? ' · ' + fmtStreamElapsed((pane && pane.streamElapsed) || 0) : '')
+                          + (pane && pane.streamingModel
+                              ? ' · ' + modelLabel(pane.streamingModel) : '')"></span>
+          </div>
           </div>
           </template>
           <div x-show="messagesReady && hasLaterMessages()" class="load-later-wrap">
@@ -2632,8 +2788,13 @@
                the pending bubble's avatar duplicated next to those
                msgs' own avatars. Now: any non-user last msg already
                has its own avatar — suppress pending. -->
+          <!-- ...and NOT while an auto-compact is running: that fires at the
+               top of the turn, when the last msg is still the user's, so both
+               placeholders would qualify and stack. The 📦 one is strictly
+               more informative, so it wins. -->
           <div x-show="streaming && (!messages.length
-                                       || messages[messages.length-1].role === 'user')"
+                                       || messages[messages.length-1].role === 'user')
+                       && !(tabState[currentId] && tabState[currentId].compacting)"
                class="msg assistant">
             <div class="msg-row">
               <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
@@ -2681,6 +2842,16 @@
                     <span class="queued-label"
                           x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
                                    + _currentQueueLen()"></span>
+                    <!-- "已排队 1/2" alone reads as "will send shortly", which
+                         is wrong while the queue is paused — the item will
+                         NEVER send until Resume. State the difference on the
+                         bubble, not just in the banner: the banner sits at the
+                         bottom of the chat and is easy to scroll past on a
+                         phone, and the bubble is what the user actually looks
+                         at when wondering why nothing happened. -->
+                    <span class="queued-paused-badge"
+                          x-show="tabState[currentId] && tabState[currentId]._queuePaused"
+                          x-text="lang==='zh' ? '已暂停' : 'paused'"></span>
                     <span style="flex:1"></span>
                     <button class="queued-act icon-btn sm"
                             @click="editPendingQueueItem(currentId, qi)"
@@ -2736,12 +2907,18 @@
                  2. Items left dormant after a process restart — the server
                     intentionally does NOT auto-resume draining on boot, so
                     they wait here for an explicit Resume.
-               While a turn is running, items just auto-drain server-side and
-               this banner stays hidden. -->
+               While a turn is running, items normally auto-drain server-side
+               and this banner stays hidden — EXCEPT when the queue is paused.
+               The old `!streaming` gate assumed running ⇒ will drain, which is
+               exactly false in the paused state: the user starts a new turn,
+               sees no banner, the turn ends, dequeue_message returns None
+               because of the flag, and nothing ever indicates why. Paused wins
+               over streaming (2026-07-25 report: 2 items sat through several
+               completed turns with no visible cause). -->
           <div x-show="tabState[currentId]
                         && tabState[currentId].pendingQueue
                         && tabState[currentId].pendingQueue.length
-                        && !streaming
+                        && (!streaming || tabState[currentId]._queuePaused)
                         && !(tabState[currentId].backgroundActive)
                         && !(tabState[currentId].compacting)
                         && !(tabState[currentId]._draining)"
@@ -2776,7 +2953,7 @@
               <div class="bubble pending">
                 <span class="compact-pending-icon"><svg><use href="#i-package"/></svg></span>
                 <span class="thinking-dots"><span></span><span></span><span></span></span>
-                <span class="thinking-label" x-text="lang==='zh' ? '压缩对话中…' : 'Compacting conversation…'"></span>
+                <span class="thinking-label" x-text="compactPendingLabel()"></span>
               </div>
             </div>
           </div>
@@ -2808,6 +2985,58 @@
       </div>
 
       <div class="chat-input">
+        <!-- Composer settings panel (mobile gear). Anchored HERE, not next to
+             its button: the button lives in .chat-toolbar inside
+             .chat-input-wrap, which sets `overflow: hidden` to clip the
+             textarea + toolbar to the rounded frame. A panel popping upward
+             from inside that box gets cut at the wrap's top edge — with the
+             41-char zh effort label wrapping to 3 lines the panel was ~176px
+             tall against ~46px of usable room, so all the user ever saw was
+             the bottom slice (one bare select). z-index could not help: this
+             is clipping, not stacking. Same escape hatch .mention-pop already
+             uses — .chat-input is position:relative with no overflow rule. -->
+        <div class="chat-toolbar-more-pop"
+             x-show="composerSettingsOpen"
+             x-cloak
+             @click.outside="composerSettingsOpen = false">
+          <label class="chat-toolbar-more-field">
+            <span x-text="t('set.label.default_permission')"></span>
+            <select x-model="permission" @change="onPermissionChange()">
+              <option value="bypassPermissions">bypass</option>
+              <option value="acceptEdits">acceptEdits</option>
+              <option value="default">default</option>
+              <option value="dontAsk">dontAsk</option>
+              <option value="auto">auto</option>
+              <option value="plan">plan</option>
+            </select>
+          </label>
+          <!-- `effort.label`, not `effort.title`: the latter is tooltip prose
+               ("Effort — Anthropic 官方术语，控制推理预算与…") and was being
+               rendered as a visible field label. -->
+          <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
+            <span x-text="t('effort.label')" :title="t('effort.title')"></span>
+            <select x-model="effort" @change="onEffortChange()">
+              <!-- effortOptLabel, not t(): the raw labels carry an "Effort · "
+                   prefix for the unlabelled desktop select, which under this
+                   field's own "Effort" label printed the word twice. -->
+              <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
+                <option :value="opt.value" x-text="effortOptLabel(opt)"></option>
+              </template>
+            </select>
+          </label>
+          <!-- Concise mode. A device preference, not a session one — it sits
+               here rather than in Settings because the screen it fixes is the
+               one you're holding, and this panel is already the "how does this
+               chat behave" drawer within thumb reach. -->
+          <label class="chat-toolbar-more-field row">
+            <span x-text="t('concise.label')" :title="t('concise.title')"></span>
+            <span class="switch sm">
+              <input type="checkbox" :checked="conciseChat"
+                     @change="toggleConciseChat()">
+              <span class="switch-slider"></span>
+            </span>
+          </label>
+        </div>
         <!-- / slash command palette -->
         <div class="mention-pop slash-pop" x-show="slashShow" x-transition.opacity>
           <div class="mention-hint" x-text="t('slash.hint')"></div>
@@ -3041,32 +3270,14 @@
                       :class="{ active: composerSettingsOpen }"
                       @click.stop="composerSettingsOpen = !composerSettingsOpen"
                       :title="lang==='zh' ? '会话设置（权限 / Effort）' : 'Session settings (permission / effort)'">
-                <svg><use href="#i-cog"/></svg>
+                <svg><use href="#i-sliders"/></svg>
               </button>
-              <div class="chat-toolbar-more-pop"
-                   x-show="composerSettingsOpen"
-                   x-cloak
-                   @click.outside="composerSettingsOpen = false">
-                <label class="chat-toolbar-more-field">
-                  <span x-text="t('set.label.default_permission')"></span>
-                  <select x-model="permission" @change="onPermissionChange()">
-                    <option value="bypassPermissions">bypass</option>
-                    <option value="acceptEdits">acceptEdits</option>
-                    <option value="default">default</option>
-                    <option value="dontAsk">dontAsk</option>
-                    <option value="auto">auto</option>
-                    <option value="plan">plan</option>
-                  </select>
-                </label>
-                <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
-                  <span x-text="t('effort.title')"></span>
-                  <select x-model="effort" @change="onEffortChange()">
-                    <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
-                      <option :value="opt.value" x-text="t(opt.labelKey)"></option>
-                    </template>
-                  </select>
-                </label>
-              </div>
+              <!-- The panel itself is NOT here — see .chat-toolbar-more-pop
+                   further up, hoisted out to .chat-input. It has to live
+                   outside .chat-input-wrap, which is `overflow: hidden` and
+                   was slicing the panel down to its bottom ~46px. Only
+                   `composerSettingsOpen` ties the two together, so the split
+                   costs nothing. -->
             </div>
             <!-- Extended-thinking on/off. Default on. Turning it OFF is the
                  escape hatch for the CLI streaming-interleaving 400 ("thinking
@@ -3090,16 +3301,25 @@
               <input type="checkbox" x-model="thinkingEnabled" @change="onThinkingChange()">
               <span x-text="t('thinking.label')"></span>
             </label>
-            <!-- Context ring — % used. Click to compact. Right-click
-                 opens the SDK breakdown popup (the dedicated magnifier
-                 button was removed per user request). -->
+            <!-- Context ring — % used. Click (either button) opens the SDK
+                 breakdown popup, which carries the Compact action.
+
+                 2026-07-25: click used to fire compaction directly and the
+                 breakdown was bound to @contextmenu. On a phone that meant the
+                 ring's only reachable behaviour was "start a compact" — the
+                 number it displays was unreadable (title needs hover) and the
+                 breakdown was unreachable (no right-click). The ring is first
+                 and foremost a READOUT, so tapping it should explain itself;
+                 compaction is the decision you make after reading. `.stop` is
+                 required or the same click bubbles to the popup's
+                 @click.outside and closes it immediately. -->
             <button class="chat-toolbar-ring"
                     :class="{
                       warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
                       danger: sessionUsage.context_used_pct >= 90,
                     }"
-                    @click="runCompact()"
-                    @contextmenu.prevent="showCtxBreakdown()"
+                    @click.stop="showCtxBreakdown()"
+                    @contextmenu.prevent.stop="showCtxBreakdown()"
                     :title="ctxRingTitle()">
               <svg viewBox="0 0 20 20" width="18" height="18">
                 <circle cx="10" cy="10" r="7" fill="none"
@@ -3449,7 +3669,7 @@
          role="dialog" aria-modal="true" :aria-label="t('set.title')">
       <div class="modal-head">
         <span class="modal-title">
-          <svg class="modal-title-icon"><use href="#i-cog"/></svg>
+          <svg class="modal-title-icon"><use href="#i-settings"/></svg>
           <span x-text="t('set.title')"></span>
         </span>
         <button class="modal-close" @click="settings.show=false"
@@ -3492,7 +3712,7 @@
           </li>
           <li class="settings-menu-item" @click="settings.activePage='defaults'"
               :class="{ active: settings.activePage==='defaults' }">
-            <span class="settings-menu-icon"><svg><use href="#i-cog"/></svg></span>
+            <span class="settings-menu-icon"><svg><use href="#i-settings"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
@@ -4864,17 +5084,42 @@
   <div class="modal-backdrop" x-show="activity.show" @click.self="activity.show=false" x-cloak>
     <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="activity.show=false">
       <div class="modal-head">
-        <span class="modal-title"><svg class="modal-title-icon"><use href="#i-list"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
+        <span class="modal-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
         <button class="modal-close" @click="activity.show=false" aria-label="Close">×</button>
       </div>
+      <!-- One chip per state group, in the SAME order as the groups below, so
+           the header and the body answer the same question. Chips keep their
+           slot at count 0 — "Failed 0" is information, and a chip that appears
+           and disappears can never be found by muscle memory. Tap to filter. -->
       <div class="activity-summary">
-        <span class="running" x-text="(lang==='zh'?'进行中 ':'Running ') + activity.summary.running"></span>
-        <span class="unread" x-text="(lang==='zh'?'待查看 ':'Unread ') + activity.summary.unread"></span>
+        <template x-for="group in activityGroups()" :key="group.key">
+          <!-- Multi-select filter chips. `has-unread` (NOT "group is
+               non-empty") is what turns on the colour, so a failure you've
+               opened goes quiet — opening an event acks it server-side. -->
+          <button class="activity-chip" type="button"
+                  :class="[group.key, activityGroupCount(group) ? '' : 'is-empty',
+                           activityGroupUnread(group) ? 'has-unread' : '',
+                           isActivityFilterOn(group.key) ? 'active' : '']"
+                  :aria-pressed="isActivityFilterOn(group.key)"
+                  :title="(lang==='zh' ? '筛选：' : 'Filter: ') + group.label
+                          + (activityGroupUnread(group)
+                              ? (lang==='zh' ? ' · ' + activityGroupUnread(group) + ' 条未读'
+                                             : ' · ' + activityGroupUnread(group) + ' unread')
+                              : '')"
+                  @click="toggleActivityFilter(group.key)">
+            <span class="activity-chip-dot"></span>
+            <span x-text="group.label"></span>
+            <b x-text="activityGroupCount(group)"></b>
+          </button>
+        </template>
+        <button class="btn-ghost sm" x-show="activity.filter.length"
+                @click="clearActivityFilter()"
+                x-text="lang==='zh' ? '清除筛选' : 'Clear filter'"></button>
         <button class="btn-ghost sm" x-show="activity.summary.unread" @click="ackAllActivity()" x-text="lang==='zh' ? '全部标为已读' : 'Mark all read'"></button>
       </div>
       <div class="modal-body activity-body">
         <div class="hint-row" x-show="activity.loading" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
-        <template x-for="group in activityGroups()" :key="group.key">
+        <template x-for="group in activityVisibleGroups()" :key="group.key">
           <section class="activity-group" x-show="activityEvents(group).length">
             <h3 x-text="group.label"></h3>
             <template x-for="item in activityEvents(group)" :key="item.id">
@@ -4887,9 +5132,23 @@
                 <span class="activity-row-side"><span x-text="activityStateLabel(item.state)"></span><small x-text="activityTime(item)"></small></span>
               </button>
             </template>
+            <button class="activity-group-more" type="button"
+                    x-show="activityHiddenCount(group) > 0"
+                    @click="toggleActivityGroup(group.key)"
+                    x-text="activity.expanded[group.key]
+                      ? (lang==='zh' ? '收起' : 'Show less')
+                      : (lang==='zh'
+                          ? '还有 ' + activityHiddenCount(group) + ' 条'
+                          : activityHiddenCount(group) + ' more')"></button>
           </section>
         </template>
         <div class="hint-row" x-show="!activity.loading && !activity.events.length" x-text="lang==='zh' ? '暂无任务记录' : 'No activity yet'"></div>
+        <!-- Filtering to an empty group must say so, or the body just goes
+             blank and reads as a loading failure. -->
+        <div class="hint-row"
+             x-show="!activity.loading && activity.events.length && activity.filter.length
+               && !activityVisibleGroups().some(g => activityEvents(g).length)"
+             x-text="lang==='zh' ? '该状态下暂无任务' : 'No tasks in this state'"></div>
       </div>
     </div>
   </div>

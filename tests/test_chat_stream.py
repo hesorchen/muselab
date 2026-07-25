@@ -451,7 +451,10 @@ def test_stream_pdf_attachment_persists_path_fallback(stream_env, client, monkey
                    f"&prompt=please read it&image_ids=pdf1&model=claude-sonnet-4-6")
     assert r.status_code == 200, r.text
 
-    attach_path = chat_mod._attachments_base() / sid / "pdf1.pdf"
+    # Filename is `{aid}-{sanitised original name}` — the aid keeps two
+    # same-named uploads from clobbering each other, the readable half tells
+    # the agent what it's about to Read.
+    attach_path = chat_mod._attachments_base() / sid / "pdf1-doc.pdf"
     assert attach_path.read_bytes() == pdf_bytes
 
     assert fake.queried, "stream handler never called client.query"
@@ -461,9 +464,67 @@ def test_stream_pdf_attachment_persists_path_fallback(stream_env, client, monkey
     assert content[0]["source"]["media_type"] == "application/pdf"
     text = content[1]["text"]
     assert "please read it" in text
-    assert "Attached PDF files available on disk" in text
+    assert "Files attached to this message (on disk)" in text
     assert "doc.pdf" in text
     assert str(attach_path) in text
+
+
+def test_stream_text_attachment_goes_to_disk_not_into_prompt(
+        stream_env, client, monkeypatch):
+    """The whole point of the 2026-07-25 change: a text attachment is written
+    to disk and referenced by PATH. Its contents must not appear in the
+    prompt — inlining put the file in the transcript forever, so every later
+    turn in the session re-sent it, and a 200 KB CSV quietly ate the context
+    window that the user actually wanted for the conversation."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    secret = "COLUMN_HEADER_THAT_MUST_NOT_BE_INLINED"
+    body = f"a,b,c\n1,2,{secret}\n".encode("utf-8")
+    chat_mod._image_store["txt1"] = {
+        "kind": "text",
+        "mime": "text/csv",
+        "name": "数据 表.csv",
+        "raw": body,
+        "text": body.decode("utf-8"),
+        "ts": 9999999999,
+    }
+
+    fake = _FakeStreamClient([
+        ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=90,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+    ])
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=summarise it&image_ids=txt1&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+
+    # Whitespace in the original name is sanitised to `_`; CJK survives.
+    attach_path = chat_mod._attachments_base() / sid / "txt1-数据_表.csv"
+    assert attach_path.read_bytes() == body
+
+    # _FakeStreamClient.query records a bare string for a plain prompt and a
+    # LIST of message dicts for an async-generator payload. With no image/PDF
+    # blocks there's nothing to structure, so this turn is the string case —
+    # indexing [0][0] the way the PDF test does would grab one character.
+    call = fake.queried[0]
+    if isinstance(call, (list, tuple)):
+        content = call[0]["message"]["content"]
+        text = content if isinstance(content, str) else "".join(
+            b.get("text", "") for b in content if isinstance(b, dict))
+    else:
+        text = call
+    assert "summarise it" in text
+    assert str(attach_path) in text
+    assert "数据 表.csv" in text          # display name stays the original
+    assert secret not in text            # …but the CONTENTS never ship
 
 
 def test_stream_background_task_messages_flow_through(stream_env, client, monkeypatch):
@@ -1603,6 +1664,85 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     assert sid not in chat_mod._active_turns
 
 
+def _ok_turn(sid):
+    """Minimal successful SDK turn: one text block + a success result."""
+    return [
+        AssistantMessage(
+            content=[TextBlock(text="ok")],
+            model="claude-sonnet-4-6",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+    ]
+
+
+def test_turn_has_no_wall_clock_cap_by_default(stream_env, client, monkeypatch):
+    """A turn must run unbounded unless an operator opts in.
+
+    The old hard 1800s cap couldn't tell "wedged" from "busy", so it killed
+    turns that were actively producing output — and the kill was total loss,
+    because the SDK only writes the JSONL on completion and the abort reason
+    only ever existed as a live SSE frame. Pin the absence of a deadline
+    directly: `asyncio.timeout(None)` arms nothing.
+    """
+    import asyncio as _asyncio
+    chat_mod = stream_env
+    sid = _make_session(client)
+    seen: list[object] = []
+    real_timeout = _asyncio.timeout
+
+    def spy(delay):
+        seen.append(delay)
+        return real_timeout(delay)
+
+    monkeypatch.setattr(_asyncio, "timeout", spy)
+    monkeypatch.delenv("MUSELAB_TURN_TIMEOUT_S", raising=False)
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return _FakeStreamClient(_ok_turn(sid))
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=hi&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    # The turn wrapper is the only asyncio.timeout on this path, and it must
+    # have been handed None. A number here means the cap got re-armed.
+    assert seen, "asyncio.timeout was never called on the turn path"
+    assert all(d is None for d in seen), f"a deadline was armed: {seen}"
+
+
+def test_turn_cap_is_opt_in_via_env(stream_env, client, monkeypatch):
+    """The escape hatch still works for anyone who wants a ceiling back."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    monkeypatch.setenv("MUSELAB_TURN_TIMEOUT_S", "1")
+
+    class _SlowClient(_FakeStreamClient):
+        async def receive_response(self):
+            import asyncio as _a
+            await _a.sleep(3)          # outlives the 1s cap
+            for m in self._messages:
+                yield m
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return _SlowClient(_ok_turn(sid))
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=hi&model=claude-sonnet-4-6")
+    assert r.status_code == 200, r.text
+    events = _parse_sse(r.text)
+    err = next((json.loads(d) for e, d in events if e == "error"), None)
+    assert err is not None, f"no error frame: {events}"
+    assert "turn exceeded" in err["error"]
+    assert sid not in chat_mod._active_turns
+
+
 def test_stream_reconnect_no_active_turn(stream_env, client):
     """Empty prompt + no in-flight turn = reconnect mode that finds nothing,
     yielding a single 'no active turn' error frame (not a 500)."""
@@ -1825,3 +1965,198 @@ def test_task_output_requires_token(client):
     r = client.get("/api/chat/task-output",
                    params={"session_id": sid, "path": p})
     assert r.status_code in (401, 403), r.text
+
+
+def test_preflight_compact_announces_itself_over_sse(stream_env, client, monkeypatch):
+    """The auto-compact must be visible while it runs, not only in the logs.
+
+    2026-07-25: a 186229/200000 session sat behind the generic "thinking"
+    bubble for 9m19s of /compact and then died. The FE has a dedicated 📦
+    placeholder driven by the per-tab `compacting` flag; these events are what
+    turn it on and off for a compact the user didn't ask for.
+    """
+    chat_mod = stream_env
+    sid = _make_session(client)
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    fake = _FakeStreamClient([compact_error])
+
+    async def near_limit_context():
+        return {
+            "maxTokens": 200_000,
+            "rawMaxTokens": 200_000,
+            "autoCompactThreshold": 160_000,
+            "totalTokens": 190_000,
+        }
+
+    fake.get_context_usage = near_limit_context
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=must-not-send&model=claude-sonnet-4-6")
+    events = _parse_sse(r.text)
+    prog = [json.loads(d) for e, d in events if e == "compact_progress"]
+
+    assert [p["phase"] for p in prog] == ["start", "end"]
+    # "start" carries the numbers that justify the wait — the FE toasts them.
+    assert prog[0]["source"] == "auto"
+    assert prog[0]["used"] == 190_000
+    assert prog[0]["limit"] == 200_000
+    # Terminal phase precedes the error event, so the bubble stops before the
+    # failure toast rather than spinning under it.
+    assert prog[1]["ok"] is False
+    kinds = [e for e, _ in events]
+    assert kinds.index("compact_progress") < kinds.index("error")
+    assert kinds.count("compact_progress") == 2
+
+
+def test_sdk_command_reads_through_the_session_pump(stream_env):
+    """A slash command must not open a SECOND iterator over the client stream.
+
+    Regression for 2026-07-26. `_SessionStream`'s pump has owned
+    `receive_messages()` since client creation, so the `receive_response()`
+    this helper used to open lost every race: /compact's ResultMessage was
+    routed to the pump and parked in `_orphans`, and the helper waited on a
+    stream nobody was feeding. Two auto-compacts reported failure after 600s
+    and 9m19s while the transcript shows both compactions had finished in
+    ~150s — `query()` is a pure transport write, so the command always ran.
+    """
+    chat_mod = stream_env
+    result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="sid", uuid="r1")
+
+    class PumpedClient:
+        """Only `receive_messages()` works — `receive_response()` is a trap."""
+
+        def __init__(self):
+            self.queries = []
+            self._q = asyncio.Queue()
+
+        async def query(self, prompt):
+            self.queries.append(prompt)
+            self._q.put_nowait(result)
+
+        async def receive_messages(self):
+            while True:
+                yield await self._q.get()
+
+        async def receive_response(self):
+            raise AssertionError(
+                "opened a second iterator instead of attaching to the pump")
+            yield  # pragma: no cover — keeps this an async generator
+
+    async def go():
+        fake = PumpedClient()
+        chat_mod._ensure_session_stream(("sid", "m", ""), fake)
+        try:
+            # The bug's signature was a hang, so the bound is the assertion.
+            got = await asyncio.wait_for(
+                chat_mod._run_sdk_command_checked(fake, "/compact"), 5)
+        finally:
+            await chat_mod._drop_session_streams("sid")
+        assert fake.queries == ["/compact"]
+        return got
+
+    assert asyncio.run(go()) is result
+
+
+def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
+    """Stopping at our own Result must not swallow what the pump queued after it.
+
+    A slash command breaks on its ResultMessage, but the pump routes
+    everything to the attached queue — a background task's notification can
+    already be sitting behind it. Letting the queue fall out of scope would
+    drop that message with no trace.
+    """
+    chat_mod = stream_env
+    later = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="t", status="completed",
+        output_file="", summary="done", uuid="bg", session_id="sid")
+
+    class IdleClient:
+        async def receive_messages(self):
+            await asyncio.Event().wait()
+            yield  # pragma: no cover — never reached
+
+    async def go():
+        stream = chat_mod._SessionStream(("sid", "m", ""), IdleClient())
+        try:
+            q = stream.attach_turn()
+            q.put_nowait(later)
+            q.put_nowait(chat_mod._STREAM_EOF)
+            stream.detach_turn(q)
+            stream.park_unconsumed(q)
+        finally:
+            await stream.aclose()
+        return list(stream._orphans)
+
+    # EOF is a wake-up sentinel, not a message — it must not be re-parked.
+    assert asyncio.run(go()) == [later]
+
+
+def test_preflight_compact_trusts_the_token_count_over_the_verdict(
+        stream_env, client, monkeypatch):
+    """A compaction that succeeded must not lose the turn it made room for.
+
+    How the command REPORTS itself is a hint; whether the context shrank is
+    the fact. On 2026-07-26 the two were opposites — /compact finished in
+    ~150s and freed the window, then the read side timed out and the preflight
+    killed the user's prompt anyway. Belt and braces for the pump fix above:
+    even if the verdict is lost again, an observably smaller context wins.
+    """
+    chat_mod = stream_env
+    sid = _make_session(client)
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="/compact ended without a ResultMessage", api_error_status=None)
+    answer = [
+        AssistantMessage(
+            content=[TextBlock(text="room to think")],
+            model="claude-sonnet-4-6", uuid="a1",
+            usage={"input_tokens": 4, "output_tokens": 2}),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.01, usage={"input_tokens": 4, "output_tokens": 2},
+            result="room to think", uuid="r1"),
+    ]
+    fake = _FakeBatchedStreamClient([[compact_error], answer])
+    reads = []
+
+    async def shrinking_context():
+        # First read is the preflight's trigger; every later read sees the
+        # compaction's effect, which is what the recovery hinges on.
+        reads.append(len(reads))
+        return {
+            "maxTokens": 200_000, "rawMaxTokens": 200_000,
+            "autoCompactThreshold": 160_000,
+            "totalTokens": 190_000 if len(reads) == 1 else 50_000,
+        }
+
+    fake.get_context_usage = shrinking_context
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=still-send-me&model=claude-sonnet-4-6")
+    events = _parse_sse(r.text)
+    kinds = [e for e, _ in events]
+    prog = [json.loads(d) for e, d in events if e == "compact_progress"]
+
+    assert "error" not in kinds
+    assert prog[-1]["phase"] == "end" and prog[-1]["ok"] is True
+    assert prog[-1]["used"] == 50_000
+    # The prompt survived the scare — it was sent after the compact, not dropped.
+    assert fake.queried[0] == "/compact"
+    assert len(fake.queried) == 2

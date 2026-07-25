@@ -865,9 +865,45 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      buttons belong to popovers (notably Terminal → New terminal) and must
      remain visible on mobile. */
   .pane.preview > .pane-head > .btn-primary { display: none; }
-  /* Keep the path + mtime strip on mobile too (user wants it visible): the
-     two-line stacked layout + 10px font fits the cramped head, and min-width:0
-     ellipsis on the path keeps the action icons right-aligned. */
+  /* Path + mtime strip: keep it on mobile (the user wants it visible), but
+     give it its OWN ROW.
+
+     2026-07-25, measured at 390x844: the previous "stacked layout fits the
+     cramped head" assumption was simply false. Sharing one row with the zoom
+     control (87.5px) and four 34px action icons left `.pane-fileinfo` just
+     10.2px wide. The mtime then wrapped one character per line into a 50px
+     column, making the strip 63.5px tall inside a head fixed at 42px — so it
+     overflowed BOTH edges (top -11.3px, bottom 52.3px), painting the path
+     above the header and smearing the mtime across the tab bar below.
+
+     Wrapping to a second row gives the strip the full width and lets the
+     first row breathe (title now gets ~100px instead of fighting for it). */
+  .pane.preview .pane-head {
+    height: auto;
+    min-height: 42px;
+    flex-wrap: wrap;
+    align-content: center;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    row-gap: 2px;
+  }
+  /* `.pane-fileinfo` used to double as the flex spacer; once it wraps away,
+     the title has to take over or the icons collapse against it. */
+  .pane.preview .pane-head .pane-title { flex: 1; min-width: 0; }
+  .pane.preview .pane-head .pane-fileinfo {
+    order: 10;          /* after the action icons → forced onto row 2 */
+    flex: 0 0 100%;
+    align-self: auto;
+  }
+  /* Full row available, so path and mtime sit side by side instead of
+     stacking; mtime is pushed right and never wraps. */
+  .pane.preview .pane-head .pane-fileinfo-row {
+    flex-direction: row;
+    align-items: baseline;
+    gap: var(--sp-2);
+    width: 100%;
+  }
+  .pane.preview .pane-head .pane-fileinfo-mtime { margin-left: auto; }
 
   /* Chat toolbar: keep attach + model + permission + effort + ctx-ring + send.
      Permission restored on mobile (2026-05-28): the prior "low-frequency,
@@ -1550,11 +1586,19 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 /* Preview-header path + mtime strip. flex:1 + min-width:0 lets it both fill
    the gap (acting as the old spacer) and shrink/ellipsis a long path instead
    of shoving the action icons off-screen. */
-.pane-head .pane-fileinfo { flex: 1; min-width: 0; display: flex; align-items: center; overflow: hidden; }
+/* `align-self: stretch` + `max-height: 100%` are load-bearing: without them a
+   squeezed strip grows TALLER than the fixed-height head and spills out of
+   both edges (it did — see the mobile override for the measurements). The head
+   itself can't take `overflow: hidden` as a guard, because the terminal
+   manager popover is a child of it and would get clipped. */
+.pane-head .pane-fileinfo {
+  flex: 1; min-width: 0; display: flex; align-items: center;
+  align-self: stretch; max-height: 100%; overflow: hidden;
+}
 /* Stack path over mtime — quieter than a single inline row. */
 .pane-head .pane-fileinfo-row {
   display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
-  min-width: 0; overflow: hidden; line-height: 1.25;
+  min-width: 0; max-height: 100%; overflow: hidden; line-height: 1.25;
 }
 .pane-head .pane-fileinfo-path {
   color: var(--c-fg-4); font-size: var(--fs-2xs); font-weight: var(--fw-normal);
@@ -1566,6 +1610,9 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 .pane-head .pane-fileinfo-mtime {
   color: var(--c-fg-4); font-size: var(--fs-2xs); opacity: 0.8;
   flex-shrink: 0; font-variant-numeric: tabular-nums;
+  /* Never wrap. "上次修改 2026-06-05 15:28" folding one glyph per line is what
+     turned a 12px strip into a 50px tower and broke the header. */
+  white-space: nowrap;
 }
 .pane-head .pane-fileinfo-mtime-label { opacity: 0.75; }
 
@@ -3132,10 +3179,14 @@ pre.text {
 .workspace-activity-mini { display:inline-flex; gap:5px; margin-left:auto; font:10px var(--font-mono); }
 .workspace-activity-mini .running { color:var(--c-accent); }
 .workspace-activity-mini .unread { color:var(--c-success); }
-.activity-center-btn { position:relative; width:34px; height:34px; flex:0 0 34px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-2); cursor:pointer; }
+/* Sized to match `.icon-btn` (28px box / 15px glyph). It used to be 34/16,
+   which made it visibly the odd one out in a row of seven 28px siblings. */
+.activity-center-btn { position:relative; width:28px; height:28px; flex:0 0 28px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:var(--r-md); background:transparent; color:var(--c-fg-2); cursor:pointer; }
 .activity-center-btn:hover,.activity-center-btn.active { background:var(--c-bg-2); color:var(--c-accent); }
 .activity-center-btn.danger { color:var(--c-danger); }
-.activity-center-btn svg { width:16px; height:16px; }
+/* `flex-shrink:0` is load-bearing: as a flex item the svg was being squeezed
+   to 14x16, i.e. rendered non-uniformly scaled. */
+.activity-center-btn svg { width:15px; height:15px; flex:0 0 15px; }
 .activity-center-btn .activity-running { position:absolute; right:-2px; bottom:-2px; width:10px; height:10px; border:2px solid var(--c-bg-1); border-radius:var(--r-full); background:var(--c-running); box-sizing:border-box; pointer-events:none; }
 .activity-center-btn .activity-running::after { content:""; position:absolute; inset:-2px; border:2px solid var(--c-running); border-radius:inherit; animation:activity-running-pulse 1.6s ease-out infinite; }
 @keyframes activity-running-pulse { 0% { transform:scale(.75); opacity:.8; } 75%,100% { transform:scale(1.4); opacity:0; } }
@@ -3150,12 +3201,40 @@ pre.text {
 }
 .files-head-workspace .workspace-picker-btn { width: 100%; max-width: none; border-radius: var(--r-sm); }
 .activity-modal { width:620px; max-width:calc(100vw - 32px); }
-.activity-summary { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--c-border); color:var(--c-fg-2); font-size:var(--fs-sm); }
-.activity-summary .running { color:var(--c-accent); }
-.activity-summary .unread { color:var(--c-success); }
-.activity-summary button { margin-left:auto; }
+.activity-summary { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:10px 14px; border-bottom:1px solid var(--c-border); color:var(--c-fg-2); font-size:var(--fs-sm); }
+.activity-summary .btn-ghost { margin-left:auto; }
+/* Status chips. One per group below, always all four, always in the same
+   order — a chip that vanishes at count 0 can't be found by muscle memory,
+   and "Failed 0" is worth stating. Non-zero danger states colour themselves. */
+.activity-chip { display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border:1px solid var(--c-border); border-radius:var(--r-full); background:transparent; color:var(--c-fg-2); font:inherit; font-size:var(--fs-xs); line-height:1.2; cursor:pointer; transition:background var(--t-fast), border-color var(--t-fast), color var(--t-fast), opacity var(--t-fast); }
+.activity-chip b { font-weight:var(--fw-medium); color:var(--c-fg-1); font-variant-numeric:tabular-nums; }
+.activity-chip-dot { width:7px; height:7px; flex:0 0 7px; border-radius:50%; background:var(--c-fg-3); }
+/* Dot colour is keyed to UNREAD, not to "the group has rows". A failure you
+   already opened is history, not an alarm — opening an event acks it, and the
+   chip must go quiet in response or the red dot is permanent furniture.
+   Colour split: 待决策 is a prompt (amber, "you need to do something"),
+   运行失败 is an outcome (red, "something broke"). Both were red before,
+   which flattened a question and a failure into the same signal. */
+.activity-chip.attention.has-unread .activity-chip-dot { background:var(--c-warn); }
+.activity-chip.failed.has-unread .activity-chip-dot { background:var(--c-danger); }
+.activity-chip.running .activity-chip-dot { background:var(--c-running); }
+.activity-chip.done .activity-chip-dot { background:var(--c-fg-4); }
+.activity-chip.running:not(.is-empty) .activity-chip-dot { animation:muse-breath 1.8s ease-in-out infinite; }
+.activity-chip.attention.has-unread { border-color:color-mix(in srgb, var(--c-warn) 45%, transparent); color:var(--c-warn); }
+.activity-chip.attention.has-unread b { color:var(--c-warn); }
+.activity-chip.failed.has-unread { border-color:color-mix(in srgb, var(--c-danger) 42%, transparent); color:var(--c-danger); }
+.activity-chip.failed.has-unread b { color:var(--c-danger); }
+.activity-chip:hover { background:var(--c-bg-2); }
+.activity-chip.active { background:var(--c-accent-soft); border-color:var(--c-accent); color:var(--c-fg-0); }
+.activity-chip.active b { color:var(--c-accent); }
+/* Count 0 keeps its slot but recedes. */
+.activity-chip.is-empty { opacity:0.42; }
+.activity-chip.is-empty:hover { opacity:0.85; }
+@media (prefers-reduced-motion:reduce) { .activity-chip .activity-chip-dot { animation:none; } }
 .activity-body { max-height:min(70vh,680px); overflow:auto; padding:10px 14px 18px; }
 .activity-group h3 { margin:10px 4px 6px; color:var(--c-fg-3); font-size:var(--fs-xs); font-weight:var(--fw-medium); }
+.activity-group-more { display:block; width:100%; margin:2px 0 0; padding:6px 8px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); font:inherit; font-size:var(--fs-xs); text-align:left; cursor:pointer; }
+.activity-group-more:hover { background:var(--c-bg-2); color:var(--c-fg-1); }
 .activity-row { width:100%; display:flex; align-items:center; gap:10px; padding:10px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-1); text-align:left; cursor:pointer; }
 .activity-row:hover { background:var(--c-bg-2); }
 .activity-row.is-unread { background:var(--c-accent-soft); box-shadow:inset 3px 0 0 var(--c-accent); }
@@ -3644,9 +3723,13 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
    isCompactSummary content returned by SDK after /compact. Centered, dashed
    border, accent color. Lets the user understand "what they see is the
    summary, not the original history that's been compacted." */
+.compact-summary-block {
+  display: flex; flex-direction: column; align-items: center;
+  width: 100%; min-width: 0;
+}
 .compact-summary-pill {
   align-self: center;
-  display: inline-block;
+  display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 14px;
   margin-bottom: 6px;
   background: var(--c-accent-soft); color: var(--c-accent-fg);
@@ -3654,7 +3737,29 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   border-radius: var(--r-full);
   font-size: var(--fs-xs); font-weight: var(--fw-semibold);
   letter-spacing: 0.2px;
+  /* It's a <button> now — reset the UA defaults it would otherwise inherit. */
+  font-family: inherit; cursor: pointer;
 }
+.compact-summary-caret { font-size: 10px; opacity: 0.75; }
+/* The summary body. `max-height` + inner scroll is deliberate: the summary is
+   10-20k chars, and letting it flow at full height would push a freshly
+   compacted session's composer thousands of pixels below the fold — the user
+   would have to scroll the whole summary just to reach the input. */
+.compact-summary-body {
+  width: 100%; min-width: 0;
+  margin-bottom: 6px;
+  padding: 10px 14px;
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  color: var(--c-fg-1);
+  font-size: var(--fs-sm); line-height: 1.65;
+  max-height: 46vh; overflow-y: auto; overscroll-behavior: contain;
+  word-break: break-word;
+}
+.compact-summary-body > :first-child { margin-top: 0; }
+.compact-summary-body > :last-child { margin-bottom: 0; }
+.compact-summary-body pre { max-width: 100%; overflow-x: auto; }
 
 .msg.assistant .bubble {
   background: var(--c-assistant-bg); color: var(--c-fg-0);
@@ -3779,12 +3884,25 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
    how many blocks (thinking / tool_use / tool_result / assistant)
    are in the turn. Aligned to the muse-side content column (avatar
    width 32px + gap 8px = 40px gutter). */
+/* Now also the turn SEPARATOR: two hairlines bracket the stamp so the row
+   reads as a boundary rather than a caption hanging off the last card. The
+   40px content-column indent is gone with them — a boundary should span the
+   full width, and there is no longer an avatar-aligned run of dots to line up
+   with (those moved to .turn-running-bar). */
 .turn-footer {
-  padding: 4px 0 6px 40px;
+  padding: 0;
+  margin: 6px 0 2px;
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  min-height: 18px;            /* avoid layout jitter when dots → time */
+  gap: 10px;
+  min-height: 16px;
+}
+.turn-footer::before,
+.turn-footer::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--c-border);
 }
 .turn-fork-btn {
   width: 22px;
@@ -3821,10 +3939,10 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   opacity: 0.3;
 }
 @media (max-width: 480px) {
-  /* avatar shrinks to 26px on phones (see .msg-avatar @ media block),
-     keep the footer aligned by matching that gutter — 26 + 8 gap = 34. */
+  /* No avatar-gutter indent to match any more — the separator spans the full
+     width on every breakpoint. Just tighten the vertical rhythm. */
   .turn-footer {
-    padding: 2px 0 3px 34px;
+    margin: 4px 0 2px;
     min-height: 14px;
   }
   .turn-fork-btn {
@@ -3832,23 +3950,38 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
     height: 30px;
   }
 }
+/* Sticky "still running" row — see the comment on .turn-running-bar in
+   index.html for why this exists instead of the trailing dots it replaced.
+   Opaque bg-1 (the chat pane's own background) so message content scrolls
+   UNDER it cleanly; the hairline gives it an edge without a heavy shadow. */
+.turn-running-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: 4px;
+  padding: 6px 2px 4px;
+  background: var(--c-bg-1);
+  border-top: 1px solid var(--c-border);
+}
+.turn-running-label {
+  font-size: var(--fs-xs);
+  color: var(--c-fg-3);
+  font-family: var(--font-mono);
+  letter-spacing: 0.3px;
+}
 
 .thinking-dots { display: inline-flex; gap: var(--sp-1); align-items: center; }
 .thinking-dots span {
   width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent);
   animation: thinking-pulse 1.2s ease-in-out infinite;
 }
-/* Elapsed counter next to the dots in turn-footer. Mono so the digits
-   don't jitter as seconds tick. Muted color — supporting info, not
-   primary. Pending-bubble version is sibling-inline so it inherits the
-   .thinking-label parent's styling; this rule covers the standalone
-   turn-footer usage only. */
-.turn-footer .stream-elapsed {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--c-fg-3);
-  letter-spacing: 0.3px;
-}
+/* `.turn-footer .stream-elapsed` removed: the footer became a turn separator
+   and its elapsed counter moved to .turn-running-bar. The only remaining
+   .stream-elapsed is inside the pending bubble, where it is sibling-inline
+   and inherits .thinking-label's styling — it never needed this rule. */
 .background-task-footer-label {
   color: var(--c-warn);
   font-size: var(--fs-xs);
@@ -5140,29 +5273,69 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-bottom: 10px;
 }
 .ctx-breakdown-stack-seg { height: 100%; transition: width var(--t-fast); }
+/* Rows carry no rule of their own. The dashed border used to run under every
+   row, which at 6 rows read as a table grid and fought the stacked bar for
+   attention. Proportion is the stacked bar's job; these rows are a figure
+   list, so they only need vertical rhythm. */
 .ctx-breakdown-row {
   display: flex; align-items: center;
-  padding: 6px 0; gap: var(--sp-2);
-  border-bottom: 1px dashed var(--c-border);
+  padding: 5px 0; gap: var(--sp-2);
 }
-.ctx-breakdown-row:last-child { border-bottom: 0; }
 .ctx-breakdown-row.expandable { cursor: pointer; }
 .ctx-breakdown-row.expandable:hover { background: var(--c-bg-1); }
+/* Remainder row: a figure, not a slice. No swatch (the 18px keeps the name
+   column aligned with the real categories above). Separated by a hairline
+   because it's the one row that is NOT part of the stacked bar. */
+.ctx-breakdown-row.free {
+  color: var(--c-fg-3);
+  margin-top: 4px; padding-top: 7px;
+  border-top: 1px solid var(--c-border);
+}
+.ctx-breakdown-row.free .ctx-breakdown-name { margin-left: 18px; color: var(--c-fg-3); }
+.ctx-breakdown-row.free .ctx-breakdown-tokens { color: var(--c-fg-3); }
 .ctx-breakdown-swatch {
   width: 10px; height: 10px; border-radius: 50%;
   flex-shrink: 0;
 }
+/* Hollow ring = "this category is a schema budget we did NOT spend". Reads as
+   an outline of the same hue rather than a filled slice. */
+.ctx-breakdown-swatch.hollow {
+  background: none !important;
+  border: 1.5px solid var(--c-fg-4);
+}
+/* Name owns all the slack now that the per-row bar is gone, so long category
+   names ("System prompt (deferred)") stop ellipsing at 168px. */
 .ctx-breakdown-name {
-  color: var(--c-fg-2); flex-shrink: 0;
-  min-width: 80px; max-width: 130px;
+  color: var(--c-fg-2);
+  flex: 1 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.ctx-breakdown-bar {
-  flex: 1; height: 6px; background: var(--c-bg-2);
-  border-radius: var(--r-sm); overflow: hidden;
-  min-width: 30px;
+/* The per-row bar is deliberately gone. Three reasons it never earned its
+   width: (1) the fill was a <span> with no `display`, and width/height do
+   not apply to non-replaced inline boxes (CSS 2.1 §10.3.1 / §10.6.1), so it
+   rendered as an empty track for its entire life; (2) even working, it
+   encoded the exact value already given by the swatch color + the numeral —
+   three encodings of one number; (3) scaled against maxTokens, 4 of 5 rows
+   sit under 10% and read as identically empty. The stacked bar at the top
+   carries proportion; this column carries the figure. */
+.ctx-breakdown-pct {
+  font-family: var(--font-mono);
+  color: var(--c-fg-3); flex-shrink: 0;
+  min-width: 44px; text-align: right;
+  font-size: var(--fs-xs);
 }
-.ctx-breakdown-bar-fill { height: 100%; transition: width var(--t-fast); }
+/* Uncounted section: separated by a rule and dimmed as a block, so no single
+   row here can be mistaken for window occupancy. */
+.ctx-breakdown-deferred {
+  margin-top: 8px; padding-top: 6px;
+  border-top: 1px solid var(--c-border);
+}
+.ctx-breakdown-deferred-head {
+  color: var(--c-fg-3); font-size: var(--fs-xs);
+  padding-bottom: 2px;
+}
+.ctx-breakdown-row.deferred .ctx-breakdown-name,
+.ctx-breakdown-row.deferred .ctx-breakdown-tokens { color: var(--c-fg-3); }
 .ctx-breakdown-tokens {
   font-family: var(--font-mono);
   color: var(--c-fg-1); flex-shrink: 0;
@@ -5173,18 +5346,30 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 /* Per-file / per-tool breakdown shown when a parent row is expanded. */
 .ctx-breakdown-sub {
-  padding: 2px 0 6px 22px;
-  border-bottom: 1px dashed var(--c-border);
+  margin: 0 0 4px 4px;
+  padding: 2px 0 2px 16px;
+  border-left: 1px solid var(--c-border);
 }
 .ctx-breakdown-subrow {
-  display: flex; justify-content: space-between; align-items: baseline;
-  padding: 3px 0; gap: var(--sp-3);
+  display: flex; align-items: baseline;
+  padding: 3px 0; gap: var(--sp-2);
   font-size: var(--fs-xs);
 }
 .ctx-breakdown-subname {
-  color: var(--c-fg-3);
+  color: var(--c-fg-3); flex: 1 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: var(--font-mono);
+  /* Names are truncated head-first elsewhere, but here the distinguishing
+     part of a path/tool name is the TAIL, so keep direction default and rely
+     on the `title` attribute for the full value. */
+}
+/* Provenance tag (memory file type / MCP server / skill source). Muted and
+   shrink-proof so it never pushes the token column off the row. */
+.ctx-breakdown-submeta {
+  color: var(--c-fg-4); flex: 0 0 auto;
+  font-size: var(--fs-2xs);
+  max-width: 84px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .ctx-breakdown-subtokens {
   font-family: var(--font-mono); color: var(--c-fg-2); flex-shrink: 0;
@@ -5196,6 +5381,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-fg-3);
   font-size: var(--fs-xs);
   line-height: 1.5;
+}
+/* Compact action, moved here from the ring's own click handler. */
+.ctx-breakdown-actions {
+  display: flex; justify-content: flex-end;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--c-border);
 }
 
 /* While compact is running: indeterminate progress shimmer in the bar +
@@ -5895,6 +6086,19 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   background: var(--c-accent-soft); border-color: var(--c-accent);
 }
 
+/* Expanded-card timestamp. Absolute so it can't take part in the card's own
+   flex layout (every tool renderer has its own head row; a flowed element
+   would have to be threaded through all of them). Sits above the card's top
+   edge in the gutter between messages, mirroring .msg-actions. */
+.msg-time {
+  position: absolute; top: -2px; right: 6px;
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono);
+  color: var(--c-fg-4);
+  letter-spacing: 0.2px;
+  pointer-events: none;
+  z-index: 1;
+}
 .msg-actions {
   position: absolute; top: -8px; right: 8px;
   background: var(--c-bg-3); border: 1px solid var(--c-border-strong); border-radius: var(--r-md);
@@ -5924,9 +6128,12 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    assistant message once the turn finishes — see fmtHM() in app.js. */
 .msg-ts {
   font-size: var(--fs-2xs); color: var(--c-fg-3);
-  margin-top: 2px; padding: 0 4px;
+  /* margin-top dropped: this now sits ON the separator rule, where a top
+     offset would push the text off the hairlines it's centered between. */
+  padding: 0 4px;
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
+  flex-shrink: 0;
 }
 /* "· 2m50s" total-elapsed pill stamped next to .msg-ts after the turn
    finishes. Same mono / muted treatment as .msg-ts so they read as one
@@ -5936,6 +6143,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-2xs); color: var(--c-fg-3);
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
+  flex-shrink: 0;
 }
 
 .jump-bottom {
@@ -6096,27 +6304,67 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 
 /* Composer "more" group — gear that collapses permission/effort on mobile.
    Hidden on desktop (the inline selects stay); CSS in the pointer:coarse
-   block flips this on and hides the inline selects instead. */
-.chat-toolbar-more { display: none; position: relative; }
+   block flips this on and hides the inline selects instead.
+   No `position: relative` here on purpose: the panel is NOT anchored to this
+   button (see .chat-toolbar-more-pop). */
+.chat-toolbar-more { display: none; }
+/* Anchored to .chat-input, not to the gear. The gear sits inside
+   .chat-input-wrap, which is `overflow: hidden` to clip the textarea +
+   toolbar to the rounded frame — a panel popping upward from in there got
+   sliced at the wrap's top edge, leaving only its bottom ~46px (one bare
+   select). Stacking context was never the issue, so bumping z-index did
+   nothing; the fix is to escape the clip box entirely. .mention-pop solves
+   the same problem the same way, so the geometry below deliberately mirrors
+   it (bottom: calc(100% + 6px), z-index: 100). */
+/* Full composer width rather than a 190px box hugging the right edge. The
+   narrow version floated with no visual tie to the gear that opened it (the
+   gear sits mid-row, the panel was flush right), so it read as a stray card
+   dropped over the chat. Spanning the composer edge-to-edge makes it read as
+   a sheet lifted out of the input area — the same affordance the composer's
+   own rounded frame already establishes. */
 .chat-toolbar-more-pop {
   position: absolute;
-  bottom: calc(100% + 8px);   /* pop upward — composer sits at screen bottom */
-  right: 0;
-  z-index: 50;
-  display: flex; flex-direction: column; gap: var(--sp-2);
-  min-width: 190px;
-  padding: var(--sp-2) var(--sp-3);
+  bottom: calc(100% + 6px);   /* pop upward — composer sits at screen bottom */
+  /* 8px, matching .chat-input's `padding-inline: max(8px, …)` — offsets here
+     resolve against the padding BOX, so this lands the panel's edges exactly
+     on the composer frame's. The max() branch only bites above ~896px of pane
+     width, where this panel is display:none anyway (touch-only). */
+  left: var(--sp-2); right: var(--sp-2);
+  z-index: 100;
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 10px var(--sp-3) 12px;
   background: var(--c-bg-1);
   border: 1px solid var(--c-border);
   border-radius: var(--r-lg);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+  /* Opaque + a real border: the panel overlaps live message text, and a
+     shadow alone left the two layers visually interleaved. */
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
+}
+/* Hoisting the panel out of .chat-toolbar-more also took it out of that
+   group's `display: none` on desktop, where the gear is unreachable and the
+   inline selects are shown instead. Re-gate it explicitly, or a phone→desktop
+   resize with the panel open would leave a duplicate control floating over the
+   chat. `!important` is required to beat the inline style x-show writes. */
+@media not all and (pointer: coarse) {
+  .chat-toolbar-more-pop { display: none !important; }
 }
 .chat-toolbar-more-field {
-  display: flex; flex-direction: column; gap: 4px;
-  font-size: var(--fs-xs); color: var(--c-fg-2);
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  letter-spacing: 0.2px;
 }
+/* Switch rows read as label-on-the-left, control-on-the-right; the stacked
+   column layout above is for full-width selects only. min-height matches the
+   34px selects so the panel's rhythm doesn't break. */
+.chat-toolbar-more-field.row {
+  flex-direction: row; align-items: center; justify-content: space-between;
+  gap: var(--sp-2); min-height: 34px; cursor: pointer;
+}
+/* 34px, not 38: two native selects at 38 made the panel taller than the
+   composer it hangs off. Font stays at 16px — below that iOS Safari zooms the
+   whole page on focus, which is not negotiable for a phone-first surface. */
 .chat-toolbar-more-field select {
-  height: 38px; width: 100%;
+  height: 34px; width: 100%;
   padding: 0 10px;
   background: var(--c-bg-2);
   border: 1px solid var(--c-border);
@@ -6235,6 +6483,21 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .queued-icon { font-size: var(--fs-sm); }
 .queued-label { white-space: nowrap; }
+/* Paused marker on a queued bubble. Warn-colored so it separates from the
+   neutral "已排队 1/2" counter beside it — this one is a blocked state, not
+   a position. */
+.queued-paused-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  /* No --c-warn-soft token exists; a translucent amber reads correctly on
+     every theme's bubble background without adding one. */
+  background: rgba(217, 119, 6, 0.15);
+  color: var(--c-warn);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+}
 .queued-act {
   width: 18px; height: 18px;
   display: inline-flex; align-items: center; justify-content: center;
@@ -8698,7 +8961,14 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
 /* Touch-first file/preview ergonomics. Desktop keeps the compact VSCode-like
    density; coarse pointers get real finger targets and wrapping toolbars. */
 @media (pointer: coarse) {
-  .filelist li:not(.filelist-status) {
+  /* `.filelist-virtual-spacer` MUST stay excluded. The spacer is a zero-or-N
+     pixel strut whose height is set inline by the virtual scroller; giving it
+     a 40px floor made an empty top spacer (height:0) render 40px tall, which
+     is the blank band that used to appear above the tree on touch devices.
+     The base rule at `.filelist li.filelist-virtual-spacer` sets min-height:0
+     but has the same specificity (0,0,2,1) as this one and comes EARLIER in
+     source order, so it loses. Excluding it here is the fix. */
+  .filelist li:not(.filelist-status):not(.filelist-virtual-spacer) {
     min-height: 40px;
     padding-top: 6px;
     padding-bottom: 6px;
@@ -10103,7 +10373,6 @@ html[data-theme="eyecare"] .tool-error-hint {
 }
 .terminal-manager { position: relative; flex-shrink: 0; }
 .terminal-manager-btn { position: relative; gap: 3px; width: auto; min-width: 28px; }
-.chat-terminal-btn { display: none; position: relative; gap: 3px; width: auto; min-width: 28px; }
 .terminal-manager-backdrop { display: none; }
 .terminal-count {
   min-width: 14px; height: 14px; padding: 0 3px;
@@ -10247,7 +10516,6 @@ html[data-theme="eyecare"] .tool-error-hint {
 .terminal-mobile-keys { display: none; }
 
 @media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
-  .pane.chat .pane-head .chat-terminal-btn { display: inline-flex; }
   .terminal-manager-backdrop {
     display: block; position: fixed; inset: 0; z-index: 1790;
     background: rgba(0, 0, 0, 0.46); touch-action: none;

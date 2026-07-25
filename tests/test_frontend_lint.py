@@ -15,6 +15,10 @@ from pathlib import Path
 
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
+# A few checks in here span the FE/BE seam (e.g. a field the backend must emit
+# for a binding to have anything to render), so the backend source is read the
+# same source-text way rather than importing it.
+BACKEND = Path(__file__).resolve().parents[1] / "backend"
 
 
 # Match top-level method definitions inside the Alpine x-data object:
@@ -625,12 +629,27 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     assert "this.messages = st.messages" not in failed
 
 
-def test_activity_center_groups_failed_tasks_as_recent():
+def test_activity_center_groups_strictly_by_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
 
-    assert 'states: ["waiting_approval", "paused"]' in app
-    assert 'states: ["completed", "failed", "cancelled"], readOnly: true' in app
-    assert 'item.state === "failed"' in app
+    # Failure gets its own group. It used to sit under a heading that read
+    # "Recent" — a failed task is not a completed one — and burying it there
+    # is why the filter needed an `item.state === "failed"` special case to
+    # keep unread failures from being hidden by the read-only rule.
+    assert 'states: ["waiting_approval"]' in app
+    assert 'states: ["failed"]' in app
+    assert 'states: ["running", "paused"]' in app
+    assert 'states: ["completed", "cancelled"]' in app
+    assert "readOnly" not in app
+    assert 'item.state === "failed"' not in app
+
+    # Read state no longer decides the group, so a finished task cannot jump
+    # between sections the moment the user glances at it.
+    assert "unreadOnly" not in app
+
+    # Each group collapses past a fixed number of rows.
+    assert "ACTIVITY_GROUP_CAP: 5" in app
+    assert "activityHiddenCount(group)" in app
 
 
 def test_activity_center_uses_two_compact_numberless_status_dots():
@@ -802,7 +821,11 @@ def test_background_task_gap_keeps_footer_running_without_blocking_composer():
     assert "if (streamState.es === es) streamState.es = null" in app
     assert "d.background && d.attachable === false" in app
     assert "continuation: !!d.continuation" in app
-    assert "(m.role === 'assistant' && m.uuid)" in html
+    # An assistant tail with a uuid still earns a footer even without a `ts`
+    # (that's the fork affordance). The `!streaming` guard came with the
+    # separator restyle: the footer no longer hosts the streaming dots, so
+    # during a live turn this clause would otherwise render an empty rule.
+    assert "(m.role === 'assistant' && m.uuid && !(pane && pane.streaming))" in html
     assert 'x-show="m.role === \'assistant\' && m.uuid' in html
 
 
@@ -991,7 +1014,20 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "st._laterMessages.splice(st._laterMessages.length - drop, drop)" in cap
     assert "_captureMessageAnchor(scrollEl, m)" in cap
     assert "_restoreMessageAnchor(scrollEl, anchor)" in cap
-    assert "return st._loadedOffset > 0" in app
+    # "Load earlier" keys off the server cursor first…
+    assert "if (st._loadedOffset > 0) return true;" in app
+    # …and, at cursor 0, off stranded pre-chain history (post-/compact), which
+    # is reached by crossing orders rather than by decrementing the cursor.
+    assert "return this._preCompactReachable(st);" in app
+    assert 'st._historyOrder !== "full" && (st._preTotal || 0) > 0' in app
+    switch_start = app.index("async _switchToFullOrder(sid)")
+    switch_end = app.index("async loadEarlierMessages(sid)", switch_start)
+    switch = app[switch_start:switch_end]
+    # The crossing must go through around_uuid; offset arithmetic across the
+    # two orders mis-seats the window (full keeps sidechains, normal doesn't).
+    assert "this._loadAroundMessage(sid, anchorUuid)" in switch
+    assert "&full=1" not in switch
+    assert "_preTotal" not in switch.split("_preCompactReachable")[-1]
     assert "historyTruncated(sid)" in app and "return false" in app[
         app.index("historyTruncated(sid)"):app.index("async renameSession()")]
 
@@ -1002,6 +1038,9 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert 'x-for="(m, i) in paneMsgs" :key="m._k"' in pane
     assert "pane.streaming" in pane
     assert "pane.streamElapsed" in pane
+    # Elapsed reads through a null-guarded pane. `pane` resolves to null while
+    # a closing tab's pane is torn down, and an unguarded property read there
+    # throws inside the Alpine effect.
     assert "fmtStreamElapsed((pane && pane.streamElapsed) || 0)" in pane
     assert 'x-text="fmtStreamElapsed(pane.streamElapsed)"' not in pane
     assert "messages.length" not in re.sub(r"<!--.*?-->", "", pane, flags=re.S)
@@ -1052,7 +1091,10 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "async terminateAllTerminals()" in app
     assert "async saveTerminalProfile()" in app
     assert "async deleteTerminalProfile()" in app
-    assert "openTerminalManagerFromChat()" in app
+    # The chat header must NOT grow a second terminal entry point. The preview
+    # header's terminal-manager button is the only one; a duplicate in the chat
+    # header competes for the most contested row in the mobile layout.
+    assert "openTerminalManagerFromChat()" not in app
     assert "terminalMobileKey(text)" in app
     assert "this._terminalSend(text)" in app
     assert "_terminalDataIsMouseReport(data)" in app
@@ -1103,11 +1145,11 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert 'class="terminal-manager-backdrop"' in html
     assert 'class="terminal-manager-dismiss"' in html
     assert "'pane-floating-layer': terminalManagerOpen" in html
-    assert 'class="icon-btn chat-terminal-btn"' in html
+    assert 'class="icon-btn chat-terminal-btn"' not in html
     assert 'class="icon-btn terminal-manager-btn preview-keep-mobile"' in html
     assert 'data-terminal-key="backslash"' in html
     assert "@click=\"terminalMobileKey('\\\\')\"" in html
-    assert ".pane.chat .pane-head .chat-terminal-btn { display: inline-flex; }" in css
+    assert "chat-terminal-btn" not in css
     assert ".pane.preview > .pane-head > .btn-primary { display: none; }" in css
     assert ".pane.preview .pane-head .btn-primary { display: none; }" not in css
     layer_start = css.index(".pane.pane-floating-layer")
@@ -1321,3 +1363,476 @@ def test_chat_send_and_stop_buttons_are_icon_only_but_accessible():
     assert ':aria-label="t(\'btn.stop\')"' in buttons
     assert ".chat-toolbar-send { width: 44px; padding: 0; }" in css
     assert ".chat-toolbar-send > span:nth-child(2)" not in css
+
+
+def test_ctx_breakdown_maps_sdk_theme_tokens_to_real_colors():
+    """SDK `color` is a THEME TOKEN NAME, not a CSS color.
+
+    Real bug, 2026-07-25: get_context_usage() returns colors like
+    "promptBorder" / "inactive" / "claude" / "warning" /
+    "purple_FOR_SUBAGENTS_ONLY". The old ctxCategoryColor() returned them
+    verbatim, so every swatch and bar got `background: promptBorder` — an
+    invalid declaration browsers drop. The whole visualisation rendered
+    blank, and the hashed-hue fallback was unreachable because `cat.color`
+    is always truthy.
+    """
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    for token in ("promptBorder", "inactive", "claude", "warning",
+                  "purple_FOR_SUBAGENTS_ONLY"):
+        assert f"{token}:" in app, f"theme token {token} left unmapped"
+    start = app.index("    ctxCategoryColor(cat) {")
+    body = app[start:app.index("\n    },", start)]
+    # The bug was returning cat.color unconditionally. Any passthrough must
+    # now be gated on it actually being a color.
+    assert "if (cat && cat.color) return cat.color;" not in body
+    assert "this.ctxColorTokens[raw]" in body
+    assert "this._isCssColor(raw)" in body
+    assert 'CSS.supports("color", v)' in app
+
+
+def test_ctx_breakdown_excludes_free_space_and_deferred_from_the_stack():
+    """Free space is the remainder, deferred rows aren't in totalTokens.
+
+    Real bug, 2026-07-25: `categories` was rendered raw. "Free space"
+    (114.8K = 57% of a 200K window) became the largest bar and flattened
+    every real category, and the two "(deferred)" rows pushed the sum to
+    208,235 against a 200,000 window — a stack overflowing its own track by
+    4%. The SDK's own gridRows (the CLI /context grid) omits both.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    # Nothing may iterate the raw category list any more.
+    assert "ctxBreakdown.data.categories" not in html
+    assert 'x-for="cat in ctxBreakdown.view.used"' in html
+    assert 'x-for="cat in ctxBreakdown.view.deferred"' in html
+    start = app.index("    _ctxBuildView(data) {")
+    body = app[start:app.index("\n    },", start)]
+    assert "/free\\s*space/i.test(name)" in body
+    assert "/\\(\\s*deferred\\s*\\)/i.test(name)" in body
+    # Deferred must be summed separately, never folded into usedTotal.
+    assert "deferredTotal: sum(deferred)" in body
+    assert "usedTotal: sum(used)" in body
+
+
+def test_ctx_breakdown_drilldown_uses_normalised_labels():
+    """memoryFiles keys its name as `path`, skills wraps skillFrontmatter.
+
+    Real bug, 2026-07-25: the template read `item.name` for every child
+    list, so expanding "Memory files" — the 2nd largest real category —
+    listed 14 rows with blank labels and `undefined-<tokens>` keys.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert 'x-text="item.name"' not in html
+    assert 'x-text="item.label"' in html
+    assert 'key="item.title + \'-\' + item.tokens"' in html
+    start = app.index("    _ctxChildrenFor(data, name) {")
+    body = app[start:app.index("\n    },", start)]
+    assert "f.path || f.name" in body          # memoryFiles: path, not name
+    assert "sk.skillFrontmatter" in body       # skills: object, not array
+    assert "data.mcpTools" in body
+    assert "sort((a, b) => b.tokens - a.tokens)" in body
+
+
+def test_ctx_breakdown_rows_survive_the_x_for_single_root_rule():
+    """Alpine x-for needs ONE root element per iteration.
+
+    The row <div> and its drill-down <template x-if> used to be siblings
+    inside the same x-for, which is not a single root. Each iteration now
+    wraps both in a container.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    assert ".ctx-breakdown-swatch.hollow" in css
+    assert ".ctx-breakdown-submeta" in css
+    # Both x-for bodies (counted + deferred) open a wrapper <div> immediately.
+    for marker in ('x-for="cat in ctxBreakdown.view.used"',
+                   'x-for="cat in ctxBreakdown.view.deferred"'):
+        # The stacked bar also iterates `.used`, and its body is a single
+        # <div class="ctx-breakdown-stack-seg"> — already one root.
+        for start in _all_indices(html, marker):
+            body = html[start:start + 400]
+            assert ("<div>" in body) or ("ctx-breakdown-stack-seg" in body), (
+                f"x-for at {start} must wrap its iteration in a single root")
+
+
+def _all_indices(hay: str, needle: str) -> list[int]:
+    out, i = [], hay.find(needle)
+    while i != -1:
+        out.append(i)
+        i = hay.find(needle, i + 1)
+    return out
+
+
+def test_ctx_breakdown_rows_show_a_percent_column_not_a_dead_inline_bar():
+    """The per-row bar was inert markup and is gone.
+
+    `.ctx-breakdown-bar-fill` was a <span> carrying only `height: 100%`, and
+    width/height do not apply to non-replaced inline boxes (CSS 2.1 §10.3.1,
+    §10.6.1) — so every row bar rendered as an empty grey track for its whole
+    life. The stacked bar at the top works because its segments are <div>s.
+    Rather than resurrect a control that triple-encoded one number (swatch +
+    bar + numeral) and flattened four of five rows into near-empty tracks, the
+    column is now the share-of-window figure.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "ctx-breakdown-bar" not in html
+    assert "ctx-breakdown-bar-fill" not in css
+    assert ".ctx-breakdown-pct" in css
+    assert 'x-text="ctxPctLabel(cat)"' in html
+    # Variable precision, or Skills (79 tokens) and System tools (10.3K) both
+    # print "0%" — the exact flattening the bars already did.
+    assert 'if (p < 0.1) return "<0.1%";' in app
+    assert 'if (p < 10) return p.toFixed(1) + "%";' in app
+    # Deferred rows get an EMPTY pct cell: their tokens are not in totalTokens,
+    # so a share-of-window figure there would read as occupancy.
+    assert '<span class="ctx-breakdown-pct"></span>' in html
+    # Rows are a figure list now, not a table: no per-row rule.
+    assert "border-bottom: 1px dashed var(--c-border);\n}" not in css.split(
+        ".ctx-breakdown-row {")[1][:200]
+
+
+def test_composer_settings_panel_escapes_the_overflow_hidden_composer():
+    """The gear panel must not live inside .chat-input-wrap.
+
+    Real bug, 2026-07-25: the panel was a child of .chat-toolbar-more, which
+    sits inside .chat-input-wrap — and that wrap sets `overflow: hidden` to
+    clip the textarea + toolbar to its rounded frame. A panel popping upward
+    from in there is CLIPPED at the wrap's top edge, not merely stacked
+    under something, so its z-index was irrelevant. With the zh effort label
+    wrapping to 3 lines the panel ran ~176px against ~46px of room: the user
+    saw one bare select and nothing else.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    panel = html.index('class="chat-toolbar-more-pop"')
+    wrap = html.index('<div class="chat-input-wrap"')
+    chat_input = html.index('<div class="chat-input">')
+    assert chat_input < panel < wrap, (
+        "the settings panel must be anchored to .chat-input, before (and thus "
+        "outside) the overflow:hidden .chat-input-wrap"
+    )
+    # .chat-input-wrap keeps its clipping — the panel moved, the frame didn't.
+    # (There are several `.chat-input-wrap {` blocks; the media-query one only
+    # zeroes padding, so check every block rather than the first.)
+    blocks = [css[m.end():css.index("}", m.end())]
+              for m in re.finditer(r"\.chat-input-wrap \{", css)]
+    assert any("overflow: hidden;" in b for b in blocks), (
+        "the clip that made this bug is gone — if that was deliberate, this "
+        "test and the panel's hoisting should be revisited together"
+    )
+    # Anchor must no longer be the button's own box.
+    assert ".chat-toolbar-more { display: none; }" in css
+    # Desktop re-gate: hoisting it out of the group's display:none exposed it
+    # on viewports where the gear itself is hidden.
+    assert "@media not all and (pointer: coarse)" in css
+    assert ".chat-toolbar-more-pop { display: none !important; }" in css
+
+
+def test_effort_field_uses_a_short_label_not_the_tooltip_prose():
+    """`effort.title` is tooltip copy, not a field caption.
+
+    The zh string is 51 chars ("Effort — Anthropic 官方术语，控制推理预算与
+    agentic loop 深度（不译）"). Rendered as a visible <span> label it wrapped
+    to 3 lines and was the single largest contributor to the panel's height.
+    Mirrors the existing thinking.label / thinking.title split.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+    assert "x-text=\"t('effort.title')\"" not in html
+    assert "x-text=\"t('effort.label')\"" in html
+    # Present in BOTH dictionaries, and actually short.
+    assert i18n.count('"effort.label": "Effort",') == 2
+    for key in ("effort.label", "effort.title"):
+        assert i18n.count(f'"{key}":') == 2, f"{key} missing from a locale"
+
+
+def test_running_state_is_pinned_to_the_scroll_viewport_not_the_last_message():
+    """A long agentic turn must show "still running" at every scroll position.
+
+    2026-07-25 report ("这种界面很让人困惑啊 为什么没有footer？"): a screenful of
+    tool cards with no time, no state, no boundary. Three separately-reasonable
+    rules composed into that: (1) one footer per TURN, on its tail message;
+    (2) the HH:MM stamp only lands in the `done` handler, so a running turn has
+    no `ts` anywhere; (3) the pulsing avatar marks the turn's FIRST message,
+    which in a 40-block turn is far off-screen. Net: the only evidence of life
+    was the composer's stop button.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    pane_start = html.index('<div class="msg-pane"')
+    pane_end = html.index("<!-- /P1 per-tab message panes", pane_start)
+    pane = html[pane_start:pane_end]
+    # Lives INSIDE the pane: panes are resident per tab, and a single shared
+    # bar would report the active tab's state under every one of them.
+    assert 'class="turn-running-bar"' in pane
+    # The gate also excludes the pending-bubble case — see
+    # test_running_bar_and_pending_bubble_are_mutually_exclusive.
+    assert 'x-show="pane && pane.streaming' in pane
+
+    block = css[css.index(".turn-running-bar {"):]
+    block = block[:block.index("}")]
+    assert "position: sticky" in block
+    assert "bottom: 0" in block
+    # Opaque, or message text shows through as it scrolls underneath.
+    assert "background: var(--c-bg-1)" in block
+
+
+def test_turn_footer_is_a_separator_and_no_longer_hosts_streaming_dots():
+    """The footer became the turn boundary; the dots moved to the sticky bar.
+
+    Keeping both would pulse two sets of dots ~20px apart whenever the user
+    happened to be scrolled to the bottom.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    footer = html[html.index('<div class="turn-footer"'):]
+    footer = footer[:footer.index("</div>")]
+    assert "thinking-dots" not in footer
+    assert "stream-elapsed" not in footer
+    # Bracketing hairlines are what make it read as a boundary rather than a
+    # caption hanging off the last card.
+    assert ".turn-footer::before," in css
+    assert ".turn-footer::after {" in css
+    # The 40px avatar-column indent went with the dots — a boundary spans the
+    # full width.
+    assert "padding: 4px 0 6px 40px;" not in css
+    assert "padding: 2px 0 3px 34px;" not in css
+
+
+def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():
+    """`mts` is the transcript wall-clock, kept distinct from the turn `ts`.
+
+    Populating `ts` per message instead would break _markDone: it walks
+    backwards looking for a bubble that ALREADY has `ts` to decide it has left
+    the current turn, so it would abort on the first block it saw.
+    """
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "def _transcript_ts_ms(entry: dict) -> int | None:" in chat
+    # Both raw-entry loaders stamp it; the pure-SDK loader can't (SessionMessage
+    # has no timestamp field) and consumers must tolerate its absence.
+    assert chat.count("_transcript_ts_ms(e)") == 2
+    assert 'entry["mts"] = mts_by_uuid[u]' in chat
+    assert '__slots__ = ("uuid", "type", "message", "mts")' in chat
+
+    # Shown only on an EXPANDED tool card — 30+ stamped cards per turn costs
+    # more attention than it returns, and the separator already answers "when".
+    assert 'class="msg-time"' in html
+    stamp = html[html.index('class="msg-time"'):]
+    stamp = stamp[:stamp.index("</div>")]
+    assert "isMsgExpanded(i, m, false, pane, paneMsgs)" in stamp
+    assert "m.role === 'tool_use'" in stamp
+
+
+def test_queue_paused_flag_cannot_outlive_its_items():
+    """An empty queue must never stay paused.
+
+    2026-07-25: a 30-min-cap abort paused a 2-item queue; the user deleted both
+    items; `paused` survived; two fresh messages then sat forever because
+    dequeue_message returns None while paused — through several completed
+    turns, with no banner (it was gated on `!streaming`) and no error. The
+    stale flag also blocks _save_queue's empty-file cleanup, so sessions/ had
+    zombie {items: [], paused: true} files up to a week old.
+    """
+    sessions = (BACKEND / "sessions.py").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    remove = sessions[sessions.index("def remove_queue_item("):]
+    remove = remove[:remove.index("def clear_queue(")]
+    assert 'if not data["items"]:' in remove
+    assert 'data["paused"] = False' in remove
+
+    # Paused beats streaming: "a turn is running" no longer implies "it will
+    # drain when the turn ends".
+    assert "(!streaming || tabState[currentId]._queuePaused)" in html
+    # And the bubble itself says so — the banner is easy to scroll past.
+    assert 'class="queued-paused-badge"' in html
+
+
+def test_compact_summary_stays_collapsed_until_tapped():
+    """A compact summary must never unfurl itself.
+
+    The original "啥也没有" fix (2026-07-25) bundled two changes: render the
+    summary body at all, and default it open while it was the pane's last
+    bubble. The second half backfired — a compact summary sits last from the
+    moment it lands until the first muse-side msg of the NEXT turn arrives, so
+    both the explicit `i === paneMsgs.length - 1` hint AND isMsgExpanded's
+    "streaming last block" fallback unfurled 10-20k chars on top of a turn the
+    user was trying to watch. Only an explicit tap opens it now; the pill's
+    state-tracking label carries the affordance instead.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    block = html[html.index('x-if="m._is_compact_summary"'):]
+    block = block[:block.index("</template>")]
+    # No default-open hint on any of the four call sites (pill click, aria,
+    # label, body).
+    assert "paneMsgs.length - 1" not in block
+    assert block.count("isMsgExpanded(i, m, false, pane, paneMsgs)") == 4
+    assert "toggleMsgExpanded(m, i, false)" in block
+    # toggleMsgExpanded's defaultOpen must mirror isMsgExpanded's, else the
+    # first tap computes the wrong "current" state and visibly does nothing.
+
+    # And the fallback rule opts compact summaries out before it can fire.
+    fn = js[js.index("isMsgExpanded(i, m, defaultOpen"):]
+    fn = fn[:fn.index("toggleMsgExpanded(")]
+    opt_out = fn.index("m._is_compact_summary")
+    assert opt_out < fn.index("if (defaultOpen) return true;")
+    assert opt_out < fn.index("streaming && i === msgs.length - 1")
+
+
+def test_running_bar_and_pending_bubble_are_mutually_exclusive():
+    """Only one live-state indicator at a time.
+
+    The sticky .turn-running-bar shows dots + elapsed + model. So does the
+    "Muse 正在思考…" pending bubble, and the bar pins itself a few px below it —
+    2026-07-25 screenshot showed "运行中 · 9m27s · Opus 5" stacked directly on
+    "Muse 正在思考… · Opus 5 · 9m27s". The pending bubble renders when there is
+    no muse-side msg yet; the bar must require the inverse.
+    """
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    bar = html[html.index('class="turn-running-bar"'):]
+    bar = bar[:bar.index("</div>")]
+    assert "paneMsgs[paneMsgs.length - 1].role !== 'user'" in bar
+    assert "paneMsgs.length" in bar
+
+    # The pending bubble's own gate, unchanged — the two conditions are
+    # complements, so exactly one renders.
+    assert ("streaming && (!messages.length\n"
+            "                                       || messages[messages.length-1]"
+            ".role === 'user')") in html
+
+
+def test_auto_compact_drives_the_same_ui_as_a_manual_one():
+    """A backend preflight compact must not masquerade as a slow turn.
+
+    2026-07-25: a 186229/200000 session auto-compacted for 9m19s behind the
+    generic "Muse 正在思考…" bubble and then died on "/compact ended without a
+    ResultMessage". The manual compact path has had a 📦 bubble + ctx-meter
+    shimmer since 2026-05-22, all driven by the per-tab `compacting` flag —
+    the automatic path now sets the same flag rather than growing a parallel
+    UI that would drift.
+    """
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    # Backend: both phases, on every exit path (ok, sdk failure, and the
+    # "context didn't shrink" verification failure).
+    pre = chat[chat.index("async def _preflight_compact_if_needed("):]
+    pre = pre[:pre.index("async def event_gen():")]
+    assert '_emit_compact(emit, "start"' in pre
+    assert pre.count('_emit_compact(\n                emit, "end"') \
+        + pre.count('_emit_compact(emit, "end"') == 3
+
+    # The emitter is injected, not closed over: merge_q is one scope deeper.
+    assert "async def _emit_side(evt: dict) -> None:" in chat
+    assert "await _preflight_compact_if_needed(_emit_side)" in chat
+    # A UI cue must never kill the turn it describes.
+    helper = chat[chat.index("async def _emit_compact("):]
+    helper = helper[:helper.index("async def _preflight_compact_if_needed(")]
+    assert "except Exception as e:" in helper
+    assert "if emit is None:" in helper
+
+    # Frontend: same flag, written per-tab (a background tab's compact must not
+    # animate the tab you're looking at).
+    h = js[js.index('es.addEventListener("compact_progress"'):]
+    h = h[:h.index('es.addEventListener("ask_user_question"')]
+    assert "streamState.compacting = true;" in h
+    assert "streamState.compacting = false;" in h
+    assert "this.compacting" not in h
+
+    # Cleared on stream teardown too — a turn that dies inside /compact may
+    # never deliver phase:"end", and a stuck flag also blocks queue drain.
+    done = js[js.index("const _markDone = ("):]
+    done = done[:done.index("this._setBackgroundTaskActive(")]
+    assert "streamState.compacting = false;" in done
+
+    # Exactly one placeholder bubble: the auto-compact fires while the last msg
+    # is still the user's, which is also the generic pending bubble's trigger.
+    assert ("&& !(tabState[currentId] && tabState[currentId].compacting)\"\n"
+            "               class=\"msg assistant\"") in html
+
+
+def test_concise_mode_hides_exactly_three_card_classes():
+    """Concise chat mode is a subtraction, and a narrow one.
+
+    2026-07-26, user-selected by circling them in a screenshot: the generic
+    tool bubble, its 改动预览 diff strip, and the tool_result. Everything that
+    carries content or needs an action stays visible — TodoWrite, Task/Agent,
+    the Task* log lines, ExitPlanMode's plan card, ask_user_question,
+    permission_request. Hiding that last pair would leave the backend awaiting
+    an answer the user cannot see, i.e. a silent deadlock.
+    """
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    fn = js[js.index("conciseHidesToolUse(m) {"):]
+    fn = fn[:fn.index("shouldHideToolResult(m) {")]
+    # Only tool_use is this predicate's business.
+    assert 'm.role !== "tool_use"' in fn
+    for keep in ("TodoWrite", "Task", "Agent", "ExitPlanMode"):
+        assert keep in fn
+    assert "isTaskTool(m)) return false" in fn
+    # Failures survive concise mode, on both the call and the result side.
+    assert "if (m.is_error) return false;" in fn
+    res = js[js.index("shouldHideToolResult(m) {"):]
+    res = res[:res.index("isMsgRenderable(")]
+    assert res.index("if (m.is_error) return false;") \
+        < res.index("if (this.conciseChat) return true;")
+
+    # BOTH x-if gates: the diff strip is a second template on the same message,
+    # so gating only the generic bubble would leave the red/green strip behind.
+    assert html.count("&& !conciseHidesToolUse(m)") == 2
+    assert "['Edit','MultiEdit','Write'].includes(m.name)" in html
+
+    # isMsgRenderable must agree with the x-if gates, or the wrapper survives
+    # around a body that no longer renders — the 30-40px blank-gap bug.
+    rend = js[js.index("isMsgRenderable(m, i, paneMsgs"):]
+    rend = rend[:rend.index("// True iff this Edit/Write/MultiEdit")]
+    assert "if (this.conciseHidesToolUse(m)) return false;" in rend
+    # ...but the turn-tail short-circuit still precedes it, so the turn
+    # separator survives on turns that end in a hidden tool card.
+    assert rend.index("if (isTurnTail) return true;") \
+        < rend.index("conciseHidesToolUse")
+
+
+def test_concise_mode_is_a_device_preference_and_defaults_off():
+    """Off by default, remembered per device.
+
+    The problem it solves is "the phone screen is small", so a desktop reading
+    the same session should still get the full detail — hence localStorage
+    rather than a per-session setting. Default off because the cards it removes
+    are the only surface on which you can notice the agent touching a file you
+    did not expect.
+    """
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    # Declared on the data object, not merely assigned in init(): the x-if
+    # gates read it during the very first paint.
+    assert "\n    conciseChat: false," in js
+    assert 'localStorage.getItem("muselab_concise_chat") === "1"' in js
+    assert 'localStorage.setItem("muselab_concise_chat",' in js
+
+    # Toggle lives in the composer gear panel, inside the hoisted popover.
+    pop = html[html.index('class="chat-toolbar-more-pop"'):]
+    pop = pop[:pop.index("<!-- / slash command palette -->")]
+    assert 't(\'concise.label\')' in pop
+    assert '@change="toggleConciseChat()"' in pop
+
+    # Both languages, label + tooltip, and the tooltip states the exception.
+    assert i18n.count('"concise.label"') == 2
+    assert i18n.count('"concise.title"') == 2
+    assert "失败的工具仍会显示" in i18n
+    assert "Failed tools still show" in i18n
