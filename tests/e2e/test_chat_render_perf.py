@@ -1070,7 +1070,7 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     _assert_no_browser_errors(page, errors)
 
 
-def test_background_task_gap_keeps_footer_live_without_empty_reconnect(
+def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
     page: Page, backend_url, auth_token,
 ):
     """A detached task reader is busy but has no SSE broadcast to attach to."""
@@ -1160,23 +1160,26 @@ def test_background_task_gap_keeps_footer_live_without_empty_reconnect(
     )
 
     _app_eval(page, "return app.loadSession(arg);", sid)
+    # A pending background task is tracked, but it no longer makes the session
+    # busy: the turn already reached ResultMessage, and the backend pump owns
+    # the stream, so the user can keep talking while the task runs.
     page.wait_for_function(
         """sid => {
           const app = document.querySelector("#app")._x_dataStack[0];
           const st = app.tabState[sid];
           return st && st.backgroundActive === true
-            && st.streaming === false && app._isBusy(sid) === true
+            && st.streaming === false && app._isBusy(sid) === false
             && st.streamElapsed >= 89;
         }""",
         arg=sid,
         timeout=10000,
     )
-    expect(page.locator(".msg-pane:visible .thinking-dots:visible")).to_be_visible(
-        timeout=5000,
-    )
-    status = page.locator(".background-task-strip:visible")
-    expect(status).to_be_visible(timeout=5000)
-    expect(status).to_contain_text("Background task running")
+    # The "background task running · new messages will queue" strip is gone
+    # along with the queueing it described, and the turn footer no longer
+    # spins for a task that is not this turn's work.
+    expect(page.locator(".background-task-strip")).to_have_count(0)
+    expect(page.locator(".msg-pane:visible .thinking-dots:visible")).to_have_count(0)
+    # The tab dot still surfaces that something is running in the background.
     expect(page.locator(".chat-tab.active .chat-tab-stream-dot.is-background")).to_be_visible(
         timeout=5000,
     )

@@ -20282,7 +20282,17 @@ function portal() {
             // Desktop only — same reason as the post-send refocus above:
             // a mobile programmatic focus re-arms body.kb-open without a
             // paired blur and leaves a blank band under the composer.
-            if (ta && !ta.disabled && !this._isMobileLayout()) ta.focus();
+            if (!ta || ta.disabled || this._isMobileLayout()) return;
+            // Never STEAL focus. A turn can take minutes, and the composer is
+            // disabled meanwhile — so the user has usually moved on: typing in
+            // the terminal, editing a file, using the tree search. Yanking the
+            // caret back mid-keystroke sends their input to the wrong place.
+            // Reclaim it only when nothing else holds it: disabling the
+            // textarea drops focus to <body>, which is the case this refocus
+            // was written for.
+            const ae = document.activeElement;
+            if (ae && ae !== document.body && ae !== ta) return;
+            ta.focus();
           });
         }
       };
