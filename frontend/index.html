@@ -2245,7 +2245,7 @@
               </template>
 
               <!-- default tool bubble -->
-              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
+              <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m) && !conciseHidesToolUse(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
                         :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, paneMsgs, pane && pane.streaming) }"
@@ -2329,7 +2329,10 @@
                    nesting two roots in one x-if silently drops the second.
                    The role guard here recovers what the parent x-if used to
                    filter for. -->
-              <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
+              <!-- The diff strip is a SECOND x-if on the same tool_use message,
+                   so it needs its own concise gate — the generic bubble's gate
+                   above does not cover it. -->
+              <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content) && !conciseHidesToolUse(m)">
                 <div class="diff-strip diff-strip-cr"
                      :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m, paneMsgs, tid), pane, paneMsgs) }">
                   <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
@@ -3020,6 +3023,18 @@
                 <option :value="opt.value" x-text="effortOptLabel(opt)"></option>
               </template>
             </select>
+          </label>
+          <!-- Concise mode. A device preference, not a session one — it sits
+               here rather than in Settings because the screen it fixes is the
+               one you're holding, and this panel is already the "how does this
+               chat behave" drawer within thumb reach. -->
+          <label class="chat-toolbar-more-field row">
+            <span x-text="t('concise.label')" :title="t('concise.title')"></span>
+            <span class="switch sm">
+              <input type="checkbox" :checked="conciseChat"
+                     @change="toggleConciseChat()">
+              <span class="switch-slider"></span>
+            </span>
           </label>
         </div>
         <!-- / slash command palette -->

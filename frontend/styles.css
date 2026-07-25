@@ -6353,6 +6353,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-xs); color: var(--c-fg-3);
   letter-spacing: 0.2px;
 }
+/* Switch rows read as label-on-the-left, control-on-the-right; the stacked
+   column layout above is for full-width selects only. min-height matches the
+   34px selects so the panel's rhythm doesn't break. */
+.chat-toolbar-more-field.row {
+  flex-direction: row; align-items: center; justify-content: space-between;
+  gap: var(--sp-2); min-height: 34px; cursor: pointer;
+}
 /* 34px, not 38: two native selects at 38 made the panel taller than the
    composer it hangs off. Font stays at 16px — below that iOS Safari zooms the
    whole page on focus, which is not negotiable for a phone-first surface. */

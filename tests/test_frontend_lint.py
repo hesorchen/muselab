@@ -1761,3 +1761,78 @@ def test_auto_compact_drives_the_same_ui_as_a_manual_one():
     # is still the user's, which is also the generic pending bubble's trigger.
     assert ("&& !(tabState[currentId] && tabState[currentId].compacting)\"\n"
             "               class=\"msg assistant\"") in html
+
+
+def test_concise_mode_hides_exactly_three_card_classes():
+    """Concise chat mode is a subtraction, and a narrow one.
+
+    2026-07-26, user-selected by circling them in a screenshot: the generic
+    tool bubble, its 改动预览 diff strip, and the tool_result. Everything that
+    carries content or needs an action stays visible — TodoWrite, Task/Agent,
+    the Task* log lines, ExitPlanMode's plan card, ask_user_question,
+    permission_request. Hiding that last pair would leave the backend awaiting
+    an answer the user cannot see, i.e. a silent deadlock.
+    """
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    fn = js[js.index("conciseHidesToolUse(m) {"):]
+    fn = fn[:fn.index("shouldHideToolResult(m) {")]
+    # Only tool_use is this predicate's business.
+    assert 'm.role !== "tool_use"' in fn
+    for keep in ("TodoWrite", "Task", "Agent", "ExitPlanMode"):
+        assert keep in fn
+    assert "isTaskTool(m)) return false" in fn
+    # Failures survive concise mode, on both the call and the result side.
+    assert "if (m.is_error) return false;" in fn
+    res = js[js.index("shouldHideToolResult(m) {"):]
+    res = res[:res.index("isMsgRenderable(")]
+    assert res.index("if (m.is_error) return false;") \
+        < res.index("if (this.conciseChat) return true;")
+
+    # BOTH x-if gates: the diff strip is a second template on the same message,
+    # so gating only the generic bubble would leave the red/green strip behind.
+    assert html.count("&& !conciseHidesToolUse(m)") == 2
+    assert "['Edit','MultiEdit','Write'].includes(m.name)" in html
+
+    # isMsgRenderable must agree with the x-if gates, or the wrapper survives
+    # around a body that no longer renders — the 30-40px blank-gap bug.
+    rend = js[js.index("isMsgRenderable(m, i, paneMsgs"):]
+    rend = rend[:rend.index("// True iff this Edit/Write/MultiEdit")]
+    assert "if (this.conciseHidesToolUse(m)) return false;" in rend
+    # ...but the turn-tail short-circuit still precedes it, so the turn
+    # separator survives on turns that end in a hidden tool card.
+    assert rend.index("if (isTurnTail) return true;") \
+        < rend.index("conciseHidesToolUse")
+
+
+def test_concise_mode_is_a_device_preference_and_defaults_off():
+    """Off by default, remembered per device.
+
+    The problem it solves is "the phone screen is small", so a desktop reading
+    the same session should still get the full detail — hence localStorage
+    rather than a per-session setting. Default off because the cards it removes
+    are the only surface on which you can notice the agent touching a file you
+    did not expect.
+    """
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    # Declared on the data object, not merely assigned in init(): the x-if
+    # gates read it during the very first paint.
+    assert "\n    conciseChat: false," in js
+    assert 'localStorage.getItem("muselab_concise_chat") === "1"' in js
+    assert 'localStorage.setItem("muselab_concise_chat",' in js
+
+    # Toggle lives in the composer gear panel, inside the hoisted popover.
+    pop = html[html.index('class="chat-toolbar-more-pop"'):]
+    pop = pop[:pop.index("<!-- / slash command palette -->")]
+    assert 't(\'concise.label\')' in pop
+    assert '@change="toggleConciseChat()"' in pop
+
+    # Both languages, label + tooltip, and the tooltip states the exception.
+    assert i18n.count('"concise.label"') == 2
+    assert i18n.count('"concise.title"') == 2
+    assert "失败的工具仍会显示" in i18n
+    assert "Failed tools still show" in i18n

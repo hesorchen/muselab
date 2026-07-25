@@ -415,6 +415,11 @@ function portal() {
     PREVIEW_ZOOM_MIN: 0.5,
     PREVIEW_ZOOM_MAX: 3,
     PREVIEW_ZOOM_STEP: 0.1,
+    // Concise chat mode — declared here (not just assigned in init) so Alpine
+    // owns it from the first render and the x-if gates that read it don't
+    // evaluate against undefined on the initial paint. Restored from
+    // localStorage in init(); see conciseHidesToolUse().
+    conciseChat: false,
     // Compact orchestration: the per-tab `compacting` flag (see
     // _blankTabState) marks the window where the CLI is busy summarising
     // *that session's* history. User messages typed during compact go into
@@ -1479,6 +1484,12 @@ function portal() {
         const z = parseFloat(localStorage.getItem("muselab_preview_zoom"));
         if (!Number.isNaN(z)) this.previewZoom = this._clampPreviewZoom(z);
       }
+      // Concise chat mode. Per-DEVICE (localStorage, like preview zoom), not
+      // per-session: the problem it solves is "the phone screen is small", so
+      // the same session read from a desktop should stay fully detailed.
+      // Default off — it removes the only surface on which you can catch the
+      // agent touching a file you didn't expect.
+      this.conciseChat = localStorage.getItem("muselab_concise_chat") === "1";
       // Vibration / push prefs come from localStorage (per-device) so a
       // shared muselab between a desktop + phone keeps independent
       // settings — your phone can vibrate; the desktop tab silently
@@ -8391,9 +8402,39 @@ function portal() {
     // "Task #N created successfully" similarly. Failed cases (is_error
     // true) are NEVER hidden — the user needs to see what broke + the
     // errorFixHint banner attached to the same result.
+    // Concise chat mode: drop the file-plumbing cards, keep the conversation.
+    // Exactly three classes go (user-selected 2026-07-26, by pointing at them
+    // in a screenshot): the generic tool bubble (Read / Bash / Grep / Edit…),
+    // its 改动预览 diff strip, and the tool_result. Everything that carries
+    // content or needs an action stays — TodoWrite, Task/Agent, the Task* log
+    // lines, ExitPlanMode's plan card, ask_user_question, permission_request.
+    //
+    // Failures are never hidden. That is not a new rule for this mode; it is
+    // shouldHideToolResult's existing invariant, and it is what keeps concise
+    // mode from turning a broken turn into an unexplained silence.
+    toggleConciseChat() {
+      this.conciseChat = !this.conciseChat;
+      try {
+        localStorage.setItem("muselab_concise_chat",
+                             this.conciseChat ? "1" : "0");
+      } catch {}
+      // The hidden cards were occupying real height; without this the viewport
+      // lands somewhere arbitrary in the middle of the now-shorter transcript.
+      this.$nextTick(() => this.scrollToBottom(true));
+    },
+    conciseHidesToolUse(m) {
+      if (!this.conciseChat || !m || m.role !== "tool_use") return false;
+      if (m.is_error) return false;
+      if (["TodoWrite", "Task", "Agent", "ExitPlanMode"].includes(m.name)) {
+        return false;
+      }
+      if (this.isTaskTool(m)) return false;
+      return true;
+    },
     shouldHideToolResult(m) {
       if (!m) return false;
       if (m.is_error) return false;  // never hide failures
+      if (this.conciseChat) return true;
       const kind = this.toolResultKind(m);
       if (kind === "task") return true;
       const name = m.tool_name || "";
@@ -8452,6 +8493,10 @@ function portal() {
         case "ask_user_question":
           return true;
         case "tool_use": {
+          // Concise mode first: this mirrors the x-if gates in index.html, and
+          // a wrapper left visible around a body that no longer renders is the
+          // 30-40px blank-gap bug this whole method exists to prevent.
+          if (this.conciseHidesToolUse(m)) return false;
           // TodoWrite / Task|Agent / ExitPlanMode always render their own card.
           if (m.name === "TodoWrite" || m.name === "Task" || m.name === "Agent"
               || m.name === "ExitPlanMode") return true;

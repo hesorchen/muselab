@@ -281,6 +281,8 @@ window.MUSELAB_STRINGS = {
     // thinking.label / thinking.title below. Using `title` as a caption
     // wrapped to 3 lines and blew the composer settings panel past its
     // clip box.
+    "concise.label": "简洁模式",
+    "concise.title": "隐藏工具调用、改动预览与工具输出，只留对话气泡与思考块；失败的工具仍会显示。按设备记忆。",
     "effort.label": "Effort",
     "effort.title": "Effort — Anthropic 官方术语，控制推理预算与 agentic loop 深度（不译）",
     "effort.auto": "Effort · auto",
@@ -669,6 +671,8 @@ window.MUSELAB_STRINGS = {
     "rl.limited": "Rate-limited",
     "rl.overage": "Overage",
     "rl.resets": "resets in {t}",
+    "concise.label": "Concise",
+    "concise.title": "Hide tool calls, diff previews and tool output — keep the conversation and thinking blocks. Failed tools still show. Remembered per device.",
     "effort.label": "Effort",
     "effort.title": "Reasoning effort — thinking budget + agentic loop depth",
     "effort.auto": "Effort · auto",
