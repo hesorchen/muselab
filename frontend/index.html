@@ -719,8 +719,11 @@
                       :title="lang==='zh'?'新终端使用的 Profile':'Profile for the new terminal'">
                 <option value="" x-text="lang==='zh'?'普通 Shell':'Plain shell'"></option>
                 <template x-for="profile in terminalProfiles" :key="profile.id">
-                  <option :value="profile.id"
-                          x-text="profile.name + (profile.is_default ? (lang==='zh'?'（默认）':' (default)') : '')"></option>
+                  <!-- No "(default)" marker: a new terminal always opens the
+                       explicitly selected entry, and the list already starts
+                       on Plain shell — so labelling one profile "default"
+                       promised behaviour that never existed. -->
+                  <option :value="profile.id" x-text="profile.name"></option>
                 </template>
               </select>
               <button class="terminal-profile-action"
@@ -738,10 +741,6 @@
               <textarea x-model="terminalProfileEditor.command"
                         maxlength="8192" rows="3"
                         :placeholder="lang==='zh'?'启动命令，例如 npm run dev':'Startup command, e.g. npm run dev'"></textarea>
-              <label class="terminal-profile-default">
-                <input type="checkbox" x-model="terminalProfileEditor.is_default">
-                <span x-text="lang==='zh'?'设为默认 Profile':'Use as default profile'"></span>
-              </label>
               <div class="terminal-profile-editor-actions">
                 <button class="btn-danger btn-compact"
                         x-show="terminalProfileEditor.id"
@@ -2647,25 +2646,22 @@
                    x-show="m.role !== 'user'
                      && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))
                      && (
-                       (pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)
+                       (pane && pane.streaming && i === paneMsgs.length - 1)
                        || m.ts
                        || m.elapsed
                        || (m.role === 'assistant' && m.uuid)
                      )">
-                <span x-show="pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1"
+                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1"
                       class="thinking-dots">
                   <span></span><span></span><span></span>
                 </span>
-                <span x-show="pane && pane.backgroundActive && i === paneMsgs.length - 1"
-                      class="background-task-footer-label"
-                      x-text="t('chat.background_running')"></span>
                 <!-- Elapsed counter next to the streaming dots — kicks in
                      after 1s so fast replies don't flash a "0s" label.
                      Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
-                <span x-show="pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
+                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
                       class="stream-elapsed"
                       x-text="fmtStreamElapsed((pane && pane.streamElapsed) || 0)"></span>
-                <span x-show="m.ts && !(pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)"
+                <span x-show="m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
                 <!-- Total elapsed kept after done so the user can
@@ -2673,12 +2669,12 @@
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts && !(pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)"
+                <span x-show="m.elapsed && m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
                 <button class="turn-fork-btn"
                         type="button"
-                        x-show="m.role === 'assistant' && m.uuid && !(pane && (pane.streaming || pane.backgroundActive))"
+                        x-show="m.role === 'assistant' && m.uuid && !(pane && pane.streaming)"
                         :disabled="forkingSessionId === tid || isTabStreaming(tid)"
                         @click.stop="forkConversation(tid, m.uuid)"
                         :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
@@ -2745,23 +2741,6 @@
                replying (or while a compact was running). They auto-drain on
                the next done event / compact-finally / activateTab. Faded
                + dashed border distinguishes them from real user bubbles. -->
-          <div x-show="tabState[currentId] && tabState[currentId].backgroundActive"
-               class="background-task-strip"
-               role="status"
-               aria-live="polite">
-            <span class="background-task-strip-dot" aria-hidden="true"></span>
-            <span class="background-task-strip-label"
-                  x-text="((tabState[currentId] && tabState[currentId].backgroundTaskCount) || 1) > 1
-                    ? t('chat.background_running_count', {
-                        count: (tabState[currentId] && tabState[currentId].backgroundTaskCount) || 1
-                      })
-                    : t('chat.background_running')"></span>
-            <span class="background-task-strip-hint"
-                  x-text="'· ' + t('chat.background_queue_hint')"></span>
-            <span class="background-task-strip-elapsed"
-                  x-show="streamElapsed >= 1"
-                  x-text="'· ' + fmtStreamElapsed(streamElapsed)"></span>
-          </div>
           <template x-for="(q, qi) in (tabState[currentId] && tabState[currentId].pendingQueue || [])"
                     :key="q.id">
             <div class="msg user queued">
@@ -4109,6 +4088,54 @@
           </div>
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
+          </template>
+          <!-- Claude subscription (Pro/Max) quota. The SDK already reports it
+               live via RateLimitEvent and the toolbar badge consumes it; the
+               dashboard used to show only the Codex account, so a Claude-only
+               user saw no remaining quota at all. Reuses the codex-quota-*
+               classes so both cards read identically. -->
+          <div class="codex-quota-card" x-show="claudeLimitRows().length">
+            <div class="codex-quota-head">
+              <div class="codex-quota-title-group">
+                <div class="cost-block-title" x-text="t('set.cost.claude_quota')"></div>
+                <div class="codex-quota-source-row">
+                  <span x-text="t('set.cost.claude_quota_source')"></span>
+                  <span x-show="claudeLimitUpdatedText()"
+                        x-text="t('set.cost.updated', { t: claudeLimitUpdatedText() })"></span>
+                </div>
+              </div>
+            </div>
+            <div class="codex-quota-grid">
+              <template x-for="w in claudeLimitRows()" :key="w.key">
+                <div class="codex-quota-window"
+                     :class="{ warn: w.used_percent >= 75 && w.used_percent < 90,
+                               crit: w.used_percent >= 90 || w.status === 'rejected' }">
+                  <div class="codex-quota-label" x-text="rateLimitWindowLabel(w.type)"></div>
+                  <div class="codex-quota-metric">
+                    <span class="codex-quota-value"
+                          x-text="w.remaining_percent == null ? '—' : w.remaining_percent + '%'"></span>
+                    <span class="codex-quota-metric-label" x-text="t('set.cost.remaining')"></span>
+                  </div>
+                  <div class="codex-quota-track" role="progressbar"
+                       :aria-label="rateLimitWindowLabel(w.type)"
+                       aria-valuemin="0" aria-valuemax="100"
+                       :aria-valuenow="w.remaining_percent == null ? null : w.remaining_percent">
+                    <div class="codex-quota-fill"
+                         :style="`width: ${w.remaining_percent ?? 0}%`"></div>
+                  </div>
+                  <div class="codex-quota-meta">
+                    <span x-text="w.used_percent === 0
+                                   ? t('set.cost.unused')
+                                   : t('set.cost.used_value', { n: w.used_percent ?? '—' })"></span>
+                    <span x-show="w.resets_at"
+                          x-text="t('rl.resets', { t: rateLimitResetText(w.resets_at) })"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+          <template x-if="!claudeLimitRows().length">
+            <div class="settings-hint" x-text="t('set.cost.claude_quota_empty')"></div>
           </template>
           <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at">
             <div class="codex-quota-head">

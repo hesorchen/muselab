@@ -58,6 +58,203 @@ def _touch_tap(page: Page, x: float, y: float) -> None:
     client.detach()
 
 
+def test_desktop_terminal_mouse_selection_copies_once(
+        page: Page, backend_url: str, auth_token: str):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const host = document.createElement("div");
+          document.body.appendChild(host);
+          let selectionHandler = null;
+          let disposed = 0;
+          let copies = 0;
+          const term = {
+            hasSelection: () => true,
+            getSelection: () => "selected terminal text",
+            onSelectionChange: handler => {
+              selectionHandler = handler;
+              return {dispose: () => { disposed += 1; }};
+            },
+          };
+          const realTerminal = app._terminal;
+          const realCopy = app.terminalCopy;
+          app._terminal = term;
+          app.terminalCopy = async () => { copies += 1; return true; };
+          try {
+            app._attachTerminalSelectionCopy(host, term);
+            // Changing selection without a drag that started in this terminal
+            // must not overwrite the clipboard.
+            selectionHandler();
+            document.dispatchEvent(new MouseEvent("mouseup", {
+              bubbles: true, button: 0,
+            }));
+            await Promise.resolve();
+            const beforeDrag = copies;
+
+            host.dispatchEvent(new MouseEvent("mousedown", {
+              bubbles: true, button: 0,
+            }));
+            selectionHandler();
+            document.dispatchEvent(new MouseEvent("mouseup", {
+              bubbles: true, button: 0,
+            }));
+            await Promise.resolve();
+            const afterDrag = copies;
+
+            // A later plain mouseup must not copy the old selection again.
+            document.dispatchEvent(new MouseEvent("mouseup", {
+              bubbles: true, button: 0,
+            }));
+            await Promise.resolve();
+            return {beforeDrag, afterDrag, final: copies, disposed};
+          } finally {
+            if (app._terminalSelectionCleanup) app._terminalSelectionCleanup();
+            app._terminal = realTerminal;
+            app.terminalCopy = realCopy;
+            host.remove();
+          }
+        }"""
+    )
+    assert result == {
+        "beforeDrag": 0,
+        "afterDrag": 1,
+        "final": 1,
+        "disposed": 0,
+    }
+
+
+def test_desktop_real_terminal_drag_selection_updates_clipboard(
+        browser: Browser, browser_name: str, backend_url: str, auth_token: str):
+    if browser_name != "chromium":
+        pytest.skip("clipboard permission setup is Chromium-specific")
+    context = browser.new_context(viewport={"width": 1280, "height": 800})
+    context.grant_permissions(
+        ["clipboard-read", "clipboard-write"], origin=backend_url)
+    page = context.new_page()
+    created_id = ""
+    try:
+        _login(page, backend_url, auth_token)
+        created_id = page.evaluate(
+            """async () => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const result = await app.api("/api/terminals", {
+                method: "POST",
+                headers: app.fileHdr(),
+                json: {rows: 20, cols: 80, profile_id: ""},
+              });
+              if (!result.ok) throw new Error(result.error || "create failed");
+              app.terminals = [...app.terminals, result.data];
+              await app.openTerminal(result.data.id);
+              return result.data.id;
+            }"""
+        )
+        page.wait_for_function(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              .terminalConnection === "connected" """
+        )
+        page.evaluate(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              ._terminalSend("printf '\\\\nMOUSE_COPY_SENTINEL\\\\n'\\n")"""
+        )
+        page.wait_for_function(
+            """() => {
+              const term = document.querySelector("#app")._x_dataStack[0]._terminal;
+              const buffer = term?.buffer?.active;
+              if (!buffer) return false;
+              for (let i = 0; i < buffer.length; i += 1) {
+                if (buffer.getLine(i)?.translateToString(true)
+                    === "MOUSE_COPY_SENTINEL") return true;
+              }
+              return false;
+            }"""
+        )
+        line = page.evaluate(
+            """() => {
+              const term = document.querySelector("#app")._x_dataStack[0]._terminal;
+              const buffer = term.buffer.active;
+              let target = -1;
+              for (let i = 0; i < buffer.length; i += 1) {
+                if (buffer.getLine(i)?.translateToString(true)
+                    === "MOUSE_COPY_SENTINEL") target = i;
+              }
+              return {
+                row: target - buffer.viewportY,
+                rows: term.rows,
+                cols: term.cols,
+              };
+            }"""
+        )
+        screen = page.locator(".terminal-host .xterm-screen")
+        box = screen.bounding_box()
+        assert box is not None
+        assert 0 <= line["row"] < line["rows"]
+        cell_w = box["width"] / line["cols"]
+        cell_h = box["height"] / line["rows"]
+        y = box["y"] + (line["row"] + 0.5) * cell_h
+        start_x = box["x"] + 0.35 * cell_w
+        end_x = box["x"] + 19.4 * cell_w
+        page.mouse.move(start_x, y)
+        page.mouse.down()
+        page.mouse.move(end_x, y, steps=12)
+        page.mouse.up()
+        page.wait_for_function(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              ._terminal?.getSelection().includes("MOUSE_COPY_SENTINEL") """
+        )
+        page.wait_for_function(
+            """async () => (await navigator.clipboard.readText())
+              .includes("MOUSE_COPY_SENTINEL") """
+        )
+
+        # Ctrl+Shift+V must stay on xterm's trusted native paste-event path.
+        # Replacing it with navigator.clipboard.readText breaks LAN HTTP
+        # deployments where the async Clipboard API is unavailable.
+        page.evaluate(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              app.__nativePasteOutbound = [];
+              const send = app._terminalSend.bind(app);
+              app._terminalSend = text => {
+                app.__nativePasteOutbound.push(text);
+                send(text);
+              };
+            }"""
+        )
+        for shortcut, sentinel in (
+            ("Control+V", "CTRL_V_PASTE_SENTINEL"),
+            ("Control+Shift+V", "CTRL_SHIFT_V_PASTE_SENTINEL"),
+        ):
+            page.evaluate(
+                """async sentinel => {
+                  const app = document.querySelector("#app")._x_dataStack[0];
+                  app.__nativePasteOutbound = [];
+                  await navigator.clipboard.writeText(sentinel);
+                  app._terminal.focus();
+                }""",
+                sentinel,
+            )
+            page.keyboard.press(shortcut)
+            page.wait_for_function(
+                """sentinel => document.querySelector("#app")._x_dataStack[0]
+                  .__nativePasteOutbound.some(value => value.includes(sentinel))""",
+                arg=sentinel,
+            )
+            paste_outbound = page.evaluate(
+                """() => document.querySelector("#app")._x_dataStack[0]
+                  .__nativePasteOutbound"""
+            )
+            assert not any("\x16" in value for value in paste_outbound)
+    finally:
+        if created_id:
+            page.evaluate(
+                """id => document.querySelector("#app")?._x_dataStack?.[0]
+                  ?.closeTerminal(id, {confirm: false})""",
+                created_id,
+            )
+        context.close()
+
+
 def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
         browser: Browser, browser_name: str, backend_url: str, auth_token: str):
     if browser_name != "chromium":

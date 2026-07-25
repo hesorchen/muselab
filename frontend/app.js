@@ -350,6 +350,7 @@ function portal() {
     _terminalSuppressMouseUntil: 0,
     _terminalReconnectTimer: null,
     _terminalConnectSeq: 0,
+    _terminalSelectionCleanup: null,
     _terminalLoadPromise: null,
     TERMINAL_SCROLLBACK_MOBILE: 3000,
     TERMINAL_SCROLLBACK_DESKTOP: 10000,
@@ -5037,6 +5038,50 @@ function portal() {
 
     // Human label for a rate-limit window key. The h/d abbreviations are
     // universal; only "overage" gets a zh form.
+    // Rows for the Claude subscription quota card. `rateLimit.windows` is
+    // keyed by window type and each entry carries `utilization` (0..1) from
+    // the SDK's RateLimitEvent. The dashboard reports what is LEFT so it reads
+    // the same way as the Codex card sitting next to it.
+    claudeLimitRows() {
+      const ws = (this.rateLimit && this.rateLimit.windows) || {};
+      const order = ["five_hour", "seven_day", "seven_day_opus",
+                     "seven_day_sonnet", "overage"];
+      return Object.entries(ws)
+        .map(([key, w]) => {
+          // `utilization` is Optional on the SDK's RateLimitInfo and has been
+          // seen missing while the window type and reset time are present.
+          // The CLI's untouched payload rides along in `raw`; check it before
+          // giving up and rendering a blank percentage.
+          const raw = w.raw || {};
+          const u = typeof w.utilization === "number" ? w.utilization
+            : (typeof raw.utilization === "number" ? raw.utilization : null);
+          const used = u == null
+            ? null : Math.min(100, Math.max(0, Math.round(u * 100)));
+          return {
+            key,
+            type: w.rate_limit_type || key,
+            status: w.status || "",
+            used_percent: used,
+            remaining_percent: used == null ? null : 100 - used,
+            resets_at: w.resets_at || 0,
+          };
+        })
+        // An untyped event is bucketed under "_" server-side; it has no
+        // window to name, so it would render as a blank tile.
+        .filter(w => w.type && w.type !== "_")
+        .sort((a, b) => {
+          const ia = order.indexOf(a.type);
+          const ib = order.indexOf(b.type);
+          return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+        });
+    },
+    claudeLimitUpdatedText() {
+      const ts = this.rateLimit && this.rateLimit.updated_at;
+      if (!ts) return "";
+      return new Date(ts * 1000).toLocaleTimeString(
+        this.lang === "zh" ? "zh-CN" : "en-US",
+        { hour: "2-digit", minute: "2-digit" });
+    },
     rateLimitWindowLabel(type) {
       const m = {
         five_hour: "5h",
@@ -5668,11 +5713,14 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       return !!(this.isTabStreaming(sid)
-        || (st && (st.backgroundActive || st.compacting)));
+        || (st && st.compacting));
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
-      if (st && (st.streaming || st.backgroundActive || st.compacting)) return true;
+      // A pending SDK background task no longer blocks a prompt: the backend
+      // pump owns the session stream, so the task's completion just arrives
+      // later as its own message instead of colliding with this turn.
+      if (st && (st.streaming || st.compacting)) return true;
       const session = (this.sessions || []).find(s => s.id === sid);
       if (!session || !session.active) return false;
       // session.active is a polled cache and can remain true for one response
@@ -5692,6 +5740,11 @@ function portal() {
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
+        // `active` is the union of "a turn is streaming" and "a background
+        // task is pending"; the response distinguishes them via `background`.
+        // Only the former blocks a prompt — keep the task card and footer
+        // alive (done above) without parking the message on the queue.
+        if (status.background) return false;
         return active;
       } catch (_) {
         return true;
@@ -14737,6 +14790,99 @@ function portal() {
         if (this.mobileTab === "preview") this.terminalManagerOpen = true;
       }));
     },
+    _attachTerminalSelectionCopy(host, term) {
+      if (this._terminalSelectionCleanup) this._terminalSelectionCleanup();
+      // Touch uses vertical gestures for scrollback and has no stable
+      // drag-selection gesture. Desktop mouse/trackpad follows the familiar
+      // terminal convention: releasing the primary button after a selection
+      // copies it once. In mouse-aware TUIs xterm only creates a selection
+      // when the user holds Shift, so application mouse input still works.
+      if (!host || !term || this._isMobileLayout()) return;
+      const connectSeq = this._terminalConnectSeq;
+      let startedHere = false;
+      let selectionChanged = false;
+      let releasedWaiting = false;
+      let settleTimer = null;
+      // Text captured at selection time. Reading it again at copy time is not
+      // safe in a full-screen TUI (Claude Code, vim, top): those repaint
+      // constantly, and a repaint can drop the selection before the button
+      // comes up — leaving nothing to copy even though the user clearly
+      // selected something.
+      let pendingText = "";
+      const copySelection = () => {
+        releasedWaiting = false;
+        clearTimeout(settleTimer);
+        settleTimer = null;
+        // Reset before copying: a later plain mouseup with no fresh drag must
+        // not push the same selection to the clipboard again.
+        startedHere = false;
+        selectionChanged = false;
+        if (connectSeq !== this._terminalConnectSeq) return;
+        let text = pendingText;
+        pendingText = "";
+        if (!text) {
+          try { text = term.getSelection ? term.getSelection() : ""; }
+          catch (_) { text = ""; }
+        }
+        if (!text) return;
+        this.terminalCopy(text);
+      };
+      const onSelection = () => {
+        if (connectSeq !== this._terminalConnectSeq) return;
+        selectionChanged = true;
+        try {
+          const t = term.getSelection ? term.getSelection() : "";
+          if (t) pendingText = t;
+        } catch (_) { /* xterm mid-teardown */ }
+        // xterm can settle the selection a tick AFTER the button came up.
+        if (releasedWaiting && startedHere) copySelection();
+      };
+      const onMouseDown = (event) => {
+        if (event.button !== 0) return;
+        startedHere = true;
+        selectionChanged = false;
+        releasedWaiting = false;
+      };
+      const onMouseUp = (event) => {
+        if (event.button !== 0) return;
+        // Only a drag that STARTED in this terminal may claim the clipboard;
+        // a selection made elsewhere on the page is not ours to copy.
+        if (!startedHere) return;
+        if (selectionChanged) {
+          copySelection();
+          return;
+        }
+        // Released before xterm reported a selection — wait briefly for it
+        // instead of dropping the copy, then give up so a plain click cannot
+        // arm the next unrelated selection change.
+        releasedWaiting = true;
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          releasedWaiting = false;
+          startedHere = false;
+          settleTimer = null;
+        }, 120);
+      };
+      const disposable = term.onSelectionChange(() => onSelection());
+      // Capture phase, deliberately. A full-screen TUI turns on xterm's mouse
+      // tracking, and xterm then consumes mousedown to forward it to the
+      // application — a bubbling listener on the host never sees it, so the
+      // drag looks like it started somewhere else and the copy is skipped.
+      // Capture runs on the way down, before anything can stop it.
+      host.addEventListener("mousedown", onMouseDown, true);
+      document.addEventListener("mouseup", onMouseUp, true);
+      this._terminalSelectionCleanup = () => {
+        host.removeEventListener("mousedown", onMouseDown, true);
+        document.removeEventListener("mouseup", onMouseUp, true);
+        clearTimeout(settleTimer);
+        settleTimer = null;
+        try {
+          if (disposable && disposable.dispose) disposable.dispose();
+        } catch (_) { /* xterm already torn down */ }
+        this._terminalSelectionCleanup = null;
+      };
+    },
+
     _attachTerminalTouchScroll(host, term) {
       if (!host || !term || !this._isMobileLayout()) return;
       if (this._terminalTouchCleanup) this._terminalTouchCleanup();
@@ -14877,6 +15023,7 @@ function portal() {
         this._terminal = term;
         this._terminalFit = fit;
         this._attachTerminalTouchScroll(host, term);
+        this._attachTerminalSelectionCopy(host, term);
         let replayActive = false;
         let replayWritesPending = 0;
         const sendSize = () => {
@@ -14911,6 +15058,9 @@ function portal() {
             return false;
           }
           if (paste) {
+            // Stop xterm from encoding Ctrl+V as \x16 — we read the clipboard
+            // ourselves and send the text, so the raw control byte must never
+            // reach the shell.
             this.terminalPaste();
             return false;
           }
@@ -14995,6 +15145,7 @@ function portal() {
       if (this._terminalResizeObserver) this._terminalResizeObserver.disconnect();
       this._terminalResizeObserver = null;
       if (this._terminalTouchCleanup) this._terminalTouchCleanup();
+      if (this._terminalSelectionCleanup) this._terminalSelectionCleanup();
       this._terminalSuppressMouseUntil = 0;
       const socket = this._terminalSocket;
       this._terminalSocket = null;
@@ -15009,16 +15160,51 @@ function portal() {
       this._terminalFit = null;
       this.terminalConnection = "idle";
     },
-    terminalCopy() {
-      const text = this._terminal && this._terminal.getSelection();
-      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    // `explicitText` lets the selection-copy handler pass the text it captured
+    // at selection time; a repainting TUI may have cleared the live selection
+    // by the time we get here.
+    async terminalCopy(explicitText = "") {
+      const text = explicitText
+        || (this._terminal && this._terminal.getSelection()) || "";
+      if (!text) return false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (_) { /* fall through to the legacy path */ }
+      }
+      return this._terminalLegacyCopy(text);
+    },
+    _terminalLegacyCopy(text) {
+      // navigator.clipboard only exists in a secure context, and reaching
+      // muselab over plain http on the LAN is a normal setup — so silently
+      // dropping the copy there would make selection-copy look broken on
+      // exactly the deployments that use the terminal most.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return !!ok;
+      } catch (_) {
+        return false;
+      }
     },
     async terminalPaste() {
       try {
         const text = await navigator.clipboard.readText();
         if (text) this._terminalSend(text);
       } catch (_) {
-        this.toast(this.lang === "zh" ? "无法读取剪贴板" : "Could not read clipboard", "warn");
+        this.toast(this.lang === "zh"
+          ? "剪贴板访问受限，请按 Ctrl+V 或 Ctrl+Shift+V"
+          : "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V",
+          "warn");
       }
     },
 
@@ -20065,16 +20251,34 @@ function portal() {
         const _now = Date.now();
         const _elapsed = streamState.streamElapsed || 0;
         const turnMessages = this._allPaneMessages(streamState);
+        const _stamp = (m) => {
+          m.ts = _now;
+          if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+        };
+        // Tail-most muse-side message of THIS turn, used when the turn has no
+        // assistant text bubble of its own to hang the footer on.
+        let tailCandidate = null;
+        let stamped = false;
         for (let k = turnMessages.length - 1; k >= 0; k--) {
           const m = turnMessages[k];
           if (m.role === "user") break;          // entered the previous turn
+          if (tailCandidate === null) tailCandidate = m;
           // Skip tool blocks / standalone thinking; they're not the
           // "reply" the user reads time off.
           if (m.role !== "assistant") continue;
-          if (!m.ts) m.ts = _now;                // found the tail text bubble
-          if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+          // An assistant bubble that already carries a stamp belongs to an
+          // earlier, finished turn — we've walked out of this one.
+          if (m.ts) break;
+          _stamp(m);                              // found the tail text bubble
+          stamped = true;
           break;                                  // stop after the first one (most recent)
         }
+        // Turns whose visible tail is not an assistant text bubble — notably a
+        // background-task continuation that only reported the task result —
+        // used to leave the footer with nothing in it: the walk above found
+        // the PREVIOUS turn's already-stamped bubble and bailed, so this
+        // turn's tail never got a time. Stamp it directly.
+        if (!stamped && tailCandidate && !tailCandidate.ts) _stamp(tailCandidate);
         if (this.currentId === streamSid) {
           this.streaming = false;
           this.es = null;
