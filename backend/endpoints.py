@@ -1038,6 +1038,7 @@ def provider_meta() -> list[dict]:
 # Pretty labels for Claude (Pro OAuth) models — the IDs themselves are ugly
 # (e.g. "claude-haiku-4-5-20251001") so we display human-friendly names.
 CLAUDE_LABELS: dict[str, str] = {
+    "claude-opus-5":                "Opus 5",
     "claude-opus-4-8":              "Opus 4.8",
     "claude-opus-4-7":              "Opus 4.7",
     "claude-sonnet-4-6":            "Sonnet 4.6",
@@ -1050,6 +1051,7 @@ CLAUDE_LABELS: dict[str, str] = {
 ANTHROPIC_DEFAULT_MODELS: tuple[str, ...] = (
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
+    "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
 )

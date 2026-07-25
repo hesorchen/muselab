@@ -769,7 +769,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "this.isTabStreaming(this.currentId)" in app
 
 
-def test_background_task_gap_keeps_composer_busy_and_footer_running():
+def test_background_task_gap_keeps_footer_running_without_blocking_composer():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -777,16 +777,27 @@ def test_background_task_gap_keeps_composer_busy_and_footer_running():
 
     assert "backgroundActive: false" in app
     assert "backgroundTaskCount: 0" in app
-    assert "st.backgroundActive || st.compacting" in app
-    assert "st.streaming || st.backgroundActive || st.compacting" in app
+    # A pending background task keeps the card + footer alive but must NOT
+    # make the composer busy: the backend pump owns the session stream now, so
+    # the task's completion arrives as its own message instead of colliding
+    # with a new turn. Blocking here parked every follow-up on the queue.
+    assert "|| (st && st.compacting));" in app
+    assert "if (st && (st.streaming || st.compacting)) return true;" in app
+    assert "if (status.background) return false;" in app
     assert "d.background && d.attachable === false" in app
     assert "background_tasks_pending" in app
     assert "_stopTimer(backgroundPending > 0)" in app
-    assert "pane.streaming || pane.backgroundActive" in html
-    assert "class=\"background-task-strip\"" in html
+    # The turn footer must key off a REAL streaming turn. It used to also
+    # suppress itself on backgroundActive, which hid the completion timestamp
+    # of every turn that finished while a background task was still pending.
+    assert "pane && pane.streaming && i === paneMsgs.length - 1" in html
+    assert "pane.streaming || pane.backgroundActive" not in html
+    # The "background task running · messages will queue" strip is gone: it
+    # told the user they could not keep talking, which is no longer true.
+    assert "background-task-strip" not in html
+    assert "background-task-strip" not in css
     assert "isTabRunning(tid)" in html
     assert "isTabBackgroundActive(tid)" in html
-    assert "background-task-strip" in css
     assert '"chat.background_running": "后台任务运行中"' in i18n
     assert "if (streamState.es === es) streamState.es = null" in app
     assert "d.background && d.attachable === false" in app
@@ -1055,6 +1066,15 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert 'message.type === "replay_end"' in app
     assert "if (this._terminal) this._terminal.focus()" in app
     assert "_attachTerminalTouchScroll(host, term)" in app
+    assert "_attachTerminalSelectionCopy(host, term)" in app
+    assert 'term.onSelectionChange(() =>' in app
+    assert 'host.addEventListener("mousedown", onMouseDown, true)' in app
+    assert 'document.addEventListener("mouseup", onMouseUp, true)' in app
+    assert "if (this._terminalSelectionCleanup) this._terminalSelectionCleanup()" in app
+    assert "_terminalLegacyCopy(text)" in app
+    assert 'document.execCommand("copy")' in app
+    assert "Stop xterm from encoding Ctrl+V as \\x16" in app
+    assert "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V" in app
     assert 'host.addEventListener("touchmove", onMove, captureActive)' in app
     assert "capture: true, passive: false" in app
     assert "if (event.cancelable) event.preventDefault()" in app

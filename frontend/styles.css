@@ -6213,51 +6213,6 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   box-sizing: border-box;
 }
 
-/* Explicit detached-task state between the main ResultMessage and the SDK's
-   later task settlement. The old UI left only the generic three-dot footer,
-   which looked indistinguishable from a stuck reply. */
-.background-task-strip {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  margin: 8px 4px;
-  padding: 8px 12px;
-  border: 1px solid color-mix(in srgb, var(--c-warn) 38%, transparent);
-  border-radius: var(--r-md);
-  background: color-mix(in srgb, var(--c-warn) 10%, transparent);
-  color: var(--c-fg-1);
-  font-size: var(--fs-sm);
-}
-.background-task-strip-dot {
-  width: 8px;
-  height: 8px;
-  flex: 0 0 8px;
-  border-radius: 50%;
-  background: var(--c-warn);
-  animation: tab-pulse 1.4s ease-in-out infinite;
-}
-.background-task-strip-label {
-  color: var(--c-fg-0);
-  font-weight: var(--fw-medium);
-}
-.background-task-strip-hint { color: var(--c-fg-3); }
-.background-task-strip-elapsed {
-  margin-left: auto;
-  color: var(--c-fg-3);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  white-space: nowrap;
-}
-@media (max-width: 480px) {
-  .background-task-strip {
-    margin: 6px 2px;
-    padding: 7px 10px;
-    gap: var(--sp-1);
-    font-size: var(--fs-xs);
-  }
-  .background-task-strip-hint { display: none; }
-}
-
 /* Queued message bubbles — user messages waiting to dispatch after the
    current turn finishes. Same accent fill + white text as a sent
    bubble (guarantees contrast on both light and dark themes); the

@@ -350,6 +350,7 @@ function portal() {
     _terminalSuppressMouseUntil: 0,
     _terminalReconnectTimer: null,
     _terminalConnectSeq: 0,
+    _terminalSelectionCleanup: null,
     _terminalLoadPromise: null,
     TERMINAL_SCROLLBACK_MOBILE: 3000,
     TERMINAL_SCROLLBACK_DESKTOP: 10000,
@@ -758,6 +759,15 @@ function portal() {
     codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
+    // False until /api/chat/providers has answered at least once. The
+    // "no model available" notice keys off an EMPTY availableModels, which is
+    // also its initial value — so on every page load it rendered for the
+    // duration of that fetch and then vanished, telling a fully-configured
+    // user to go configure a provider. Only a list we have actually seen can
+    // prove the absence of models; a list we have not fetched yet proves
+    // nothing. Deliberately stays false if the fetch fails: an unreachable
+    // backend is not evidence of a missing provider either.
+    _modelsLoaded: false,
     atBottom: true,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
     // onChatScroll uses it to disengage auto-follow ONLY on user-driven
@@ -4920,6 +4930,7 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           this.availableModels = d.models || [];
+          this._modelsLoaded = true;
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           if (d.default_permission) {
             this.defaultPermission = d.default_permission;
@@ -5668,11 +5679,14 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       return !!(this.isTabStreaming(sid)
-        || (st && (st.backgroundActive || st.compacting)));
+        || (st && st.compacting));
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
-      if (st && (st.streaming || st.backgroundActive || st.compacting)) return true;
+      // A pending SDK background task no longer blocks a prompt: the backend
+      // pump owns the session stream, so the task's completion just arrives
+      // later as its own message instead of colliding with this turn.
+      if (st && (st.streaming || st.compacting)) return true;
       const session = (this.sessions || []).find(s => s.id === sid);
       if (!session || !session.active) return false;
       // session.active is a polled cache and can remain true for one response
@@ -5692,6 +5706,11 @@ function portal() {
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
+        // `active` is the union of "a turn is streaming" and "a background
+        // task is pending"; the response distinguishes them via `background`.
+        // Only the former blocks a prompt — keep the task card and footer
+        // alive (done above) without parking the message on the queue.
+        if (status.background) return false;
         return active;
       } catch (_) {
         return true;
@@ -12044,6 +12063,7 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           this.availableModels = d.models || [];
+          this._modelsLoaded = true;
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           if (d.default_permission) {
             this.defaultPermission = d.default_permission;
@@ -14737,6 +14757,99 @@ function portal() {
         if (this.mobileTab === "preview") this.terminalManagerOpen = true;
       }));
     },
+    _attachTerminalSelectionCopy(host, term) {
+      if (this._terminalSelectionCleanup) this._terminalSelectionCleanup();
+      // Touch uses vertical gestures for scrollback and has no stable
+      // drag-selection gesture. Desktop mouse/trackpad follows the familiar
+      // terminal convention: releasing the primary button after a selection
+      // copies it once. In mouse-aware TUIs xterm only creates a selection
+      // when the user holds Shift, so application mouse input still works.
+      if (!host || !term || this._isMobileLayout()) return;
+      const connectSeq = this._terminalConnectSeq;
+      let startedHere = false;
+      let selectionChanged = false;
+      let releasedWaiting = false;
+      let settleTimer = null;
+      // Text captured at selection time. Reading it again at copy time is not
+      // safe in a full-screen TUI (Claude Code, vim, top): those repaint
+      // constantly, and a repaint can drop the selection before the button
+      // comes up — leaving nothing to copy even though the user clearly
+      // selected something.
+      let pendingText = "";
+      const copySelection = () => {
+        releasedWaiting = false;
+        clearTimeout(settleTimer);
+        settleTimer = null;
+        // Reset before copying: a later plain mouseup with no fresh drag must
+        // not push the same selection to the clipboard again.
+        startedHere = false;
+        selectionChanged = false;
+        if (connectSeq !== this._terminalConnectSeq) return;
+        let text = pendingText;
+        pendingText = "";
+        if (!text) {
+          try { text = term.getSelection ? term.getSelection() : ""; }
+          catch (_) { text = ""; }
+        }
+        if (!text) return;
+        this.terminalCopy(text);
+      };
+      const onSelection = () => {
+        if (connectSeq !== this._terminalConnectSeq) return;
+        selectionChanged = true;
+        try {
+          const t = term.getSelection ? term.getSelection() : "";
+          if (t) pendingText = t;
+        } catch (_) { /* xterm mid-teardown */ }
+        // xterm can settle the selection a tick AFTER the button came up.
+        if (releasedWaiting && startedHere) copySelection();
+      };
+      const onMouseDown = (event) => {
+        if (event.button !== 0) return;
+        startedHere = true;
+        selectionChanged = false;
+        releasedWaiting = false;
+      };
+      const onMouseUp = (event) => {
+        if (event.button !== 0) return;
+        // Only a drag that STARTED in this terminal may claim the clipboard;
+        // a selection made elsewhere on the page is not ours to copy.
+        if (!startedHere) return;
+        if (selectionChanged) {
+          copySelection();
+          return;
+        }
+        // Released before xterm reported a selection — wait briefly for it
+        // instead of dropping the copy, then give up so a plain click cannot
+        // arm the next unrelated selection change.
+        releasedWaiting = true;
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          releasedWaiting = false;
+          startedHere = false;
+          settleTimer = null;
+        }, 120);
+      };
+      const disposable = term.onSelectionChange(() => onSelection());
+      // Capture phase, deliberately. A full-screen TUI turns on xterm's mouse
+      // tracking, and xterm then consumes mousedown to forward it to the
+      // application — a bubbling listener on the host never sees it, so the
+      // drag looks like it started somewhere else and the copy is skipped.
+      // Capture runs on the way down, before anything can stop it.
+      host.addEventListener("mousedown", onMouseDown, true);
+      document.addEventListener("mouseup", onMouseUp, true);
+      this._terminalSelectionCleanup = () => {
+        host.removeEventListener("mousedown", onMouseDown, true);
+        document.removeEventListener("mouseup", onMouseUp, true);
+        clearTimeout(settleTimer);
+        settleTimer = null;
+        try {
+          if (disposable && disposable.dispose) disposable.dispose();
+        } catch (_) { /* xterm already torn down */ }
+        this._terminalSelectionCleanup = null;
+      };
+    },
+
     _attachTerminalTouchScroll(host, term) {
       if (!host || !term || !this._isMobileLayout()) return;
       if (this._terminalTouchCleanup) this._terminalTouchCleanup();
@@ -14745,8 +14858,15 @@ function portal() {
       let startY = null;
       let remainder = 0;
       let claimed = false;
+      // Pixels of finger travel per scrollback line. Dividing the real line
+      // height by this doubles how far a swipe carries — one text line per
+      // half a line's worth of movement. The floor scales with it so the
+      // clamp keeps meaning the same thing.
+      const SCROLL_SENSITIVITY = 2;
       const linePx = Math.max(
-        10, Number(term.options.fontSize || 13) * Number(term.options.lineHeight || 1.2));
+        10 / SCROLL_SENSITIVITY,
+        Number(term.options.fontSize || 13)
+          * Number(term.options.lineHeight || 1.2) / SCROLL_SENSITIVITY);
       const reset = () => {
         lastY = null;
         startX = null;
@@ -14847,6 +14967,13 @@ function portal() {
             .getPropertyValue("--font-mono").trim() || "monospace",
           fontSize: this._isMobileLayout() ? 13 : 14,
           lineHeight: 1.2,
+          // Mouse-wheel scrollback speed. The touch path has its own handler
+          // (_attachTerminalTouchScroll, which bails on desktop), so tuning
+          // sensitivity there did nothing for a mouse — xterm owns the wheel.
+          // 2 lines per notch matches the doubled touch sensitivity; Alt+wheel
+          // keeps its proportional fast multiplier.
+          scrollSensitivity: 2,
+          fastScrollSensitivity: 10,
           // ANSI 16 colors are curated above; this also protects arbitrary
           // 256-color / truecolor foregrounds emitted by third-party TUIs.
           // xterm caches adjusted pairs, keeping the mobile rendering cost low.
@@ -14877,6 +15004,7 @@ function portal() {
         this._terminal = term;
         this._terminalFit = fit;
         this._attachTerminalTouchScroll(host, term);
+        this._attachTerminalSelectionCopy(host, term);
         let replayActive = false;
         let replayWritesPending = 0;
         const sendSize = () => {
@@ -14902,15 +15030,29 @@ function portal() {
         term.attachCustomKeyEventHandler(event => {
           if (event.type !== "keydown") return true;
           const key = String(event.key || "").toLowerCase();
+          // Copy deliberately does NOT take plain Ctrl+C: that is SIGINT, the
+          // single most important key in a terminal. Cmd+C / Ctrl+Shift+C only.
           const copy = key === "c"
             && (event.metaKey || (event.ctrlKey && event.shiftKey));
-          const paste = key === "v"
-            && (event.metaKey || (event.ctrlKey && event.shiftKey));
+          // Paste takes plain Ctrl+V as well as Cmd+V / Ctrl+Shift+V. Leaving
+          // plain Ctrl+V to xterm encoded it as \x16 (readline's literal-next)
+          // and sent that to the program instead of the clipboard text, which
+          // full-screen TUIs surface as a bogus input error. Nothing is lost:
+          // \x16 is an obscure quoted-insert prefix, while Ctrl+V is what
+          // people actually press. altKey is excluded because AltGr layouts
+          // report Ctrl+Alt for ordinary characters.
+          const paste = key === "v" && !event.altKey
+            && (event.metaKey || event.ctrlKey);
           if (copy) {
             this.terminalCopy();
             return false;
           }
           if (paste) {
+            // Stop xterm from encoding Ctrl+V as \x16 — we read the clipboard
+            // ourselves and send the text, so the raw control byte must never
+            // reach the shell. preventDefault also keeps the browser from
+            // dropping the text into xterm's hidden helper textarea.
+            event.preventDefault();
             this.terminalPaste();
             return false;
           }
@@ -14995,6 +15137,7 @@ function portal() {
       if (this._terminalResizeObserver) this._terminalResizeObserver.disconnect();
       this._terminalResizeObserver = null;
       if (this._terminalTouchCleanup) this._terminalTouchCleanup();
+      if (this._terminalSelectionCleanup) this._terminalSelectionCleanup();
       this._terminalSuppressMouseUntil = 0;
       const socket = this._terminalSocket;
       this._terminalSocket = null;
@@ -15009,16 +15152,51 @@ function portal() {
       this._terminalFit = null;
       this.terminalConnection = "idle";
     },
-    terminalCopy() {
-      const text = this._terminal && this._terminal.getSelection();
-      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    // `explicitText` lets the selection-copy handler pass the text it captured
+    // at selection time; a repainting TUI may have cleared the live selection
+    // by the time we get here.
+    async terminalCopy(explicitText = "") {
+      const text = explicitText
+        || (this._terminal && this._terminal.getSelection()) || "";
+      if (!text) return false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (_) { /* fall through to the legacy path */ }
+      }
+      return this._terminalLegacyCopy(text);
+    },
+    _terminalLegacyCopy(text) {
+      // navigator.clipboard only exists in a secure context, and reaching
+      // muselab over plain http on the LAN is a normal setup — so silently
+      // dropping the copy there would make selection-copy look broken on
+      // exactly the deployments that use the terminal most.
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        return !!ok;
+      } catch (_) {
+        return false;
+      }
     },
     async terminalPaste() {
       try {
         const text = await navigator.clipboard.readText();
         if (text) this._terminalSend(text);
       } catch (_) {
-        this.toast(this.lang === "zh" ? "无法读取剪贴板" : "Could not read clipboard", "warn");
+        this.toast(this.lang === "zh"
+          ? "剪贴板访问受限，请按 Ctrl+V 或 Ctrl+Shift+V"
+          : "Clipboard access is restricted; press Ctrl+V or Ctrl+Shift+V",
+          "warn");
       }
     },
 
@@ -20065,16 +20243,34 @@ function portal() {
         const _now = Date.now();
         const _elapsed = streamState.streamElapsed || 0;
         const turnMessages = this._allPaneMessages(streamState);
+        const _stamp = (m) => {
+          m.ts = _now;
+          if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+        };
+        // Tail-most muse-side message of THIS turn, used when the turn has no
+        // assistant text bubble of its own to hang the footer on.
+        let tailCandidate = null;
+        let stamped = false;
         for (let k = turnMessages.length - 1; k >= 0; k--) {
           const m = turnMessages[k];
           if (m.role === "user") break;          // entered the previous turn
+          if (tailCandidate === null) tailCandidate = m;
           // Skip tool blocks / standalone thinking; they're not the
           // "reply" the user reads time off.
           if (m.role !== "assistant") continue;
-          if (!m.ts) m.ts = _now;                // found the tail text bubble
-          if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+          // An assistant bubble that already carries a stamp belongs to an
+          // earlier, finished turn — we've walked out of this one.
+          if (m.ts) break;
+          _stamp(m);                              // found the tail text bubble
+          stamped = true;
           break;                                  // stop after the first one (most recent)
         }
+        // Turns whose visible tail is not an assistant text bubble — notably a
+        // background-task continuation that only reported the task result —
+        // used to leave the footer with nothing in it: the walk above found
+        // the PREVIOUS turn's already-stamped bubble and bailed, so this
+        // turn's tail never got a time. Stamp it directly.
+        if (!stamped && tailCandidate && !tailCandidate.ts) _stamp(tailCandidate);
         if (this.currentId === streamSid) {
           this.streaming = false;
           this.es = null;
@@ -20086,7 +20282,17 @@ function portal() {
             // Desktop only — same reason as the post-send refocus above:
             // a mobile programmatic focus re-arms body.kb-open without a
             // paired blur and leaves a blank band under the composer.
-            if (ta && !ta.disabled && !this._isMobileLayout()) ta.focus();
+            if (!ta || ta.disabled || this._isMobileLayout()) return;
+            // Never STEAL focus. A turn can take minutes, and the composer is
+            // disabled meanwhile — so the user has usually moved on: typing in
+            // the terminal, editing a file, using the tree search. Yanking the
+            // caret back mid-keystroke sends their input to the wrong place.
+            // Reclaim it only when nothing else holds it: disabling the
+            // textarea drops focus to <body>, which is the case this refocus
+            // was written for.
+            const ae = document.activeElement;
+            if (ae && ae !== document.body && ae !== ta) return;
+            ta.focus();
           });
         }
       };

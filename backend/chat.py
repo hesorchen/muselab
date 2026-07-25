@@ -1,6 +1,7 @@
 import os
 import threading
 import base64
+from collections import deque
 from contextlib import contextmanager, suppress
 import hashlib
 import json
@@ -367,10 +368,18 @@ _clients: dict[_ClientKey, ClaudeSDKClient] = {}
 _client_permission: dict[_ClientKey, str] = {}
 
 
-_BROADCAST_REPLAY_MAX_EVENTS = env_int(
-    "MUSELAB_STREAM_REPLAY_MAX_EVENTS", 512, min_value=8)
-_BROADCAST_REPLAY_MAX_BYTES = env_int(
-    "MUSELAB_STREAM_REPLAY_MAX_BYTES", 2 * 1024 * 1024, min_value=1024)
+# Cap on token deltas queued for a single attached subscriber. Deltas are the
+# ephemeral presentation channel (see _TurnSubscriber): they are never spooled,
+# so this bounds the only per-subscriber memory that exists. A client that
+# backs up past this is resynced rather than served a truncated bubble.
+#
+# This replaces the old MUSELAB_STREAM_REPLAY_MAX_EVENTS / _MAX_BYTES replay
+# window. That window existed because every token delta was written to the
+# replay spool, so a normal reply blew past 512 events in seconds and mobile
+# reconnects were told to give up on the live stream. The spool now records one
+# coalesced event per message instead, so there is no replay length to bound.
+_BROADCAST_LIVE_DELTA_MAX = env_int(
+    "MUSELAB_STREAM_LIVE_DELTA_MAX", 4096, min_value=64)
 _BROADCAST_SUBSCRIBER_MAX_EVENTS = env_int(
     "MUSELAB_STREAM_SUBSCRIBER_MAX_EVENTS", 256, min_value=8)
 _BROADCAST_SUBSCRIBER_MAX_BYTES = env_int(
@@ -409,14 +418,24 @@ class _ReplaySpool:
         self.path = Path(name)
         self._writer = os.fdopen(fd, "ab", buffering=0)
         self._count = 0
+        self._bytes = 0
         self._closed = False
 
     def append(self, event: dict) -> None:
         if self._closed:
             raise RuntimeError("replay spool is closed")
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
-        self._writer.write(payload.encode("utf-8") + b"\n")
+        blob = payload.encode("utf-8") + b"\n"
+        self._writer.write(blob)
         self._count += 1
+        self._bytes += len(blob)
+
+    def size(self) -> int:
+        """Bytes written so far. A subscriber records this at attach time to
+        tell "history I must replay" from "events that happened while I was
+        already attached" — the two need different handling for coalesced
+        text (see _TurnSubscriber._skip_from)."""
+        return self._bytes
 
     def open_reader(self):
         return self.path.open("rb")
@@ -453,11 +472,37 @@ class _ReplaySpool:
 
 
 class _TurnSubscriber:
-    """Independent cursor over the broadcast's append-only replay spool."""
+    """Independent cursor over the broadcast's replay spool, plus a small
+    queue for live token deltas.
 
-    def __init__(self, replay=None, *, resync_reason: str = ""):
+    Two channels, because the SDK models two different things (see the
+    ``publish``/``_flush_compact_text`` comments on TurnBroadcast):
+
+      * The spool is the RECORD: one coalesced text/thinking event per
+        assistant message, plus every tool_use / tool_result / done. It is
+        replayed in full to anyone who attaches, and its length is
+        proportional to the number of SDK messages in the turn.
+      * ``_live_q`` is PRESENTATION: raw ``StreamEvent`` deltas, delivered
+        only to subscribers attached at the moment they were produced, and
+        never persisted.
+
+    A subscriber that was already attached when a message streamed has seen
+    that message as deltas, so it must NOT also receive the coalesced event
+    the spool records for it. ``_skip_from`` is the spool byte offset at
+    attach time and draws exactly that line: coalesced events at or after it
+    are ours-already-seen and get skipped; everything before it is history we
+    are replaying and gets emitted.
+    """
+
+    def __init__(self, replay=None, *, resync_reason: str = "",
+                 skip_from: int = 0):
         self._replay = replay
         self._resync_reason = resync_reason
+        self._skip_from = skip_from
+        # Deltas produced while attached. Bounded: a stalled HTTP connection
+        # must not grow this without limit. Overflow degrades to a resync
+        # rather than silently dropping text (see publish_live()).
+        self._live_q: deque[dict] = deque()
         self._wake = asyncio.Event()
         self._done = False
 
@@ -471,29 +516,70 @@ class _TurnSubscriber:
         if self._replay is None:
             return None
         while True:
-            line = self._replay.readline()
-            if line:
-                return json.loads(line)
+            event = self._next_spool_event()
+            if event is not None:
+                return event
+            if self._live_q:
+                return self._live_q.popleft()
             if self._done:
                 self.close_reader()
                 return None
             self._wake.clear()
             # Close the clear/append race: publish() may have written between
             # the first EOF read and clear(). Recheck before sleeping.
-            line = self._replay.readline()
-            if line:
-                return json.loads(line)
+            event = self._next_spool_event()
+            if event is not None:
+                return event
+            if self._live_q:
+                return self._live_q.popleft()
             if self._done:
                 self.close_reader()
                 return None
             await self._wake.wait()
 
+    def _next_spool_event(self):
+        """Next spool line this subscriber should actually emit, or None when
+        the spool is exhausted. Drops coalesced text that this subscriber
+        already received as live deltas."""
+        while True:
+            offset = self._replay.tell()
+            line = self._replay.readline()
+            if not line:
+                return None
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            coalesced = event.pop("_coalesced", False)
+            if coalesced and offset >= self._skip_from:
+                # Streamed to us live, token by token — emitting the coalesced
+                # form too would duplicate the whole message.
+                continue
+            return event
+
     def qsize(self) -> int:
-        return 0
+        return len(self._live_q)
 
     def publish(self, event: dict) -> bool:
+        """Wake this subscriber for a newly-appended spool event."""
         if self._done:
             return False
+        self._wake.set()
+        return True
+
+    def publish_live(self, event: dict) -> bool:
+        """Deliver an ephemeral delta that is deliberately never spooled."""
+        if self._done:
+            return False
+        if len(self._live_q) >= _BROADCAST_LIVE_DELTA_MAX:
+            # This client is too far behind to keep up with the token stream.
+            # Deltas are best-effort by design, but we have already emitted
+            # some of this message and skipped its coalesced form, so silently
+            # dropping the rest would leave a truncated bubble. Resync instead:
+            # the client reloads canonical history and comes back consistent.
+            self.resync("live_backlog")
+            return False
+        self._live_q.append(event)
         self._wake.set()
         return True
 
@@ -533,8 +619,8 @@ class TurnBroadcast:
         session_id: str,
         model: str = "",
         *,
-        replay_max_events: int = _BROADCAST_REPLAY_MAX_EVENTS,
-        replay_max_bytes: int = _BROADCAST_REPLAY_MAX_BYTES,
+        replay_max_events: int = 0,
+        replay_max_bytes: int = 0,
         subscriber_max_events: int = _BROADCAST_SUBSCRIBER_MAX_EVENTS,
         subscriber_max_bytes: int = _BROADCAST_SUBSCRIBER_MAX_BYTES,
     ):
@@ -542,11 +628,12 @@ class TurnBroadcast:
         self.model = model
         self.events = _ReplaySpool()
         self.subscribers: set[_TurnSubscriber] = set()
-        self.replay_max_events = replay_max_events
-        self.replay_max_bytes = replay_max_bytes
-        # Legacy constructor arguments remain accepted for callers/tests. The
-        # shared spool no longer has a per-subscriber queue to size.
-        _ = subscriber_max_events, subscriber_max_bytes
+        # Legacy constructor arguments remain accepted for callers/tests.
+        # replay_max_* used to bound a spool that recorded every token delta;
+        # the spool now records one coalesced event per message, so there is
+        # nothing to truncate and no subscriber-side queue to size.
+        _ = (replay_max_events, replay_max_bytes,
+             subscriber_max_events, subscriber_max_bytes)
         self._compact_kind: str | None = None
         self._compact_parts: list[str] = []
         self._compact_chars = 0
@@ -606,10 +693,22 @@ class TurnBroadcast:
         self.task: "asyncio.Task | None" = None
 
     def publish(self, event: dict) -> None:
-        # Live readers tail the same append-only spool as reconnect readers, so
-        # no per-subscriber event queue can grow in memory. Flush each text
-        # delta while readers are attached to preserve the live token cadence;
-        # detached/headless turns batch text into 64 KiB replay chunks.
+        """Route one SSE event to the record channel, the live channel, or both.
+
+        The Claude Agent SDK draws this line for us. ``StreamEvent`` carries
+        "the raw Anthropic API stream event" and is opt-in via
+        ``include_partial_messages`` (default False) — a presentation detail.
+        ``AssistantMessage`` / ``UserMessage`` / ``ResultMessage`` are the
+        modeled, complete units — the record. We mirror that split:
+
+          * text/thinking deltas  → live subscribers only, accumulated here
+            and written to the spool once, coalesced, at the message boundary.
+          * everything else       → spool (and therefore every live tail too).
+
+        The previous implementation appended each delta to the spool whenever
+        any subscriber was attached, which made replay length proportional to
+        token count rather than message count.
+        """
         current_text = _stream_text_payload(event)
         if current_text is not None:
             kind, text = current_text
@@ -619,9 +718,19 @@ class TurnBroadcast:
                 self._compact_kind = kind
             self._compact_parts.append(text)
             self._compact_chars += len(text)
-            if self.subscribers or self._compact_chars >= 64 * 1024:
+            for subscriber in tuple(self.subscribers):
+                if not subscriber.publish_live(event):
+                    self.subscribers.discard(subscriber)
+            # Bound the accumulator so a very long message (or a headless turn
+            # with nobody attached) cannot hold unbounded text in memory. A
+            # mid-message flush just splits the record into two coalesced
+            # events; consecutive text events rebuild into one bubble on both
+            # the replay path and the frontend, so nothing downstream changes.
+            if self._compact_chars >= 64 * 1024:
                 self._flush_compact_text()
             return
+        # A non-delta event closes whatever message was streaming: write its
+        # coalesced form first so the spool stays in true chronological order.
         self._flush_compact_text()
         self._append_replay(event)
 
@@ -645,11 +754,19 @@ class TurnBroadcast:
                 self.subscribers.discard(subscriber)
 
     def _flush_compact_text(self) -> None:
+        """Write the message that just finished streaming as ONE spool event.
+
+        Marked ``_coalesced`` so subscribers that already received this message
+        as live deltas skip it instead of rendering the text twice; subscribers
+        replaying history emit it normally. The marker is stripped before the
+        event leaves _TurnSubscriber, so it never reaches the wire.
+        """
         if self._compact_kind is None:
             return
         event = {
             "event": self._compact_kind,
             "data": json.dumps({"text": "".join(self._compact_parts)}, ensure_ascii=False),
+            "_coalesced": True,
         }
         self._compact_kind = None
         self._compact_parts = []
@@ -687,18 +804,26 @@ class TurnBroadcast:
         self.events.close()
 
     def subscribe(self, *, mobile: bool = False) -> _TurnSubscriber:
-        # Readers tail the append-only spool directly. New events wake them, but
-        # are never copied into per-reader queues; a stalled HTTP connection uses
-        # a constant-size cursor while complete desktop replay stays available.
+        """Attach a reader. Every subscriber gets the complete turn.
+
+        Flushing first is what makes a mid-message join lossless: the half of
+        the current bubble that has streamed so far is still sitting in the
+        accumulator, so we write it to the spool now. The arriving subscriber
+        replays it as history and then picks up the remaining deltas live,
+        continuing from the right place instead of starting mid-word. Already-
+        attached subscribers skip it — its offset is at or after their own
+        attach point, and they received those tokens as deltas.
+
+        `mobile` is accepted for wire compatibility and deliberately ignored.
+        Mobile clients used to be handed a `replay_truncated` resync and no
+        live stream at all whenever the spool had grown past 512 events, which
+        a normal reply did within seconds because every token was an event.
+        There is no longer a replay length to outgrow.
+        """
+        _ = mobile
         self._flush_compact_text()
-        replay_count = len(self.events)
-        subscriber = _TurnSubscriber(self.events.open_reader())
-        if mobile and (
-            replay_count > self.replay_max_events
-            or self._replay_bytes > self.replay_max_bytes
-        ):
-            subscriber.resync("replay_truncated")
-            return subscriber
+        subscriber = _TurnSubscriber(
+            self.events.open_reader(), skip_from=self.events.size())
         if self.done:
             subscriber.close()
         else:
@@ -1063,6 +1188,11 @@ MODEL_CONTEXT_LIMITS = {
     # the SDK-reported maxTokens is persisted per-session
     # (sessions.set_session_ctx_window) and overrides this — so accounts that
     # genuinely have the 1M window auto-upgrade after their first turn.
+    # Opus 5 is a 1M-context model on paper, but this table is deliberately
+    # the conservative Pro/Max fallback (see the note above): the SDK reports
+    # the real window on the first turn and that value wins. Filling 1M here
+    # would put the meter back to reading ~5x low for subscription accounts.
+    "claude-opus-5":                200_000,
     "claude-opus-4-8":              200_000,
     "claude-opus-4-7":              200_000,
     "claude-sonnet-4-6":            200_000,
@@ -2106,6 +2236,10 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         async with _lock:
             _clients[key] = client
             _client_permission[key] = permission
+            # Start the sole reader for this client BEFORE anyone can consume
+            # it. Turns and the background-task watcher both attach to this
+            # pump instead of opening their own iterator over the same stream.
+            _ensure_session_stream(key, client)
             _client_lru.append(key)
             while len(_client_lru) > _CLIENT_POOL_CAP:
                 # Find the oldest evictable client: not ourselves, not
@@ -2148,6 +2282,157 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         return client
 
 
+# Sentinel pushed to a consumer queue when the underlying SDK stream ends.
+_STREAM_EOF = object()
+
+
+class _SessionStream:
+    """The sole reader of one SDK client's message stream.
+
+    The Claude Agent SDK gives a client exactly ONE message stream.
+    ``receive_messages()`` is an unbounded iterator over it and
+    ``receive_response()`` is a bounded convenience wrapper that stops at the
+    next ResultMessage (see the SDK's client.py). muselab used to open one of
+    those per consumer — a turn opened ``receive_response()``, a detached
+    background-task watcher opened ``receive_messages()`` — so two iterators
+    competed for the same underlying queue. Whoever happened to be reading
+    owned the stream, which is exactly why starting a turn while a background
+    task was still pending had to be refused with ``_TurnBusy``.
+
+    This makes ownership explicit: one pump per client reads the stream
+    forever and routes each message to whoever is registered. ``query()`` is a
+    pure write on the transport, so submitting a new prompt while the pump is
+    iterating is safe by construction.
+
+    Routing: an attached turn wins; otherwise the background sink; otherwise
+    the message is parked in ``_orphans`` and handed to the next consumer that
+    attaches. That parking is load-bearing — the SDK queue used to do it for
+    us (a late auto-continuation buffered there until the next turn drained
+    it), and a permanently-draining pump takes that job over.
+    """
+
+    # Bounded so a session nobody is reading cannot grow without limit. Far
+    # above the handful of messages a late continuation actually parks.
+    _ORPHAN_MAX = 512
+
+    def __init__(self, key: "_ClientKey", client: ClaudeSDKClient):
+        self.key = key
+        self.client = client
+        self._turn: asyncio.Queue | None = None
+        self._background: asyncio.Queue | None = None
+        self._orphans: deque = deque(maxlen=self._ORPHAN_MAX)
+        self._closed = False
+        self.task: asyncio.Task = asyncio.create_task(self._pump())
+
+    def _adopt_orphans(self, q: asyncio.Queue) -> None:
+        while self._orphans:
+            q.put_nowait(self._orphans.popleft())
+
+    def attach_turn(self) -> asyncio.Queue:
+        """Register the active turn as the destination for NEW messages.
+
+        Deliberately does not adopt `_orphans`: anything parked there was
+        produced before this turn's query() went out, so it belongs to earlier
+        work — typically a background task's auto-continuation that landed
+        while nobody was attached. Handing it to this turn is exactly how a
+        follow-up used to swallow the previous task's continuation and render
+        it as the answer to the new prompt. It stays parked for the watcher.
+        """
+        q: asyncio.Queue = asyncio.Queue()
+        self._turn = q
+        return q
+
+    def detach_turn(self, q: asyncio.Queue) -> None:
+        if self._turn is q:
+            self._turn = None
+
+    def attach_background(self) -> asyncio.Queue:
+        """Register the task watcher as the sink for messages nobody owns.
+
+        Always adopts `_orphans`, including while a turn is attached: parked
+        messages were produced before that turn asked for anything, so they
+        are the watcher's by definition.
+        """
+        q: asyncio.Queue = asyncio.Queue()
+        self._background = q
+        self._adopt_orphans(q)
+        return q
+
+    def detach_background(self, q: asyncio.Queue) -> None:
+        if self._background is q:
+            self._background = None
+
+    async def _pump(self) -> None:
+        try:
+            async for msg in self.client.receive_messages():
+                if self._closed:
+                    break
+                q = self._turn or self._background
+                if q is not None:
+                    q.put_nowait(msg)
+                else:
+                    self._orphans.append(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # The CLI died or the transport broke. Wake any consumer with a
+            # sentinel so it fails fast instead of hanging on an empty queue.
+            sys.stderr.write(
+                f"[chat] session stream ended sid={self.key[0][:8]} "
+                f"exc={type(e).__name__}: {e}\n")
+            sys.stderr.flush()
+            for q in (self._turn, self._background):
+                if q is not None:
+                    q.put_nowait(_STREAM_EOF)
+        finally:
+            self._closed = True
+            for q in (self._turn, self._background):
+                if q is not None:
+                    q.put_nowait(_STREAM_EOF)
+
+    async def aclose(self) -> None:
+        self._closed = True
+        if not self.task.done():
+            self.task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self.task
+
+
+# One pump per cached client, keyed exactly like `_clients`.
+_session_streams: dict["_ClientKey", _SessionStream] = {}
+
+
+def _ensure_session_stream(key: "_ClientKey",
+                           client: ClaudeSDKClient) -> _SessionStream:
+    stream = _session_streams.get(key)
+    if stream is not None and not stream._closed and stream.client is client:
+        return stream
+    if stream is not None:
+        stream._closed = True
+    stream = _SessionStream(key, client)
+    _session_streams[key] = stream
+    return stream
+
+
+def _stream_for(client: ClaudeSDKClient) -> _SessionStream | None:
+    """Find the pump that owns this client's message stream.
+
+    Consumers (the turn loop, the background-task watcher) already hold a
+    `client`; looking the pump up by identity keeps their signatures unchanged.
+    """
+    for stream in _session_streams.values():
+        if stream.client is client and not stream._closed:
+            return stream
+    return None
+
+
+async def _drop_session_streams(session_id: str) -> None:
+    for key in [k for k in _session_streams if k[0] == session_id]:
+        stream = _session_streams.pop(key, None)
+        if stream is not None:
+            await stream.aclose()
+
+
 async def disconnect_client(session_id: str) -> None:
     """Disconnect every cached client for this session (across all models).
     The disconnect() call can wait up to 5 s for the CLI subprocess to
@@ -2155,6 +2440,10 @@ async def disconnect_client(session_id: str) -> None:
     other requests aren't blocked for seconds at a time."""
     to_disconnect: list[ClaudeSDKClient] = []
     _pending_runtime_rebuilds.discard(session_id)
+    # Stop the pumps first: they iterate the very stream disconnect() tears
+    # down, and a reader still attached would surface the teardown as a
+    # transport exception rather than a clean end.
+    await _drop_session_streams(session_id)
     async with _lock:
         keys = [k for k in _clients if k[0] == session_id]
         for k in keys:
@@ -8064,6 +8353,39 @@ async def _watch_inflight_tasks(
                 "cta": "retry",
                 "retryable": True,
             })
+        # Persist the completion time the way a normal turn does (see the
+        # set_message_annotation call in _handle_result_message). Without it
+        # the turn-footer under a background-task reply stays blank: the FE
+        # stamps `ts` in memory, but _reconcileCompletedContinuation reloads
+        # the session from canonical history right after this `done`, and only
+        # sidecar annotations survive that reload.
+        #
+        # The uuid MUST come from the transcript tail, not from the live
+        # message object — annotations are keyed by transcript uuid, which is
+        # why the normal path resolves it through _recent_turn_uuids too.
+        try:
+            asst_uuid, _ = await asyncio.to_thread(
+                _recent_turn_uuids, session_id, False)
+            if asst_uuid:
+                existing = await asyncio.to_thread(
+                    sess.get_message_annotations, session_id)
+                # Never overwrite. A continuation that ended without a reply of
+                # its own resolves to the PREVIOUS turn's assistant message,
+                # which already carries that turn's timestamp.
+                if "ts" not in (existing.get(asst_uuid) or {}):
+                    _cont_elapsed = round(max(0.0, time.time() - b.started_at), 1)
+                    await asyncio.to_thread(
+                        sess.set_message_annotation,
+                        session_id, asst_uuid,
+                        model=b.model,
+                        ts=int(time.time() * 1000),
+                        elapsed_s=_cont_elapsed if _cont_elapsed >= 1 else None)
+        except Exception as e:
+            # A missing footer timestamp must never take the continuation down.
+            sys.stderr.write(
+                f"[chat] continuation ts annotation failed "
+                f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
+            sys.stderr.flush()
         b.publish({"event": "done", "data": json.dumps(done_payload)})
         b.finish()
         async with _lock:
@@ -8128,7 +8450,34 @@ async def _watch_inflight_tasks(
                 "完成上一轮。"
             )
 
-    msg_iter = client.receive_messages().__aiter__()
+    # Attach to the session's sole reader. The watcher used to open its OWN
+    # `receive_messages()` iterator, which is what made it compete with a turn
+    # for the same underlying queue — and therefore why starting a turn while
+    # a background task was pending had to be refused with _TurnBusy.
+    _bg_stream = _stream_for(client)
+    bg_q = _bg_stream.attach_background() if _bg_stream is not None else None
+    msg_iter = None if bg_q is not None else client.receive_messages().__aiter__()
+
+    async def _next_message(timeout: float | None):
+        """Next message for this watcher, or ``_STREAM_EOF`` when it ends."""
+        nonlocal msg_iter
+        if bg_q is not None:
+            if timeout is not None:
+                return await asyncio.wait_for(bg_q.get(), timeout)
+            return await bg_q.get()
+        try:
+            if timeout is not None:
+                return await asyncio.wait_for(msg_iter.__anext__(), timeout)
+            return await msg_iter.__anext__()
+        except StopAsyncIteration:
+            return _STREAM_EOF
+
+    def _reopen_stream() -> None:
+        """Re-arm the reader after an explicit resume."""
+        nonlocal msg_iter
+        if bg_q is None:
+            msg_iter = client.receive_messages().__aiter__()
+
     # Status of the most recent settle. A USER-STOPPED task almost never
     # produces an auto-continue reaction (the CLI treats the stop as user
     # intent), so waiting the full _CONTINUATION_GRACE leaves the attached
@@ -8150,22 +8499,18 @@ async def _watch_inflight_tasks(
                                if last_settle_status == "stopped"
                                else _CONTINUATION_GRACE)
                 try:
-                    if read_to is not None:
-                        msg = await asyncio.wait_for(
-                            msg_iter.__anext__(), read_to)
-                    else:
-                        msg = await msg_iter.__anext__()
-                except StopAsyncIteration:
-                    if await _request_explicit_resume("message stream ended"):
-                        msg_iter = client.receive_messages().__aiter__()
+                    msg = await _next_message(read_to)
+                except asyncio.TimeoutError:
+                    if await _request_explicit_resume("continuation grace elapsed"):
+                        _reopen_stream()
                         continue
                     if (not pending and cont is not None
                             and last_settle_status != "stopped"):
                         _mark_incomplete()
                     break
-                except asyncio.TimeoutError:
-                    if await _request_explicit_resume("continuation grace elapsed"):
-                        msg_iter = client.receive_messages().__aiter__()
+                if msg is _STREAM_EOF:
+                    if await _request_explicit_resume("message stream ended"):
+                        _reopen_stream()
                         continue
                     if (not pending and cont is not None
                             and last_settle_status != "stopped"):
@@ -8322,8 +8667,12 @@ async def _watch_inflight_tasks(
             f"{type(e).__name__}: {e}; unpinning client\n")
         _release_task_pins(session_id, pending)
     finally:
+        # Release our slot on the session pump so a later turn's messages are
+        # not routed to a watcher that has exited.
+        if _bg_stream is not None and bg_q is not None:
+            _bg_stream.detach_background(bg_q)
         # Close any continuation still open (e.g. grace timeout / outer
-        # timeout / StopAsyncIteration with no ResultMessage). No-op on the
+        # timeout / stream end with no ResultMessage). No-op on the
         # cancellation path (cont is None by the invariant), so we never await
         # while cancelled.
         if cont is not None:
@@ -8415,15 +8764,19 @@ def _spawn_task_watcher(
 
 
 async def _handoff_task_watcher(session_id: str) -> None:
-    """Clear a completed watcher before a new turn reads the client stream.
+    """Clear a COMPLETED watcher before a new turn attaches to the stream.
 
-    A live watcher is a logic error here: _start_turn's atomic busy check must
-    keep the user message queued until that watcher exits. Never cancel it,
-    because doing so can hand its buffered auto-continuation to the new turn.
+    A live watcher used to be a hard conflict: it owned the client's message
+    stream, so _start_turn had to refuse the turn to keep the one-reader
+    invariant. The session pump owns the stream now and routes to the active
+    turn and the watcher independently, so a live watcher is simply left alone
+    — it is still waiting on background tasks that are none of this turn's
+    business. Never cancel it: its buffered auto-continuation belongs to the
+    turn that launched the task.
     """
     watcher = _task_watchers.get(session_id)
     if watcher is not None and not watcher.done():
-        raise _TurnBusy()
+        return
     _task_watchers.pop(session_id, None)
     if not _sessions_with_inflight_tasks.get(session_id):
         _background_turn_started_at.pop(session_id, None)
@@ -8488,16 +8841,13 @@ async def _start_turn(
             # tearing it down). Rather than bounce the user's resend with
             # "previous turn still running", wait below for the slot to free.
             draining = cur
-        elif (_sessions_with_inflight_tasks.get(session_id)
-              or (session_id in _task_watchers
-                  and not _task_watchers[session_id].done())):
-            # A detached task watcher is the sole reader of this session's SDK
-            # stream until every background task and its auto-continuation
-            # settle. Starting a user turn here used to cancel that watcher,
-            # then drain the old continuation as if it answered the new prompt.
-            # Keep the one-session/one-reader invariant and let the caller
-            # enqueue instead.
-            raise _TurnBusy()
+        # NOTE: pending background tasks no longer block a new turn. They used
+        # to, because the detached watcher was the SOLE reader of this
+        # session's SDK stream — starting a turn cancelled it and then drained
+        # the old continuation as if it answered the new prompt. The session
+        # pump (_SessionStream) now owns the stream and routes messages to the
+        # active turn or to the watcher, so both coexist and the user can keep
+        # talking while a background task runs.
         else:
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -8993,32 +9343,54 @@ async def _start_turn(
                     await client.query(prompt)
 
                 replay_dropped = 0
-                while True:
-                    stale_terminal = False
-                    current_terminal = False
-                    async for msg in client.receive_response():
-                        decision = boundary.classify(msg)
-                        if decision == "drop":
-                            replay_dropped += 1
-                            continue
-                        if decision == "stale_result":
-                            replay_dropped += 1
-                            stale_terminal = True
-                            continue
-                        await merge_q.put(("claude", msg))
-                        if decision == "current_result":
-                            current_terminal = True
+
+                async def _dispatch(msg) -> str:
+                    """Classify one message and forward it to the turn."""
+                    nonlocal replay_dropped
+                    decision = boundary.classify(msg)
+                    if decision in ("drop", "stale_result"):
+                        replay_dropped += 1
+                        return decision
+                    await merge_q.put(("claude", msg))
+                    return decision
+
+                stream = _stream_for(client)
+                if stream is not None:
+                    # Attach to the session's sole reader instead of opening a
+                    # second iterator over the same stream. The old outer loop
+                    # existed only because receive_response() returns at EVERY
+                    # ResultMessage — including a stale replayed one — and had
+                    # to be re-entered; a queue has no such boundary, so a
+                    # stale result just keeps draining.
+                    turn_q = stream.attach_turn()
+                    try:
+                        while True:
+                            msg = await turn_q.get()
+                            if msg is _STREAM_EOF:
+                                # Transport ended without a Result for this
+                                # query; keep the previous completion/error
+                                # behavior rather than spinning forever.
+                                break
+                            if await _dispatch(msg) == "current_result":
+                                break
+                    finally:
+                        stream.detach_turn(turn_q)
+                else:
+                    # No pump: this client was not created through get_client
+                    # (test doubles inject their own). Fall back to the SDK's
+                    # bounded iterator with the original re-entry loop.
+                    while True:
+                        stale_terminal = False
+                        current_terminal = False
+                        async for msg in client.receive_response():
+                            decision = await _dispatch(msg)
+                            if decision == "stale_result":
+                                stale_terminal = True
+                            elif decision == "current_result":
+                                current_terminal = True
+                                break
+                        if current_terminal or not stale_terminal:
                             break
-                    if current_terminal:
-                        break
-                    if stale_terminal:
-                        # receive_response() itself returns at every ResultMessage.
-                        # Re-enter it to continue draining toward this query's
-                        # Result instead of ending the turn on the stale one.
-                        continue
-                    # Transport ended without a Result; preserve the existing
-                    # completion/error behavior rather than spinning forever.
-                    break
                 if replay_dropped:
                     sys.stderr.write(
                         f"[chat-stream] dropped stale replay sid={session_id[:8]} "

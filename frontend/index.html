@@ -719,8 +719,11 @@
                       :title="lang==='zh'?'新终端使用的 Profile':'Profile for the new terminal'">
                 <option value="" x-text="lang==='zh'?'普通 Shell':'Plain shell'"></option>
                 <template x-for="profile in terminalProfiles" :key="profile.id">
-                  <option :value="profile.id"
-                          x-text="profile.name + (profile.is_default ? (lang==='zh'?'（默认）':' (default)') : '')"></option>
+                  <!-- No "(default)" marker: a new terminal always opens the
+                       explicitly selected entry, and the list already starts
+                       on Plain shell — so labelling one profile "default"
+                       promised behaviour that never existed. -->
+                  <option :value="profile.id" x-text="profile.name"></option>
                 </template>
               </select>
               <button class="terminal-profile-action"
@@ -738,10 +741,6 @@
               <textarea x-model="terminalProfileEditor.command"
                         maxlength="8192" rows="3"
                         :placeholder="lang==='zh'?'启动命令，例如 npm run dev':'Startup command, e.g. npm run dev'"></textarea>
-              <label class="terminal-profile-default">
-                <input type="checkbox" x-model="terminalProfileEditor.is_default">
-                <span x-text="lang==='zh'?'设为默认 Profile':'Use as default profile'"></span>
-              </label>
               <div class="terminal-profile-editor-actions">
                 <button class="btn-danger btn-compact"
                         x-show="terminalProfileEditor.id"
@@ -1751,94 +1750,15 @@
               </div>
             </template>
 
-            <!-- ★ Muse opener — UI-only first bubble, state-aware (see
-                 museOpener() in app.js). Doesn't go into session history,
-                 doesn't cost tokens. Hides the moment the user starts
-                 typing so it never competes with their own first message. -->
-            <template x-if="contextInfo._fetched && contextInfo.has_any_provider && museOpener() && !input">
-              <div class="muse-opener" x-transition.opacity.duration.300ms>
-                <span class="muse-mascot sm">
-                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                </span>
-                <div class="muse-opener-bubble">
-                  <div class="muse-opener-text" x-text="museOpener()"></div>
-                  <template x-if="museOpenerAction()">
-                    <button class="muse-opener-action" @click="museOpenerAction().handler()"
-                            x-text="museOpenerAction().label"></button>
-                  </template>
-                </div>
-              </div>
-            </template>
-
-            <!-- Archive subdir hints — kept as informational chips, only
-                 when the user has a profile but no docs yet. Distinct from
-                 the Muse opener (which is conversational); these are a
-                 visual map of "where to drop your stuff". -->
-            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_meaningfully_filled && contextInfo.archive_empty">
-              <div class="onboard-card calm onboard-subdirs-card">
-                <div class="onboard-card-body" x-text="t('onboard.empty_archive_body')"></div>
-                <div class="onboard-subdirs">
-                  <template x-for="sub in onboardingSubdirs()" :key="sub.name">
-                    <div class="onboard-subdir">
-                      <span class="onboard-subdir-name mono" x-text="sub.name + '/'"></span>
-                      <span class="onboard-subdir-hint" x-text="sub.hint"></span>
-                    </div>
-                  </template>
-                </div>
-              </div>
-            </template>
-
-            <!-- ★ Nine Muses 3×3 grid — visible whenever a provider is
-                 configured, regardless of archive state. Each cell is a
-                 conversation entry point: click → switch mascot + prefill
-                 her invite line into the chat input. -->
-            <template x-if="contextInfo._fetched && contextInfo.has_any_provider">
-              <div class="muse-grid-wrap" x-show="!input"
-                   x-transition.opacity.duration.300ms>
-                <div class="muse-grid-divider">
-                  <span x-text="t('muse_opener.divider')"></span>
-                </div>
-                <div class="muse-grid">
-                  <template x-for="(m, i) in MASCOTS" :key="m.id">
-                    <button class="muse-cell" :class="{'active': mascotIdx === i}"
-                            @click="pickMascotAndAsk(i)"
-                            :title="lang==='zh' ? m.zhName + '・' + m.domain.zh : m.greek + ' · ' + m.domain.en">
-                      <span class="muse-cell-icon">
-                        <svg viewBox="0 0 24 24"><use :href="'#m-' + m.id"/></svg>
-                      </span>
-                      <span class="muse-cell-name"
-                            x-text="lang==='zh' ? m.zhName : m.greek"></span>
-                      <span class="muse-cell-domain"
-                            x-text="lang==='zh' ? m.domain.zh : m.domain.en"></span>
-                      <span class="muse-cell-invite"
-                            x-text="lang==='zh' ? m.invite.zh : m.invite.en"></span>
-                    </button>
-                  </template>
-                </div>
-                <!-- Skill chips — kept as a thin row below the grid for
-                     users with loaded skills. Hidden when no skills. -->
-                <template x-if="settings.skills && settings.skills.length">
-                  <div class="onboard-skills">
-                    <div class="onboard-skills-label">
-                      <span x-text="t('onboard.skill_hint_count', { n: settings.skills.length })"></span>
-                      <button class="onboard-skills-seeall" @click="toggleSkillsDrawer()"
-                              x-text="lang==='zh' ? '查看全部 →' : 'See all →'"></button>
-                    </div>
-                    <div class="onboard-skills-chips">
-                      <template x-for="sk in skillSuggestions()" :key="sk.name">
-                        <button class="skill-chip" @click="useSuggestedPrompt(sk.prompt)"
-                                :title="sk.description">
-                          <span class="skill-chip-icon"><svg><use href="#i-puzzle"/></svg></span>
-                          <span x-text="sk.label"></span>
-                        </button>
-                      </template>
-                    </div>
-                  </div>
-                </template>
-              </div>
-            </template>
-
-            <div class="brand-tips" x-show="input" x-transition.opacity.duration.200ms>
+            <!-- The nine-muse grid and the state-aware opener bubble that
+                 used to fill this screen are gone. They were an
+                 introduction, and a returning user meets them on every new
+                 chat — three rows of cards to scroll past before reaching
+                 the composer. What is left is the same thing the screen
+                 already showed the moment you began typing: the hero and a
+                 short row of hints. Muses are still reachable from the
+                 mascot itself (cycleMascot). -->
+            <div class="brand-tips" x-transition.opacity.duration.200ms>
               <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span> <span x-text="t('chat.empty_tip1b')"></span></div>
               <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
               <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
@@ -2647,25 +2567,22 @@
                    x-show="m.role !== 'user'
                      && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))
                      && (
-                       (pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)
+                       (pane && pane.streaming && i === paneMsgs.length - 1)
                        || m.ts
                        || m.elapsed
                        || (m.role === 'assistant' && m.uuid)
                      )">
-                <span x-show="pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1"
+                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1"
                       class="thinking-dots">
                   <span></span><span></span><span></span>
                 </span>
-                <span x-show="pane && pane.backgroundActive && i === paneMsgs.length - 1"
-                      class="background-task-footer-label"
-                      x-text="t('chat.background_running')"></span>
                 <!-- Elapsed counter next to the streaming dots — kicks in
                      after 1s so fast replies don't flash a "0s" label.
                      Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
-                <span x-show="pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
+                <span x-show="pane && pane.streaming && i === paneMsgs.length - 1 && pane.streamElapsed >= 1"
                       class="stream-elapsed"
                       x-text="fmtStreamElapsed((pane && pane.streamElapsed) || 0)"></span>
-                <span x-show="m.ts && !(pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)"
+                <span x-show="m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
                 <!-- Total elapsed kept after done so the user can
@@ -2673,12 +2590,12 @@
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts && !(pane && (pane.streaming || pane.backgroundActive) && i === paneMsgs.length - 1)"
+                <span x-show="m.elapsed && m.ts && !(pane && pane.streaming && i === paneMsgs.length - 1)"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
                 <button class="turn-fork-btn"
                         type="button"
-                        x-show="m.role === 'assistant' && m.uuid && !(pane && (pane.streaming || pane.backgroundActive))"
+                        x-show="m.role === 'assistant' && m.uuid && !(pane && pane.streaming)"
                         :disabled="forkingSessionId === tid || isTabStreaming(tid)"
                         @click.stop="forkConversation(tid, m.uuid)"
                         :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
@@ -2745,23 +2662,6 @@
                replying (or while a compact was running). They auto-drain on
                the next done event / compact-finally / activateTab. Faded
                + dashed border distinguishes them from real user bubbles. -->
-          <div x-show="tabState[currentId] && tabState[currentId].backgroundActive"
-               class="background-task-strip"
-               role="status"
-               aria-live="polite">
-            <span class="background-task-strip-dot" aria-hidden="true"></span>
-            <span class="background-task-strip-label"
-                  x-text="((tabState[currentId] && tabState[currentId].backgroundTaskCount) || 1) > 1
-                    ? t('chat.background_running_count', {
-                        count: (tabState[currentId] && tabState[currentId].backgroundTaskCount) || 1
-                      })
-                    : t('chat.background_running')"></span>
-            <span class="background-task-strip-hint"
-                  x-text="'· ' + t('chat.background_queue_hint')"></span>
-            <span class="background-task-strip-elapsed"
-                  x-show="streamElapsed >= 1"
-                  x-text="'· ' + fmtStreamElapsed(streamElapsed)"></span>
-          </div>
           <template x-for="(q, qi) in (tabState[currentId] && tabState[currentId].pendingQueue || [])"
                     :key="q.id">
             <div class="msg user queued">
@@ -3021,7 +2921,12 @@
                  provider") misled users who *had* configured one (2026-06-06).
                No "switch model" CTA here: availableModels is empty, so there's
                nothing to switch to — the fix is to check credentials. -->
-          <div class="chat-input-noprov" x-show="!availableModels.length" x-cloak>
+          <!-- Gated on _modelsLoaded: an empty availableModels is also its
+               value before /api/chat/providers has answered, so this used to
+               flash on every page load and tell an already-configured user to
+               go configure a provider. -->
+          <div class="chat-input-noprov"
+               x-show="_modelsLoaded && !availableModels.length" x-cloak>
             <span x-text="(contextInfo && contextInfo.has_any_provider)
                             ? (lang==='zh'
                                 ? '已配置 provider，但当前没有可用模型 —— 凭证可能未填全或仍在校验，打开设置检查一下'

@@ -10,6 +10,7 @@ No real network, no real CLI subprocess, no Anthropic API.
 """
 import asyncio
 import base64
+import collections
 import json
 from types import SimpleNamespace
 
@@ -1063,19 +1064,65 @@ def test_active_reports_background_reader_as_busy_not_attachable(
         chat_mod._background_origin_turn_id.pop(sid, None)
 
 
-def test_start_turn_rejects_while_background_reader_owns_session(
+def test_start_turn_allowed_while_background_task_pending(
     stream_env, client,
 ):
-    """A follow-up must not consume the prior task's auto-continuation."""
+    """A pending background task must NOT block the user from sending.
+
+    This used to raise _TurnBusy: the detached watcher was the sole reader of
+    the session's SDK stream, so a concurrent turn was refused and the user's
+    message was parked on the queue instead. The session pump owns the stream
+    now, so the turn is allowed and the task's completion simply arrives later
+    as its own message in the conversation.
+    """
     chat_mod = stream_env
     sid = _make_session(client)
     chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
     try:
-        with pytest.raises(chat_mod._TurnBusy):
+        # The contract is only that we are not REFUSED as busy. Whether the
+        # turn then survives is environmental — there is no real CLI behind
+        # this session, so the detached pump tears the broadcast down again
+        # (racing any assertion on _active_turns).
+        try:
             asyncio.run(chat_mod._start_turn(sid, "new user prompt"))
-        assert sid not in chat_mod._active_turns
+        except chat_mod._TurnBusy:
+            pytest.fail("a pending background task must not block a new turn")
+        except Exception:
+            pass
     finally:
+        bc = chat_mod._active_turns.pop(sid, None)
+        if bc is not None:
+            bc.finish()
+            bc.close()
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+
+def test_turn_does_not_consume_buffered_continuation(stream_env):
+    """The invariant the old _TurnBusy gate was really protecting.
+
+    A background task's auto-continuation can land while no consumer is
+    attached; the pump parks it. A turn that attaches afterwards must not
+    inherit it — otherwise the follow-up renders the previous task's reply as
+    the answer to the new prompt. It belongs to the watcher.
+    """
+    chat_mod = stream_env
+
+    async def exercise():
+        stream = chat_mod._SessionStream.__new__(chat_mod._SessionStream)
+        # Build the routing state directly; a real pump needs a live CLI.
+        stream._turn = None
+        stream._background = None
+        stream._orphans = collections.deque(maxlen=8)
+        stream._closed = False
+        stream._orphans.append("continuation-of-previous-task")
+
+        turn_q = stream.attach_turn()
+        assert turn_q.empty(), "a new turn must not inherit parked messages"
+
+        bg_q = stream.attach_background()
+        assert bg_q.get_nowait() == "continuation-of-previous-task"
+
+    asyncio.run(exercise())
 
 
 def test_subscribe_broadcast_marks_continuation_consumed(stream_env):
@@ -1130,20 +1177,21 @@ def test_broadcast_replay_compacts_100k_deltas_into_bounded_chunks(stream_env):
     assert bc._replay_bytes <= 512_000
 
 
-def test_mobile_bounds_replay_while_desktop_receives_complete_turn(stream_env):
+def test_mobile_and_desktop_both_receive_complete_turn(stream_env):
+    """Mobile is no longer a truncated second-class subscriber.
+
+    This used to assert the opposite: past a 512-event replay window a mobile
+    subscriber was handed `resync("replay_truncated")` and no live stream at
+    all. The window existed only because every token delta was spooled, so a
+    normal reply blew past it in seconds. The spool now records one coalesced
+    event per message, so mobile and desktop get byte-identical replays.
+    """
     import asyncio
-    import json
 
     chat_mod = stream_env
 
     async def exercise():
-        bc = chat_mod.TurnBroadcast(
-            session_id="stress-subscribers",
-            replay_max_events=1,
-            replay_max_bytes=4096,
-            subscriber_max_events=8,
-            subscriber_max_bytes=4096,
-        )
+        bc = chat_mod.TurnBroadcast(session_id="stress-subscribers")
         mobile_live = bc.subscribe(mobile=True)
         desktop_live = bc.subscribe()
         stalled_live = bc.subscribe()
@@ -1182,10 +1230,16 @@ def test_mobile_bounds_replay_while_desktop_receives_complete_turn(stream_env):
         assert len(stalled_received) == 2_000
         assert len(bc.events) == 2_000
 
+        # A late mobile subscriber replays the whole turn, exactly like desktop.
         mobile_replay = bc.subscribe(mobile=True)
-        mobile_replay_first = await mobile_replay.get()
-        assert mobile_replay_first["event"] == "resync"
-        assert json.loads(mobile_replay_first["data"])["reason"] == "replay_truncated"
+        mobile_replayed = []
+        while True:
+            event = await mobile_replay.get()
+            if event is None:
+                break
+            mobile_replayed.append(event)
+        assert len(mobile_replayed) == 2_000
+        assert all(event["event"] != "resync" for event in mobile_replayed)
 
         desktop_replay = bc.subscribe()
         replayed = []
@@ -1196,6 +1250,127 @@ def test_mobile_bounds_replay_while_desktop_receives_complete_turn(stream_env):
             replayed.append(event)
         assert replayed == list(bc.events)
         assert len(replayed) == 2_000
+
+    asyncio.run(exercise())
+
+
+def test_token_deltas_are_coalesced_into_one_spool_event(stream_env):
+    """Replay length must scale with MESSAGES, not tokens.
+
+    This is the core of the fix. The spool used to take one entry per token
+    delta whenever any subscriber was attached, so a single ordinary reply
+    produced tens of thousands of replay events — which is what the old
+    512-event mobile window was really reacting to.
+    """
+    import asyncio
+    import json
+
+    chat_mod = stream_env
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(session_id="coalesce")
+        # Attached — this is precisely the condition that used to force a
+        # spool write per delta.
+        live = bc.subscribe()
+        for i in range(500):
+            bc.publish({"event": "text", "data": json.dumps({"text": f"t{i}"})})
+        bc.publish({"event": "tool_result", "data": "{}"})
+        bc.finish()
+
+        # 500 deltas + 1 tool_result => 2 spool entries, not 501.
+        assert len(bc.events) == 2
+
+        replay = bc.subscribe()
+        events = []
+        while True:
+            event = await replay.get()
+            if event is None:
+                break
+            events.append(event)
+        assert [e["event"] for e in events] == ["text", "tool_result"]
+        assert (json.loads(events[0]["data"])["text"]
+                == "".join(f"t{i}" for i in range(500)))
+        # The internal marker must never reach the wire.
+        assert all("_coalesced" not in e for e in events)
+        live.close()
+        bc.close()
+
+    asyncio.run(exercise())
+
+
+def test_attached_subscriber_gets_deltas_not_the_coalesced_duplicate(stream_env):
+    """A live reader sees the message once, token by token — never twice."""
+    import asyncio
+    import json
+
+    chat_mod = stream_env
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(session_id="no-dup")
+        live = bc.subscribe()
+        received = []
+
+        async def consume():
+            while True:
+                event = await live.get()
+                if event is None:
+                    return
+                received.append(event)
+
+        task = asyncio.create_task(consume())
+        for chunk in ("Hel", "lo ", "world"):
+            bc.publish({"event": "text", "data": json.dumps({"text": chunk})})
+            await asyncio.sleep(0)
+        bc.publish({"event": "tool_result", "data": "{}"})
+        bc.finish()
+        await task
+
+        texts = [json.loads(e["data"])["text"]
+                 for e in received if e["event"] == "text"]
+        # Three deltas and no fourth, coalesced copy of the same sentence.
+        assert texts == ["Hel", "lo ", "world"]
+        bc.close()
+
+    asyncio.run(exercise())
+
+
+def test_mid_message_join_receives_the_head_it_missed(stream_env):
+    """Attaching while a bubble is streaming must not start mid-word.
+
+    This is the case that used to strand mobile clients: reconnecting during a
+    long reply meant no live stream at all until the turn ended.
+    """
+    import asyncio
+    import json
+
+    chat_mod = stream_env
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(session_id="mid-join")
+        early = bc.subscribe()
+        bc.publish({"event": "text", "data": json.dumps({"text": "Hello "})})
+        await asyncio.sleep(0)
+        # Half the bubble has already streamed when this client shows up.
+        late = bc.subscribe()
+        bc.publish({"event": "text", "data": json.dumps({"text": "world"})})
+        bc.publish({"event": "done", "data": "{}"})
+        bc.finish()
+
+        async def drain(subscriber):
+            out = []
+            while True:
+                event = await subscriber.get()
+                if event is None:
+                    return out
+                out.append(event)
+
+        def text_of(events):
+            return "".join(json.loads(e["data"])["text"]
+                           for e in events if e["event"] == "text")
+
+        assert text_of(await drain(late)) == "Hello world"
+        assert text_of(await drain(early)) == "Hello world"
+        bc.close()
 
     asyncio.run(exercise())
 
@@ -1332,14 +1507,13 @@ def test_reconnect_turn_id_mismatch_resyncs_instead_of_attaching(
         bc.close()
 
 
-def test_stream_ticket_applies_mobile_layout_to_replay(stream_env, client):
+def test_stream_ticket_replays_complete_turn_for_mobile_and_desktop(
+        stream_env, client):
+    """End-to-end counterpart of the unit test above: a `mobile: true` ticket
+    replays the same complete turn a desktop ticket does, with no resync."""
     chat_mod = stream_env
     sid = _make_session(client)
-    bc = chat_mod.TurnBroadcast(
-        session_id=sid,
-        replay_max_events=1,
-        replay_max_bytes=256,
-    )
+    bc = chat_mod.TurnBroadcast(session_id=sid)
     for i in range(10):
         bc.publish({"event": "tool_result", "data": '{"id":"%d"}' % i})
     bc.finish()
@@ -1362,9 +1536,8 @@ def test_stream_ticket_applies_mobile_layout_to_replay(stream_env, client):
 
         mobile_response = client.get(f"/api/chat/stream?ticket={mint(True)}")
         mobile_events = _parse_sse(mobile_response.text)
-        resync = next(json.loads(data) for event, data in mobile_events
-                      if event == "resync")
-        assert resync["reason"] == "replay_truncated"
+        assert sum(event == "tool_result" for event, _ in mobile_events) == 10
+        assert all(event != "resync" for event, _ in mobile_events)
 
         desktop_response = client.get(f"/api/chat/stream?ticket={mint(False)}")
         desktop_events = _parse_sse(desktop_response.text)
