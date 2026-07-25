@@ -1750,94 +1750,15 @@
               </div>
             </template>
 
-            <!-- ★ Muse opener — UI-only first bubble, state-aware (see
-                 museOpener() in app.js). Doesn't go into session history,
-                 doesn't cost tokens. Hides the moment the user starts
-                 typing so it never competes with their own first message. -->
-            <template x-if="contextInfo._fetched && contextInfo.has_any_provider && museOpener() && !input">
-              <div class="muse-opener" x-transition.opacity.duration.300ms>
-                <span class="muse-mascot sm">
-                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-                </span>
-                <div class="muse-opener-bubble">
-                  <div class="muse-opener-text" x-text="museOpener()"></div>
-                  <template x-if="museOpenerAction()">
-                    <button class="muse-opener-action" @click="museOpenerAction().handler()"
-                            x-text="museOpenerAction().label"></button>
-                  </template>
-                </div>
-              </div>
-            </template>
-
-            <!-- Archive subdir hints — kept as informational chips, only
-                 when the user has a profile but no docs yet. Distinct from
-                 the Muse opener (which is conversational); these are a
-                 visual map of "where to drop your stuff". -->
-            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_meaningfully_filled && contextInfo.archive_empty">
-              <div class="onboard-card calm onboard-subdirs-card">
-                <div class="onboard-card-body" x-text="t('onboard.empty_archive_body')"></div>
-                <div class="onboard-subdirs">
-                  <template x-for="sub in onboardingSubdirs()" :key="sub.name">
-                    <div class="onboard-subdir">
-                      <span class="onboard-subdir-name mono" x-text="sub.name + '/'"></span>
-                      <span class="onboard-subdir-hint" x-text="sub.hint"></span>
-                    </div>
-                  </template>
-                </div>
-              </div>
-            </template>
-
-            <!-- ★ Nine Muses 3×3 grid — visible whenever a provider is
-                 configured, regardless of archive state. Each cell is a
-                 conversation entry point: click → switch mascot + prefill
-                 her invite line into the chat input. -->
-            <template x-if="contextInfo._fetched && contextInfo.has_any_provider">
-              <div class="muse-grid-wrap" x-show="!input"
-                   x-transition.opacity.duration.300ms>
-                <div class="muse-grid-divider">
-                  <span x-text="t('muse_opener.divider')"></span>
-                </div>
-                <div class="muse-grid">
-                  <template x-for="(m, i) in MASCOTS" :key="m.id">
-                    <button class="muse-cell" :class="{'active': mascotIdx === i}"
-                            @click="pickMascotAndAsk(i)"
-                            :title="lang==='zh' ? m.zhName + '・' + m.domain.zh : m.greek + ' · ' + m.domain.en">
-                      <span class="muse-cell-icon">
-                        <svg viewBox="0 0 24 24"><use :href="'#m-' + m.id"/></svg>
-                      </span>
-                      <span class="muse-cell-name"
-                            x-text="lang==='zh' ? m.zhName : m.greek"></span>
-                      <span class="muse-cell-domain"
-                            x-text="lang==='zh' ? m.domain.zh : m.domain.en"></span>
-                      <span class="muse-cell-invite"
-                            x-text="lang==='zh' ? m.invite.zh : m.invite.en"></span>
-                    </button>
-                  </template>
-                </div>
-                <!-- Skill chips — kept as a thin row below the grid for
-                     users with loaded skills. Hidden when no skills. -->
-                <template x-if="settings.skills && settings.skills.length">
-                  <div class="onboard-skills">
-                    <div class="onboard-skills-label">
-                      <span x-text="t('onboard.skill_hint_count', { n: settings.skills.length })"></span>
-                      <button class="onboard-skills-seeall" @click="toggleSkillsDrawer()"
-                              x-text="lang==='zh' ? '查看全部 →' : 'See all →'"></button>
-                    </div>
-                    <div class="onboard-skills-chips">
-                      <template x-for="sk in skillSuggestions()" :key="sk.name">
-                        <button class="skill-chip" @click="useSuggestedPrompt(sk.prompt)"
-                                :title="sk.description">
-                          <span class="skill-chip-icon"><svg><use href="#i-puzzle"/></svg></span>
-                          <span x-text="sk.label"></span>
-                        </button>
-                      </template>
-                    </div>
-                  </div>
-                </template>
-              </div>
-            </template>
-
-            <div class="brand-tips" x-show="input" x-transition.opacity.duration.200ms>
+            <!-- The nine-muse grid and the state-aware opener bubble that
+                 used to fill this screen are gone. They were an
+                 introduction, and a returning user meets them on every new
+                 chat — three rows of cards to scroll past before reaching
+                 the composer. What is left is the same thing the screen
+                 already showed the moment you began typing: the hero and a
+                 short row of hints. Muses are still reachable from the
+                 mascot itself (cycleMascot). -->
+            <div class="brand-tips" x-transition.opacity.duration.200ms>
               <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span> <span x-text="t('chat.empty_tip1b')"></span></div>
               <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
               <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
@@ -3000,7 +2921,12 @@
                  provider") misled users who *had* configured one (2026-06-06).
                No "switch model" CTA here: availableModels is empty, so there's
                nothing to switch to — the fix is to check credentials. -->
-          <div class="chat-input-noprov" x-show="!availableModels.length" x-cloak>
+          <!-- Gated on _modelsLoaded: an empty availableModels is also its
+               value before /api/chat/providers has answered, so this used to
+               flash on every page load and tell an already-configured user to
+               go configure a provider. -->
+          <div class="chat-input-noprov"
+               x-show="_modelsLoaded && !availableModels.length" x-cloak>
             <span x-text="(contextInfo && contextInfo.has_any_provider)
                             ? (lang==='zh'
                                 ? '已配置 provider，但当前没有可用模型 —— 凭证可能未填全或仍在校验，打开设置检查一下'
@@ -4088,54 +4014,6 @@
           </div>
           <template x-if="!cost.data && !cost.loading">
             <div class="settings-hint" x-text="t('set.cost.empty')"></div>
-          </template>
-          <!-- Claude subscription (Pro/Max) quota. The SDK already reports it
-               live via RateLimitEvent and the toolbar badge consumes it; the
-               dashboard used to show only the Codex account, so a Claude-only
-               user saw no remaining quota at all. Reuses the codex-quota-*
-               classes so both cards read identically. -->
-          <div class="codex-quota-card" x-show="claudeLimitRows().length">
-            <div class="codex-quota-head">
-              <div class="codex-quota-title-group">
-                <div class="cost-block-title" x-text="t('set.cost.claude_quota')"></div>
-                <div class="codex-quota-source-row">
-                  <span x-text="t('set.cost.claude_quota_source')"></span>
-                  <span x-show="claudeLimitUpdatedText()"
-                        x-text="t('set.cost.updated', { t: claudeLimitUpdatedText() })"></span>
-                </div>
-              </div>
-            </div>
-            <div class="codex-quota-grid">
-              <template x-for="w in claudeLimitRows()" :key="w.key">
-                <div class="codex-quota-window"
-                     :class="{ warn: w.used_percent >= 75 && w.used_percent < 90,
-                               crit: w.used_percent >= 90 || w.status === 'rejected' }">
-                  <div class="codex-quota-label" x-text="rateLimitWindowLabel(w.type)"></div>
-                  <div class="codex-quota-metric">
-                    <span class="codex-quota-value"
-                          x-text="w.remaining_percent == null ? '—' : w.remaining_percent + '%'"></span>
-                    <span class="codex-quota-metric-label" x-text="t('set.cost.remaining')"></span>
-                  </div>
-                  <div class="codex-quota-track" role="progressbar"
-                       :aria-label="rateLimitWindowLabel(w.type)"
-                       aria-valuemin="0" aria-valuemax="100"
-                       :aria-valuenow="w.remaining_percent == null ? null : w.remaining_percent">
-                    <div class="codex-quota-fill"
-                         :style="`width: ${w.remaining_percent ?? 0}%`"></div>
-                  </div>
-                  <div class="codex-quota-meta">
-                    <span x-text="w.used_percent === 0
-                                   ? t('set.cost.unused')
-                                   : t('set.cost.used_value', { n: w.used_percent ?? '—' })"></span>
-                    <span x-show="w.resets_at"
-                          x-text="t('rl.resets', { t: rateLimitResetText(w.resets_at) })"></span>
-                  </div>
-                </div>
-              </template>
-            </div>
-          </div>
-          <template x-if="!claudeLimitRows().length">
-            <div class="settings-hint" x-text="t('set.cost.claude_quota_empty')"></div>
           </template>
           <div class="codex-quota-card" x-show="codexLimit && codexLimit.updated_at">
             <div class="codex-quota-head">

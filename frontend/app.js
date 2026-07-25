@@ -759,6 +759,15 @@ function portal() {
     codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
+    // False until /api/chat/providers has answered at least once. The
+    // "no model available" notice keys off an EMPTY availableModels, which is
+    // also its initial value — so on every page load it rendered for the
+    // duration of that fetch and then vanished, telling a fully-configured
+    // user to go configure a provider. Only a list we have actually seen can
+    // prove the absence of models; a list we have not fetched yet proves
+    // nothing. Deliberately stays false if the fetch fails: an unreachable
+    // backend is not evidence of a missing provider either.
+    _modelsLoaded: false,
     atBottom: true,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
     // onChatScroll uses it to disengage auto-follow ONLY on user-driven
@@ -4921,6 +4930,7 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           this.availableModels = d.models || [];
+          this._modelsLoaded = true;
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           if (d.default_permission) {
             this.defaultPermission = d.default_permission;
@@ -5038,50 +5048,6 @@ function portal() {
 
     // Human label for a rate-limit window key. The h/d abbreviations are
     // universal; only "overage" gets a zh form.
-    // Rows for the Claude subscription quota card. `rateLimit.windows` is
-    // keyed by window type and each entry carries `utilization` (0..1) from
-    // the SDK's RateLimitEvent. The dashboard reports what is LEFT so it reads
-    // the same way as the Codex card sitting next to it.
-    claudeLimitRows() {
-      const ws = (this.rateLimit && this.rateLimit.windows) || {};
-      const order = ["five_hour", "seven_day", "seven_day_opus",
-                     "seven_day_sonnet", "overage"];
-      return Object.entries(ws)
-        .map(([key, w]) => {
-          // `utilization` is Optional on the SDK's RateLimitInfo and has been
-          // seen missing while the window type and reset time are present.
-          // The CLI's untouched payload rides along in `raw`; check it before
-          // giving up and rendering a blank percentage.
-          const raw = w.raw || {};
-          const u = typeof w.utilization === "number" ? w.utilization
-            : (typeof raw.utilization === "number" ? raw.utilization : null);
-          const used = u == null
-            ? null : Math.min(100, Math.max(0, Math.round(u * 100)));
-          return {
-            key,
-            type: w.rate_limit_type || key,
-            status: w.status || "",
-            used_percent: used,
-            remaining_percent: used == null ? null : 100 - used,
-            resets_at: w.resets_at || 0,
-          };
-        })
-        // An untyped event is bucketed under "_" server-side; it has no
-        // window to name, so it would render as a blank tile.
-        .filter(w => w.type && w.type !== "_")
-        .sort((a, b) => {
-          const ia = order.indexOf(a.type);
-          const ib = order.indexOf(b.type);
-          return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-        });
-    },
-    claudeLimitUpdatedText() {
-      const ts = this.rateLimit && this.rateLimit.updated_at;
-      if (!ts) return "";
-      return new Date(ts * 1000).toLocaleTimeString(
-        this.lang === "zh" ? "zh-CN" : "en-US",
-        { hour: "2-digit", minute: "2-digit" });
-    },
     rateLimitWindowLabel(type) {
       const m = {
         five_hour: "5h",
@@ -12097,6 +12063,7 @@ function portal() {
         if (r.ok) {
           const d = await r.json();
           this.availableModels = d.models || [];
+          this._modelsLoaded = true;
           if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
           if (d.default_permission) {
             this.defaultPermission = d.default_permission;
@@ -14891,8 +14858,15 @@ function portal() {
       let startY = null;
       let remainder = 0;
       let claimed = false;
+      // Pixels of finger travel per scrollback line. Dividing the real line
+      // height by this doubles how far a swipe carries — one text line per
+      // half a line's worth of movement. The floor scales with it so the
+      // clamp keeps meaning the same thing.
+      const SCROLL_SENSITIVITY = 2;
       const linePx = Math.max(
-        10, Number(term.options.fontSize || 13) * Number(term.options.lineHeight || 1.2));
+        10 / SCROLL_SENSITIVITY,
+        Number(term.options.fontSize || 13)
+          * Number(term.options.lineHeight || 1.2) / SCROLL_SENSITIVITY);
       const reset = () => {
         lastY = null;
         startX = null;
@@ -14993,6 +14967,13 @@ function portal() {
             .getPropertyValue("--font-mono").trim() || "monospace",
           fontSize: this._isMobileLayout() ? 13 : 14,
           lineHeight: 1.2,
+          // Mouse-wheel scrollback speed. The touch path has its own handler
+          // (_attachTerminalTouchScroll, which bails on desktop), so tuning
+          // sensitivity there did nothing for a mouse — xterm owns the wheel.
+          // 2 lines per notch matches the doubled touch sensitivity; Alt+wheel
+          // keeps its proportional fast multiplier.
+          scrollSensitivity: 2,
+          fastScrollSensitivity: 10,
           // ANSI 16 colors are curated above; this also protects arbitrary
           // 256-color / truecolor foregrounds emitted by third-party TUIs.
           // xterm caches adjusted pairs, keeping the mobile rendering cost low.
@@ -15049,10 +15030,19 @@ function portal() {
         term.attachCustomKeyEventHandler(event => {
           if (event.type !== "keydown") return true;
           const key = String(event.key || "").toLowerCase();
+          // Copy deliberately does NOT take plain Ctrl+C: that is SIGINT, the
+          // single most important key in a terminal. Cmd+C / Ctrl+Shift+C only.
           const copy = key === "c"
             && (event.metaKey || (event.ctrlKey && event.shiftKey));
-          const paste = key === "v"
-            && (event.metaKey || (event.ctrlKey && event.shiftKey));
+          // Paste takes plain Ctrl+V as well as Cmd+V / Ctrl+Shift+V. Leaving
+          // plain Ctrl+V to xterm encoded it as \x16 (readline's literal-next)
+          // and sent that to the program instead of the clipboard text, which
+          // full-screen TUIs surface as a bogus input error. Nothing is lost:
+          // \x16 is an obscure quoted-insert prefix, while Ctrl+V is what
+          // people actually press. altKey is excluded because AltGr layouts
+          // report Ctrl+Alt for ordinary characters.
+          const paste = key === "v" && !event.altKey
+            && (event.metaKey || event.ctrlKey);
           if (copy) {
             this.terminalCopy();
             return false;
@@ -15060,7 +15050,9 @@ function portal() {
           if (paste) {
             // Stop xterm from encoding Ctrl+V as \x16 — we read the clipboard
             // ourselves and send the text, so the raw control byte must never
-            // reach the shell.
+            // reach the shell. preventDefault also keeps the browser from
+            // dropping the text into xterm's hidden helper textarea.
+            event.preventDefault();
             this.terminalPaste();
             return false;
           }

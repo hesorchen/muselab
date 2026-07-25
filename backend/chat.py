@@ -1143,12 +1143,6 @@ def _rate_limit_payload(info) -> dict:
         "overage_status": getattr(info, "overage_status", None),
         "overage_resets_at": getattr(info, "overage_resets_at", None),
         "overage_disabled_reason": getattr(info, "overage_disabled_reason", None),
-        # The SDK models only the fields above but keeps the CLI's untouched
-        # payload in `raw`. `utilization` is Optional and has been observed
-        # absent while resetsAt/rateLimitType are present — which renders the
-        # quota card with a blank percentage. Pass raw through so the UI can
-        # recover the number instead of showing an empty bar.
-        "raw": dict(getattr(info, "raw", None) or {}),
     }
 
 
@@ -8359,6 +8353,39 @@ async def _watch_inflight_tasks(
                 "cta": "retry",
                 "retryable": True,
             })
+        # Persist the completion time the way a normal turn does (see the
+        # set_message_annotation call in _handle_result_message). Without it
+        # the turn-footer under a background-task reply stays blank: the FE
+        # stamps `ts` in memory, but _reconcileCompletedContinuation reloads
+        # the session from canonical history right after this `done`, and only
+        # sidecar annotations survive that reload.
+        #
+        # The uuid MUST come from the transcript tail, not from the live
+        # message object — annotations are keyed by transcript uuid, which is
+        # why the normal path resolves it through _recent_turn_uuids too.
+        try:
+            asst_uuid, _ = await asyncio.to_thread(
+                _recent_turn_uuids, session_id, False)
+            if asst_uuid:
+                existing = await asyncio.to_thread(
+                    sess.get_message_annotations, session_id)
+                # Never overwrite. A continuation that ended without a reply of
+                # its own resolves to the PREVIOUS turn's assistant message,
+                # which already carries that turn's timestamp.
+                if "ts" not in (existing.get(asst_uuid) or {}):
+                    _cont_elapsed = round(max(0.0, time.time() - b.started_at), 1)
+                    await asyncio.to_thread(
+                        sess.set_message_annotation,
+                        session_id, asst_uuid,
+                        model=b.model,
+                        ts=int(time.time() * 1000),
+                        elapsed_s=_cont_elapsed if _cont_elapsed >= 1 else None)
+        except Exception as e:
+            # A missing footer timestamp must never take the continuation down.
+            sys.stderr.write(
+                f"[chat] continuation ts annotation failed "
+                f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
+            sys.stderr.flush()
         b.publish({"event": "done", "data": json.dumps(done_payload)})
         b.finish()
         async with _lock:
