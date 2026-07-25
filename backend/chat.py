@@ -220,17 +220,40 @@ def _get_session_msgs(sid: str, model: str = "") -> list:
             sid, directory=str(sess.session_workspace(sid)))
 
 
+def _transcript_ts_ms(entry: dict) -> int | None:
+    """Epoch-ms of a raw transcript entry's ``timestamp`` (ISO-8601, UTC).
+
+    Every CLI JSONL record carries one; the SDK's SessionMessage does not
+    expose it, which is why per-message times were unavailable to the UI even
+    though the data was on disk the whole time. Returns None for missing or
+    unparseable values — a message with no time simply doesn't show one."""
+    raw = entry.get("timestamp") or ""
+    if not raw:
+        return None
+    try:
+        import datetime as _dt
+        return int(_dt.datetime.fromisoformat(
+            str(raw).replace("Z", "+00:00")).timestamp() * 1000)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 class _RawMsg:
     """Minimal stand-in for the SDK's SessionMessage, exposing just the
     .uuid / .type / .message surface that _sdk_messages_to_ui consumes. Lets
     the full-history reader reuse the exact same UI-shaping logic as the
-    normal path, so the two views can't drift."""
-    __slots__ = ("uuid", "type", "message")
+    normal path, so the two views can't drift.
 
-    def __init__(self, uuid: str, type_: str, message: dict):
+    `mts` is the extra field the real SessionMessage lacks — see
+    _transcript_ts_ms. Optional so existing construction sites keep working."""
+    __slots__ = ("uuid", "type", "message", "mts")
+
+    def __init__(self, uuid: str, type_: str, message: dict,
+                 mts: int | None = None):
         self.uuid = uuid
         self.type = type_
         self.message = message
+        self.mts = mts
 
 
 def _full_session_msgs(sid: str) -> list:
@@ -276,7 +299,8 @@ def _full_session_msgs(sid: str) -> list:
                 if not u or u in seen:
                     continue
                 seen.add(u)
-                out.append(_RawMsg(u, e.get("type"), e.get("message") or {}))
+                out.append(_RawMsg(u, e.get("type"), e.get("message") or {},
+                                   _transcript_ts_ms(e)))
     except Exception:
         return []
     return out
@@ -611,8 +635,9 @@ class TurnBroadcast:
     endpoint is just a SUBSCRIBER — it replays the existing buffer +
     streams new events. A reconnecting browser becomes a new subscriber
     and gets the full reply via replay + live tail, with no extra logic
-    on the SDK side. Up to 30 min per turn (asyncio.wait_for at the
-    background-task level). Removed from `_active_turns` when finished.
+    on the SDK side. A turn runs unbounded by default; set
+    MUSELAB_TURN_TIMEOUT_S to arm a wall-clock cap at the background-task
+    level. Removed from `_active_turns` when finished.
     """
     def __init__(
         self,
@@ -2518,6 +2543,93 @@ def _attachments_base() -> Path:
     return ROOT / ".muselab-attach"
 
 
+# Longest filename component we'll write. Keeps `{aid}-{name}` (32 hex + dash
+# + this) comfortably under the 255-byte limit ext4/APFS enforce PER COMPONENT
+# — and that limit is in BYTES, so a CJK name at 3 bytes/char hits it ~3x
+# sooner than a Latin one. Truncation is applied to the stem so the extension
+# always survives; the extension is what tells the agent (and our MIME map)
+# what the file actually is.
+_ATTACH_NAME_MAX = 60
+
+
+def _safe_attach_name(name: str) -> str:
+    """Turn a client-supplied filename into a safe single path component.
+
+    Keeps the original name legible (CJK included) because it lands in the
+    prompt as a path the agent reads back — `a3f2…-季度报表.xlsx` tells the
+    model what it's looking at, `a3f2….bin` does not. Everything that could
+    escape the directory or confuse a shell is replaced:
+      - any directory part is dropped (`Path.name`)
+      - path separators, NUL, control chars, quotes, and whitespace runs → `_`
+      - leading dots are stripped so nothing lands as a hidden file
+    Falls back to "file" if the input sanitises down to nothing.
+    """
+    base = Path(str(name or "")).name
+    # Reject separators explicitly first — Path.name already drops POSIX dirs,
+    # but a Windows-style "..\\..\\evil" arriving on Linux keeps its
+    # backslashes, so the replace below has to see them.
+    base = base.replace("\\", "_").replace("/", "_")
+    base = re.sub(r"[\x00-\x1f\x7f]", "", base)
+    base = re.sub(r'[\s"\'`$;|&<>*?]+', "_", base)
+    # Strip dots and underscores together, in one pass. Doing it as two
+    # separate steps (lstrip(".") then strip("_")) leaves debris when they
+    # interleave: "..\\..\\windows" sanitises to ".._.._windows", the lstrip
+    # eats the leading dots, the strip eats one underscore, and the SECOND
+    # ".." is left stranded at the front.
+    base = base.strip("._") or "file"
+    if len(base.encode("utf-8")) > _ATTACH_NAME_MAX:
+        stem, dot, ext = base.rpartition(".")
+        if not dot or len(ext) > 8:
+            stem, dot, ext = base, "", ""
+        budget = _ATTACH_NAME_MAX - len((dot + ext).encode("utf-8"))
+        trimmed = stem.encode("utf-8")[:max(1, budget)]
+        # A byte-slice can land mid-codepoint; drop the partial tail.
+        stem = trimmed.decode("utf-8", "ignore") or "file"
+        base = stem + dot + ext
+    return base
+
+
+def _persist_attachment(session_id: str, aid: str, name: str,
+                        data: bytes) -> tuple[str, str] | None:
+    """Write one attachment to `.muselab-attach/{sid}/{aid}-{safe name}`.
+
+    Returns (absolute path, browser URL), or None if the write failed — a
+    failed attachment must not abort the turn, the user still gets their
+    prompt through, just without that file. Callers log nothing extra; the
+    stderr line here is the single record.
+
+    The `{aid}-` prefix is what makes the name collision-proof: two messages
+    can each attach a `report.csv` and neither overwrites the other, while the
+    human-readable half still tells the agent (and the user browsing the
+    folder) what the file is.
+    """
+    safe = _safe_attach_name(name)
+    attach_dir = _attachments_base() / session_id
+    try:
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        path = attach_dir / f"{aid}-{safe}"
+        path.write_bytes(data)
+    except Exception as e:
+        sys.stderr.write(
+            f"[attach] persist failed sid={session_id} aid={aid} "
+            f"name={safe!r} err={type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        return None
+    url = (f"/api/chat/attachments/{session_id}/"
+           f"{urllib.parse.quote(f'{aid}-{safe}')}")
+    return str(path), url
+
+
+def _doc_item(name: str, kind: str, saved: tuple[str, str] | None) -> dict:
+    """Bubble metadata for one non-image attachment. `url` is present only
+    when the file actually made it to disk, so the frontend can render a
+    dead-end chip rather than a link that 404s."""
+    item = {"name": name, "kind": kind}
+    if saved:
+        item["url"] = saved[1]
+    return item
+
+
 def _migrate_legacy_attachments() -> None:
     """One-shot migration: sessions/attachments/* → ROOT/.muselab-attach/*.
     Runs at module import. Idempotent — only moves dirs that don't yet
@@ -3415,6 +3527,19 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
     # under whichever entry is the turn tail; making sure all of them
     # carry ts means whatever block ends up at the tail can display
     # the time. Cheap O(N) — annotations is already a dict lookup.
+    # Per-message wall-clock, distinct from `ts`. `ts` is the TURN-completion
+    # stamp deliberately fanned across the tail uuid only; `mts` is when this
+    # individual record was written. Keeping them separate matters: the FE's
+    # _markDone walks backwards looking for a bubble that already has `ts` to
+    # decide it has left the current turn, so populating `ts` everywhere would
+    # abort that walk on the first block it saw. Absent on the pure-SDK loader
+    # (SessionMessage carries no timestamp) — consumers must treat it as
+    # optional.
+    mts_by_uuid: dict[str, int] = {}
+    for sm in sm_list:
+        val = getattr(sm, "mts", None)
+        if val:
+            mts_by_uuid[sm.uuid] = val
     key_ordinals: dict[str, int] = {}
     for entry in out:
         u = entry.get("uuid")
@@ -3423,6 +3548,8 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         ordinal = key_ordinals.get(u, 0)
         key_ordinals[u] = ordinal + 1
         entry["_key"] = f"{u}:{ordinal}"
+        if u in mts_by_uuid:
+            entry["mts"] = mts_by_uuid[u]
         ann = annotations.get(u, {})
         ts = ann.get("ts")
         if ts is not None and "ts" not in entry:
@@ -3509,7 +3636,7 @@ def _indexed_ui_records(
     entries = transcript_idx.read_records(transcript_path, index, record_indices)
     raw = [
         _RawMsg(str(e.get("uuid") or ""), str(e.get("type") or ""),
-                e.get("message") or {})
+                e.get("message") or {}, _transcript_ts_ms(e))
         for e in entries
     ]
     compact = {str(e.get("uuid")) for e in entries if e.get("isCompactSummary")}
@@ -3913,6 +4040,7 @@ def get_session_api(
     uses_index = bool(around_uuid or tail > 0 or offset >= 0)
     generation = ""
     has_later = False
+    pre_total = 0
     history_order = "full" if (full or around_uuid) else "normal"
 
     if uses_index:
@@ -3925,6 +4053,11 @@ def get_session_api(
         else:
             transcript_path, index = indexed
             generation = str(index.get("history_generation") or "")
+            # Bubbles stranded before the visible chain's root (post-/compact,
+            # or a fork). Reported in FULL-order units in every response so the
+            # client can offer "Load earlier" even when the normal-order window
+            # is sitting at offset 0 with nothing apparently behind it.
+            pre_total = transcript_idx.pre_chain_bubbles(index)
             if history_generation and history_generation != generation:
                 raise HTTPException(409, detail={
                     "error": "history_generation_mismatch",
@@ -4013,8 +4146,10 @@ def get_session_api(
             indexed = _ensure_transcript_index(sid)
             if indexed is not None:
                 generation = str(indexed[1].get("history_generation") or "")
+                pre_total = transcript_idx.pre_chain_bubbles(indexed[1])
         except Exception:
             generation = ""
+            pre_total = 0
         if not full and total > 0 and meta.get("message_count", 0) != total:
             try:
                 turns = sum(1 for item in messages if item.get("role") == "user")
@@ -4029,6 +4164,10 @@ def get_session_api(
         "offset": win_offset,
         "has_more": win_offset > 0,
         "has_later": has_later,
+        # Only meaningful while the client is reading normal order: once it has
+        # switched to full order those bubbles are inside `total` already, and
+        # plain `offset > 0` paging reaches them.
+        "pre_total": pre_total if history_order == "normal" else 0,
         "history_generation": generation,
         "history_order": history_order,
     }
@@ -6645,7 +6784,11 @@ _TEXT_EXTS = {
 # frontend" contract — frontend's _classifyFile maps these to "text"
 # too so the chip is consistent.
 _XLSX_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
-_TEXT_MAX_BYTES = 200 * 1024            # inline at most 200 KB as text
+# Was a hard 413 ceiling back when text attachments were pasted into the
+# prompt verbatim. Attachments now go to disk and are referenced by path, so
+# this is only the threshold above which we log "this one was big" — the real
+# limit is _IMAGE_MAX_BYTES, same as every other upload.
+_TEXT_MAX_BYTES = 200 * 1024
 # Caps for xlsx inlining — same shape as the /api/files/xlsx preview
 # endpoint, kept smaller because we're shoving this into the prompt
 # context, not just rendering a table.
@@ -6665,8 +6808,12 @@ def _gc_images() -> None:
 
 def _image_entry_bytes(entry: dict) -> int:
     """Approximate retained size of a staged-upload entry. The base64 payload
-    (images / PDF) dominates; inlined text is already bounded but counted too."""
+    (images / PDF) dominates; text and the raw bytes we hold for disk
+    persistence are counted too — `raw` in particular is un-capped now that
+    text attachments are no longer inlined, so leaving it out of the budget
+    would let the eviction logic under-count by the full file size."""
     return (len(entry.get("b64", ""))
+            + len(entry.get("raw", b""))
             + len(entry.get("text", ""))
             + len(entry.get("name", "")))
 
@@ -7739,7 +7886,14 @@ def get_attachment(session_id: str, filename: str):
         raise HTTPException(400, "bad session_id")
     if "/" in filename or ".." in filename or "\\" in filename:
         raise HTTPException(400, "bad filename")
-    if not _re.fullmatch(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}", filename):
+    # Was `[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}`, which predates this endpoint
+    # serving anything but images named `{aid}.{ext}`. Now that every
+    # attachment persists as `{aid}-{原文件名}`, an ASCII-only pattern 400s
+    # every Chinese filename — i.e. most of them. Widened to "one path
+    # component, no control chars", which combined with the traversal guard
+    # above and the resolve()/relative_to() check below is the actual
+    # security boundary. The `{aid}-` prefix still has to match a real file.
+    if not _re.fullmatch(r"[^/\\\x00-\x1f\x7f]{1,200}", filename):
         raise HTTPException(400, "bad filename format")
     path = _attachments_base() / session_id / filename
     if not path.exists() or not path.is_file():
@@ -7756,6 +7910,18 @@ def get_attachment(session_id: str, filename: str):
     mime = {
         "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
         "gif": "image/gif", "webp": "image/webp",
+        # Non-image attachments now live here too. Text types get an explicit
+        # charset so the browser doesn't mojibake a UTF-8 Chinese .md/.csv,
+        # and PDF gets its real type so the tab renders inline instead of
+        # forcing a download.
+        "pdf": "application/pdf",
+        "txt": "text/plain; charset=utf-8",
+        "md": "text/plain; charset=utf-8",
+        "csv": "text/plain; charset=utf-8",
+        "json": "application/json; charset=utf-8",
+        "yaml": "text/plain; charset=utf-8", "yml": "text/plain; charset=utf-8",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     }.get(ext, "application/octet-stream")
     from fastapi.responses import FileResponse
     return FileResponse(
@@ -7788,36 +7954,36 @@ async def upload_image(file: UploadFile = File(...)) -> dict:
     aid = uuid.uuid4().hex
     entry: dict = {"kind": kind, "mime": mime, "name": name, "ts": time.time()}
     if kind == "text":
-        if len(body) > _TEXT_MAX_BYTES:
-            raise HTTPException(
-                413,
-                f"text file too large: {len(body)} bytes. Max "
-                f"{_TEXT_MAX_BYTES} (~200 KB). Trim it or send as PDF.",
-            )
+        # `raw` is what actually lands on disk at send-time. The decoded
+        # `text` is kept only as a validity check + for anything that still
+        # wants a preview — it is NO LONGER pasted into the prompt.
         try:
             entry["text"] = body.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPException(400, "text file is not valid UTF-8 — "
                                       "convert to UTF-8 or send as PDF") from None
+        # The old 200 KB ceiling existed because the whole file was inlined
+        # into the prompt, where it burned context 1:1. Attachments now go to
+        # disk and the agent Reads only what it needs, so the cap can be the
+        # generic upload limit. Kept as a named constant so the error message
+        # stays honest about which limit was hit.
+        if len(body) > _TEXT_MAX_BYTES:
+            sys.stderr.write(
+                f"[upload] large text attachment: {len(body)} bytes "
+                f"name={Path(name).name!r} — persisted to disk, not inlined\n")
+        entry["raw"] = body
     elif kind == "xlsx":
-        # Convert to text up front; downstream chat code only inlines
-        # entries whose kind is "text", so flip it before storing.
+        # Store the ORIGINAL workbook (the user asked for the real file to
+        # survive) AND a plain-text transcription. Neither alone is enough:
+        # `Read` can't parse the zip container, and a transcription throws
+        # away formulas / multiple sheets / exact cell values the user may
+        # want a script to open later. Both paths go into the prompt.
         # openpyxl load_workbook + full-sheet walk is CPU-heavy and fully
         # synchronous — off-load so a multi-MB xlsx upload doesn't freeze the
         # event loop (and every concurrent SSE stream) mid-parse. (perf: RED —
         # chat.py upload_image xlsx parse)
+        entry["raw"] = body
         entry["text"] = await asyncio.to_thread(_xlsx_to_text, body, name)
-        entry["kind"] = "text"
-        if len(entry["text"].encode("utf-8")) > _TEXT_MAX_BYTES * 2:
-            # Higher cap for converted spreadsheets — the per-cell + row
-            # ceilings already bound output size, this is just a hard
-            # safety rail. 400 KB ≈ 10k rows of 8 short cols.
-            raise HTTPException(
-                413,
-                "spreadsheet too large after conversion. Reduce rows / "
-                "cols and re-upload, or send a CSV of just the slice "
-                "you need.",
-            )
     else:
         # base64-encoding a ~10MB image is tens of ms of pure CPU on the loop
         # — off-load it so the upload doesn't stall concurrent streams.
@@ -8969,8 +9135,12 @@ async def _start_turn(
     # SDK. Consume them — same attachment won't be re-sent on retry.
     img_blocks: list[dict] = []
     pdf_blocks: list[dict] = []
-    text_attachments: list[tuple[str, str]] = []   # (name, content)
-    pdf_path_attachments: list[tuple[str, str]] = []   # (name, local path)
+    # Every non-image attachment lands here as (display name, on-disk path,
+    # optional note). Nothing is pasted into the prompt any more — the user's
+    # call, and the right one: a 200 KB CSV used to cost 200 KB of context on
+    # EVERY subsequent turn because it lived in the transcript forever, while
+    # the agent usually only needed three columns of it.
+    disk_attachments: list[tuple[str, str, str]] = []
     persisted_imgs: list[dict] = []
     persisted_docs: list[dict] = []
     if image_ids:
@@ -9061,56 +9231,55 @@ async def _start_turn(
                 # silently ignore PDF document blocks; the path fallback lets
                 # Claude Code/Agent tools inspect the same PDF via Read.
                 doc_name = entry.get("name", "doc.pdf")
-                attach_dir = _attachments_base() / session_id
-                try:
-                    attach_dir.mkdir(parents=True, exist_ok=True)
-                    attach_path = attach_dir / f"{aid}.pdf"
-                    attach_path.write_bytes(base64.b64decode(entry["b64"]))
-                    pdf_path_attachments.append((doc_name, str(attach_path)))
-                except Exception as _e:
-                    sys.stderr.write(
-                        f"[attach] pdf persist failed sid={session_id} aid={aid} "
-                        f"path={attach_dir} err={type(_e).__name__}: {_e}\n")
-                    sys.stderr.flush()
-                persisted_docs.append({"name": doc_name, "kind": "pdf"})
+                saved = _persist_attachment(
+                    session_id, aid, doc_name,
+                    base64.b64decode(entry["b64"]))
+                if saved:
+                    disk_attachments.append((doc_name, saved[0], ""))
+                persisted_docs.append(_doc_item(doc_name, "pdf", saved))
             elif kind == "text":
-                text_attachments.append((entry.get("name", "file.txt"),
-                                          entry["text"]))
-                persisted_docs.append({"name": entry.get("name", "file.txt"),
-                                        "kind": "text"})
+                doc_name = entry.get("name", "file.txt")
+                saved = _persist_attachment(
+                    session_id, aid, doc_name,
+                    entry.get("raw") or (entry.get("text") or "").encode("utf-8"))
+                if saved:
+                    disk_attachments.append((doc_name, saved[0], ""))
+                persisted_docs.append(_doc_item(doc_name, "text", saved))
+            elif kind == "xlsx":
+                # Original workbook + plain-text transcription, both on disk.
+                doc_name = entry.get("name", "book.xlsx")
+                saved = _persist_attachment(
+                    session_id, aid, doc_name, entry.get("raw") or b"")
+                txt_name = Path(doc_name).stem + ".txt"
+                txt_saved = _persist_attachment(
+                    session_id, aid + "-txt", txt_name,
+                    (entry.get("text") or "").encode("utf-8"))
+                if saved:
+                    note = (f"plain-text transcription: {txt_saved[0]}"
+                            if txt_saved else "")
+                    disk_attachments.append((doc_name, saved[0], note))
+                elif txt_saved:
+                    disk_attachments.append((txt_name, txt_saved[0], ""))
+                persisted_docs.append(_doc_item(doc_name, "xlsx", saved))
 
-    # Prepend inline text attachments to the prompt (any model can consume).
-    if text_attachments:
-        parts = [prompt] if prompt else []
-        for name, body in text_attachments:
-            # Pick a fence longer than the longest backtick run in the body so
-            # an attachment that itself contains ``` can't prematurely close the
-            # code block and let its content bleed into / spoof the prompt.
-            longest_run = cur = 0
-            for ch in body:
-                if ch == "`":
-                    cur += 1
-                    longest_run = max(longest_run, cur)
-                else:
-                    cur = 0
-            fence = "`" * max(3, longest_run + 1)
-            parts.append(
-                f"\n\n--- Attached file: {name} ---\n{fence}\n{body}\n{fence}\n--- end {name} ---"
-            )
-        prompt = "\n".join(parts).lstrip()
-
-    # PDF document blocks are not reliably supported by every
-    # Anthropic-compatible backend. Tell the agent where the same PDF lives on
-    # disk so it can call Read if the native document block is unavailable.
-    if pdf_path_attachments:
+    # Attachments are referenced BY PATH, never inlined. The prompt gets a
+    # manifest; the agent Reads what it needs. Two things this buys:
+    #   - context: a big CSV no longer sits in the transcript forever, re-sent
+    #     on every subsequent turn of the session
+    #   - fidelity: the agent sees the real file (exact bytes, full length),
+    #     not a truncated / fenced copy of it
+    # The old inline path also needed backtick-fence-length arithmetic to stop
+    # an attachment containing ``` from breaking out of its code block and
+    # spoofing prompt text. Referencing by path removes that class of bug.
+    if disk_attachments:
         parts = [prompt] if prompt else []
         lines = [
-            "\n\n--- Attached PDF files available on disk ---",
-            "If you cannot access the PDF document block directly, use the Read tool on these local paths:",
+            "\n\n--- Files attached to this message (on disk) ---",
+            "Use the Read tool on these paths. Do not guess at their contents.",
         ]
-        for name, path in pdf_path_attachments:
-            lines.append(f"- {name}: {path}")
-        lines.append("--- end attached PDF files ---")
+        for name, path, note in disk_attachments:
+            lines.append(f"- {name}: {path}" + (f"  ({note})" if note else ""))
+        lines.append("--- end attached files ---")
         parts.append("\n".join(lines))
         prompt = "\n".join(parts).lstrip()
 
@@ -9154,7 +9323,26 @@ async def _start_turn(
     # marked failed even when ResultMessage itself omits the detail.
     turn_sdk_errors: list[dict] = []
 
-    async def _preflight_compact_if_needed() -> None:
+    async def _emit_compact(emit, phase: str, **fields) -> None:
+        """Push one `compact_progress` SSE event, best-effort.
+
+        A UI cue must never be able to kill the turn it is describing, so every
+        failure here is swallowed. `emit` is None on the paths that have no
+        stream to write to (tests, the post-turn compact) — also a no-op.
+        """
+        if emit is None:
+            return
+        try:
+            payload = {"phase": phase, "source": "auto", **fields}
+            await emit({"event": "compact_progress",
+                        "data": json.dumps(payload)})
+        except Exception as e:
+            sys.stderr.write(
+                f"[chat-preflight] compact_progress emit failed "
+                f"sid={session_id[:8]} phase={phase}: {type(e).__name__}: {e}\n")
+            sys.stderr.flush()
+
+    async def _preflight_compact_if_needed(emit=None) -> None:
         """Use Claude Code's native context accounting before sending a turn.
 
         The previous auto-compact path only ran after a successful `done` event,
@@ -9221,6 +9409,15 @@ async def _start_turn(
             f"[chat-preflight] native compact sid={session_id[:8]} model={model_to_use} "
             f"total={total} next~={next_est} threshold={threshold} limit={limit}\n")
         sys.stderr.flush()
+        # Tell the UI. Without this the auto-compact is indistinguishable from a
+        # slow turn: the FE shows the generic "Muse 正在思考…" bubble for the
+        # entire compact, which on a long session runs MINUTES (2026-07-25: a
+        # 186229/200000 session sat on that bubble for 9m19s and then died on
+        # "/compact ended without a ResultMessage" — the user's read was
+        # "这是在运行啥呢"). The manual compact path has had a dedicated
+        # 📦 bubble since 2026-05-22; this reuses it for the automatic one.
+        await _emit_compact(emit, "start", used=total, limit=limit,
+                            threshold=threshold)
         try:
             async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 600, min_value=1)):
                 await _run_sdk_command_checked(client, "/compact")
@@ -9234,9 +9431,19 @@ async def _start_turn(
                 f"[chat-preflight] native compact failed sid={session_id[:8]} "
                 f"model={model_to_use}: {type(e).__name__}: {e}\n")
             sys.stderr.flush()
+            # The `error` SSE that follows tears the stream down, and the FE
+            # clears `compacting` on stream teardown regardless — but emit the
+            # terminal phase anyway so the bubble's reason is the compact's,
+            # not a generic transport failure.
+            await _emit_compact(emit, "end", ok=False,
+                                error=f"{type(e).__name__}: {e}")
             raise
         real_total = _positive_int(cu2.get("totalTokens"))
         if total and real_total and real_total >= total:
+            # Outside the try/except above, so it needs its own terminal emit.
+            await _emit_compact(
+                emit, "end", ok=False,
+                error=f"context did not shrink ({total} -> {real_total})")
             raise _SDKCommandError({
                 "message": (
                     "native /compact reported success but context usage did not decrease "
@@ -9282,6 +9489,9 @@ async def _start_turn(
             sess_u["auto_compact_threshold"] = th
         if real_total and lim:
             sess_u["context_used_pct"] = round(real_total / lim * 100, 1)
+        # Success. The turn's real query starts immediately after this returns,
+        # so the FE swaps the 📦 bubble back for the normal streaming one.
+        await _emit_compact(emit, "end", ok=True, used=real_total, limit=lim)
 
     async def event_gen():
         nonlocal assistant_acc, streamed_in_bubble
@@ -9319,7 +9529,14 @@ async def _start_turn(
             stale Result until the current query reaches its own terminal.
             """
             async def _run_query() -> None:
-                await _preflight_compact_if_needed()
+                # `merge_q` lives in event_gen's scope, one level deeper than
+                # _preflight_compact_if_needed's — hence the injected emitter
+                # rather than a closure reference. Events ride the same "side"
+                # lane as ask_user_question / permission_request: already
+                # shaped as {"event", "data"} and passed straight through.
+                async def _emit_side(evt: dict) -> None:
+                    await merge_q.put(("side", evt))
+                await _preflight_compact_if_needed(_emit_side)
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
                 # cheap; to_thread keeps a long-session parse off the event loop.
@@ -10284,8 +10501,8 @@ async def _start_turn(
             raise
         finally:
             # event_gen runs as part of a detached background task now;
-            # cleanup here runs after the task finishes naturally (or
-            # the 30-min outer timeout fires and cancels us).
+            # cleanup here runs after the task finishes naturally (or an
+            # explicit interrupt / an armed MUSELAB_TURN_TIMEOUT_S cancels us).
             side_task.cancel()
             perm_task.cancel()
             claude_task.cancel()
@@ -10302,10 +10519,26 @@ async def _start_turn(
     # every event it would have yielded into a per-session TurnBroadcast.
     # The HTTP response is just a subscriber that replays the buffer +
     # streams new events. A user closing their browser doesn't affect
-    # the background task — it runs to completion (or 30-min timeout).
+    # the background task — it runs to completion (or until interrupted).
     # A second SSE request to the same session (reconnect) becomes
     # another subscriber and sees the full reply via replay + live tail.
-    BG_TIMEOUT_S = 1800   # 30 minutes — see PR thread for rationale
+    # Wall-clock cap on a whole turn. 0 (the default) disables it.
+    #
+    # This used to be a hard 1800s. A wall-clock cap is the wrong shape for an
+    # agentic workspace: it can't tell "wedged" from "busy", so it kills turns
+    # that are actively producing output. A full test suite, a migration or a
+    # deep tool loop legitimately runs past 30 minutes, and the kill is total
+    # loss — the SDK CLI only writes the JSONL on completion, so an aborted
+    # turn leaves NO transcript record of its work or of why it stopped
+    # (`_error_event` is live-only SSE; miss the moment and the reason is gone).
+    #
+    # Nothing depends on it as a safety net: POST /interrupt marks the turn
+    # cancelled and schedules _force_stop_after_grace independently of this
+    # timeout, so a genuinely wedged turn already has an escape hatch that
+    # works whether or not a cap exists.
+    #
+    # Set MUSELAB_TURN_TIMEOUT_S to a positive number to re-arm it.
+    BG_TIMEOUT_S = env_int("MUSELAB_TURN_TIMEOUT_S", 0, min_value=0)
 
     # `broadcast` was already reserved under _lock at the top of NEW-TURN
     # MODE to close the check+insert race. Fill its remaining fields now
@@ -10324,7 +10557,8 @@ async def _start_turn(
     async def _pump_gen_to_broadcast():
         turn_errored = False
         try:
-            async with asyncio.timeout(BG_TIMEOUT_S):
+            # None → asyncio.timeout is a no-op wrapper (no deadline armed).
+            async with asyncio.timeout(BG_TIMEOUT_S or None):
                 async for ev in event_gen():
                     # Track in-band errors too (merge_q "error" → an SSE error
                     # event flows through event_gen without raising). The queue
@@ -10346,10 +10580,11 @@ async def _start_turn(
         except asyncio.TimeoutError:
             turn_errored = True
             sys.stderr.write(
-                f"[chat] turn exceeded {BG_TIMEOUT_S}s (30min), aborting "
-                f"sid={session_id}\n")
+                f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
+                f"aborting sid={session_id}\n")
             sys.stderr.flush()
-            broadcast.publish(_error_event("turn exceeded 30min"))
+            broadcast.publish(
+                _error_event(f"turn exceeded {BG_TIMEOUT_S}s"))
         except Exception as e:
             turn_errored = True
             import traceback as _tb

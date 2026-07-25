@@ -1158,10 +1158,23 @@ def requeue_head(sid: str, item: dict) -> dict:
 
 
 def remove_queue_item(sid: str, item_id: str) -> dict:
-    """Remove one item by id. Returns the updated queue snapshot."""
+    """Remove one item by id. Returns the updated queue snapshot.
+
+    Emptying the queue also clears ``paused``. The flag means "there is queued
+    work that stopped auto-draining because a turn errored" — with no items
+    left it has no referent, and leaving it set is a silent trap: the next
+    enqueue lands in a queue whose ``dequeue_message`` returns None forever, so
+    the message sits there through every subsequent completed turn with no
+    banner and no error. Observed 2026-07-25: a 30-min-cap abort paused a queue
+    of 2, the user deleted both stale items, enqueued 2 fresh ones, and they
+    never sent. It also unblocks _save_queue's empty-file cleanup, which skips
+    deletion while ``paused`` is true — sessions/ had zombie
+    ``{items: [], paused: true}`` files dating back a week."""
     with _QUEUE_LOCK:
         data = _load_queue(sid)
         data["items"] = [it for it in data["items"] if it.get("id") != item_id]
+        if not data["items"]:
+            data["paused"] = False
         _save_queue(sid, data)
         return data
 

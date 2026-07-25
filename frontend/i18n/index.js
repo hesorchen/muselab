@@ -277,6 +277,11 @@ window.MUSELAB_STRINGS = {
     "rl.limited": "已限流",
     "rl.overage": "超额",
     "rl.resets": "{t}后重置",
+    // label = visible field caption, title = tooltip prose. Mirrors
+    // thinking.label / thinking.title below. Using `title` as a caption
+    // wrapped to 3 lines and blew the composer settings panel past its
+    // clip box.
+    "effort.label": "Effort",
     "effort.title": "Effort — Anthropic 官方术语，控制推理预算与 agentic loop 深度（不译）",
     "effort.auto": "Effort · auto",
     "effort.low": "Effort · low",
@@ -664,6 +669,7 @@ window.MUSELAB_STRINGS = {
     "rl.limited": "Rate-limited",
     "rl.overage": "Overage",
     "rl.resets": "resets in {t}",
+    "effort.label": "Effort",
     "effort.title": "Reasoning effort — thinking budget + agentic loop depth",
     "effort.auto": "Effort · auto",
     "effort.low": "Effort · low",

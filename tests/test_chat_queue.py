@@ -151,6 +151,39 @@ def test_remove_queue_item(app_module):
     assert [it["id"] for it in data2["items"]] == [b]
 
 
+def test_removing_the_last_item_also_clears_paused(app_module):
+    """`paused` must not outlive the items it was protecting.
+
+    Real failure, 2026-07-25: a wall-clock-capped turn aborted and paused a
+    2-item queue. The user deleted both stale items by hand, then sent two new
+    messages — which never went out. dequeue_message returns None while paused,
+    so every subsequent completed turn silently skipped the drain, and the
+    banner that would have explained it was gated on `!streaming`. The flag
+    describes "queued work stopped auto-draining"; with no work left it has no
+    referent and is purely a trap for the NEXT enqueue.
+    """
+    sess = _sess(app_module)
+    sid = "s-unpause-on-empty"
+    a = sess.enqueue_message(sid, "a")["item"]["id"]
+    b = sess.enqueue_message(sid, "b")["item"]["id"]
+    sess.set_queue_paused(sid, True)
+
+    # Removing one of two leaves the pause intact — there IS still work.
+    data = sess.remove_queue_item(sid, a)
+    assert data["paused"] is True
+
+    data = sess.remove_queue_item(sid, b)
+    assert data["items"] == []
+    assert data["paused"] is False
+    # A queue that is empty AND un-paused leaves no file behind; a stale
+    # `paused` used to block that cleanup too (sessions/ had zombie
+    # {items: [], paused: true} files up to a week old).
+    assert not sess._queue_path(sid).exists()
+    # And the next message drains normally instead of vanishing.
+    sess.enqueue_message(sid, "fresh")
+    assert sess.dequeue_message(sid)["text"] == "fresh"
+
+
 def test_clear_queue_empties_and_unpauses(app_module):
     sess = _sess(app_module)
     sid = "s-clear"
