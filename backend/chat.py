@@ -2371,6 +2371,24 @@ class _SessionStream:
         if self._turn is q:
             self._turn = None
 
+    def park_unconsumed(self, q: asyncio.Queue) -> None:
+        """Hand a detached consumer's leftovers back to the orphan park.
+
+        A slash-command consumer (`_run_sdk_command_checked`) stops at ITS
+        ResultMessage, but the pump may already have routed later messages into
+        the same queue — a background task's notification, an auto-continuation.
+        Letting the queue fall out of scope would drop them silently, so they go
+        back to `_orphans` for whoever attaches next.
+        """
+        while True:
+            try:
+                msg = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if msg is _STREAM_EOF:
+                continue
+            self._orphans.append(msg)
+
     def attach_background(self) -> asyncio.Queue:
         """Register the task watcher as the sink for messages nobody owns.
 
@@ -5647,14 +5665,28 @@ class _SDKCommandError(RuntimeError):
 async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> ResultMessage:
     """Run a CLI slash command and require an explicitly successful Result.
 
+    Reads through the session's pump (`_SessionStream`) rather than opening
+    `client.receive_response()`. The SDK gives a client exactly ONE message
+    stream and the pump has owned it since client creation, so a second iterator
+    here lost every race — the command's ResultMessage went to the pump's
+    `_orphans` park and this function waited on a stream nobody was feeding.
+    The turn loop was migrated to `attach_turn()` when the pump landed; this
+    call site was missed. Symptom (2026-07-26): two auto-compacts reported
+    failure after 600s (TimeoutError) and 9m19s ("ended without a
+    ResultMessage") while the transcript shows both compactions had finished in
+    ~150s. Both were FALSE NEGATIVES — `query()` is a pure transport write, so
+    the command itself always ran.
+
     Assistant/API errors are in-band SDK messages, not Python exceptions. Drain
     through the terminal Result before raising so a failed command cannot leave
     a stale Result in the pooled client's receive queue for the next turn.
     """
-    await client.query(command)
     errors: list[dict] = []
     result: ResultMessage | None = None
-    async for msg in client.receive_response():
+
+    def _note(msg) -> bool:
+        """Record one message; True once the terminal Result has been seen."""
+        nonlocal result
         if isinstance(msg, AssistantMessage):
             if info := _sdk_assistant_error(msg):
                 errors.append(info)
@@ -5662,7 +5694,33 @@ async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> Res
             result = msg
             if info := _sdk_result_error(msg):
                 errors.append(info)
-            break
+            return True
+        return False
+
+    stream = _stream_for(client)
+    if stream is not None:
+        # Attach BEFORE query(): anything the pump routes between the write and
+        # the attach would be parked as an orphan, and attach_turn deliberately
+        # does not adopt orphans, so a late attach could miss its own Result.
+        q = stream.attach_turn()
+        try:
+            await client.query(command)
+            while True:
+                msg = await q.get()
+                if msg is _STREAM_EOF:
+                    break
+                if _note(msg):
+                    break
+        finally:
+            stream.detach_turn(q)
+            stream.park_unconsumed(q)
+    else:
+        # No pump — a client built outside the pool (unit tests). The SDK's own
+        # bounded reader is then the only reader, so it is safe to use.
+        await client.query(command)
+        async for msg in client.receive_response():
+            if _note(msg):
+                break
     if result is None:
         errors.append({
             "message": f"{command} ended without a ResultMessage",
@@ -5783,7 +5841,9 @@ async def _native_compact_session_locked(sid: str) -> dict:
             pass
         # Bound the wait: a hung CLI /compact would otherwise leave this HTTP
         # request open forever (the main turn loop has its own 1800s guard).
-        async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 600, min_value=1)):
+        # 300s is ~2x the observed worst case (~150s at 190K tokens) now that
+        # the command reads through the pump instead of racing it.
+        async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)):
             await _run_sdk_command_checked(client, "/compact")
         post_compact_usage = dict(await client.get_context_usage())
         after_total = _positive_int(post_compact_usage.get("totalTokens"))
@@ -9418,32 +9478,47 @@ async def _start_turn(
         # 📦 bubble since 2026-05-22; this reuses it for the automatic one.
         await _emit_compact(emit, "start", used=total, limit=limit,
                             threshold=threshold)
+        # How the command REPORTS itself is a hint; whether the context actually
+        # shrank is the fact. Keep the command's verdict aside and let the token
+        # count adjudicate, so a compaction that succeeded but failed to
+        # acknowledge itself cannot kill the turn it just made room for.
+        cmd_error: Exception | None = None
         try:
-            async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 600, min_value=1)):
+            async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)):
                 await _run_sdk_command_checked(client, "/compact")
+        except Exception as e:
+            cmd_error = e
+            sys.stderr.write(
+                f"[chat-preflight] native compact reported failure sid={session_id[:8]} "
+                f"model={model_to_use}: {type(e).__name__}: {e} — verifying\n")
+            sys.stderr.flush()
+        try:
             cu2 = await client.get_context_usage()
         except Exception as e:
-            # Once the SDK says compaction is required, failure is terminal for
-            # this turn. Sending the original prompt anyway only produces a
-            # second context-window error and trains the UI to offer a useless
-            # retry loop.
+            # Can't observe the outcome, so the command's verdict is all we
+            # have. No reading also means no evidence of success.
+            await _emit_compact(emit, "end", ok=False,
+                                error=f"{type(e).__name__}: {e}")
+            raise cmd_error or e
+        real_total = _positive_int(cu2.get("totalTokens"))
+        if not (total and real_total and real_total < total):
+            # Genuinely no room made. Once the SDK says compaction is required,
+            # that is terminal for this turn — sending the original prompt
+            # anyway only produces a second context-window error and trains the
+            # UI to offer a useless retry loop.
+            reason = (f"{type(cmd_error).__name__}: {cmd_error}" if cmd_error
+                      else f"context did not shrink ({total} -> {real_total})")
             sys.stderr.write(
                 f"[chat-preflight] native compact failed sid={session_id[:8]} "
-                f"model={model_to_use}: {type(e).__name__}: {e}\n")
+                f"model={model_to_use}: {reason}\n")
             sys.stderr.flush()
             # The `error` SSE that follows tears the stream down, and the FE
             # clears `compacting` on stream teardown regardless — but emit the
             # terminal phase anyway so the bubble's reason is the compact's,
             # not a generic transport failure.
-            await _emit_compact(emit, "end", ok=False,
-                                error=f"{type(e).__name__}: {e}")
-            raise
-        real_total = _positive_int(cu2.get("totalTokens"))
-        if total and real_total and real_total >= total:
-            # Outside the try/except above, so it needs its own terminal emit.
-            await _emit_compact(
-                emit, "end", ok=False,
-                error=f"context did not shrink ({total} -> {real_total})")
+            await _emit_compact(emit, "end", ok=False, error=reason)
+            if cmd_error is not None:
+                raise cmd_error
             raise _SDKCommandError({
                 "message": (
                     "native /compact reported success but context usage did not decrease "
@@ -9452,6 +9527,12 @@ async def _start_turn(
                 "source": "verification",
                 "api_error_status": None,
             })
+        if cmd_error is not None:
+            sys.stderr.write(
+                f"[chat-preflight] native compact recovered sid={session_id[:8]}: "
+                f"command reported {type(cmd_error).__name__} but context shrank "
+                f"{total} -> {real_total}; continuing\n")
+            sys.stderr.flush()
         real_max = _positive_int(cu2.get("maxTokens"))
         real_raw = _positive_int(cu2.get("rawMaxTokens"))
         refreshed_details = _context_limit_details(

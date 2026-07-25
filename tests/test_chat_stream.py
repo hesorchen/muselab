@@ -2015,3 +2015,148 @@ def test_preflight_compact_announces_itself_over_sse(stream_env, client, monkeyp
     kinds = [e for e, _ in events]
     assert kinds.index("compact_progress") < kinds.index("error")
     assert kinds.count("compact_progress") == 2
+
+
+def test_sdk_command_reads_through_the_session_pump(stream_env):
+    """A slash command must not open a SECOND iterator over the client stream.
+
+    Regression for 2026-07-26. `_SessionStream`'s pump has owned
+    `receive_messages()` since client creation, so the `receive_response()`
+    this helper used to open lost every race: /compact's ResultMessage was
+    routed to the pump and parked in `_orphans`, and the helper waited on a
+    stream nobody was feeding. Two auto-compacts reported failure after 600s
+    and 9m19s while the transcript shows both compactions had finished in
+    ~150s — `query()` is a pure transport write, so the command always ran.
+    """
+    chat_mod = stream_env
+    result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id="sid", uuid="r1")
+
+    class PumpedClient:
+        """Only `receive_messages()` works — `receive_response()` is a trap."""
+
+        def __init__(self):
+            self.queries = []
+            self._q = asyncio.Queue()
+
+        async def query(self, prompt):
+            self.queries.append(prompt)
+            self._q.put_nowait(result)
+
+        async def receive_messages(self):
+            while True:
+                yield await self._q.get()
+
+        async def receive_response(self):
+            raise AssertionError(
+                "opened a second iterator instead of attaching to the pump")
+            yield  # pragma: no cover — keeps this an async generator
+
+    async def go():
+        fake = PumpedClient()
+        chat_mod._ensure_session_stream(("sid", "m", ""), fake)
+        try:
+            # The bug's signature was a hang, so the bound is the assertion.
+            got = await asyncio.wait_for(
+                chat_mod._run_sdk_command_checked(fake, "/compact"), 5)
+        finally:
+            await chat_mod._drop_session_streams("sid")
+        assert fake.queries == ["/compact"]
+        return got
+
+    assert asyncio.run(go()) is result
+
+
+def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
+    """Stopping at our own Result must not swallow what the pump queued after it.
+
+    A slash command breaks on its ResultMessage, but the pump routes
+    everything to the attached queue — a background task's notification can
+    already be sitting behind it. Letting the queue fall out of scope would
+    drop that message with no trace.
+    """
+    chat_mod = stream_env
+    later = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="t", status="completed",
+        output_file="", summary="done", uuid="bg", session_id="sid")
+
+    class IdleClient:
+        async def receive_messages(self):
+            await asyncio.Event().wait()
+            yield  # pragma: no cover — never reached
+
+    async def go():
+        stream = chat_mod._SessionStream(("sid", "m", ""), IdleClient())
+        try:
+            q = stream.attach_turn()
+            q.put_nowait(later)
+            q.put_nowait(chat_mod._STREAM_EOF)
+            stream.detach_turn(q)
+            stream.park_unconsumed(q)
+        finally:
+            await stream.aclose()
+        return list(stream._orphans)
+
+    # EOF is a wake-up sentinel, not a message — it must not be re-parked.
+    assert asyncio.run(go()) == [later]
+
+
+def test_preflight_compact_trusts_the_token_count_over_the_verdict(
+        stream_env, client, monkeypatch):
+    """A compaction that succeeded must not lose the turn it made room for.
+
+    How the command REPORTS itself is a hint; whether the context shrank is
+    the fact. On 2026-07-26 the two were opposites — /compact finished in
+    ~150s and freed the window, then the read side timed out and the preflight
+    killed the user's prompt anyway. Belt and braces for the pump fix above:
+    even if the verdict is lost again, an observably smaller context wins.
+    """
+    chat_mod = stream_env
+    sid = _make_session(client)
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="/compact ended without a ResultMessage", api_error_status=None)
+    answer = [
+        AssistantMessage(
+            content=[TextBlock(text="room to think")],
+            model="claude-sonnet-4-6", uuid="a1",
+            usage={"input_tokens": 4, "output_tokens": 2}),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.01, usage={"input_tokens": 4, "output_tokens": 2},
+            result="room to think", uuid="r1"),
+    ]
+    fake = _FakeBatchedStreamClient([[compact_error], answer])
+    reads = []
+
+    async def shrinking_context():
+        # First read is the preflight's trigger; every later read sees the
+        # compaction's effect, which is what the recovery hinges on.
+        reads.append(len(reads))
+        return {
+            "maxTokens": 200_000, "rawMaxTokens": 200_000,
+            "autoCompactThreshold": 160_000,
+            "totalTokens": 190_000 if len(reads) == 1 else 50_000,
+        }
+
+    fake.get_context_usage = shrinking_context
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+                   f"&prompt=still-send-me&model=claude-sonnet-4-6")
+    events = _parse_sse(r.text)
+    kinds = [e for e, _ in events]
+    prog = [json.loads(d) for e, d in events if e == "compact_progress"]
+
+    assert "error" not in kinds
+    assert prog[-1]["phase"] == "end" and prog[-1]["ok"] is True
+    assert prog[-1]["used"] == 50_000
+    # The prompt survived the scare — it was sent after the compact, not dropped.
+    assert fake.queried[0] == "/compact"
+    assert len(fake.queried) == 2
