@@ -11,9 +11,15 @@ The daemon (127.0.0.1:8800 by default) exposes:
   POST /add     {messages, run_id?, user_id?, agent_id?, infer}
 
 Scope mapping for single-user muselab:
-  run_id   = session_id   (per-conversation memory isolation)
-  user_id  = fixed constant (all turns share one logical owner)
-  agent_id = model         (optional; lets memories note which model wrote them)
+  user_id  = fixed constant ("muselab") — the ONE persistent memory pool,
+             shared across ALL sessions. This is what makes recall work
+             cross-session (a fact learned in session A is recalled in B).
+  agent_id = model         (optional tag noting which model wrote a memory)
+
+NOTE: we deliberately do NOT pass mem0's `run_id`. run_id is mem0's finest
+isolation scope (per single conversation); passing it to both add and search
+would silo every session's memory and defeat the whole point. For a single
+user there is no value in that isolation — one user_id pool is correct.
 """
 import logging
 
@@ -56,15 +62,16 @@ def _extract_text(results) -> list[str]:
 async def search_context(query: str, session_id: str) -> str:
     """Return a prompt-ready memory block for `query`, or "" if none / disabled.
 
-    The returned string, when non-empty, is a self-contained section safe to
-    prepend to the user prompt. Never raises."""
+    `session_id` is accepted but intentionally unused: memory is a single
+    cross-session pool keyed by user_id. The param is kept so callers don't
+    change and so a future per-project namespace can hook in here. Never
+    raises."""
     if not enabled() or not query.strip():
         return ""
     try:
         import httpx
         payload = {
             "query": query,
-            "run_id": session_id,
             "user_id": _USER_ID,
             "limit": _SEARCH_LIMIT,
         }
@@ -91,8 +98,11 @@ async def store_turn(session_id: str, model: str, user_text: str,
                      assistant_text: str) -> None:
     """Persist one completed (user, assistant) exchange to mem0. Never raises.
 
-    mem0's LLM fact-extractor (infer=True) distills durable facts from the
-    exchange; we hand it the raw two-message conversation."""
+    `session_id` is accepted but intentionally unused (see search_context):
+    the exchange is stored into the single user_id-keyed pool so it is
+    recallable from any later session. mem0's LLM fact-extractor (infer=True)
+    distills durable facts from the exchange; we hand it the raw two-message
+    conversation."""
     if not enabled():
         return
     if not user_text.strip() and not assistant_text.strip():
@@ -105,7 +115,6 @@ async def store_turn(session_id: str, model: str, user_text: str,
         ]
         payload = {
             "messages": messages,
-            "run_id": session_id,
             "user_id": _USER_ID,
             "agent_id": model or None,
             "infer": True,
