@@ -1231,6 +1231,7 @@ MODEL_CONTEXT_LIMITS = {
     "deepseek-reasoner":            128_000,
     # Zhipu GLM 5 series — 200K context, 128K output cap.
     "glm-5.2-internal":              200_000,
+    "glm-5.2":                       200_000,
     "glm-5":                         200_000,
     "glm-5-air":                     200_000,
     "glm-4.7":                       200_000,
@@ -1251,6 +1252,9 @@ MODEL_CONTEXT_LIMITS = {
     "codex:gpt-5.4":                  272_000,
     "codex:gpt-5.4-mini":             272_000,
     "codex:gpt-5.3-codex-spark":      128_000,
+    # Direct-GPT route (no codex: prefix) — local patch mirrors codex:* above.
+    "gpt-5.6-sol":                    372_000,
+    "gpt-5.5":                        272_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
 CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT = 95
@@ -9627,9 +9631,10 @@ async def _start_turn(
                 boundary = _TurnResponseBoundary(existing_uuids)
                 # mem0 recall: best-effort semantic memory from prior turns,
                 # prepended to the prompt. Fail-soft (returns "" if the daemon
-                # is off/down), so with MEM0_DAEMON_URL unset behavior is
-                # identical to before — `prompt` itself is never mutated.
-                _mem_block = await mem0.search_context(prompt, session_id)
+                # is off/down); `prompt` is otherwise unchanged so behavior with
+                # MEM0_DAEMON_URL unset is identical to before.
+                _mem_query = prompt
+                _mem_block = await mem0.search_context(_mem_query, session_id)
                 query_prompt = _mem_block + prompt if _mem_block else prompt
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
@@ -10250,17 +10255,9 @@ async def _start_turn(
                     session_id, new_user_uuid,
                     images=persisted_imgs or None,
                     docs=persisted_docs or None)
-            # mem0 write: persist the completed (user, assistant) exchange as a
-            # fire-and-forget background task so it never delays the 'done' SSE.
-            # Fail-soft inside store_turn; no-op when MEM0_DAEMON_URL is unset.
-            # Uses the ORIGINAL `prompt` (not the memory-augmented query_prompt)
-            # so recalled context is never fed back into the store.
-            if mem0.enabled():
-                _asst_full = "".join(assistant_acc)
-                if _asst_full.strip():
-                    asyncio.create_task(
-                        mem0.store_turn(session_id, model_to_use,
-                                        prompt, _asst_full))
+            # mem0 write is deferred to AFTER we compute was_cancelled / _is_error
+            # below — we must not distill a cancelled or errored turn into a
+            # "durable fact". See the mem0.schedule_store(...) call further down.
             # message_count = total transcript size; auto-rename from first
             # user message text if session is still auto-named. These counts
             # need the full transcript, so parse it now if the fast UUID path
@@ -10455,6 +10452,19 @@ async def _start_turn(
             _error_class = _classify_stream_error(_error_message) if _is_error else {
                 "kind": None, "cta": None, "retryable": False,
             }
+            # mem0 write (deferred to here so turn status is known): persist the
+            # completed (user, assistant) exchange ONLY on a clean success —
+            # never a user-cancelled turn (was_cancelled) nor an errored/partial
+            # one (_is_error), so a wrong or aborted draft can't be distilled
+            # into a "durable fact" and recalled forever. Tracked + shutdown-
+            # drained via mem0.schedule_store (not a bare create_task). Uses the
+            # ORIGINAL `prompt`, never the memory-augmented query_prompt, so
+            # recalled context is not fed back into the store. Fully fail-soft.
+            if mem0.enabled() and not was_cancelled and not _is_error:
+                _asst_full = "".join(assistant_acc)
+                if _asst_full.strip():
+                    mem0.schedule_store(session_id, model_to_use,
+                                        prompt, _asst_full)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,

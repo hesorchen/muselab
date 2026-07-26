@@ -1,6 +1,6 @@
 [project]
 name = "muselab"
-version = "1.2.0"
+version = "1.1.0"
 description = "Self-hosted web UI for the Claude Agent SDK — talk to your own files with Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -77,6 +77,12 @@ dependencies = [
     # PYSEC-2026-175/177/178/179 (all fixed in 2.13.0). Direct constraint
     # so the pip-audit CVE-scan CI job stays green.
     "pyjwt[crypto]>=2.13.0",
+    # Direct async HTTP client. Used by backend/memory_client.py to talk to the
+    # optional self-hosted mem0 daemon. It is already an SDK/httpcore transitive
+    # dep today, but we import it directly, so declare it explicitly — otherwise
+    # an upstream drop would make `import httpx` fail and (because mem0 is
+    # fail-soft) silently disable memory with no signal.
+    "httpx>=0.27",
 ]
 
 [project.urls]

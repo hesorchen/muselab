@@ -238,6 +238,13 @@ async def _lifespan(app: FastAPI):
         # PTY workers outlive individual WebSocket connections so refreshes
         # can reattach. They must not outlive the muselab service itself.
         await _terminal_manager.shutdown()
+        # Drain any in-flight mem0 memory writes so a turn that just finished
+        # still gets persisted across a restart (best-effort, time-bounded).
+        try:
+            from . import memory_client as _mem0
+            await _mem0.aclose()
+        except Exception:
+            pass
 
 
 async def _backfill_turn_counts() -> None:
