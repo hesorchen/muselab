@@ -514,7 +514,12 @@ function portal() {
     },
     activity: {
       show: false, loading: false, events: [],
-      summary: { running: 0, unread: 0, attention: 0, workspaces: [] },
+      summary: {
+        running: 0, unread: 0, attention: 0,
+        groups: { review: 0, running: 0, failed: 0, history: 0 },
+        group_unread: { review: 0, running: 0, failed: 0, history: 0 },
+        workspaces: [],
+      },
       // group key -> true when the user asked to see past the row cap.
       expanded: {},
       // Selected group keys. Empty array = no filter = show every group.
@@ -522,6 +527,8 @@ function portal() {
     },
     _activityEtags: {},
     _activityFetchPromises: {},
+    _activityRequestSeq: 0,
+    _activityAppliedSeq: 0,
     // Per-task "run-now" inflight flag — disables retry / send buttons
     // until the LLM call returns and history is reloaded. Keyed by task id.
     schedRunning: {},
@@ -21661,16 +21668,26 @@ function portal() {
     async fetchActivity(opts = {}) {
       const key = opts.summaryOnly ? "summary" : "events";
       if (this._activityFetchPromises[key]) return this._activityFetchPromises[key];
+      const seq = ++this._activityRequestSeq;
       const promise = (async () => {
         try {
-          const path = opts.summaryOnly ? "/api/activity/summary" : "/api/activity?limit=150";
+          const path = opts.summaryOnly ? "/api/activity/summary" : "/api/activity?limit=500";
           const headers = { ...this.hdr() };
           if (this._activityEtags[key]) headers["If-None-Match"] = this._activityEtags[key];
-          const r = await fetch(path, { headers });
+          let r = await fetch(path, { headers });
+          // A long-lived tab can retain an ETag while Alpine state is rebuilt.
+          // Never accept a 304 as the only source for an empty task list.
+          if (r.status === 304 && !opts.summaryOnly && !this.activity.events.length) {
+            delete this._activityEtags[key];
+            delete headers["If-None-Match"];
+            r = await fetch(path, { headers, cache: "reload" });
+          }
           if (r.status === 304 || !r.ok) return false;
           const etag = r.headers.get("etag");
           if (etag) this._activityEtags[key] = etag;
           const data = await r.json();
+          if (seq < this._activityAppliedSeq) return false;
+          this._activityAppliedSeq = seq;
           const summary = opts.summaryOnly ? data : data.summary;
           if (summary) this.activity.summary = summary;
           if (!opts.summaryOnly && Array.isArray(data.events)) this.activity.events = data.events;
@@ -21690,31 +21707,40 @@ function portal() {
     },
     activityGroups() {
       const zh = this.lang === "zh";
-      // Grouped strictly by STATE, in the order the user has to act on them.
-      // Read/unread deliberately no longer decides the group: it used to, and
-      // a finished task jumped from "results to review" into "recent" the
-      // moment you glanced at it — items moving under the cursor makes the
-      // list impossible to build any spatial memory of. Unread is shown
-      // in-row instead (see .activity-row.is-unread).
+      // Attention order: new results first, then live work, failures, history.
+      // A completed row intentionally moves to history after it is opened.
       return [
-        { key: "attention", label: zh ? "待决策" : "Awaiting decision", states: ["waiting_approval"] },
-        // Failure used to live under a heading that read "Recent" — a failed
-        // task is not a completed one, and burying it there is why the filter
-        // below needed a special case to keep unread failures visible at all.
-        { key: "failed", label: zh ? "运行失败" : "Failed", states: ["failed"] },
-        // Paused is an interrupted run, not an outcome, so it belongs here
-        // rather than under a heading that asks the user for a decision.
-        { key: "running", label: zh ? "进行中" : "Running", states: ["running", "paused"] },
-        { key: "done", label: zh ? "已结束" : "Finished", states: ["completed", "cancelled"] },
+        { key: "review", label: zh ? "已完成 · 待查看" : "Completed · Unread" },
+        { key: "running", label: zh ? "进行中" : "Running" },
+        { key: "failed", label: zh ? "运行失败" : "Failed" },
+        { key: "history", label: zh ? "历史任务" : "History" },
       ];
     },
-    // Rows shown per group before "show all". A durable cross-workspace
-    // ledger accumulates hundreds of finished tasks, and an uncapped list
-    // buries the two groups that need action under the one that does not.
     ACTIVITY_GROUP_CAP: 5,
+    activityMatchesGroup(item, key) {
+      if (!item) return false;
+      if (key === "review") return item.state === "completed" && !item.read;
+      if (key === "running") return ["running", "waiting_approval", "paused"].includes(item.state);
+      if (key === "failed") return item.state === "failed";
+      if (key === "history") {
+        return (item.state === "completed" && !!item.read) || item.state === "cancelled";
+      }
+      return false;
+    },
+    activityEventTimestamp(item) {
+      return Number(item?.updated_at || item?.finished_at || item?.started_at || 0);
+    },
     activityAllEvents(group) {
-      const states = new Set(group.states || []);
-      return (this.activity.events || []).filter(item => states.has(item.state));
+      const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
+      return (this.activity.events || [])
+        .filter(item => this.activityMatchesGroup(item, group.key))
+        .sort((a, b) => {
+          if (group.key === "running") {
+            const rank = (activeRank[a.state] ?? 9) - (activeRank[b.state] ?? 9);
+            if (rank) return rank;
+          }
+          return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+        });
     },
     activityEvents(group) {
       const all = this.activityAllEvents(group);
@@ -21728,13 +21754,10 @@ function portal() {
     toggleActivityGroup(key) {
       this.activity.expanded[key] = !this.activity.expanded[key];
     },
-    // Header-chip count. Deliberately computed from the loaded events rather
-    // than from `activity.summary`: the backend summary only reports
-    // running/unread/attention, which is exactly why the header used to show
-    // two numbers while the body showed four groups. Counting client-side
-    // keeps the two in sync with no API change.
     activityGroupCount(group) {
-      return this.activityAllEvents(group).length;
+      const count = this.activity.summary?.groups?.[group.key];
+      return Number.isFinite(Number(count))
+        ? Number(count) : this.activityAllEvents(group).length;
     },
     activityVisibleGroups() {
       const groups = this.activityGroups();
@@ -21742,10 +21765,6 @@ function portal() {
       if (!on.length) return groups;
       return groups.filter(g => on.includes(g.key));
     },
-    // Multi-select, not radio. The chips read as a filter bar, and a filter bar
-    // that silently drops your previous pick when you add a second one is the
-    // kind of thing you only notice after wondering where the failures went.
-    // Empty selection === show everything (no "all" chip needed).
     isActivityFilterOn(key) {
       return (this.activity.filter || []).includes(key);
     },
@@ -21754,22 +21773,22 @@ function portal() {
       const at = on.indexOf(key);
       if (at >= 0) on.splice(at, 1);
       else on.push(key);
-      // Replace the array rather than mutate: Alpine v3 doesn't deep-wrap
-      // array contents, so an in-place splice on the nested `activity.filter`
-      // wouldn't re-run the `:class` bindings.
       this.activity.filter = on;
     },
     clearActivityFilter() {
       this.activity.filter = [];
     },
-    // Unread-in-this-group count. Drives the chip's colour: a group only earns
-    // its warning/danger tint while something in it is UNACKED. Opening an
-    // event acks it (openActivityEvent → POST /ack), so a failure you've
-    // already looked at stops shouting — previously the red dot was keyed to
-    // "group is non-empty", which meant it never went away.
+    activityIsUnreadResult(item) {
+      return !!item && ["completed", "failed"].includes(item.state) && !item.read;
+    },
+    activityRequiresAction(item) {
+      return !!item && ["waiting_approval", "paused"].includes(item.state);
+    },
     activityGroupUnread(group) {
+      const count = this.activity.summary?.group_unread?.[group.key];
+      if (Number.isFinite(Number(count))) return Number(count);
       return this.activityAllEvents(group)
-        .filter(x => x && x.needs_attention && !x.read).length;
+        .filter(item => this.activityIsUnreadResult(item) || this.activityRequiresAction(item)).length;
     },
     activityStateLabel(state) {
       const zh = this.lang === "zh";
@@ -21778,22 +21797,38 @@ function portal() {
         failed: zh ? "失败" : "Failed", cancelled: zh ? "已取消" : "Cancelled" })[state] || state;
     },
     activityTime(item) {
-      const ts = Number(item.finished_at || item.started_at || 0) * 1000;
+      const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
     },
-    async openActivityEvent(item) {
-      if (!item) return;
-      if (item.needs_attention && !item.read) {
+    async ackActivityEvent(item, retries = 2) {
+      if (!this.activityIsUnreadResult(item)) return true;
+      for (let attempt = 0; attempt <= retries; attempt += 1) {
         try {
           const r = await fetch(`/api/activity/${encodeURIComponent(item.id)}/ack`,
             { method: "POST", headers: this.hdr() });
-          if (r.ok) { const d = await r.json(); item.read = true; this.activity.summary = d.summary; }
+          if (r.ok) {
+            const d = await r.json();
+            this._activityAppliedSeq = ++this._activityRequestSeq;
+            item.read = true;
+            this.activity.events = [...this.activity.events];
+            this.activity.summary = d.summary;
+            return true;
+          }
         } catch (_) {}
+        if (attempt < retries) await new Promise(resolve => setTimeout(resolve, 250));
       }
+      this.toast(this.lang === "zh" ? "已打开任务，但未能同步已查看状态" :
+        "Opened the task, but could not sync its read state", "warn", 3000);
+      return false;
+    },
+    async openActivityEvent(item) {
+      if (!item) return;
       this.activity.show = false;
+      const ack = this.ackActivityEvent(item);
       const sid = item.session_id || item.thread_id;
       if (sid) await this._openSessionFromDeeplink(sid);
+      await ack;
       this._syncAppBadge();
     },
     async ackAllActivity() {
@@ -21801,7 +21836,9 @@ function portal() {
         const r = await fetch("/api/activity/ack-all", { method: "POST", headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
+        this._activityAppliedSeq = ++this._activityRequestSeq;
         for (const item of this.activity.events) item.read = true;
+        this.activity.events = [...this.activity.events];
         this.activity.summary = d.summary;
         this._syncAppBadge();
       } catch (_) {}
@@ -21818,11 +21855,13 @@ function portal() {
           { method: "POST", headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
+        this._activityAppliedSeq = ++this._activityRequestSeq;
         if (d.summary) this.activity.summary = d.summary;
         if (Number(d.changed) > 0) {
           for (const item of this.activity.events || []) {
             if ((item.session_id || item.thread_id) === sid) item.read = true;
           }
+          this.activity.events = [...this.activity.events];
         }
         this._syncAppBadge();
         if (Number(d.changed) === 0 && retries > 0

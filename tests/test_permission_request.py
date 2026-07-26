@@ -34,6 +34,28 @@ def test_submit_decision_bad_decision_returns_false():
     assert perm.submit_decision("s1", "qid", "maybe") is False
 
 
+def test_submit_decision_resumes_before_waking_model(monkeypatch):
+    order = []
+
+    class FakeFuture:
+        def done(self):
+            return False
+
+        def set_result(self, value):
+            order.append(("resolve", value))
+
+    from backend import activity as activity_module
+    monkeypatch.setattr(activity_module.activity, "resume",
+                        lambda sid: order.append(("resume", sid)))
+    perm._pending[("s1", "qid")] = FakeFuture()
+
+    assert perm.submit_decision("s1", "qid", "allow") is True
+    assert order == [
+        ("resume", "s1"),
+        ("resolve", {"decision": "allow", "message": None}),
+    ]
+
+
 def test_input_key_bash_safe_binary_uses_first_word():
     # Safe binaries broaden the always-allow cache to the first word so
     # "ls -la X" and "ls Y" share one grant.

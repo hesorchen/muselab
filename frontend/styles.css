@@ -3203,25 +3203,21 @@ pre.text {
 .activity-modal { width:620px; max-width:calc(100vw - 32px); }
 .activity-summary { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:10px 14px; border-bottom:1px solid var(--c-border); color:var(--c-fg-2); font-size:var(--fs-sm); }
 .activity-summary .btn-ghost { margin-left:auto; }
-/* Status chips. One per group below, always all four, always in the same
-   order — a chip that vanishes at count 0 can't be found by muscle memory,
-   and "Failed 0" is worth stating. Non-zero danger states colour themselves. */
+/* Status chips follow the same attention order as the body. Counts come from
+   the full backend ledger, while colour only signals unread/actionable work. */
 .activity-chip { display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border:1px solid var(--c-border); border-radius:var(--r-full); background:transparent; color:var(--c-fg-2); font:inherit; font-size:var(--fs-xs); line-height:1.2; cursor:pointer; transition:background var(--t-fast), border-color var(--t-fast), color var(--t-fast), opacity var(--t-fast); }
 .activity-chip b { font-weight:var(--fw-medium); color:var(--c-fg-1); font-variant-numeric:tabular-nums; }
 .activity-chip-dot { width:7px; height:7px; flex:0 0 7px; border-radius:50%; background:var(--c-fg-3); }
-/* Dot colour is keyed to UNREAD, not to "the group has rows". A failure you
-   already opened is history, not an alarm — opening an event acks it, and the
-   chip must go quiet in response or the red dot is permanent furniture.
-   Colour split: 待决策 is a prompt (amber, "you need to do something"),
-   运行失败 is an outcome (red, "something broke"). Both were red before,
-   which flattened a question and a failure into the same signal. */
-.activity-chip.attention.has-unread .activity-chip-dot { background:var(--c-warn); }
+.activity-chip.review.has-unread .activity-chip-dot { background:var(--c-success); }
 .activity-chip.failed.has-unread .activity-chip-dot { background:var(--c-danger); }
 .activity-chip.running .activity-chip-dot { background:var(--c-running); }
-.activity-chip.done .activity-chip-dot { background:var(--c-fg-4); }
+.activity-chip.running.has-unread .activity-chip-dot { background:var(--c-warn); }
+.activity-chip.history .activity-chip-dot { background:var(--c-fg-4); }
 .activity-chip.running:not(.is-empty) .activity-chip-dot { animation:muse-breath 1.8s ease-in-out infinite; }
-.activity-chip.attention.has-unread { border-color:color-mix(in srgb, var(--c-warn) 45%, transparent); color:var(--c-warn); }
-.activity-chip.attention.has-unread b { color:var(--c-warn); }
+.activity-chip.review.has-unread { border-color:color-mix(in srgb, var(--c-success) 42%, transparent); color:var(--c-success); }
+.activity-chip.review.has-unread b { color:var(--c-success); }
+.activity-chip.running.has-unread { border-color:color-mix(in srgb, var(--c-warn) 45%, transparent); color:var(--c-warn); }
+.activity-chip.running.has-unread b { color:var(--c-warn); }
 .activity-chip.failed.has-unread { border-color:color-mix(in srgb, var(--c-danger) 42%, transparent); color:var(--c-danger); }
 .activity-chip.failed.has-unread b { color:var(--c-danger); }
 .activity-chip:hover { background:var(--c-bg-2); }
@@ -3238,12 +3234,12 @@ pre.text {
 .activity-row { width:100%; display:flex; align-items:center; gap:10px; padding:10px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-1); text-align:left; cursor:pointer; }
 .activity-row:hover { background:var(--c-bg-2); }
 .activity-row.is-unread { background:var(--c-accent-soft); box-shadow:inset 3px 0 0 var(--c-accent); }
-.activity-state-dot { width:8px; height:8px; flex:0 0 8px; border-radius:50%; background:var(--c-fg-3); }
-.activity-row.running .activity-state-dot { background:var(--c-running); animation:muse-breath 1.8s ease-in-out infinite; }
-/* Terminal tasks are not notifications. Only an unread result gets the green marker. */
-.activity-row.completed .activity-state-dot,.activity-row.cancelled .activity-state-dot { visibility:hidden; }
-.activity-row.is-unread .activity-state-dot { visibility:visible; background:var(--c-success); }
-.activity-row.failed .activity-state-dot,.activity-row.waiting_approval .activity-state-dot,.activity-row.paused .activity-state-dot { background:var(--c-danger); }
+.activity-state-dot { width:8px; height:8px; flex:0 0 8px; border-radius:50%; background:var(--c-fg-3); visibility:hidden; }
+.activity-row.running .activity-state-dot { visibility:visible; background:var(--c-running); animation:muse-breath 1.8s ease-in-out infinite; }
+.activity-row.waiting_approval .activity-state-dot,.activity-row.paused .activity-state-dot { visibility:visible; background:var(--c-warn); }
+.activity-row.completed.is-unread .activity-state-dot { visibility:visible; background:var(--c-success); }
+.activity-row.failed.is-unread .activity-state-dot { visibility:visible; background:var(--c-danger); }
+.activity-row.failed .activity-row-side > span { color:var(--c-danger); }
 .activity-row-main { min-width:0; flex:1; display:flex; flex-direction:column; gap:3px; }
 .activity-row-main strong,.activity-row-main small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .activity-row-main small,.activity-row-side small { color:var(--c-fg-3); font-size:var(--fs-xs); }

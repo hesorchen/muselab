@@ -188,6 +188,14 @@ def submit_answer(session_id: str, question_id: str, answers: dict[str, Any]) ->
     fut = _pending.get((session_id, question_id))
     if fut is None or fut.done():
         return False
+    # Move the current turn back to running before resolving the Future. Once
+    # resolved, the model can immediately finish or ask another question, so a
+    # later resume write could overwrite a newer state.
+    try:
+        from .activity import activity
+        activity.resume(session_id)
+    except Exception:
+        pass
     fut.set_result(answers)
     return True
 

@@ -25,8 +25,7 @@ def _json(request: Request, response: Response, payload: dict):
 @router.get("", dependencies=[Depends(require_token)])
 def list_activity(request: Request, response: Response,
                   limit: int = Query(100, ge=1, le=500)):
-    return _json(request, response,
-                 {"events": activity.list(limit), "summary": activity.summary()})
+    return _json(request, response, activity.snapshot(limit))
 
 
 @router.get("/summary", dependencies=[Depends(require_token)])
