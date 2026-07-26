@@ -1,6 +1,6 @@
 [project]
 name = "muselab"
-version = "1.1.0"
+version = "1.2.0"
 description = "Self-hosted web UI for the Claude Agent SDK — talk to your own files with Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo."
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -122,6 +122,6 @@ Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How
 
 ## Status
 
-v1.1 — first stable enhancement release.
+v1.2 — multi-workspace support, a real terminal, and richer agent workflows.
 
 [MIT](LICENSE)
