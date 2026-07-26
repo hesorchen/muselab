@@ -38,7 +38,7 @@ from claude_agent_sdk import (
     tag_session as sdk_tag_session,
     fork_session as sdk_fork_session,
 )
-from claude_agent_sdk.types import PermissionMode
+from claude_agent_sdk.types import HookMatcher, PermissionMode
 from .auth import require_token_query, require_token, require_token_header_or_query
 from .settings import (
     ROOT,
@@ -1813,6 +1813,16 @@ async def _build_and_connect_client(
         # see full blocks at the end → user waits for the whole reply
         # before seeing anything. With this, each token shows up.
         include_partial_messages=True,
+        # Recall runs in the SDK's dedicated UserPromptSubmit additional-context
+        # channel. Never prepend it to client.query(prompt): that would persist
+        # the memory block as if the user typed it, polluting JSONL history,
+        # titles, transcript search, exports, and every later resume.
+        hooks={
+            "UserPromptSubmit": [HookMatcher(
+                hooks=[mem0.build_recall_hook(session_id)],
+                timeout=mem0.RECALL_HOOK_TIMEOUT,
+            )],
+        },
     )
     # Let the SDK expose every discovered Skill for every provider, including
     # Anthropic-compatible third-party gateways:
@@ -9629,18 +9639,14 @@ async def _start_turn(
                 existing_uuids = await asyncio.to_thread(
                     _session_message_uuids, session_id, model_to_use)
                 boundary = _TurnResponseBoundary(existing_uuids)
-                # mem0 recall: best-effort semantic memory from prior turns,
-                # prepended to the prompt. Fail-soft (returns "" if the daemon
-                # is off/down); `prompt` is otherwise unchanged so behavior with
-                # MEM0_DAEMON_URL unset is identical to before.
-                _mem_query = prompt
-                _mem_block = await mem0.search_context(_mem_query, session_id)
-                query_prompt = _mem_block + prompt if _mem_block else prompt
+                # mem0 recall is supplied by the UserPromptSubmit hook configured
+                # on this client. The canonical query remains exactly `prompt` so
+                # recalled data is never persisted as a fake user message.
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
                 binary_blocks = [*img_blocks, *pdf_blocks]
                 if binary_blocks:
-                    text_block = {"type": "text", "text": query_prompt}
+                    text_block = {"type": "text", "text": prompt}
                     content = [*binary_blocks, text_block]
 
                     async def gen():
@@ -9650,7 +9656,7 @@ async def _start_turn(
                         }
                     await client.query(gen())
                 else:
-                    await client.query(query_prompt)
+                    await client.query(prompt)
 
                 replay_dropped = 0
 
@@ -10458,8 +10464,8 @@ async def _start_turn(
             # one (_is_error), so a wrong or aborted draft can't be distilled
             # into a "durable fact" and recalled forever. Tracked + shutdown-
             # drained via mem0.schedule_store (not a bare create_task). Uses the
-            # ORIGINAL `prompt`, never the memory-augmented query_prompt, so
-            # recalled context is not fed back into the store. Fully fail-soft.
+            # original `prompt`; recalled hook context is never fed back into the
+            # store. Fully fail-soft.
             if mem0.enabled() and not was_cancelled and not _is_error:
                 _asst_full = "".join(assistant_acc)
                 if _asst_full.strip():

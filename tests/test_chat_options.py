@@ -110,3 +110,22 @@ def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):
         "sid-third-party-no-skills", "deepseek-v4-pro", "bypassPermissions", ""))
 
     assert "skills" not in captured
+
+
+def test_mem0_recall_uses_user_prompt_hook(app_module, monkeypatch, tmp_path):
+    """Memory context belongs in additionalContext, never the user message."""
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-mem0-hook", "deepseek-v4-pro", "bypassPermissions", ""))
+
+    matchers = captured["hooks"]["UserPromptSubmit"]
+    assert len(matchers) == 1
+    assert len(matchers[0].hooks) == 1
+    assert callable(matchers[0].hooks[0])
+    assert matchers[0].timeout == chat_mod.mem0.RECALL_HOOK_TIMEOUT

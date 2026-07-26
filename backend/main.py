@@ -141,6 +141,8 @@ async def _lifespan(app: FastAPI):
     must come up even if peripheral subsystems are degraded."""
     from . import scheduler as _sched
     from . import push as _push
+    from . import memory_client as _mem0
+    _mem0.start()
     import traceback
     try:
         _push.init()
@@ -241,7 +243,6 @@ async def _lifespan(app: FastAPI):
         # Drain any in-flight mem0 memory writes so a turn that just finished
         # still gets persisted across a restart (best-effort, time-bounded).
         try:
-            from . import memory_client as _mem0
             await _mem0.aclose()
         except Exception:
             pass
