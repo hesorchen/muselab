@@ -3609,7 +3609,7 @@
                 @click="runToastAction(t)" x-text="t.action && t.action.label"></button>
         <button class="close"
                 :title="lang==='zh' ? '关闭' : 'Dismiss'"
-                @click="dismissToast(t.id)"><svg style="width:14px;height:14px"><use href="#i-x"/></svg></button>
+                @click="dismissToast(t.id, true)"><svg style="width:14px;height:14px"><use href="#i-x"/></svg></button>
       </div>
     </template>
   </div>

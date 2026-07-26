@@ -474,17 +474,24 @@ def test_stream_reconnect_is_pinned_to_backend_turn_identity():
     assert "turnId: d.turn_id || streamState.activeTurnId || \"\"" in send
 
 
-def test_interrupted_turn_is_dismissed_only_after_open():
+def test_interrupted_turn_is_dismissed_after_open_or_manual_close():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    helper_start = app.index("async _dismissInterruptedTurn(sid)")
+    helper_end = app.index("\n    // Toast any turns", helper_start)
+    helper = app[helper_start:helper_end]
     start = app.index("async _checkInterruptedTurns()")
     end = app.index("\n    // 10s heartbeat", start)
     recovery = app[start:end]
 
+    assert "/api/chat/interrupted-turns/${encodeURIComponent(sid)}/dismiss" in helper
     click_at = recovery.index("onClick: async () =>")
     open_at = recovery.index("await this.openTab(turn.sid)", click_at)
-    dismiss_at = recovery.index("/dismiss", open_at)
+    dismiss_at = recovery.index("await this._dismissInterruptedTurn(turn.sid)", open_at)
     assert click_at < open_at < dismiss_at
-    assert recovery.count("/dismiss") == 1
+    assert "onDismiss: () => this._dismissInterruptedTurn(turn.sid)" in recovery
+    assert 'dismissToast(t.id, true)' in html
+    assert "userInitiated && toast?.action?.onDismiss" in app
 
 
 def test_mobile_keyboard_watchdog_clears_stale_pwa_viewport_inset():

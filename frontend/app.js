@@ -1978,6 +1978,13 @@ function portal() {
       return this.lang === "zh" ? `${d} 天前` : `${d}d ago`;
     },
 
+    async _dismissInterruptedTurn(sid) {
+      const r = await fetch(`/api/chat/interrupted-turns/${encodeURIComponent(sid)}/dismiss`, {
+        method: "POST", headers: this.hdr(),
+      });
+      if (!r.ok) throw new Error(`dismiss interrupted turn failed: HTTP ${r.status}`);
+    },
+
     // Toast any turns the previous muselab process left in-flight at the
     // moment it died. Backend persists `sessions/active_turns/<sid>.json`
     // on turn start and deletes it on clean completion — anything left
@@ -2016,11 +2023,13 @@ function portal() {
             try {
               await this.openTab(turn.sid);
               if (this.currentId !== turn.sid) return;
-              await fetch(`/api/chat/interrupted-turns/${turn.sid}/dismiss`, {
-                method: "POST", headers: this.hdr(),
-              });
+              await this._dismissInterruptedTurn(turn.sid);
             } catch (_) { /* keep the durable breadcrumb for next boot */ }
           },
+          // Closing the banner is also an explicit acknowledgement. Previously
+          // only "Open" dismissed the durable sidecar, so tapping × made the
+          // same warning return on every app launch.
+          onDismiss: () => this._dismissInterruptedTurn(turn.sid),
         });
       }
     },
@@ -4699,7 +4708,13 @@ function portal() {
       }
       if (timeout) setTimeout(() => this.dismissToast(id), timeout);
     },
-    dismissToast(id) { this.toasts = this.toasts.filter(t => t.id !== id); },
+    dismissToast(id, userInitiated = false) {
+      const toast = this.toasts.find(t => t.id === id);
+      this.toasts = this.toasts.filter(t => t.id !== id);
+      if (userInitiated && toast?.action?.onDismiss) {
+        Promise.resolve(toast.action.onDismiss()).catch(() => {});
+      }
+    },
     runToastAction(t) {
       try { t.action && t.action.onClick && t.action.onClick(); }
       finally { this.dismissToast(t.id); }
