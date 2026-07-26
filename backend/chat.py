@@ -61,6 +61,7 @@ from .ask_user_question import (
     unregister_session_queue, submit_answer,
 )
 from . import permission_request as perm
+from . import memory_client as mem0
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
@@ -9624,11 +9625,17 @@ async def _start_turn(
                 existing_uuids = await asyncio.to_thread(
                     _session_message_uuids, session_id, model_to_use)
                 boundary = _TurnResponseBoundary(existing_uuids)
+                # mem0 recall: best-effort semantic memory from prior turns,
+                # prepended to the prompt. Fail-soft (returns "" if the daemon
+                # is off/down), so with MEM0_DAEMON_URL unset behavior is
+                # identical to before — `prompt` itself is never mutated.
+                _mem_block = await mem0.search_context(prompt, session_id)
+                query_prompt = _mem_block + prompt if _mem_block else prompt
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
                 binary_blocks = [*img_blocks, *pdf_blocks]
                 if binary_blocks:
-                    text_block = {"type": "text", "text": prompt}
+                    text_block = {"type": "text", "text": query_prompt}
                     content = [*binary_blocks, text_block]
 
                     async def gen():
@@ -9638,7 +9645,7 @@ async def _start_turn(
                         }
                     await client.query(gen())
                 else:
-                    await client.query(prompt)
+                    await client.query(query_prompt)
 
                 replay_dropped = 0
 
@@ -10243,6 +10250,17 @@ async def _start_turn(
                     session_id, new_user_uuid,
                     images=persisted_imgs or None,
                     docs=persisted_docs or None)
+            # mem0 write: persist the completed (user, assistant) exchange as a
+            # fire-and-forget background task so it never delays the 'done' SSE.
+            # Fail-soft inside store_turn; no-op when MEM0_DAEMON_URL is unset.
+            # Uses the ORIGINAL `prompt` (not the memory-augmented query_prompt)
+            # so recalled context is never fed back into the store.
+            if mem0.enabled():
+                _asst_full = "".join(assistant_acc)
+                if _asst_full.strip():
+                    asyncio.create_task(
+                        mem0.store_turn(session_id, model_to_use,
+                                        prompt, _asst_full))
             # message_count = total transcript size; auto-rename from first
             # user message text if session is still auto-named. These counts
             # need the full transcript, so parse it now if the fast UUID path
