@@ -15,34 +15,42 @@
 
 <table align="center">
 <tr>
-<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+<td align="center"><a href="promo/media/screenshot-desktop.png"><img src="promo/media/screenshot-desktop.png" width="470" alt="桌面端完整工作台"></a></td>
+<td align="center"><a href="promo/media/screenshot-desktop-terminal.png"><img src="promo/media/screenshot-desktop-terminal.png" width="470" alt="桌面端真实 Unix PTY 终端"></a></td>
 </tr>
 <tr>
-<td align="center">移动端 · 文件区</td>
-<td align="center">移动端 · 预览区</td>
-<td align="center">移动端 · 对话区</td>
-<td align="center">桌面端 · 黑夜主题 + HTML 渲染效果</td>
+<td align="center">桌面端 · 文件、预览与对话</td>
+<td align="center">桌面端 · 真实 Unix PTY 终端</td>
 </tr>
 </table>
 
-<p align="center"><sub>点击任意图片放大查看</sub></p>
+<table align="center">
+<tr>
+<td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="210" alt="移动端文件区"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="210" alt="移动端预览区"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="210" alt="移动端对话区"></a></td>
+</tr>
+<tr>
+<td align="center">移动端 · 文件区</td>
+<td align="center">移动端 · 原生预览</td>
+<td align="center">移动端 · Agent 对话</td>
+</tr>
+</table>
+
+<p align="center"><sub>点击任意图片查看原图</sub></p>
 
 ## 核心特性
 
 | | |
 |---|---|
-| **复用已有订阅额度** | Claude 走 OAuth 复用 Pro / Max；GPT 通过本地 Codex Gateway 复用 Codex / GPT Plus / Pro|
-| **完整的用户上下文** | 不断累积的用户上下文，越用越懂你，产生 context 复利 |
-| **领先的 Agent Harness** | 基于 Claude Agent SDK 构建，具备工具调用、Skills、MCP 扩展等 Agent 能力|
-| **灵活切换的基座模型** | Claude、OpenAI、Codex Gateway、DeepSeek、GLM、MiniMax、Kimi、Qwen、MiMo、ERNIE 等内置提供方一键切换，也可添加 Anthropic-compatible 自定义提供方 |
-| **跨领域交叉分析** | 项目开发 ✖️ 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
-| **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
-| **多工作目录与多会话** | 文件树、预览标签、终端和会话与工作目录一起切换，每个目录保存工作状态 |
-| **真实多终端** | 在预览区直接运行 PTY 终端，按工作目录管理、重命名和切换；可在新建终端时自动执行固定命令 |
-| **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
+| **复用已有订阅** | Claude 支持 OAuth；Codex 可通过 Gateway 接入，复用已有的 Claude、ChatGPT 订阅服务 |
+| **一体化 Agent 工作台** | 在同一个页面中浏览文件、预览报告、与 Agent 对话交互，并通过真实终端运行和检查结果 |
+| **多工作目录** | 创建并一键切换多个工作目录；每个工作目录都是一整套完整的 Agent 上下文和运行环境 |
+| **真实 Unix PTY 多终端** | 创建、重命名和切换多个真实终端；每个终端绑定创建时的工作目录，并支持 Terminal Profile |
+| **Claude Agent SDK** | 原生支持文件读写、工具调用、Skills 和 MCP，让 Agent 可以直接执行任务并生成成果 |
+| **原生文件预览** | 支持 Markdown、文本、HTML、图片、PDF、XLSX、CSV 和 TSV 等文件格式 |
+| **多模型与多 Provider** | 内置 Claude、Codex Gateway 等 Provider，也可接入所有 Anthropic-compatible 模型服务，如 Kimi、GLM、Deepseek 等 |
+| **自托管与多端访问** | 工作目录、会话状态和生成文件保存在本地，可通过桌面浏览器和移动端 PWA 访问，移动端与 PC 端内容实时同步 |
 
 ## 快速开始
 

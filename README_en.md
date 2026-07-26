@@ -15,34 +15,42 @@
 
 <table align="center">
 <tr>
-<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+<td align="center"><a href="promo/media/screenshot-desktop.png"><img src="promo/media/screenshot-desktop.png" width="470" alt="Complete desktop workspace"></a></td>
+<td align="center"><a href="promo/media/screenshot-desktop-terminal.png"><img src="promo/media/screenshot-desktop-terminal.png" width="470" alt="Real Unix PTY terminal on desktop"></a></td>
 </tr>
 <tr>
-<td align="center">Mobile · files</td>
-<td align="center">Mobile · preview</td>
-<td align="center">Mobile · chat</td>
-<td align="center">Desktop · dark theme + live HTML</td>
+<td align="center">Desktop · files, preview, and chat</td>
+<td align="center">Desktop · real Unix PTY terminal</td>
 </tr>
 </table>
 
-<p align="center"><sub>Click any image to enlarge.</sub></p>
+<table align="center">
+<tr>
+<td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="210" alt="Mobile file browser"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="210" alt="Mobile native preview"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="210" alt="Mobile Agent chat"></a></td>
+</tr>
+<tr>
+<td align="center">Mobile · files</td>
+<td align="center">Mobile · native preview</td>
+<td align="center">Mobile · Agent chat</td>
+</tr>
+</table>
+
+<p align="center"><sub>Click any image to view the original.</sub></p>
 
 ## Core features
 
 | | |
 |---|---|
-| **Reuse existing subscriptions** | Claude uses Pro / Max through OAuth; GPT can reuse Codex / GPT Plus / Pro through a local Codex Gateway |
-| **Complete user context** | Your personal archive keeps accumulating; the more you use it, the better Muse understands you, creating compounding context |
-| **Leading Agent Harness** | Built on the Claude Agent SDK, with agent capabilities such as tool use, Skills, and MCP extensions |
-| **Switchable foundation models** | Switch among built-in Claude, OpenAI, Codex Gateway, DeepSeek, GLM, MiniMax, Kimi, Qwen, MiMo, and ERNIE providers, or add an Anthropic-compatible custom provider |
-| **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
-| **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
-| **Multiple workspaces and sessions** | File trees, preview tabs, and sessions switch together by working directory, each retaining its own browsing state |
-| **Real multi-terminal workspace** | Run PTY terminals directly in preview, organize and rename them per workspace, and use profiles to run fixed startup commands |
-| **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
+| **Reuse existing subscriptions** | Claude supports OAuth; Codex can connect through Gateway, allowing you to reuse existing Claude and ChatGPT subscription services |
+| **Integrated Agent workspace** | Browse files, preview reports, interact with an Agent, and run or inspect results in a real terminal—all on the same page |
+| **Multiple working directories** | Create and switch among multiple working directories with one click; each directory is a complete Agent context and runtime environment |
+| **Real Unix PTY terminals** | Create, rename, and switch among multiple real terminals; each terminal stays bound to the directory where it was created and supports Terminal Profiles |
+| **Claude Agent SDK** | Native file operations, tool use, Skills, and MCP support let the Agent execute tasks directly and produce persistent artifacts |
+| **Native file preview** | Preview Markdown, text, HTML, images, PDF, XLSX, CSV, TSV, and more |
+| **Multiple models and Providers** | Built-in Claude and Codex Gateway Providers, plus support for Anthropic-compatible model services such as Kimi, GLM, and DeepSeek |
+| **Self-hosted, multi-device access** | Working directories, session state, and generated files stay local, while desktop browsers and the mobile PWA keep content in sync across devices |
 
 ## Quick start
 
