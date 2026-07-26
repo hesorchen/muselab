@@ -84,6 +84,34 @@ def stream_env(app_module, monkeypatch):
     return chat_mod
 
 
+def test_mem0_never_rewrites_canonical_user_query(
+        stream_env, client, monkeypatch):
+    """Recall is an SDK hook; client.query must receive only user-authored text."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    messages = [ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=9,
+        is_error=False, num_turns=1, session_id=sid,
+        total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+    )]
+    fake = _FakeStreamClient(messages)
+
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+        return fake
+
+    async def must_not_search_here(*args, **kwargs):
+        raise AssertionError("recall must run in UserPromptSubmit hook")
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod.mem0, "search_context", must_not_search_here)
+    prompt = "the exact user-authored prompt"
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        f"&prompt={prompt}&model=claude-sonnet-4-6")
+    assert response.status_code == 200
+    assert fake.queried == [prompt]
+
+
 def _make_session(client):
     r = client.post("/api/chat/sessions",
                     headers={"X-Auth-Token": TEST_TOKEN,

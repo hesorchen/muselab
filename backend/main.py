@@ -141,6 +141,8 @@ async def _lifespan(app: FastAPI):
     must come up even if peripheral subsystems are degraded."""
     from . import scheduler as _sched
     from . import push as _push
+    from . import memory_client as _mem0
+    _mem0.start()
     import traceback
     try:
         _push.init()
@@ -238,6 +240,12 @@ async def _lifespan(app: FastAPI):
         # PTY workers outlive individual WebSocket connections so refreshes
         # can reattach. They must not outlive the muselab service itself.
         await _terminal_manager.shutdown()
+        # Drain any in-flight mem0 memory writes so a turn that just finished
+        # still gets persisted across a restart (best-effort, time-bounded).
+        try:
+            await _mem0.aclose()
+        except Exception:
+            pass
 
 
 async def _backfill_turn_counts() -> None:

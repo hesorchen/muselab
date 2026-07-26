@@ -38,7 +38,7 @@ from claude_agent_sdk import (
     tag_session as sdk_tag_session,
     fork_session as sdk_fork_session,
 )
-from claude_agent_sdk.types import PermissionMode
+from claude_agent_sdk.types import HookMatcher, PermissionMode
 from .auth import require_token_query, require_token, require_token_header_or_query
 from .settings import (
     ROOT,
@@ -61,6 +61,7 @@ from .ask_user_question import (
     unregister_session_queue, submit_answer,
 )
 from . import permission_request as perm
+from . import memory_client as mem0
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
@@ -1230,6 +1231,7 @@ MODEL_CONTEXT_LIMITS = {
     "deepseek-reasoner":            128_000,
     # Zhipu GLM 5 series — 200K context, 128K output cap.
     "glm-5.2-internal":              200_000,
+    "glm-5.2":                       200_000,
     "glm-5":                         200_000,
     "glm-5-air":                     200_000,
     "glm-4.7":                       200_000,
@@ -1250,6 +1252,9 @@ MODEL_CONTEXT_LIMITS = {
     "codex:gpt-5.4":                  272_000,
     "codex:gpt-5.4-mini":             272_000,
     "codex:gpt-5.3-codex-spark":      128_000,
+    # Direct-GPT route (no codex: prefix) — local patch mirrors codex:* above.
+    "gpt-5.6-sol":                    372_000,
+    "gpt-5.5":                        272_000,
 }
 DEFAULT_CONTEXT_LIMIT = 128_000
 CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT = 95
@@ -1808,6 +1813,16 @@ async def _build_and_connect_client(
         # see full blocks at the end → user waits for the whole reply
         # before seeing anything. With this, each token shows up.
         include_partial_messages=True,
+        # Recall runs in the SDK's dedicated UserPromptSubmit additional-context
+        # channel. Never prepend it to client.query(prompt): that would persist
+        # the memory block as if the user typed it, polluting JSONL history,
+        # titles, transcript search, exports, and every later resume.
+        hooks={
+            "UserPromptSubmit": [HookMatcher(
+                hooks=[mem0.build_recall_hook(session_id)],
+                timeout=mem0.RECALL_HOOK_TIMEOUT,
+            )],
+        },
     )
     # Let the SDK expose every discovered Skill for every provider, including
     # Anthropic-compatible third-party gateways:
@@ -9624,6 +9639,9 @@ async def _start_turn(
                 existing_uuids = await asyncio.to_thread(
                     _session_message_uuids, session_id, model_to_use)
                 boundary = _TurnResponseBoundary(existing_uuids)
+                # mem0 recall is supplied by the UserPromptSubmit hook configured
+                # on this client. The canonical query remains exactly `prompt` so
+                # recalled data is never persisted as a fake user message.
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
                 binary_blocks = [*img_blocks, *pdf_blocks]
@@ -10243,6 +10261,9 @@ async def _start_turn(
                     session_id, new_user_uuid,
                     images=persisted_imgs or None,
                     docs=persisted_docs or None)
+            # mem0 write is deferred to AFTER we compute was_cancelled / _is_error
+            # below — we must not distill a cancelled or errored turn into a
+            # "durable fact". See the mem0.schedule_store(...) call further down.
             # message_count = total transcript size; auto-rename from first
             # user message text if session is still auto-named. These counts
             # need the full transcript, so parse it now if the fast UUID path
@@ -10437,6 +10458,19 @@ async def _start_turn(
             _error_class = _classify_stream_error(_error_message) if _is_error else {
                 "kind": None, "cta": None, "retryable": False,
             }
+            # mem0 write (deferred to here so turn status is known): persist the
+            # completed (user, assistant) exchange ONLY on a clean success —
+            # never a user-cancelled turn (was_cancelled) nor an errored/partial
+            # one (_is_error), so a wrong or aborted draft can't be distilled
+            # into a "durable fact" and recalled forever. Tracked + shutdown-
+            # drained via mem0.schedule_store (not a bare create_task). Uses the
+            # original `prompt`; recalled hook context is never fed back into the
+            # store. Fully fail-soft.
+            if mem0.enabled() and not was_cancelled and not _is_error:
+                _asst_full = "".join(assistant_acc)
+                if _asst_full.strip():
+                    mem0.schedule_store(session_id, model_to_use,
+                                        prompt, _asst_full)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,

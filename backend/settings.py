@@ -238,6 +238,14 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 ZHIPUAI_BASE_URL = os.environ.get("ZHIPUAI_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
 MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
 
+# Self-hosted mem0 semantic-memory daemon (optional). Empty = feature OFF
+# (chat runs exactly as before). When set to the daemon's base URL, each turn
+# does a best-effort memory search (recalled facts prepended to the prompt) +
+# an async store of the completed turn. All calls are fail-soft: any error is
+# swallowed so a down / slow daemon never breaks or delays a chat turn.
+# See backend/memory_client.py for the client and the daemon contract.
+MEM0_DAEMON_URL = os.environ.get("MEM0_DAEMON_URL", "")
+
 if not TOKEN:
     raise RuntimeError("MUSELAB_TOKEN must be set in .env")
 if len(TOKEN) < 16:
