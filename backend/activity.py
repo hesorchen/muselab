@@ -14,6 +14,61 @@ from . import sessions
 
 _MAX_EVENTS = 500
 _TERMINAL = {"completed", "failed", "cancelled"}
+_ACTIVE = {"running", "waiting_approval", "paused"}
+
+
+def _activity_at(item: dict[str, Any]) -> float:
+    """Return the latest task transition timestamp without letting ACK reorder rows."""
+    return float(item.get("updated_at") or item.get("finished_at")
+                 or item.get("started_at") or 0)
+
+
+def _is_unread_result(item: dict[str, Any]) -> bool:
+    return item.get("state") in {"completed", "failed"} and not item.get("read")
+
+
+def _requires_action(item: dict[str, Any]) -> bool:
+    return item.get("state") in {"waiting_approval", "paused"}
+
+
+def _summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
+    groups = {
+        "review": sum(x.get("state") == "completed" and not x.get("read")
+                      for x in events),
+        "running": sum(x.get("state") in _ACTIVE for x in events),
+        "failed": sum(x.get("state") == "failed" for x in events),
+        "history": sum((x.get("state") == "completed" and bool(x.get("read")))
+                       or x.get("state") == "cancelled" for x in events),
+    }
+    group_unread = {
+        "review": groups["review"],
+        "running": sum(_requires_action(x) for x in events),
+        "failed": sum(x.get("state") == "failed" and not x.get("read")
+                      for x in events),
+        "history": 0,
+    }
+    workspaces: dict[str, dict[str, Any]] = {}
+    for item in events:
+        path = str(item.get("workspace") or "")
+        row = workspaces.setdefault(path, {"path": path,
+            "name": item.get("workspace_name") or Path(path).name or "Workspace",
+            "running": 0, "unread": 0, "attention": 0})
+        if item.get("state") in _ACTIVE:
+            row["running"] += 1
+        if _is_unread_result(item):
+            row["unread"] += 1
+        if _requires_action(item) or (item.get("state") == "failed" and not item.get("read")):
+            row["attention"] += 1
+    return {
+        "running": groups["running"],
+        "unread": sum(_is_unread_result(x) for x in events),
+        "attention": sum(_requires_action(x)
+                         or (x.get("state") == "failed" and not x.get("read"))
+                         for x in events),
+        "groups": groups,
+        "group_unread": group_unread,
+        "workspaces": list(workspaces.values()),
+    }
 
 
 class ActivityService:
@@ -25,9 +80,11 @@ class ActivityService:
         self._events = self._load()
         changed = self._collapse_sessions()
         for item in self._events:
-            if item.get("state") in {"running", "waiting_approval", "paused"}:
+            if item.get("state") in _ACTIVE:
+                now = time.time()
                 item.update(state="failed", status_detail="Interrupted by service restart",
-                            finished_at=time.time(), needs_attention=True, read=False)
+                            finished_at=now, updated_at=now,
+                            needs_attention=False, read=False)
                 changed = True
         if changed:
             self._save()
@@ -89,7 +146,7 @@ class ActivityService:
                 session_name=name, state="running",
                 task_summary=(summary or item.get("task_summary") or name)[:500],
                 status_detail="", started_at=now, finished_at=None,
-                needs_attention=False, read=True,
+                updated_at=now, needs_attention=False, read=True,
                 turn_count=int(item.get("turn_count") or 0) + 1,
             )
             self._events = self._events[-_MAX_EVENTS:]
@@ -97,7 +154,7 @@ class ActivityService:
             return dict(item)
 
     def set_state(self, sid: str, state: str, *, detail: str = "") -> dict[str, Any]:
-        if state not in {"running", "waiting_approval", "paused"}:
+        if state not in _ACTIVE:
             raise ValueError("invalid activity state")
         with self._lock:
             item = self._latest(sid)
@@ -107,9 +164,21 @@ class ActivityService:
             item = self._latest(sid)
             assert item is not None
             item.update(state=state, status_detail=detail[:500],
-                        needs_attention=state != "running", read=state == "running")
+                        updated_at=time.time(),
+                        needs_attention=state in {"waiting_approval", "paused"}, read=True)
             self._save()
             return dict(item)
+
+    def resume(self, sid: str) -> bool:
+        """Resume only the currently waiting turn; never revive a terminal row."""
+        with self._lock:
+            item = self._latest(sid)
+            if item is None or item.get("state") not in {"waiting_approval", "paused"}:
+                return False
+            item.update(state="running", status_detail="", updated_at=time.time(),
+                        needs_attention=False, read=True)
+            self._save()
+            return True
 
     def finish(self, sid: str, status: str) -> dict[str, Any]:
         state = "completed" if status == "completed" else (
@@ -121,8 +190,9 @@ class ActivityService:
         with self._lock:
             item = self._latest(sid)
             assert item is not None
-            item.update(state=state, finished_at=time.time(),
-                        needs_attention=state != "cancelled", read=state == "cancelled",
+            now = time.time()
+            item.update(state=state, finished_at=now, updated_at=now,
+                        needs_attention=False, read=state == "cancelled",
                         status_detail={"completed": "Task completed",
                                        "failed": "Task failed",
                                        "cancelled": "Task cancelled"}[state])
@@ -131,29 +201,22 @@ class ActivityService:
 
     def list(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict(x) for x in reversed(self._events[-min(max(limit, 1), 500):])]
+            events = sorted(self._events, key=_activity_at, reverse=True)
+            return [dict(x) for x in events[:min(max(limit, 1), _MAX_EVENTS)]]
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
+            return _summarize([dict(x) for x in self._events])
+
+    def snapshot(self, limit: int = 100) -> dict[str, Any]:
+        """Return rows and counters from the same locked ledger snapshot."""
+        with self._lock:
             events = [dict(x) for x in self._events]
-        active = {"running", "waiting_approval", "paused"}
-        workspaces: dict[str, dict[str, Any]] = {}
-        for item in events:
-            path = str(item.get("workspace") or "")
-            row = workspaces.setdefault(path, {"path": path,
-                "name": item.get("workspace_name") or Path(path).name or "Workspace",
-                "running": 0, "unread": 0, "attention": 0})
-            if item.get("state") in active:
-                row["running"] += 1
-            if item.get("needs_attention") and not item.get("read"):
-                row["unread"] += 1
-            if item.get("state") in {"failed", "waiting_approval", "paused"} and not item.get("read"):
-                row["attention"] += 1
-        return {"running": sum(x.get("state") in active for x in events),
-                "unread": sum(bool(x.get("needs_attention")) and not x.get("read") for x in events),
-                "attention": sum(x.get("state") in {"failed", "waiting_approval", "paused"}
-                                 and not x.get("read") for x in events),
-                "workspaces": list(workspaces.values())}
+        ordered = sorted(events, key=_activity_at, reverse=True)
+        return {
+            "events": ordered[:min(max(limit, 1), _MAX_EVENTS)],
+            "summary": _summarize(events),
+        }
 
     def ack(self, event_id: str | None = None, *, sid: str | None = None) -> int:
         changed = 0
@@ -163,7 +226,7 @@ class ActivityService:
                     continue
                 if sid is not None and item.get("session_id") != sid:
                     continue
-                if item.get("needs_attention") and not item.get("read"):
+                if not item.get("read"):
                     item["read"] = True
                     changed += 1
             if changed:

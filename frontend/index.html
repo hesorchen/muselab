@@ -5087,15 +5087,12 @@
         <span class="modal-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
         <button class="modal-close" @click="activity.show=false" aria-label="Close">×</button>
       </div>
-      <!-- One chip per state group, in the SAME order as the groups below, so
-           the header and the body answer the same question. Chips keep their
-           slot at count 0 — "Failed 0" is information, and a chip that appears
-           and disappears can never be found by muscle memory. Tap to filter. -->
+      <!-- One chip per attention group, in the same order as the sections below:
+           completed results to review, live work, failures, then viewed history. -->
       <div class="activity-summary">
         <template x-for="group in activityGroups()" :key="group.key">
-          <!-- Multi-select filter chips. `has-unread` (NOT "group is
-               non-empty") is what turns on the colour, so a failure you've
-               opened goes quiet — opening an event acks it server-side. -->
+          <!-- Multi-select filters. Colour reflects unread results or a live
+               task waiting for user action, never mere group non-emptiness. -->
           <button class="activity-chip" type="button"
                   :class="[group.key, activityGroupCount(group) ? '' : 'is-empty',
                            activityGroupUnread(group) ? 'has-unread' : '',
@@ -5123,7 +5120,10 @@
           <section class="activity-group" x-show="activityEvents(group).length">
             <h3 x-text="group.label"></h3>
             <template x-for="item in activityEvents(group)" :key="item.id">
-              <button class="activity-row" @click="openActivityEvent(item)" :class="item.state + ((item.needs_attention && !item.read) ? ' is-unread' : '')">
+              <button class="activity-row" @click="openActivityEvent(item)"
+                      :class="item.state
+                        + (activityIsUnreadResult(item) ? ' is-unread' : '')
+                        + (activityRequiresAction(item) ? ' requires-action' : '')">
                 <span class="activity-state-dot"></span>
                 <span class="activity-row-main">
                   <strong x-text="item.task_summary || item.session_name"></strong>

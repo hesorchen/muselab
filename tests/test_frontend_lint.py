@@ -629,27 +629,35 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     assert "this.messages = st.messages" not in failed
 
 
-def test_activity_center_groups_strictly_by_state():
+def test_activity_center_groups_by_attention_order_and_read_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
-    # Failure gets its own group. It used to sit under a heading that read
-    # "Recent" — a failed task is not a completed one — and burying it there
-    # is why the filter needed an `item.state === "failed"` special case to
-    # keep unread failures from being hidden by the read-only rule.
-    assert 'states: ["waiting_approval"]' in app
-    assert 'states: ["failed"]' in app
-    assert 'states: ["running", "paused"]' in app
-    assert 'states: ["completed", "cancelled"]' in app
-    assert "readOnly" not in app
-    assert 'item.state === "failed"' not in app
+    review = app.index('{ key: "review"')
+    running = app.index('{ key: "running"', review)
+    failed = app.index('{ key: "failed"', running)
+    history = app.index('{ key: "history"', failed)
+    assert review < running < failed < history
 
-    # Read state no longer decides the group, so a finished task cannot jump
-    # between sections the moment the user glances at it.
-    assert "unreadOnly" not in app
-
-    # Each group collapses past a fixed number of rows.
+    assert 'key === "review") return item.state === "completed" && !item.read' in app
+    assert '["running", "waiting_approval", "paused"].includes(item.state)' in app
+    assert 'key === "failed") return item.state === "failed"' in app
+    assert 'item.state === "completed" && !!item.read' in app
+    assert 'item.state === "cancelled"' in app
     assert "ACTIVITY_GROUP_CAP: 5" in app
     assert "activityHiddenCount(group)" in app
+    assert '"/api/activity?limit=500"' in app
+    assert "r.status === 304 && !opts.summaryOnly && !this.activity.events.length" in app
+    assert 'cache: "reload"' in app
+    assert "const rank = (activeRank[a.state] ?? 9)" in app
+    assert "return this.activityEventTimestamp(b)" in app
+    assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
+
+    # The left marker is unread/action state, not a permanent failure marker.
+    assert "activityIsUnreadResult(item) ? ' is-unread'" in html
+    assert ".activity-row.failed.is-unread .activity-state-dot" in css
+    assert ".activity-row.failed .activity-state-dot,.activity-row.waiting_approval" not in css
 
 
 def test_activity_center_uses_two_compact_numberless_status_dots():

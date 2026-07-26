@@ -25,6 +25,25 @@ def test_submit_answer_returns_false_when_no_pending():
     assert auq.submit_answer("sess-X", "q-doesnt-exist", {"Q?": "A"}) is False
 
 
+def test_submit_answer_resumes_before_waking_model(monkeypatch):
+    order = []
+
+    class FakeFuture:
+        def done(self):
+            return False
+
+        def set_result(self, value):
+            order.append(("resolve", value))
+
+    from backend import activity as activity_module
+    monkeypatch.setattr(activity_module.activity, "resume",
+                        lambda sid: order.append(("resume", sid)))
+    auq._pending[("sess-X", "q-1")] = FakeFuture()
+
+    assert auq.submit_answer("sess-X", "q-1", {"Q?": "A"}) is True
+    assert order == [("resume", "sess-X"), ("resolve", {"Q?": "A"})]
+
+
 def test_unregister_cancels_pending_futures():
     """Stream ending should cancel any in-flight question futures so the tool
     handler raises and the model gets an error result (vs. leaking memory)."""

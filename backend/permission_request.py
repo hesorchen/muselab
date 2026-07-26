@@ -86,6 +86,13 @@ def submit_decision(session_id: str, request_id: str, decision: str,
     fut = _pending.get((session_id, request_id))
     if fut is None or fut.done():
         return False
+    # Resume before waking the model; after set_result it may finish or produce
+    # another permission prompt before this call stack gets control again.
+    try:
+        from .activity import activity
+        activity.resume(session_id)
+    except Exception:
+        pass
     fut.set_result({"decision": decision, "message": message})
     return True
 
