@@ -5620,6 +5620,11 @@ function portal() {
         es: null,
         // Deduplicate stop taps while the interrupt request is in flight.
         _stopping: false,
+        // Abort the POST /stream/start ticket request when Stop is clicked
+        // before EventSource exists. Without this, the backend has no active
+        // turn/client to interrupt yet and the reply starts after Stop.
+        _streamStartController: null,
+        _cancelBeforeStream: false,
         streamingModel: "",
         streamElapsed: 0,
         _streamTimer: null,
@@ -7553,12 +7558,17 @@ function portal() {
         }
         const ownedEs = st.es;
         if (ownedEs) { try { ownedEs.close(); } catch {} }
+        if (st._streamStartController) {
+          try { st._streamStartController.abort(); } catch {}
+        }
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
         if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
         st.es = null;
+        st._streamStartController = null;
+        st._cancelBeforeStream = false;
         st.streaming = false;
         st.backgroundActive = false;
         st.backgroundTaskCount = 0;
@@ -19964,10 +19974,14 @@ function portal() {
       // downgrade to putting the prompt + token back into the URL — retry
       // the ticket once, then surface the failure instead.
       let url;
+      const streamStartController = new AbortController();
+      streamState._streamStartController = streamStartController;
+      streamState._cancelBeforeStream = false;
       const _mintTicket = async () => {
         const tr = await fetch("/api/chat/stream/start", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          signal: streamStartController.signal,
           body: JSON.stringify({
             prompt: text,
             session_id: streamSid,
@@ -20003,6 +20017,11 @@ function portal() {
           url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
         }
       } catch (_e) {
+        if (streamState._cancelBeforeStream) {
+          // stop() already performed the authoritative local cleanup. The
+          // ticket was never consumed, so no backend turn/transcript exists.
+          return false;
+        }
         // Could not mint a ticket (server error / network) — fail the send
         // visibly rather than leaking prompt+token into the URL.
         this._markDone(streamSid);
@@ -20011,7 +20030,12 @@ function portal() {
           : "Send failed: could not start the stream — please retry",
           "error", 4000);
         return;
+      } finally {
+        if (streamState._streamStartController === streamStartController) {
+          streamState._streamStartController = null;
+        }
       }
+      if (streamState._cancelBeforeStream) return false;
       const es = new EventSource(url);
       streamState.es = es;
       if (streamSid === this.currentId) this.es = es;
@@ -20576,6 +20600,8 @@ function portal() {
       const _markDone = (cancelled = false, backgroundPending = false) => {
         streamState.streaming = false;
         streamState.es = null;
+        streamState._streamStartController = null;
+        streamState._cancelBeforeStream = false;
         streamState._stopping = false;
         streamState._serverActiveObserved = false;
         // Belt-and-braces for the auto-compact bubble: a turn that dies inside
@@ -21080,6 +21106,32 @@ function portal() {
       if (st._stopping) return;
       st._stopping = true;
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
+      // The earliest Stop window is before EventSource exists, while send()
+      // is still minting its one-time ticket. No backend turn exists yet, so
+      // /interrupt cannot find anything. Abort locally and restore idle state
+      // immediately; the ticket is never consumed and expires harmlessly.
+      if (st._streamStartController && !st.es) {
+        st._cancelBeforeStream = true;
+        st._streamStartController.abort();
+        st._streamStartController = null;
+        if (st._streamTimer) clearInterval(st._streamTimer);
+        st._streamTimer = null;
+        st._streamStartedAt = 0;
+        st.streamElapsed = 0;
+        st.streaming = false;
+        st._stopping = false;
+        st.streamingModel = "";
+        if (sid === this.currentId) {
+          this.streaming = false;
+          this.es = null;
+          this._streamTimer = null;
+          this._streamStartedAt = 0;
+          this.streamElapsed = 0;
+          this.streamingModel = "";
+        }
+        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
+        return;
+      }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
       let waitForTerminalEvent = false;

@@ -1851,3 +1851,24 @@ def test_concise_mode_is_a_device_preference_and_defaults_off():
     assert i18n.count('"concise.title"') == 2
     assert "失败的工具仍会显示" in i18n
     assert "Failed tools still show" in i18n
+
+
+def test_stop_aborts_stream_ticket_before_backend_turn_exists():
+    """A Stop click during POST /stream/start must prevent the later turn."""
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    state = js[js.index("_stopping: false,"):]
+    state = state[:state.index("streamingModel:", 0)]
+    assert "_streamStartController: null" in state
+    assert "_cancelBeforeStream: false" in state
+
+    ticket = js[js.index("const streamStartController = new AbortController()"):]
+    ticket = ticket[:ticket.index("const es = new EventSource(url)")]
+    assert "signal: streamStartController.signal" in ticket
+    assert "if (streamState._cancelBeforeStream)" in ticket
+
+    stop = js[js.index("async stop() {"):]
+    stop = stop[:stop.index("// ====== ask_user_question UI helpers")]
+    assert "if (st._streamStartController && !st.es)" in stop
+    assert "st._streamStartController.abort()" in stop
+    assert "st.streaming = false" in stop

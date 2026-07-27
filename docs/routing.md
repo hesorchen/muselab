@@ -88,7 +88,7 @@ Desktop subscribers retain full replay behavior. If a mobile replay exceeds `MUS
 
 Active turns live in an in-memory registry. A just-finished turn remains available for 60 seconds by default, configurable with `MUSELAB_RECENT_TURN_TTL`, so a browser can still attach to a fast queue-drained turn. Expiry closes and deletes its temporary spool.
 
-A background turn has a hard 30-minute timeout. Explicit interruption marks it cancelled and pauses a non-empty server queue.
+A background turn has a hard 30-minute timeout. Explicit interruption marks it cancelled and pauses a non-empty server queue. Stop also covers the pre-stream phases: the browser aborts an unconsumed ticket request, the server cancels cold client startup, and an already-running SDK client gets a short graceful-interrupt window before forced teardown.
 
 ## Reconnection and cross-device state
 

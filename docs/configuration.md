@@ -82,6 +82,8 @@ Local Codex image generation is suitable only for trusted instances. Durable job
 | `MUSELAB_THINKING_BUDGET` | Extended-thinking token budget | `10000` |
 | `MUSELAB_CLIENT_POOL_CAP` | Number of live SDK clients | `3` |
 | `MUSELAB_RECENT_TURN_TTL` | Seconds a finished turn remains reconnectable | `60` |
+| `MUSELAB_INTERRUPT_ACK_TIMEOUT_S` | Graceful SDK interrupt acknowledgement timeout | `0.35` |
+| `MUSELAB_INTERRUPT_FORCE_GRACE_S` | Deadline from Stop click before forced client teardown | `0.5` |
 | `MUSELAB_STREAM_REPLAY_MAX_EVENTS` | Mobile replay event threshold before resync | `512` |
 | `MUSELAB_STREAM_REPLAY_MAX_BYTES` | Mobile replay byte threshold before resync | `2097152` |
 | `MUSELAB_DISABLED_PROVIDERS` | Comma-separated stable provider IDs to hide | Empty |
