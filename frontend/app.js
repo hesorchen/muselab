@@ -5862,6 +5862,24 @@ function portal() {
       const previous = this.mobileTab;
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
+      const tabSeq = this._mobileTabSeq = (this._mobileTabSeq || 0) + 1;
+      // A hidden `display:none` chat pane has no retained layout tree. Showing
+      // a rich history therefore makes the phone synchronously style/layout
+      // every mounted bubble before it can paint the tab change. Keep the
+      // bubbles behind the lightweight skeleton for one painted frame, then
+      // reveal them. This path is distinct from switchSession(): tapping the
+      // bottom Chat tab can reveal the already-current session without ever
+      // switching sessions, which used to bypass the existing protection.
+      const chatState = next === "chat" && this.currentId
+        ? this.tabState && this.tabState[this.currentId] : null;
+      const chatLen = (chatState && chatState.messages && chatState.messages.length) || 0;
+      // Even one envelope may contain a very large tool result or diff, so
+      // message count alone is not a safe complexity proxy on this reveal path.
+      const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
+      if (deferChat) {
+        chatState.messagesReady = false;
+        this.messagesReady = false;
+      }
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
         this._cancelPreviewViewRestore();
@@ -5873,6 +5891,21 @@ function portal() {
         this._restorePreviewViewState(ownerPath, ownerLoadSeq);
       }
       this.mobileTab = next;
+      if (deferChat) {
+        const target = this.currentId;
+        this._afterPaint(() => {
+          if (this._mobileTabSeq !== tabSeq || this.mobileTab !== "chat"
+              || this.currentId !== target || this.tabState[target] !== chatState) return;
+          chatState.messagesReady = true;
+          this.messagesReady = true;
+          this._afterPaint(() => {
+            if (this._mobileTabSeq === tabSeq && this.mobileTab === "chat"
+                && this.currentId === target) {
+              this._restoreChatPosition(target);
+            }
+          });
+        });
+      }
       if (next === "preview" && previous !== "preview" && ownerPath) {
         this.$nextTick(() => requestAnimationFrame(() => {
           if (this.mobileTab === "preview" && this.selected === ownerPath
@@ -10310,7 +10343,9 @@ function portal() {
         // suppressed during it, so the default cap is cheap in the common case
         // while still landing correctly on tall histories.
         const settle = () => this._restoreChatPosition(target);
-        if (this._isMobileLayout() && histLen > 60 && shouldFollow) {
+        if (this._isMobileLayout()
+            && histLen >= Math.ceil(this._mountedMessageCap() / 2)
+            && shouldFollow) {
           stCur.messagesReady = false;
           this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
           this._afterPaint(() => {
@@ -11107,7 +11142,12 @@ function portal() {
       this._capHistoryCache(st);
       return target[target.length - 1];
     },
-    _mountedMessageCap() { return this._isMobileLayout() ? 60 : 300; },
+    // Keep the phone DOM deliberately small. Rich tool/diff/code bubbles can
+    // expand into hundreds of descendants each; 60 envelopes was still enough
+    // to exhaust a mobile WebView during a display:none → flex reveal. Evicted
+    // envelopes stay in the bounded history cache and remain reachable through
+    // "Load earlier", so this is windowing rather than data loss.
+    _mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; },
     _historyCacheCap() { return this._isMobileLayout() ? 120 : 800; },
     _capMountedWindow(st, direction = "newer", anchorUuid = "") {
       const cap = this._mountedMessageCap();
