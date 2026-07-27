@@ -119,6 +119,8 @@ Activity Center 把每个会话的当前状态持久化在 `$MUSELAB_ROOT/.musel
 - `effort` 按会话保存，也是客户端缓存键的一部分；有效值为 `low`、`medium`、`high`、`xhigh`、`max`，空值使用 SDK 默认。
 - 扩展思考预算默认 10,000 token，可用 `MUSELAB_THINKING_BUDGET` 调整。
 - provider 是否显示 effort、是否支持 thinking，以 `/api/chat/providers` 返回的能力为准。
+- 部分 Anthropic 兼容 provider 会省略 thinking 块必需的 `signature` 键。第三方路由会在内存解析副本中以空串占位，让 SDK 流能够走完，随后从持久化 JSONL 中删除无法验证的 thinking 块。原生 Claude 路由仍使用 SDK 严格解析；muselab 不会伪造有效签名。
+- 如果池化 SDK 流仍然意外终止，muselab 会逐出对应的精确 client、把当前回合显示为 SSE 错误，并在下一次发送时重建运行时；缓存快速路径不会再返回已经死亡的 CLI 子进程。
 
 ```mermaid
 sequenceDiagram

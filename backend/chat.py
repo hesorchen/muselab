@@ -62,6 +62,7 @@ from .ask_user_question import (
 )
 from . import permission_request as perm
 from . import memory_client as mem0
+from .sdk_compat import UnsignedThinkingCompatibleClient
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
@@ -1977,8 +1978,18 @@ async def _build_and_connect_client(
     # dedicated muselab MCP tool in every mode.
     if permission != "bypassPermissions":
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
+    # Third-party Anthropic-compatible endpoints may emit a `thinking` block
+    # without the signature key that the SDK parser requires.  Use the narrow
+    # compatibility client only for vendor routes; native Claude stays on the
+    # SDK's strict parser.  The existing post-turn JSONL cleanup removes the
+    # empty parser sentinel before a future resume.
+    client_cls = (
+        UnsignedThinkingCompatibleClient
+        if endpoints.is_third_party(model)
+        else ClaudeSDKClient
+    )
     try:
-        client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
+        client = client_cls(options=ClaudeAgentOptions(**opts_kwargs))
         await client.connect()
         return client
     except Exception as e:
@@ -2014,7 +2025,7 @@ async def _build_and_connect_client(
         last_err: Exception | None = None
         for attempt in range(4):
             try:
-                client = ClaudeSDKClient(
+                client = client_cls(
                     options=ClaudeAgentOptions(**opts_kwargs))
                 await client.connect()
                 if attempt > 0:
@@ -2362,6 +2373,7 @@ class _SessionStream:
         self._background: asyncio.Queue | None = None
         self._orphans: deque = deque(maxlen=self._ORPHAN_MAX)
         self._closed = False
+        self._failure: Exception | None = None
         self.task: asyncio.Task = asyncio.create_task(self._pump())
 
     def _adopt_orphans(self, q: asyncio.Queue) -> None:
@@ -2433,20 +2445,29 @@ class _SessionStream:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # The CLI died or the transport broke. Wake any consumer with a
-            # sentinel so it fails fast instead of hanging on an empty queue.
+            self._failure = e
             sys.stderr.write(
                 f"[chat] session stream ended sid={self.key[0][:8]} "
                 f"exc={type(e).__name__}: {e}\n")
             sys.stderr.flush()
-            for q in (self._turn, self._background):
-                if q is not None:
-                    q.put_nowait(_STREAM_EOF)
         finally:
+            # A pooled interactive SDK stream is expected to live until
+            # muselab explicitly closes it. Natural EOF while `_closed` is
+            # still false therefore means the CLI/runtime died even if the SDK
+            # did not preserve a more specific exception.
+            if not self._closed and self._failure is None:
+                self._failure = ClaudeSDKError(
+                    "SDK message stream ended before the session was closed")
             self._closed = True
             for q in (self._turn, self._background):
                 if q is not None:
                     q.put_nowait(_STREAM_EOF)
+            if self._failure is not None:
+                # The previous implementation left the dead client in
+                # `_clients`. Every later turn hit get_client()'s cache fast
+                # path and tried to write to the terminated subprocess until a
+                # fork/settings change/restart happened to rebuild it.
+                await _evict_failed_session_stream(self)
 
     async def aclose(self) -> None:
         self._closed = True
@@ -2458,6 +2479,32 @@ class _SessionStream:
 
 # One pump per cached client, keyed exactly like `_clients`.
 _session_streams: dict["_ClientKey", _SessionStream] = {}
+
+
+async def _evict_failed_session_stream(stream: _SessionStream) -> None:
+    """Remove one failed stream's exact client from every runtime cache.
+
+    Identity checks are load-bearing: a settings change or concurrent recovery
+    may already have installed a replacement under the same key. The failed
+    stream must never evict that fresh runtime.
+    """
+    key = stream.key
+    client = stream.client
+    async with _lock:
+        if _clients.get(key) is client:
+            _clients.pop(key, None)
+            _client_permission.pop(key, None)
+            if key in _client_lru:
+                _client_lru.remove(key)
+        if _session_streams.get(key) is stream:
+            _session_streams.pop(key, None)
+    try:
+        await client.disconnect()
+    except Exception as e:
+        sys.stderr.write(
+            f"[chat] failed-stream disconnect sid={key[0][:8]} "
+            f"exc={type(e).__name__}: {e}\n")
+        sys.stderr.flush()
 
 
 def _ensure_session_stream(key: "_ClientKey",
@@ -9683,10 +9730,17 @@ async def _start_turn(
                         while True:
                             msg = await turn_q.get()
                             if msg is _STREAM_EOF:
-                                # Transport ended without a Result for this
-                                # query; keep the previous completion/error
-                                # behavior rather than spinning forever.
-                                break
+                                # Never turn a dead SDK stream into a silent,
+                                # apparently-successful zero-event turn. The
+                                # pump has already evicted its cached client;
+                                # raising here produces a visible SSE error and
+                                # makes the next send build a fresh runtime.
+                                raise (
+                                    stream._failure
+                                    or ClaudeSDKError(
+                                        "SDK message stream ended without "
+                                        "a ResultMessage")
+                                )
                             if await _dispatch(msg) == "current_result":
                                 break
                     finally:

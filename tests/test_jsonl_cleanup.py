@@ -28,6 +28,7 @@ from pathlib import Path
 from backend.jsonl_cleanup import (
     MIN_SIG_LEN,
     clean_jsonl,
+    clean_session,
     is_invalid_thinking,
 )
 
@@ -148,5 +149,32 @@ def test_malformed_and_non_message_lines_preserved(tmp_path):
     assert json.loads(lines[1])["text"] == "no message key"
     # Dirty line cleaned.
     assert json.loads(lines[2])["message"]["content"] == [
+        {"type": "text", "text": "kept"}
+    ]
+
+
+def test_clean_session_finds_vendor_isolated_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    sid = "vendor-session"
+    target = (
+        tmp_path / ".local" / "state" / "muselab" / "vendor-cli"
+        / "projects" / "-workspace" / f"{sid}.jsonl"
+    )
+    target.parent.mkdir(parents=True)
+    _write_jsonl(target, [{
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "thinking", "thinking": "scratch"},
+            {"type": "text", "text": "kept"},
+        ]},
+    }])
+
+    report = clean_session(sid)
+
+    assert report is not None
+    assert report.path == target
+    assert report.blocks_dropped == 1
+    assert json.loads(target.read_text(encoding="utf-8"))["message"]["content"] == [
         {"type": "text", "text": "kept"}
     ]

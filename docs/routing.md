@@ -119,6 +119,8 @@ The Activity Center persists each conversation's current state in `$MUSELAB_ROOT
 - `effort` is stored per session and participates in the client cache key. Values are `low`, `medium`, `high`, `xhigh`, and `max`; empty uses the SDK default.
 - The extended-thinking budget defaults to 10,000 tokens and is configurable with `MUSELAB_THINKING_BUDGET`.
 - Provider capabilities for effort and thinking come from `/api/chat/providers`.
+- Some Anthropic-compatible providers omit the required `signature` key from thinking blocks. Vendor routes normalize the missing field to an empty in-memory parser sentinel so the SDK stream can finish, then remove the unverifiable thinking block from persisted JSONL. Native Claude routes keep strict SDK parsing; muselab never fabricates a valid signature.
+- If a pooled SDK stream nevertheless terminates, muselab evicts that exact client, surfaces the failed turn as an SSE error, and rebuilds the runtime on the next send. A dead CLI subprocess is never returned from the cache fast path.
 
 ```mermaid
 sequenceDiagram
