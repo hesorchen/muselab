@@ -241,3 +241,48 @@ def test_skill_draft_is_inert_until_explicit_approval(tmp_path, monkeypatch):
     disabled = instance.disable_skill(candidate["id"])
     assert disabled["status"] == "disabled"
     assert not (discoverable / "SKILL.md").exists()
+
+
+def test_recall_bounds_the_text_sent_to_the_embedder(tmp_path, monkeypatch):
+    """Long prior turns must not inflate the embedding input without bound.
+
+    Local CPU embedding latency scales with input length, so joining two
+    1000-char prior turns onto the query pushed the dense channel past the
+    soft timeout on exactly the long-context turns where recall matters.
+    """
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine, _RECALL_QUERY_CHARS
+    from backend.memory_store import MemoryStore
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    for index in range(2):
+        instance.store.add_evidence(
+            "default", "session-long", "user", f"{index}" + "旧上下文" * 400,
+            source_ref=f"msg-{index}")
+    question = "当前召回是否正常"
+    seen: list[str] = []
+
+    class FakeEmbedding:
+        def __init__(self, _config): pass
+
+        async def embed(self, texts):
+            seen.extend(texts)
+            return [[1.0, 0.0, 0.0]]
+
+    class FakeVector:
+        async def search(self, _vector, *, owner_id, limit):
+            return []
+
+    monkeypatch.setattr(module, "EmbeddingProvider", FakeEmbedding)
+    monkeypatch.setattr(module, "vector_store", lambda _config: FakeVector())
+    _run(instance.recall(question, "session-long"))
+    assert seen and len(seen[0]) <= _RECALL_QUERY_CHARS
+    # The tail carries the actual question; truncation must keep it.
+    assert seen[0].endswith(question)
+
+
+def test_default_soft_timeout_exceeds_a_single_embedding_call():
+    """Guards the budget against regressing below one embedding round-trip."""
+    from backend.memory_config import RetrievalConfig
+    assert RetrievalConfig().soft_timeout_ms >= 1000

@@ -30,6 +30,11 @@ _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}")
 _TOKEN_RE = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,})\b")
+# Upper bound on the text handed to the embedder in recall(). Not a config
+# knob: it exists to keep dense-channel latency inside the soft timeout, and
+# retrieval quality is flat well below it — a query is a topic hint, not the
+# document being matched.
+_RECALL_QUERY_CHARS = 800
 
 
 def _redact(text: str, limit: int = 40_000) -> str:
@@ -739,7 +744,13 @@ class MemoryEngine:
             role="user", limit=2)
         prior = [str(item.get("content", ""))[:1000] for item in recent
                  if item.get("content")]
-        retrieval_query = "\n".join([*prior, query])[-8000:]
+        # Bound what goes to the embedder. Local CPU BGE-M3 latency scales
+        # with input length (~0.1s at 2 chars, ~1.1s at 800, ~2.1s at 1200),
+        # so an 8000-char join blew past any sane soft timeout and the dense
+        # channel silently dropped out on exactly the long-context turns where
+        # recall matters most. The tail is kept because the current question
+        # lives there; earlier turns only disambiguate it.
+        retrieval_query = "\n".join([*prior, query])[-_RECALL_QUERY_CHARS:]
         started = time.perf_counter()
         deadline = started + cfg.retrieval.soft_timeout_ms / 1000
 

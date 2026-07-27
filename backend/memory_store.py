@@ -27,6 +27,85 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+# Bumping this rebuilds memory_fts from `memories` on the next open, which is
+# what makes an existing registry pick up the tokenization below instead of
+# keeping rows indexed under the old scheme.
+_FTS_SCHEMA_VERSION = 1
+
+
+def _is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x3040 <= code <= 0x30FF      # hiragana, katakana
+        or 0x3400 <= code <= 0x4DBF   # CJK extension A
+        or 0x4E00 <= code <= 0x9FFF   # CJK unified ideographs
+        or 0xAC00 <= code <= 0xD7AF   # hangul syllables
+        or 0xF900 <= code <= 0xFAFF   # CJK compatibility ideographs
+    )
+
+
+def _fts_terms(text: str) -> list[str]:
+    """Tokenize for FTS5 unicode61: words for latin, bigrams for CJK.
+
+    unicode61 only breaks on non-alphanumerics, so it collapses an unbroken
+    Chinese run into ONE token: "记忆系统端口" is a single term that no
+    realistic query ever reproduces verbatim. The lexical channel therefore
+    returned zero rows for every Chinese query while happily matching latin
+    ones, quietly reducing hybrid recall to dense-only — and dense is the
+    channel that drops out under the soft timeout, so a slow embedding call
+    meant no results at all.
+
+    Overlapping bigrams give CJK the substring-ish matching latin gets for
+    free. Applying the identical expansion when indexing and when querying is
+    what keeps the two sides speaking the same language; that symmetry is why
+    this lives here rather than in the callers.
+
+    Terms are returned in order and NOT deduplicated: bm25 needs the term
+    frequencies of the indexed side. Query-side dedup happens in
+    lexical_search, where repetition only inflates the MATCH expression.
+    """
+    terms: list[str] = []
+    cjk: list[str] = []
+    latin: list[str] = []
+
+    def flush_cjk() -> None:
+        if not cjk:
+            return
+        # A lone character has no bigram; index it as-is so single-glyph
+        # queries (and one-character tails) still resolve.
+        if len(cjk) == 1:
+            terms.append(cjk[0])
+        else:
+            terms.extend(cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1))
+        cjk.clear()
+
+    def flush_latin() -> None:
+        if latin:
+            terms.append("".join(latin))
+            latin.clear()
+
+    for char in text:
+        # CJK first: those code points are alphanumeric too, so the isalnum
+        # branch below would otherwise swallow them into a latin word.
+        if _is_cjk(char):
+            flush_latin()
+            cjk.append(char)
+        elif char.isalnum():
+            flush_cjk()
+            latin.append(char)
+        else:
+            flush_cjk()
+            flush_latin()
+    flush_cjk()
+    flush_latin()
+    return terms
+
+
+def _fts_text(content: str) -> str:
+    """Indexed form of `content` — see _fts_terms for why it is not raw text."""
+    return " ".join(_fts_terms(content))
+
+
 class MemoryStore:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -124,6 +203,28 @@ class MemoryStore:
         """
         with self._lock, self._connect() as conn:
             conn.executescript(schema)
+            self._migrate_fts(conn)
+
+    def _migrate_fts(self, conn: sqlite3.Connection) -> None:
+        """Reindex memory_fts when the tokenization scheme changes.
+
+        The FTS table stores the expanded form from _fts_text, not raw
+        content, so a registry written by an older build holds rows the new
+        query expansion cannot match. `memories` is the source of truth, so
+        the index is simply rebuilt from it — cheap at these row counts and
+        idempotent via PRAGMA user_version.
+        """
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version >= _FTS_SCHEMA_VERSION:
+            return
+        conn.execute("DELETE FROM memory_fts")
+        rows = conn.execute("SELECT id,owner_id,kind,content FROM memories").fetchall()
+        conn.executemany(
+            "INSERT INTO memory_fts(memory_id,owner_id,kind,content) VALUES (?,?,?,?)",
+            [(row["id"], row["owner_id"], row["kind"], _fts_text(row["content"]))
+             for row in rows],
+        )
+        conn.execute(f"PRAGMA user_version={_FTS_SCHEMA_VERSION}")
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict | None:
@@ -312,7 +413,7 @@ class MemoryStore:
             )
             conn.execute(
                 "INSERT INTO memory_fts(memory_id,owner_id,kind,content) VALUES (?,?,?,?)",
-                (memory_id, owner_id, kind, content),
+                (memory_id, owner_id, kind, _fts_text(content)),
             )
             for source in sources or []:
                 conn.execute(
@@ -406,7 +507,7 @@ class MemoryStore:
                 ).fetchone()
                 conn.execute(
                     "INSERT INTO memory_fts(memory_id,owner_id,kind,content) VALUES (?,?,?,?)",
-                    (memory_id, row["owner_id"], row["kind"], row["content"]),
+                    (memory_id, row["owner_id"], row["kind"], _fts_text(row["content"])),
                 )
         return self.memory(memory_id)
 
@@ -436,7 +537,12 @@ class MemoryStore:
     def lexical_search(self, owner_id: str, query: str, *, limit: int = 20,
                        include_status: str | None = "active",
                        kind: str | None = None) -> list[dict]:
-        tokens = [token.replace('"', "") for token in query.split() if token.strip()]
+        # Expand the query the same way the index was written (_fts_text), so
+        # Chinese input turns into the bigrams actually stored instead of one
+        # unmatchable whole-sentence token. Deduplicate while preserving order:
+        # a repeated bigram adds nothing to an OR expression but does count
+        # against the 20-term cap below.
+        tokens = list(dict.fromkeys(_fts_terms(query)))
         expression = " OR ".join(f'"{token}"' for token in tokens[:20])
         if not expression:
             return []

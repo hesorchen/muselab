@@ -86,3 +86,56 @@ def test_idle_episode_is_closed_for_background_consolidation(tmp_path: Path):
     closed = store.close_idle_episodes("u", cutoff=float("inf"))
     assert closed == [episode["id"]]
     assert store.episode(episode["id"], with_evidence=False)["status"] == "closed"
+
+
+def test_lexical_search_matches_chinese_substrings(tmp_path: Path):
+    """CJK must be searchable by fragment, not only by the exact full string.
+
+    FTS5 unicode61 makes an unbroken Chinese run one token, so before bigram
+    expansion a query like "记忆系统" could not match a memory containing it —
+    the lexical channel returned nothing for Chinese and hybrid recall
+    degraded to dense-only.
+    """
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    target = store.create_memory(
+        "u", "fact", "记忆系统的召回链路依赖 qdrant 与 bge-m3 向量检索")
+    store.create_memory("u", "fact", "完全无关的另一条记录")
+
+    for query in ("记忆系统", "召回链路", "记忆", "向量检索 是否正常"):
+        hits = store.lexical_search("u", query)
+        assert [hit["memory"]["id"] for hit in hits][:1] == [target["id"]], query
+
+    # Latin tokens must keep working unchanged.
+    assert store.lexical_search("u", "qdrant")[0]["memory"]["id"] == target["id"]
+    assert store.lexical_search("u", "bge-m3")[0]["memory"]["id"] == target["id"]
+    # A query sharing no fragment must stay empty rather than matching all.
+    assert store.lexical_search("u", "xyzzy") == []
+
+
+def test_reopening_an_old_registry_reindexes_fts_for_cjk(tmp_path: Path):
+    """A registry written before bigram indexing becomes searchable on open.
+
+    memory_fts holds the expanded form, so rows indexed by an older build are
+    invisible to the new query expansion until rebuilt. `memories` is the
+    source of truth; the migration replays it.
+    """
+    import sqlite3
+
+    from backend.memory_store import _FTS_SCHEMA_VERSION
+
+    path = tmp_path / "memory.sqlite3"
+    store = MemoryStore(path)
+    memory = store.create_memory("u", "fact", "融合层的排序权重需要小流量验证")
+
+    # Simulate the pre-migration state: raw content in the index, no version.
+    with sqlite3.connect(path) as conn:
+        conn.execute("DELETE FROM memory_fts")
+        conn.execute(
+            "INSERT INTO memory_fts(memory_id,owner_id,kind,content) VALUES (?,?,?,?)",
+            (memory["id"], "u", "fact", "融合层的排序权重需要小流量验证"))
+        conn.execute("PRAGMA user_version=0")
+    assert MemoryStore(path).lexical_search("u", "排序权重")[0]["memory"]["id"] \
+        == memory["id"]
+    with sqlite3.connect(path) as conn:
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) \
+            == _FTS_SCHEMA_VERSION

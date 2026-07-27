@@ -50,7 +50,11 @@ class RetrievalConfig(BaseModel):
     lexical_candidates: int = Field(default=20, ge=1, le=100)
     final_limit: int = Field(default=6, ge=1, le=20)
     max_context_chars: int = Field(default=3000, ge=500, le=12000)
-    soft_timeout_ms: int = Field(default=250, ge=100, le=3000)
+    # 250ms was below the cost of a single local CPU embedding call (~0.15-0.3s
+    # for a short query), so the dense channel timed out on most real turns and
+    # recall returned nothing. Recall is best-effort and off the critical path
+    # of the reply, so a budget that actually fits the slowest hop is cheap.
+    soft_timeout_ms: int = Field(default=2000, ge=100, le=5000)
 
 
 class ConsolidationConfig(BaseModel):
