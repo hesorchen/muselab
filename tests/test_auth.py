@@ -11,6 +11,12 @@ def test_bad_token_rejected(client):
     assert r.status_code == 401
 
 
+def test_non_ascii_token_is_a_normal_401(client):
+    r = client.get("/api/files/list?path=",
+                   headers={"X-Auth-Token": b"h\xe9llo"})
+    assert r.status_code == 401
+
+
 def test_good_token_accepted(client, auth):
     r = client.get("/api/files/list?path=", headers=auth)
     assert r.status_code == 200

@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
 from .chat import router as chat_router
 from .api_settings import router as settings_router
+from .api_memory import router as memory_router
 from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
 from .workspaces import router as workspaces_router
@@ -363,6 +364,7 @@ app.include_router(files_router)
 app.include_router(file_events_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
+app.include_router(memory_router)
 app.include_router(scheduler_router)
 app.include_router(push_router)
 app.include_router(workspaces_router)

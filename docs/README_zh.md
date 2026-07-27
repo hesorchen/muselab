@@ -16,6 +16,7 @@
 - [手机端 PWA](mobile_zh.md) —— 加到主屏、推送通知、HTTPS
 - [终端](terminal_zh.md) —— 真实 PTY、终端列表、Profile 与移动操作
 - [定时任务](scheduler_zh.md) —— 按节奏运行保存的 prompt
+- [长期记忆](memory_zh.md) —— Episode、Dreamer／Verifier、混合召回与人工审核 Skill
 
 ## 模型
 

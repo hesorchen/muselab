@@ -283,6 +283,35 @@ def test_raw_image_inline(client, temp_root):
     assert r.headers["content-disposition"].startswith("inline")
 
 
+def test_path_bound_preview_ticket_replaces_long_lived_token(
+    client, auth, temp_root,
+):
+    (temp_root / "report.html").write_text(
+        "<h1>safe preview</h1>", encoding="utf-8")
+    minted = client.post(
+        "/api/files/preview-ticket",
+        headers=auth,
+        json={"path": "report.html"},
+    )
+    assert minted.status_code == 200
+    ticket = minted.json()["ticket"]
+    assert ticket.startswith("preview.")
+
+    preview = client.get(
+        "/api/files/raw",
+        params={"path": "report.html", "ticket": ticket, "preview": "1"},
+    )
+    assert preview.status_code == 200
+    assert "safe preview" in preview.text
+
+    # A leaked iframe URL cannot be repurposed to read another workspace file.
+    replay = client.get(
+        "/api/files/raw",
+        params={"path": "README.md", "ticket": ticket},
+    )
+    assert replay.status_code == 401
+
+
 # ---- new endpoints / edge cases ----
 
 def test_rename_endpoint(client, auth, temp_root):

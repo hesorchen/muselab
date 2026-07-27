@@ -83,6 +83,11 @@ dependencies = [
     # an upstream drop would make `import httpx` fail and (because mem0 is
     # fail-soft) silently disable memory with no signal.
     "httpx>=0.27",
+    # Optional pgvector adapter for the long-term memory index. Imported only
+    # when pgvector is selected; Qdrant deployments never open a Postgres
+    # connection, but keeping the driver installed makes provider switching a
+    # runtime setting instead of a redeploy.
+    "psycopg[binary]>=3.2.9",
 ]
 
 [project.urls]

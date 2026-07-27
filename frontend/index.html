@@ -2027,6 +2027,11 @@
                       <svg x-show="!m._copied"><use href="#i-copy"/></svg>
                       <svg x-show="m._copied"><use href="#i-check"/></svg>
                     </button>
+                    <button @click="memorySaveMessage(m)" class="icon-btn sm"
+                            :class="{ 'copied-flash': m._memorySaved }"
+                            :title="lang==='zh' ? '明确保存为记忆' : 'Save as confirmed memory'">
+                      <svg><use :href="m._memorySaved ? '#i-check' : '#i-brain'"/></svg>
+                    </button>
                     <button x-show="pane && !pane.streaming && !m._editing"
                             @click="startEditMessage(m)" class="icon-btn sm"
                             :title="t('btn.edit')">
@@ -2095,6 +2100,11 @@
                             :title="m._copied ? (lang==='zh'?'已复制':'Copied') : (lang==='zh'?'复制':'Copy')">
                       <svg x-show="!m._copied"><use href="#i-copy"/></svg>
                       <svg x-show="m._copied"><use href="#i-check"/></svg>
+                    </button>
+                    <button @click="memorySaveMessage(m)" class="icon-btn sm"
+                            :class="{ 'copied-flash': m._memorySaved }"
+                            :title="lang==='zh' ? '明确保存为记忆' : 'Save as confirmed memory'">
+                      <svg><use :href="m._memorySaved ? '#i-check' : '#i-brain'"/></svg>
                     </button>
                   </div>
                 </div>
@@ -2718,6 +2728,30 @@
                 <span x-show="m.elapsed && m.ts"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
+                <details class="memory-recall-trace"
+                         x-show="m.memoryRecall && m.memoryRecall.count">
+                  <summary x-text="lang==='zh'
+                    ? `· 使用了 ${m.memoryRecall?.count || 0} 条记忆`
+                    : `· Used ${m.memoryRecall?.count || 0} memories`"></summary>
+                  <div class="memory-recall-popover">
+                    <div class="memory-recall-meta"
+                         x-text="`${m.memoryRecall?.latency_ms || 0} ms · ${m.memoryRecall?.status || ''}`"></div>
+                    <template x-for="item in (m.memoryRecall?.items || [])" :key="item.id">
+                      <div class="memory-recall-item">
+                        <span x-text="item.kind"></span>
+                        <p x-text="item.content"></p>
+                        <div class="memory-recall-feedback">
+                          <button @click.stop="memoryFeedback(item, true, m.memoryRecall?.id)"
+                                  :class="{ active: item._feedback === 'up' }"
+                                  :title="lang==='zh' ? '这条记忆有用' : 'Helpful'">↑</button>
+                          <button @click.stop="memoryFeedback(item, false, m.memoryRecall?.id)"
+                                  :class="{ active: item._feedback === 'down' }"
+                                  :title="lang==='zh' ? '这条记忆无用' : 'Not helpful'">↓</button>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </details>
                 <button class="turn-fork-btn"
                         type="button"
                         x-show="m.role === 'assistant' && m.uuid && !(pane && pane.streaming)"
@@ -3697,6 +3731,16 @@
             <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
+          <li class="settings-menu-item" @click="settings.activePage='memory'; loadMemorySettings()"
+              :class="{ active: settings.activePage==='memory' }">
+            <span class="settings-menu-icon"><svg><use href="#i-brain"/></svg></span>
+            <span class="settings-menu-title"
+                  x-text="lang==='zh' ? '记忆' : 'Memory'"></span>
+            <span class="settings-memory-badge"
+                  x-show="settings.memory.status?.pending_artifacts"
+                  x-text="settings.memory.status?.pending_artifacts || ''"></span>
+            <span class="settings-menu-chevron">›</span>
+          </li>
           <li class="settings-menu-item" @click="settings.activePage='appearance'"
               :class="{ active: settings.activePage==='appearance' }">
             <span class="settings-menu-icon"><svg><use href="#i-palette"/></svg></span>
@@ -3768,6 +3812,245 @@
               <button class="btn-ghost" :class="{active: lang==='zh'}" @click="setLang('zh')" x-text="t('set.lang.zh')"></button>
               <button class="btn-ghost" :class="{active: lang==='en'}" @click="setLang('en')" x-text="t('set.lang.en')"></button>
             </div>
+          </div>
+        </div>
+
+        <!-- Long-term Memory: environment + white-box registry + review.
+             This remains inspectable while disabled. No draft Skill is ever
+             written into an SDK-discoverable directory from this page unless
+             the user explicitly presses Approve. -->
+        <div class="settings-section memory-settings-section" data-page="memory"
+             x-show="settings.activePage === 'memory'">
+          <div class="settings-section-title">
+            <span x-text="lang==='zh' ? '长期记忆' : 'Long-term memory'"></span>
+            <span class="settings-save-mode live"
+                  x-text="settings.memory.config.mode === 'off'
+                    ? (lang==='zh' ? '已关闭' : 'Off')
+                    : settings.memory.config.mode"></span>
+          </div>
+          <div class="settings-hint"
+               x-text="lang==='zh'
+                 ? '一个用户级记忆池；业务、项目和主题只是软标签。原始会话是证据，SQLite Registry 是治理真相源，向量库可随时重建。'
+                 : 'One user-level memory pool. Domains and projects are soft metadata. Transcripts are evidence, SQLite is the governance source of truth, and vector indexes are rebuildable.'"></div>
+
+          <div class="memory-status-grid" x-show="settings.memory.status">
+            <div><strong x-text="settings.memory.status?.memories || 0"></strong>
+              <span x-text="lang==='zh' ? '有效记忆' : 'active memories'"></span></div>
+            <div><strong x-text="settings.memory.status?.episodes || 0"></strong>
+              <span>Episodes</span></div>
+            <div><strong x-text="settings.memory.status?.pending_artifacts || 0"></strong>
+              <span x-text="lang==='zh' ? '待审核' : 'pending review'"></span></div>
+            <div><strong x-text="settings.memory.status?.queued_jobs || 0"></strong>
+              <span x-text="lang==='zh' ? '后台任务' : 'background jobs'"></span></div>
+          </div>
+
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '运行模式' : 'Mode'"></label>
+            <select class="settings-input" x-model="settings.memory.config.mode">
+              <option value="off" x-text="lang==='zh' ? '关闭（无外部调用）' : 'Off (no external calls)'"></option>
+              <option value="shadow" x-text="lang==='zh' ? '影子（只产候选，不召回）' : 'Shadow (candidates only)'"></option>
+              <option value="active" x-text="lang==='zh' ? '启用' : 'Active'"></option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label x-text="lang==='zh' ? '抽取／反思模型' : 'Extraction / reflection model'"></label>
+            <select class="settings-input" x-model="settings.memory.config.generation_model">
+              <option value="" x-text="lang==='zh' ? '请选择' : 'Select a model'"></option>
+              <template x-for="m in availableModels" :key="'memory-'+m.model">
+                <option :value="m.model" x-text="m.group + ' · ' + m.label"></option>
+              </template>
+            </select>
+          </div>
+
+          <div class="memory-subtitle" x-text="lang==='zh' ? 'Embedding 服务（OpenAI 兼容）' : 'Embedding service (OpenAI-compatible)'"></div>
+          <div class="settings-row"><label>Base URL</label>
+            <input class="settings-input" x-model="settings.memory.config.embedding.base_url"
+                   placeholder="http://127.0.0.1:8080/v1" /></div>
+          <div class="settings-row"><label>Model</label>
+            <input class="settings-input" x-model="settings.memory.config.embedding.model"
+                   placeholder="BAAI/bge-m3" /></div>
+          <div class="settings-row"><label>API key</label>
+            <input class="settings-input" type="password"
+                   x-model="settings.memory.config.embedding.api_key"
+                   :placeholder="settings.memory.config.embedding.has_api_key ? '•••••••• (unchanged)' : 'optional'" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '向量维度（可自动探测）' : 'Dimensions (auto-detect allowed)'"></label>
+            <input class="settings-input" type="number" min="1"
+                   x-model.number="settings.memory.config.embedding.dimensions"
+                   placeholder="1024" /></div>
+
+          <div class="memory-subtitle" x-text="lang==='zh' ? '向量数据库' : 'Vector database'"></div>
+          <div class="settings-row"><label>Provider</label>
+            <select class="settings-input" x-model="settings.memory.config.vector.provider">
+              <option value="qdrant">Qdrant</option>
+              <option value="pgvector">PostgreSQL + pgvector</option>
+            </select></div>
+          <div class="settings-row"><label x-text="settings.memory.config.vector.provider === 'qdrant' ? 'URL' : 'DSN'"></label>
+            <input class="settings-input"
+                   :type="settings.memory.config.vector.provider === 'qdrant' ? 'url' : 'password'"
+                   x-model="settings.memory.config.vector.url"
+                   :placeholder="settings.memory.config.vector.provider === 'qdrant'
+                     ? 'http://127.0.0.1:6333'
+                     : (settings.memory.config.vector.has_url ? '•••••••• (unchanged)' : 'postgresql://user:password@host/db')" /></div>
+          <div class="settings-row" x-show="settings.memory.config.vector.provider === 'qdrant'">
+            <label>API key</label>
+            <input class="settings-input" type="password"
+                   x-model="settings.memory.config.vector.api_key"
+                   :placeholder="settings.memory.config.vector.has_api_key ? '•••••••• (unchanged)' : 'optional'" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '集合／表名' : 'Collection / table'"></label>
+            <input class="settings-input" x-model="settings.memory.config.vector.collection" /></div>
+
+          <div class="memory-subtitle" x-text="lang==='zh' ? '检索与巩固' : 'Retrieval and consolidation'"></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '召回软截止（ms）' : 'Recall soft deadline (ms)'"></label>
+            <input class="settings-input" type="number" min="100" max="3000"
+                   x-model.number="settings.memory.config.retrieval.soft_timeout_ms" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '最终召回条数' : 'Final recall limit'"></label>
+            <input class="settings-input" type="number" min="1" max="20"
+                   x-model.number="settings.memory.config.retrieval.final_limit" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '向量候选数' : 'Dense candidates'"></label>
+            <input class="settings-input" type="number" min="1" max="100"
+                   x-model.number="settings.memory.config.retrieval.dense_candidates" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '关键词候选数' : 'Lexical candidates'"></label>
+            <input class="settings-input" type="number" min="1" max="100"
+                   x-model.number="settings.memory.config.retrieval.lexical_candidates" /></div>
+          <div class="settings-row"><label>Reranker</label><label class="switch">
+            <input type="checkbox" x-model="settings.memory.config.rerank.enabled" />
+            <span class="switch-slider"></span></label></div>
+          <div x-show="settings.memory.config.rerank.enabled">
+            <div class="settings-row"><label>Rerank Base URL</label>
+              <input class="settings-input" x-model="settings.memory.config.rerank.base_url"
+                     placeholder="http://127.0.0.1:8081/v1" /></div>
+            <div class="settings-row"><label>Rerank Model</label>
+              <input class="settings-input" x-model="settings.memory.config.rerank.model"
+                     placeholder="Qwen3-Reranker" /></div>
+            <div class="settings-row"><label>Rerank API key</label>
+              <input class="settings-input" type="password"
+                     x-model="settings.memory.config.rerank.api_key"
+                     :placeholder="settings.memory.config.rerank.has_api_key ? '•••••••• (unchanged)' : 'optional'" /></div>
+          </div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '每个 Episode 轮数' : 'Turns per episode'"></label>
+            <input class="settings-input" type="number" min="2" max="50"
+                   x-model.number="settings.memory.config.consolidation.episode_turns" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? 'Episode 空闲关闭（分钟）' : 'Episode idle close (minutes)'"></label>
+            <input class="settings-input" type="number" min="2" max="10080"
+                   x-model.number="settings.memory.config.consolidation.episode_idle_minutes" /></div>
+          <div class="settings-row"><label>Dreamer</label><label class="switch">
+            <input type="checkbox" x-model="settings.memory.config.consolidation.dreamer_enabled" />
+            <span class="switch-slider"></span></label></div>
+          <div class="settings-row"><label>Verifier</label><label class="switch">
+            <input type="checkbox" x-model="settings.memory.config.consolidation.verifier_enabled" />
+            <span class="switch-slider"></span></label></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '生成 Skill 候选' : 'Generate skill candidates'"></label><label class="switch">
+            <input type="checkbox" x-model="settings.memory.config.consolidation.skill_learning_enabled" />
+            <span class="switch-slider"></span></label></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? '反思最少独立 Episodes' : 'Minimum independent Episodes'"></label>
+            <input class="settings-input" type="number" min="2" max="20"
+                   x-model.number="settings.memory.config.consolidation.min_reflection_episodes" /></div>
+          <div class="settings-row"><label x-text="lang==='zh' ? 'Skill 最少成功 Episodes' : 'Minimum successful Skill Episodes'"></label>
+            <input class="settings-input" type="number" min="2" max="20"
+                   x-model.number="settings.memory.config.consolidation.min_skill_success_episodes" /></div>
+          <div class="settings-hint warn"
+               x-text="lang==='zh'
+                 ? 'Skill 只能生成候选；后台 Worker 无启用权限。每个版本必须在下方审核后，才会写入 ~/.claude/skills。'
+                 : 'Workers can only create drafts. Each version requires explicit review before it is installed into ~/.claude/skills.'"></div>
+
+          <div class="memory-actions">
+            <button class="btn-ghost sm" @click="probeMemory()" :disabled="settings.memory.probing"
+                    x-text="settings.memory.probing ? (lang==='zh' ? '检查中…' : 'Probing…') : (lang==='zh' ? '环境自检' : 'Probe')"></button>
+            <button class="btn-primary sm" @click="saveMemorySettings()" :disabled="settings.memory.saving"
+                    x-text="settings.memory.saving ? (lang==='zh' ? '保存中…' : 'Saving…') : (lang==='zh' ? '保存记忆设置' : 'Save memory settings')"></button>
+            <button class="btn-ghost sm" @click="memoryRunAction('dream')" :disabled="settings.memory.actionRunning || settings.memory.config.mode === 'off' || !settings.memory.config.consolidation.dreamer_enabled"
+                    x-text="lang==='zh' ? '立即做梦' : 'Dream now'"></button>
+            <button class="btn-ghost sm" @click="memoryRunAction('reindex')" :disabled="settings.memory.actionRunning || settings.memory.config.mode === 'off'"
+                    x-text="lang==='zh' ? '重建索引' : 'Reindex'"></button>
+            <button class="btn-ghost sm" @click="importLegacyMem0()"
+                    x-text="lang==='zh' ? '导入旧 Mem0' : 'Import legacy Mem0'"></button>
+          </div>
+          <div class="memory-probe-result" x-show="settings.memory.probeResult"
+               :class="{ ok: settings.memory.probeResult?.ok }"
+               x-text="settings.memory.probeResult?.ok
+                 ? JSON.stringify(settings.memory.probeResult)
+                 : settings.memory.probeResult?.error"></div>
+
+          <div class="memory-center-head">
+            <div class="memory-subtitle" x-text="lang==='zh' ? '记忆中心' : 'Memory Center'"></div>
+            <button class="btn-ghost xs" @click="refreshMemoryCenter()">↻</button>
+          </div>
+          <div class="memory-tabs">
+            <template x-for="tab in [
+              ['items', lang==='zh'?'记忆':'Memories'],
+              ['episodes','Episodes'], ['reflections',lang==='zh'?'反思':'Dreams'],
+              ['skills','Skills'], ['jobs',lang==='zh'?'任务':'Jobs'],
+              ['recalls',lang==='zh'?'召回':'Recalls'], ['audit',lang==='zh'?'审计':'Audit']
+            ]" :key="tab[0]">
+              <button :class="{ active: settings.memory.tab === tab[0] }"
+                      @click="settings.memory.tab=tab[0]; refreshMemoryCenter()"
+                      x-text="tab[1]"></button>
+            </template>
+          </div>
+          <div class="memory-filters" x-show="settings.memory.tab === 'items'">
+            <input class="settings-input" x-model.debounce.350ms="settings.memory.query"
+                   @input.debounce.400ms="refreshMemoryCenter()"
+                   :placeholder="lang==='zh' ? '搜索记忆…' : 'Search memories…'" />
+            <select class="settings-input" x-model="settings.memory.itemStatus"
+                    @change="refreshMemoryCenter()">
+              <option value="" x-text="lang==='zh' ? '全部状态' : 'All states'"></option>
+              <option value="active">active</option><option value="pending_review">pending_review</option>
+              <option value="quarantined">quarantined</option><option value="superseded">superseded</option>
+              <option value="deleted">deleted</option>
+            </select>
+            <button class="btn-primary sm" @click="memoryAdd()"
+                    x-text="lang==='zh' ? '＋确认记忆' : '+ Confirmed memory'"></button>
+          </div>
+          <div class="memory-list">
+            <template x-for="item in settings.memory.items" :key="item.id">
+              <article class="memory-card">
+                <div class="memory-card-head">
+                  <span class="memory-kind"
+                        x-text="item.kind || item.status || item.event_type || 'item'"></span>
+                  <span class="memory-authority"
+                        x-text="item.authority || item.status || ''"></span>
+                  <time x-text="item.updated_at || item.created_at
+                    ? new Date((item.updated_at || item.created_at)*1000).toLocaleString() : ''"></time>
+                </div>
+                <div class="memory-card-content"
+                     x-text="item.content || item.summary || item.title
+                       || item.last_error || item.action || JSON.stringify(item.payload || item.results || {})"></div>
+                <div class="memory-source" x-show="item.sources?.length"
+                     x-text="(lang==='zh' ? '来源：' : 'Sources: ') + item.sources.map(s => s.source_type + ':' + s.source_id).join(' · ')"></div>
+                <div class="memory-card-actions" x-show="settings.memory.tab === 'items'">
+                  <button class="btn-ghost xs" @click="memoryCorrect(item)"
+                          x-text="lang==='zh' ? '更正' : 'Correct'"></button>
+                  <button class="btn-ghost xs" x-show="item.status === 'pending_review' || item.status === 'quarantined'"
+                          @click="memoryApprove(item)"
+                          x-text="lang==='zh' ? '确认' : 'Confirm'"></button>
+                  <button class="btn-ghost xs danger" @click="memoryForget(item)"
+                          x-text="lang==='zh' ? '忘记' : 'Forget'"></button>
+                </div>
+                <div class="memory-card-actions" x-show="settings.memory.tab === 'skills' && item.status === 'pending_review'">
+                  <button class="btn-primary xs" @click="memorySkillAction(item,'approve')"
+                          x-text="lang==='zh' ? '审核并启用' : 'Review & activate'"></button>
+                  <button class="btn-ghost xs danger" @click="memorySkillAction(item,'reject')"
+                          x-text="lang==='zh' ? '拒绝' : 'Reject'"></button>
+                </div>
+                <div class="memory-card-actions"
+                     x-show="settings.memory.tab === 'skills' && item.status === 'active'">
+                  <button class="btn-ghost xs danger" @click="memorySkillAction(item,'disable')"
+                          x-text="lang==='zh' ? '停用 Skill' : 'Disable Skill'"></button>
+                </div>
+                <details x-show="settings.memory.tab !== 'items'"
+                         @toggle="if ($event.target.open) loadMemoryDetail(item)">
+                  <summary x-text="lang==='zh' ? '查看完整白盒数据' : 'View full white-box data'"></summary>
+                  <pre x-text="JSON.stringify(item._details || item.payload || item, null, 2)"></pre>
+                  <textarea x-show="settings.memory.tab === 'skills' && item.status === 'pending_review'"
+                            class="settings-input memory-skill-editor" rows="14"
+                            x-init="item._skillDraft = item._skillDraft || item.payload?.skill_markdown || ''"
+                            x-model="item._skillDraft"
+                            :aria-label="lang==='zh' ? '审核并编辑 Skill Markdown' : 'Review and edit Skill Markdown'"></textarea>
+                </details>
+              </article>
+            </template>
+            <div class="settings-hint" x-show="!settings.memory.items.length"
+                 x-text="lang==='zh' ? '暂无数据' : 'No data yet'"></div>
           </div>
         </div>
 
@@ -4637,7 +4920,14 @@
       <div class="modal-foot">
         <button @click="logout()" class="btn-ghost" style="margin-right:auto;color:var(--c-danger)" x-text="t('btn.logout')"></button>
         <button @click="settings.show=false" class="btn-ghost" x-text="t('btn.cancel')"></button>
-        <button @click="saveSettings()" class="btn-primary" x-text="t('btn.save')"></button>
+        <button x-show="settings.activePage !== 'memory'"
+                @click="saveSettings()" class="btn-primary" x-text="t('btn.save')"></button>
+        <button x-show="settings.activePage === 'memory'"
+                @click="saveMemorySettings()" class="btn-primary"
+                :disabled="settings.memory.saving"
+                x-text="settings.memory.saving
+                  ? (lang==='zh' ? '保存中…' : 'Saving…')
+                  : (lang==='zh' ? '保存记忆设置' : 'Save memory settings')"></button>
       </div>
     </div>
   </div>

@@ -98,6 +98,25 @@ def test_i18n_zh_en_key_parity():
     )
 
 
+def test_memory_center_and_chat_recall_trace_are_wired():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    api = (BACKEND / "api_memory.py").read_text(encoding="utf-8")
+
+    assert "loadMemorySettings()" in app
+    assert "saveMemorySettings()" in app
+    assert "memorySkillAction(item, action)" in app
+    assert "memorySaveMessage(message)" in app
+    assert "_startMemoryMonitor()" in app
+    assert "muselab_memory_artifacts_seen" in app
+    assert 'data-page="memory"' in index
+    assert "Skill 只能生成候选" in index
+    assert "memoryRecall" in index
+    assert '"memory_recall": mem0.pop_recall_trace(session_id)' in chat
+    assert '@router.post("/skills/{artifact_id}/approve")' in api
+
+
 def test_image_generation_history_prompt_actions_are_wired():
     """History prompt actions need both Alpine handlers and template wiring."""
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
@@ -851,6 +870,37 @@ def test_attachment_uploads_have_deadlines_and_never_log_filenames():
     assert app.count("signal: uploadController.signal") == 2
     assert app.count("clearTimeout(uploadTimeout)") == 2
     assert "[muselab][upload]" not in app
+
+
+def test_html_preview_uses_path_bound_ticket_not_api_token():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    open_start = app.index('} else if (["html", "htm"].includes(ext))')
+    open_branch = app[open_start:app.index(
+        'else if (["png", "jpg"', open_start)]
+    raw_start = app.index("rawUrl(p, opts = {})")
+    raw = app[raw_start:app.index("async reloadPreview()", raw_start)]
+    preview_branch = raw[raw.index("if (opts.preview)"):
+                         raw.index('return "/api/files/raw?path="', raw.index(
+                             'return "/api/files/raw?path="') + 1)]
+
+    assert open_branch.index("_mintPreviewTicket") < open_branch.index(
+        'this.previewMode = "html"')
+    assert '"&ticket="' in preview_branch
+    assert '"&token="' not in preview_branch
+    assert 'if (!ticket) return "about:blank"' in preview_branch
+
+
+def test_turn_finalization_repairs_whole_pane_and_cache_bytes():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'this.highlightCode(".chat-body", pane ? [pane] : null)' in app
+    assert 'finalEl ? [finalEl] : []' not in app
+    assert "_mdCacheDelete(text)" in app
+    rerender_start = app.index("_rerenderMathMessages()")
+    rerender = app[rerender_start:app.index(
+        "// Path-shaped strings", rerender_start)]
+    assert ".delete(m.text)" not in rerender
+    assert ".delete(this.rawText)" not in rerender
 
 
 def test_send_pins_owner_waits_before_enqueue_and_blocks_failed_attachments():

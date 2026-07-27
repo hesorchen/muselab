@@ -1782,13 +1782,10 @@ async def _build_and_connect_client(
             "CronCreate", "CronDelete", "CronList",
             "EnterWorktree", "ExitWorktree",
             "Monitor", "PushNotification",
-            "ShareOnboardingGuide",
             # Claude CLI 2.1.211 additions whose protocol is owned by a
             # Claude Code / claude.ai host. muselab has no matching design,
-            # review-findings, or teammate-message surface. Keep
-            # WaitForMcpServers enabled: it is a local CLI lifecycle helper
-            # and lets slow MCP servers finish connecting without a prompt.
-            "DesignSync", "ReportFindings", "SendMessage",
+            # review-findings, remote-trigger, or teammate-message surface.
+            "DesignSync", "RemoteTrigger", "ReportFindings", "SendMessage",
         ],
         # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
         # (cwd/CLAUDE.md → the user's archive), and local (.claude/
@@ -2288,7 +2285,9 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         # also SKIPS any client whose session has an in-flight turn —
         # dropping a live stream mid-flow looked like "Muse just stopped
         # talking" to the user (no error event, just dead air).
-        to_disconnect: list[tuple[_ClientKey, ClaudeSDKClient]] = []
+        to_disconnect: list[
+            tuple[_ClientKey, ClaudeSDKClient, "_SessionStream | None"]
+        ] = []
         async with _lock:
             _clients[key] = client
             _client_permission[key] = permission
@@ -2325,9 +2324,15 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 # (disconnect_client clears it, but LRU eviction didn't).
                 _creation_locks.pop(old_key, None)
                 if old_client is not None:
-                    to_disconnect.append((old_key, old_client))
+                    # The pump owns a task plus replay deques and a reference
+                    # to the SDK client.  LRU eviction used to remove only the
+                    # client, leaving that whole stream graph alive forever.
+                    old_stream = _session_streams.pop(old_key, None)
+                    to_disconnect.append((old_key, old_client, old_stream))
 
-        for old_key, c in to_disconnect:
+        for old_key, c, old_stream in to_disconnect:
+            if old_stream is not None:
+                await old_stream.aclose()
             try:
                 await c.disconnect()
             except Exception as e:
@@ -4688,7 +4693,10 @@ def _gc_orphan_attachments() -> None:
     if not base.exists():
         return
     try:
-        known_sids = {s["id"] for s in sess.list_sessions() if s.get("id")}
+        # list_sessions() intentionally hides sessions belonging to a removed
+        # workspace.  Those rows still exist and reappear when the workspace
+        # is registered again, so attachment GC must use the unfiltered index.
+        known_sids = sess.indexed_session_ids()
     except Exception:
         return
     for child in base.iterdir():
@@ -9480,6 +9488,10 @@ async def _start_turn(
     # is read only for truthiness at the end; streamed_in_bubble's content is
     # joined once per AssistantMessage (infrequent). (perf: RED — chat.py O(n²))
     assistant_acc: list[str] = []
+    # Set only after a Memory write has been accepted by the tracked scheduler.
+    # The detached pump uses this to retain failure/cancel evidence if a forced
+    # interrupt prevents the SDK from emitting its terminal ResultMessage.
+    memory_outcome_scheduled = False
     # Mirror of frontend's per-bubble `acc`. Reset on tool_use (FE
     # closeAsst). Lets us tail-emit any TextBlock suffix the SDK didn't
     # send as text_delta — see TextBlock branch below for context.
@@ -10197,6 +10209,7 @@ async def _start_turn(
             """ResultMessage = turn complete. Update cumulative cost / stats,
             write per-message sidecar annotations, bump session metadata, then
             yield the consolidated 'done' SSE event the FE awaits."""
+            nonlocal memory_outcome_scheduled
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
             # ResultMessage.usage is CUMULATIVE per session. Per-turn
@@ -10574,19 +10587,23 @@ async def _start_turn(
             _error_class = _classify_stream_error(_error_message) if _is_error else {
                 "kind": None, "cta": None, "retryable": False,
             }
-            # mem0 write (deferred to here so turn status is known): persist the
-            # completed (user, assistant) exchange ONLY on a clean success —
-            # never a user-cancelled turn (was_cancelled) nor an errored/partial
-            # one (_is_error), so a wrong or aborted draft can't be distilled
-            # into a "durable fact" and recalled forever. Tracked + shutdown-
-            # drained via mem0.schedule_store (not a bare create_task). Uses the
-            # original `prompt`; recalled hook context is never fed back into the
-            # store. Fully fail-soft.
+            # Memory write is deferred until turn status is known. Clean
+            # exchanges may be consolidated into memories. Cancelled turns are
+            # evidence-only (never fact candidates), which preserves the useful
+            # failed trajectory without teaching the partial answer as truth.
+            # Legacy Mem0 keeps its historical success-only behaviour.
             if mem0.enabled() and not was_cancelled and not _is_error:
                 _asst_full = "".join(assistant_acc)
                 if _asst_full.strip():
-                    mem0.schedule_store(session_id, model_to_use,
-                                        prompt, _asst_full)
+                    memory_outcome_scheduled = mem0.schedule_store(
+                        session_id, model_to_use, prompt, _asst_full, new_asst_uuid)
+            elif was_cancelled:
+                memory_outcome_scheduled = mem0.schedule_cancelled(
+                    session_id, prompt, new_asst_uuid)
+            elif _is_error:
+                memory_outcome_scheduled = mem0.schedule_failed(
+                    session_id, model_to_use, prompt,
+                    "".join(assistant_acc), _error_message, new_asst_uuid)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,
@@ -10620,6 +10637,9 @@ async def _start_turn(
                     round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
                     if _budget_usd() > 0 else 0
                 ),
+                # White-box recall trace. The content is already bounded and
+                # provenance-only; the UI keeps it collapsed by default.
+                "memory_recall": mem0.pop_recall_trace(session_id),
                 # Main ResultMessage can arrive while SDK-native background
                 # Agent/Bash tasks continue. The browser keeps the turn footer
                 # alive and queues follow-ups until their detached watcher
@@ -10786,7 +10806,9 @@ async def _start_turn(
     _interrupted_at_startup.pop(session_id, None)
 
     async def _pump_gen_to_broadcast():
+        nonlocal memory_outcome_scheduled
         turn_errored = False
+        turn_error_text = ""
         try:
             # None → asyncio.timeout is a no-op wrapper (no deadline armed).
             async with asyncio.timeout(BG_TIMEOUT_S or None):
@@ -10796,6 +10818,12 @@ async def _start_turn(
                     # must pause on these exactly like an exception-path error.
                     if isinstance(ev, dict) and ev.get("event") == "error":
                         turn_errored = True
+                        try:
+                            payload = json.loads(ev.get("data") or "{}")
+                            turn_error_text = str(
+                                payload.get("error") or payload.get("message") or "")
+                        except (ValueError, TypeError):
+                            pass
                     # SDK-level failures arrive as a NORMAL done event with
                     # is_error=True (max turns / budget / permission denied /
                     # API error — see _handle_result_message). Treat them as
@@ -10810,6 +10838,7 @@ async def _start_turn(
                     broadcast.publish(ev)
         except asyncio.TimeoutError:
             turn_errored = True
+            turn_error_text = f"turn exceeded {BG_TIMEOUT_S}s"
             sys.stderr.write(
                 f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
                 f"aborting sid={session_id}\n")
@@ -10818,6 +10847,7 @@ async def _start_turn(
                 _error_event(f"turn exceeded {BG_TIMEOUT_S}s"))
         except Exception as e:
             turn_errored = True
+            turn_error_text = f"{type(e).__name__}: {e}"
             import traceback as _tb
             sys.stderr.write(
                 f"[chat] background turn crashed sid={session_id} "
@@ -10825,6 +10855,19 @@ async def _start_turn(
             sys.stderr.flush()
             broadcast.publish(_error_event(f"{type(e).__name__}: {e}"))
         finally:
+            # A force-stop can terminate receive_response() before the SDK
+            # emits ResultMessage. Keep that turn as trajectory evidence, but
+            # never let partial output become a fact/Skill candidate.
+            if not memory_outcome_scheduled:
+                if broadcast.cancelled:
+                    memory_outcome_scheduled = mem0.schedule_cancelled(
+                        session_id, prompt, broadcast.turn_id)
+                elif turn_errored:
+                    memory_outcome_scheduled = mem0.schedule_failed(
+                        session_id, model_to_use, prompt,
+                        "".join(assistant_acc),
+                        turn_error_text or "turn stream failed",
+                        broadcast.turn_id)
             try:
                 from .activity import activity as _activity
                 _activity_status = ("cancelled" if broadcast.cancelled else

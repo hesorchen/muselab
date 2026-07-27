@@ -25,6 +25,7 @@ provider_overrides.json
 .cli-proxy-muselab/
 .muselab/codex-gateway/
 .muselab/imagegen/
+.muselab/memory/
 codex-gateway/.env
 codex-gateway/*.log
 data/

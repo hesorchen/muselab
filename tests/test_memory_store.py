@@ -1,0 +1,88 @@
+"""Canonical memory registry invariants."""
+from pathlib import Path
+
+from backend.memory_store import MemoryStore
+
+
+def test_evidence_is_idempotent_and_episode_keeps_provenance(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    first = store.add_evidence("u", "s", "user", "same message", source_ref="msg-1")
+    second = store.add_evidence("u", "s", "user", "same message", source_ref="msg-1")
+    assert first == second
+
+    episode = store.get_or_create_episode("u", "s", idle_seconds=60)
+    store.attach_evidence(episode["id"], [first])
+    loaded = store.episode(episode["id"])
+    assert loaded["turn_count"] == 1
+    assert loaded["evidence"][0]["source_ref"] == "msg-1"
+
+
+def test_confirm_correct_forget_and_lexical_search(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    old = store.create_memory(
+        "u", "preference", "用户偏好先验证再提交",
+        authority="confirmed", confidence=1.0,
+        sources=[{"source_type": "user_action", "source_id": "ui",
+                  "relation": "confirmed_by"}],
+    )
+    hits = store.lexical_search("u", "用户偏好先验证再提交")
+    assert hits[0]["memory"]["id"] == old["id"]
+    assert store.memory_sources([old["id"]])[old["id"]][0]["source_type"] == "user_action"
+
+    new = store.supersede_memory(old["id"], "u", "用户偏好先测试，但提交前必须确认")
+    assert store.memory(old["id"])["status"] == "superseded"
+    assert new["authority"] == "confirmed"
+    assert any(row["relation"] == "supersedes" for row in new["relations"])
+
+    assert store.delete_memory(new["id"], "u") is True
+    assert store.memory(new["id"])["status"] == "deleted"
+    assert store.delete_memory(new["id"], "other-user") is False
+
+
+def test_persistent_jobs_and_artifact_review_state(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    job_id = store.enqueue("consolidate_episode", {"episode_id": "ep-1"})
+    claimed = store.claim_job()
+    assert claimed["id"] == job_id
+    store.finish_job(job_id, error="temporary", retry_seconds=0)
+    assert store.claim_job()["id"] == job_id
+    store.finish_job(job_id)
+    assert store.list_jobs()[0]["status"] == "done"
+
+    artifact = store.create_artifact(
+        "u", "skill_candidate", "candidate", {"name": "safe-flow"},
+        ["ep-1", "ep-2", "ep-3"])
+    assert artifact["status"] == "pending_review"
+    assert store.update_artifact(artifact["id"], status="rejected")["status"] == "rejected"
+
+
+def test_orphaned_running_jobs_are_recovered(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    job_id = store.enqueue("reindex_memory", {"memory_id": "memory-1"})
+    assert store.claim_job()["id"] == job_id
+    assert store.list_jobs()[0]["status"] == "running"
+
+    assert store.recover_running_jobs() == 1
+    recovered = store.list_jobs()[0]
+    assert recovered["status"] == "queued"
+    assert "recovered" in recovered["last_error"]
+
+
+def test_stats_and_reopen_preserve_registry(tmp_path: Path):
+    path = tmp_path / "memory.sqlite3"
+    first = MemoryStore(path)
+    first.create_memory("u", "fact", "durable fact")
+    first.get_or_create_episode("u", "s", idle_seconds=60)
+    second = MemoryStore(path)
+    assert second.stats("u")["memories"] == 1
+    assert second.stats("u")["episodes"] == 1
+
+
+def test_idle_episode_is_closed_for_background_consolidation(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    evidence = store.add_evidence("u", "s", "user", "one turn")
+    episode = store.get_or_create_episode("u", "s", idle_seconds=60)
+    store.attach_evidence(episode["id"], [evidence])
+    closed = store.close_idle_episodes("u", cutoff=float("inf"))
+    assert closed == [episode["id"]]
+    assert store.episode(episode["id"], with_evidence=False)["status"] == "closed"

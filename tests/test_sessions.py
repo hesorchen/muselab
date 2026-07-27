@@ -5,6 +5,7 @@ locally — CLI's JSONL is source of truth. These tests cover muselab's
 metadata + per-message annotation sidecar layer only. End-to-end transcript
 flows require a live SDK and are not unit-testable here.
 """
+import pytest
 
 
 def test_session_lifecycle(client, auth):
@@ -39,6 +40,32 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 200
     r = client.get(f"/api/chat/sessions/{sid}", headers=auth)
     assert r.status_code == 404
+
+
+def test_corrupt_index_is_never_overwritten_by_a_mutator(app_module):
+    from backend import sessions as sess
+
+    broken = '{"sessions": [not-json'
+    sess.INDEX.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="cannot parse session index"):
+        sess.create_session("must-not-replace-index")
+
+    assert sess.INDEX.read_text(encoding="utf-8") == broken
+
+
+def test_corrupt_sidecar_is_never_overwritten_by_a_mutator(app_module):
+    from backend import sessions as sess
+
+    meta = sess.create_session("sidecar-guard")
+    path = sess._sidecar_path(meta["id"])
+    broken = '{"messages":'
+    path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="cannot parse session sidecar"):
+        sess.set_message_annotation(meta["id"], "msg-1", cost="$1")
+
+    assert path.read_text(encoding="utf-8") == broken
 
 
 def test_permission_patch_unknown_session_is_404(client, auth):

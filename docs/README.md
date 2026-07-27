@@ -16,6 +16,7 @@
 - [Mobile (PWA)](mobile.md) — install to home screen, push notifications, HTTPS
 - [Terminal](terminal.md) — real PTY, terminal list, Profiles, and mobile controls
 - [Scheduled tasks](scheduler.md) — run a saved prompt on a cadence
+- [Long-term memory](memory.md) — Episodes, Dreamer/Verifier, hybrid recall, and reviewed Skills
 
 ## Models
 

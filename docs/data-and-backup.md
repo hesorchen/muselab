@@ -2,7 +2,10 @@
 
 > [中文](data-and-backup_zh.md)
 
-muselab has no database, but its state does not live in one directory. A complete migration covers workspaces, repository state, Claude CLI data, and optional browser-local preferences.
+Core conversations still use CLI JSONL as their source of truth. Enabling
+long-term memory adds a SQLite Registry, so a complete migration covers
+workspaces, repository state, Claude CLI data, memory data, and optional
+browser-local preferences.
 
 ## Primary workspace
 
@@ -17,6 +20,7 @@ Back up the complete `$MUSELAB_ROOT/` when practical. In addition to user files,
 | `.muselab/vapid.json` | Web Push VAPID private/public keypair | Recommended together with subscriptions |
 | `.muselab/push_subs.json` | Device Push subscriptions | Back up with `vapid.json` to preserve subscriptions |
 | `.muselab/imagegen/` | Image-generation job history and durable files | Back up to preserve image history |
+| `.muselab/memory/` | Memory config, SQLite Registry, jobs, audit, and disabled Skills | Required when long-term memory is used; config may contain credentials |
 | `.muselab-attach/` | Conversation image and PDF originals | Required to preserve attachment previews |
 | `.muselab-dustbin/` | Recoverable dustbin for the primary workspace | Back up to preserve recovery |
 

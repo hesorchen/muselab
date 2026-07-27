@@ -460,6 +460,9 @@ def test_html_preview_lru_reuses_four_live_frames_without_refetch(
     open_report("cache-0.html")
     first_frame = page.frame(url=lambda url: "path=cache-0.html" in url)
     assert first_frame is not None
+    first_query = parse_qs(urlparse(first_frame.url).query)
+    assert "token" not in first_query
+    assert first_query.get("ticket", [""])[0].startswith("preview.")
     first_frame.wait_for_load_state("domcontentloaded")
     first_frame.locator("input").fill("kept-live-state")
     first_frame.evaluate("window.scrollTo({top: 700, behavior: 'instant'})")
