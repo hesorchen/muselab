@@ -139,3 +139,60 @@ def test_reopening_an_old_registry_reindexes_fts_for_cjk(tmp_path: Path):
     with sqlite3.connect(path) as conn:
         assert int(conn.execute("PRAGMA user_version").fetchone()[0]) \
             == _FTS_SCHEMA_VERSION
+
+
+def test_portable_snapshot_round_trip_preserves_governance_and_provenance(
+    tmp_path: Path,
+):
+    source = MemoryStore(tmp_path / "source.sqlite3")
+    evidence_id = source.add_evidence(
+        "owner-a", "session-a", "user", "证据内容",
+        source_ref="message-1", metadata={"model": "test-model"})
+    episode = source.get_or_create_episode(
+        "owner-a", "session-a", idle_seconds=60)
+    source.attach_evidence(episode["id"], [evidence_id])
+    source.update_episode(
+        episode["id"], status="closed", title="一次成功操作",
+        summary="完整摘要", outcome="success", ended_at=10,
+        entities_json=["实体"], attributes_json={"quality": "verified"})
+    memory = source.create_memory(
+        "owner-a", "decision", "上线前必须验证",
+        authority="confirmed", confidence=0.97,
+        entities=["上线"], attributes={"verification": {"supported": True}},
+        tags=["release"], valid_from=5,
+        sources=[
+            {"source_type": "episode", "source_id": episode["id"],
+             "relation": "derived_from"},
+            {"source_type": "evidence", "source_id": evidence_id,
+             "relation": "supported_by"},
+        ])
+    source.create_artifact(
+        "owner-a", "reflection_run", "复盘",
+        {"conclusion": "继续验证"}, [episode["id"]],
+        model="test-model", status="active")
+
+    snapshot = source.export_snapshot("owner-a")
+    restored = MemoryStore(tmp_path / "restored.sqlite3")
+    counts = restored.import_snapshot(snapshot, "owner-b")
+    assert counts["memories"] == 1
+    assert counts["episodes"] == 1
+    assert counts["evidence"] == 1
+
+    loaded = restored.memory(memory["id"])
+    assert loaded["owner_id"] == "owner-b"
+    assert loaded["authority"] == "confirmed"
+    assert loaded["confidence"] == 0.97
+    assert loaded["entities"] == ["上线"]
+    assert loaded["attributes"]["verification"]["supported"] is True
+    assert loaded["tags"] == ["release"]
+    assert loaded["embedding_state"] == "pending"
+    assert {row["source_type"] for row in loaded["sources"]} == {
+        "episode", "evidence"}
+    restored_episode = restored.episode(episode["id"])
+    assert restored_episode["summary"] == "完整摘要"
+    assert restored_episode["evidence"][0]["source_ref"] == "message-1"
+    assert restored.list_artifacts("owner-b")[0]["payload"] == {
+        "conclusion": "继续验证"}
+
+    replay = restored.import_snapshot(snapshot, "owner-b")
+    assert all(value == 0 for value in replay.values())

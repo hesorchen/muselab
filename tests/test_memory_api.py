@@ -114,10 +114,11 @@ def test_neutral_export_and_import(client, auth):
     assert imported.status_code == 200
     assert imported.json()["created"] == 2
     exported = client.get("/api/memory/export", headers=auth).json()
-    assert exported["schema"] == "muselab-memory-export-v1"
+    assert exported["schema"] == "muselab-memory-export-v2"
     assert {row["content"] for row in exported["memories"]} == {"决策 A", "偏好 B"}
     # The neutral export is directly accepted by the import endpoint. Exact
     # content deduplication makes restoring into the same registry idempotent.
     restored = client.post("/api/memory/import", headers=auth, json=exported)
     assert restored.status_code == 200
     assert restored.json()["created"] == 0
+    assert "restored" in restored.json()

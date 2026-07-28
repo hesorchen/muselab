@@ -20,6 +20,7 @@ from .memory_providers import (
     vector_store,
 )
 from .memory_store import MemoryStore
+from .memory_transcript import slice_turn_records
 
 log = logging.getLogger("muselab.memory")
 
@@ -246,6 +247,8 @@ class MemoryEngine:
                     await self._cross_episode_dream(job["payload"].get("episode_ids"))
                 elif job["kind"] == "reindex_memory":
                     await self._index_memory(job["payload"]["memory_id"])
+                elif job["kind"] == "reindex_memories":
+                    await self._index_memories(job["payload"].get("memory_ids", []))
                 else:
                     raise ValueError(f"unknown memory job: {job['kind']}")
             except asyncio.CancelledError:
@@ -302,26 +305,11 @@ class MemoryEngine:
                         records.append(value)
                 except Exception:
                     continue
-            target_text = " ".join(target["content"].split())
-            start = -1
-            for index, record in enumerate(records):
-                if record.get("type") != "user":
-                    continue
-                content = (record.get("message") or {}).get("content")
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    text = "".join(
-                        str(block.get("text", "")) for block in content
-                        if isinstance(block, dict) and block.get("type") == "text")
-                normalized = " ".join(text.split())
-                if normalized == target_text or (
-                        target_text and target_text[:500] in normalized):
-                    start = index
-            if start < 0:
-                return []
-            return records[start:]
+            return slice_turn_records(
+                records,
+                target["content"],
+                is_interrupt=chat._is_cli_interrupt_message,
+            )
 
         records = await asyncio.to_thread(parse)
         attached: list[str] = []
@@ -712,27 +700,41 @@ class MemoryEngine:
             status="pending_review")
 
     async def _index_memory(self, memory_id: str) -> None:
+        await self._index_memories([memory_id])
+
+    async def _index_memories(self, memory_ids: list[str]) -> None:
         cfg = self.config()
-        item = self.store.memory(memory_id)
-        if not item or item.get("status") != "active":
+        items = [
+            item for item in self.store.memories_by_ids(memory_ids)
+            if item.get("status") == "active"
+        ]
+        if not items:
             return
         provider = EmbeddingProvider(cfg.embedding)
-        vector = (await provider.embed([item["content"]]))[0]
+        vectors = await provider.embed([item["content"] for item in items])
         target = vector_store(cfg.vector)
-        await target.ensure(len(vector))
-        await target.upsert(memory_id, vector, {
-            "owner_id": cfg.owner_id, "status": item["status"], "kind": item["kind"],
-            "authority": item["authority"], "confidence": item["confidence"],
-            "updated_at": item["updated_at"],
-        })
-        self.store.update_memory(memory_id, attributes={
-            **(item.get("attributes") or {}),
-            "embedding_model": cfg.embedding.model,
-            "embedding_dimensions": len(vector),
-        })
-        with self.store._lock, self.store._connect() as conn:
-            conn.execute("UPDATE memories SET embedding_state='ready' WHERE id=?",
-                         (memory_id,))
+        dimensions = len(vectors[0])
+        await target.ensure(dimensions)
+        await target.upsert_many([
+            (
+                item["id"],
+                vector,
+                {
+                    "owner_id": cfg.owner_id,
+                    "status": item["status"],
+                    "kind": item["kind"],
+                    "authority": item["authority"],
+                    "confidence": item["confidence"],
+                    "updated_at": item["updated_at"],
+                },
+            )
+            for item, vector in zip(items, vectors, strict=True)
+        ])
+        self.store.mark_memories_indexed(
+            [item["id"] for item in items],
+            model=cfg.embedding.model,
+            dimensions=dimensions,
+        )
 
     async def recall(self, query: str, session_id: str) -> list[dict]:
         cfg = self.config()
@@ -930,8 +932,11 @@ class MemoryEngine:
     def reindex_all(self) -> int:
         cfg = self.config()
         rows = self.store.list_memories(cfg.owner_id, limit=10_000, status="active")
-        for row in rows:
-            self.store.enqueue("reindex_memory", {"memory_id": row["id"]})
+        if rows:
+            self.store.enqueue(
+                "reindex_memories",
+                {"memory_ids": [row["id"] for row in rows]},
+            )
         self._wake.set()
         return len(rows)
 

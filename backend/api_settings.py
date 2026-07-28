@@ -1519,27 +1519,69 @@ async def _do_restart() -> None:
     """Try platform restart command first; fall back to os.execv."""
     import asyncio as _asyncio
     await _asyncio.sleep(0.8)   # let the HTTP response reach the browser
-    hint = _restart_hint()
-    if hint:
+    command = _restart_command()
+    if command:
         try:
-            rc = subprocess.run(hint, shell=True, timeout=8)
-            if rc.returncode == 0:
-                return          # systemd/launchctl handled it
+            # Never wait for the manager here: this process belongs to the
+            # unit being stopped, so a waiting child can be signalled before
+            # it returns even after the restart job was successfully queued.
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return
         except Exception:
             pass
-    # Fallback: replace current process with a fresh copy.
-    # Works for both `uv run python -m backend.main` and direct invocations.
+    # Fallback: replace the current process while preserving package context;
+    # using sys.argv[0] executes backend/main.py as a script and breaks every
+    # relative import.
     import os as _os
-    _os.execv(sys.executable, [sys.executable] + sys.argv)
+    _os.execv(
+        sys.executable,
+        [sys.executable, "-m", "backend.main", *sys.argv[1:]],
+    )
+
+
+def _restart_command() -> list[str]:
+    """Return a shell-free command for restarting this deployment.
+
+    Multiple MuseLab checkouts can run under different user units on one host.
+    ``MUSELAB_SERVICE_NAME`` makes the owning unit explicit instead of
+    accidentally restarting a different checkout that happens to use the
+    historical ``muselab.service`` name.
+    """
+    import os
+    import platform
+
+    sysname = platform.system()
+    if sysname == "Darwin":
+        label = os.environ.get("MUSELAB_LAUNCHD_LABEL", "com.muselab").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+            return []
+        return [
+            "launchctl",
+            "kickstart",
+            "-k",
+            f"gui/{os.getuid()}/{label}",
+        ]
+    if sysname == "Linux":
+        service = os.environ.get("MUSELAB_SERVICE_NAME", "muselab.service").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", service):
+            return []
+        # The restart is requested by the service being restarted. Waiting for
+        # the job would deadlock its event loop against systemd's stop phase,
+        # preventing FastAPI's lifespan shutdown from running.
+        return ["systemctl", "--user", "--no-block", "restart", service]
+    return []
 
 
 def _restart_hint() -> str:
-    """Platform-specific command to restart muselab so the new SDK is loaded."""
-    import platform
-    sysname = platform.system()
-    if sysname == "Darwin":
-        return "launchctl kickstart -k gui/$UID/com.muselab"
-    return "systemctl --user restart muselab"
+    """Human-readable form of the exact shell-free restart command."""
+    import shlex
+
+    return shlex.join(_restart_command())
 
 
 # ============================================================

@@ -1398,15 +1398,18 @@ def test_diff_surfaces_use_theme_tokens_and_readable_edges():
 def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     assert "new EventSource(`/api/files/events?${params.toString()}`)" in app
+    assert '"/api/files/events-ticket"' in app
+    assert "new URLSearchParams({ ticket, workspace })" in app
+    assert "token: this.token, workspace" not in app
     assert "this._fileEventsWorkspace === workspace" in app
     assert 'es.addEventListener("changes"' in app
     assert 'es.addEventListener("resync"' in app
     assert "this._workspaceIsCurrent(ownerWorkspace)" in app
     assert "this._refreshParentInTree(path, ownerWorkspace)" in app
     assert "const delay = this._isMobileLayout() ? 650 : 250" in app
-    assert 'document.visibilityState !== "visible"' in app
+    assert "if (!this._fileTreeIsVisible())" in app
     assert "this._stopFileEvents(true)" in app
-    assert 'if (t === "files") this.$nextTick(() => this._flushFileTreeDirty())' in app
+    assert 'if (t === "files") this._flushFileTreeDirty()' in app
 
 
 def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():

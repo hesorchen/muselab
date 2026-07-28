@@ -32,6 +32,48 @@ def _json(value: Any) -> str:
 # keeping rows indexed under the old scheme.
 _FTS_SCHEMA_VERSION = 1
 
+_SNAPSHOT_TABLES: tuple[
+    tuple[str, tuple[str, ...], tuple[str, ...]], ...
+] = (
+    ("evidence", (
+        "id", "owner_id", "session_id", "role", "content", "event_type",
+        "source_ref", "metadata_json", "checksum", "created_at",
+    ), ("metadata_json",)),
+    ("episodes", (
+        "id", "owner_id", "primary_session_id", "status", "title",
+        "summary", "outcome", "entities_json", "attributes_json",
+        "started_at", "ended_at", "updated_at", "turn_count",
+        "extractor_version",
+    ), ("entities_json", "attributes_json")),
+    ("episode_evidence", (
+        "episode_id", "evidence_id", "position",
+    ), ()),
+    ("memories", (
+        "id", "owner_id", "kind", "content", "status", "authority",
+        "confidence", "entities_json", "attributes_json", "tags_json",
+        "valid_from", "valid_to", "version", "embedding_state",
+        "created_at", "updated_at",
+    ), ("entities_json", "attributes_json", "tags_json")),
+    ("memory_sources", (
+        "memory_id", "source_type", "source_id", "relation",
+    ), ()),
+    ("relations", (
+        "id", "from_type", "from_id", "relation", "to_type", "to_id",
+        "metadata_json", "created_at",
+    ), ("metadata_json",)),
+    ("artifacts", (
+        "id", "owner_id", "kind", "status", "title", "payload_json",
+        "source_episode_ids_json", "model", "version", "created_at",
+        "updated_at",
+    ), ("payload_json", "source_episode_ids_json")),
+    ("audit", (
+        "id", "owner_id", "action", "target_type", "target_id",
+        "details_json", "created_at",
+    ), ("details_json",)),
+)
+_SNAPSHOT_OWNER_TABLES = {"evidence", "episodes", "memories", "artifacts", "audit"}
+_SNAPSHOT_LIST_DEFAULTS = {"entities", "tags", "source_episode_ids"}
+
 
 def _is_cjk(char: str) -> bool:
     code = ord(char)
@@ -459,6 +501,61 @@ class MemoryStore:
         with self._lock, self._connect() as conn:
             return [self._row(row) or {} for row in conn.execute(sql, params)]
 
+    def memories_by_ids(self, memory_ids: list[str]) -> list[dict]:
+        if not memory_ids:
+            return []
+        rows: list[dict] = []
+        with self._lock, self._connect() as conn:
+            for start in range(0, len(memory_ids), 500):
+                chunk = memory_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                found = {
+                    row["id"]: self._row(row) or {}
+                    for row in conn.execute(
+                        f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                        tuple(chunk),
+                    )
+                }
+                rows.extend(found[item_id] for item_id in chunk if item_id in found)
+        return rows
+
+    def mark_memories_indexed(
+        self,
+        memory_ids: list[str],
+        *,
+        model: str,
+        dimensions: int,
+    ) -> None:
+        now = _now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for memory_id in memory_ids:
+                    row = conn.execute(
+                        "SELECT attributes_json FROM memories WHERE id=?",
+                        (memory_id,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        attributes = json.loads(row["attributes_json"])
+                    except Exception:
+                        attributes = {}
+                    attributes.update({
+                        "embedding_model": model,
+                        "embedding_dimensions": dimensions,
+                    })
+                    conn.execute(
+                        """UPDATE memories
+                           SET attributes_json=?,embedding_state='ready',updated_at=?
+                           WHERE id=?""",
+                        (_json(attributes), now, memory_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def memory_sources(self, memory_ids: list[str]) -> dict[str, list[dict]]:
         if not memory_ids:
             return {}
@@ -748,3 +845,169 @@ class MemoryStore:
                     "artifacts", "owner_id=? AND status='pending_review'"),
                 "queued_jobs": int(queued),
             }
+
+    def export_snapshot(self, owner_id: str) -> dict:
+        """Return every portable canonical row for one owner.
+
+        Jobs, recall telemetry, FTS rows, and embeddings are materialized
+        runtime state and are deliberately excluded.
+        """
+        with self._lock, self._connect() as conn:
+            def rows(sql: str, params: tuple = ()) -> list[dict]:
+                return [self._row(row) or {} for row in conn.execute(sql, params)]
+
+            evidence = rows(
+                "SELECT * FROM evidence WHERE owner_id=? ORDER BY created_at,id",
+                (owner_id,),
+            )
+            episodes = rows(
+                "SELECT * FROM episodes WHERE owner_id=? ORDER BY started_at,id",
+                (owner_id,),
+            )
+            memories = rows(
+                "SELECT * FROM memories WHERE owner_id=? ORDER BY created_at,id",
+                (owner_id,),
+            )
+            artifacts = rows(
+                "SELECT * FROM artifacts WHERE owner_id=? ORDER BY created_at,id",
+                (owner_id,),
+            )
+            episode_ids = [row["id"] for row in episodes]
+            memory_ids = [row["id"] for row in memories]
+            owned_ids = {
+                *(row["id"] for row in evidence),
+                *episode_ids,
+                *memory_ids,
+                *(row["id"] for row in artifacts),
+            }
+
+            episode_evidence: list[dict] = []
+            if episode_ids:
+                placeholders = ",".join("?" for _ in episode_ids)
+                episode_evidence = rows(
+                    f"""SELECT * FROM episode_evidence
+                        WHERE episode_id IN ({placeholders})
+                        ORDER BY episode_id,position""",
+                    tuple(episode_ids),
+                )
+            memory_sources: list[dict] = []
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                memory_sources = rows(
+                    f"""SELECT * FROM memory_sources
+                        WHERE memory_id IN ({placeholders})
+                        ORDER BY memory_id,source_type,source_id,relation""",
+                    tuple(memory_ids),
+                )
+            relations = [
+                row for row in rows("SELECT * FROM relations ORDER BY created_at,id")
+                if row.get("from_id") in owned_ids or row.get("to_id") in owned_ids
+            ]
+            audits = rows(
+                "SELECT * FROM audit WHERE owner_id=? ORDER BY created_at,id",
+                (owner_id,),
+            )
+        return {
+            "owner_id": owner_id,
+            "evidence": evidence,
+            "episodes": episodes,
+            "episode_evidence": episode_evidence,
+            "memories": memories,
+            "memory_sources": memory_sources,
+            "relations": relations,
+            "artifacts": artifacts,
+            "audit": audits,
+        }
+
+    def import_snapshot(self, snapshot: dict, owner_id: str) -> dict[str, int]:
+        """Transactionally restore a v2 canonical snapshot.
+
+        Existing primary keys win, making replay idempotent and preventing an
+        import from overwriting newer local governance decisions.
+        """
+        counts: dict[str, int] = {}
+        imported_memory_ids: list[str] = []
+
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for spec in _SNAPSHOT_TABLES:
+                    inserted, memory_ids = self._import_snapshot_table(
+                        conn, snapshot, owner_id, spec)
+                    counts[spec[0]] = inserted
+                    imported_memory_ids.extend(memory_ids)
+                self._rebuild_imported_fts(conn, imported_memory_ids)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return counts
+
+    @staticmethod
+    def _import_snapshot_table(
+        conn: sqlite3.Connection,
+        snapshot: dict,
+        owner_id: str,
+        spec: tuple[str, tuple[str, ...], tuple[str, ...]],
+    ) -> tuple[int, list[str]]:
+        table, columns, json_columns = spec
+        values = snapshot.get(table, [])
+        if not isinstance(values, list) or len(values) > 100_000:
+            raise ValueError(f"invalid {table} rows")
+        placeholders = ",".join("?" for _ in columns)
+        sql = (
+            f"INSERT OR IGNORE INTO {table}"
+            f"({','.join(columns)}) VALUES ({placeholders})"
+        )
+        inserted = 0
+        memory_ids: list[str] = []
+        for value in values:
+            if not isinstance(value, dict):
+                raise ValueError(f"invalid {table} row")
+            row = dict(value)
+            if table in _SNAPSHOT_OWNER_TABLES:
+                row["owner_id"] = owner_id
+            if table == "memories":
+                # Embeddings are deliberately absent from portable snapshots.
+                row["embedding_state"] = "pending"
+                memory_ids.append(str(row.get("id", "")))
+            args = [
+                MemoryStore._snapshot_column_value(row, column, json_columns)
+                for column in columns
+            ]
+            cursor = conn.execute(sql, tuple(args))
+            inserted += max(0, int(cursor.rowcount))
+        return inserted, memory_ids
+
+    @staticmethod
+    def _snapshot_column_value(
+        row: dict,
+        column: str,
+        json_columns: tuple[str, ...],
+    ) -> Any:
+        key = column[:-5] if column.endswith("_json") else column
+        value = row.get(key)
+        if column not in json_columns:
+            return value
+        if value is None:
+            value = [] if key in _SNAPSHOT_LIST_DEFAULTS else {}
+        return _json(value)
+
+    @staticmethod
+    def _rebuild_imported_fts(
+        conn: sqlite3.Connection,
+        memory_ids: list[str],
+    ) -> None:
+        for memory_id in memory_ids:
+            row = conn.execute(
+                "SELECT id,owner_id,kind,content FROM memories WHERE id=?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+            conn.execute(
+                """INSERT INTO memory_fts(memory_id,owner_id,kind,content)
+                   VALUES (?,?,?,?)""",
+                (row["id"], row["owner_id"], row["kind"], _fts_text(row["content"])),
+            )

@@ -103,7 +103,8 @@ jobs:
         run: |
           set -e
           for f in frontend/app.js frontend/sw.js \
-                   frontend/data/constants.js frontend/i18n/index.js; do
+                   frontend/data/constants.js frontend/i18n/index.js \
+                   frontend/modules/file-capabilities.mjs; do
             echo "node --check $f"
             node --check "$f"
           done

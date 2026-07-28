@@ -26,6 +26,7 @@ from starlette.websockets import WebSocketDisconnect
 from .auth import require_token
 from .settings import ROOT, atomic_write_text
 from .workspaces import resolve_workspace_root
+from .websocket_writer import WebSocketWriter
 
 
 ENABLED = os.environ.get("MUSELAB_TERMINAL_ENABLED", "1").strip().lower() in {
@@ -717,24 +718,29 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
         await manager.detach(session, subscriber)
         return
 
+    writer = WebSocketWriter(websocket)
+
     async def send_loop() -> None:
         while True:
             item = await subscriber.queue.get()
             if item is None:
-                await websocket.close(code=1013, reason="terminal client too slow")
+                await writer.close(code=1013, reason="terminal client too slow")
                 return
             if isinstance(item, bytes):
-                await websocket.send_bytes(item)
+                if not await writer.send_bytes(item):
+                    return
             else:
-                await websocket.send_json(item)
+                if not await writer.send_json(item):
+                    return
                 if item.get("type") == "exit":
-                    await websocket.close(code=1000)
+                    await writer.close(code=1000)
                     return
 
     async def receive_loop() -> None:
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
+                writer.mark_closed()
                 return
             payload = message.get("bytes")
             if payload is not None:
@@ -754,7 +760,8 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
                 except (TypeError, ValueError):
                     continue
             elif control.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
+                if not await writer.send_json({"type": "pong"}):
+                    return
 
     sender = asyncio.create_task(send_loop())
     receiver = asyncio.create_task(receive_loop())

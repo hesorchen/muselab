@@ -17,6 +17,7 @@ def _capture_build_options(chat_mod, monkeypatch):
 
     monkeypatch.setattr(chat_mod, "ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr(chat_mod, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(chat_mod, "UnsignedThinkingCompatibleClient", FakeClient)
     monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda sid: None)
     return captured
 

@@ -43,18 +43,28 @@ class EmbeddingProvider:
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
-        payload: dict[str, Any] = {"model": self.config.model, "input": texts}
-        if self.config.dimensions:
-            payload["dimensions"] = self.config.dimensions
+        vectors: list[list[float]] = []
+        batch_size = max(1, int(self.config.batch_size))
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.config.timeout_seconds)
         ) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            body = response.json()
-        rows = body.get("data", []) if isinstance(body, dict) else []
-        rows = sorted(rows, key=lambda item: int(item.get("index", 0)))
-        vectors = [item.get("embedding") for item in rows]
+            for start in range(0, len(texts), batch_size):
+                chunk = texts[start:start + batch_size]
+                payload: dict[str, Any] = {
+                    "model": self.config.model,
+                    "input": chunk,
+                }
+                if self.config.dimensions:
+                    payload["dimensions"] = self.config.dimensions
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                body = response.json()
+                rows = body.get("data", []) if isinstance(body, dict) else []
+                rows = sorted(rows, key=lambda item: int(item.get("index", 0)))
+                chunk_vectors = [item.get("embedding") for item in rows]
+                if len(chunk_vectors) != len(chunk):
+                    raise ValueError("embedding provider returned an invalid response")
+                vectors.extend(chunk_vectors)
         if len(vectors) != len(texts) or not all(isinstance(v, list) and v for v in vectors):
             raise ValueError("embedding provider returned an invalid response")
         dimensions = len(vectors[0])
@@ -76,6 +86,13 @@ class VectorStore(ABC):
 
     @abstractmethod
     async def upsert(self, item_id: str, vector: list[float], payload: dict) -> None: ...
+
+    async def upsert_many(
+        self,
+        items: list[tuple[str, list[float], dict]],
+    ) -> None:
+        for item_id, vector, payload in items:
+            await self.upsert(item_id, vector, payload)
 
     @abstractmethod
     async def search(self, vector: list[float], *, owner_id: str,
@@ -132,12 +149,25 @@ class QdrantVectorStore(VectorStore):
         })
 
     async def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
-        clean_payload = {**payload, "memory_id": item_id}
-        await self._request(
-            "PUT", f"/collections/{self.config.collection}/points?wait=true",
-            json={"points": [{"id": self._point_id(item_id), "vector": vector,
-                              "payload": clean_payload}]},
-        )
+        await self.upsert_many([(item_id, vector, payload)])
+
+    async def upsert_many(
+        self,
+        items: list[tuple[str, list[float], dict]],
+    ) -> None:
+        for start in range(0, len(items), 256):
+            chunk = items[start:start + 256]
+            await self._request(
+                "PUT", f"/collections/{self.config.collection}/points?wait=true",
+                json={"points": [
+                    {
+                        "id": self._point_id(item_id),
+                        "vector": vector,
+                        "payload": {**payload, "memory_id": item_id},
+                    }
+                    for item_id, vector, payload in chunk
+                ]},
+            )
 
     async def search(self, vector: list[float], *, owner_id: str,
                      limit: int) -> list[dict]:
@@ -228,17 +258,31 @@ class PgVectorStore(VectorStore):
         await asyncio.to_thread(run)
 
     async def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
+        await self.upsert_many([(item_id, vector, payload)])
+
+    async def upsert_many(
+        self,
+        items: list[tuple[str, list[float], dict]],
+    ) -> None:
         def run():
             with self._connect() as conn:
-                conn.execute(
+                conn.executemany(
                     f"""INSERT INTO {self.table}
                         (id,owner_id,status,payload,embedding)
                         VALUES (%s,%s,%s,%s,%s::vector)
                         ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id,
                         status=excluded.status,payload=excluded.payload,
                         embedding=excluded.embedding""",
-                    (item_id, payload["owner_id"], payload.get("status", "active"),
-                     json.dumps(payload), json.dumps(vector)),
+                    [
+                        (
+                            item_id,
+                            payload["owner_id"],
+                            payload.get("status", "active"),
+                            json.dumps(payload),
+                            json.dumps(vector),
+                        )
+                        for item_id, vector, payload in items
+                    ],
                 )
         await asyncio.to_thread(run)
 

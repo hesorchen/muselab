@@ -16,7 +16,7 @@
 
 ## 端点
 
-当前共 19 个文件端点，全部需要 token。
+当前共 21 个文件端点。普通请求使用 token 鉴权；浏览器下载先通过已鉴权请求签发一个短时、限定作用域的能力票据。
 
 ### 读取与预览
 
@@ -26,13 +26,14 @@
 | `GET /api/files/stat` | 获取单个路径的类型、大小和修改时间 |
 | `GET /api/files/read` | 读取文本，最大 2 MiB |
 | `GET /api/files/raw` | 内联预览受支持的图片、媒体、PDF、HTML 与 SVG，其余强制下载 |
-| `GET /api/files/download` | 作为附件下载 |
+| `POST /api/files/download-ticket` | 签发绑定到单个文件和工作目录的一次性票据 |
+| `GET /api/files/download` | 使用该票据下载附件 |
 | `GET /api/files/xlsx` | 工作簿结构化预览 |
 | `GET /api/files/csv` | CSV/TSV 分页预览 |
 | `GET /api/files/grep` | 有界全文搜索 |
 | `GET /api/files/search` | 文件名和目录名搜索 |
 
-`raw` 与 `download` 用于 iframe、图片或浏览器导航，因此接受查询参数 token。HTML/SVG 预览使用 sandbox CSP；HTML 预览桥仅对不超过 12 MiB 的文件注入滚动和图片交互支持。
+`raw` 用于 iframe 和图片，仍接受查询参数 token。`download` 不再把可复用的应用 token 放入 URL：前端会先签发一个有效期 60 秒、只能使用一次，并绑定到具体文件和工作目录的票据。HTML/SVG 预览使用 sandbox CSP；HTML 预览桥仅对不超过 12 MiB 的文件注入滚动和图片交互支持。
 
 预览限制：
 

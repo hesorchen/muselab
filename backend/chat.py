@@ -2576,6 +2576,58 @@ async def disconnect_client(session_id: str) -> None:
             pass
 
 
+async def shutdown_runtime() -> None:
+    """Boundedly stop every in-process chat task, stream, and SDK client."""
+    global _client_lru
+
+    # Stop detached task watchers and active turn pumps before tearing down the
+    # shared SDK streams they consume.
+    tasks: set[asyncio.Task] = {
+        task for task in _task_watchers.values() if not task.done()
+    }
+    for broadcast in tuple(_active_turns.values()):
+        broadcast.cancelled = True
+        for attr in ("startup_task", "task"):
+            task = getattr(broadcast, attr, None)
+            if isinstance(task, asyncio.Task) and not task.done():
+                tasks.add(task)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    streams = list(_session_streams.values())
+    _session_streams.clear()
+    if streams:
+        await asyncio.gather(
+            *(stream.aclose() for stream in streams),
+            return_exceptions=True,
+        )
+
+    async with _lock:
+        clients = list({id(client): client for client in _clients.values()}.values())
+        _clients.clear()
+        _client_permission.clear()
+        _creation_locks.clear()
+        _client_lru.clear()
+        _pending_runtime_rebuilds.clear()
+        _active_turns.clear()
+        _sessions_with_inflight_tasks.clear()
+        _task_watchers.clear()
+
+    async def _disconnect(client: ClaudeSDKClient) -> None:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=4.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    if clients:
+        await asyncio.gather(
+            *(_disconnect(client) for client in clients),
+            return_exceptions=True,
+        )
+
+
 async def _rebuild_session_runtime(session_id: str) -> None:
     """Disconnect now, or defer until the active turn reaches a safe boundary."""
     if _session_runtime_busy(session_id):

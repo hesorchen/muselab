@@ -1370,9 +1370,16 @@ function portal() {
           this.previewImmersive = false;
           document.body.classList.remove("preview-immersive");
         }
-        if (t === "files") this.$nextTick(() => this._flushFileTreeDirty());
+        this.$nextTick(() => {
+          if (t === "files") this._flushFileTreeDirty();
+          this._startFileEvents();
+        });
         this.savePrefs();
       });
+      // Native file watches are needed only while the file tree is visible.
+      // Keep their lifecycle tied to every desktop layout transition too.
+      this.$watch("leftOpen", () => this.$nextTick(() => this._startFileEvents()));
+      this.$watch("desktopFullPane", () => this.$nextTick(() => this._startFileEvents()));
 
       // ============================================================
       // Document-level OS-file-drag detection
@@ -13188,18 +13195,43 @@ function portal() {
       this._fileEventsTimer = null;
       if (markDirty) this._fileTreeDirty = true;
     },
-    _startFileEvents() {
+    _fileCapabilities() {
+      if (!this._fileCapabilitiesPromise) {
+        this._fileCapabilitiesPromise = import(
+          "/static/modules/file-capabilities.mjs"
+        ).catch(error => {
+          this._fileCapabilitiesPromise = null;
+          throw error;
+        });
+      }
+      return this._fileCapabilitiesPromise;
+    },
+    async _startFileEvents() {
       const workspace = this.fileWorkspacePath();
       if (!this.token || !workspace || typeof EventSource === "undefined") return;
-      if (typeof document !== "undefined"
-          && document.visibilityState !== "visible") {
+      if (!this._fileTreeIsVisible()) {
+        this._stopFileEvents(true);
         this._fileTreeDirty = true;
         return;
       }
       if (this._fileEvents && this._fileEventsWorkspace === workspace) return;
       this._stopFileEvents(false);
       const seq = ++this._fileEventsSeq;
-      const params = new URLSearchParams({ token: this.token, workspace });
+      let ticket;
+      try {
+        const capabilities = await this._fileCapabilities();
+        ticket = await capabilities.mintTicket(
+          "/api/files/events-ticket",
+          this.fileHdr(),
+        );
+      } catch (_) {
+        if (seq === this._fileEventsSeq && this._fileTreeIsVisible()) {
+          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+        }
+        return;
+      }
+      if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket) return;
+      const params = new URLSearchParams({ ticket, workspace });
       const es = new EventSource(`/api/files/events?${params.toString()}`);
       this._fileEvents = es;
       this._fileEventsWorkspace = workspace;
@@ -13224,9 +13256,13 @@ function portal() {
       });
       es.onerror = () => {
         if (!owns()) return;
-        // EventSource reconnects itself. Mark the tree dirty because changes
-        // can land in the disconnect gap; the next `ready` re-baselines once.
+        // Tickets are single-use, so close the native retry and mint a fresh
+        // credential for a controlled reconnect.
         this._fileTreeDirty = true;
+        try { es.close(); } catch (_) {}
+        this._fileEvents = null;
+        this._fileEventsWorkspace = "";
+        this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
       };
       if (!this._fileEventsVisibilityBound) {
         this._fileEventsVisibilityBound = true;
@@ -14006,7 +14042,7 @@ function portal() {
           if (!n.is_dir) await this.doCopyAsBak(n);
           break;
         case "download":
-          if (!n.is_dir) window.open(this.downloadUrl(n.path), "_blank");
+          if (!n.is_dir) await this.downloadFile(n.path);
           break;
         case "rename":
           await this.doRename(n);
@@ -16707,11 +16743,26 @@ function portal() {
       // A tool just wrote this file → its mtime moved; refresh the strip.
       this.loadSelectedMeta(path);
     },
-    downloadUrl(p) {
+    async downloadFile(p) {
+      if (!p) return;
+      let capabilities;
+      let ticket;
+      try {
+        capabilities = await this._fileCapabilities();
+        ticket = await capabilities.mintTicket(
+          "/api/files/download-ticket",
+          { ...this.fileHdr(), "Content-Type": "application/json" },
+          { path: p },
+        );
+      } catch (error) {
+        this.errToast("generic", String((error && error.message) || error));
+        return;
+      }
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      return "/api/files/download?path=" + encodeURIComponent(p)
-        + "&token=" + encodeURIComponent(this.token) + workspace;
+      const url = "/api/files/download?path=" + encodeURIComponent(p)
+        + "&ticket=" + encodeURIComponent(ticket) + workspace;
+      capabilities.triggerDownload(url, p.split("/").pop() || "download");
     },
 
     iconRef(n) {

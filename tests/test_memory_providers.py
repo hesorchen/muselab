@@ -53,6 +53,45 @@ def test_embedding_response_order_and_dimension_validation(monkeypatch):
         _run(provider.embed(["a", "b"]))
 
 
+def test_embedding_provider_honours_configured_batch_size(monkeypatch):
+    import backend.memory_providers as module
+    from backend.memory_config import EmbeddingConfig
+    from backend.memory_providers import EmbeddingProvider
+
+    batches: list[list[str]] = []
+
+    class Response:
+        def __init__(self, texts):
+            self.texts = texts
+
+        def raise_for_status(self): pass
+
+        def json(self):
+            return {"data": [
+                {"index": index, "embedding": [float(index), 1.0]}
+                for index, _text in enumerate(self.texts)
+            ]}
+
+    class Client:
+        def __init__(self, **_kwargs): pass
+
+        async def __aenter__(self): return self
+
+        async def __aexit__(self, *_args): return False
+
+        async def post(self, _url, **kwargs):
+            texts = kwargs["json"]["input"]
+            batches.append(texts)
+            return Response(texts)
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", Client)
+    provider = EmbeddingProvider(EmbeddingConfig(
+        base_url="http://embed/v1", model="bge", dimensions=2, batch_size=2))
+    vectors = _run(provider.embed(["a", "b", "c", "d", "e"]))
+    assert batches == [["a", "b"], ["c", "d"], ["e"]]
+    assert len(vectors) == 5
+
+
 def test_qdrant_refuses_existing_collection_with_wrong_dimension(monkeypatch):
     from backend.memory_config import VectorConfig
     from backend.memory_providers import QdrantVectorStore

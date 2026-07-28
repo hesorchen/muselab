@@ -15,6 +15,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
+from .capability_tickets import tickets
 from .settings import ROOT, atomic_write_text, env_int
 from .workspaces import (
     registry as workspace_registry,
@@ -923,6 +924,26 @@ def mint_preview_ticket(
     }
 
 
+_DOWNLOAD_TICKET_TTL_S = 60
+
+
+@router.post("/download-ticket", dependencies=[Depends(require_token)])
+def mint_download_ticket(
+    req: PreviewTicketReq,
+    root: Path = Depends(_workspace_root),
+) -> dict:
+    target = safe_resolve(req.path, root=root)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    ticket = tickets.mint(
+        "download",
+        (str(target), str(root.resolve())),
+        ttl=_DOWNLOAD_TICKET_TTL_S,
+        single_use=True,
+    )
+    return {"ticket": ticket, "expires_in": _DOWNLOAD_TICKET_TTL_S}
+
+
 async def _require_raw_access(
     path: str = Query(...),
     ticket: str = Query(""),
@@ -1027,7 +1048,24 @@ def raw_file(
     })
 
 
-@router.get("/download", dependencies=[Depends(require_token_query)])
+def _require_download_ticket(
+    path: str = Query(...),
+    ticket: str = Query(""),
+    root: Path = Depends(_workspace_root),
+) -> None:
+    try:
+        target = safe_resolve(path, root=root)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="invalid download ticket") from None
+    if not tickets.validate(
+        ticket,
+        "download",
+        (str(target), str(root.resolve())),
+    ):
+        raise HTTPException(status_code=401, detail="invalid or expired download ticket")
+
+
+@router.get("/download", dependencies=[Depends(_require_download_ticket)])
 def download_file(
     path: str = Query(...),
     root: Path = Depends(_workspace_root),

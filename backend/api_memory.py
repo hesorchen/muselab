@@ -1,8 +1,11 @@
 """Authenticated white-box API for memory configuration and governance."""
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import require_token
 from .memory_config import (
@@ -36,11 +39,21 @@ class SkillApproval(BaseModel):
 
 
 class MemoryImport(BaseModel):
-    schema: str | None = None
-    # ``items`` is the compact/manual shape. ``memories`` accepts the direct
-    # output of GET /api/memory/export for a real round-trip migration.
+    model_config = ConfigDict(populate_by_name=True)
+
+    export_schema: str | None = Field(default=None, alias="schema")
+    # ``items`` remains the compact/manual compatibility shape.
     items: list[MemoryCreate] = Field(default_factory=list, max_length=10_000)
-    memories: list[MemoryCreate] = Field(default_factory=list, max_length=10_000)
+    memories: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
+    evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
+    episodes: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
+    episode_evidence: list[dict[str, Any]] = Field(
+        default_factory=list, max_length=100_000)
+    memory_sources: list[dict[str, Any]] = Field(
+        default_factory=list, max_length=100_000)
+    relations: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
+    audit: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
 
 
 class MemoryFeedback(BaseModel):
@@ -302,24 +315,49 @@ def export_memory() -> dict:
     """Portable canonical export; vector embeddings are intentionally absent."""
     cfg = load_config()
     return {
-        "schema": "muselab-memory-export-v1",
-        "owner_id": cfg.owner_id,
-        "memories": engine.store.list_memories(cfg.owner_id, limit=100_000),
-        "episodes": engine.store.list_episodes(cfg.owner_id, limit=100_000),
-        "artifacts": engine.store.list_artifacts(cfg.owner_id, limit=100_000),
+        "schema": "muselab-memory-export-v2",
+        **engine.store.export_snapshot(cfg.owner_id),
     }
 
 
 @router.post("/import")
 async def import_memory(body: MemoryImport) -> dict:
-    if body.schema not in (None, "muselab-memory-export-v1"):
+    schema = body.export_schema
+    if schema not in (
+        None,
+        "muselab-memory-export-v1",
+        "muselab-memory-export-v2",
+    ):
         raise HTTPException(422, "unsupported memory export schema")
-    incoming = [*body.items, *body.memories]
+
+    cfg = load_config()
+    if schema == "muselab-memory-export-v2":
+        snapshot = body.model_dump(
+            by_alias=True,
+            exclude={"export_schema", "items"},
+        )
+        try:
+            counts = await asyncio.to_thread(
+                engine.store.import_snapshot, snapshot, cfg.owner_id)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from None
+        queued = engine.reindex_all() if cfg.enabled and body.memories else 0
+        return {
+            "ok": True,
+            "created": counts.get("memories", 0),
+            "restored": counts,
+            "queued_reindex": queued,
+        }
+
+    try:
+        legacy_memories = [MemoryCreate.model_validate(row) for row in body.memories]
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, f"invalid legacy memory import: {exc}") from None
+    incoming = [*body.items, *legacy_memories]
     if not incoming:
         raise HTTPException(422, "memory import contains no items")
     if len(incoming) > 10_000:
         raise HTTPException(422, "memory import exceeds 10000 items")
-    cfg = load_config()
     existing = {
         " ".join(item["content"].casefold().split())
         for item in engine.store.list_memories(cfg.owner_id, limit=100_000)

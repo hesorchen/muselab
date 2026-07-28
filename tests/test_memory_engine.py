@@ -286,3 +286,68 @@ def test_default_soft_timeout_exceeds_a_single_embedding_call():
     """Guards the budget against regressing below one embedding round-trip."""
     from backend.memory_config import RetrievalConfig
     assert RetrievalConfig().soft_timeout_ms >= 1000
+
+
+def test_transcript_reconciliation_stops_at_next_real_user_turn(
+    tmp_path, monkeypatch,
+):
+    import json
+
+    from backend import chat
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    user_id = instance.store.add_evidence(
+        "default", "session-a", "user", "第一问")
+    episode = instance.store.get_or_create_episode(
+        "default", "session-a", idle_seconds=60)
+    instance.store.attach_evidence(episode["id"], [user_id])
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "user", "uuid": "u1",
+         "message": {"content": "第一问"}},
+        {"type": "assistant", "uuid": "a1", "message": {"content": [
+            {"type": "tool_use", "id": "tool-1", "name": "Read",
+             "input": {"file_path": "one.md"}},
+        ]}},
+        {"type": "user", "uuid": "r1", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tool-1", "content": "one"},
+        ]}},
+        {"type": "user", "uuid": "u2",
+         "message": {"content": "第二问"}},
+        {"type": "assistant", "uuid": "a2", "message": {"content": [
+            {"type": "tool_use", "id": "tool-2", "name": "Read",
+             "input": {"file_path": "two.md"}},
+        ]}},
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in records),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(chat, "_find_session_jsonl", lambda _sid: transcript)
+
+    _run(instance._reconcile_transcript(
+        episode["id"], user_id, "session-a"))
+    event_types = [
+        row["event_type"] for row in instance.store.episode(episode["id"])["evidence"]
+    ]
+    assert event_types == ["message", "tool_use", "tool_result"]
+
+
+def test_reindex_all_queues_one_batch_job(tmp_path, monkeypatch):
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    for index in range(5):
+        instance.store.create_memory(
+            "default", "fact", f"批量索引 {index}")
+
+    assert instance.reindex_all() == 5
+    jobs = instance.store.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["kind"] == "reindex_memories"
+    assert len(jobs[0]["payload"]["memory_ids"]) == 5

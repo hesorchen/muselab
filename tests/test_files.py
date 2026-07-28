@@ -312,6 +312,38 @@ def test_path_bound_preview_ticket_replaces_long_lived_token(
     assert replay.status_code == 401
 
 
+def test_download_uses_path_bound_single_use_ticket(client, auth):
+    minted = client.post(
+        "/api/files/download-ticket",
+        headers=auth,
+        json={"path": "README.md"},
+    )
+    assert minted.status_code == 200
+    ticket = minted.json()["ticket"]
+
+    downloaded = client.get(
+        "/api/files/download",
+        params={"path": "README.md", "ticket": ticket},
+    )
+    assert downloaded.status_code == 200
+
+    replay = client.get(
+        "/api/files/download",
+        params={"path": "README.md", "ticket": ticket},
+    )
+    assert replay.status_code == 401
+
+    wrong_path = client.post(
+        "/api/files/download-ticket",
+        headers=auth,
+        json={"path": "README.md"},
+    ).json()["ticket"]
+    assert client.get(
+        "/api/files/download",
+        params={"path": "notes/a.md", "ticket": wrong_path},
+    ).status_code == 401
+
+
 # ---- new endpoints / edge cases ----
 
 def test_rename_endpoint(client, auth, temp_root):

@@ -652,10 +652,10 @@
           <template x-if="previewSurface==='terminal' && activeTerminal()">
             <div class="pane-fileinfo-row">
               <span class="terminal-status-dot"
-                    :class="activeTerminal().status"></span>
+                    :class="activeTerminal()?.status || ''"></span>
               <span class="pane-fileinfo-path"
-                    :title="activeTerminal().cwd"
-                    x-text="activeTerminal().cwd"></span>
+                    :title="activeTerminal()?.cwd || ''"
+                    x-text="activeTerminal()?.cwd || ''"></span>
               <span class="pane-fileinfo-mtime"
                     x-show="terminalConnection!=='connected'"
                     x-text="terminalConnection==='connecting'
@@ -664,8 +664,8 @@
                           ? (lang==='zh'?'正在重连…':'Reconnecting…')
                           : (terminalConnection==='error'
                               ? (lang==='zh'?'连接失败':'Connection failed')
-                              : (activeTerminal().status==='exited'
-                                  ? ((lang==='zh'?'已退出 · ':'Exited · ') + activeTerminal().exit_code)
+                              : (activeTerminal()?.status==='exited'
+                                  ? ((lang==='zh'?'已退出 · ':'Exited · ') + (activeTerminal()?.exit_code ?? ''))
                                   : '')))"></span>
             </div>
           </template>
@@ -1260,14 +1260,16 @@
             <div class="empty-hint">
               <span x-text="previewError.hint"></span>
               <template x-if="previewError.status === 413">
-                <a :href="downloadUrl(selected)" x-text="lang==='zh' ? ' 点这里下载' : ' Download instead'"></a>
+                <a href="#" @click.prevent="downloadFile(selected)"
+                   x-text="lang==='zh' ? ' 点这里下载' : ' Download instead'"></a>
               </template>
             </div>
           </template>
           <template x-if="!previewError">
             <div class="empty-hint">
               <span x-text="lang==='zh' ? '该文件类型无法在浏览器中预览。' : 'This file type cannot be previewed in browser. '"></span>
-              <a :href="downloadUrl(selected)" x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a><span x-show="lang==='zh'">。</span>
+              <a href="#" @click.prevent="downloadFile(selected)"
+                 x-text="lang==='zh' ? '点这里下载' : 'Download it instead'"></a><span x-show="lang==='zh'">。</span>
             </div>
           </template>
         </div>
@@ -4016,7 +4018,7 @@
                      x-text="item.content || item.summary || item.title
                        || item.last_error || item.action || JSON.stringify(item.payload || item.results || {})"></div>
                 <div class="memory-source" x-show="item.sources?.length"
-                     x-text="(lang==='zh' ? '来源：' : 'Sources: ') + item.sources.map(s => s.source_type + ':' + s.source_id).join(' · ')"></div>
+                     x-text="(lang==='zh' ? '来源：' : 'Sources: ') + (item.sources || []).map(s => s.source_type + ':' + s.source_id).join(' · ')"></div>
                 <div class="memory-card-actions" x-show="settings.memory.tab === 'items'">
                   <button class="btn-ghost xs" @click="memoryCorrect(item)"
                           x-text="lang==='zh' ? '更正' : 'Correct'"></button>

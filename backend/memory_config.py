@@ -148,7 +148,8 @@ def load_config(*, fresh: bool = False) -> MemoryConfig:
             value = MemoryConfig()
         else:
             try:
-                value = MemoryConfig.model_validate_json(path.read_text("utf-8"))
+                value = MemoryConfig.model_validate_json(
+                    path.read_text(encoding="utf-8"))
             except Exception:
                 # A corrupt config must never stop MuseLab from starting.
                 value = MemoryConfig()
