@@ -122,3 +122,47 @@ def test_neutral_export_and_import(client, auth):
     assert restored.status_code == 200
     assert restored.json()["created"] == 0
     assert "restored" in restored.json()
+
+
+def test_export_preserves_governance_state_through_round_trip(client, auth):
+    created = client.post("/api/memory/items", headers=auth, json={
+        "kind": "fact", "content": "会被更正的事实", "tags": []}).json()
+    client.post(f"/api/memory/items/{created['id']}/correct", headers=auth,
+                json={"content": "更正后的事实"})
+    exported = client.get("/api/memory/export", headers=auth).json()
+    # The v2 snapshot is a verbatim canonical dump, so the superseded original
+    # rides along WITH its terminal status. That is what makes replay safe:
+    # import_snapshot restores by primary key, so a tombstone comes back as a
+    # tombstone instead of being promoted to user-confirmed content.
+    by_content = {row["content"]: row for row in exported["memories"]}
+    assert by_content["会被更正的事实"]["status"] == "superseded"
+    assert by_content["更正后的事实"]["status"] == "active"
+
+    # The compact v1 shape also keeps declared governance instead of defaulting
+    # everything to active/confirmed.
+    pending = client.post("/api/memory/import", headers=auth, json={
+        "items": [{"kind": "fact", "content": "待复核的导入项",
+                   "status": "pending_review", "authority": "legacy_import",
+                   "confidence": 0.4}]})
+    assert pending.status_code == 200
+    row = next(item for item in client.get(
+        "/api/memory/items", headers=auth,
+        params={"status": "pending_review"}).json()["items"]
+        if item["content"] == "待复核的导入项")
+    assert row["authority"] == "legacy_import"
+    assert row["confidence"] == 0.4
+
+
+def test_approve_and_correct_reject_retired_rows(client, auth):
+    item = client.post("/api/memory/items", headers=auth, json={
+        "kind": "fact", "content": "先确认再更正", "tags": []}).json()
+    assert client.post(
+        f"/api/memory/items/{item['id']}/approve", headers=auth).status_code == 200
+    client.post(f"/api/memory/items/{item['id']}/correct", headers=auth,
+                json={"content": "更正内容"})
+    # Superseded is terminal: neither approving nor correcting may resurrect it.
+    assert client.post(
+        f"/api/memory/items/{item['id']}/approve", headers=auth).status_code == 409
+    assert client.post(
+        f"/api/memory/items/{item['id']}/correct", headers=auth,
+        json={"content": "再更正一次"}).status_code == 409

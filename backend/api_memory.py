@@ -19,6 +19,13 @@ from .memory_engine import engine
 router = APIRouter(
     prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_token)])
 
+# Statuses a legacy v1 import may land in. Matches memory_engine._MEMORY_STATUSES;
+# kept as a local name so the API layer states its own contract explicitly.
+_IMPORTABLE_STATUSES = ("active", "pending_review")
+# Authorities recall() knows how to weight (see memory_engine._rank); anything
+# else imports as "confirmed" rather than silently landing in the 0.8 bucket.
+_IMPORTABLE_AUTHORITIES = ("confirmed", "inferred", "legacy_import")
+
 
 class MemoryCreate(BaseModel):
     kind: str = "fact"
@@ -38,12 +45,21 @@ class SkillApproval(BaseModel):
     markdown: str | None = Field(default=None, max_length=50_000)
 
 
+class MemoryImportItem(MemoryCreate):
+    """An export row. Governance fields are optional so a hand-written
+    ``{kind, content}`` list still imports as a user-confirmed memory."""
+
+    status: str | None = None
+    authority: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class MemoryImport(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     export_schema: str | None = Field(default=None, alias="schema")
     # ``items`` remains the compact/manual compatibility shape.
-    items: list[MemoryCreate] = Field(default_factory=list, max_length=10_000)
+    items: list[MemoryImportItem] = Field(default_factory=list, max_length=10_000)
     memories: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
     evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
     episodes: list[dict[str, Any]] = Field(default_factory=list, max_length=100_000)
@@ -173,6 +189,8 @@ async def correct_item(memory_id: str, body: MemoryCorrection) -> dict:
         return await engine.correct_memory(memory_id, body.content, kind=body.kind)
     except KeyError:
         raise HTTPException(404, "memory not found") from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @router.post("/items/{memory_id}/approve")
@@ -181,13 +199,15 @@ async def approve_item(memory_id: str) -> dict:
     item = engine.store.memory(memory_id)
     if not item or item.get("owner_id") != cfg.owner_id:
         raise HTTPException(404, "memory not found")
-    updated = engine.store.update_memory(
-        memory_id, status="active", authority="confirmed", confidence=1.0)
-    engine.store.audit(cfg.owner_id, "approve", "memory", memory_id)
+    updated = engine.store.approve_memory(memory_id, cfg.owner_id)
+    if updated is None:
+        raise HTTPException(
+            409, f"memory is {item.get('status')} and cannot be approved")
     if cfg.enabled:
-        engine.store.enqueue("reindex_memory", {"memory_id": memory_id})
+        engine.store.enqueue("reindex_memory", {"memory_id": memory_id},
+                             owner_id=cfg.owner_id)
         engine._wake.set()
-    return updated or item
+    return updated
 
 
 @router.delete("/items/{memory_id}")
@@ -312,7 +332,13 @@ def trigger_reindex() -> dict:
 
 @router.get("/export")
 def export_memory() -> dict:
-    """Portable canonical export; vector embeddings are intentionally absent."""
+    """Portable canonical export; vector embeddings are intentionally absent.
+
+    The v2 snapshot carries every row verbatim, including retired ones and their
+    governance state (status/authority/confidence), because import_snapshot
+    restores by primary key: replaying an export cannot promote a superseded row
+    back to user-confirmed the way a lossy `{kind, content}` round-trip would.
+    """
     cfg = load_config()
     return {
         "schema": "muselab-memory-export-v2",
@@ -350,7 +376,8 @@ async def import_memory(body: MemoryImport) -> dict:
         }
 
     try:
-        legacy_memories = [MemoryCreate.model_validate(row) for row in body.memories]
+        legacy_memories = [MemoryImportItem.model_validate(row)
+                           for row in body.memories]
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, f"invalid legacy memory import: {exc}") from None
     incoming = [*body.items, *legacy_memories]
@@ -367,7 +394,16 @@ async def import_memory(body: MemoryImport) -> dict:
         key = " ".join(item.content.casefold().split())
         if key in existing:
             continue
-        await engine.add_confirmed_memory(item.kind, item.content, tags=item.tags)
+        status = item.status if item.status in _IMPORTABLE_STATUSES else "active"
+        authority = (item.authority if item.authority in _IMPORTABLE_AUTHORITIES
+                     else "confirmed")
+        try:
+            await engine.add_confirmed_memory(
+                item.kind, item.content, tags=item.tags, status=status,
+                authority=authority,
+                confidence=1.0 if item.confidence is None else item.confidence)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         existing.add(key)
         created += 1
     return {"ok": True, "created": created}

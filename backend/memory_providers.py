@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import uuid
@@ -19,6 +20,8 @@ from .memory_config import (
     VectorConfig,
     memory_dir,
 )
+
+log = logging.getLogger("muselab.memory")
 
 
 def _safe_http_url(raw: str) -> str:
@@ -380,15 +383,29 @@ class GenerationProvider:
         if route is None:
             return await self._complete_with_sdk(system, prompt)
         url, key, model = route
+        payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
+                   "system": system,
+                   "messages": [{"role": "user", "content": prompt}]}
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
             response = await client.post(
                 url,
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                          "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": max_tokens, "temperature": 0,
-                      "system": system,
-                      "messages": [{"role": "user", "content": prompt}]},
+                json=payload,
             )
+            if response.status_code == 400 and "temperature" in response.text.lower():
+                # Extended-thinking models (GLM/Claude thinking variants) reject
+                # any temperature other than 1 with a 400. Consolidation only
+                # wants determinism as a preference, not a hard requirement, so
+                # drop the knob and retry rather than failing the whole job.
+                log.debug("generation endpoint rejected temperature, retrying without")
+                payload.pop("temperature", None)
+                response = await client.post(
+                    url,
+                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                )
             response.raise_for_status()
             body = response.json()
         blocks = body.get("content", [])

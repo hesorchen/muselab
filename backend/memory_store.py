@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("muselab.memory")
 
 
 def _now() -> float:
@@ -154,6 +159,32 @@ class MemoryStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._init()
+        self._harden_permissions()
+
+    def _harden_permissions(self) -> None:
+        """Restrict the registry to the owning user.
+
+        The registry holds verbatim conversation evidence — the most sensitive
+        data MuseLab persists. mkdir/sqlite3 respect the process umask, which
+        on a typical host means 0755 / 0644, i.e. world-readable memories on a
+        shared machine. Applied on every open so an existing registry created
+        by an older build is tightened too. Best-effort: a bind-mounted or
+        foreign-owned path must not stop the engine from starting.
+        """
+        for target, mode in ((self.path.parent, 0o700), (self.path, 0o600)):
+            try:
+                target.chmod(mode)
+            except OSError as exc:  # noqa: PERF203 - two items, clarity wins
+                log.debug("could not chmod %s: %s", target, exc)
+        # WAL/SHM siblings carry the same content and are created lazily by
+        # SQLite with the same permissive default.
+        for suffix in ("-wal", "-shm"):
+            sibling = self.path.with_name(self.path.name + suffix)
+            if sibling.exists():
+                try:
+                    sibling.chmod(0o600)
+                except OSError as exc:
+                    log.debug("could not chmod %s: %s", sibling, exc)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -161,6 +192,25 @@ class MemoryStore:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
+
+    @contextmanager
+    def _write_tx(self) -> Iterator[sqlite3.Connection]:
+        """Run a multi-statement write as one transaction.
+
+        Connections are autocommit (``isolation_level=None``), so without an
+        explicit transaction a failure midway through e.g. create_memory would
+        commit the `memories` row but not its `memory_fts` twin, leaving the
+        index permanently out of sync with the registry.  Do not nest: SQLite
+        would deadlock on the second BEGIN IMMEDIATE from a sibling connection.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
 
     def _init(self) -> None:
         schema = """
@@ -224,6 +274,7 @@ class MemoryStore:
           id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
           payload_json TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
           run_after REAL NOT NULL, last_error TEXT NOT NULL DEFAULT '',
+          owner_id TEXT NOT NULL DEFAULT '',
           created_at REAL NOT NULL, updated_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_claim
@@ -245,7 +296,20 @@ class MemoryStore:
         """
         with self._lock, self._connect() as conn:
             conn.executescript(schema)
+            self._migrate_columns(conn)
             self._migrate_fts(conn)
+
+    @staticmethod
+    def _migrate_columns(conn: sqlite3.Connection) -> None:
+        """Additive column migrations for registries created by older builds.
+
+        CREATE TABLE IF NOT EXISTS silently keeps the OLD shape, so a column
+        added to the schema string above never reaches an existing file.
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if "owner_id" not in columns:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
 
     def _migrate_fts(self, conn: sqlite3.Connection) -> None:
         """Reindex memory_fts when the tokenization scheme changes.
@@ -443,7 +507,7 @@ class MemoryStore:
                       sources: list[dict] | None = None,
                       valid_from: float | None = None) -> dict:
         memory_id, now = _id("mem"), _now()
-        with self._lock, self._connect() as conn:
+        with self._write_tx() as conn:
             conn.execute(
                 """INSERT INTO memories
                    (id,owner_id,kind,content,status,authority,confidence,
@@ -590,7 +654,7 @@ class MemoryStore:
             fields["attributes_json"] = _json(attributes)
         if tags is not None:
             fields["tags_json"] = _json(tags)
-        with self._lock, self._connect() as conn:
+        with self._write_tx() as conn:
             if conn.execute("SELECT 1 FROM memories WHERE id=?", (memory_id,)).fetchone() is None:
                 return None
             conn.execute(
@@ -610,9 +674,16 @@ class MemoryStore:
 
     def supersede_memory(self, memory_id: str, owner_id: str, content: str,
                          *, kind: str | None = None) -> dict:
+        # Three atomic steps rather than one transaction: _write_tx is not
+        # reentrant (create_memory's own audit/read helpers open sibling
+        # connections that would block on the outer write lock).  The order is
+        # chosen so a crash in between leaves the replacement present and the
+        # old row still readable, never the reverse.
         old = self.memory(memory_id)
         if not old or old["owner_id"] != owner_id:
             raise KeyError(memory_id)
+        if old["status"] in {"superseded", "deleted"}:
+            raise ValueError(f"memory is {old['status']} and cannot be corrected")
         new = self.create_memory(
             owner_id, kind or old["kind"], content, authority="confirmed",
             confidence=1.0, attributes=old.get("attributes"), tags=old.get("tags"),
@@ -622,6 +693,28 @@ class MemoryStore:
         self.update_memory(memory_id, status="superseded")
         self.add_relation("memory", new["id"], "supersedes", "memory", memory_id)
         return self.memory(new["id"]) or new
+
+    def approve_memory(self, memory_id: str, owner_id: str) -> dict | None:
+        """Confirm a memory, but only from a state that may still be confirmed.
+
+        A read-then-blind-UPDATE in the API layer cannot fence a concurrent
+        correct/forget: those go through their own connections, so a supersede
+        or delete landing between the read and the write would be silently
+        undone — resurrecting content the user just retired.  Keeping the status
+        predicate inside the writing statement makes the loser of that race get
+        None back instead.
+        """
+        with self._write_tx() as conn:
+            changed = conn.execute(
+                "UPDATE memories SET status='active',authority='confirmed',"
+                "confidence=1.0,updated_at=? WHERE id=? AND owner_id=? "
+                "AND status IN ('pending_review','active')",
+                (_now(), memory_id, owner_id),
+            ).rowcount
+        if not changed:
+            return None
+        self.audit(owner_id, "approve", "memory", memory_id)
+        return self.memory(memory_id)
 
     def delete_memory(self, memory_id: str, owner_id: str) -> bool:
         item = self.memory(memory_id)
@@ -727,14 +820,22 @@ class MemoryStore:
             )
         return self.artifact(artifact_id)
 
-    def enqueue(self, kind: str, payload: dict, *, run_after: float | None = None) -> str:
+    def enqueue(self, kind: str, payload: dict, *, run_after: float | None = None,
+                owner_id: str = "") -> str:
+        """Queue a background job.
+
+        `owner_id` is stamped at ENQUEUE time on purpose: the worker used to
+        read `cfg.owner_id` when the job finally ran, so a job queued under
+        one owner and executed after the owner changed (config edit, profile
+        switch) wrote its results into the wrong owner's registry.
+        """
         job_id, now = _id("job"), _now()
         with self._lock, self._connect() as conn:
             conn.execute(
                 """INSERT INTO jobs
-                   (id,kind,payload_json,run_after,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (job_id, kind, _json(payload), run_after or now, now, now),
+                   (id,kind,payload_json,run_after,owner_id,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (job_id, kind, _json(payload), run_after or now, owner_id, now, now),
             )
         return job_id
 

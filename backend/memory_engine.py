@@ -25,8 +25,23 @@ from .memory_transcript import slice_turn_records
 log = logging.getLogger("muselab.memory")
 
 _MEMORY_KINDS = {"fact", "preference", "decision", "state", "episode", "reflection"}
+# Statuses an import / manual write may legitimately land in. `superseded` and
+# `deleted` are terminal outcomes of a governance action and are deliberately
+# not creatable.
+_MEMORY_STATUSES = {"active", "pending_review"}
+# Credential redaction. The key/value separator must tolerate the quoting that
+# real payloads use — JSON (`"api_key": "sk-…"`), YAML (`api_key: "…"`) and
+# shell (`API_KEY='…'`) — otherwise the closing quote after the key name sits
+# between the key and the `:` and the whole match fails, silently persisting
+# the secret. Quotes are therefore optional on BOTH sides and excluded from the
+# value character class so the match stops at the value's closing quote.
 _SECRET_RE = re.compile(
-    r"(?i)(api[_-]?key|token|password|secret|cookie)\s*[:=]\s*([^\s,;]{6,})")
+    r"""(?ix)
+    (api[_-]?key | access[_-]?token | refresh[_-]?token | auth[_-]?token
+     | token | password | passwd | secret | cookie)
+    ["']?\s*[:=]\s*["']?
+    ([^\s,;"']{6,})["']?
+    """)
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}")
 _TOKEN_RE = re.compile(
@@ -137,12 +152,13 @@ class MemoryEngine:
         self.store.enqueue("reconcile_transcript", {
             "episode_id": episode_id, "user_evidence_id": user_evidence_id,
             "session_id": session_id,
-        })
+        }, owner_id=cfg.owner_id)
         self._wake.set()
         if turns >= cfg.consolidation.episode_turns:
             self.store.update_episode(
                 episode_id, status="closed", ended_at=time.time(), outcome=outcome)
-            self.store.enqueue("consolidate_episode", {"episode_id": episode_id})
+            self.store.enqueue("consolidate_episode", {"episode_id": episode_id},
+                               owner_id=cfg.owner_id)
             self._wake.set()
         return episode_id
 
@@ -171,7 +187,8 @@ class MemoryEngine:
         episode_id, previous_episode_id = await asyncio.to_thread(persist)
         if previous_episode_id:
             self.store.enqueue(
-                "consolidate_episode", {"episode_id": previous_episode_id})
+                "consolidate_episode", {"episode_id": previous_episode_id},
+                owner_id=cfg.owner_id)
             self._wake.set()
         # Cancelled evidence is retained but intentionally never schedules
         # Dreamer or Skill Learner.
@@ -212,11 +229,13 @@ class MemoryEngine:
         episode_id, user_id, previous_episode_id = await asyncio.to_thread(persist)
         if previous_episode_id:
             self.store.enqueue(
-                "consolidate_episode", {"episode_id": previous_episode_id})
+                "consolidate_episode", {"episode_id": previous_episode_id},
+                owner_id=cfg.owner_id)
         self.store.enqueue("reconcile_transcript", {
             "episode_id": episode_id, "user_evidence_id": user_id,
-            "session_id": session_id})
-        self.store.enqueue("consolidate_episode", {"episode_id": episode_id})
+            "session_id": session_id}, owner_id=cfg.owner_id)
+        self.store.enqueue("consolidate_episode", {"episode_id": episode_id},
+                           owner_id=cfg.owner_id)
         self._wake.set()
         return episode_id
 
@@ -234,6 +253,18 @@ class MemoryEngine:
                     pass
                 continue
             error: str | None = None
+            # Owner fence. Jobs carry the owner that enqueued them; the
+            # handlers below resolve everything else from the LIVE config, so
+            # a job that outlives an owner change (config edit / profile
+            # switch) would attribute the old owner's episodes and memories to
+            # the new one. Drop instead of retrying — the payload references
+            # rows the current owner does not own, so no retry can fix it.
+            job_owner = str(job.get("owner_id") or "")
+            if job_owner and job_owner != self.config().owner_id:
+                await asyncio.to_thread(
+                    self.store.finish_job, job["id"],
+                    error=f"dropped: enqueued under owner {job_owner!r}")
+                continue
             try:
                 if job["kind"] == "consolidate_episode":
                     await self._consolidate_episode(job["payload"]["episode_id"])
@@ -249,6 +280,8 @@ class MemoryEngine:
                     await self._index_memory(job["payload"]["memory_id"])
                 elif job["kind"] == "reindex_memories":
                     await self._index_memories(job["payload"].get("memory_ids", []))
+                elif job["kind"] == "unindex_memory":
+                    await self._unindex_memory(job["payload"]["memory_id"])
                 else:
                     raise ValueError(f"unknown memory job: {job['kind']}")
             except asyncio.CancelledError:
@@ -267,7 +300,8 @@ class MemoryEngine:
         episode_ids = await asyncio.to_thread(
             self.store.close_idle_episodes, cfg.owner_id, cutoff=cutoff)
         for episode_id in episode_ids:
-            self.store.enqueue("consolidate_episode", {"episode_id": episode_id})
+            self.store.enqueue("consolidate_episode", {"episode_id": episode_id},
+                               owner_id=cfg.owner_id)
         if episode_ids:
             self._wake.set()
 
@@ -422,7 +456,8 @@ class MemoryEngine:
         threshold = cfg.consolidation.min_reflection_episodes
         if cfg.consolidation.dreamer_enabled and len(consolidated) >= threshold:
             chosen = [item["id"] for item in consolidated[:max(threshold, 5)]]
-            self.store.enqueue("cross_episode_dream", {"episode_ids": chosen})
+            self.store.enqueue("cross_episode_dream", {"episode_ids": chosen},
+                               owner_id=cfg.owner_id)
             self._wake.set()
 
     async def _verify_and_store(self, candidate: dict, episode_id: str,
@@ -540,7 +575,8 @@ class MemoryEngine:
             sources=sources,
         )
         if status == "active":
-            self.store.enqueue("reindex_memory", {"memory_id": memory["id"]})
+            self.store.enqueue("reindex_memory", {"memory_id": memory["id"]},
+                               owner_id=cfg.owner_id)
             self._wake.set()
         return memory
 
@@ -720,7 +756,12 @@ class MemoryEngine:
                 item["id"],
                 vector,
                 {
-                    "owner_id": cfg.owner_id,
+                    # Owner comes from the ROW, not from the live config. A job
+                    # queued before an owner change would otherwise index the
+                    # old owner's memory under the new owner_id, making it
+                    # recallable by the wrong profile — the registry row is the
+                    # source of truth.
+                    "owner_id": item["owner_id"],
                     "status": item["status"],
                     "kind": item["kind"],
                     "authority": item["authority"],
@@ -735,6 +776,20 @@ class MemoryEngine:
             model=cfg.embedding.model,
             dimensions=dimensions,
         )
+
+    async def _unindex_memory(self, memory_id: str) -> None:
+        """Durable retry for a vector delete that failed inline.
+
+        Raising on failure is what makes it retry — finish_job backs off and
+        requeues, so the point is eventually removed instead of lingering in
+        the index after the user deleted the memory.
+        """
+        cfg = self.config()
+        await vector_store(cfg.vector).delete(memory_id)
+        with self.store._lock, self.store._connect() as conn:
+            conn.execute(
+                "UPDATE memories SET embedding_state='pending' WHERE id=?",
+                (memory_id,))
 
     async def recall(self, query: str, session_id: str) -> list[dict]:
         cfg = self.config()
@@ -767,19 +822,30 @@ class MemoryEngine:
                 self.store.lexical_search, cfg.owner_id, query,
                 limit=cfg.retrieval.lexical_candidates)
 
-        status = "ok"
-        try:
+        async def _bounded(channel):
+            """Give each channel its OWN budget against the shared deadline.
+
+            A single `asyncio.timeout` around `gather` cancels BOTH channels
+            the instant the slower one overruns, so a cold embedder (or a
+            down Qdrant) threw away the lexical hits that had already
+            returned in 5ms — hybrid recall degraded to *nothing* instead of
+            to lexical-only. Per-channel bounding keeps whichever channel
+            finished, which is the whole point of fail-soft fusion.
+            """
             async with asyncio.timeout(max(0.001, deadline - time.perf_counter())):
-                dense_rows, lexical_rows = await asyncio.gather(
-                    dense(), lexical(), return_exceptions=True)
-        except TimeoutError:
-            dense_rows, lexical_rows, status = [], [], "timeout"
+                return await channel()
+
+        status = "ok"
+        dense_rows, lexical_rows = await asyncio.gather(
+            _bounded(dense), _bounded(lexical), return_exceptions=True)
         if isinstance(dense_rows, Exception):
-            log.debug("dense recall skipped: %s", dense_rows)
-            dense_rows, status = [], "partial"
+            log.debug("dense recall skipped: %r", dense_rows)
+            dense_rows, status = [], (
+                "timeout" if isinstance(dense_rows, TimeoutError) else "partial")
         if isinstance(lexical_rows, Exception):
-            log.debug("lexical recall skipped: %s", lexical_rows)
-            lexical_rows, status = [], "partial"
+            log.debug("lexical recall skipped: %r", lexical_rows)
+            lexical_rows, status = [], (
+                "timeout" if isinstance(lexical_rows, TimeoutError) else "partial")
 
         fused: dict[str, dict] = {}
         for channel_rows in (dense_rows, lexical_rows):
@@ -860,10 +926,15 @@ class MemoryEngine:
 
     async def add_confirmed_memory(self, kind: str, content: str, *,
                                    tags: list[str] | None = None,
-                                   source: dict | None = None) -> dict:
+                                   source: dict | None = None,
+                                   status: str = "active",
+                                   authority: str = "confirmed",
+                                   confidence: float = 1.0) -> dict:
         cfg = self.config()
         if kind not in _MEMORY_KINDS:
             raise ValueError("unsupported memory kind")
+        if status not in _MEMORY_STATUSES:
+            raise ValueError("unsupported memory status")
         sources = [dict(source)] if source else [{
             "source_type": "user_action", "source_id": "memory_center",
             "relation": "confirmed_by"}]
@@ -872,11 +943,15 @@ class MemoryEngine:
         source_role = sources[0].pop("role", None)
         memory = await asyncio.to_thread(
             self.store.create_memory, cfg.owner_id, kind, content,
-            authority="confirmed", confidence=1.0, status="active", tags=tags or [],
+            authority=authority, confidence=confidence, status=status,
+            tags=tags or [],
             attributes={"source_role": source_role} if source_role else {},
             sources=sources)
-        if cfg.enabled:
-            self.store.enqueue("reindex_memory", {"memory_id": memory["id"]})
+        # Only active rows belong in the vector index; a restored
+        # pending_review / superseded row must not become recallable.
+        if cfg.enabled and status == "active":
+            self.store.enqueue("reindex_memory", {"memory_id": memory["id"]},
+                               owner_id=cfg.owner_id)
             self._wake.set()
         return memory
 
@@ -889,8 +964,12 @@ class MemoryEngine:
             try:
                 await vector_store(cfg.vector).delete(memory_id)
             except Exception as exc:
-                log.debug("old vector deletion deferred: %s", exc)
-            self.store.enqueue("reindex_memory", {"memory_id": memory["id"]})
+                log.warning("old vector deletion queued for retry (%s): %s",
+                            memory_id, exc)
+                self.store.enqueue("unindex_memory", {"memory_id": memory_id},
+                                   owner_id=cfg.owner_id)
+            self.store.enqueue("reindex_memory", {"memory_id": memory["id"]},
+                               owner_id=cfg.owner_id)
             self._wake.set()
         return memory
 
@@ -899,10 +978,20 @@ class MemoryEngine:
         deleted = await asyncio.to_thread(
             self.store.delete_memory, memory_id, cfg.owner_id)
         if deleted and cfg.enabled:
+            # Vector deletion must actually happen, not merely be logged.
+            # Qdrant being briefly unreachable used to leave the point in the
+            # index forever while the registry row read `deleted` — a forgotten
+            # memory that dense recall still returns (recall() filters on the
+            # registry, so it wouldn't surface, but the content stayed on disk
+            # after the user asked for deletion). Queue a durable retry.
             try:
                 await vector_store(cfg.vector).delete(memory_id)
             except Exception as exc:
-                log.debug("vector deletion deferred: %s", exc)
+                log.warning("vector deletion queued for retry (%s): %s",
+                            memory_id, exc)
+                self.store.enqueue("unindex_memory", {"memory_id": memory_id},
+                                   owner_id=cfg.owner_id)
+                self._wake.set()
         return deleted
 
     def status(self) -> dict:
@@ -922,10 +1011,12 @@ class MemoryEngine:
         newly_closed = self.store.close_idle_episodes(
             cfg.owner_id, cutoff=float("inf"))
         for episode_id in newly_closed:
-            self.store.enqueue("consolidate_episode", {"episode_id": episode_id})
+            self.store.enqueue("consolidate_episode", {"episode_id": episode_id},
+                               owner_id=cfg.owner_id)
         episodes = self.store.list_episodes(cfg.owner_id, limit=20, status="closed")
         ids = [item["id"] for item in episodes]
-        job_id = self.store.enqueue("cross_episode_dream", {"episode_ids": ids})
+        job_id = self.store.enqueue("cross_episode_dream", {"episode_ids": ids},
+                                    owner_id=cfg.owner_id)
         self._wake.set()
         return job_id
 
@@ -936,6 +1027,7 @@ class MemoryEngine:
             self.store.enqueue(
                 "reindex_memories",
                 {"memory_ids": [row["id"] for row in rows]},
+                owner_id=cfg.owner_id,
             )
         self._wake.set()
         return len(rows)
