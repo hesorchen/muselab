@@ -11140,6 +11140,15 @@ function portal() {
         || (st._earlierMessages || []).includes(m)
         || (st._laterMessages || []).includes(m));
     },
+    _removePaneMessage(st, m) {
+      if (!st || !m) return false;
+      for (const list of [st.messages, st._earlierMessages, st._laterMessages]) {
+        if (!list) continue;
+        const idx = list.indexOf(m);
+        if (idx >= 0) { list.splice(idx, 1); return true; }
+      }
+      return false;
+    },
     _appendLiveMessage(st, m) {
       this._assignLiveKey(st, m);
       const target = (st._laterMessages && st._laterMessages.length)
@@ -11960,6 +11969,27 @@ function portal() {
     },
 
     async memorySaveMessage(message) {
+      // A reply that is still streaming has only the text rendered so far, and
+      // memories are immutable once written (correcting one costs a supersede).
+      // Saving mid-stream therefore persists a truncated half-sentence as a
+      // "confirmed" memory. Block the whole in-flight turn — every muse-side
+      // bubble after the last user message can still grow. Locate the owning
+      // tab by identity: the same button markup renders in the split pane, whose
+      // session is not necessarily currentId.
+      const st = Object.values(this.tabState || {}).find(
+        s => s && s.streaming && this._containsPaneMessage(s, message));
+      if (st) {
+        const msgs = this._allPaneMessages(st);
+        const idx = msgs.indexOf(message);
+        const lastUserIdx = msgs.map(m => m && m.role).lastIndexOf("user");
+        if (idx >= 0 && idx > lastUserIdx) {
+          this.toast(this.lang === "zh"
+            ? "等回复完成后再保存到记忆"
+            : "Wait for the reply to finish before saving it as memory",
+            "warn", 2000);
+          return;
+        }
+      }
       let content = String(message?.text || "").trim();
       if (!content) return;
       if (content.length > 12000) {
@@ -20510,6 +20540,19 @@ function portal() {
         });
         return tr;
       };
+      // Stop pressed while the ticket POST was still in flight: no backend turn
+      // was ever created, so the optimistic user bubble is a lie — it would sit
+      // in the transcript forever, unanswered and unrecoverable (a reload drops
+      // it because the server never persisted it). Roll the send back to the
+      // composer so the text stays editable and re-sendable.
+      const discardCancelledSend = () => {
+        if (sentUserBubble) {
+          this._removePaneMessage(streamState, sentUserBubble);
+          sentUserBubble = null;
+        }
+        if (ownsSendDraft() && !sendDraft.input) sendDraft.input = composerText;
+        if (sendSid === this.currentId) this._activateComposerState(sendSid);
+      };
       try {
         let tr = await _mintTicket();
         if (tr.status === 404 || tr.status === 405) {
@@ -20536,6 +20579,7 @@ function portal() {
         if (streamState._cancelBeforeStream) {
           // stop() already performed the authoritative local cleanup. The
           // ticket was never consumed, so no backend turn/transcript exists.
+          discardCancelledSend();
           return false;
         }
         // Could not mint a ticket (server error / network) — fail the send
@@ -20551,7 +20595,12 @@ function portal() {
           streamState._streamStartController = null;
         }
       }
-      if (streamState._cancelBeforeStream) return false;
+      if (streamState._cancelBeforeStream) {
+        // Ticket minted but Stop landed first — same rollback. The ticket is
+        // never consumed and expires on its own.
+        discardCancelledSend();
+        return false;
+      }
       const es = new EventSource(url);
       streamState.es = es;
       if (streamSid === this.currentId) this.es = es;

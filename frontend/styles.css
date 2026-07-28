@@ -123,7 +123,6 @@
   --fw-medium: 500;
   --fw-semibold: 600;
   --fw-bold: 700;
-  --c-fg-2: var(--c-fg-2);
   --c-warning: #f59e0b;
   --c-error: #ef4444;
   --c-error-soft: rgba(239, 68, 68, 0.12);
