@@ -10,6 +10,13 @@ def _load(monkeypatch, url="http://127.0.0.1:8800"):
     monkeypatch.setenv("MEM0_DAEMON_URL", url)
     monkeypatch.setenv("MUSELAB_TOKEN", "test-token-1234567890abcdef-secure-min-32")
     monkeypatch.setenv("MUSELAB_ROOT", "/tmp")
+    # enabled() is true when EITHER the legacy daemon URL or the native engine
+    # is live, and memory_dir() honours this override ahead of ROOT. On a host
+    # where the deployment exports it (run-local points it at
+    # .memory-runtime/data), the "no daemon URL ⇒ disabled" cases below read the
+    # real, enabled registry instead. Clear it so these tests only exercise the
+    # daemon-URL validation they are about. See the same note in conftest.
+    monkeypatch.delenv("MUSELAB_MEMORY_DIR", raising=False)
     import backend.settings as settings
     importlib.reload(settings)
     import backend.memory_client as mc

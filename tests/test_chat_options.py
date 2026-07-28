@@ -17,6 +17,12 @@ def _capture_build_options(chat_mod, monkeypatch):
 
     monkeypatch.setattr(chat_mod, "ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr(chat_mod, "ClaudeSDKClient", FakeClient)
+    # Third-party models take the compatibility subclass, NOT ClaudeSDKClient
+    # (see _build_and_connect_client). Patching only the latter left the real
+    # SDK client in the third-party tests, and its connect() reads concrete
+    # ClaudeAgentOptions attributes (session_store, can_use_tool, …) that a
+    # kwargs-capturing stub doesn't have → AttributeError. Stub both so these
+    # tests keep asserting on the OPTIONS we build, not on SDK internals.
     monkeypatch.setattr(chat_mod, "UnsignedThinkingCompatibleClient", FakeClient)
     monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda sid: None)
     return captured
