@@ -30,6 +30,53 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def test_directory_can_be_mentioned_from_search_and_tree_action(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const created = await fetch('/api/files/mkdir', {
+            method: 'POST',
+            headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+            body: JSON.stringify({path: 'mention-folder'}),
+          });
+          if (!created.ok) throw new Error(await created.text());
+
+          await app.fetchMention('mention-folder');
+          const directory = app.mentionResults.find(
+            item => item.path === 'mention-folder'
+          );
+          if (!directory) return {found: false};
+
+          app.input = '查看 @mention-folder';
+          app.mentionAnchor = app.input.lastIndexOf('@');
+          const input = app.$refs.chatInput;
+          input.value = app.input;
+          input.setSelectionRange(app.input.length, app.input.length);
+          app.pickMention(app.mentionResults.indexOf(directory));
+          await new Promise(resolve => app.$nextTick(resolve));
+          const pickerInput = app.input;
+
+          app.input = '';
+          app.ctxMenu = {show: true, x: 0, y: 0, node: directory, multi: 0};
+          await app.ctxAction('mention');
+          return {
+            found: true,
+            isDir: directory.is_dir,
+            pickerInput,
+            treeInput: app.input,
+          };
+        }"""
+    )
+    assert result == {
+        "found": True,
+        "isDir": True,
+        "pickerInput": "查看 @mention-folder/ ",
+        "treeInput": "@mention-folder/ ",
+    }
+
+
 def test_external_file_changes_refresh_tree_without_manual_reload(
         page: Page, backend_url, auth_token):
     """Direct API mutations stand in for Agent/terminal writes and deletes."""
