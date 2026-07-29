@@ -24,6 +24,7 @@ muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 | `MUSELAB_MODEL` | 新会话默认模型；未设置时使用内置 Claude 默认值 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | 设置面板保存的默认模型，与 `MUSELAB_MODEL` 同步 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_PERMISSION` | 新会话默认 SDK 权限模式 | `bypassPermissions` |
+| `MUSELAB_MEMORY_DIR` | 可选的长期记忆 Registry／配置目录 | `$MUSELAB_ROOT/.muselab/memory` |
 
 `MUSELAB_ROOT` 必须存在。`/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等系统级根路径会被拒绝；用户自己的 home 或其子目录可以使用。
 
@@ -57,6 +58,13 @@ Claude 可使用 `claude login` 或 `ANTHROPIC_API_KEY`。内置 Anthropic-compa
 MiniMax 国内与国际 key 不通用；Qwen 两个区域分组共用 key、使用不同 endpoint。模型与分组会随版本变化，设置面板和 `/api/chat/providers` 是当前事实来源。
 
 设置面板对内置 provider 的修改、自定义 provider 和删除状态保存在 `<repo>/provider_overrides.json`。MCP server 配置保存在 `<repo>/mcp.json`。自定义 provider key 使用 `MUSELAB_PROVIDER_<SLUG>_API_KEY`。
+
+## 长期记忆
+
+长期记忆默认关闭，结构化配置保存在
+`$MUSELAB_MEMORY_DIR/config.json`（默认 `$MUSELAB_ROOT/.muselab/memory/config.json`）。
+Embedding、向量库和 reranker 凭据不写入 `.env`，设置页读取时也不会回传明文。
+完整配置、运行模式和备份要求见[长期记忆](memory_zh.md)。
 
 ## 生图
 

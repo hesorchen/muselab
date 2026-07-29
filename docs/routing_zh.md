@@ -88,7 +88,7 @@ ticket 有效期 60 秒且首次使用即销毁。prompt、附件参数和长期
 
 进行中的回合保存在内存活动表。刚结束的回合默认再保留 60 秒，可用 `MUSELAB_RECENT_TURN_TTL` 调整，以便队列自动启动的快速回合仍可被晚到的浏览器接上。过期后关闭并删除临时 spool。
 
-后台回合硬超时为 30 分钟。显式中断会标记回合为取消，并暂停仍有内容的服务端队列。
+后台回合硬超时为 30 分钟。显式中断会标记回合为取消，并暂停仍有内容的服务端队列。Stop 同时覆盖流建立前的阶段：浏览器会取消尚未消费的 ticket 请求，服务端会取消冷启动 client；对于已经运行的 SDK client，则先给一个很短的优雅中断窗口，随后强制清理。
 
 ## 重连与跨设备状态
 
@@ -119,6 +119,8 @@ Activity Center 把每个会话的当前状态持久化在 `$MUSELAB_ROOT/.musel
 - `effort` 按会话保存，也是客户端缓存键的一部分；有效值为 `low`、`medium`、`high`、`xhigh`、`max`，空值使用 SDK 默认。
 - 扩展思考预算默认 10,000 token，可用 `MUSELAB_THINKING_BUDGET` 调整。
 - provider 是否显示 effort、是否支持 thinking，以 `/api/chat/providers` 返回的能力为准。
+- 部分 Anthropic 兼容 provider 会省略 thinking 块必需的 `signature` 键。第三方路由会在内存解析副本中以空串占位，让 SDK 流能够走完，随后从持久化 JSONL 中删除无法验证的 thinking 块。原生 Claude 路由仍使用 SDK 严格解析；muselab 不会伪造有效签名。
+- 如果池化 SDK 流仍然意外终止，muselab 会逐出对应的精确 client、把当前回合显示为 SSE 错误，并在下一次发送时重建运行时；缓存快速路径不会再返回已经死亡的 CLI 子进程。
 
 ```mermaid
 sequenceDiagram

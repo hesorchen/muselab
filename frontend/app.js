@@ -383,6 +383,9 @@ function portal() {
     PREVIEW_FIND_MAX_MATCHES: 500,
     _previewLoadSeq: 0,
     _previewAbort: null,
+    // Path-bound, short-lived credentials for script-capable HTML iframes.
+    // Kept in memory only; never persisted alongside the long-lived API token.
+    _previewTickets: {},
     _previewViewSaveTimer: null,
     _previewViewRestoreTimers: [],
     _previewRestoringPath: "",
@@ -971,6 +974,30 @@ function portal() {
       skills: [],         // discovered skill list (read-only browse)
       skillFilter: "",    // free-text filter (name / description / source)
       probeResults: {},   // env_key -> {ok, text} from last "Test" click
+      // Provider-neutral long-term memory.  The registry and Review Center
+      // are visible even while memory is off; external embedding/vector
+      // services are touched only by an explicit probe or an enabled config.
+      memory: {
+        loading: false, saving: false, probing: false, actionRunning: false,
+        config: {
+          schema_version: 1, mode: "off", owner_id: "default",
+          generation_model: "",
+          embedding: { provider: "openai_compatible", base_url: "", api_key: "",
+            model: "", dimensions: null, timeout_seconds: 10, batch_size: 32 },
+          vector: { provider: "qdrant", url: "", api_key: "",
+            collection: "muselab_memory_v1", timeout_seconds: 10 },
+          rerank: { enabled: false, base_url: "", api_key: "",
+            model: "", timeout_seconds: 3 },
+          retrieval: { dense_candidates: 20, lexical_candidates: 20,
+            final_limit: 6, max_context_chars: 3000, soft_timeout_ms: 250 },
+          consolidation: { episode_turns: 6, episode_idle_minutes: 30,
+            dreamer_enabled: true, verifier_enabled: true,
+            skill_learning_enabled: true, min_reflection_episodes: 2,
+            min_skill_success_episodes: 3 },
+        },
+        status: null, probeResult: null, tab: "items", items: [],
+        selected: null, query: "", kind: "", itemStatus: "",
+      },
       // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
       versions: null,
       versionsLoading: false,
@@ -983,6 +1010,8 @@ function portal() {
       // section is always rendered, the menu list is CSS-hidden).
       activePage: null,
     },
+    _memoryMonitorTimer: null,
+    _memoryMonitorEnabled: null,
     // Cost dashboard state — lazily loaded when the user opens the
     // Settings → Cost section. Lives outside `settings` so it survives
     // settings modal close/open without refetching unless user clicks
@@ -1341,9 +1370,16 @@ function portal() {
           this.previewImmersive = false;
           document.body.classList.remove("preview-immersive");
         }
-        if (t === "files") this.$nextTick(() => this._flushFileTreeDirty());
+        this.$nextTick(() => {
+          if (t === "files") this._flushFileTreeDirty();
+          this._startFileEvents();
+        });
         this.savePrefs();
       });
+      // Native file watches are needed only while the file tree is visible.
+      // Keep their lifecycle tied to every desktop layout transition too.
+      this.$watch("leftOpen", () => this.$nextTick(() => this._startFileEvents()));
+      this.$watch("desktopFullPane", () => this.$nextTick(() => this._startFileEvents()));
 
       // ============================================================
       // Document-level OS-file-drag detection
@@ -1913,6 +1949,7 @@ function portal() {
       this._startSessionsSync();
       this._startFileEvents();
       this.fetchActivity();
+      this._startMemoryMonitor();
       // Restoring a saved current session means the user is already looking at
       // it; clear any completion that landed before this page loaded.
       this.ackCurrentActivity();
@@ -4000,6 +4037,18 @@ function portal() {
       return out;
     },
 
+    _mdCacheDelete(text) {
+      const cache = this._mdCache;
+      if (!cache || !cache.has(text)) return;
+      const out = cache.get(text);
+      this._mdCacheBytes = Math.max(
+        0,
+        (this._mdCacheBytes || 0)
+          - (text.length + (out ? out.length : 0)) * 2,
+      );
+      cache.delete(text);
+    },
+
     // YAML frontmatter (`---\n…\n---` at the very top of a file) is metadata,
     // not body. marked renders it as a stray <hr> plus a giant Setext <h2>
     // (the closing `---` underlines the preceding paragraph), so SKILL.md /
@@ -4212,14 +4261,14 @@ function portal() {
       if (Array.isArray(this.messages)) {
         for (const m of this.messages) {
           if (m && typeof m.text === "string" && m.html && RE.test(m.text)) {
-            if (this._mdCache) this._mdCache.delete(m.text);  // drop stale (raw-$$) cache entry
+            this._mdCacheDelete(m.text);  // drop stale (raw-$$) cache entry
             m.html = this.mdRender(m.text);
           }
         }
       }
       // Markdown file-preview pane keeps its own rendered string.
       if (typeof this.rawText === "string" && this.previewMode === "md" && RE.test(this.rawText)) {
-        this._mdCache && this._mdCache.delete(this.rawText);
+        this._mdCacheDelete(this.rawText);
         this.renderedMd = this._renderPreviewMd(this.rawText);
       }
     },
@@ -5620,6 +5669,11 @@ function portal() {
         es: null,
         // Deduplicate stop taps while the interrupt request is in flight.
         _stopping: false,
+        // Abort the POST /stream/start ticket request when Stop is clicked
+        // before EventSource exists. Without this, the backend has no active
+        // turn/client to interrupt yet and the reply starts after Stop.
+        _streamStartController: null,
+        _cancelBeforeStream: false,
         streamingModel: "",
         streamElapsed: 0,
         _streamTimer: null,
@@ -5815,6 +5869,24 @@ function portal() {
       const previous = this.mobileTab;
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
+      const tabSeq = this._mobileTabSeq = (this._mobileTabSeq || 0) + 1;
+      // A hidden `display:none` chat pane has no retained layout tree. Showing
+      // a rich history therefore makes the phone synchronously style/layout
+      // every mounted bubble before it can paint the tab change. Keep the
+      // bubbles behind the lightweight skeleton for one painted frame, then
+      // reveal them. This path is distinct from switchSession(): tapping the
+      // bottom Chat tab can reveal the already-current session without ever
+      // switching sessions, which used to bypass the existing protection.
+      const chatState = next === "chat" && this.currentId
+        ? this.tabState && this.tabState[this.currentId] : null;
+      const chatLen = (chatState && chatState.messages && chatState.messages.length) || 0;
+      // Even one envelope may contain a very large tool result or diff, so
+      // message count alone is not a safe complexity proxy on this reveal path.
+      const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
+      if (deferChat) {
+        chatState.messagesReady = false;
+        this.messagesReady = false;
+      }
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
         this._cancelPreviewViewRestore();
@@ -5826,6 +5898,21 @@ function portal() {
         this._restorePreviewViewState(ownerPath, ownerLoadSeq);
       }
       this.mobileTab = next;
+      if (deferChat) {
+        const target = this.currentId;
+        this._afterPaint(() => {
+          if (this._mobileTabSeq !== tabSeq || this.mobileTab !== "chat"
+              || this.currentId !== target || this.tabState[target] !== chatState) return;
+          chatState.messagesReady = true;
+          this.messagesReady = true;
+          this._afterPaint(() => {
+            if (this._mobileTabSeq === tabSeq && this.mobileTab === "chat"
+                && this.currentId === target) {
+              this._restoreChatPosition(target);
+            }
+          });
+        });
+      }
       if (next === "preview" && previous !== "preview" && ownerPath) {
         this.$nextTick(() => requestAnimationFrame(() => {
           if (this.mobileTab === "preview" && this.selected === ownerPath
@@ -7553,12 +7640,17 @@ function portal() {
         }
         const ownedEs = st.es;
         if (ownedEs) { try { ownedEs.close(); } catch {} }
+        if (st._streamStartController) {
+          try { st._streamStartController.abort(); } catch {}
+        }
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
         if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
         st.es = null;
+        st._streamStartController = null;
+        st._cancelBeforeStream = false;
         st.streaming = false;
         st.backgroundActive = false;
         st.backgroundTaskCount = 0;
@@ -10258,7 +10350,9 @@ function portal() {
         // suppressed during it, so the default cap is cheap in the common case
         // while still landing correctly on tall histories.
         const settle = () => this._restoreChatPosition(target);
-        if (this._isMobileLayout() && histLen > 60 && shouldFollow) {
+        if (this._isMobileLayout()
+            && histLen >= Math.ceil(this._mountedMessageCap() / 2)
+            && shouldFollow) {
           stCur.messagesReady = false;
           this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
           this._afterPaint(() => {
@@ -11046,6 +11140,15 @@ function portal() {
         || (st._earlierMessages || []).includes(m)
         || (st._laterMessages || []).includes(m));
     },
+    _removePaneMessage(st, m) {
+      if (!st || !m) return false;
+      for (const list of [st.messages, st._earlierMessages, st._laterMessages]) {
+        if (!list) continue;
+        const idx = list.indexOf(m);
+        if (idx >= 0) { list.splice(idx, 1); return true; }
+      }
+      return false;
+    },
     _appendLiveMessage(st, m) {
       this._assignLiveKey(st, m);
       const target = (st._laterMessages && st._laterMessages.length)
@@ -11055,7 +11158,12 @@ function portal() {
       this._capHistoryCache(st);
       return target[target.length - 1];
     },
-    _mountedMessageCap() { return this._isMobileLayout() ? 60 : 300; },
+    // Keep the phone DOM deliberately small. Rich tool/diff/code bubbles can
+    // expand into hundreds of descendants each; 60 envelopes was still enough
+    // to exhaust a mobile WebView during a display:none → flex reveal. Evicted
+    // envelopes stay in the bounded history cache and remain reachable through
+    // "Load earlier", so this is windowing rather than data loss.
+    _mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; },
     _historyCacheCap() { return this._isMobileLayout() ? 120 : 800; },
     _capMountedWindow(st, direction = "newer", anchorUuid = "") {
       const cap = this._mountedMessageCap();
@@ -11677,6 +11785,360 @@ function portal() {
       this.refreshMcpList();
       this.refreshSkillList();
       this.loadClaudeAuthStatus();
+      this.loadMemorySettings();
+    },
+
+    _memoryConfigPayload() {
+      const cfg = JSON.parse(JSON.stringify(this.settings.memory.config || {}));
+      delete cfg.enabled;
+      for (const name of ["embedding", "vector", "rerank"]) {
+        if (cfg[name]) delete cfg[name].has_api_key;
+      }
+      if (cfg.vector) delete cfg.vector.has_url;
+      if (cfg.embedding && cfg.embedding.dimensions === "") cfg.embedding.dimensions = null;
+      return cfg;
+    },
+
+    _startMemoryMonitor() {
+      if (this._memoryMonitorTimer) clearInterval(this._memoryMonitorTimer);
+      this._pollMemoryReview();
+      this._memoryMonitorTimer = setInterval(() => this._pollMemoryReview(), 60000);
+    },
+
+    async _pollMemoryReview() {
+      try {
+        if (this._memoryMonitorEnabled == null) {
+          const cfgR = await fetch("/api/memory/config", {
+            headers: this.hdr(), cache: "no-store",
+          });
+          if (!cfgR.ok) return;
+          this._memoryMonitorEnabled = (await cfgR.json()).mode !== "off";
+        }
+        if (!this._memoryMonitorEnabled) return;
+        const r = await fetch("/api/memory/status", {
+          headers: this.hdr(), cache: "no-store",
+        });
+        if (!r.ok) return;
+        const status = await r.json();
+        this.settings.memory.status = status;
+        const ids = status.pending_artifact_ids || [];
+        let seen = [];
+        try { seen = JSON.parse(localStorage.getItem("muselab_memory_artifacts_seen") || "[]"); }
+        catch (_) { seen = []; }
+        const unseen = ids.filter(id => !seen.includes(id));
+        if (unseen.length) {
+          this.toast(
+            this.lang === "zh"
+              ? `发现 ${unseen.length} 个新的 Skill 候选，等待你审核`
+              : `${unseen.length} new Skill candidate(s) await review`,
+            "info", 8000, {
+              label: this.lang === "zh" ? "打开记忆中心" : "Open Memory Center",
+              onClick: async () => {
+                await this.openSettings();
+                this.settings.activePage = "memory";
+                this.settings.memory.tab = "skills";
+                await this.refreshMemoryCenter();
+              },
+            });
+          const merged = [...new Set([...seen, ...unseen])].slice(-100);
+          this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
+        }
+      } catch (_) { /* optional and fail-soft */ }
+    },
+
+    async loadMemorySettings() {
+      const mem = this.settings.memory;
+      mem.loading = true;
+      try {
+        const [cfgR, statusR] = await Promise.all([
+          fetch("/api/memory/config", { headers: this.hdr(), cache: "no-store" }),
+          fetch("/api/memory/status", { headers: this.hdr(), cache: "no-store" }),
+        ]);
+        if (!cfgR.ok || !statusR.ok) throw new Error(`HTTP ${cfgR.status}/${statusR.status}`);
+        mem.config = await cfgR.json();
+        mem.status = await statusR.json();
+        await this.refreshMemoryCenter();
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "记忆设置加载失败：" : "Memory settings failed: ")
+          + (e.message || e), "error");
+      } finally {
+        mem.loading = false;
+      }
+    },
+
+    async probeMemory() {
+      const mem = this.settings.memory;
+      mem.probing = true; mem.probeResult = null;
+      try {
+        const r = await fetch("/api/memory/probe", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(this._memoryConfigPayload()),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+        mem.probeResult = d;
+        this.toast(this.lang === "zh" ? "记忆环境检查通过" : "Memory environment is healthy",
+          "success");
+      } catch (e) {
+        mem.probeResult = { ok: false, error: e.message || String(e) };
+        this.toast((this.lang === "zh" ? "检查失败：" : "Probe failed: ")
+          + (e.message || e), "error", 5000);
+      } finally {
+        mem.probing = false;
+      }
+    },
+
+    async saveMemorySettings() {
+      const mem = this.settings.memory;
+      mem.saving = true;
+      try {
+        const r = await fetch("/api/memory/config?probe=true", {
+          method: "PUT",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(this._memoryConfigPayload()),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+        mem.config = d.config; mem.status = d.status;
+        this._memoryMonitorEnabled = d.config.mode !== "off";
+        this._startMemoryMonitor();
+        this.toast(this.lang === "zh" ? "记忆设置已保存" : "Memory settings saved",
+          "success");
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "保存失败：" : "Save failed: ")
+          + (e.message || e), "error", 6000);
+      } finally {
+        mem.saving = false;
+      }
+    },
+
+    async refreshMemoryCenter() {
+      const mem = this.settings.memory;
+      let url = "/api/memory/items?limit=200";
+      if (mem.tab === "episodes") url = "/api/memory/episodes?limit=200";
+      else if (mem.tab === "reflections") url = "/api/memory/artifacts?kind=reflection_run&limit=200";
+      else if (mem.tab === "skills") url = "/api/memory/artifacts?kind=skill_candidate&limit=200";
+      else if (mem.tab === "jobs") url = "/api/memory/jobs?limit=200";
+      else if (mem.tab === "recalls") url = "/api/memory/recalls?limit=200";
+      else if (mem.tab === "audit") url = "/api/memory/audit?limit=200";
+      if (mem.tab === "items") {
+        const qs = new URLSearchParams({ limit: "200" });
+        if (mem.query) qs.set("q", mem.query);
+        if (mem.kind) qs.set("kind", mem.kind);
+        if (mem.itemStatus) qs.set("status", mem.itemStatus);
+        url = "/api/memory/items?" + qs.toString();
+      }
+      try {
+        const r = await fetch(url, { headers: this.hdr(), cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        mem.items = (await r.json()).items || [];
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "记忆中心加载失败：" : "Memory Center failed: ")
+          + (e.message || e), "error");
+      }
+    },
+
+    async loadMemoryDetail(item) {
+      if (this.settings.memory.tab !== "episodes" || item._details) return;
+      const r = await fetch(`/api/memory/episodes/${encodeURIComponent(item.id)}`, {
+        headers: this.hdr(), cache: "no-store",
+      });
+      if (r.ok) item._details = await r.json();
+    },
+
+    async memoryAdd() {
+      const content = await this.prompt({
+        title: this.lang === "zh" ? "新增确认记忆" : "Add confirmed memory",
+        body: this.lang === "zh"
+          ? "这条内容由你明确确认，权威级别高于后台推断。"
+          : "This is explicitly confirmed and outranks inferred memories.",
+      });
+      if (!content || !content.trim()) return;
+      const r = await fetch("/api/memory/items", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "fact", content: content.trim(), tags: [] }),
+      });
+      if (!r.ok) {
+        this.toast(await r.text(), "error"); return;
+      }
+      this.toast(this.lang === "zh" ? "已保存为确认记忆" : "Confirmed memory saved",
+        "success");
+      await this.refreshMemoryCenter();
+    },
+
+    async memorySaveMessage(message) {
+      // A reply that is still streaming has only the text rendered so far, and
+      // memories are immutable once written (correcting one costs a supersede).
+      // Saving mid-stream therefore persists a truncated half-sentence as a
+      // "confirmed" memory. Block the whole in-flight turn — every muse-side
+      // bubble after the last user message can still grow. Locate the owning
+      // tab by identity: the same button markup renders in the split pane, whose
+      // session is not necessarily currentId.
+      const st = Object.values(this.tabState || {}).find(
+        s => s && s.streaming && this._containsPaneMessage(s, message));
+      if (st) {
+        const msgs = this._allPaneMessages(st);
+        const idx = msgs.indexOf(message);
+        const lastUserIdx = msgs.map(m => m && m.role).lastIndexOf("user");
+        if (idx >= 0 && idx > lastUserIdx) {
+          this.toast(this.lang === "zh"
+            ? "等回复完成后再保存到记忆"
+            : "Wait for the reply to finish before saving it as memory",
+            "warn", 2000);
+          return;
+        }
+      }
+      let content = String(message?.text || "").trim();
+      if (!content) return;
+      if (content.length > 12000) {
+        content = await this.prompt({
+          title: this.lang === "zh" ? "提炼后保存" : "Trim before saving",
+          body: this.lang === "zh"
+            ? "原消息较长，请保留真正希望长期记住的部分。"
+            : "The message is long. Keep only what should become durable memory.",
+          value: content.slice(0, 12000),
+        });
+        if (!content) return;
+      }
+      const r = await fetch("/api/memory/items", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: message.role === "assistant" ? "decision" : "fact",
+          content, tags: ["saved-from-chat"],
+          source_session_id: this.currentId || null,
+          source_message_id: message.uuid || message._k || null,
+          source_role: message.role || null,
+        }),
+      });
+      if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      message._memorySaved = true;
+      this.toast(this.lang === "zh" ? "已明确保存到记忆中心" : "Saved to Memory Center",
+        "success");
+    },
+
+    async memoryCorrect(item) {
+      const content = await this.prompt({
+        title: this.lang === "zh" ? "更正记忆" : "Correct memory",
+        value: item.content || "",
+      });
+      if (!content || content.trim() === (item.content || "").trim()) return;
+      const r = await fetch(`/api/memory/items/${encodeURIComponent(item.id)}/correct`, {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ content: content.trim(), kind: item.kind }),
+      });
+      if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      this.toast(this.lang === "zh" ? "记忆已更正，旧版本已保留为被替代"
+        : "Memory corrected; the old version is retained as superseded", "success");
+      await this.refreshMemoryCenter();
+    },
+
+    async memoryApprove(item) {
+      const r = await fetch(`/api/memory/items/${encodeURIComponent(item.id)}/approve`, {
+        method: "POST", headers: this.hdr(),
+      });
+      if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      await this.refreshMemoryCenter();
+    },
+
+    async memoryForget(item) {
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "忘记这条记忆？" : "Forget this memory?",
+        body: item.content || "", danger: true,
+      });
+      if (!ok) return;
+      const r = await fetch(`/api/memory/items/${encodeURIComponent(item.id)}`, {
+        method: "DELETE", headers: this.hdr(),
+      });
+      if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      this.toast(this.lang === "zh" ? "已删除并从向量索引清理" : "Deleted from registry and index",
+        "success");
+      await this.refreshMemoryCenter();
+    },
+
+    async memoryFeedback(item, useful, recallId) {
+      const r = await fetch(
+        `/api/memory/items/${encodeURIComponent(item.id)}/feedback`, {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ useful: !!useful, recall_id: recallId || null }),
+        });
+      if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      item._feedback = useful ? "up" : "down";
+      this.toast(this.lang === "zh" ? "已记录，将影响后续召回排序"
+        : "Feedback recorded for future ranking", "success");
+    },
+
+    async memorySkillAction(item, action) {
+      const verb = action === "approve"
+        ? (this.lang === "zh" ? "批准并启用这个 Skill？" : "Approve and activate this skill?")
+        : action === "disable"
+          ? (this.lang === "zh" ? "停用这个 Skill？" : "Disable this skill?")
+          : (this.lang === "zh" ? "拒绝这个 Skill 候选？" : "Reject this skill candidate?");
+      const ok = await this.confirm({ title: verb,
+        body: this.lang === "zh"
+          ? "只有批准操作会写入 SDK 可发现目录；后台任务本身没有启用权限。"
+          : "Only approval writes to the SDK-discoverable directory.",
+        danger: action !== "approve" });
+      if (!ok) return;
+      const r = await fetch(
+        `/api/memory/skills/${encodeURIComponent(item.id)}/${action}`, {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: action === "approve"
+            ? JSON.stringify({ markdown: item._skillDraft || null }) : "{}",
+        });
+      if (!r.ok) { this.toast(await r.text(), "error"); return; }
+      this.toast(action === "approve"
+        ? (this.lang === "zh" ? "Skill 已批准并启用" : "Skill approved and activated")
+        : action === "disable"
+          ? (this.lang === "zh" ? "Skill 已停用并移出发现目录" : "Skill disabled and undiscoverable")
+          : (this.lang === "zh" ? "候选已拒绝" : "Candidate rejected"), "success");
+      await this.refreshMemoryCenter();
+    },
+
+    async memoryRunAction(action) {
+      const mem = this.settings.memory;
+      mem.actionRunning = true;
+      try {
+        const r = await fetch(`/api/memory/${action}`, {
+          method: "POST", headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        this.toast(action === "dream"
+          ? (this.lang === "zh" ? "跨会话反思任务已排队" : "Dream job queued")
+          : (this.lang === "zh" ? "重建索引任务已排队" : "Reindex jobs queued"), "success");
+        await this.refreshMemoryCenter();
+      } catch (e) {
+        this.toast(e.message || String(e), "error");
+      } finally {
+        mem.actionRunning = false;
+      }
+    },
+
+    async importLegacyMem0() {
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "导入旧 Mem0 记忆？" : "Import legacy Mem0 memories?",
+        body: this.lang === "zh"
+          ? "旧记忆缺少原始来源，将以低置信度「待审核」状态导入，不会直接影响召回。"
+          : "Legacy items lack provenance, so they are imported as low-confidence pending review.",
+      });
+      if (!ok) return;
+      const r = await fetch("/api/memory/import/mem0", {
+        method: "POST", headers: this.hdr(),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        this.toast(d.detail || `HTTP ${r.status}`, "error", 5000); return;
+      }
+      this.toast(this.lang === "zh"
+        ? `找到 ${d.found} 条，新增 ${d.created} 条待审核记忆`
+        : `Found ${d.found}; imported ${d.created} for review`, "success");
+      this.settings.memory.tab = "items";
+      await this.refreshMemoryCenter();
     },
 
     // ===== Claude Auth methods =====
@@ -12763,18 +13225,43 @@ function portal() {
       this._fileEventsTimer = null;
       if (markDirty) this._fileTreeDirty = true;
     },
-    _startFileEvents() {
+    _fileCapabilities() {
+      if (!this._fileCapabilitiesPromise) {
+        this._fileCapabilitiesPromise = import(
+          "/static/modules/file-capabilities.mjs"
+        ).catch(error => {
+          this._fileCapabilitiesPromise = null;
+          throw error;
+        });
+      }
+      return this._fileCapabilitiesPromise;
+    },
+    async _startFileEvents() {
       const workspace = this.fileWorkspacePath();
       if (!this.token || !workspace || typeof EventSource === "undefined") return;
-      if (typeof document !== "undefined"
-          && document.visibilityState !== "visible") {
+      if (!this._fileTreeIsVisible()) {
+        this._stopFileEvents(true);
         this._fileTreeDirty = true;
         return;
       }
       if (this._fileEvents && this._fileEventsWorkspace === workspace) return;
       this._stopFileEvents(false);
       const seq = ++this._fileEventsSeq;
-      const params = new URLSearchParams({ token: this.token, workspace });
+      let ticket;
+      try {
+        const capabilities = await this._fileCapabilities();
+        ticket = await capabilities.mintTicket(
+          "/api/files/events-ticket",
+          this.fileHdr(),
+        );
+      } catch (_) {
+        if (seq === this._fileEventsSeq && this._fileTreeIsVisible()) {
+          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+        }
+        return;
+      }
+      if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket) return;
+      const params = new URLSearchParams({ ticket, workspace });
       const es = new EventSource(`/api/files/events?${params.toString()}`);
       this._fileEvents = es;
       this._fileEventsWorkspace = workspace;
@@ -12799,9 +13286,13 @@ function portal() {
       });
       es.onerror = () => {
         if (!owns()) return;
-        // EventSource reconnects itself. Mark the tree dirty because changes
-        // can land in the disconnect gap; the next `ready` re-baselines once.
+        // Tickets are single-use, so close the native retry and mint a fresh
+        // credential for a controlled reconnect.
         this._fileTreeDirty = true;
+        try { es.close(); } catch (_) {}
+        this._fileEvents = null;
+        this._fileEventsWorkspace = "";
+        this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
       };
       if (!this._fileEventsVisibilityBound) {
         this._fileEventsVisibilityBound = true;
@@ -13581,7 +14072,7 @@ function portal() {
           if (!n.is_dir) await this.doCopyAsBak(n);
           break;
         case "download":
-          if (!n.is_dir) window.open(this.downloadUrl(n.path), "_blank");
+          if (!n.is_dir) await this.downloadFile(n.path);
           break;
         case "rename":
           await this.doRename(n);
@@ -14259,6 +14750,7 @@ function portal() {
       if (next.length >= this.HTML_PREVIEW_CACHE_MAX) {
         const oldest = next.reduce((a, b) => a.lastUsed <= b.lastUsed ? a : b);
         next = next.filter(entry => entry.path !== oldest.path);
+        this._dropPreviewTicket(oldest.path);
       }
       this.htmlPreviewFrames = [...next, { path, lastUsed }];
       return false;
@@ -14266,6 +14758,11 @@ function portal() {
     _dropHtmlPreviewFramesUnder(roots) {
       const list = (roots || []).filter(Boolean);
       if (!list.length || !this.htmlPreviewFrames.length) return;
+      for (const entry of this.htmlPreviewFrames) {
+        if (list.some(root => this._pathAtOrBelow(entry.path, root))) {
+          this._dropPreviewTicket(entry.path);
+        }
+      }
       this.htmlPreviewFrames = this.htmlPreviewFrames.filter(entry =>
         !list.some(root => this._pathAtOrBelow(entry.path, root)));
     },
@@ -15726,7 +16223,15 @@ function portal() {
           loadOk = false;
         }
       } else if (["html", "htm"].includes(ext)) {
-        // Render via sandboxed iframe (backend sends strict CSP + sandbox token).
+        // Mint a file/workspace-bound credential before mounting the sandboxed
+        // iframe. A previewed script can read its own location.search, so the
+        // long-lived API token must never appear in this URL.
+        const hasResidentFrame = this.htmlPreviewFrames.some(
+          entry => entry.path === n.path);
+        if (!hasResidentFrame || opts.forceReload) {
+          await this._mintPreviewTicket(n.path, controller.signal);
+          if (_stale()) return false;
+        }
         reusedHtmlFrame = this._touchHtmlPreviewFrame(n.path);
         this.previewMode = "html";
       }
@@ -16049,6 +16554,7 @@ function portal() {
       this._htmlPreviewFramePosition = null;
       this.htmlPreviewFrames = [];
       this._htmlPreviewFrameClock = 0;
+      this._previewTickets = {};
       this._cancelPreviewViewRestore();
       this._previewAbort = null;
       this._csvAbort = null;
@@ -16129,6 +16635,33 @@ function portal() {
       this.savePrefs();
     },
 
+    _previewTicketKey(p) {
+      return `${this.fileWorkspacePath()}\u001f${p || ""}`;
+    },
+    _dropPreviewTicket(p) {
+      const key = this._previewTicketKey(p);
+      if (!this._previewTickets || !this._previewTickets[key]) return;
+      const next = { ...this._previewTickets };
+      delete next[key];
+      this._previewTickets = next;
+    },
+    async _mintPreviewTicket(p, signal = undefined) {
+      const r = await fetch("/api/files/preview-ticket", {
+        method: "POST",
+        headers: { ...this.fileHdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ path: p }),
+        signal,
+      });
+      if (!r.ok) throw new Error(`preview ticket failed (${r.status})`);
+      const data = await r.json();
+      if (!data || !data.ticket) throw new Error("preview ticket missing");
+      const key = this._previewTicketKey(p);
+      this._previewTickets = {
+        ...(this._previewTickets || {}),
+        [key]: data.ticket,
+      };
+      return data.ticket;
+    },
     rawUrl(p, opts = {}) {
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
       // Iframe/img/pdf/anchor requests cannot attach our custom workspace
@@ -16139,6 +16672,14 @@ function portal() {
       // HTML (see files.py). Only the html preview iframe passes it; images /
       // pdf / downloads stream untouched.
       const pv = opts.preview ? "&preview=1" : "";
+      if (opts.preview) {
+        const ticket = (this._previewTickets || {})[
+          this._previewTicketKey(p)] || "";
+        if (!ticket) return "about:blank";
+        return "/api/files/raw?path=" + encodeURIComponent(p)
+                + "&ticket=" + encodeURIComponent(ticket)
+                + workspace + v + pv;
+      }
       return "/api/files/raw?path=" + encodeURIComponent(p)
               + "&token=" + encodeURIComponent(this.token) + workspace + v + pv;
     },
@@ -16232,11 +16773,26 @@ function portal() {
       // A tool just wrote this file → its mtime moved; refresh the strip.
       this.loadSelectedMeta(path);
     },
-    downloadUrl(p) {
+    async downloadFile(p) {
+      if (!p) return;
+      let capabilities;
+      let ticket;
+      try {
+        capabilities = await this._fileCapabilities();
+        ticket = await capabilities.mintTicket(
+          "/api/files/download-ticket",
+          { ...this.fileHdr(), "Content-Type": "application/json" },
+          { path: p },
+        );
+      } catch (error) {
+        this.errToast("generic", String((error && error.message) || error));
+        return;
+      }
       const workspace = this.fileWorkspacePath()
         ? "&workspace=" + encodeURIComponent(this.fileWorkspacePath()) : "";
-      return "/api/files/download?path=" + encodeURIComponent(p)
-        + "&token=" + encodeURIComponent(this.token) + workspace;
+      const url = "/api/files/download?path=" + encodeURIComponent(p)
+        + "&ticket=" + encodeURIComponent(ticket) + workspace;
+      capabilities.triggerDownload(url, p.split("/").pop() || "download");
     },
 
     iconRef(n) {
@@ -19964,10 +20520,14 @@ function portal() {
       // downgrade to putting the prompt + token back into the URL — retry
       // the ticket once, then surface the failure instead.
       let url;
+      const streamStartController = new AbortController();
+      streamState._streamStartController = streamStartController;
+      streamState._cancelBeforeStream = false;
       const _mintTicket = async () => {
         const tr = await fetch("/api/chat/stream/start", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          signal: streamStartController.signal,
           body: JSON.stringify({
             prompt: text,
             session_id: streamSid,
@@ -19979,6 +20539,19 @@ function portal() {
           }),
         });
         return tr;
+      };
+      // Stop pressed while the ticket POST was still in flight: no backend turn
+      // was ever created, so the optimistic user bubble is a lie — it would sit
+      // in the transcript forever, unanswered and unrecoverable (a reload drops
+      // it because the server never persisted it). Roll the send back to the
+      // composer so the text stays editable and re-sendable.
+      const discardCancelledSend = () => {
+        if (sentUserBubble) {
+          this._removePaneMessage(streamState, sentUserBubble);
+          sentUserBubble = null;
+        }
+        if (ownsSendDraft() && !sendDraft.input) sendDraft.input = composerText;
+        if (sendSid === this.currentId) this._activateComposerState(sendSid);
       };
       try {
         let tr = await _mintTicket();
@@ -20003,6 +20576,12 @@ function portal() {
           url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
         }
       } catch (_e) {
+        if (streamState._cancelBeforeStream) {
+          // stop() already performed the authoritative local cleanup. The
+          // ticket was never consumed, so no backend turn/transcript exists.
+          discardCancelledSend();
+          return false;
+        }
         // Could not mint a ticket (server error / network) — fail the send
         // visibly rather than leaking prompt+token into the URL.
         this._markDone(streamSid);
@@ -20011,6 +20590,16 @@ function portal() {
           : "Send failed: could not start the stream — please retry",
           "error", 4000);
         return;
+      } finally {
+        if (streamState._streamStartController === streamStartController) {
+          streamState._streamStartController = null;
+        }
+      }
+      if (streamState._cancelBeforeStream) {
+        // Ticket minted but Stop landed first — same rollback. The ticket is
+        // never consumed and expires on its own.
+        discardCancelledSend();
+        return false;
       }
       const es = new EventSource(url);
       streamState.es = es;
@@ -20159,6 +20748,7 @@ function portal() {
           model: modelForBubble,
           ts: null,
           elapsed: 0,
+          memoryRecall: null,
         };
         curBubble = this._appendLiveMessage(streamState, bubble);
         // CRITICAL: pull the reactive-wrapped object back out of the
@@ -20576,6 +21166,8 @@ function portal() {
       const _markDone = (cancelled = false, backgroundPending = false) => {
         streamState.streaming = false;
         streamState.es = null;
+        streamState._streamStartController = null;
+        streamState._cancelBeforeStream = false;
         streamState._stopping = false;
         streamState._serverActiveObserved = false;
         // Belt-and-braces for the auto-compact bubble: a turn that dies inside
@@ -20699,6 +21291,9 @@ function portal() {
         if (d.total_cost_usd != null && ownsCurBubble()) {
           curBubble.cost = "$" + d.total_cost_usd.toFixed(4);
         }
+        if (d.memory_recall && ownsCurBubble()) {
+          curBubble.memoryRecall = d.memory_recall;
+        }
         if (d.stats) this.stats = { ...this.stats, ...d.stats };
         if (d.session_usage) {
           Object.assign(streamState.sessionUsage, d.session_usage);
@@ -20796,10 +21391,9 @@ function portal() {
           // async growth — so if the user is still at the bottom, re-pin once
           // the final layout settles. Gated on atBottom so a user who scrolled
           // up to read history isn't yanked back down.
-          const finalKey = ownsCurBubble() ? curBubble._k : "";
           this.$nextTick(() => {
-            const finalEl = this._messageElement(streamSid, finalKey);
-            this.highlightCode(".chat-body", finalEl ? [finalEl] : []).then(() => {
+            const pane = this._paneElement(streamSid);
+            this.highlightCode(".chat-body", pane ? [pane] : null).then(() => {
               if (this.currentId === streamSid && this.atBottom) this.scrollToBottom(true);
             });
           });
@@ -21080,6 +21674,32 @@ function portal() {
       if (st._stopping) return;
       st._stopping = true;
       if (st.pendingQueue && st.pendingQueue.length > 0) st._queuePaused = true;
+      // The earliest Stop window is before EventSource exists, while send()
+      // is still minting its one-time ticket. No backend turn exists yet, so
+      // /interrupt cannot find anything. Abort locally and restore idle state
+      // immediately; the ticket is never consumed and expires harmlessly.
+      if (st._streamStartController && !st.es) {
+        st._cancelBeforeStream = true;
+        st._streamStartController.abort();
+        st._streamStartController = null;
+        if (st._streamTimer) clearInterval(st._streamTimer);
+        st._streamTimer = null;
+        st._streamStartedAt = 0;
+        st.streamElapsed = 0;
+        st.streaming = false;
+        st._stopping = false;
+        st.streamingModel = "";
+        if (sid === this.currentId) {
+          this.streaming = false;
+          this.es = null;
+          this._streamTimer = null;
+          this._streamStartedAt = 0;
+          this.streamElapsed = 0;
+          this.streamingModel = "";
+        }
+        this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 1500);
+        return;
+      }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
       let waitForTerminalEvent = false;

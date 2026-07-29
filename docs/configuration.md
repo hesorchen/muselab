@@ -24,6 +24,7 @@ Restart after editing `.env` manually. Provider keys, default model, and default
 | `MUSELAB_MODEL` | Default model for new sessions; the built-in Claude default is effective when unset | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | Settings-managed default, synchronized with `MUSELAB_MODEL` | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_PERMISSION` | Default SDK permission mode | `bypassPermissions` |
+| `MUSELAB_MEMORY_DIR` | Optional long-term-memory Registry/config directory | `$MUSELAB_ROOT/.muselab/memory` |
 
 `MUSELAB_ROOT` must exist. System-level roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, and `/boot` are rejected. A user's own home directory or a directory beneath it is allowed.
 
@@ -58,6 +59,15 @@ MiniMax China and international keys are not interchangeable. The two Qwen regio
 
 Built-in edits, custom providers, and deletion state are stored in `<repo>/provider_overrides.json`. MCP server configuration is stored in `<repo>/mcp.json`. Custom-provider keys use `MUSELAB_PROVIDER_<SLUG>_API_KEY`.
 
+## Long-term memory
+
+Long-term memory is off by default. Its structured configuration lives in
+`$MUSELAB_MEMORY_DIR/config.json` (default:
+`$MUSELAB_ROOT/.muselab/memory/config.json`). Embedding, vector-store, and
+reranker credentials are not written to `.env` and are never returned in
+plaintext by Settings. See [Long-term memory](memory.md) for modes, providers,
+and backup requirements.
+
 ## Image generation
 
 | Variable | Purpose | Default |
@@ -82,6 +92,8 @@ Local Codex image generation is suitable only for trusted instances. Durable job
 | `MUSELAB_THINKING_BUDGET` | Extended-thinking token budget | `10000` |
 | `MUSELAB_CLIENT_POOL_CAP` | Number of live SDK clients | `3` |
 | `MUSELAB_RECENT_TURN_TTL` | Seconds a finished turn remains reconnectable | `60` |
+| `MUSELAB_INTERRUPT_ACK_TIMEOUT_S` | Graceful SDK interrupt acknowledgement timeout | `0.35` |
+| `MUSELAB_INTERRUPT_FORCE_GRACE_S` | Deadline from Stop click before forced client teardown | `0.5` |
 | `MUSELAB_STREAM_REPLAY_MAX_EVENTS` | Mobile replay event threshold before resync | `512` |
 | `MUSELAB_STREAM_REPLAY_MAX_BYTES` | Mobile replay byte threshold before resync | `2097152` |
 | `MUSELAB_DISABLED_PROVIDERS` | Comma-separated stable provider IDs to hide | Empty |

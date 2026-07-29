@@ -26,6 +26,18 @@ class _FakeSDKClient:
         self.disconnected = True
 
 
+class _FakeSessionStream:
+    """Stable pump stand-in; pool tests exercise ownership, not SDK parsing."""
+
+    def __init__(self, key, client):
+        self.key = key
+        self.client = client
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+
 @pytest.fixture()
 def chat_mod(app_module):
     """The freshly-reloaded backend.chat, with all pool state cleared so a
@@ -35,6 +47,7 @@ def chat_mod(app_module):
     chat_mod._client_permission.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._session_streams.clear()
     chat_mod._session_runtime_locks.clear()
     chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._sessions_with_inflight_tasks.clear()
@@ -43,6 +56,7 @@ def chat_mod(app_module):
     chat_mod._client_permission.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
+    chat_mod._session_streams.clear()
     chat_mod._session_runtime_locks.clear()
     chat_mod._pending_runtime_rebuilds.clear()
     chat_mod._sessions_with_inflight_tasks.clear()
@@ -53,7 +67,15 @@ def _patch_builder(monkeypatch, chat_mod):
     async def fake_build(session_id, model, permission, effort):
         return _FakeSDKClient(session_id, model, effort)
 
+    def fake_ensure(key, client):
+        stream = chat_mod._session_streams.get(key)
+        if stream is None or stream.client is not client:
+            stream = _FakeSessionStream(key, client)
+            chat_mod._session_streams[key] = stream
+        return stream
+
     monkeypatch.setattr(chat_mod, "_build_and_connect_client", fake_build)
+    monkeypatch.setattr(chat_mod, "_ensure_session_stream", fake_ensure)
 
 
 def test_cache_hit_reuses_same_client(chat_mod, monkeypatch):
@@ -159,6 +181,43 @@ def test_eviction_at_pool_cap_drops_oldest_and_its_side_dicts(chat_mod, monkeypa
     # B and C survive.
     assert ("B", "claude-sonnet-4-6", "") in chat_mod._clients
     assert ("C", "claude-sonnet-4-6", "") in chat_mod._clients
+
+
+def test_lru_eviction_closes_and_drops_session_stream(chat_mod, monkeypatch):
+    _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_CLIENT_POOL_CAP", 2)
+    created = {}
+
+    class FakeStream:
+        def __init__(self, key, client):
+            self.key = key
+            self.client = client
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    def fake_ensure(key, client):
+        stream = FakeStream(key, client)
+        created[key] = stream
+        chat_mod._session_streams[key] = stream
+        return stream
+
+    monkeypatch.setattr(chat_mod, "_ensure_session_stream", fake_ensure)
+
+    async def run():
+        await chat_mod.get_client(
+            "A", "claude-sonnet-4-6", "bypassPermissions")
+        await chat_mod.get_client(
+            "B", "claude-sonnet-4-6", "bypassPermissions")
+        await chat_mod.get_client(
+            "C", "claude-sonnet-4-6", "bypassPermissions")
+
+    asyncio.run(run())
+
+    key_a = ("A", "claude-sonnet-4-6", "")
+    assert created[key_a].closed is True
+    assert key_a not in chat_mod._session_streams
 
 
 def test_eviction_skips_session_with_inflight_background_task(chat_mod, monkeypatch):

@@ -226,6 +226,69 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     assert "sid-boom" in chat_mod._pending_interrupts
 
 
+def test_interrupt_does_not_inherit_sdk_60_second_ack_timeout(
+        chat_mod, client, monkeypatch):
+    """A wedged SDK control request must not make the Stop button wait."""
+    sid = "sid-slow-interrupt"
+
+    class SlowClient(_FakeSDKClient):
+        async def interrupt(self):
+            await asyncio.Event().wait()
+
+    _seed(chat_mod, (sid, "claude-sonnet-4-6", ""), client=SlowClient())
+    monkeypatch.setattr(chat_mod, "_INTERRUPT_ACK_TIMEOUT_S", 0.01)
+
+    response = client.post(
+        f"/api/chat/interrupt?session_id={sid}&token={TEST_TOKEN}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["interrupted"] == []
+    assert sid in chat_mod._pending_interrupts
+
+
+@pytest.mark.asyncio
+async def test_interrupt_cancels_cold_client_startup_immediately(
+        chat_mod, monkeypatch):
+    """Stop must work before get_client() has produced a cached client."""
+    sid = "sid-cold-start"
+    startup_entered = asyncio.Event()
+
+    async def slow_get_client(*_args, **_kwargs):
+        startup_entered.set()
+        await asyncio.Event().wait()
+
+    async def no_watcher(_sid):
+        return None
+
+    monkeypatch.setattr(chat_mod, "get_client", slow_get_client)
+    monkeypatch.setattr(chat_mod, "_handoff_task_watcher", no_watcher)
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "get_session",
+        lambda _sid: {"model": "glm-5.2-internal", "effort": ""},
+    )
+    monkeypatch.setattr(chat_mod.sess, "update_permission", lambda *_a: True)
+
+    start_task = asyncio.create_task(chat_mod._start_turn(sid, "stop me"))
+    await asyncio.wait_for(startup_entered.wait(), timeout=1)
+    broadcast = chat_mod._active_turns[sid]
+
+    result = await chat_mod.interrupt(sid)
+    finished = await asyncio.wait_for(start_task, timeout=1)
+
+    assert result["interrupted"] == [f"{sid}@startup"]
+    assert result["phase"] == "starting"
+    assert finished is broadcast
+    assert broadcast.cancelled is True
+    assert broadcast.done is True
+    assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
+    assert sid not in chat_mod._active_turns
+    assert sid not in chat_mod._clients
+    recent = chat_mod._recent_turns.pop(sid, None)
+    if recent is not None:
+        recent.close()
+
+
 def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
     """The current turn may finish while interrupt() awaits the SDK. Queue
     state must already be paused then, otherwise its finally block can dequeue

@@ -2096,6 +2096,55 @@ def test_sdk_command_reads_through_the_session_pump(stream_env):
     assert asyncio.run(go()) is result
 
 
+def test_failed_session_stream_evicts_dead_cached_client(stream_env):
+    """A parser/transport failure must not poison every later turn.
+
+    Regression for the GLM missing-thinking-signature failure: the pump closed,
+    but `_clients[key]` still pointed at the terminated CLI process. Forking
+    appeared to fix the conversation only because the new session id missed
+    that stale cache entry.
+    """
+    chat_mod = stream_env
+
+    class BrokenClient:
+        def __init__(self):
+            self.release = asyncio.Event()
+            self.disconnected = False
+
+        async def receive_messages(self):
+            await self.release.wait()
+            raise RuntimeError("missing thinking signature")
+            yield  # pragma: no cover
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def go():
+        key = ("dead-session", "glm-5.2-internal", "")
+        client = BrokenClient()
+        async with chat_mod._lock:
+            chat_mod._clients[key] = client
+            chat_mod._client_permission[key] = "bypassPermissions"
+            chat_mod._client_lru.append(key)
+        stream = chat_mod._SessionStream(key, client)
+        chat_mod._session_streams[key] = stream
+        queue = stream.attach_turn()
+        client.release.set()
+
+        marker = await asyncio.wait_for(queue.get(), timeout=1)
+        await asyncio.wait_for(stream.task, timeout=1)
+
+        assert marker is chat_mod._STREAM_EOF
+        assert isinstance(stream._failure, RuntimeError)
+        assert key not in chat_mod._clients
+        assert key not in chat_mod._client_permission
+        assert key not in chat_mod._client_lru
+        assert key not in chat_mod._session_streams
+        assert client.disconnected is True
+
+    asyncio.run(go())
+
+
 def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
     """Stopping at our own Result must not swallow what the pump queued after it.
 

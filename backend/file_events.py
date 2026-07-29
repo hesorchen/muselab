@@ -15,11 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from watchfiles import Change, DefaultFilter, awatch
 
-from .auth import require_token_query
+from .auth import require_token
+from .capability_tickets import tickets
 from .files import TRASH_DIR_NAME
 from .workspaces import resolve_workspace_root
 
@@ -29,6 +30,7 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 _QUEUE_LIMIT = 8
 _WATCH_DEBOUNCE_MS = 350
 _WATCH_STEP_MS = 100
+_EVENT_TICKET_TTL_S = 45
 _IGNORED_DIRS = tuple(DefaultFilter.ignore_dirs) + (
     TRASH_DIR_NAME,
     ".muselab",
@@ -178,7 +180,28 @@ class FileWatchManager:
 manager = FileWatchManager()
 
 
-@router.get("/events", dependencies=[Depends(require_token_query)])
+@router.post("/events-ticket", dependencies=[Depends(require_token)])
+def mint_file_event_ticket(
+    root: Path = Depends(resolve_workspace_root),
+) -> dict:
+    ticket = tickets.mint(
+        "files",
+        (str(root.resolve()),),
+        ttl=_EVENT_TICKET_TTL_S,
+        single_use=True,
+    )
+    return {"ticket": ticket, "expires_in": _EVENT_TICKET_TTL_S}
+
+
+def _require_file_event_ticket(
+    ticket: str = Query(""),
+    root: Path = Depends(resolve_workspace_root),
+) -> None:
+    if not tickets.validate(ticket, "files", (str(root.resolve()),)):
+        raise HTTPException(status_code=401, detail="invalid or expired file event ticket")
+
+
+@router.get("/events", dependencies=[Depends(_require_file_event_ticket)])
 async def file_events(
     root: Path = Depends(resolve_workspace_root),
 ) -> EventSourceResponse:

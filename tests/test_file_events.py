@@ -7,9 +7,22 @@ import pytest
 from watchfiles import Change
 
 
-def test_file_events_require_query_token(client):
+def test_file_events_require_short_lived_ticket(client):
     response = client.get("/api/files/events")
     assert response.status_code == 401
+
+
+def test_file_event_ticket_is_workspace_bound_and_single_use(
+    client, auth, app_module, temp_root,
+):
+    from backend.capability_tickets import tickets
+
+    minted = client.post("/api/files/events-ticket", headers=auth)
+    assert minted.status_code == 200
+    ticket = minted.json()["ticket"]
+    scope = (str(temp_root.resolve()),)
+    assert tickets.validate(ticket, "files", scope) is True
+    assert tickets.validate(ticket, "files", scope) is False
 
 
 def test_normalise_changes_keeps_paths_relative_and_deduplicated(app_module, temp_root):

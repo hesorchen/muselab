@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import json
 import re
@@ -14,6 +15,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
+from .capability_tickets import tickets
 from .settings import ROOT, atomic_write_text, env_int
 from .workspaces import (
     registry as workspace_registry,
@@ -854,6 +856,106 @@ _PREVIEW_HTML_BRIDGE = (
 # have click-to-zoom or reading-position restoration, an acceptable degradation.
 _PREVIEW_INJECT_MAX_BYTES = 12 * 1024 * 1024
 
+# Browser-native preview surfaces (notably a sandboxed HTML iframe) cannot add
+# X-Auth-Token.  Never put the long-lived API token in their URL: the previewed
+# document can read its own location.search even though the sandbox blocks
+# cookies and parent storage.  These tickets are short-lived and bound to one
+# exact resolved file + workspace.  They are reusable during the TTL because
+# PDF viewers and conditional/range requests may fetch the same URL more than
+# once; replay cannot reach any other file or API.
+_PREVIEW_TICKET_TTL_S = max(
+    30, min(env_int("MUSELAB_PREVIEW_TICKET_TTL_S", 600, min_value=1), 3600))
+_PREVIEW_TICKET_MAX = 2048
+_preview_tickets: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
+_preview_ticket_lock = threading.Lock()
+
+
+class PreviewTicketReq(BaseModel):
+    path: str
+
+
+def _prune_preview_tickets(now: float) -> None:
+    while _preview_tickets:
+        digest, row = next(iter(_preview_tickets.items()))
+        if row[2] >= now and len(_preview_tickets) <= _PREVIEW_TICKET_MAX:
+            break
+        _preview_tickets.pop(digest, None)
+
+
+def _preview_ticket_ok(ticket: str, path: str, root: Path) -> bool:
+    if not ticket.startswith("preview."):
+        return False
+    digest = hashlib.sha256(ticket[8:].encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    try:
+        target = safe_resolve(path, root=root)
+    except HTTPException:
+        return False
+    with _preview_ticket_lock:
+        _prune_preview_tickets(now)
+        row = _preview_tickets.get(digest)
+        if row is None or row[2] < now:
+            return False
+    return row[0] == str(target) and row[1] == str(root.resolve())
+
+
+@router.post("/preview-ticket", dependencies=[Depends(require_token)])
+def mint_preview_ticket(
+    req: PreviewTicketReq,
+    root: Path = Depends(_workspace_root),
+) -> dict:
+    target = safe_resolve(req.path, root=root)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    raw = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    with _preview_ticket_lock:
+        _prune_preview_tickets(now)
+        _preview_tickets[digest] = (
+            str(target),
+            str(root.resolve()),
+            now + _PREVIEW_TICKET_TTL_S,
+        )
+        _prune_preview_tickets(now)
+    return {
+        "ticket": "preview." + raw,
+        "expires_in": _PREVIEW_TICKET_TTL_S,
+    }
+
+
+_DOWNLOAD_TICKET_TTL_S = 60
+
+
+@router.post("/download-ticket", dependencies=[Depends(require_token)])
+def mint_download_ticket(
+    req: PreviewTicketReq,
+    root: Path = Depends(_workspace_root),
+) -> dict:
+    target = safe_resolve(req.path, root=root)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not a file")
+    ticket = tickets.mint(
+        "download",
+        (str(target), str(root.resolve())),
+        ttl=_DOWNLOAD_TICKET_TTL_S,
+        single_use=True,
+    )
+    return {"ticket": ticket, "expires_in": _DOWNLOAD_TICKET_TTL_S}
+
+
+async def _require_raw_access(
+    path: str = Query(...),
+    ticket: str = Query(""),
+    token: str | None = Query(default=None),
+    root: Path = Depends(_workspace_root),
+) -> None:
+    if ticket and _preview_ticket_ok(ticket, path, root):
+        return
+    # Backward compatibility for old clients, copied download links and image
+    # URLs.  The first-party HTML preview no longer uses this long-lived token.
+    await require_token_query(token)
+
 
 def _inject_preview_html_bridge(target: Path) -> str | None:
     """Return HTML with the preview bridge, or None for untouched streaming."""
@@ -872,14 +974,16 @@ def _inject_preview_html_bridge(target: Path) -> str | None:
     return html[:idx] + _PREVIEW_HTML_BRIDGE + html[idx:]
 
 
-@router.get("/raw", dependencies=[Depends(require_token_query)])
+@router.get("/raw", dependencies=[Depends(_require_raw_access)])
 def raw_file(
     path: str = Query(...),
     preview: bool = Query(False),
     root: Path = Depends(_workspace_root),
 ):
-    """Stream raw file (images, PDF, sandboxed HTML, etc.). Token via query.
-    Everything outside the whitelists is forced to download as octet-stream."""
+    """Stream a raw file using a path-bound preview ticket or legacy token.
+
+    Everything outside the whitelists is forced to download as octet-stream.
+    """
     target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
@@ -944,7 +1048,24 @@ def raw_file(
     })
 
 
-@router.get("/download", dependencies=[Depends(require_token_query)])
+def _require_download_ticket(
+    path: str = Query(...),
+    ticket: str = Query(""),
+    root: Path = Depends(_workspace_root),
+) -> None:
+    try:
+        target = safe_resolve(path, root=root)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="invalid download ticket") from None
+    if not tickets.validate(
+        ticket,
+        "download",
+        (str(target), str(root.resolve())),
+    ):
+        raise HTTPException(status_code=401, detail="invalid or expired download ticket")
+
+
+@router.get("/download", dependencies=[Depends(_require_download_ticket)])
 def download_file(
     path: str = Query(...),
     root: Path = Depends(_workspace_root),

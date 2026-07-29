@@ -16,7 +16,14 @@ def _token_ok(presented: str | None) -> bool:
     """
     if not presented or not TOKEN:
         return False
-    return hmac.compare_digest(presented, TOKEN)
+    # compare_digest(str, str) rejects non-ASCII input with TypeError.  Auth
+    # headers are untrusted, so compare UTF-8 bytes instead: every Unicode
+    # candidate gets a normal constant-time mismatch and a 401, never a 500
+    # plus traceback.
+    return hmac.compare_digest(
+        presented.encode("utf-8"),
+        TOKEN.encode("utf-8"),
+    )
 
 
 async def require_token(x_auth_token: str | None = Header(default=None)) -> None:

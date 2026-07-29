@@ -62,6 +62,7 @@ from .ask_user_question import (
 )
 from . import permission_request as perm
 from . import memory_client as mem0
+from .sdk_compat import UnsignedThinkingCompatibleClient
 
 # Valid permission modes, derived from the SDK's PermissionMode literal so
 # the whitelist tracks SDK upgrades automatically. External strings (query
@@ -717,6 +718,11 @@ class TurnBroadcast:
         # cancel a pump that an interrupt + client teardown failed to unblock.
         # None until _start_turn finishes wiring the pump.
         self.task: "asyncio.Task | None" = None
+        # Client creation can take up to 60s on a cold session (CLI spawn, MCP
+        # initialization). Stop must be able to cancel during that window,
+        # before the client exists in `_clients` and before `self.task` above is
+        # created. `_start_turn` owns and clears this handle.
+        self.startup_task: "asyncio.Task | None" = None
 
     def publish(self, event: dict) -> None:
         """Route one SSE event to the record channel, the live channel, or both.
@@ -1776,13 +1782,10 @@ async def _build_and_connect_client(
             "CronCreate", "CronDelete", "CronList",
             "EnterWorktree", "ExitWorktree",
             "Monitor", "PushNotification",
-            "ShareOnboardingGuide",
             # Claude CLI 2.1.211 additions whose protocol is owned by a
             # Claude Code / claude.ai host. muselab has no matching design,
-            # review-findings, or teammate-message surface. Keep
-            # WaitForMcpServers enabled: it is a local CLI lifecycle helper
-            # and lets slow MCP servers finish connecting without a prompt.
-            "DesignSync", "ReportFindings", "SendMessage",
+            # review-findings, remote-trigger, or teammate-message surface.
+            "DesignSync", "RemoteTrigger", "ReportFindings", "SendMessage",
         ],
         # Load CLAUDE.md from user (~/.claude/CLAUDE.md), project
         # (cwd/CLAUDE.md → the user's archive), and local (.claude/
@@ -1977,8 +1980,18 @@ async def _build_and_connect_client(
     # dedicated muselab MCP tool in every mode.
     if permission != "bypassPermissions":
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
+    # Third-party Anthropic-compatible endpoints may emit a `thinking` block
+    # without the signature key that the SDK parser requires.  Use the narrow
+    # compatibility client only for vendor routes; native Claude stays on the
+    # SDK's strict parser.  The existing post-turn JSONL cleanup removes the
+    # empty parser sentinel before a future resume.
+    client_cls = (
+        UnsignedThinkingCompatibleClient
+        if endpoints.is_third_party(model)
+        else ClaudeSDKClient
+    )
     try:
-        client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts_kwargs))
+        client = client_cls(options=ClaudeAgentOptions(**opts_kwargs))
         await client.connect()
         return client
     except Exception as e:
@@ -2014,7 +2027,7 @@ async def _build_and_connect_client(
         last_err: Exception | None = None
         for attempt in range(4):
             try:
-                client = ClaudeSDKClient(
+                client = client_cls(
                     options=ClaudeAgentOptions(**opts_kwargs))
                 await client.connect()
                 if attempt > 0:
@@ -2272,7 +2285,9 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         # also SKIPS any client whose session has an in-flight turn —
         # dropping a live stream mid-flow looked like "Muse just stopped
         # talking" to the user (no error event, just dead air).
-        to_disconnect: list[tuple[_ClientKey, ClaudeSDKClient]] = []
+        to_disconnect: list[
+            tuple[_ClientKey, ClaudeSDKClient, "_SessionStream | None"]
+        ] = []
         async with _lock:
             _clients[key] = client
             _client_permission[key] = permission
@@ -2309,9 +2324,15 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 # (disconnect_client clears it, but LRU eviction didn't).
                 _creation_locks.pop(old_key, None)
                 if old_client is not None:
-                    to_disconnect.append((old_key, old_client))
+                    # The pump owns a task plus replay deques and a reference
+                    # to the SDK client.  LRU eviction used to remove only the
+                    # client, leaving that whole stream graph alive forever.
+                    old_stream = _session_streams.pop(old_key, None)
+                    to_disconnect.append((old_key, old_client, old_stream))
 
-        for old_key, c in to_disconnect:
+        for old_key, c, old_stream in to_disconnect:
+            if old_stream is not None:
+                await old_stream.aclose()
             try:
                 await c.disconnect()
             except Exception as e:
@@ -2362,6 +2383,7 @@ class _SessionStream:
         self._background: asyncio.Queue | None = None
         self._orphans: deque = deque(maxlen=self._ORPHAN_MAX)
         self._closed = False
+        self._failure: Exception | None = None
         self.task: asyncio.Task = asyncio.create_task(self._pump())
 
     def _adopt_orphans(self, q: asyncio.Queue) -> None:
@@ -2433,20 +2455,29 @@ class _SessionStream:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # The CLI died or the transport broke. Wake any consumer with a
-            # sentinel so it fails fast instead of hanging on an empty queue.
+            self._failure = e
             sys.stderr.write(
                 f"[chat] session stream ended sid={self.key[0][:8]} "
                 f"exc={type(e).__name__}: {e}\n")
             sys.stderr.flush()
-            for q in (self._turn, self._background):
-                if q is not None:
-                    q.put_nowait(_STREAM_EOF)
         finally:
+            # A pooled interactive SDK stream is expected to live until
+            # muselab explicitly closes it. Natural EOF while `_closed` is
+            # still false therefore means the CLI/runtime died even if the SDK
+            # did not preserve a more specific exception.
+            if not self._closed and self._failure is None:
+                self._failure = ClaudeSDKError(
+                    "SDK message stream ended before the session was closed")
             self._closed = True
             for q in (self._turn, self._background):
                 if q is not None:
                     q.put_nowait(_STREAM_EOF)
+            if self._failure is not None:
+                # The previous implementation left the dead client in
+                # `_clients`. Every later turn hit get_client()'s cache fast
+                # path and tried to write to the terminated subprocess until a
+                # fork/settings change/restart happened to rebuild it.
+                await _evict_failed_session_stream(self)
 
     async def aclose(self) -> None:
         self._closed = True
@@ -2458,6 +2489,32 @@ class _SessionStream:
 
 # One pump per cached client, keyed exactly like `_clients`.
 _session_streams: dict["_ClientKey", _SessionStream] = {}
+
+
+async def _evict_failed_session_stream(stream: _SessionStream) -> None:
+    """Remove one failed stream's exact client from every runtime cache.
+
+    Identity checks are load-bearing: a settings change or concurrent recovery
+    may already have installed a replacement under the same key. The failed
+    stream must never evict that fresh runtime.
+    """
+    key = stream.key
+    client = stream.client
+    async with _lock:
+        if _clients.get(key) is client:
+            _clients.pop(key, None)
+            _client_permission.pop(key, None)
+            if key in _client_lru:
+                _client_lru.remove(key)
+        if _session_streams.get(key) is stream:
+            _session_streams.pop(key, None)
+    try:
+        await client.disconnect()
+    except Exception as e:
+        sys.stderr.write(
+            f"[chat] failed-stream disconnect sid={key[0][:8]} "
+            f"exc={type(e).__name__}: {e}\n")
+        sys.stderr.flush()
 
 
 def _ensure_session_stream(key: "_ClientKey",
@@ -2517,6 +2574,58 @@ async def disconnect_client(session_id: str) -> None:
             await c.disconnect()
         except Exception:
             pass
+
+
+async def shutdown_runtime() -> None:
+    """Boundedly stop every in-process chat task, stream, and SDK client."""
+    global _client_lru
+
+    # Stop detached task watchers and active turn pumps before tearing down the
+    # shared SDK streams they consume.
+    tasks: set[asyncio.Task] = {
+        task for task in _task_watchers.values() if not task.done()
+    }
+    for broadcast in tuple(_active_turns.values()):
+        broadcast.cancelled = True
+        for attr in ("startup_task", "task"):
+            task = getattr(broadcast, attr, None)
+            if isinstance(task, asyncio.Task) and not task.done():
+                tasks.add(task)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    streams = list(_session_streams.values())
+    _session_streams.clear()
+    if streams:
+        await asyncio.gather(
+            *(stream.aclose() for stream in streams),
+            return_exceptions=True,
+        )
+
+    async with _lock:
+        clients = list({id(client): client for client in _clients.values()}.values())
+        _clients.clear()
+        _client_permission.clear()
+        _creation_locks.clear()
+        _client_lru.clear()
+        _pending_runtime_rebuilds.clear()
+        _active_turns.clear()
+        _sessions_with_inflight_tasks.clear()
+        _task_watchers.clear()
+
+    async def _disconnect(client: ClaudeSDKClient) -> None:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=4.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    if clients:
+        await asyncio.gather(
+            *(_disconnect(client) for client in clients),
+            return_exceptions=True,
+        )
 
 
 async def _rebuild_session_runtime(session_id: str) -> None:
@@ -4636,7 +4745,10 @@ def _gc_orphan_attachments() -> None:
     if not base.exists():
         return
     try:
-        known_sids = {s["id"] for s in sess.list_sessions() if s.get("id")}
+        # list_sessions() intentionally hides sessions belonging to a removed
+        # workspace.  Those rows still exist and reappear when the workspace
+        # is registered again, so attachment GC must use the unfiltered index.
+        known_sids = sess.indexed_session_ids()
     except Exception:
         return
     for child in base.iterdir():
@@ -6371,7 +6483,14 @@ _pending_interrupts: set[str] = set()
 # within this grace window we kill the CLI subprocess to guarantee the slot
 # frees. Kept short so the user can resend quickly, but long enough that a
 # legitimately-fast interrupt completes naturally (warm-client preserved).
-_INTERRUPT_FORCE_GRACE_S = 2.5
+# The SDK's own interrupt control request defaults to a 60-second acknowledgement
+# timeout. A Stop button must never inherit that latency. Give a healthy CLI a
+# brief chance to acknowledge, while the force-stop timer runs in parallel.
+_INTERRUPT_ACK_TIMEOUT_S = max(
+    0.05, env_float("MUSELAB_INTERRUPT_ACK_TIMEOUT_S", 0.35))
+_INTERRUPT_FORCE_GRACE_S = max(
+    _INTERRUPT_ACK_TIMEOUT_S,
+    env_float("MUSELAB_INTERRUPT_FORCE_GRACE_S", 0.5))
 
 # How long a NEW turn waits for an already-interrupted (cancelled) turn to
 # finish draining before it gives up with _TurnBusy. Must comfortably exceed
@@ -6401,30 +6520,50 @@ async def interrupt(session_id: str) -> dict:
     bc = _active_turns.get(session_id)
     if bc is not None and not bc.done:
         bc.cancelled = True
+        # Arm the hard-stop deadline from the CLICK, not after waiting for the
+        # SDK control request. The old ordering added its possible 60s timeout
+        # in front of the 2.5s grace period.
+        asyncio.create_task(_force_stop_after_grace(session_id, bc))
+        startup_task = getattr(bc, "startup_task", None)
+        if startup_task is not None and not startup_task.done():
+            # Cold-start cancellation: no client has reached `_clients` yet,
+            # so client.interrupt() cannot help. Cancelling this task unwinds
+            # CLI/MCP initialization; _start_turn converts it to a replayable
+            # `cancelled` terminal event.
+            startup_task.cancel()
+            return {
+                "ok": True,
+                "interrupted": [f"{session_id}@startup"],
+                "phase": "starting",
+            }
     if not targets:
         # No live client in the pool, but a detached pump task may still be
         # holding the _active_turns slot. Schedule the watchdog anyway so the
         # session can't get wedged. Don't set the pending-interrupt flag: with
         # no turn to suppress a push for, leaving it set would wrongly mute the
         # NEXT turn's done-push.
-        if bc is not None and not bc.done:
-            asyncio.create_task(_force_stop_after_grace(session_id, bc))
         return {"ok": True, "interrupted": [], "note": "no live client"}
     _pending_interrupts.add(session_id)
-    interrupted: list[str] = []
-    for k, c in targets:
+
+    async def _interrupt_one(k, c) -> str | None:
         try:
-            await c.interrupt()
-            interrupted.append(f"{k[0]}@{k[1]}")
+            await asyncio.wait_for(
+                c.interrupt(), timeout=_INTERRUPT_ACK_TIMEOUT_S)
+            return f"{k[0]}@{k[1]}"
+        except asyncio.TimeoutError:
+            sys.stderr.write(
+                f"[chat-interrupt] {k} ack timed out after "
+                f"{_INTERRUPT_ACK_TIMEOUT_S:.2f}s; force-stop armed\n")
         except Exception as e:
             sys.stderr.write(
                 f"[chat-interrupt] {k} failed: {type(e).__name__}: {e}\n")
-    # The SDK interrupt is best-effort (see _INTERRUPT_FORCE_GRACE_S). Arm a
-    # watchdog that force-tears-down the client if the turn doesn't drain on
-    # its own — otherwise a turn the CLI refuses to abort would pin the slot
-    # until the 30-min outer timeout.
-    if bc is not None and not bc.done:
-        asyncio.create_task(_force_stop_after_grace(session_id, bc))
+        return None
+
+    results = await asyncio.gather(
+        *(_interrupt_one(k, c) for k, c in targets))
+    interrupted = [result for result in results if result is not None]
+    # The watchdog was armed before these control requests, so a slow/broken
+    # acknowledgement cannot postpone the hard-stop deadline.
     return {"ok": True, "interrupted": interrupted}
 
 
@@ -9024,6 +9163,22 @@ async def _handoff_task_watcher(session_id: str) -> None:
         _background_origin_turn_id.pop(session_id, None)
 
 
+async def _finish_cancelled_startup(
+    session_id: str,
+    broadcast: TurnBroadcast,
+) -> TurnBroadcast:
+    """Finish a turn cancelled before its SDK client/query was ready."""
+    if not broadcast.done:
+        broadcast.publish({"event": "cancelled", "data": "{}"})
+        broadcast.finish()
+    async with _lock:
+        if _active_turns.get(session_id) is broadcast:
+            _active_turns.pop(session_id, None)
+    _remember_recent_turn(session_id, broadcast)
+    _delete_active_turn_sidecar(session_id)
+    return broadcast
+
+
 async def _start_turn(
     session_id: str,
     prompt: str,
@@ -9119,6 +9274,8 @@ async def _start_turn(
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
         raise
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
     # Defensive: clear any stale "user cancelled" flag carried over from
     # a previous turn on this session. Normally consumed by the prior
     # turn's ResultMessage handler, but if that handler never reached
@@ -9162,12 +9319,16 @@ async def _start_turn(
         # The active-turn reservation above is visible before we wait here, so
         # those paths can fail cleanly instead of mutating this runtime.
         async with _session_runtime_lock_for(session_id):
-            client = await asyncio.wait_for(
+            startup_task = asyncio.create_task(
                 get_client(
                     session_id, model_to_use, permission,
-                    effort=effort_to_use),
-                timeout=60.0,
-            )
+                    effort=effort_to_use))
+            broadcast.startup_task = startup_task
+            try:
+                client = await asyncio.wait_for(startup_task, timeout=60.0)
+            finally:
+                if broadcast.startup_task is startup_task:
+                    broadcast.startup_task = None
     except asyncio.TimeoutError:
         async with _lock:
             if _active_turns.get(session_id) is broadcast:
@@ -9177,6 +9338,8 @@ async def _start_turn(
             "Client connection timed out — CLI process may be hung",
             status=504)
     except asyncio.CancelledError:
+        if broadcast.cancelled:
+            return await _finish_cancelled_startup(session_id, broadcast)
         # FastAPI cancels the handler when the client disconnects mid-
         # await (browser tab closed, request aborted). Without this the
         # reservation we made above stays in _active_turns forever and
@@ -9197,6 +9360,12 @@ async def _start_turn(
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
         raise _TurnStartError(err_msg)
+
+    # Stop can race the final instant of client startup: the client may have
+    # committed to the pool just after /interrupt snapshotted an empty target
+    # list. Do not send the prompt after the user has already cancelled.
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
 
     # Record only after the SDK client is ready, so connection failures do not
     # leave a phantom running task in the global activity center.
@@ -9371,6 +9540,10 @@ async def _start_turn(
     # is read only for truthiness at the end; streamed_in_bubble's content is
     # joined once per AssistantMessage (infrequent). (perf: RED — chat.py O(n²))
     assistant_acc: list[str] = []
+    # Set only after a Memory write has been accepted by the tracked scheduler.
+    # The detached pump uses this to retain failure/cancel evidence if a forced
+    # interrupt prevents the SDK from emitting its terminal ResultMessage.
+    memory_outcome_scheduled = False
     # Mirror of frontend's per-bubble `acc`. Reset on tool_use (FE
     # closeAsst). Lets us tail-emit any TextBlock suffix the SDK didn't
     # send as text_delta — see TextBlock branch below for context.
@@ -9683,10 +9856,17 @@ async def _start_turn(
                         while True:
                             msg = await turn_q.get()
                             if msg is _STREAM_EOF:
-                                # Transport ended without a Result for this
-                                # query; keep the previous completion/error
-                                # behavior rather than spinning forever.
-                                break
+                                # Never turn a dead SDK stream into a silent,
+                                # apparently-successful zero-event turn. The
+                                # pump has already evicted its cached client;
+                                # raising here produces a visible SSE error and
+                                # makes the next send build a fresh runtime.
+                                raise (
+                                    stream._failure
+                                    or ClaudeSDKError(
+                                        "SDK message stream ended without "
+                                        "a ResultMessage")
+                                )
                             if await _dispatch(msg) == "current_result":
                                 break
                     finally:
@@ -10081,6 +10261,7 @@ async def _start_turn(
             """ResultMessage = turn complete. Update cumulative cost / stats,
             write per-message sidecar annotations, bump session metadata, then
             yield the consolidated 'done' SSE event the FE awaits."""
+            nonlocal memory_outcome_scheduled
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
             # ResultMessage.usage is CUMULATIVE per session. Per-turn
@@ -10458,19 +10639,23 @@ async def _start_turn(
             _error_class = _classify_stream_error(_error_message) if _is_error else {
                 "kind": None, "cta": None, "retryable": False,
             }
-            # mem0 write (deferred to here so turn status is known): persist the
-            # completed (user, assistant) exchange ONLY on a clean success —
-            # never a user-cancelled turn (was_cancelled) nor an errored/partial
-            # one (_is_error), so a wrong or aborted draft can't be distilled
-            # into a "durable fact" and recalled forever. Tracked + shutdown-
-            # drained via mem0.schedule_store (not a bare create_task). Uses the
-            # original `prompt`; recalled hook context is never fed back into the
-            # store. Fully fail-soft.
+            # Memory write is deferred until turn status is known. Clean
+            # exchanges may be consolidated into memories. Cancelled turns are
+            # evidence-only (never fact candidates), which preserves the useful
+            # failed trajectory without teaching the partial answer as truth.
+            # Legacy Mem0 keeps its historical success-only behaviour.
             if mem0.enabled() and not was_cancelled and not _is_error:
                 _asst_full = "".join(assistant_acc)
                 if _asst_full.strip():
-                    mem0.schedule_store(session_id, model_to_use,
-                                        prompt, _asst_full)
+                    memory_outcome_scheduled = mem0.schedule_store(
+                        session_id, model_to_use, prompt, _asst_full, new_asst_uuid)
+            elif was_cancelled:
+                memory_outcome_scheduled = mem0.schedule_cancelled(
+                    session_id, prompt, new_asst_uuid)
+            elif _is_error:
+                memory_outcome_scheduled = mem0.schedule_failed(
+                    session_id, model_to_use, prompt,
+                    "".join(assistant_acc), _error_message, new_asst_uuid)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,
@@ -10504,6 +10689,9 @@ async def _start_turn(
                     round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
                     if _budget_usd() > 0 else 0
                 ),
+                # White-box recall trace. The content is already bounded and
+                # provenance-only; the UI keeps it collapsed by default.
+                "memory_recall": mem0.pop_recall_trace(session_id),
                 # Main ResultMessage can arrive while SDK-native background
                 # Agent/Bash tasks continue. The browser keeps the turn footer
                 # alive and queues follow-ups until their detached watcher
@@ -10670,7 +10858,9 @@ async def _start_turn(
     _interrupted_at_startup.pop(session_id, None)
 
     async def _pump_gen_to_broadcast():
+        nonlocal memory_outcome_scheduled
         turn_errored = False
+        turn_error_text = ""
         try:
             # None → asyncio.timeout is a no-op wrapper (no deadline armed).
             async with asyncio.timeout(BG_TIMEOUT_S or None):
@@ -10680,6 +10870,12 @@ async def _start_turn(
                     # must pause on these exactly like an exception-path error.
                     if isinstance(ev, dict) and ev.get("event") == "error":
                         turn_errored = True
+                        try:
+                            payload = json.loads(ev.get("data") or "{}")
+                            turn_error_text = str(
+                                payload.get("error") or payload.get("message") or "")
+                        except (ValueError, TypeError):
+                            pass
                     # SDK-level failures arrive as a NORMAL done event with
                     # is_error=True (max turns / budget / permission denied /
                     # API error — see _handle_result_message). Treat them as
@@ -10694,6 +10890,7 @@ async def _start_turn(
                     broadcast.publish(ev)
         except asyncio.TimeoutError:
             turn_errored = True
+            turn_error_text = f"turn exceeded {BG_TIMEOUT_S}s"
             sys.stderr.write(
                 f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
                 f"aborting sid={session_id}\n")
@@ -10702,6 +10899,7 @@ async def _start_turn(
                 _error_event(f"turn exceeded {BG_TIMEOUT_S}s"))
         except Exception as e:
             turn_errored = True
+            turn_error_text = f"{type(e).__name__}: {e}"
             import traceback as _tb
             sys.stderr.write(
                 f"[chat] background turn crashed sid={session_id} "
@@ -10709,6 +10907,19 @@ async def _start_turn(
             sys.stderr.flush()
             broadcast.publish(_error_event(f"{type(e).__name__}: {e}"))
         finally:
+            # A force-stop can terminate receive_response() before the SDK
+            # emits ResultMessage. Keep that turn as trajectory evidence, but
+            # never let partial output become a fact/Skill candidate.
+            if not memory_outcome_scheduled:
+                if broadcast.cancelled:
+                    memory_outcome_scheduled = mem0.schedule_cancelled(
+                        session_id, prompt, broadcast.turn_id)
+                elif turn_errored:
+                    memory_outcome_scheduled = mem0.schedule_failed(
+                        session_id, model_to_use, prompt,
+                        "".join(assistant_acc),
+                        turn_error_text or "turn stream failed",
+                        broadcast.turn_id)
             try:
                 from .activity import activity as _activity
                 _activity_status = ("cancelled" if broadcast.cancelled else

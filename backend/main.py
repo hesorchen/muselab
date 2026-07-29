@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
 from .chat import router as chat_router
 from .api_settings import router as settings_router
+from .api_memory import router as memory_router
 from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
 from .workspaces import router as workspaces_router
@@ -22,11 +23,12 @@ from .activity_api import router as activity_router
 from .terminal import router as terminal_router
 from .file_events import router as file_events_router
 from .settings import ROOT, PORT, HOST
+from .version import project_version
 
 
 class _TokenFilter(logging.Filter):
-    """Strip token= query param from uvicorn access log URLs."""
-    _re = re.compile(r'token=[^&\s"]+')
+    """Strip reusable tokens and capability tickets from access-log URLs."""
+    _re = re.compile(r'(?P<name>token|ticket)=[^&\s"]+')
 
     def filter(self, record: logging.LogRecord) -> bool:
         # uvicorn's access logger calls info("%s - \"%s %s HTTP/%s\" %d", ...)
@@ -45,10 +47,12 @@ class _TokenFilter(logging.Filter):
         args = record.args
         if isinstance(args, tuple) and len(args) == 5:
             full_path = args[2]
-            if isinstance(full_path, str) and "token=" in full_path:
+            if isinstance(full_path, str) and (
+                "token=" in full_path or "ticket=" in full_path
+            ):
                 record.args = (
                     args[0], args[1],
-                    self._re.sub("token=***", full_path),
+                    self._re.sub(r"\g<name>=***", full_path),
                     args[3], args[4],
                 )
             return True
@@ -59,7 +63,7 @@ class _TokenFilter(logging.Filter):
             message = record.getMessage()
         except Exception:
             return True
-        redacted = self._re.sub("token=***", message)
+        redacted = self._re.sub(r"\g<name>=***", message)
         if redacted != message:
             record.msg = redacted
             record.args = ()
@@ -74,33 +78,24 @@ FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 # Strong references to long-lived fire-and-forget startup tasks so the
 # event loop's weak task references don't let them be GC'd mid-run.
 _BG_TASKS: set = set()
+GRACEFUL_SHUTDOWN_TIMEOUT = 3
 
 
-_ASSET_VERSION_CANDIDATES = (
-    FRONTEND / "app.js", FRONTEND / "styles.css", FRONTEND / "index.html",
-    # Split-out modules so editing only translations / data still bumps the
-    # stamp and forces clients to refetch.
-    FRONTEND / "i18n" / "index.js", FRONTEND / "data" / "constants.js",
-    FRONTEND / "vendor" / "xterm" / "xterm.js",
-    FRONTEND / "vendor" / "xterm" / "xterm.css",
-    FRONTEND / "vendor" / "xterm" / "addon-fit.js",
-)
-# Cache: {computed_version_string} keyed by the max-mtime we last saw. index()
-# / manifest / meta each called _asset_version() (5 stat()s + a max()) on
-# EVERY "/" request; the value only changes on deploy. We still stat the
-# candidate files each call (cheap, sub-µs, and the only reliable change
-# signal) but skip recomputation when the mtime is unchanged. Also memoize
-# the fully-rendered index HTML keyed by the same mtime so the per-request
-# file read + double regex sub disappears on the hot path.
+_ASSET_VERSION_CANDIDATES = tuple(sorted(
+    path for path in FRONTEND.rglob("*")
+    if path.is_file()
+))
+# Cache the computed version by the newest frontend mtime. Every frontend file
+# participates so editing a split module, locale, or vendored dependency cannot
+# leave stale immutable assets behind.
 _asset_cache: dict[str, object] = {"mtime": None, "version": "0",
                                    "index_html": None, "manifest": None}
 _asset_cache_lock = threading.Lock()
 
 
 def _max_asset_mtime() -> int:
-    # Single stat() per candidate instead of exists()+stat() (was 2 syscalls
-    # × 5 files = 10 per static request). Missing files raise OSError, which
-    # we swallow per-file so a deleted optional asset doesn't zero the stamp.
+    # Missing files can disappear during a deployment; ignore them while the
+    # directory is being replaced instead of failing the HTML request.
     mtimes = []
     for p in _ASSET_VERSION_CANDIDATES:
         try:
@@ -126,14 +121,44 @@ def _asset_version() -> str:
             _asset_cache["manifest"] = None    # invalidate rendered manifest
         return _asset_cache["version"]  # type: ignore[return-value]
 
+
+async def _start_optional_services(scheduler, push, memory) -> None:
+    """Start peripheral services without making chat availability depend on them."""
+    import traceback
+
+    memory.start()
+    try:
+        push.init()
+    except Exception as exc:
+        sys.stderr.write(
+            f"[muselab] push init failed (continuing without push): "
+            f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}\n"
+        )
+        sys.stderr.flush()
+    try:
+        await scheduler.start_scheduler()
+    except Exception as exc:
+        sys.stderr.write(
+            f"[muselab] scheduler start failed (continuing without scheduler): "
+            f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}\n"
+        )
+        sys.stderr.flush()
+
+
+def _launch_background_tasks(coroutines) -> None:
+    import asyncio
+
+    for coroutine in coroutines:
+        task = asyncio.create_task(coroutine)
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Boot the in-process scheduler + push subsystem on startup.
     Uses the modern lifespan context manager — `@app.on_event("startup")`
     is deprecated and emits a warning on every server restart.
-
-    The scheduler task continues until interpreter exit; no graceful
-    shutdown handling needed (systemctl SIGTERMs the whole process).
 
     Each subsystem is guarded so a single failure (e.g. push VAPID
     generation hitting a disk-quota error) doesn't take down the
@@ -142,22 +167,7 @@ async def _lifespan(app: FastAPI):
     from . import scheduler as _sched
     from . import push as _push
     from . import memory_client as _mem0
-    _mem0.start()
-    import traceback
-    try:
-        _push.init()
-    except Exception as e:
-        sys.stderr.write(
-            f"[muselab] push init failed (continuing without push): "
-            f"{type(e).__name__}: {e}\n{traceback.format_exc()}\n")
-        sys.stderr.flush()
-    try:
-        await _sched.start_scheduler()
-    except Exception as e:
-        sys.stderr.write(
-            f"[muselab] scheduler start failed (continuing without scheduler): "
-            f"{type(e).__name__}: {e}\n{traceback.format_exc()}\n")
-        sys.stderr.flush()
+    await _start_optional_services(_sched, _push, _mem0)
     # Prune empty sessions + auto-purge expired trash. Both used to block
     # lifespan before yield (50-300 ms total on archives with many
     # sessions / a populated trash dir), pushing first-request TTFB out.
@@ -221,11 +231,12 @@ async def _lifespan(app: FastAPI):
     # discarded can be garbage-collected mid-run, silently cancelling the
     # background work. Stash them on a module-level set and drop each one
     # when it finishes so the set doesn't grow unbounded.
-    for _coro in (_bg_prune_sessions(), _bg_purge_trash(),
-                  _bg_warm_versions(), _backfill_turn_counts()):
-        _t = _asyncio.create_task(_coro)
-        _BG_TASKS.add(_t)
-        _t.add_done_callback(_BG_TASKS.discard)
+    _launch_background_tasks((
+        _bg_prune_sessions(),
+        _bg_purge_trash(),
+        _bg_warm_versions(),
+        _backfill_turn_counts(),
+    ))
     # Same fire-and-forget pattern: rewrite turn_count for any session
     # written by the old algorithm. Gated by a sentinel file so reruns
     # are cheap; first run can take a few seconds on archives with
@@ -236,16 +247,14 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await _file_watch_manager.shutdown()
-        # PTY workers outlive individual WebSocket connections so refreshes
-        # can reattach. They must not outlive the muselab service itself.
-        await _terminal_manager.shutdown()
-        # Drain any in-flight mem0 memory writes so a turn that just finished
-        # still gets persisted across a restart (best-effort, time-bounded).
-        try:
-            await _mem0.aclose()
-        except Exception:
-            pass
+        from .runtime_lifecycle import shutdown_runtime
+        await shutdown_runtime(
+            _BG_TASKS,
+            scheduler=_sched,
+            memory=_mem0,
+            terminal=_terminal_manager,
+            file_watcher=_file_watch_manager,
+        )
 
 
 async def _backfill_turn_counts() -> None:
@@ -311,7 +320,7 @@ async def _backfill_turn_counts() -> None:
         sys.stderr.write(f"[muselab] backfill sentinel write failed: {e}\n")
 
 
-app = FastAPI(title="muselab", version="1.1.0", lifespan=_lifespan)
+app = FastAPI(title="muselab", version=project_version(), lifespan=_lifespan)
 
 # Gzip every response ≥1KB. The frontend ships ~1.2MB of uncompressed text
 # assets (app.js / index.html / styles.css) plus JSON-heavy API responses
@@ -363,6 +372,7 @@ app.include_router(files_router)
 app.include_router(file_events_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
+app.include_router(memory_router)
 app.include_router(scheduler_router)
 app.include_router(push_router)
 app.include_router(workspaces_router)
@@ -727,4 +737,13 @@ async def client_error_log(request: Request) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host=HOST, port=PORT, reload=False)
+    uvicorn.run(
+        "backend.main:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        # SSE and WebSocket connections are intentionally long-lived. Without
+        # a deadline Uvicorn waits forever before entering lifespan shutdown,
+        # so systemd reaches TimeoutStopSec and SIGKILLs the process.
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT,
+    )

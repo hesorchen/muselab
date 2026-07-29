@@ -195,9 +195,13 @@ def _install_fake_event_source(page: Page) -> None:
           }
           window.EventSource = FakeEventSource;
           window.__fakeStreams = streams;
+          window.__fakeChatStreams = () => streams.filter(
+            es => String(es.url || "").includes("/api/chat/stream?")
+          );
           window.__emitSse = (type, payload) => {
-            const es = streams[streams.length - 1];
-            if (!es) throw new Error("no fake EventSource");
+            const chatStreams = window.__fakeChatStreams();
+            const es = chatStreams[chatStreams.length - 1];
+            if (!es) throw new Error("no fake chat EventSource");
             es.dispatchEvent(new MessageEvent(type, {
               data: typeof payload === "string" ? payload : JSON.stringify(payload || {}),
             }));
@@ -401,13 +405,16 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         return true;
         """,
     )
+    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
 
     page.wait_for_function(
-        """() => {
+        """mountedCap => {
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
-          return panes.length === 1 && panes[0].querySelectorAll(".msg").length === 60;
+          return panes.length === 1
+            && panes[0].querySelectorAll(".msg").length === mountedCap;
         }""",
+        arg=mounted_cap,
         timeout=5000,
     )
 
@@ -427,13 +434,13 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
         expected_tail = f"history {sid.rsplit('-', 1)[1]}:89"
         try:
             page.wait_for_function(
-                """expected => {
+                """({ expected, mountedCap }) => {
                   const panes = Array.from(document.querySelectorAll(".msg-pane"))
                     .filter(p => getComputedStyle(p).display !== "none");
                   return panes.some(p => p.textContent.includes(expected)
-                    && p.querySelectorAll(".msg").length === 60);
+                    && p.querySelectorAll(".msg").length === mountedCap);
                 }""",
-                arg=expected_tail,
+                arg={"expected": expected_tail, "mountedCap": mounted_cap},
                 timeout=5000,
             )
         except TimeoutError as exc:
@@ -454,7 +461,7 @@ def test_mobile_long_history_switching_does_not_blank(page: Page, backend_url, a
             )
             raise AssertionError(f"target tail not visible: {expected_tail}; diag={diag}") from exc
         snap = _visible_pane_with_text_snapshot(page, expected_tail)
-        assert snap["msgCount"] <= 60
+        assert snap["msgCount"] <= mounted_cap
         assert expected_tail in snap["text"]
         assert page.locator(".msg-pane").count() <= 1
         assert _app_eval(page, "return app.residentPaneIds().length;") <= 1
@@ -863,12 +870,22 @@ def test_bidirectional_cap_preserves_keyed_scroll_anchor(
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _login(page, backend_url, auth_token)
-    sid = _app_eval(page, "return app.currentId;")
+    sid = "perf-bidirectional-cap"
     _app_eval(
         page,
         """
         const sid = arg;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app.sessions = [{
+          id: sid, name: "Perf bidirectional cap", updated_at: Date.now() / 1000,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
         const st = app._ensureTabState(sid);
+        const cap = app._mountedMessageCap();
         const make = (prefix, i) => ({
           role: "assistant", uuid: `${prefix}-uuid-${i}`,
           _k: `${prefix}-key-${i}`, _noAnim: true,
@@ -876,11 +893,11 @@ def test_bidirectional_cap_preserves_keyed_scroll_anchor(
           html: `<p>${prefix}-${i} ${"variable height ".repeat(8 + (i % 5) * 8)}</p>`,
         });
         st.messages.splice(0, st.messages.length,
-          ...Array.from({ length: 60 }, (_, i) => make("mounted", i)));
+          ...Array.from({ length: cap }, (_, i) => make("mounted", i)));
         st._earlierMessages = Array.from({ length: 10 }, (_, i) => make("older", i));
         st._laterMessages = [];
         st._loadedOffset = 0;
-        st._total = 70;
+        st._total = cap + st._earlierMessages.length;
         st._hasServerLater = false;
         st.messagesReady = true;
         st.messagesLoading = false;
@@ -893,10 +910,12 @@ def test_bidirectional_cap_preserves_keyed_scroll_anchor(
         """,
         sid,
     )
+    mounted_cap = _app_eval(page, "return app._mountedMessageCap();")
     page.wait_for_function(
-        """() => Array.from(document.querySelectorAll('.msg-pane'))
+        """mountedCap => Array.from(document.querySelectorAll('.msg-pane'))
           .filter(p => getComputedStyle(p).display !== 'none')
-          .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0) === 60""",
+          .reduce((n, p) => n + p.querySelectorAll('.msg').length, 0) === mountedCap""",
+        arg=mounted_cap,
         timeout=10000,
     )
     page.evaluate(
@@ -905,30 +924,64 @@ def test_bidirectional_cap_preserves_keyed_scroll_anchor(
           body.scrollTop = Math.min(500, body.scrollHeight - body.clientHeight);
         }"""
     )
-    before_older = page.evaluate(
-        """() => document.querySelector(
-          '.msg[data-message-key="mounted-key-0"]').getBoundingClientRect().top"""
+    older_anchor = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          const key = st.messages[0]._k;
+          const top = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
+          return { key, top };
+        }"""
     )
     _app_eval(page, "return app.loadEarlierMessages(arg);", sid)
-    page.wait_for_timeout(100)
-    after_older = page.evaluate(
-        """() => document.querySelector(
-          '.msg[data-message-key="mounted-key-0"]').getBoundingClientRect().top"""
+    page.wait_for_function(
+        """({ key, mountedCap }) => {
+          const pane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(p => getComputedStyle(p).display !== "none");
+          return pane && pane.querySelectorAll(".msg").length === mountedCap
+            && pane.querySelector(
+              `.msg[data-message-key="${CSS.escape(key)}"]`);
+        }""",
+        arg={"key": older_anchor["key"], "mountedCap": mounted_cap},
+        timeout=10000,
     )
-    assert abs(after_older - before_older) < 2
+    after_older = page.evaluate(
+        """key => document.querySelector(
+          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
+        older_anchor["key"],
+    )
+    assert abs(after_older - older_anchor["top"]) < 2
 
-    before_newer = page.evaluate(
-        """() => document.querySelector(
-          '.msg[data-message-key="mounted-key-49"]').getBoundingClientRect().top"""
+    newer_anchor = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          const key = st.messages[st.messages.length - 1]._k;
+          const top = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top;
+          return { key, top };
+        }"""
     )
     _app_eval(page, "return app.loadLaterMessages(arg);", sid)
-    page.wait_for_timeout(100)
-    after_newer = page.evaluate(
-        """() => document.querySelector(
-          '.msg[data-message-key="mounted-key-49"]').getBoundingClientRect().top"""
+    page.wait_for_function(
+        """({ key, mountedCap }) => {
+          const pane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(p => getComputedStyle(p).display !== "none");
+          return pane && pane.querySelectorAll(".msg").length === mountedCap
+            && pane.querySelector(
+              `.msg[data-message-key="${CSS.escape(key)}"]`);
+        }""",
+        arg={"key": newer_anchor["key"], "mountedCap": mounted_cap},
+        timeout=10000,
     )
-    assert abs(after_newer - before_newer) < 2
-    assert page.locator(".msg-pane:visible .msg").count() == 60
+    after_newer = page.evaluate(
+        """key => document.querySelector(
+          `.msg[data-message-key="${CSS.escape(key)}"]`).getBoundingClientRect().top""",
+        newer_anchor["key"],
+    )
+    assert abs(after_newer - newer_anchor["top"]) < 2
+    assert page.locator(".msg-pane:visible .msg").count() == mounted_cap
     _assert_no_browser_errors(page, errors)
 
 
@@ -1013,7 +1066,9 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     )
 
     _app_eval(page, "return app.loadSession(arg);", sid)
-    page.wait_for_function("() => window.__fakeStreams && window.__fakeStreams.length === 1")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
@@ -1600,7 +1655,9 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         }"""
     )
     _app_eval(page, "app.send(); return true;")
-    page.wait_for_function("() => window.__fakeStreams && window.__fakeStreams.length === 1")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
 
     page.evaluate(
         """() => {

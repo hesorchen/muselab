@@ -98,6 +98,25 @@ def test_i18n_zh_en_key_parity():
     )
 
 
+def test_memory_center_and_chat_recall_trace_are_wired():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    api = (BACKEND / "api_memory.py").read_text(encoding="utf-8")
+
+    assert "loadMemorySettings()" in app
+    assert "saveMemorySettings()" in app
+    assert "memorySkillAction(item, action)" in app
+    assert "memorySaveMessage(message)" in app
+    assert "_startMemoryMonitor()" in app
+    assert "muselab_memory_artifacts_seen" in app
+    assert 'data-page="memory"' in index
+    assert "Skill 只能生成候选" in index
+    assert "memoryRecall" in index
+    assert '"memory_recall": mem0.pop_recall_trace(session_id)' in chat
+    assert '@router.post("/skills/{artifact_id}/approve")' in api
+
+
 def test_image_generation_history_prompt_actions_are_wired():
     """History prompt actions need both Alpine handlers and template wiring."""
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
@@ -148,6 +167,11 @@ def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
         "this._restorePreviewViewState(ownerPath, ownerLoadSeq)"
     ) < mobile_tab.index("this.mobileTab = next")
     assert "this._schedulePreviewViewRestore(ownerPath, ownerLoadSeq)" in mobile_tab
+    assert mobile_tab.index("this.messagesReady = false") < mobile_tab.index(
+        "this.mobileTab = next"
+    )
+    assert "this._afterPaint(() => {" in mobile_tab
+    assert 'this.mobileTab !== "chat"' in mobile_tab
     assert 'this.mobileTab !== "preview"' in app
     assert "preview: !this._isMobileLayout()" in node_click
     assert html.count("@click=\"setMobileTab('") == 3
@@ -853,6 +877,37 @@ def test_attachment_uploads_have_deadlines_and_never_log_filenames():
     assert "[muselab][upload]" not in app
 
 
+def test_html_preview_uses_path_bound_ticket_not_api_token():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    open_start = app.index('} else if (["html", "htm"].includes(ext))')
+    open_branch = app[open_start:app.index(
+        'else if (["png", "jpg"', open_start)]
+    raw_start = app.index("rawUrl(p, opts = {})")
+    raw = app[raw_start:app.index("async reloadPreview()", raw_start)]
+    preview_branch = raw[raw.index("if (opts.preview)"):
+                         raw.index('return "/api/files/raw?path="', raw.index(
+                             'return "/api/files/raw?path="') + 1)]
+
+    assert open_branch.index("_mintPreviewTicket") < open_branch.index(
+        'this.previewMode = "html"')
+    assert '"&ticket="' in preview_branch
+    assert '"&token="' not in preview_branch
+    assert 'if (!ticket) return "about:blank"' in preview_branch
+
+
+def test_turn_finalization_repairs_whole_pane_and_cache_bytes():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'this.highlightCode(".chat-body", pane ? [pane] : null)' in app
+    assert 'finalEl ? [finalEl] : []' not in app
+    assert "_mdCacheDelete(text)" in app
+    rerender_start = app.index("_rerenderMathMessages()")
+    rerender = app[rerender_start:app.index(
+        "// Path-shaped strings", rerender_start)]
+    assert ".delete(m.text)" not in rerender
+    assert ".delete(this.rawText)" not in rerender
+
+
 def test_send_pins_owner_waits_before_enqueue_and_blocks_failed_attachments():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async send(opts = {})")
@@ -990,13 +1045,14 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "_hasServerLater: false" in blank
     assert "_laterMessages: []" in blank
     assert "_nextLiveKey: 1" in blank
-    assert "_mountedMessageCap() { return this._isMobileLayout() ? 60 : 300; }" in app
+    assert "_mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; }" in app
+    assert "histLen >= Math.ceil(this._mountedMessageCap() / 2)" in app
     assert "_historyCacheCap() { return this._isMobileLayout() ? 120 : 800; }" in app
     assert "const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES" in app
     assert "_MAX_RESIDENT_PANES: 4" in app
     assert "? (_coldEarly ? 8 : 15)" in app
     assert ": (_coldEarly ? 30 : 60)" in app
-    assert "if (this._isMobileLayout() && histLen > 60 && shouldFollow)" in app
+    assert "&& histLen >= Math.ceil(this._mountedMessageCap() / 2)" in app
     assert "if (cst && cst.streaming) continue" not in app
     assert '"&history_generation="' in app
     assert "if (r.status === 409)" in app
@@ -1342,15 +1398,18 @@ def test_diff_surfaces_use_theme_tokens_and_readable_edges():
 def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     assert "new EventSource(`/api/files/events?${params.toString()}`)" in app
+    assert '"/api/files/events-ticket"' in app
+    assert "new URLSearchParams({ ticket, workspace })" in app
+    assert "token: this.token, workspace" not in app
     assert "this._fileEventsWorkspace === workspace" in app
     assert 'es.addEventListener("changes"' in app
     assert 'es.addEventListener("resync"' in app
     assert "this._workspaceIsCurrent(ownerWorkspace)" in app
     assert "this._refreshParentInTree(path, ownerWorkspace)" in app
     assert "const delay = this._isMobileLayout() ? 650 : 250" in app
-    assert 'document.visibilityState !== "visible"' in app
+    assert "if (!this._fileTreeIsVisible())" in app
     assert "this._stopFileEvents(true)" in app
-    assert 'if (t === "files") this.$nextTick(() => this._flushFileTreeDirty())' in app
+    assert 'if (t === "files") this._flushFileTreeDirty()' in app
 
 
 def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():
@@ -1851,3 +1910,24 @@ def test_concise_mode_is_a_device_preference_and_defaults_off():
     assert i18n.count('"concise.title"') == 2
     assert "失败的工具仍会显示" in i18n
     assert "Failed tools still show" in i18n
+
+
+def test_stop_aborts_stream_ticket_before_backend_turn_exists():
+    """A Stop click during POST /stream/start must prevent the later turn."""
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    state = js[js.index("_stopping: false,"):]
+    state = state[:state.index("streamingModel:", 0)]
+    assert "_streamStartController: null" in state
+    assert "_cancelBeforeStream: false" in state
+
+    ticket = js[js.index("const streamStartController = new AbortController()"):]
+    ticket = ticket[:ticket.index("const es = new EventSource(url)")]
+    assert "signal: streamStartController.signal" in ticket
+    assert "if (streamState._cancelBeforeStream)" in ticket
+
+    stop = js[js.index("async stop() {"):]
+    stop = stop[:stop.index("// ====== ask_user_question UI helpers")]
+    assert "if (st._streamStartController && !st.es)" in stop
+    assert "st._streamStartController.abort()" in stop
+    assert "st.streaming = false" in stop

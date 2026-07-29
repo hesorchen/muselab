@@ -913,3 +913,17 @@ async def start_scheduler() -> None:
             _delayed_execute(task, i * _CATCHUP_STAGGER_S)))
         t.add_done_callback(_make_task_done(task.get("id", "?")))
     _scheduler_task = asyncio.create_task(_scheduler_loop())
+
+
+async def stop_scheduler() -> None:
+    """Stop the tick loop and every scheduled execution owned by this process."""
+    global _scheduler_task
+
+    tasks = [task for task in (_scheduler_task, *_RUN_TASKS)
+             if task is not None and not task.done()]
+    _scheduler_task = None
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _RUN_TASKS.clear()

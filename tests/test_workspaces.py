@@ -32,6 +32,33 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     assert [row["path"] for row in rows] == [str(temp_root.resolve())]
 
 
+def test_removed_workspace_sessions_keep_their_attachments(
+    client, auth, temp_root, tmp_path,
+):
+    from backend import chat, sessions
+
+    other = _make_workspace(tmp_path)
+    assert client.post(
+        "/api/chat/workspaces", headers=auth, json={"path": str(other)}
+    ).status_code == 200
+    session = sessions.create_session("kept", cwd=other)
+    kept = chat._attachments_base() / session["id"]
+    kept.mkdir(parents=True)
+    (kept / "image.png").write_bytes(b"image")
+    orphan = chat._attachments_base() / "actually-orphaned"
+    orphan.mkdir()
+
+    assert client.delete(
+        "/api/chat/workspaces",
+        headers=auth,
+        params={"path": str(other)},
+    ).status_code == 200
+    chat._gc_orphan_attachments()
+
+    assert kept.exists()
+    assert not orphan.exists()
+
+
 def test_reorder_workspaces_persists_complete_order(client, auth, temp_root, tmp_path):
     first = _make_workspace(tmp_path, "first")
     second = _make_workspace(tmp_path, "second")

@@ -83,12 +83,21 @@ def _sidecar_path(sid: str) -> Path:
 
 
 def _load_index() -> list[dict]:
-    if not INDEX.exists():
+    try:
+        raw = INDEX.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return []
     try:
-        return json.loads(INDEX.read_text(encoding="utf-8"))
-    except Exception:
-        return []
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # A corrupt/unreadable index is not an empty index.  Returning [] here
+        # lets the next read-modify-write silently replace every session's
+        # metadata with one fresh row.  Fail closed so the original file stays
+        # available for repair or recovery.
+        raise RuntimeError(f"cannot parse session index: {INDEX}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError(f"session index must contain a list: {INDEX}")
+    return data
 
 
 def _save_index(items: list[dict]) -> None:
@@ -242,7 +251,7 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
     p = _sidecar_path(sid)
     try:
         st = p.stat()
-    except OSError:
+    except FileNotFoundError:
         return {"messages": {}}
     sig = (st.st_mtime, st.st_size)
     if use_cache:
@@ -251,9 +260,14 @@ def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
             return hit[2]
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("sidecar root must be an object")
         d.setdefault("messages", {})
-    except Exception:
-        return {"messages": {}}
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        # Mutators call this with use_cache=False.  Treating malformed data as
+        # an empty sidecar would make their next save destroy annotations and
+        # pending attachments.  Surface the corruption and preserve the file.
+        raise RuntimeError(f"cannot parse session sidecar: {p}") from exc
     if use_cache:
         if len(_SIDECAR_CACHE) >= _SIDECAR_CACHE_MAX and sid not in _SIDECAR_CACHE:
             _SIDECAR_CACHE.pop(next(iter(_SIDECAR_CACHE)), None)
@@ -266,6 +280,22 @@ def _save_sidecar(sid: str, data: dict) -> None:
     # Drop rather than refresh: the next _load_sidecar re-stats and caches
     # the just-written file, keeping cache state derived purely from disk.
     _SIDECAR_CACHE.pop(sid, None)
+
+
+def indexed_session_ids() -> set[str]:
+    """Return every id in the raw index, including removed workspaces.
+
+    This is intentionally different from list_sessions(), whose public view
+    hides rows belonging to a workspace that is temporarily unregistered.
+    Storage GC must use the durable index view or it can mistake those hidden
+    sessions for deleted sessions and permanently remove their attachments.
+    """
+    with _INDEX_LOCK:
+        return {
+            str(row["id"])
+            for row in _load_index()
+            if isinstance(row, dict) and row.get("id")
+        }
 
 
 # ============================================================================

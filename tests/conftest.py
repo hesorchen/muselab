@@ -127,7 +127,15 @@ def app_module(monkeypatch, temp_root, tmp_path):
               "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
               "MUSELAB_MODEL", "MUSELAB_DEFAULT_MODEL",
               "MUSELAB_DEFAULT_PERMISSION", "MUSELAB_THINKING_BUDGET",
-              "MUSELAB_MAX_TURNS"):
+              "MUSELAB_MAX_TURNS",
+              # memory_dir() honours this override ahead of ROOT, and a
+              # deployment sets it (run-local points it at
+              # .memory-runtime/data) — so the /api/memory tests were reading
+              # and mutating the REAL registry: list returned the developer's
+              # live memories and an import pushed test rows into production
+              # Qdrant. It has to be cleared here rather than before the
+              # import, because load_dotenv() repopulates it from .env.
+              "MUSELAB_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
 
     return main_mod

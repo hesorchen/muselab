@@ -88,7 +88,7 @@ Desktop subscribers retain full replay behavior. If a mobile replay exceeds `MUS
 
 Active turns live in an in-memory registry. A just-finished turn remains available for 60 seconds by default, configurable with `MUSELAB_RECENT_TURN_TTL`, so a browser can still attach to a fast queue-drained turn. Expiry closes and deletes its temporary spool.
 
-A background turn has a hard 30-minute timeout. Explicit interruption marks it cancelled and pauses a non-empty server queue.
+A background turn has a hard 30-minute timeout. Explicit interruption marks it cancelled and pauses a non-empty server queue. Stop also covers the pre-stream phases: the browser aborts an unconsumed ticket request, the server cancels cold client startup, and an already-running SDK client gets a short graceful-interrupt window before forced teardown.
 
 ## Reconnection and cross-device state
 
@@ -119,6 +119,8 @@ The Activity Center persists each conversation's current state in `$MUSELAB_ROOT
 - `effort` is stored per session and participates in the client cache key. Values are `low`, `medium`, `high`, `xhigh`, and `max`; empty uses the SDK default.
 - The extended-thinking budget defaults to 10,000 tokens and is configurable with `MUSELAB_THINKING_BUDGET`.
 - Provider capabilities for effort and thinking come from `/api/chat/providers`.
+- Some Anthropic-compatible providers omit the required `signature` key from thinking blocks. Vendor routes normalize the missing field to an empty in-memory parser sentinel so the SDK stream can finish, then remove the unverifiable thinking block from persisted JSONL. Native Claude routes keep strict SDK parsing; muselab never fabricates a valid signature.
+- If a pooled SDK stream nevertheless terminates, muselab evicts that exact client, surfaces the failed turn as an SSE error, and rebuilds the runtime on the next send. A dead CLI subprocess is never returned from the cache fast path.
 
 ```mermaid
 sequenceDiagram

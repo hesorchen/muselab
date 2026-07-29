@@ -21,7 +21,7 @@ TaskList
 TaskOutput
 TaskStop
 TaskUpdate
-WaitForMcpServers
+ToolSearch
 WebFetch
 WebSearch
 Workflow

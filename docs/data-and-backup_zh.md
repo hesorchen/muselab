@@ -2,7 +2,9 @@
 
 > [English](data-and-backup.md)
 
-muselab 没有数据库，但状态并不只在一个目录。完整迁移需要同时考虑工作目录、仓库状态、Claude CLI 数据和浏览器本地偏好。
+muselab 的核心会话仍以 CLI JSONL 为真相源；启用长期记忆时会额外使用一个 SQLite
+Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CLI 数据、记忆目录和
+浏览器本地偏好。
 
 ## 主工作目录
 
@@ -17,6 +19,7 @@ muselab 没有数据库，但状态并不只在一个目录。完整迁移需要
 | `.muselab/vapid.json` | Web Push VAPID 私钥与公钥 | 建议与订阅一起备份 |
 | `.muselab/push_subs.json` | 设备 Push 订阅 | 想保留现有订阅时与 `vapid.json` 一起备份 |
 | `.muselab/imagegen/` | 生图任务历史和持久化图片 | 想保留生图历史时备份 |
+| `.muselab/memory/` | 记忆配置、SQLite Registry、队列、审计与停用 Skill | 使用长期记忆时必备；配置可能含凭据 |
 | `.muselab-attach/` | 会话图片和 PDF 原文件 | 想保留附件预览时必备 |
 | `.muselab-dustbin/` | 主工作目录可恢复回收站 | 想保留恢复能力时备份 |
 

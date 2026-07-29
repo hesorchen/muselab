@@ -16,7 +16,9 @@ Unregistered, removed, or disallowed directories are rejected. Returned paths ar
 
 ## Endpoints
 
-There are currently 19 Files endpoints, all token-authenticated.
+There are currently 21 Files endpoints. Normal calls use token authentication;
+browser downloads use a short-lived, scope-bound capability ticket minted by
+an authenticated call.
 
 ### Read and preview
 
@@ -26,13 +28,18 @@ There are currently 19 Files endpoints, all token-authenticated.
 | `GET /api/files/stat` | Read type, size, and modification time for one path |
 | `GET /api/files/read` | Read text, up to 2 MiB |
 | `GET /api/files/raw` | Inline supported image, media, PDF, HTML, and SVG; force-download other types |
-| `GET /api/files/download` | Download as an attachment |
+| `POST /api/files/download-ticket` | Mint a one-time ticket bound to one file and workspace |
+| `GET /api/files/download` | Download as an attachment with that ticket |
 | `GET /api/files/xlsx` | Structured workbook preview |
 | `GET /api/files/csv` | Paginated CSV/TSV preview |
 | `GET /api/files/grep` | Bounded full-text search |
 | `GET /api/files/search` | Filename and directory-name search |
 
-`raw` and `download` serve iframes, images, or browser navigation and therefore accept a query token. HTML and SVG previews use a sandbox CSP. The HTML preview bridge for scroll and image interaction is injected only for files up to 12 MiB.
+`raw` serves iframes and images and therefore still accepts a query token.
+`download` never puts the reusable application token in its URL: the frontend
+first mints a 60-second, one-use ticket bound to the exact resolved file and
+workspace. HTML and SVG previews use a sandbox CSP. The HTML preview bridge for
+scroll and image interaction is injected only for files up to 12 MiB.
 
 Preview limits:
 

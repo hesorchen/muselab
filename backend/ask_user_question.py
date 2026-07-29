@@ -310,8 +310,10 @@ def build_server_for_session(session_id: str):
             lines.append(f"Q: {q_text}\nA: {ans_text}")
         return {"content": [{"type": "text", "text": "\n\n".join(lines)}]}
 
+    from .version import project_version
+
     return create_sdk_mcp_server(
         name="muselab",
-        version="1.1.0",
+        version=project_version(),
         tools=[handler],
     )
