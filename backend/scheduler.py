@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from .settings import ROOT, atomic_write_text, is_chinese_locale
+from .settings import ROOT, atomic_write_text, env_int, is_chinese_locale
 
 
 def _scheduled_label_prefix() -> str:
@@ -649,6 +649,8 @@ async def _execute_task(task: dict) -> None:
     mode = _effective_session_mode(task)
     reply_text = ""
     error: str | None = None
+    cancelled = False
+    activity_started = False
 
     async with _task_lock(tid):
         # Resolve `sid` INSIDE the lock so two parallel run-now clicks
@@ -688,6 +690,19 @@ async def _execute_task(task: dict) -> None:
         else:
             sid = task["session_id"]
         try:
+            from .activity import activity as _activity
+            _activity.start(
+                sid,
+                summary=task["name"],
+                kind="scheduled",
+                source_id=tid,
+            )
+            activity_started = True
+        except Exception as e:
+            sys.stderr.write(
+                f"[scheduler] activity start failed for {tid}: "
+                f"{type(e).__name__}: {e}\n")
+        try:
             # Tasks created before the scheduler UI had a model picker stored
             # model=""; SDK then silently fell back to its built-in default
             # (which differs from whatever the user has selected in the chat
@@ -696,12 +711,30 @@ async def _execute_task(task: dict) -> None:
             # default when task.model is empty.
             from .settings import MODEL as _DEFAULT_MODEL
             model = task.get("model") or _DEFAULT_MODEL
-            reply_text, error = await _run_sdk_task_turn(
-                sid, model, task["prompt"])
+            timeout_s = env_int(
+                "MUSELAB_SCHEDULER_TIMEOUT_S", 1800, min_value=0)
+            async with asyncio.timeout(timeout_s or None):
+                reply_text, error = await _run_sdk_task_turn(
+                    sid, model, task["prompt"])
             if error:
                 sys.stderr.write(
                     f"[scheduler] task {tid} ({task['name']}) "
                     f"result is_error: {error}\n")
+        except asyncio.TimeoutError:
+            error = (
+                "scheduled task timed out after "
+                f"{env_int('MUSELAB_SCHEDULER_TIMEOUT_S', 1800, min_value=0)}s"
+            )
+            sys.stderr.write(
+                f"[scheduler] task {tid} ({task['name']}) timed out\n")
+        except asyncio.CancelledError:
+            # Service shutdown cancels tracked scheduler tasks. CancelledError
+            # inherits BaseException, so the generic handler below does not
+            # see it. Persist an explicit cancelled result before propagating;
+            # otherwise `error is None` in finally records a false success.
+            cancelled = True
+            error = "scheduled task cancelled by service shutdown"
+            raise
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             sys.stderr.write(f"[scheduler] task {tid} ({task['name']}) failed: {error}\n")
@@ -731,6 +764,18 @@ async def _execute_task(task: dict) -> None:
                 if len(_state["history"]) > _HISTORY_CAP:
                     _state["history"] = _state["history"][-_HISTORY_CAP:]
                 _save_state()
+            if activity_started:
+                try:
+                    from .activity import activity as _activity
+                    _activity.finish(
+                        sid,
+                        "cancelled" if cancelled else (
+                            "failed" if error else "completed"),
+                    )
+                except Exception as e:
+                    sys.stderr.write(
+                        f"[scheduler] activity finish failed for {tid}: "
+                        f"{type(e).__name__}: {e}\n")
             # Fire Web Push to every subscribed device — but skip when the
             # user is actively at one of their devices (presence heartbeat
             # within GRACE_SECONDS). In-app the UI already flashes the bell
@@ -743,6 +788,8 @@ async def _execute_task(task: dict) -> None:
             # 4-toggle UI down to one "notify me" switch).
             # Errors swallowed — push is best-effort, must never break the loop.
             try:
+                if cancelled:
+                    raise
                 from . import presence as _presence
                 if _presence.recently_active():
                     # User is at their screen — UI badge + foreground vibrate

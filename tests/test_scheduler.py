@@ -1,10 +1,8 @@
-"""Tests for backend.scheduler — focused on the 2026-05-28 fresh/reuse
-session_mode addition. _execute_task itself is not unit-tested (needs the
-Claude SDK + a real model call); we cover the state-management surface
-that fresh mode introduced and the back-compat path for old tasks."""
+"""Tests for scheduler state, execution lifecycle, and schedule math."""
 from __future__ import annotations
 
 import asyncio
+import pytest
 
 
 def _sched_mod(app_module):
@@ -112,6 +110,132 @@ def test_sdk_turn_rejects_session_with_interactive_owner(
     finally:
         chat._active_turns.pop(sid, None)
         chat._session_runtime_locks.pop(sid, None)
+
+
+def _execution_task(tid: str = "exec-task") -> dict:
+    return {
+        "id": tid,
+        "name": "Execution task",
+        "prompt": "produce a result",
+        "session_id": f"session-{tid}",
+        "session_mode": "reuse",
+        "model": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_task_publishes_activity_and_success_history(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import activity as activity_module
+    transitions = []
+
+    async def run_turn(*_args, **_kwargs):
+        return "finished", None
+
+    monkeypatch.setattr(sched, "_run_sdk_task_turn", run_turn)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "start",
+        lambda sid, **kwargs: transitions.append(("start", sid, kwargs)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda sid, status: transitions.append(("finish", sid, status)),
+    )
+    from backend import presence
+    monkeypatch.setattr(presence, "recently_active", lambda: True)
+    monkeypatch.setattr(presence, "last_seen_age", lambda: 0.0)
+
+    task = _execution_task()
+    await sched._execute_task(task)
+
+    assert sched._state["history"][-1]["ok"] is True
+    assert sched._state["history"][-1]["reply_preview"] == "finished"
+    assert transitions[0] == (
+        "start",
+        task["session_id"],
+        {
+            "summary": task["name"],
+            "kind": "scheduled",
+            "source_id": task["id"],
+        },
+    )
+    assert transitions[-1] == ("finish", task["session_id"], "completed")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_cancellation_is_not_recorded_as_success(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import activity as activity_module
+    entered = asyncio.Event()
+    transitions = []
+
+    async def blocked(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sched, "_run_sdk_task_turn", blocked)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "start",
+        lambda sid, **kwargs: transitions.append(("start", sid, kwargs)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda sid, status: transitions.append(("finish", sid, status)),
+    )
+
+    task = _execution_task("cancel-task")
+    running = asyncio.create_task(sched._execute_task(task))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    history = sched._state["history"]
+    assert len(history) == 1
+    assert history[0]["ok"] is False
+    assert "cancelled" in history[0]["error"]
+    assert transitions[-1] == ("finish", task["session_id"], "cancelled")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_has_bounded_unattended_runtime(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+
+    async def blocked(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    original_env_int = sched.env_int
+    monkeypatch.setattr(sched, "_run_sdk_task_turn", blocked)
+    monkeypatch.setattr(
+        sched,
+        "env_int",
+        lambda name, default, **kwargs: (
+            0.01 if name == "MUSELAB_SCHEDULER_TIMEOUT_S"
+            else original_env_int(name, default, **kwargs)
+        ),
+    )
+    from backend import presence
+    monkeypatch.setattr(presence, "recently_active", lambda: True)
+    monkeypatch.setattr(presence, "last_seen_age", lambda: 0.0)
+
+    await sched._execute_task(_execution_task("timeout-task"))
+
+    row = sched._state["history"][-1]
+    assert row["ok"] is False
+    assert "timed out" in row["error"]
 
 
 # ---- delete_task ----
@@ -329,7 +453,6 @@ def test_api_task_history_404_for_unknown_task(client, auth, app_module):
 # (weekday-in-set, hour==slot, soonest within window) for weekly/monthly so
 # we don't reimplement the SUT's calendar walk in the assertion.
 
-import pytest  # noqa: E402  (kept local to this section's needs)
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
 # UTC+8, the same offset the rest of this file passes as tz_offset_minutes=480.

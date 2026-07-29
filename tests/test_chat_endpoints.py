@@ -179,6 +179,8 @@ def test_session_list_marks_detached_background_work_active(chat_mod, client):
         assert response.status_code == 200, response.text
         row = next(s for s in response.json()["sessions"] if s["id"] == sid)
         assert row["active"] is True
+        assert row["turn_active"] is False
+        assert row["background_active"] is True
     finally:
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
 
@@ -250,8 +252,11 @@ def test_interrupt_does_not_inherit_sdk_60_second_ack_timeout(
 async def test_interrupt_cancels_cold_client_startup_immediately(
         chat_mod, monkeypatch):
     """Stop must work before get_client() has produced a cached client."""
+    from backend import activity as activity_module
+
     sid = "sid-cold-start"
     startup_entered = asyncio.Event()
+    activity_transitions = []
 
     async def slow_get_client(*_args, **_kwargs):
         startup_entered.set()
@@ -268,10 +273,23 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
         lambda _sid: {"model": "glm-5.2-internal", "effort": ""},
     )
     monkeypatch.setattr(chat_mod.sess, "update_permission", lambda *_a: True)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "start",
+        lambda activity_sid, *, summary="": activity_transitions.append(
+            ("start", activity_sid, summary)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda activity_sid, status: activity_transitions.append(
+            ("finish", activity_sid, status)),
+    )
 
     start_task = asyncio.create_task(chat_mod._start_turn(sid, "stop me"))
     await asyncio.wait_for(startup_entered.wait(), timeout=1)
     broadcast = chat_mod._active_turns[sid]
+    assert activity_transitions == [("start", sid, "stop me")]
 
     result = await chat_mod.interrupt(sid)
     finished = await asyncio.wait_for(start_task, timeout=1)
@@ -284,6 +302,10 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
     assert sid not in chat_mod._active_turns
     assert sid not in chat_mod._clients
+    assert activity_transitions == [
+        ("start", sid, "stop me"),
+        ("finish", sid, "cancelled"),
+    ]
     recent = chat_mod._recent_turns.pop(sid, None)
     if recent is not None:
         recent.close()
@@ -644,6 +666,40 @@ def test_fork_rejects_active_source_session(
     assert called is False
 
 
+def test_fork_snapshots_source_while_background_task_keeps_running(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "background source"},
+    )
+    assert source.status_code == 200, source.text
+    sid = source.json()["id"]
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-a", "task-b"}
+    new_sid = "11111111-2222-4333-8444-555555555555"
+    called = False
+
+    def fake_fork(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return SimpleNamespace(session_id=new_sid)
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    response = client.post(
+        f"/api/chat/sessions/{sid}/fork",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"title": "background snapshot"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert called is True
+    assert response.json()["source_background_tasks_pending"] == 2
+    assert chat_mod._sessions_with_inflight_tasks[sid] == {"task-a", "task-b"}
+
+
 def test_native_compact_rejects_success_without_token_drop(chat_mod, client, monkeypatch):
     sid = _make_compact_session(client)
     result = ResultMessage(
@@ -662,3 +718,79 @@ def test_native_compact_rejects_success_without_token_drop(chat_mod, client, mon
     )
     assert r.status_code == 500, r.text
     assert "did not decrease" in r.json()["detail"]
+
+
+def test_native_compact_total_timeout_covers_post_command_verification(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    sid = _make_compact_session(client)
+    result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=sid,
+    )
+
+    class SlowVerifyClient(_FakeCompactClient):
+        async def get_context_usage(self):
+            try:
+                return {"totalTokens": next(self.totals), "maxTokens": 200_000}
+            except StopIteration:
+                await asyncio.Event().wait()
+
+    fake = SlowVerifyClient(result, totals=(190_000,))
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    original_env_int = chat_mod.env_int
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod,
+        "env_int",
+        lambda name, default, **kwargs: (
+            0.02 if name == "MUSELAB_COMPACT_TIMEOUT_S"
+            else original_env_int(name, default, **kwargs)
+        ),
+    )
+
+    r = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert r.status_code == 504, r.text
+    assert "timed out" in r.json()["detail"]
+
+
+def test_native_compact_returns_after_verification_and_schedules_recount(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    sid = _make_compact_session(client)
+    result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=sid,
+    )
+    fake = _FakeCompactClient(result, totals=(190_000, 50_000))
+    scheduled = []
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod,
+        "_schedule_post_compact_refresh",
+        lambda compact_sid, model, usage: scheduled.append(
+            (compact_sid, model, usage)),
+    )
+
+    r = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert r.status_code == 200, r.text
+    assert scheduled
+    assert scheduled[0][0] == sid
+    assert scheduled[0][2]["totalTokens"] == 50_000

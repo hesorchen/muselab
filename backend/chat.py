@@ -723,6 +723,10 @@ class TurnBroadcast:
         # before the client exists in `_clients` and before `self.task` above is
         # created. `_start_turn` owns and clears this handle.
         self.startup_task: "asyncio.Task | None" = None
+        # The global activity row starts as soon as this broadcast reserves the
+        # session, before cold client/MCP startup. Startup failure/cancellation
+        # uses this bit to close only rows that were actually created.
+        self.activity_started = False
 
     def publish(self, event: dict) -> None:
         """Route one SSE event to the record channel, the live channel, or both.
@@ -950,6 +954,10 @@ def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
 # task settlement + auto-continuation and released the reader.
 _sessions_with_inflight_tasks: dict[str, set[str]] = {}
 _task_watchers: dict[str, asyncio.Task] = {}
+# Small post-response maintenance tasks, currently used to refresh compacted
+# transcript counts after the verified compact result has already reached the
+# browser. Strong references prevent accidental mid-run garbage collection.
+_maintenance_tasks: set[asyncio.Task] = set()
 # Original user-turn start (epoch seconds) retained across the detached gap and
 # every headless continuation. `/active` returns it after a page refresh so the
 # footer timer keeps counting from the real turn start instead of restarting.
@@ -971,12 +979,12 @@ _TASK_WATCH_TIMEOUT = env_int("MUSELAB_TASK_WATCH_TIMEOUT", 1800, min_value=60)
 # AssistantMessage + ResultMessage before closing the continuation and
 # unpinning — bounding the worst case (no auto-continue ever comes) instead of
 # holding the client + the _active_turns slot for the full _TASK_WATCH_TIMEOUT.
-_CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 60, min_value=5)
+_CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 8, min_value=2)
 # Short grace for USER-STOPPED tasks: the CLI doesn't auto-continue after a
 # deliberate stop, so the watcher only needs a token window before closing
 # the continuation (frees the attached FE from an idle "streaming…" footer).
 _STOPPED_CONTINUATION_GRACE = env_int(
-    "MUSELAB_STOPPED_CONTINUATION_GRACE", 5, min_value=1)
+    "MUSELAB_STOPPED_CONTINUATION_GRACE", 2, min_value=1)
 # task_id -> description, surviving across the turn that started the task. The
 # per-turn inflight_tasks dict is local to a turn. This module-level cache keeps
 # the label available to the detached watcher and across watcher replacement.
@@ -2585,6 +2593,7 @@ async def shutdown_runtime() -> None:
     tasks: set[asyncio.Task] = {
         task for task in _task_watchers.values() if not task.done()
     }
+    tasks.update(task for task in _maintenance_tasks if not task.done())
     for broadcast in tuple(_active_turns.values()):
         broadcast.cancelled = True
         for attr in ("startup_task", "task"):
@@ -2614,6 +2623,7 @@ async def shutdown_runtime() -> None:
         _active_turns.clear()
         _sessions_with_inflight_tasks.clear()
         _task_watchers.clear()
+        _maintenance_tasks.clear()
 
     async def _disconnect(client: ClaudeSDKClient) -> None:
         try:
@@ -2863,24 +2873,27 @@ def list_sessions_api(
     # when it finishes). The frontend's local `tabState[sid].streaming` only
     # knows about turns THIS browser kicked off — a turn started on phone A
     # left phone B's picker dot dark. Falling back to `s.active` fixes that.
-    active_sids = {
+    turn_active_sids = {
         sid for sid, bc in _active_turns.items()
         if bc is not None and not bc.done
     }
-    active_sids.update(
+    background_active_sids = {
         sid for sid, task_ids in _sessions_with_inflight_tasks.items()
         if task_ids
-    )
-    active_sids.update(
+    }
+    background_active_sids.update(
         sid for sid, watcher in _task_watchers.items()
         if watcher is not None and not watcher.done()
     )
+    active_sids = turn_active_sids | background_active_sids
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
     sessions = []
     for s in subset:
         s = dict(s)  # don't mutate cache
         s["active"] = s.get("id") in active_sids
+        s["turn_active"] = s.get("id") in turn_active_sids
+        s["background_active"] = s.get("id") in background_active_sids
         sessions.append(s)
     # Piggy-back orphan-attachments GC here — runs at most hourly. Cheaper
     # than a cron, and naturally fires whenever the UI is in use.
@@ -2907,8 +2920,14 @@ def list_sessions_api(
     # active turn set), so key on those and skip the dumps+md5 when nothing
     # changed. Any session mutation bumps the generation; a turn starting /
     # finishing changes active_sids; different limit/ids/q get their own key.
-    _etag_key = (sess.list_sessions_generation(), limit, ids, q_norm,
-                 frozenset(active_sids))
+    _etag_key = (
+        sess.list_sessions_generation(),
+        limit,
+        ids,
+        q_norm,
+        frozenset(turn_active_sids),
+        frozenset(background_active_sids),
+    )
     _hit = _LIST_ETAG_CACHE.get("v")
     if _hit is not None and _hit[0] == _etag_key:
         etag = _hit[1]
@@ -5932,11 +5951,82 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
 
 @router.post("/sessions/{sid}/native-compact", dependencies=[Depends(require_token)])
 async def native_compact_session_api(sid: str) -> dict:
-    async with _session_runtime_lock_for(sid):
-        bc = _active_turns.get(sid)
-        if bc is not None and not bc.done:
-            raise HTTPException(409, "cannot compact while a turn is active")
-        return await _native_compact_session_locked(sid)
+    timeout_s = env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)
+    try:
+        # One deadline covers lock acquisition, client startup, /compact and
+        # the authoritative post-command token verification. Previously only
+        # the slash command itself was bounded, so a wedged control probe could
+        # leave the HTTP request and compacting UI open forever.
+        async with asyncio.timeout(timeout_s):
+            async with _session_runtime_lock_for(sid):
+                bc = _active_turns.get(sid)
+                if bc is not None and not bc.done:
+                    raise HTTPException(409, "cannot compact while a turn is active")
+                return await _native_compact_session_locked(sid)
+    except asyncio.TimeoutError:
+        sys.stderr.write(f"[chat] native /compact total timeout sid={sid[:8]}\n")
+        sys.stderr.flush()
+        raise HTTPException(
+            504, "native /compact timed out — CLI may be hung") from None
+
+
+def _refresh_compacted_message_counts(sid: str, model: str) -> None:
+    """Refresh sidebar counters after the compact result is already visible."""
+    new_msgs = _get_session_msgs(sid, model)
+    n_turns = sum(1 for sm in new_msgs if _is_real_user_prompt(sm))
+    sess.bump_session(
+        sid,
+        message_count=len(new_msgs),
+        turn_count=n_turns,
+    )
+
+
+def _schedule_post_compact_refresh(
+    sid: str,
+    model: str,
+    usage: dict[str, Any],
+) -> None:
+    async def _run() -> None:
+        try:
+            if endpoints.is_third_party(model):
+                capability = await _detect_gateway_context_capability(model)
+                real_max = _positive_int(usage.get("maxTokens"))
+                real_total = _positive_int(usage.get("totalTokens"))
+                sess_u = _session_usage.setdefault(sid, {})
+                details = _context_limit_details(
+                    model,
+                    sdk_max=real_max,
+                    sdk_raw=_positive_int(usage.get("rawMaxTokens")),
+                    stored=_positive_int(sess_u.get("context_limit")),
+                    capability=capability,
+                )
+                _apply_context_limit_details(sess_u, details)
+                threshold = _compact_threshold(
+                    model,
+                    _positive_int(details.get("context_limit")),
+                    _positive_int(usage.get("autoCompactThreshold")),
+                    sdk_max=real_max,
+                    capability=capability,
+                )
+                if threshold:
+                    sess_u["auto_compact_threshold"] = threshold
+                if real_total:
+                    _mark_context_used(
+                        sess_u, "sdk_context", estimate=True)
+                    limit = _positive_int(sess_u.get("context_limit"))
+                    if limit:
+                        sess_u["context_used_pct"] = round(
+                            real_total / limit * 100, 1)
+            await asyncio.to_thread(
+                _refresh_compacted_message_counts, sid, model)
+        except Exception as e:
+            sys.stderr.write(
+                f"[chat] post-compact count refresh skipped sid={sid[:8]}: "
+                f"{type(e).__name__}: {e}\n")
+
+    task = asyncio.create_task(_run())
+    _maintenance_tasks.add(task)
+    task.add_done_callback(_maintenance_tasks.discard)
 
 
 async def _native_compact_session_locked(sid: str) -> dict:
@@ -5966,8 +6056,8 @@ async def _native_compact_session_locked(sid: str) -> dict:
             before_total = _positive_int((await client.get_context_usage()).get("totalTokens"))
         except Exception:
             pass
-        # Bound the wait: a hung CLI /compact would otherwise leave this HTTP
-        # request open forever (the main turn loop has its own 1800s guard).
+        # Bound the command too for direct internal callers. The HTTP endpoint
+        # has an outer deadline that also covers lock/client/verification.
         # 300s is ~2x the observed worst case (~150s at 190K tokens) now that
         # the command reads through the pump instead of racing it.
         async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)):
@@ -6027,26 +6117,8 @@ async def _native_compact_session_locked(sid: str) -> dict:
         if real_total:
             sess_u["context_used"] = real_total
         if endpoints.is_third_party(model):
-            capability = await _detect_gateway_context_capability(model)
-            details = _context_limit_details(
-                model,
-                sdk_max=real_max,
-                sdk_raw=_positive_int(cu.get("rawMaxTokens")),
-                stored=_positive_int(sess_u.get("context_limit")),
-                capability=capability,
-            )
-            _apply_context_limit_details(sess_u, details)
             sess_u["sdk_context_max_tokens"] = real_max
             sess_u["sdk_context_raw_max_tokens"] = _positive_int(cu.get("rawMaxTokens"))
-            threshold = _compact_threshold(
-                model,
-                _positive_int(details.get("context_limit")),
-                _positive_int(cu.get("autoCompactThreshold")),
-                sdk_max=real_max,
-                capability=capability,
-            )
-            if threshold:
-                sess_u["auto_compact_threshold"] = threshold
             if real_total:
                 _mark_context_used(sess_u, "sdk_context", estimate=True)
         elif real_max:
@@ -6065,17 +6137,11 @@ async def _native_compact_session_locked(sid: str) -> dict:
             f"[chat] post-compact ctx refresh skipped for sid={sid[:8]}: "
             f"{type(_e).__name__}\n")
         sys.stderr.flush()
-    # Refresh message_count + turn_count so the sidebar reflects the
-    # compacted size. turn_count uses the real-prompt filter — see the
-    # comment on _is_real_user_prompt for why bare `type == "user"` over-
-    # counts by 5-10× in tool-heavy sessions.
-    try:
-        new_msgs = await asyncio.to_thread(_get_session_msgs, sid, model)
-        n_turns = sum(1 for sm in new_msgs if _is_real_user_prompt(sm))
-        sess.bump_session(sid, message_count=len(new_msgs),
-                           turn_count=n_turns)
-    except Exception:
-        pass
+    # Message/turn recount can scan a very large transcript. It is
+    # presentation bookkeeping, not part of compact correctness; schedule it
+    # after the verified token drop so the browser can leave "compacting"
+    # immediately. The next session read also self-heals these counters.
+    _schedule_post_compact_refresh(sid, model, dict(post_compact_usage or {}))
     return {"ok": True}
 
 
@@ -6103,11 +6169,17 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
     active = _active_turns.get(sid)
     if active is not None and not active.done:
         raise HTTPException(409, "cannot fork while a turn is active")
-    if _sessions_with_inflight_tasks.get(sid):
-        raise HTTPException(
-            409,
-            "cannot fork while background tasks are still running",
-        )
+    # A detached background task belongs to the source CLI process, not to
+    # the JSONL transcript. Forking here is therefore a point-in-time snapshot:
+    # the fork receives every complete record persisted when the SDK reads the
+    # file, while the process and its eventual continuation stay in the source
+    # session. The SDK reads the source bytes once and its JSONL parser ignores
+    # an incomplete final append, so this does not clone a half-written record.
+    # Keep the stricter active-turn guard above: ordinary token/tool streaming
+    # writes continuously and does not yet have a clean user-visible boundary.
+    background_tasks_pending = len(
+        _sessions_with_inflight_tasks.get(sid, ())
+    )
     source_model = (src_meta.get("model") or MODEL).strip()
     source_name = (src_meta.get("name") or "会话").strip()
     requested_title = (req.title or "").strip()
@@ -6160,6 +6232,7 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
     return {
         **meta,
         "session_id": new_sid,
+        "source_background_tasks_pending": background_tasks_pending,
     }
 
 
@@ -8733,45 +8806,53 @@ async def _watch_inflight_tasks(
                 "cta": "retry",
                 "retryable": True,
             })
-        # Persist the completion time the way a normal turn does (see the
-        # set_message_annotation call in _handle_result_message). Without it
-        # the turn-footer under a background-task reply stays blank: the FE
-        # stamps `ts` in memory, but _reconcileCompletedContinuation reloads
-        # the session from canonical history right after this `done`, and only
-        # sidecar annotations survive that reload.
-        #
-        # The uuid MUST come from the transcript tail, not from the live
-        # message object — annotations are keyed by transcript uuid, which is
-        # why the normal path resolves it through _recent_turn_uuids too.
-        try:
-            asst_uuid, _ = await asyncio.to_thread(
-                _recent_turn_uuids, session_id, False)
-            if asst_uuid:
-                existing = await asyncio.to_thread(
-                    sess.get_message_annotations, session_id)
-                # Never overwrite. A continuation that ended without a reply of
-                # its own resolves to the PREVIOUS turn's assistant message,
-                # which already carries that turn's timestamp.
-                if "ts" not in (existing.get(asst_uuid) or {}):
-                    _cont_elapsed = round(max(0.0, time.time() - b.started_at), 1)
-                    await asyncio.to_thread(
-                        sess.set_message_annotation,
-                        session_id, asst_uuid,
-                        model=b.model,
-                        ts=int(time.time() * 1000),
-                        elapsed_s=_cont_elapsed if _cont_elapsed >= 1 else None)
-        except Exception as e:
-            # A missing footer timestamp must never take the continuation down.
-            sys.stderr.write(
-                f"[chat] continuation ts annotation failed "
-                f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
-            sys.stderr.flush()
+        # The broadcast terminal boundary is user-facing truth. Close it
+        # before transcript scans / annotation writes so a slow sidecar or
+        # long JSONL cannot leave the continuation footer pulsing after the
+        # SDK has already emitted its ResultMessage.
         b.publish({"event": "done", "data": json.dumps(done_payload)})
         b.finish()
         async with _lock:
             if _active_turns.get(session_id) is b:
                 _active_turns.pop(session_id, None)
         _remember_recent_turn(session_id, b)
+        # Persist the completion time the way a normal turn does (see the
+        # set_message_annotation call in _handle_result_message). The uuid MUST
+        # come from the transcript tail because annotations are keyed by the
+        # persisted uuid. This is presentation bookkeeping, so run it after
+        # the watcher has released its stream slot; a slow transcript scan or
+        # sidecar write must not delay footer completion or queue draining.
+        async def _annotate_completion() -> None:
+            try:
+                asst_uuid, _ = await asyncio.to_thread(
+                    _recent_turn_uuids, session_id, False)
+                if asst_uuid:
+                    existing = await asyncio.to_thread(
+                        sess.get_message_annotations, session_id)
+                    # Never overwrite. A continuation that ended without a
+                    # reply of its own resolves to the previous turn's
+                    # assistant message, which already has that timestamp.
+                    if "ts" not in (existing.get(asst_uuid) or {}):
+                        cont_elapsed = round(
+                            max(0.0, time.time() - b.started_at), 1)
+                        await asyncio.to_thread(
+                            sess.set_message_annotation,
+                            session_id, asst_uuid,
+                            model=b.model,
+                            ts=int(time.time() * 1000),
+                            elapsed_s=(
+                                cont_elapsed if cont_elapsed >= 1 else None),
+                        )
+            except Exception as e:
+                # A missing footer timestamp must never affect the continuation.
+                sys.stderr.write(
+                    f"[chat] continuation ts annotation failed "
+                    f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
+                sys.stderr.flush()
+
+        annotation_task = asyncio.create_task(_annotate_completion())
+        _maintenance_tasks.add(annotation_task)
+        annotation_task.add_done_callback(_maintenance_tasks.discard)
 
     async def _request_explicit_resume(reason: str) -> bool:
         """Ask the existing SDK session to finish the originating request.
@@ -8861,8 +8942,8 @@ async def _watch_inflight_tasks(
     # Status of the most recent settle. A USER-STOPPED task almost never
     # produces an auto-continue reaction (the CLI treats the stop as user
     # intent), so waiting the full _CONTINUATION_GRACE leaves the attached
-    # frontend spinning "streaming…" for 60 idle seconds after the card
-    # already flipped ⏹ (2026-06-11 footer complaint). Use a short grace
+    # frontend spinning "streaming…" after the card already flipped ⏹
+    # (2026-06-11 footer complaint). Use a short grace
     # for stopped settles; a reaction that somehow arrives later is not
     # lost — it buffers in the SDK queue and the next turn's in-turn
     # dispatch drains it.
@@ -8929,6 +9010,7 @@ async def _watch_inflight_tasks(
                                 "summary": getattr(msg, "summary", None),
                                 "output_file": getattr(msg, "output_file", None),
                                 "usage": dict(getattr(msg, "usage", None) or {}),
+                                "background_tasks_pending": len(pending),
                             })})
                 elif isinstance(msg, TaskUpdatedMessage):
                     terminal = _terminal_task_update(msg)
@@ -8946,6 +9028,7 @@ async def _watch_inflight_tasks(
                             if cont is None:
                                 await _open_continuation()
                             if cont is not None:
+                                terminal["background_tasks_pending"] = len(pending)
                                 cont.publish({
                                     "event": "task_notification",
                                     "data": json.dumps(terminal),
@@ -9018,6 +9101,7 @@ async def _watch_inflight_tasks(
                                 "status": n.get("status") or None,
                                 "summary": n.get("summary") or None,
                                 "output_file": n.get("output_file") or None,
+                                "background_tasks_pending": len(pending),
                             })})
                 elif isinstance(msg, ResultMessage):
                     # End of the CLI's auto-continue reaction — close the
@@ -9174,9 +9258,43 @@ async def _finish_cancelled_startup(
     async with _lock:
         if _active_turns.get(session_id) is broadcast:
             _active_turns.pop(session_id, None)
+    await _finish_activity(session_id, broadcast, "cancelled")
     _remember_recent_turn(session_id, broadcast)
     _delete_active_turn_sidecar(session_id)
     return broadcast
+
+
+async def _start_activity_early(
+    session_id: str,
+    broadcast: TurnBroadcast,
+    prompt: str,
+) -> None:
+    """Expose a reserved turn while its SDK client is still starting."""
+    try:
+        from .activity import activity as _activity
+        await asyncio.to_thread(
+            _activity.start, session_id, summary=prompt)
+        broadcast.activity_started = True
+    except Exception as e:
+        sys.stderr.write(f"[activity] start failed sid={session_id}: {e}\n")
+
+
+async def _finish_activity(
+    session_id: str,
+    broadcast: TurnBroadcast,
+    status: str,
+) -> None:
+    """Close the activity row once, whether startup or the turn ends."""
+    if not broadcast.activity_started:
+        return
+    try:
+        from .activity import activity as _activity
+        await asyncio.to_thread(_activity.finish, session_id, status)
+    except Exception as e:
+        sys.stderr.write(
+            f"[activity] startup finish failed sid={session_id}: {e}\n")
+    finally:
+        broadcast.activity_started = False
 
 
 async def _start_turn(
@@ -9308,6 +9426,13 @@ async def _start_turn(
     # Effort is per-session; read from metadata (settable via PATCH). Empty
     # string = SDK adaptive default, which is what the existing behavior was.
     effort_to_use = (s.get("effort") or "").strip()
+    # "Running" means the backend accepted and exclusively reserved the turn,
+    # not that a cold CLI/MCP client has already finished starting. Publishing
+    # here removes the user-visible startup gap while the terminal cleanup
+    # paths below prevent failed starts from becoming phantom running rows.
+    await _start_activity_early(session_id, broadcast, prompt)
+    if broadcast.cancelled:
+        return await _finish_cancelled_startup(session_id, broadcast)
     # Wrap get_client so SDK / auth pre-check errors surface as a typed
     # _TurnStartError the caller can shape (the /stream handler → SSE error
     # event / 504; the queue drain → pause + push) instead of bubbling up as
@@ -9334,6 +9459,7 @@ async def _start_turn(
             if _active_turns.get(session_id) is broadcast:
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
+        await _finish_activity(session_id, broadcast, "failed")
         raise _TurnStartError(
             "Client connection timed out — CLI process may be hung",
             status=504)
@@ -9350,6 +9476,7 @@ async def _start_turn(
             if _active_turns.get(session_id) is broadcast:
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
+        await _finish_activity(session_id, broadcast, "cancelled")
         raise
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
@@ -9359,6 +9486,7 @@ async def _start_turn(
             if _active_turns.get(session_id) is broadcast:
                 broadcast.finish()
                 _active_turns.pop(session_id, None)
+        await _finish_activity(session_id, broadcast, "failed")
         raise _TurnStartError(err_msg)
 
     # Stop can race the final instant of client startup: the client may have
@@ -9366,14 +9494,6 @@ async def _start_turn(
     # list. Do not send the prompt after the user has already cancelled.
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
-
-    # Record only after the SDK client is ready, so connection failures do not
-    # leave a phantom running task in the global activity center.
-    try:
-        from .activity import activity as _activity
-        await asyncio.to_thread(_activity.start, session_id, summary=prompt)
-    except Exception as e:
-        sys.stderr.write(f"[activity] start failed sid={session_id}: {e}\n")
 
     # Pull attachments from the in-memory store; build content blocks for the
     # SDK. Consume them — same attachment won't be re-sent on retry.
@@ -9600,7 +9720,16 @@ async def _start_turn(
         close to full.
         """
         try:
-            cu = await client.get_context_usage()
+            # This probe is advisory when no compact is needed. Never let a
+            # wedged SDK control request delay the user's real prompt for the
+            # full compact window.
+            cu = await asyncio.wait_for(
+                client.get_context_usage(),
+                timeout=min(
+                    10,
+                    env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1),
+                ),
+            )
         except Exception as e:
             sys.stderr.write(
                 f"[chat-preflight] get_context_usage skipped sid={session_id[:8]} "
@@ -9672,16 +9801,31 @@ async def _start_turn(
         # acknowledge itself cannot kill the turn it just made room for.
         cmd_error: Exception | None = None
         try:
-            async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)):
-                await _run_sdk_command_checked(client, "/compact")
-        except Exception as e:
-            cmd_error = e
-            sys.stderr.write(
-                f"[chat-preflight] native compact reported failure sid={session_id[:8]} "
-                f"model={model_to_use}: {type(e).__name__}: {e} — verifying\n")
-            sys.stderr.flush()
-        try:
-            cu2 = await client.get_context_usage()
+            # One compact deadline covers both the slash command and the
+            # authoritative token-drop verification. The old split left the
+            # compact bubble spinning forever when the second control request
+            # hung after `/compact` had already succeeded.
+            async with asyncio.timeout(
+                env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)
+            ):
+                try:
+                    await _run_sdk_command_checked(client, "/compact")
+                except Exception as e:
+                    cmd_error = e
+                    sys.stderr.write(
+                        f"[chat-preflight] native compact reported failure "
+                        f"sid={session_id[:8]} model={model_to_use}: "
+                        f"{type(e).__name__}: {e} — verifying\n")
+                    sys.stderr.flush()
+                cu2 = await client.get_context_usage()
+        except asyncio.TimeoutError:
+            await _emit_compact(
+                emit,
+                "end",
+                ok=False,
+                error="native compact timed out during command or verification",
+            )
+            raise
         except Exception as e:
             # Can't observe the outcome, so the command's verdict is all we
             # have. No reading also means no evidence of success.
@@ -10218,6 +10362,11 @@ async def _start_turn(
                     "summary": summary,
                     "output_file": output_file,
                     "usage": dict(getattr(msg, "usage", None) or {}),
+                    "background_tasks_pending": max(
+                        0,
+                        len(_sessions_with_inflight_tasks.get(
+                            session_id, ())) - (1 if tid else 0),
+                    ),
                 })}
                 # In-turn settle (the rare case where a background task finishes
                 # before this turn's ResultMessage). The card already flipped via
@@ -10241,6 +10390,8 @@ async def _start_turn(
                     f"[chat] in-turn terminal update sid={session_id[:8]} "
                     f"task={tid} status={terminal['status']} won={won_updated}\n")
                 if won_updated:
+                    terminal["background_tasks_pending"] = len(
+                        _sessions_with_inflight_tasks.get(session_id, ()))
                     yield {
                         "event": "task_notification",
                         "data": json.dumps(terminal),
@@ -10288,6 +10439,79 @@ async def _start_turn(
             sess_u["total_cost_usd"] += cost
             sess_u["last_turn_at"] = time.time()
 
+            # ResultMessage is the SDK's authoritative turn boundary. Do the
+            # small status/error accounting needed by the browser immediately,
+            # close the global activity row, and emit `done` BEFORE slower
+            # bookkeeping below (context control calls, transcript parsing,
+            # push fan-out, JSONL compatibility cleanup). The old ordering kept
+            # the footer pulsing "Running" for seconds after the final answer
+            # was already visible.
+            was_cancelled = session_id in _pending_interrupts
+            _pending_interrupts.discard(session_id)
+            broadcast.cancelled = was_cancelled
+            _result_error = _sdk_result_error(msg)
+            _turn_error = _merge_sdk_errors([
+                *turn_sdk_errors,
+                *([_result_error] if _result_error else []),
+            ])
+            _is_error = _turn_error is not None
+            _subtype = getattr(msg, "subtype", None)
+            _errors = getattr(msg, "errors", None) or []
+            if not isinstance(_errors, (list, tuple)):
+                _errors = [_errors]
+            _api_error_status = (
+                (_turn_error or {}).get("api_error_status")
+                or getattr(msg, "api_error_status", None)
+            )
+            _error_message = (_turn_error or {}).get("message", "")
+            _error_class = _classify_stream_error(_error_message) if _is_error else {
+                "kind": None, "cta": None, "retryable": False,
+            }
+            _activity_status = ("cancelled" if was_cancelled else
+                                "failed" if _is_error else "completed")
+            await _finish_activity(session_id, broadcast, _activity_status)
+            _done_session_usage = dict(sess_u)
+            _done_memory_recall = mem0.pop_recall_trace(session_id)
+            _done_background_tasks = len(
+                _merge_session_inflight(session_id, inflight_tasks)
+            )
+            yield {"event": "done", "data": json.dumps({
+                "duration_ms": getattr(msg, "duration_ms", None),
+                "total_cost_usd": cost,
+                "model": model_to_use,
+                "stats": _stats,
+                "cancelled": was_cancelled,
+                "is_error": _is_error,
+                "error": _error_message,
+                "kind": _error_class["kind"],
+                "cta": _error_class["cta"],
+                "retryable": _error_class["retryable"],
+                "result_subtype": _subtype,
+                "errors": (_dedupe_error_parts([*_errors, _error_message])
+                           if _is_error else []),
+                "api_error_status": _api_error_status,
+                "turn_usage": {
+                    "input_tokens": in_t,
+                    "output_tokens": out_t,
+                    "cache_read_tokens": cr_t,
+                    "cache_creation_tokens": cc_t,
+                },
+                # Context-control refresh continues below. Assistant-message
+                # usage has already updated this snapshot; a later API read
+                # sees the authoritative postprocessed value.
+                "session_usage": _done_session_usage,
+                "budget_usd": _budget_usd(),
+                "budget_used_pct": (
+                    round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
+                    if _budget_usd() > 0 else 0
+                ),
+                "memory_recall": _done_memory_recall,
+                "background_tasks_pending": _done_background_tasks,
+            })}
+
+            # Everything below is post-turn persistence/telemetry. It remains
+            # inside the detached pump so browser disconnects cannot cancel it,
+            # but it no longer delays the user-visible terminal event.
             # Pull authoritative max-window from SDK so the meter reflects the
             # ACTUAL effective limit (which may be 1M for Pro/Max subscribers,
             # not the hardcoded 200K in MODEL_CONTEXT_LIMITS). One control
@@ -10488,20 +10712,6 @@ async def _start_turn(
                                turn_count=n_turns,
                                auto_rename_from=_rename_src)
             sess.update_model(session_id, model_to_use)
-            # Was this turn cancelled by an explicit /interrupt? The FE
-            # closes its EventSource immediately on stop-click, which
-            # zeroes live_subscribers below — without this flag, the
-            # "no live subscriber → fire push" path would buzz the user
-            # for a reply they just cancelled. Consume the flag (.discard
-            # always returns None — wrap with `in` test then discard).
-            # (2026-05-23 user report)
-            was_cancelled = session_id in _pending_interrupts
-            _pending_interrupts.discard(session_id)
-            # Record on the broadcast so the queue-drain trigger (which runs
-            # in _pump_gen_to_broadcast's finally, after _pending_interrupts
-            # is already cleared here) can tell "user stopped" from "finished
-            # / errored" and pause instead of advancing the queue.
-            broadcast.cancelled = was_cancelled
             # Web Push on turn-done. Three gates, in order:
             #   1. Turn was NOT user-cancelled — see was_cancelled above.
             #   2. No device has heartbeated /api/presence recently — i.e.
@@ -10615,30 +10825,6 @@ async def _start_turn(
                     await asyncio.to_thread(_jc.clean_session, session_id)
                 except Exception as e:
                     sys.stderr.write(f"[chat] jsonl cleanup failed: {e}\n")
-            # SDK reports turn-level failures THROUGH ResultMessage, not as
-            # exceptions: max-turns / budget exceeded, permission denied,
-            # API errors all arrive as a normal ResultMessage with
-            # is_error=True (+ subtype / errors detail). Surface them in the
-            # done payload so the FE can render a failure state — previously
-            # these turns looked identical to successes in UI and history.
-            _result_error = _sdk_result_error(msg)
-            _turn_error = _merge_sdk_errors([
-                *turn_sdk_errors,
-                *([_result_error] if _result_error else []),
-            ])
-            _is_error = _turn_error is not None
-            _subtype = getattr(msg, "subtype", None)
-            _errors = getattr(msg, "errors", None) or []
-            if not isinstance(_errors, (list, tuple)):
-                _errors = [_errors]
-            _api_error_status = (
-                (_turn_error or {}).get("api_error_status")
-                or getattr(msg, "api_error_status", None)
-            )
-            _error_message = (_turn_error or {}).get("message", "")
-            _error_class = _classify_stream_error(_error_message) if _is_error else {
-                "kind": None, "cta": None, "retryable": False,
-            }
             # Memory write is deferred until turn status is known. Clean
             # exchanges may be consolidated into memories. Cancelled turns are
             # evidence-only (never fact candidates), which preserves the useful
@@ -10656,52 +10842,6 @@ async def _start_turn(
                 memory_outcome_scheduled = mem0.schedule_failed(
                     session_id, model_to_use, prompt,
                     "".join(assistant_acc), _error_message, new_asst_uuid)
-            yield {"event": "done", "data": json.dumps({
-                "duration_ms": getattr(msg, "duration_ms", None),
-                "total_cost_usd": cost,
-                "model": model_to_use,
-                "stats": _stats,
-                # Flag so the FE can skip celebration UI (success toast /
-                # green-dot tab unread badge would be wrong for a user-
-                # cancelled turn — they clicked stop, they know).
-                "cancelled": was_cancelled,
-                "is_error": _is_error,
-                "error": _error_message,
-                "kind": _error_class["kind"],
-                "cta": _error_class["cta"],
-                "retryable": _error_class["retryable"],
-                "result_subtype": _subtype,
-                "errors": (_dedupe_error_parts([*_errors, _error_message])
-                           if _is_error else []),
-                "api_error_status": _api_error_status,
-                # turn_usage: cumulative (ResultMessage.usage). FE should
-                # prefer session_usage.context_* for window display. Will be
-                # removed once FE is fully migrated.
-                "turn_usage": {
-                    "input_tokens": in_t,
-                    "output_tokens": out_t,
-                    "cache_read_tokens": cr_t,
-                    "cache_creation_tokens": cc_t,
-                },
-                "session_usage": _session_usage[session_id],
-                "budget_usd": _budget_usd(),
-                "budget_used_pct": (
-                    round(_stats["total_cost_usd"] / _budget_usd() * 100, 1)
-                    if _budget_usd() > 0 else 0
-                ),
-                # White-box recall trace. The content is already bounded and
-                # provenance-only; the UI keeps it collapsed by default.
-                "memory_recall": mem0.pop_recall_trace(session_id),
-                # Main ResultMessage can arrive while SDK-native background
-                # Agent/Bash tasks continue. The browser keeps the turn footer
-                # alive and queues follow-ups until their detached watcher
-                # completes, preventing old continuation text from appearing
-                # beneath a newer user message.
-                "background_tasks_pending": len(
-                    _merge_session_inflight(session_id, inflight_tasks)
-                ),
-            })}
-
         # event_gen is now driven by a detached background task (see
         # stream endpoint below), so the SSE generator doesn't cancel
         # these workers when the browser disconnects — they complete
@@ -10861,6 +11001,7 @@ async def _start_turn(
         nonlocal memory_outcome_scheduled
         turn_errored = False
         turn_error_text = ""
+        terminal_published = False
         try:
             # None → asyncio.timeout is a no-op wrapper (no deadline armed).
             async with asyncio.timeout(BG_TIMEOUT_S or None):
@@ -10888,7 +11029,13 @@ async def _start_turn(
                         except (ValueError, TypeError):
                             pass
                     broadcast.publish(ev)
+                    if isinstance(ev, dict) and ev.get("event") == "done":
+                        terminal_published = True
         except asyncio.TimeoutError:
+            if terminal_published:
+                sys.stderr.write(
+                    f"[chat] post-turn bookkeeping timed out sid={session_id}\n")
+                return
             turn_errored = True
             turn_error_text = f"turn exceeded {BG_TIMEOUT_S}s"
             sys.stderr.write(
@@ -10898,6 +11045,11 @@ async def _start_turn(
             broadcast.publish(
                 _error_event(f"turn exceeded {BG_TIMEOUT_S}s"))
         except Exception as e:
+            if terminal_published:
+                sys.stderr.write(
+                    f"[chat] post-turn bookkeeping failed sid={session_id} "
+                    f"exc={type(e).__name__}: {e}\n")
+                return
             turn_errored = True
             turn_error_text = f"{type(e).__name__}: {e}"
             import traceback as _tb
@@ -10920,14 +11072,10 @@ async def _start_turn(
                         "".join(assistant_acc),
                         turn_error_text or "turn stream failed",
                         broadcast.turn_id)
-            try:
-                from .activity import activity as _activity
-                _activity_status = ("cancelled" if broadcast.cancelled else
-                                    "failed" if turn_errored else "completed")
-                await asyncio.to_thread(
-                    _activity.finish, session_id, _activity_status)
-            except Exception as e:
-                sys.stderr.write(f"[activity] finish failed sid={session_id}: {e}\n")
+            _activity_status = ("cancelled" if broadcast.cancelled else
+                                "failed" if turn_errored else "completed")
+            await _finish_activity(
+                session_id, broadcast, _activity_status)
             broadcast.finish()
             _active_turns.pop(session_id, None)
             if session_id in _pending_runtime_rebuilds:
