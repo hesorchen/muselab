@@ -289,6 +289,8 @@ def disable_skill(artifact_id: str) -> dict:
         return engine.disable_skill(artifact_id)
     except KeyError:
         raise HTTPException(404, "skill candidate not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @router.get("/jobs")
@@ -338,6 +340,8 @@ def export_memory() -> dict:
     governance state (status/authority/confidence), because import_snapshot
     restores by primary key: replaying an export cannot promote a superseded row
     back to user-confirmed the way a lossy `{kind, content}` round-trip would.
+    Installed Skill paths are host-local and are therefore stripped on import;
+    an imported active Skill candidate returns to pending review.
     """
     cfg = load_config()
     return {

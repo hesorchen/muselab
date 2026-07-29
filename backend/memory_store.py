@@ -1024,7 +1024,9 @@ class MemoryStore:
         """Transactionally restore a v2 canonical snapshot.
 
         Existing primary keys win, making replay idempotent and preventing an
-        import from overwriting newer local governance decisions.
+        import from overwriting newer local governance decisions. Host-local
+        Skill activation is the deliberate exception: imported candidates must
+        be approved again before they can affect the local filesystem.
         """
         counts: dict[str, int] = {}
         imported_memory_ids: list[str] = []
@@ -1072,6 +1074,21 @@ class MemoryStore:
                 # Embeddings are deliberately absent from portable snapshots.
                 row["embedding_state"] = "pending"
                 memory_ids.append(str(row.get("id", "")))
+            elif table == "artifacts" and row.get("kind") == "skill_candidate":
+                payload = row.get("payload")
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid skill_candidate payload")
+                # A Skill's installed path and active state are host-local
+                # effects, not portable governance data. Restoring them from
+                # an untrusted snapshot would let the later disable action
+                # operate on a path chosen by the snapshot. Keep the reviewed
+                # draft, but require explicit approval on this host.
+                payload = dict(payload)
+                payload.pop("installed_path", None)
+                payload.pop("approved_at", None)
+                row["payload"] = payload
+                if row.get("status") == "active":
+                    row["status"] = "pending_review"
             args = [
                 MemoryStore._snapshot_column_value(row, column, json_columns)
                 for column in columns

@@ -1119,6 +1119,25 @@ class MemoryEngine:
         self.store.audit(cfg.owner_id, "reject", "skill_candidate", artifact_id)
         return updated
 
+    def _installed_skill_path(self, artifact: dict) -> Path:
+        payload = artifact.get("payload") or {}
+        installed_value = payload.get("installed_path", "")
+        if not isinstance(installed_value, str) or not installed_value:
+            raise ValueError("active Skill has no trusted installed path")
+        installed = Path(installed_value)
+        skills_root = (Path.home() / ".claude" / "skills").resolve()
+        slug = self._safe_slug(str(payload.get("name", artifact.get("id", ""))))
+        expected = (
+            skills_root
+            / f"muselab-generated-{slug}"
+            / "SKILL.md"
+        )
+        if installed.is_symlink() or installed.parent.is_symlink():
+            raise ValueError("refusing to disable a Skill through a symlink")
+        if installed.resolve() != expected:
+            raise ValueError("Skill path escapes its generated installation directory")
+        return installed
+
     def disable_skill(self, artifact_id: str) -> dict:
         cfg = self.config()
         artifact = self.store.artifact(artifact_id)
@@ -1126,9 +1145,13 @@ class MemoryEngine:
                 or artifact.get("kind") != "skill_candidate"
                 or artifact.get("status") != "active"):
             raise KeyError(artifact_id)
-        installed = Path(str((artifact.get("payload") or {}).get("installed_path", "")))
+        installed = self._installed_skill_path(artifact)
         if installed.is_file():
-            disabled_dir = memory_dir() / "disabled-skills" / artifact_id
+            disabled_name = (
+                f"{self._safe_slug(artifact_id)[:40]}-"
+                f"{hashlib.sha256(artifact_id.encode()).hexdigest()[:12]}"
+            )
+            disabled_dir = memory_dir() / "disabled-skills" / disabled_name
             disabled_dir.mkdir(parents=True, exist_ok=True)
             shutil.move(str(installed), str(disabled_dir / "SKILL.md"))
             try:

@@ -196,3 +196,32 @@ def test_portable_snapshot_round_trip_preserves_governance_and_provenance(
 
     replay = restored.import_snapshot(snapshot, "owner-b")
     assert all(value == 0 for value in replay.values())
+
+
+def test_imported_active_skill_requires_local_reapproval(tmp_path: Path):
+    source = MemoryStore(tmp_path / "source.sqlite3")
+    skill = source.create_artifact(
+        "owner-a",
+        "skill_candidate",
+        "portable workflow",
+        {
+            "name": "portable-workflow",
+            "skill_markdown": (
+                "---\nname: portable-workflow\n"
+                "description: Portable workflow\n---\n\n# Workflow\n"
+            ),
+            "installed_path": "/tmp/snapshot-controlled/SKILL.md",
+            "approved_at": 123.0,
+        },
+        [],
+        status="active",
+    )
+
+    restored = MemoryStore(tmp_path / "restored.sqlite3")
+    restored.import_snapshot(source.export_snapshot("owner-a"), "owner-b")
+
+    imported = restored.artifact(skill["id"])
+    assert imported["owner_id"] == "owner-b"
+    assert imported["status"] == "pending_review"
+    assert "installed_path" not in imported["payload"]
+    assert "approved_at" not in imported["payload"]

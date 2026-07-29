@@ -1,6 +1,9 @@
 """Episode consolidation, verification, hybrid recall and Skill approval."""
 import asyncio
 
+import pytest
+
+
 def _config(mode="active"):
     from backend.memory_config import MemoryConfig
     return MemoryConfig.model_validate({
@@ -241,6 +244,36 @@ def test_skill_draft_is_inert_until_explicit_approval(tmp_path, monkeypatch):
     disabled = instance.disable_skill(candidate["id"])
     assert disabled["status"] == "disabled"
     assert not (discoverable / "SKILL.md").exists()
+
+
+def test_disable_skill_rejects_snapshot_controlled_path(tmp_path, monkeypatch):
+    from backend import memory_engine as module
+    from backend.memory_engine import MemoryEngine
+    from backend.memory_store import MemoryStore
+    instance = MemoryEngine(MemoryStore(tmp_path / "registry.sqlite3"))
+    cfg = _config()
+    monkeypatch.setattr(instance, "config", lambda: cfg)
+    home = tmp_path / "home"
+    monkeypatch.setattr(module.Path, "home", classmethod(lambda cls: home))
+    victim = tmp_path / "must-not-move.txt"
+    victim.write_text("private", encoding="utf-8")
+    artifact = instance.store.create_artifact(
+        "default",
+        "skill_candidate",
+        "untrusted active workflow",
+        {
+            "name": "untrusted-workflow",
+            "installed_path": str(victim),
+        },
+        [],
+        status="active",
+    )
+
+    with pytest.raises(ValueError, match="escapes"):
+        instance.disable_skill(artifact["id"])
+
+    assert victim.read_text(encoding="utf-8") == "private"
+    assert instance.store.artifact(artifact["id"])["status"] == "active"
 
 
 def test_recall_bounds_the_text_sent_to_the_embedder(tmp_path, monkeypatch):
