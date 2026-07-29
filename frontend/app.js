@@ -517,6 +517,10 @@ function portal() {
     },
     activity: {
       show: false, loading: false, events: [],
+      // Status groups remain the default operational view. The alternate
+      // timeline shows every state by its latest transition time.
+      view: "status",
+      viewLoaded: false,
       summary: {
         running: 0, unread: 0, attention: 0,
         groups: { review: 0, running: 0, failed: 0, history: 0 },
@@ -532,8 +536,14 @@ function portal() {
     _activityFetchPromises: {},
     _activityRequestSeq: 0,
     _activityAppliedSeq: 0,
-    // Per-task "run-now" inflight flag — disables retry / send buttons
-    // until the LLM call returns and history is reloaded. Keyed by task id.
+    _activityGeneration: "",
+    _activityRevision: 0,
+    _activityLiveSource: null,
+    _activityLiveSeq: 0,
+    _activityLiveTimer: null,
+    _activityLiveVisibilityBound: false,
+    // Per-task "run-now" inflight flag — disables retry / send buttons until
+    // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
     // Single notification switch — collapsed from 4 toggles (vibrate /
     // push / notify_scheduled / notify_normal) on 2026-05-28 because the
@@ -1949,6 +1959,7 @@ function portal() {
       this._startSessionsSync();
       this._startFileEvents();
       this.fetchActivity();
+      this._startActivityEvents();
       this._startMemoryMonitor();
       // Restoring a saved current session means the user is already looking at
       // it; clear any completion that landed before this page loaded.
@@ -5661,6 +5672,10 @@ function portal() {
         // task settlement opens a continuation broadcast.
         backgroundActive: false,
         backgroundTaskCount: 0,
+        // A background task can settle before Claude starts its automatic
+        // follow-up reaction. Keep the transport attached, but suppress the
+        // generic running footer during that idle protocol gap.
+        _continuationAwaitingReaction: false,
         // Exact backend turn currently owned by this tab. Session id is not
         // sufficient: a reconnect for turn A must never attach to newer B.
         activeTurnId: "",
@@ -5683,6 +5698,11 @@ function portal() {
         _lastSseActivity: 0,
         _stallWatch: null,
         _serverActiveObserved: false,
+        // A terminal SSE event is newer than the last polled session-list
+        // snapshot. Keep its activity flags authoritative until the backend
+        // list echoes the same state, so an in-flight stale response cannot
+        // relight the tab's running dot for another poll interval.
+        _sessionActivityExpected: null,
         _streamHealthProbe: null,
         _reconnectTimer: null,
         _canonicalResyncTimer: null,
@@ -5798,6 +5818,9 @@ function portal() {
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
+      if (st._sessionActivityExpected === undefined) {
+        st._sessionActivityExpected = null;
+      }
       return st;
     },
 
@@ -6210,10 +6233,10 @@ function portal() {
       const bgState = this.tabState[sid];
       if (!this._bgHasRunningCard(sid)
           && !(bgState && bgState.backgroundActive)) return;
-      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (1800s): at an
-      // 8s cadence that's ~225 ticks. Prevents an interval lingering forever if
+      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (1800s): at a
+      // 2s cadence that's ~900 ticks. Prevents an interval lingering forever if
       // the user navigates away and the running card never resolves on the FE.
-      let ticksLeft = 230;
+      let ticksLeft = 910;
       const tick = async () => {
         if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
         const ownerState = this.tabState[sid];
@@ -6314,7 +6337,7 @@ function portal() {
           }
         } catch (_e) {}
       };
-      this._bgContPollers[sid] = setInterval(tick, 8000);
+      this._bgContPollers[sid] = setInterval(tick, 2000);
       tick();   // kick once immediately
     },
     _stopBgContPoller(sid) {
@@ -6807,6 +6830,32 @@ function portal() {
       }
       return out;
     },
+    _retainExpectedSessionActivity(meta) {
+      const st = meta && this.tabState && this.tabState[meta.id];
+      const expected = st && st._sessionActivityExpected;
+      if (!expected) return meta;
+      // This guard should normally clear on the first post-terminal list
+      // response. Bound it defensively so a broken/legacy backend cannot hide
+      // a genuinely new cross-device turn forever.
+      if (Date.now() - Number(expected.at || 0) > 15_000) {
+        st._sessionActivityExpected = null;
+        return meta;
+      }
+      const fields = ["active", "turn_active", "background_active"];
+      const echoed = fields.every(field =>
+        Object.prototype.hasOwnProperty.call(meta, field)
+        && !!meta[field] === !!expected[field]);
+      if (echoed) {
+        st._sessionActivityExpected = null;
+        return meta;
+      }
+      return {
+        ...meta,
+        active: !!expected.active,
+        turn_active: !!expected.turn_active,
+        background_active: !!expected.background_active,
+      };
+    },
     // Shared session-list applier. Snapshots the prior server-side `active`
     // flags BEFORE swapping in the new list (FIX ⑩) so we can detect a
     // streaming→idle transition that happened on another device: when a turn
@@ -6833,7 +6882,9 @@ function portal() {
       if (_pending.length) {
         next = [...(_pending.map(id => _om[id])), ...next];
       }
-      next = next.map(meta => this._retainExpectedSessionSettings(meta));
+      next = next
+        .map(meta => this._retainExpectedSessionSettings(meta))
+        .map(meta => this._retainExpectedSessionActivity(meta));
       // Keep the OPEN conversation's messages live too — not just the session
       // LIST. Runs BEFORE the equality early-return so it fires every pull even
       // when the picker itself doesn't need a re-render (e.g. a turn still
@@ -7028,6 +7079,7 @@ function portal() {
       st.streaming = false;
       st.backgroundActive = false;
       st.backgroundTaskCount = 0;
+      st._continuationAwaitingReaction = false;
       st._draining = false;
       st._reconnectAttempts = 0;
       st._serverActiveObserved = false;
@@ -7147,6 +7199,8 @@ function portal() {
         if ((x.model || "") !== (y.model || "")) return false;
         if (!!x.pinned !== !!y.pinned) return false;
         if (!!x.active !== !!y.active) return false;
+        if (!!x.turn_active !== !!y.turn_active) return false;
+        if (!!x.background_active !== !!y.background_active) return false;
         if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
         if ((x.effort || "") !== (y.effort || "")) return false;
@@ -8119,11 +8173,43 @@ function portal() {
       // chat.py's _active_turns). So the blue "streaming" dot lights up on
       // every device, not just the one that sent the message.
       const s = this.sessions.find(x => x.id === tid);
-      return !!(s && s.active);
+      if (!s) return false;
+      // New backends distinguish a transcript-writing turn/continuation from
+      // a detached background process. Fork is safe in the latter state but
+      // not while JSONL is actively streaming. Fall back to the legacy
+      // aggregate flag during rolling upgrades.
+      if (Object.prototype.hasOwnProperty.call(s, "turn_active")) {
+        return !!s.turn_active;
+      }
+      return !!s.active;
+    },
+    _setSessionActivityExpectation(tid, backgroundActive = false) {
+      if (!tid) return;
+      const st = this._ensureTabState(tid);
+      const background = !!backgroundActive;
+      st._sessionActivityExpected = {
+        active: background,
+        turn_active: false,
+        background_active: background,
+        at: Date.now(),
+      };
+      // Apply the terminal transition in the same browser tick as `done`.
+      // The next list pull confirms and clears the expectation.
+      this.sessions = (this.sessions || []).map(session =>
+        session.id === tid
+          ? {
+              ...session,
+              active: background,
+              turn_active: false,
+              background_active: background,
+            }
+          : session);
     },
     isTabBackgroundActive(tid) {
       const st = this.tabState[tid];
-      return !!(st && st.backgroundActive);
+      if (st && st.backgroundActive) return true;
+      const s = this.sessions.find(x => x.id === tid);
+      return !!(s && s.background_active);
     },
     isTabRunning(tid) {
       return this.isTabBackgroundActive(tid) || this.isTabStreaming(tid);
@@ -10182,8 +10268,8 @@ function portal() {
           } catch (_) {}
           const message = response.status === 409
             ? (this.lang === "zh"
-              ? "等当前回复或后台任务完成后再 Fork"
-              : "Wait for the active turn or background task to finish")
+              ? "等当前正在写入的回复完成后再 Fork"
+              : "Wait for the currently streaming reply to finish")
             : (/no messages/i.test(detail)
               ? (this.lang === "zh" ? "空会话无法 Fork" : "An empty conversation cannot be forked")
               : (this.lang === "zh" ? "Fork 对话失败" : "Could not fork conversation"));
@@ -10208,11 +10294,15 @@ function portal() {
         st._loaded = false;
         await this.openTab(newId);
         this.toast(
-          upToMessageId
-            ? (this.lang === "zh" ? "已从这里创建分支" : "Forked from this point")
-            : (this.lang === "zh" ? "已 Fork 对话" : "Conversation forked"),
+          Number(payload.source_background_tasks_pending) > 0
+            ? (this.lang === "zh"
+              ? `已从当前进度 Fork；${payload.source_background_tasks_pending} 个后台任务仍在原会话运行`
+              : `Forked the current snapshot; ${payload.source_background_tasks_pending} background task(s) remain in the source`)
+            : (upToMessageId
+              ? (this.lang === "zh" ? "已从这里创建分支" : "Forked from this point")
+              : (this.lang === "zh" ? "已 Fork 对话" : "Conversation forked")),
           "success",
-          2200,
+          Number(payload.source_background_tasks_pending) > 0 ? 4200 : 2200,
         );
         return meta;
       } catch (error) {
@@ -20422,8 +20512,13 @@ function portal() {
       const primaryWorkspace = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
       const streamWorkspace = (streamSession && streamSession.cwd) || primaryWorkspace;
 
-      if (!isReconnect) streamState._serverActiveObserved = false;
+      if (!isReconnect) {
+        streamState._serverActiveObserved = false;
+        // A real new local turn supersedes any just-finished list expectation.
+        streamState._sessionActivityExpected = null;
+      }
       streamState.streaming = true;
+      streamState._continuationAwaitingReaction = false;
       if (streamSid === this.currentId) this.streaming = true;
       // A live turn renders DIRECTLY into the visible pane, so it must never be
       // hidden by the bulk-reveal gate. `messagesReady=false` drives
@@ -20483,10 +20578,8 @@ function portal() {
       // Fresh (non-reconnect) sends always start at now.
       let _streamStartMs;
       if (isReconnect) {
-        if (isContinuation && streamState.backgroundActive
-            && streamState._streamStartedAt) {
-          _streamStartMs = streamState._streamStartedAt;
-        } else if (opts.startedAt) _streamStartMs = opts.startedAt * 1000;
+        if (isContinuation) _streamStartMs = Date.now();
+        else if (opts.startedAt) _streamStartMs = opts.startedAt * 1000;
         else if (streamState._streamStartedAt) _streamStartMs = streamState._streamStartedAt;
         else _streamStartMs = Date.now();
       } else {
@@ -20842,6 +20935,38 @@ function portal() {
         else { curBubble = null; acc = ""; }
       };
       const closeAsst = () => { flushRender(); curBubble = null; acc = ""; };
+      const _setContinuationAwaitingReaction = (waiting) => {
+        if (!isContinuation) return;
+        const next = !!waiting;
+        if (streamState._continuationAwaitingReaction === next) return;
+        streamState._continuationAwaitingReaction = next;
+        if (next) {
+          if (streamState._streamTimer) {
+            clearInterval(streamState._streamTimer);
+            streamState._streamTimer = null;
+          }
+          streamState._streamStartedAt = 0;
+          streamState.streamElapsed = 0;
+          if (this.currentId === streamSid) {
+            this._streamTimer = null;
+            this._streamStartedAt = 0;
+            this.streamElapsed = 0;
+          }
+          return;
+        }
+        if (!streamState.streaming || streamState._streamTimer) return;
+        streamState._streamStartedAt = Date.now();
+        streamState._streamTimer = setInterval(() => {
+          const elapsed = Math.max(
+            0, (Date.now() - streamState._streamStartedAt) / 1000);
+          streamState.streamElapsed = elapsed;
+          if (this.currentId === streamSid) this.streamElapsed = elapsed;
+        }, 1000);
+        if (this.currentId === streamSid) {
+          this._streamStartedAt = streamState._streamStartedAt;
+          this._streamTimer = streamState._streamTimer;
+        }
+      };
 
       // Re-render the in-flight assistant bubble from the accumulated text.
       // Exposed on streamState so the global selectionchange guard (see
@@ -20903,6 +21028,7 @@ function portal() {
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
         if (!openAsst()) return;
         acc += d.text;
         curBubble.text = acc;
@@ -20928,6 +21054,7 @@ function portal() {
       es.addEventListener("thinking", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
         closeAsst();
         // Backend yields one SSE event per thinking_delta. Coalesce them
         // into the most recent thinking message so we see ONE block per
@@ -20948,6 +21075,7 @@ function portal() {
       es.addEventListener("tool_use", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
         closeAsst();
         // `id` is the SDK's toolu_xxx tool_use_id. Critical for
         // _taskSubjectMapForMessages — it pairs each TaskCreate
@@ -20983,6 +21111,7 @@ function portal() {
       es.addEventListener("tool_result", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
         // `text` (up to 50KB) drives the "expand" affordance and per-tool
         // rich renderers (Bash terminal / Read with gutter / WebFetch card).
         // `tool_name` lets the FE pick a renderer without scanning backwards
@@ -21005,6 +21134,7 @@ function portal() {
       es.addEventListener("task_started", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
+        _setContinuationAwaitingReaction(false);
         applyTaskStatus(d.tool_use_id, {
           task_id: d.task_id,
           state: "running",
@@ -21036,6 +21166,18 @@ function portal() {
           summary: d.summary || "",
           output_file: d.output_file || "",
         });
+        const remaining = Number(d.background_tasks_pending);
+        if (Number.isFinite(remaining)) {
+          this._setBackgroundTaskActive(
+            streamSid,
+            remaining > 0,
+            streamState._streamStartedAt / 1000,
+            remaining,
+          );
+        }
+        if (isContinuation && (!Number.isFinite(remaining) || remaining <= 0)) {
+          _setContinuationAwaitingReaction(true);
+        }
         // User-perceivable settle feedback (mirrors the server's
         // _on_task_settled which handles the away-from-screen case via
         // presence-gated Web Push; this branch covers the at-screen case):
@@ -21163,8 +21305,13 @@ function portal() {
       // cancellation flag (user clicked stop). For those, suppress the
       // green-dot unread indicator — the user knows they cancelled, an
       // "attention!" dot would imply something new arrived.
-      const _markDone = (cancelled = false, backgroundPending = false) => {
+      const _markDone = (
+        cancelled = false,
+        backgroundPending = false,
+        authoritativeTerminal = false,
+      ) => {
         streamState.streaming = false;
+        streamState._continuationAwaitingReaction = false;
         streamState.es = null;
         streamState._streamStartController = null;
         streamState._cancelBeforeStream = false;
@@ -21187,6 +21334,12 @@ function portal() {
           streamState._streamStartedAt / 1000,
           backgroundPending,
         );
+        if (authoritativeTerminal) {
+          this._setSessionActivityExpectation(
+            streamSid,
+            Number(backgroundPending) > 0 && !cancelled,
+          );
+        }
         // If the user is on a different tab when this turn lands, flag
         // unread so the tab strip can show a green dot. Doing it inside
         // _markDone covers every termination path (done / error /
@@ -21361,8 +21514,8 @@ function portal() {
           ? Math.max(0, Number(d.background_tasks_pending) || 0)
           : 0;
         es.close();
-        _markDone(!!d.cancelled, backgroundPending);
-        _stopTimer(backgroundPending > 0);
+        _markDone(!!d.cancelled, backgroundPending, true);
+        _stopTimer();
         if (isContinuation && !d.cancelled) {
           this._reconcileCompletedContinuation(
             streamSid, streamState, continuationFinalText,
@@ -21485,7 +21638,7 @@ function portal() {
         // Instead: silently reload history (surfacing the finished reply) and
         // let the queue drain continue.
         if (serverError === "no active turn") {
-          es.close(); _markDone(); _stopTimer();
+          es.close(); _markDone(false, false, true); _stopTimer();
           this.loadSession(streamSid).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
@@ -21497,7 +21650,7 @@ function portal() {
           if (!isContinuation) {
             markUserFailed(serverError, errKind, errCta, errRetryable);
           }
-          es.close(); _markDone(); _stopTimer();
+          es.close(); _markDone(false, false, true); _stopTimer();
           // Pause auto-drain — same context likely fails the next message
           // too (quota / auth / cross-vendor signature). The failed user
           // bubble surfaces a "resume queue (N)" CTA so the user can
@@ -21583,7 +21736,7 @@ function portal() {
             if (!d.active) {
               // Backend turn already finished while we were disconnected.
               // Refresh session from disk to pick up the completed reply.
-              _markDone(); _stopTimer();
+              _markDone(false, false, true); _stopTimer();
               if (this.currentId === streamSid) this.loadSession(streamSid);
               streamState._reconnectAttempts = 0;
               return;
@@ -21593,8 +21746,8 @@ function portal() {
               // its SDK background task still owns the session reader. There
               // is no broadcast to attach to yet: preserve the running footer
               // and let the continuation poller discover the next broadcast.
-              _markDone(false, true);
-              _stopTimer(true);
+              _markDone(false, true, true);
+              _stopTimer();
               this._ensureBgContPoller(streamSid);
               streamState._reconnectAttempts = 0;
               return;
@@ -21640,7 +21793,7 @@ function portal() {
       es.addEventListener("cancelled", () => {
         flushRender();
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        es.close(); _markDone(true); _stopTimer();
+        es.close(); _markDone(true, false, true); _stopTimer();
         // User explicitly stopped — pause the queue too. Auto-draining
         // here would be surprising (they cancelled for a reason, almost
         // never "just this one but please send the rest"). The paused
@@ -22302,7 +22455,21 @@ function portal() {
     // ===== global cross-workspace activity center =====
     async fetchActivity(opts = {}) {
       const key = opts.summaryOnly ? "summary" : "events";
+      // A full snapshot also satisfies a summary refresh. Conversely, if a
+      // cheap summary is already in flight when the user opens the center,
+      // let it settle and then start the full request with a newer sequence.
+      // This prevents the global stale-response guard from discarding the only
+      // response that contains rows.
+      if (opts.summaryOnly && this._activityFetchPromises.events) {
+        return this._activityFetchPromises.events;
+      }
       if (this._activityFetchPromises[key]) return this._activityFetchPromises[key];
+      if (!opts.summaryOnly && this._activityFetchPromises.summary) {
+        await this._activityFetchPromises.summary;
+        if (this._activityFetchPromises[key]) {
+          return this._activityFetchPromises[key];
+        }
+      }
       const seq = ++this._activityRequestSeq;
       const promise = (async () => {
         try {
@@ -22324,8 +22491,22 @@ function portal() {
           if (seq < this._activityAppliedSeq) return false;
           this._activityAppliedSeq = seq;
           const summary = opts.summaryOnly ? data : data.summary;
-          if (summary) this.activity.summary = summary;
-          if (!opts.summaryOnly && Array.isArray(data.events)) this.activity.events = data.events;
+          if (summary) {
+            this.activity.summary = summary;
+            const generation = String(summary.generation || "");
+            if (generation && generation !== this._activityGeneration) {
+              this._activityGeneration = generation;
+              this._activityRevision = 0;
+            }
+            this._activityRevision = Math.max(
+              this._activityRevision,
+              Number(summary.revision) || 0,
+            );
+          }
+          if (!opts.summaryOnly && Array.isArray(data.events)) {
+            this.activity.events = data.events;
+            this._syncScheduledActivitySnapshot(data.events);
+          }
           this._syncAppBadge();
           return true;
         } catch (_) { return false; }
@@ -22335,10 +22516,28 @@ function portal() {
       finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
     },
     async openActivityCenter() {
+      if (!this.activity.viewLoaded) {
+        this.activity.viewLoaded = true;
+        try {
+          const saved = localStorage.getItem("muselab_activity_view");
+          if (saved === "status" || saved === "timeline") {
+            this.activity.view = saved;
+          } else if (saved === "finished") {
+            // Migrate the short-lived terminal-only view to the corrected
+            // all-status timeline.
+            this.activity.view = "timeline";
+          }
+        } catch (_) {}
+      }
       this.activity.show = true;
       this.activity.loading = true;
       await this.fetchActivity();
       this.activity.loading = false;
+    },
+    setActivityView(view) {
+      if (view !== "status" && view !== "timeline") return;
+      this.activity.view = view;
+      try { localStorage.setItem("muselab_activity_view", view); } catch (_) {}
     },
     activityGroups() {
       const zh = this.lang === "zh";
@@ -22354,6 +22553,7 @@ function portal() {
     ACTIVITY_GROUP_CAP: 5,
     activityMatchesGroup(item, key) {
       if (!item) return false;
+      if (key === "timeline") return true;
       if (key === "review") return item.state === "completed" && !item.read;
       if (key === "running") return ["running", "waiting_approval", "paused"].includes(item.state);
       if (key === "failed") return item.state === "failed";
@@ -22370,6 +22570,9 @@ function portal() {
       return (this.activity.events || [])
         .filter(item => this.activityMatchesGroup(item, group.key))
         .sort((a, b) => {
+          if (group.key === "timeline") {
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
           if (group.key === "running") {
             const rank = (activeRank[a.state] ?? 9) - (activeRank[b.state] ?? 9);
             if (rank) return rank;
@@ -22395,6 +22598,14 @@ function portal() {
         ? Number(count) : this.activityAllEvents(group).length;
     },
     activityVisibleGroups() {
+      if (this.activity.view === "timeline") {
+        return [{
+          key: "timeline",
+          label: this.lang === "zh"
+            ? "全部会话（按时间倒序）"
+            : "All sessions (newest first)",
+        }];
+      }
       const groups = this.activityGroups();
       const on = this.activity.filter || [];
       if (!on.length) return groups;
@@ -22435,6 +22646,173 @@ function portal() {
       const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    },
+    _stopActivityEvents() {
+      ++this._activityLiveSeq;
+      if (this._activityLiveSource) {
+        try { this._activityLiveSource.close(); } catch (_) {}
+      }
+      this._activityLiveSource = null;
+      if (this._activityLiveTimer) clearTimeout(this._activityLiveTimer);
+      this._activityLiveTimer = null;
+    },
+    async _refreshActivityFromSignal() {
+      return await this.fetchActivity({
+        summaryOnly: !this.activity.show && this.activity.events.length > 0,
+      });
+    },
+    _syncScheduledActivitySnapshot(events) {
+      const scheduled = (events || []).filter(
+        item => item && item.kind === "scheduled" && item.source_id,
+      );
+      if (!scheduled.length) return;
+      const active = new Set(
+        scheduled
+          .filter(item => ["running", "waiting_approval", "paused"].includes(item.state))
+          .map(item => String(item.source_id)),
+      );
+      const next = { ...(this.schedRunning || {}) };
+      for (const item of scheduled) {
+        next[String(item.source_id)] = active.has(String(item.source_id));
+      }
+      this.schedRunning = next;
+    },
+    _applyScheduledActivity(item) {
+      if (!item || item.kind !== "scheduled" || !item.source_id) return;
+      const taskId = String(item.source_id);
+      const running = ["running", "waiting_approval", "paused"].includes(item.state);
+      this.schedRunning = {
+        ...(this.schedRunning || {}),
+        [taskId]: running,
+      };
+      this._schedLiveRunning = this._schedLiveRunning || {};
+      this._schedLiveRunning[taskId] = running;
+      if (!running) {
+        // The activity transition is the authoritative completion signal.
+        // Refresh both the result row and last_run immediately instead of
+        // guessing with fixed 1.5s / 8s timers.
+        this.loadSchedulerHistory().catch(() => {});
+        this.loadSchedulerTasks().catch(() => {});
+      }
+    },
+    _applyActivityUpdate(payload) {
+      const generation = String(payload?.generation || "");
+      if (generation && generation !== this._activityGeneration) {
+        this._activityGeneration = generation;
+        this._activityRevision = 0;
+      }
+      const revision = Number(payload?.revision) || 0;
+      if (revision && revision <= this._activityRevision) return;
+      if (payload?.resync) {
+        this._activityRevision = Math.max(this._activityRevision, revision);
+        this._activityAppliedSeq = ++this._activityRequestSeq;
+        Promise.resolve(this._refreshActivityFromSignal()).finally(
+          () => this._refreshActivityFromSignal(),
+        );
+        return;
+      }
+      // A pushed transition is newer than any HTTP snapshot already in
+      // flight. Retire those requests so a slow response cannot roll back the
+      // just-applied live state.
+      this._activityAppliedSeq = ++this._activityRequestSeq;
+      const item = payload?.item;
+      if (item && item.id) {
+        const at = this.activity.events.findIndex(row => row.id === item.id);
+        if (at >= 0) this.activity.events.splice(at, 1, item);
+        else this.activity.events.unshift(item);
+        this.activity.events = [...this.activity.events];
+        this._applyScheduledActivity(item);
+      }
+      const acked = new Set(
+        Array.isArray(payload?.acked_ids) ? payload.acked_ids : [],
+      );
+      if (acked.size) {
+        for (const row of this.activity.events) {
+          if (acked.has(row.id)) row.read = true;
+        }
+        this.activity.events = [...this.activity.events];
+      }
+      if (payload?.summary) this.activity.summary = payload.summary;
+      this._activityRevision = Math.max(this._activityRevision, revision);
+      this._syncAppBadge();
+    },
+    async _startActivityEvents() {
+      if (!this.token || typeof EventSource === "undefined") return;
+      if (typeof document !== "undefined"
+          && document.visibilityState !== "visible") {
+        this._stopActivityEvents();
+        return;
+      }
+      if (this._activityLiveSource) return;
+      this._stopActivityEvents();
+      const seq = ++this._activityLiveSeq;
+      let ticket = "";
+      try {
+        const r = await fetch("/api/activity/events-ticket", {
+          method: "POST",
+          headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error("activity ticket failed");
+        ticket = String((await r.json()).ticket || "");
+      } catch (_) {
+        if (seq === this._activityLiveSeq) {
+          this._activityLiveTimer = setTimeout(
+            () => this._startActivityEvents(),
+            1500,
+          );
+        }
+        return;
+      }
+      if (seq !== this._activityLiveSeq || !ticket) return;
+      const es = new EventSource(
+        `/api/activity/events?ticket=${encodeURIComponent(ticket)}`,
+      );
+      this._activityLiveSource = es;
+      const owns = () => (
+        seq === this._activityLiveSeq && this._activityLiveSource === es
+      );
+      es.addEventListener("ready", (ev) => {
+        if (!owns()) return;
+        let payload;
+        try { payload = JSON.parse(ev.data); } catch (_) { return; }
+        const generation = String(payload.generation || "");
+        if ((generation && generation !== this._activityGeneration)
+            || (Number(payload.revision) || 0) > this._activityRevision) {
+          this._refreshActivityFromSignal();
+        }
+      });
+      es.addEventListener("update", (ev) => {
+        if (!owns()) return;
+        let payload;
+        try { payload = JSON.parse(ev.data); } catch (_) { return; }
+        this._applyActivityUpdate(payload);
+      });
+      es.onerror = () => {
+        if (!owns()) return;
+        // Capability tickets are single-use; disable EventSource's native
+        // retry and mint a fresh scoped ticket for the next connection.
+        try { es.close(); } catch (_) {}
+        this._activityLiveSource = null;
+        this._activityLiveTimer = setTimeout(
+          () => this._startActivityEvents(),
+          1500,
+        );
+      };
+      if (!this._activityLiveVisibilityBound) {
+        this._activityLiveVisibilityBound = true;
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState !== "visible") {
+            this._stopActivityEvents();
+          } else {
+            this._refreshActivityFromSignal();
+            this._startActivityEvents();
+          }
+        });
+        window.addEventListener(
+          "pagehide",
+          () => this._stopActivityEvents(),
+        );
+      }
     },
     async ackActivityEvent(item, retries = 2) {
       if (!this.activityIsUnreadResult(item)) return true;
@@ -22917,9 +23295,9 @@ function portal() {
       }
       if (r.ok) await this.loadSchedulerTasks();
     },
-    // Out-of-schedule run. Backend dispatches a background task; we poll
-    // history once and again after a short delay so the new entry shows
-    // up without waiting for the next periodic refresh.
+    // Out-of-schedule run. The backend publishes the real running + terminal
+    // state through the global activity stream; the button and history follow
+    // that authoritative lifecycle instead of fixed-delay history guesses.
     async runSchedTaskNow(t) {
       if (!t || !t.id) return;
       // Double-tap guard is a TIMESTAMP, not a boolean flag. The button is no
@@ -22933,9 +23311,20 @@ function portal() {
       this._lastSchedRun = this._lastSchedRun || {};
       if (now - (this._lastSchedRun[t.id] || 0) < 1200) return;
       this._lastSchedRun[t.id] = now;
-      // Cosmetic only: spin the glyph for ~900ms so the click is perceptible.
+      // Optimistic until the activity `running` event lands. A fail-safe
+      // clears it if the live channel is unavailable; an actual live run owns
+      // the flag until its terminal activity event.
+      this._schedLiveRunning = this._schedLiveRunning || {};
+      delete this._schedLiveRunning[t.id];
       this.schedRunning[t.id] = true;
-      setTimeout(() => { this.schedRunning[t.id] = false; }, 900);
+      setTimeout(() => {
+        if (this._schedLiveRunning[t.id] === undefined) {
+          this.schedRunning = {
+            ...(this.schedRunning || {}),
+            [t.id]: false,
+          };
+        }
+      }, 10000);
       try {
         const r = await fetch(
           "/api/scheduler/tasks/" + encodeURIComponent(t.id) + "/run",
@@ -22945,11 +23334,11 @@ function portal() {
                      ? "已触发，结果稍后出现在下方运行记录"
                      : "Triggered — result will appear in the run log below",
                     "success", 3000);
-        // Surface the new history entry as the background run lands. Cheap,
-        // swallow their own errors.
-        setTimeout(() => this.loadSchedulerHistory().catch(() => {}), 1500);
-        setTimeout(() => this.loadSchedulerHistory().catch(() => {}), 8000);
       } catch (e) {
+        this.schedRunning = {
+          ...(this.schedRunning || {}),
+          [t.id]: false,
+        };
         this.toast((this.lang === "zh" ? "触发失败: " : "Trigger failed: ")
                     + ((e && e.message) || e), "error", 4000);
       }

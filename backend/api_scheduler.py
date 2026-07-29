@@ -135,7 +135,8 @@ def delete_task_endpoint(tid: str) -> dict:
 async def run_task_now_endpoint(tid: str) -> dict:
     """Trigger an out-of-schedule run of an existing task. Fire-and-forget:
     the actual LLM call happens in a background asyncio.task so the HTTP
-    response returns immediately. UI polls /history to see the result.
+    response returns immediately. Activity SSE carries running/terminal state;
+    the UI refreshes history when that terminal event arrives.
 
     Used for: (a) "retry" on a failed history entry; (b) manual smoke-test
     after editing prompt / model without waiting for the next fire window."""

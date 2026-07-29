@@ -2,13 +2,17 @@
 
 import hashlib
 import json
+from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .activity import activity
 from .auth import require_token
+from .capability_tickets import tickets
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
+_EVENT_TICKET_TTL_S = 45
 
 
 def _json(request: Request, response: Response, payload: dict):
@@ -31,6 +35,62 @@ def list_activity(request: Request, response: Response,
 @router.get("/summary", dependencies=[Depends(require_token)])
 def activity_summary(request: Request, response: Response):
     return _json(request, response, activity.summary())
+
+
+@router.post("/events-ticket", dependencies=[Depends(require_token)])
+def mint_activity_event_ticket() -> dict:
+    ticket = tickets.mint(
+        "activity",
+        (),
+        ttl=_EVENT_TICKET_TTL_S,
+        single_use=True,
+    )
+    return {"ticket": ticket, "expires_in": _EVENT_TICKET_TTL_S}
+
+
+def _require_activity_event_ticket(ticket: str = Query("")) -> None:
+    if not tickets.validate(ticket, "activity", ()):
+        raise HTTPException(
+            status_code=401,
+            detail="invalid or expired activity event ticket",
+        )
+
+
+@router.get("/events", dependencies=[Depends(_require_activity_event_ticket)])
+async def activity_events() -> EventSourceResponse:
+    """Push task state transitions instead of waiting for the 10 s fallback poll."""
+
+    async def events() -> AsyncIterator[ServerSentEvent]:
+        async with activity.subscribe() as queue:
+            yield ServerSentEvent(
+                event="ready",
+                data=json.dumps(
+                    {
+                        "generation": activity.generation,
+                        "revision": activity.revision,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+            while True:
+                payload = await queue.get()
+                yield ServerSentEvent(
+                    event="update",
+                    data=json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+
+    return EventSourceResponse(
+        events(),
+        ping=20,
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/ack-all", dependencies=[Depends(require_token)])

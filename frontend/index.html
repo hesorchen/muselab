@@ -2786,6 +2786,7 @@
                exactly one of the two is ever visible. -->
           <div class="turn-running-bar"
                x-show="pane && pane.streaming
+                       && !(pane._continuationAwaitingReaction)
                        && paneMsgs.length
                        && paneMsgs[paneMsgs.length - 1].role !== 'user'"
                x-cloak>
@@ -5377,11 +5378,20 @@
     <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="activity.show=false">
       <div class="modal-head">
         <span class="modal-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
+        <div class="activity-view-switch" role="group"
+             :aria-label="lang==='zh' ? '任务视图' : 'Task view'">
+          <button type="button" @click="setActivityView('status')"
+                  :class="{ active: activity.view === 'status' }"
+                  x-text="lang==='zh' ? '按状态' : 'By status'"></button>
+          <button type="button" @click="setActivityView('timeline')"
+                  :class="{ active: activity.view === 'timeline' }"
+                  x-text="lang==='zh' ? '时间倒序' : 'By time'"></button>
+        </div>
         <button class="modal-close" @click="activity.show=false" aria-label="Close">×</button>
       </div>
       <!-- One chip per attention group, in the same order as the sections below:
            completed results to review, live work, failures, then viewed history. -->
-      <div class="activity-summary">
+      <div class="activity-summary" x-show="activity.view === 'status'">
         <template x-for="group in activityGroups()" :key="group.key">
           <!-- Multi-select filters. Colour reflects unread results or a live
                task waiting for user action, never mere group non-emptiness. -->
@@ -5438,7 +5448,8 @@
         <!-- Filtering to an empty group must say so, or the body just goes
              blank and reads as a loading failure. -->
         <div class="hint-row"
-             x-show="!activity.loading && activity.events.length && activity.filter.length
+             x-show="!activity.loading && activity.view === 'status'
+               && activity.events.length && activity.filter.length
                && !activityVisibleGroups().some(g => activityEvents(g).length)"
              x-text="lang==='zh' ? '该状态下暂无任务' : 'No tasks in this state'"></div>
       </div>
@@ -5691,13 +5702,10 @@
                           :title="lang==='zh' ? '历史运行' : 'Past runs'">
                     <svg><use href="#i-history"/></svg>
                   </button>
-                  <!-- NO :disabled here. A stuck schedRunning[t.id] used to
-                       leave the native disabled attribute on, so the button
-                       showed `not-allowed` and ate the click ("鼠标一挪上去就是
-                       禁用的标志，点不了", 2026-06-09). Double-fire is now
-                       guarded by a timestamp in runSchedTaskNow; schedRunning
-                       only drives the cosmetic spinner (paper-plane → spinning
-                       refresh glyph, see .icon-btn.is-running in styles.css). -->
+                  <!-- NO :disabled here. Double-fire is guarded by a timestamp
+                       in runSchedTaskNow; schedRunning follows the backend's
+                       live scheduled-activity lifecycle and drives the
+                       paper-plane → spinning refresh glyph. -->
                   <button class="icon-btn sm" @click.stop="runSchedTaskNow(t)"
                           :class="{ 'is-running': schedRunning[t.id] }"
                           :title="schedRunning[t.id]

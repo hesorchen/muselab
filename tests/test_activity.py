@@ -1,5 +1,8 @@
+import asyncio
 import json
 from pathlib import Path
+
+import pytest
 
 from backend.activity import ActivityService
 
@@ -23,6 +26,26 @@ def test_one_row_per_session_and_latest_prompt(tmp_path, monkeypatch):
     assert rows[0]["id"] == first["id"] == second["id"]
     assert rows[0]["task_summary"] == "second task"
     assert rows[0]["turn_count"] == 2
+
+
+def test_start_records_source_kind_and_clears_it_for_plain_turn(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    scheduled = service.start(
+        "s1",
+        summary="daily report",
+        kind="scheduled",
+        source_id="task-1",
+    )
+    assert scheduled["kind"] == "scheduled"
+    assert scheduled["source_id"] == "task-1"
+
+    service.finish("s1", "completed")
+    plain = service.start("s1", summary="follow-up")
+    assert plain["kind"] == "turn"
+    assert "source_id" not in plain
 
 
 def test_summary_and_ack(tmp_path, monkeypatch):
@@ -125,3 +148,45 @@ def test_restart_marks_running_as_failed(tmp_path, monkeypatch):
     assert row["read"] is False
     assert row["updated_at"] == row["finished_at"]
     assert json.loads((Path(tmp_path) / ".muselab" / "activity.json").read_text())
+
+
+@pytest.mark.asyncio
+async def test_subscriber_receives_task_transition_without_polling(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    async with service.subscribe() as queue:
+        await asyncio.to_thread(service.start, "s1", summary="live task")
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert payload["revision"] == 1
+    assert payload["item"]["session_id"] == "s1"
+    assert payload["item"]["state"] == "running"
+    assert payload["summary"]["running"] == 1
+    assert payload["summary"]["revision"] == 1
+    assert payload["summary"]["generation"] == payload["generation"]
+
+
+@pytest.mark.asyncio
+async def test_slow_subscriber_gets_resync_marker(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    async with service.subscribe() as queue:
+        await asyncio.to_thread(service.start, "s1", summary="first")
+        await asyncio.sleep(0)
+        await asyncio.to_thread(service.start, "s2", summary="second")
+        await asyncio.sleep(0)
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert payload["revision"] == 2
+    assert payload["resync"] is True
+    assert payload["summary"]["running"] == 2
+
+
+def test_activity_event_ticket_requires_authentication(client, auth):
+    denied = client.post("/api/activity/events-ticket")
+    assert denied.status_code == 401
+
+    response = client.post("/api/activity/events-ticket", headers=auth)
+    assert response.status_code == 200
+    assert response.json()["ticket"].startswith("activity.")

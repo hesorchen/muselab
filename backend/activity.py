@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +80,11 @@ class ActivityService:
     def __init__(self, root: Path = ROOT):
         self.path = root / ".muselab" / "activity.json"
         self._lock = threading.RLock()
+        self._generation = uuid.uuid4().hex
+        self._revision = 0
+        self._subscribers: dict[
+            asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop
+        ] = {}
         self._events = self._load()
         changed = self._collapse_sessions()
         for item in self._events:
@@ -102,6 +110,83 @@ class ActivityService:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self.path, json.dumps(
             self._events[-_MAX_EVENTS:], ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _enqueue_update(
+        queue: asyncio.Queue[dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Deliver the latest ledger change without an unbounded SSE backlog."""
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+            payload = {
+                "generation": payload["generation"],
+                "revision": payload["revision"],
+                "summary": payload["summary"],
+                "resync": True,
+            }
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(payload)
+
+    def _publish_locked(
+        self,
+        *,
+        item: dict[str, Any] | None = None,
+        acked_ids: list[str] | None = None,
+    ) -> None:
+        """Fan out a compact transition to SSE subscribers.
+
+        Activity mutations run in FastAPI worker threads (and chat explicitly
+        uses ``asyncio.to_thread``), so subscribers retain their owning event
+        loops and delivery crosses the boundary via ``call_soon_threadsafe``.
+        """
+        self._revision += 1
+        summary = _summarize([dict(x) for x in self._events])
+        summary["generation"] = self._generation
+        summary["revision"] = self._revision
+        payload: dict[str, Any] = {
+            "generation": self._generation,
+            "revision": self._revision,
+            "summary": summary,
+        }
+        if item is not None:
+            payload["item"] = dict(item)
+        if acked_ids:
+            payload["acked_ids"] = list(acked_ids)
+        stale: list[asyncio.Queue[dict[str, Any]]] = []
+        for queue, loop in tuple(self._subscribers.items()):
+            try:
+                loop.call_soon_threadsafe(self._enqueue_update, queue, payload)
+            except RuntimeError:
+                stale.append(queue)
+        for queue in stale:
+            self._subscribers.pop(queue, None)
+
+    @contextlib.asynccontextmanager
+    async def subscribe(
+        self,
+    ) -> AsyncIterator[asyncio.Queue[dict[str, Any]]]:
+        """Subscribe to future task transitions from the current event loop."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            self._subscribers[queue] = loop
+        try:
+            yield queue
+        finally:
+            with self._lock:
+                self._subscribers.pop(queue, None)
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    @property
+    def generation(self) -> str:
+        with self._lock:
+            return self._generation
 
     def _collapse_sessions(self) -> bool:
         latest: dict[str, dict[str, Any]] = {}
@@ -132,16 +217,24 @@ class ActivityService:
         return next((x for x in reversed(self._events)
                      if x.get("session_id") == sid), None)
 
-    def start(self, sid: str, *, summary: str = "") -> dict[str, Any]:
+    def start(
+        self,
+        sid: str,
+        *,
+        summary: str = "",
+        kind: str = "turn",
+        source_id: str = "",
+    ) -> dict[str, Any]:
         now = time.time()
         name, workspace, workspace_name = self._metadata(sid)
         with self._lock:
             item = self._latest(sid)
             if item is None:
                 item = {"id": uuid.uuid4().hex, "session_id": sid,
-                        "kind": "turn", "turn_count": 0}
+                        "turn_count": 0}
                 self._events.append(item)
             item.update(
+                kind=(kind or "turn")[:40],
                 workspace=workspace, workspace_name=workspace_name,
                 session_name=name, state="running",
                 task_summary=(summary or item.get("task_summary") or name)[:500],
@@ -149,8 +242,13 @@ class ActivityService:
                 updated_at=now, needs_attention=False, read=True,
                 turn_count=int(item.get("turn_count") or 0) + 1,
             )
+            if source_id:
+                item["source_id"] = source_id[:200]
+            else:
+                item.pop("source_id", None)
             self._events = self._events[-_MAX_EVENTS:]
             self._save()
+            self._publish_locked(item=item)
             return dict(item)
 
     def set_state(self, sid: str, state: str, *, detail: str = "") -> dict[str, Any]:
@@ -167,6 +265,7 @@ class ActivityService:
                         updated_at=time.time(),
                         needs_attention=state in {"waiting_approval", "paused"}, read=True)
             self._save()
+            self._publish_locked(item=item)
             return dict(item)
 
     def resume(self, sid: str) -> bool:
@@ -178,6 +277,7 @@ class ActivityService:
             item.update(state="running", status_detail="", updated_at=time.time(),
                         needs_attention=False, read=True)
             self._save()
+            self._publish_locked(item=item)
             return True
 
     def finish(self, sid: str, status: str) -> dict[str, Any]:
@@ -197,6 +297,7 @@ class ActivityService:
                                        "failed": "Task failed",
                                        "cancelled": "Task cancelled"}[state])
             self._save()
+            self._publish_locked(item=item)
             return dict(item)
 
     def list(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -206,20 +307,29 @@ class ActivityService:
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
-            return _summarize([dict(x) for x in self._events])
+            result = _summarize([dict(x) for x in self._events])
+            result["generation"] = self._generation
+            result["revision"] = self._revision
+            return result
 
     def snapshot(self, limit: int = 100) -> dict[str, Any]:
         """Return rows and counters from the same locked ledger snapshot."""
         with self._lock:
             events = [dict(x) for x in self._events]
+            generation = self._generation
+            revision = self._revision
         ordered = sorted(events, key=_activity_at, reverse=True)
+        summary = _summarize(events)
+        summary["generation"] = generation
+        summary["revision"] = revision
         return {
             "events": ordered[:min(max(limit, 1), _MAX_EVENTS)],
-            "summary": _summarize(events),
+            "summary": summary,
         }
 
     def ack(self, event_id: str | None = None, *, sid: str | None = None) -> int:
         changed = 0
+        acked_ids: list[str] = []
         with self._lock:
             for item in self._events:
                 if event_id is not None and item.get("id") != event_id:
@@ -229,8 +339,11 @@ class ActivityService:
                 if not item.get("read"):
                     item["read"] = True
                     changed += 1
+                    if item.get("id"):
+                        acked_ids.append(str(item["id"]))
             if changed:
                 self._save()
+                self._publish_locked(acked_ids=acked_ids)
         return changed
 
 

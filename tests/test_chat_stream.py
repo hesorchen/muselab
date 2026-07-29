@@ -230,6 +230,88 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert sid not in chat_mod._active_turns
 
 
+def test_done_is_published_before_slow_post_turn_bookkeeping(
+        stream_env, client, monkeypatch):
+    """ResultMessage ends the UI turn before context/JSONL bookkeeping."""
+    from backend import activity as activity_module
+
+    chat_mod = stream_env
+    sid = _make_session(client)
+
+    async def exercise():
+        context_entered = asyncio.Event()
+        release_context = asyncio.Event()
+        activity_transitions = []
+        context_calls = 0
+
+        class _SlowPostprocessClient(_FakeStreamClient):
+            async def get_context_usage(self):
+                nonlocal context_calls
+                context_calls += 1
+                if context_calls == 1:
+                    # Preflight accounting happens before the model query and
+                    # is intentionally not part of this regression.
+                    return {
+                        "maxTokens": 200_000,
+                        "totalTokens": 1000,
+                    }
+                context_entered.set()
+                await release_context.wait()
+                return {
+                    "maxTokens": 200_000,
+                    "totalTokens": 1234,
+                }
+
+        fake = _SlowPostprocessClient([ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )])
+
+        async def fake_get_client(*_args, **_kwargs):
+            return fake
+
+        monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+        monkeypatch.setattr(
+            activity_module.activity,
+            "start",
+            lambda activity_sid, *, summary="": activity_transitions.append(
+                ("start", activity_sid, summary)),
+        )
+        monkeypatch.setattr(
+            activity_module.activity,
+            "finish",
+            lambda activity_sid, status: activity_transitions.append(
+                ("finish", activity_sid, status)),
+        )
+
+        broadcast = await chat_mod._start_turn(sid, "quick reply")
+        await asyncio.wait_for(context_entered.wait(), timeout=1)
+
+        # The context refresh is deliberately blocked, yet both the browser
+        # terminal event and the global activity completion already happened.
+        assert any(
+            event.get("event") == "done"
+            for event in broadcast.replay_events()
+        )
+        assert activity_transitions == [
+            ("start", sid, "quick reply"),
+            ("finish", sid, "completed"),
+        ]
+        assert broadcast.done is False
+
+        release_context.set()
+        await asyncio.wait_for(broadcast.task, timeout=1)
+        assert broadcast.done is True
+        assert sid not in chat_mod._active_turns
+        recent = chat_mod._recent_turns.pop(sid, None)
+        if recent is not None:
+            recent.close()
+
+    asyncio.run(exercise())
+
+
 def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
         stream_env, client, monkeypatch):
     """A pooled SDK queue may start with the preceding turn's delayed tail.
@@ -810,6 +892,18 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._active_turns.pop(sid, None)
         chat_mod._recent_turns.pop(sid, None)
+
+
+def test_continuation_terminal_precedes_annotation_bookkeeping(stream_env):
+    """The footer terminal event must not wait for transcript sidecars."""
+    import inspect
+
+    source = inspect.getsource(stream_env._watch_inflight_tasks)
+    done_at = source.index(
+        'b.publish({"event": "done", "data": json.dumps(done_payload)})')
+    annotate_at = source.index("_recent_turn_uuids, session_id, False")
+    assert done_at < annotate_at
+    assert stream_env._CONTINUATION_GRACE <= 8
 
 
 def test_watcher_explicitly_resumes_when_auto_continuation_stream_ends(stream_env):
@@ -1673,14 +1767,29 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     """If get_client itself raises (e.g. auth pre-check), the handler must
     surface an SSE error frame, NOT bubble a 500 — the FE can only render
     typed errors from the frame, not from a 500."""
+    from backend import activity as activity_module
+
     chat_mod = stream_env
     sid = _make_session(client)
+    activity_transitions = []
 
     async def boom_get_client(session_id, model, permission="bypassPermissions", effort=""):
         from claude_agent_sdk import ClaudeSDKError
         raise ClaudeSDKError("Claude model requires auth: run `claude login`")
 
     monkeypatch.setattr(chat_mod, "get_client", boom_get_client)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "start",
+        lambda activity_sid, *, summary="": activity_transitions.append(
+            ("start", activity_sid, summary)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda activity_sid, status: activity_transitions.append(
+            ("finish", activity_sid, status)),
+    )
 
     r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
                    f"&prompt=hi&model=claude-sonnet-4-6")
@@ -1690,6 +1799,10 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     assert err is not None, f"no error frame: {events}"
     assert err["kind"] == "auth"
     assert sid not in chat_mod._active_turns
+    assert activity_transitions == [
+        ("start", sid, "hi"),
+        ("finish", sid, "failed"),
+    ]
 
 
 def _ok_turn(sid):

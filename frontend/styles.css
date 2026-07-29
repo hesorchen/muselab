@@ -3200,6 +3200,10 @@ pre.text {
 }
 .files-head-workspace .workspace-picker-btn { width: 100%; max-width: none; border-radius: var(--r-sm); }
 .activity-modal { width:620px; max-width:calc(100vw - 32px); }
+.activity-view-switch { display:inline-flex; margin-left:auto; padding:2px; border:1px solid var(--c-border); border-radius:var(--r-md); background:var(--c-bg-2); }
+.activity-view-switch button { padding:4px 9px; border:0; border-radius:calc(var(--r-md) - 2px); background:transparent; color:var(--c-fg-3); font:inherit; font-size:var(--fs-xs); cursor:pointer; }
+.activity-view-switch button:hover { color:var(--c-fg-1); }
+.activity-view-switch button.active { background:var(--c-bg-1); color:var(--c-fg-0); box-shadow:var(--shadow-sm); }
 .activity-summary { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:10px 14px; border-bottom:1px solid var(--c-border); color:var(--c-fg-2); font-size:var(--fs-sm); }
 .activity-summary .btn-ghost { margin-left:auto; }
 /* Status chips follow the same attention order as the body. Counts come from

@@ -113,7 +113,8 @@ def test_memory_center_and_chat_recall_trace_are_wired():
     assert 'data-page="memory"' in index
     assert "Skill 只能生成候选" in index
     assert "memoryRecall" in index
-    assert '"memory_recall": mem0.pop_recall_trace(session_id)' in chat
+    assert "_done_memory_recall = mem0.pop_recall_trace(session_id)" in chat
+    assert '"memory_recall": _done_memory_recall' in chat
     assert '@router.post("/skills/{artifact_id}/approve")' in api
 
 
@@ -681,9 +682,16 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert '"/api/activity?limit=500"' in app
     assert "r.status === 304 && !opts.summaryOnly && !this.activity.events.length" in app
     assert 'cache: "reload"' in app
+    assert "opts.summaryOnly && this._activityFetchPromises.events" in app
+    assert "!opts.summaryOnly && this._activityFetchPromises.summary" in app
     assert "const rank = (activeRank[a.state] ?? 9)" in app
     assert "return this.activityEventTimestamp(b)" in app
     assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
+    assert '"/api/activity/events-ticket"' in app
+    assert "new EventSource(" in app
+    assert 'this.activity.view === "timeline"' in app
+    assert 'key === "timeline") return true' in app
+    assert "setActivityView('timeline')" in html
 
     # The left marker is unread/action state, not a permanent failure marker.
     assert "activityIsUnreadResult(item) ? ' is-unread'" in html
@@ -818,16 +826,15 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "if (!waitForTerminalEvent || !st.streaming)" in stop
     cancelled_start = app.index('es.addEventListener("cancelled"')
     cancelled_end = app.index("\n      });", cancelled_start)
-    assert "_markDone(true)" in app[cancelled_start:cancelled_end]
-    mark_done_start = app.index(
-        "const _markDone = (cancelled = false, backgroundPending = false)")
+    assert "_markDone(true, false, true)" in app[cancelled_start:cancelled_end]
+    mark_done_start = app.index("const _markDone = (")
     mark_done_end = app.index("\n      };", mark_done_start)
     assert "streamState._stopping = false" in app[
         mark_done_start:mark_done_end]
     assert "this.isTabStreaming(this.currentId)" in app
 
 
-def test_background_task_gap_keeps_footer_running_without_blocking_composer():
+def test_background_task_gap_stops_footer_without_blocking_composer():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -835,16 +842,16 @@ def test_background_task_gap_keeps_footer_running_without_blocking_composer():
 
     assert "backgroundActive: false" in app
     assert "backgroundTaskCount: 0" in app
-    # A pending background task keeps the card + footer alive but must NOT
-    # make the composer busy: the backend pump owns the session stream now, so
-    # the task's completion arrives as its own message instead of colliding
-    # with a new turn. Blocking here parked every follow-up on the queue.
+    # A pending background task keeps its card alive but must NOT keep the
+    # completed turn's footer timer or make the composer busy: the backend pump
+    # owns the session stream now, so task completion arrives independently.
     assert "|| (st && st.compacting));" in app
     assert "if (st && (st.streaming || st.compacting)) return true;" in app
     assert "if (status.background) return false;" in app
     assert "d.background && d.attachable === false" in app
     assert "background_tasks_pending" in app
-    assert "_stopTimer(backgroundPending > 0)" in app
+    assert "_stopTimer();" in app
+    assert "_continuationAwaitingReaction: false" in app
     # The turn footer must key off a REAL streaming turn. It used to also
     # suppress itself on backgroundActive, which hid the completion timestamp
     # of every turn that finished while a background task was still pending.
@@ -866,6 +873,9 @@ def test_background_task_gap_keeps_footer_running_without_blocking_composer():
     # during a live turn this clause would otherwise render an empty rule.
     assert "(m.role === 'assistant' && m.uuid && !(pane && pane.streaming))" in html
     assert 'x-show="m.role === \'assistant\' && m.uuid' in html
+    assert 'Object.prototype.hasOwnProperty.call(s, "turn_active")' in app
+    assert "return !!s.turn_active" in app
+    assert "return !!(s && s.background_active)" in app
 
 
 def test_attachment_uploads_have_deadlines_and_never_log_filenames():
@@ -1007,6 +1017,45 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "expectedText" in app
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
+
+
+def test_background_settlement_pauses_footer_until_reaction_starts():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    send_start = app.index("async send(opts = {})")
+    send = app[send_start:app.index("async stop()", send_start)]
+
+    assert "_setContinuationAwaitingReaction(true)" in send
+    assert "_setContinuationAwaitingReaction(false)" in send
+    assert "background_tasks_pending" in send
+    assert "_continuationAwaitingReaction: false" in app
+    assert "!(pane._continuationAwaitingReaction)" in html
+
+
+def test_terminal_event_immediately_settles_tab_activity_snapshot():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert "_sessionActivityExpected: null" in app
+    assert "_retainExpectedSessionActivity(meta)" in app
+    assert ".map(meta => this._retainExpectedSessionActivity(meta))" in app
+    assert "_setSessionActivityExpectation(tid, backgroundActive = false)" in app
+    done_start = app.index("const _markDone = (")
+    done = app[done_start:app.index("const markUserFailed =", done_start)]
+    assert "if (authoritativeTerminal)" in done
+    assert "this._setSessionActivityExpectation(" in done
+    assert "_markDone(!!d.cancelled, backgroundPending, true);" in app
+
+
+def test_scheduler_uses_activity_completion_instead_of_fixed_history_polling():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_applyScheduledActivity(item)")
+    live = app[start:app.index("_applyActivityUpdate(payload)", start)]
+    run_start = app.index("async runSchedTaskNow(t)")
+    run = app[run_start:app.index("retrySchedHistory(h)", run_start)]
+
+    assert "item.kind !== \"scheduled\"" in live
+    assert "this.loadSchedulerHistory()" in live
+    assert "this.loadSchedulerTasks()" in live
+    assert "setTimeout(() => this.loadSchedulerHistory()" not in run
 
 
 def test_workspace_gate_does_not_destroy_retry_or_edit_before_send_rejects():
