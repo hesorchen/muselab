@@ -3671,11 +3671,12 @@
       <span class="icon"><svg><use href="#i-upload"/></svg></span><span x-text="t('btn.upload')"></span>
     </button>
     <div class="ctx-sep" x-show="!ctxMenu.multi && (ctxMenu.node && ctxMenu.node.is_dir)"></div>
-    <!-- 文件专属 -->
+    <!-- 文件专属：预览 -->
     <button class="ctx-item" @click="ctxAction('open')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-eye"/></svg></span><span x-text="t('btn.preview')"></span>
     </button>
-    <button class="ctx-item" @click="ctxAction('mention')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
+    <!-- 文件或目录：引用到对话 -->
+    <button class="ctx-item" @click="ctxAction('mention')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-at"/></svg></span><span x-text="t('btn.at_mention')"></span>
     </button>
     <button class="ctx-item" @click="ctxAction('download')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
@@ -4998,7 +4999,7 @@
             </tr>
             <tr>
               <td><span class="kbd">@</span></td>
-              <td x-text="lang==='zh' ? '在输入框引用 archive 文件（自动补全）' : 'Mention archive file in input (autocomplete)'"></td>
+              <td x-text="lang==='zh' ? '在输入框引用 archive 文件或目录（自动补全）' : 'Mention archive file or folder in input (autocomplete)'"></td>
             </tr>
             <tr>
               <td><span class="kbd">/</span></td>

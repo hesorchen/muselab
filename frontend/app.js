@@ -1904,8 +1904,8 @@ function portal() {
         setTimeout(() => {
           this.toast(
             this.lang === "zh"
-              ? "Tip：⌘K 命令面板 · / 斜杠命令 · @ 引用文件 · ↑ 回滚上一条"
-              : "Tip: ⌘K command palette · / slash commands · @ to reference files · ↑ to recall last message",
+              ? "Tip：⌘K 命令面板 · / 斜杠命令 · @ 引用文件或目录 · ↑ 回滚上一条"
+              : "Tip: ⌘K command palette · / slash commands · @ to reference files or folders · ↑ to recall last message",
             "info", 7000);
           this._setLS("muselab_seen_help", "1");
         }, 1500);
@@ -14148,7 +14148,7 @@ function portal() {
           if (!n.is_dir) await this.openFile(n);
           break;
         case "mention":
-          this.insertFileMention(n.path);
+          this.insertFileMention(n.path, !!n.is_dir);
           break;
         case "copyPath":
           await navigator.clipboard?.writeText(n.path);
@@ -15659,6 +15659,85 @@ function portal() {
       return /^(?:(?:\x1b\[<\d+;\d+;\d+[Mm])|(?:\x1b\[\d+;\d+;\d+M)|(?:\x1b\[M[\s\S]{3}))+$/
         .test(data);
     },
+    _terminalDataIsReplayReply(data) {
+      // Every xterm-generated reply to a replayed DA / DSR / OSC / DCS query
+      // is an escape sequence. Printable keyboard and IME input is not. This
+      // lets users type while a large scrollback is still being parsed
+      // without leaking stale device replies into the live PTY.
+      return typeof data === "string" && data.startsWith("\x1b");
+    },
+    _terminalTextInputDelta(before, after) {
+      const oldText = String(before || "");
+      const newText = String(after || "");
+      if (oldText === newText) return "";
+      let prefix = 0;
+      const common = Math.min(oldText.length, newText.length);
+      while (prefix < common && oldText[prefix] === newText[prefix]) prefix += 1;
+      return "\x7f".repeat(oldText.length - prefix) + newText.slice(prefix);
+    },
+    _attachTerminalImeFallback(term) {
+      const textarea = term && term.textarea;
+      const state = { pending: null, disposed: false };
+      if (!textarea) return state;
+      const keyCode = event => Number(event.keyCode || event.which || 0);
+      const onKeyDown = event => {
+        // iOS Chinese IMEs report digits, punctuation and spaces through the
+        // keyCode=229 path. Their textarea value may update only by keyup,
+        // after xterm's keydown timer has already checked it.
+        if (keyCode(event) !== 229 || event.isComposing) return;
+        if (!state.pending) {
+          state.pending = {
+            baseline: textarea.value,
+            delivered: false,
+            recovering: false,
+          };
+        }
+      };
+      const onCompositionStart = () => { state.pending = null; };
+      const onKeyUp = event => {
+        if (keyCode(event) !== 229 || !state.pending) return;
+        const pending = state.pending;
+        setTimeout(() => {
+          if (state.disposed || state.pending !== pending || pending.delivered) return;
+          const delta = this._terminalTextInputDelta(
+            pending.baseline, textarea.value);
+          if (delta) {
+            pending.recovering = true;
+            term.input(delta, true);
+          }
+          if (state.pending === pending) state.pending = null;
+        }, 0);
+      };
+      textarea.addEventListener("keydown", onKeyDown);
+      textarea.addEventListener("keyup", onKeyUp);
+      textarea.addEventListener("compositionstart", onCompositionStart);
+      state.dispose = () => {
+        state.disposed = true;
+        state.pending = null;
+        textarea.removeEventListener("keydown", onKeyDown);
+        textarea.removeEventListener("keyup", onKeyUp);
+        textarea.removeEventListener("compositionstart", onCompositionStart);
+      };
+      return state;
+    },
+    _terminalNormalizeImeData(data, state, term) {
+      const pending = state && state.pending;
+      if (!pending || pending.recovering || typeof data !== "string") return data;
+      const after = String(term?.textarea?.value || "");
+      const expected = this._terminalTextInputDelta(pending.baseline, after);
+      if (!expected) return data;
+      // xterm 6's keyCode=229 fallback handles append-only edits, but for an
+      // equal-length IME replacement it emits the entire helper textarea.
+      // Rewrite only that exact legacy output; unrelated terminal data keeps
+      // flowing untouched.
+      const legacy = after.length > pending.baseline.length
+        ? after.replace(pending.baseline, "")
+        : after.length < pending.baseline.length ? "\x7f" : after;
+      if (data !== expected && data !== legacy) return data;
+      pending.delivered = true;
+      state.pending = null;
+      return expected;
+    },
     _terminalHandleInput(data, term = this._terminal) {
       if (!this._terminalDataIsMouseReport(data)) {
         this._terminalSend(data);
@@ -15937,6 +16016,8 @@ function portal() {
         this._terminalFit = fit;
         this._attachTerminalTouchScroll(host, term);
         this._attachTerminalSelectionCopy(host, term);
+        const imeFallback = this._attachTerminalImeFallback(term);
+        this._terminalImeCleanup = () => imeFallback.dispose?.();
         let replayActive = false;
         let replayWritesPending = 0;
         const sendSize = () => {
@@ -15951,11 +16032,14 @@ function portal() {
         this._terminalResizeObserver = new ResizeObserver(() => sendSize());
         this._terminalResizeObserver.observe(host);
         term.onData(data => {
+          data = this._terminalNormalizeImeData(data, imeFallback, term);
           // Replaying historical output can re-run old DA/DSR/OSC queries.
           // xterm answers them through onData, but the original process is no
           // longer waiting; forwarding the reply makes readline show fragments
-          // such as "0;276;0c". Suppress input only while replay is parsing.
-          if (replayActive || replayWritesPending) return;
+          // such as "0;276;0c". Suppress only escape-prefixed device replies:
+          // printable keyboard/IME data must remain responsive during replay.
+          if ((replayActive || replayWritesPending)
+              && this._terminalDataIsReplayReply(data)) return;
           this._terminalHandleInput(data, term);
         });
         term.onResize(() => sendSize());
@@ -16070,6 +16154,8 @@ function portal() {
       this._terminalResizeObserver = null;
       if (this._terminalTouchCleanup) this._terminalTouchCleanup();
       if (this._terminalSelectionCleanup) this._terminalSelectionCleanup();
+      if (this._terminalImeCleanup) this._terminalImeCleanup();
+      this._terminalImeCleanup = null;
       this._terminalSuppressMouseUntil = 0;
       const socket = this._terminalSocket;
       this._terminalSocket = null;
@@ -18964,11 +19050,16 @@ function portal() {
     },
 
     // ===== @ mention =====
-    insertFileMention(path) {
+    _mentionPath(path, isDir = false) {
       const fileRoot = this.fileWorkspacePath();
-      const mentionPath = this.currentWorkspacePath() === fileRoot
+      let mentionPath = this.currentWorkspacePath() === fileRoot
         ? path
         : fileRoot.replace(/\/$/, "") + "/" + String(path || "").replace(/^\//, "");
+      if (isDir && mentionPath && !mentionPath.endsWith("/")) mentionPath += "/";
+      return mentionPath;
+    },
+    insertFileMention(path, isDir = false) {
+      const mentionPath = this._mentionPath(path, isDir);
       const mention = "@" + mentionPath + " ";
       this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
@@ -19863,7 +19954,7 @@ function portal() {
           }
         }
         if (mentionSeq !== this._mentionSeq) return;
-        const searchResults = (d.entries || []).filter(e => !e.is_dir);
+        const searchResults = d.entries || [];
         const openPaths = new Set(openMatches.map(t => t.path));
         const fresh = searchResults.filter(e => !openPaths.has(e.path));
         this.mentionResults = [...openMatches, ...fresh].slice(0, 15);
@@ -19879,10 +19970,11 @@ function portal() {
       const ta = this.$refs.chatInput;
       const before = this.input.slice(0, this.mentionAnchor);
       const after = this.input.slice(ta.selectionStart);
-      this.input = before + "@" + item.path + " " + after;
+      const mentionPath = this._mentionPath(item.path, !!item.is_dir);
+      this.input = before + "@" + mentionPath + " " + after;
       this._cancelMentionLookup();
       this.$nextTick(() => {
-        const newPos = (before + "@" + item.path + " ").length;
+        const newPos = (before + "@" + mentionPath + " ").length;
         ta.setSelectionRange(newPos, newPos);
         ta.focus();
       });

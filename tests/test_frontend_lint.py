@@ -1218,12 +1218,16 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "terminalMobileKey(text)" in app
     assert "this._terminalSend(text)" in app
     assert "_terminalDataIsMouseReport(data)" in app
+    assert "_terminalDataIsReplayReply(data)" in app
+    assert "_terminalTextInputDelta(before, after)" in app
+    assert "_attachTerminalImeFallback(term)" in app
+    assert "_terminalNormalizeImeData(data, state, term)" in app
     assert "_terminalHandleInput(data, term = this._terminal)" in app
     assert 'term.buffer?.active?.type !== "alternate"' in app
     assert '"\\x1b[?1000l\\x1b[?1002l\\x1b[?1003l\\x1b[?1005l"' in app
     assert "let replayActive = false" in app
     assert "let replayWritesPending = 0" in app
-    assert "if (replayActive || replayWritesPending) return" in app
+    assert "&& this._terminalDataIsReplayReply(data)) return" in app
     assert 'message.type === "replay_start"' in app
     assert 'message.type === "replay_end"' in app
     assert "if (this._terminal) this._terminal.focus()" in app

@@ -430,6 +430,47 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
             }"""
         )
 
+        # iOS Chinese IMEs can update xterm's hidden textarea only at keyup
+        # for keyCode=229 digits/punctuation. Exercise that exact event shape,
+        # including an equal-length replacement which needs DEL + insert.
+        ime_outbound = page.evaluate(
+            """async () => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const term = app._terminal;
+              const textarea = term.textarea;
+              const dispatch229 = (type, key) => {
+                const event = new KeyboardEvent(type, {bubbles: true, key});
+                Object.defineProperty(event, "keyCode", {value: 229});
+                Object.defineProperty(event, "which", {value: 229});
+                textarea.dispatchEvent(event);
+              };
+              const run = async (before, after, key) => {
+                app.__terminalOutboundData = [];
+                textarea.value = before;
+                dispatch229("keydown", key);
+                textarea.value = after;
+                dispatch229("keyup", key);
+                await new Promise(resolve => setTimeout(resolve, 30));
+                return app.__terminalOutboundData.slice();
+              };
+              const result = {
+                digit: await run("", "1", "1"),
+                punctuation: await run("", "，", "，"),
+                replacement: await run(" ", "。", "。"),
+                replayReply: app._terminalDataIsReplayReply("\\u001b[>0;276;0c"),
+                printable: app._terminalDataIsReplayReply("1，。"),
+              };
+              app._terminalSend("\\u0003");
+              await new Promise(resolve => setTimeout(resolve, 30));
+              return result;
+            }"""
+        )
+        assert "".join(ime_outbound["digit"]) == "1"
+        assert "".join(ime_outbound["punctuation"]) == "，"
+        assert "".join(ime_outbound["replacement"]) == "\x7f。"
+        assert ime_outbound["replayReply"] is True
+        assert ime_outbound["printable"] is False
+
         # A device query produced by an old process remains in the server
         # replay buffer. Reopening the terminal must render it without sending
         # xterm's fresh DA2 reply (ESC[>0;276;0c) into the current shell.
