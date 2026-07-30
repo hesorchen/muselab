@@ -5902,15 +5902,22 @@ function portal() {
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
       const tabSeq = this._mobileTabSeq = (this._mobileTabSeq || 0) + 1;
+      // A hidden `display:none` chat pane has no retained layout tree. Showing
+      // a rich history therefore makes the phone synchronously style/layout
+      // every mounted bubble before it can paint the tab change. Keep the
+      // bubbles behind the lightweight skeleton for one painted frame, then
+      // reveal them. This path is distinct from switchSession(): tapping the
+      // bottom Chat tab can reveal the already-current session without ever
+      // switching sessions, which used to bypass the existing protection.
       const chatState = next === "chat" && this.currentId
         ? this.tabState && this.tabState[this.currentId] : null;
-      // A loaded pane must remain visible while switching mobile tabs. Reusing
-      // the cold-history reveal gate here produced a real blank frame followed
-      // by a skeleton frame, and every historical bubble replayed `msg-in`.
-      // The mobile mounted window is already bounded, so reveal it directly.
-      if (chatState) {
-        chatState.messagesReady = true;
-        this.messagesReady = true;
+      const chatLen = (chatState && chatState.messages && chatState.messages.length) || 0;
+      // Even one envelope may contain a very large tool result or diff, so
+      // message count alone is not a safe complexity proxy on this reveal path.
+      const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
+      if (deferChat) {
+        chatState.messagesReady = false;
+        this.messagesReady = false;
       }
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
@@ -5923,12 +5930,19 @@ function portal() {
         this._restorePreviewViewState(ownerPath, ownerLoadSeq);
       }
       this.mobileTab = next;
-      if (next === "chat" && chatState) {
+      if (deferChat) {
         const target = this.currentId;
         this._afterPaint(() => {
           if (this._mobileTabSeq !== tabSeq || this.mobileTab !== "chat"
               || this.currentId !== target || this.tabState[target] !== chatState) return;
-          this._restoreChatPosition(target);
+          chatState.messagesReady = true;
+          this.messagesReady = true;
+          this._afterPaint(() => {
+            if (this._mobileTabSeq === tabSeq && this.mobileTab === "chat"
+                && this.currentId === target) {
+              this._restoreChatPosition(target);
+            }
+          });
         });
       }
       if (next === "preview" && previous !== "preview" && ownerPath) {
@@ -7044,9 +7058,11 @@ function portal() {
         }
         this._retireStaleSessionStream(sid, st);
         st._pendingExternalUpdate = true;
-        const loaded = await this.loadSession(sid, {
-          quiet: sid === this.currentId,
-        });
+        // This is reconciliation of an already-rendered stream, never a cold
+        // open. Keep quiet semantics even if the tab changes while the fetch is
+        // in flight, so becoming current cannot clear the pane and enter the
+        // chunked skeleton path mid-recovery.
+        const loaded = await this.loadSession(sid, { quiet: true });
         if (this.tabState[sid] !== st) return;
         st._canonicalResyncPending = false;
         if (loaded) {
@@ -10408,6 +10424,19 @@ function portal() {
         const stCur = this.tabState && this.tabState[this.currentId];
         const shouldFollow = !stCur || stCur.atBottom !== false;
         this.atBottom = shouldFollow;
+        const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
+        // On mobile, heavy history keeps the bubbles display:none'd for one frame
+        // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
+        // messagesReady=false) so the tab-bar flip + a loading skeleton PAINT
+        // immediately with ZERO bubble layout. Then reveal on the next frame —
+        // the (unavoidable) layout of N bubbles now happens AFTER the switch is
+        // already on screen, so the click feels instant with a brief loading
+        // state. Desktop favours visual continuity and keeps warm panes visible;
+        // the wider resident set makes these switches a direct x-show flip.
+        // Guard the deferred callbacks against a rapid re-switch: if the user
+        // tabs away again before the next frame, the stale callback must not
+        // flip messagesReady / scroll / highlight for a tab that's no longer
+        // visible (it would clobber the now-current tab's state).
         const target = this.currentId;
         // Already-highlighted tabs don't need another full-body highlight pass
         // on every switch: the per-node data-hl sentinel already early-returns,
@@ -10422,13 +10451,30 @@ function portal() {
         // suppressed during it, so the default cap is cheap in the common case
         // while still landing correctly on tall histories.
         const settle = () => this._restoreChatPosition(target);
-        stCur.messagesReady = true;
-        this.messagesReady = true;
-        this._afterPaint(() => {
-          if (this.currentId !== target) return;
-          settle();
-          reHighlight();
-        });
+        if (this._isMobileLayout()
+            && histLen >= Math.ceil(this._mountedMessageCap() / 2)
+            && shouldFollow) {
+          stCur.messagesReady = false;
+          this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
+          this._afterPaint(() => {
+            if (this.currentId !== target) return;
+            stCur.messagesReady = true;
+            this.messagesReady = true;         // reveal bubbles (layout now, post-switch-paint)
+            this._afterPaint(() => {
+              if (this.currentId !== target) return;
+              settle();
+              reHighlight();
+            });
+          });
+        } else {
+          stCur.messagesReady = true;
+          this.messagesReady = true;           // cheap reveal → no skeleton flash
+          this._afterPaint(() => {
+            if (this.currentId !== target) return;
+            settle();
+            reHighlight();
+          });
+        }
       } else {
         // [resident-panes] REBUILD: history is loaded in tabState but this pane
         // was NOT mounted (LRU-evicted, or first activation of a tab opened in
@@ -10442,21 +10488,23 @@ function portal() {
         const stCur = this.tabState && this.tabState[this.currentId];
         const shouldFollow = !stCur || stCur.atBottom !== false;
         this.atBottom = shouldFollow;
-        // A fresh DOM mount would otherwise replay the CSS entrance animation
-        // for every old bubble. Keep historical content visually continuous;
-        // live messages still omit `_noAnim` and retain the normal animation.
-        for (const m of this._allPaneMessages(stCur)) {
-          if (m) m._noAnim = true;
-        }
-        stCur.messagesReady = true;
-        this.messagesReady = true;
+        // Hide bubbles for one frame so the tab-bar flip + skeleton paint
+        // instantly; reveal next frame so the O(M) fresh-mount layout lands AFTER
+        // the switch is on-screen (same trick as the heavy-warm path above).
+        stCur.messagesReady = false;
+        this.messagesReady = false;
         this._afterPaint(() => {
           if (this.currentId !== target) return;
-          this._restoreChatPosition(target);
-          // Fresh DOM → always (re)highlight; reset the sentinel first.
-          if (stCur) stCur._highlighted = false;
-          this.highlightCode(".chat-body");
-          if (stCur) stCur._highlighted = true;
+          stCur.messagesReady = true;
+          this.messagesReady = true;
+          this._afterPaint(() => {
+            if (this.currentId !== target) return;
+            this._restoreChatPosition(target);
+            // Fresh DOM → always (re)highlight; reset the sentinel first.
+            if (stCur) stCur._highlighted = false;
+            this.highlightCode(".chat-body");
+            if (stCur) stCur._highlighted = true;
+          });
         });
       }
     },
@@ -10708,8 +10756,8 @@ function portal() {
         // defer it until the message is actually about to be shown.
         const buildEnvelope = (m) => {
           // History is existing content, not a newly-arrived chat bubble.
-          // Suppress the per-message entrance animation on cold load and on a
-          // later LRU pane rebuild; live SSE messages intentionally omit this.
+          // Live messages keep the default entrance animation; canonical
+          // history never replays it during a load or reconciliation.
           const out = { ...m, _k: this._historyMessageKey(sid, m), _noAnim: true };
           // Restore blob preview URLs on user messages with images
           if (m.role === "user" && m.images && m.images.length) {
@@ -10725,7 +10773,15 @@ function portal() {
           }
           return out;
         };
-        const all = this._historyEnvelopes(sid, (s.messages || []).map(buildEnvelope));
+        let all = this._historyEnvelopes(sid, (s.messages || []).map(buildEnvelope));
+        if (quiet) {
+          // A finished live turn is optimistic UI for this same canonical
+          // transcript. Reuse matching message objects + DOM keys before the
+          // in-place splice so Alpine keeps the existing bubble elements
+          // mounted instead of destroying `sid:live:*` nodes and recreating
+          // them as `sid:uuid:*` / `sid:hist:*`.
+          all = this._preserveCanonicalMessageIdentity(st, all);
+        }
         // Lazy-load thresholds — only render the tail of the conversation on
         // first paint; older messages stay in a "to-render" stash and get
         // mdRender'd on demand when the user clicks "Load earlier".
@@ -10828,9 +10884,9 @@ function portal() {
           // Re-check after the fetch await: if a stream started meanwhile, abort
           // the swap so we don't wipe live bubbles (see up-front guard above).
           if (st.streaming || st.es) return true;
-          // One-shot splice swap: Alpine morphs by stable :key (_k = sid+idx), so
-          // already-rendered bubbles stay mounted (no blank flash, scroll kept)
-          // and only the newly-finished tail bubbles get added.
+          // One-shot splice swap after `_preserveCanonicalMessageIdentity`:
+          // matching live/canonical bubbles retain both their object identity
+          // and `_k`, so only genuinely new/removed transcript rows touch DOM.
           this.messages = st.messages;
           st.messages.splice(0, st.messages.length, ...visible);
         } else {
@@ -11183,6 +11239,64 @@ function portal() {
         seen.set(base, n + 1);
         return { ...m, _k: n ? base + ":dup:" + n : base };
       });
+    },
+    _messageContinuitySignatures(m) {
+      if (!m) return [];
+      const role = String(m.role || "");
+      const out = [];
+      const push = (kind, value) => {
+        if (value === undefined || value === null || value === "") return;
+        out.push(role + ":" + kind + ":" + this._stableHash(String(value)));
+      };
+      // Tool/task identifiers survive the live → canonical boundary. UUID is
+      // also useful for canonical → canonical refreshes, but a live assistant
+      // bubble usually has no UUID yet, so text remains a required fallback.
+      for (const value of [m.uuid, m.id, m.tool_use_id, m.task_id]) {
+        push("id", value);
+      }
+      push("text", m.text);
+      // Some non-text tool/status rows expose only a preview or summary.
+      push("preview", m.preview);
+      push("summary", m.summary);
+      return out;
+    },
+    _preserveCanonicalMessageIdentity(st, incoming) {
+      const existing = this._allPaneMessages(st);
+      if (!existing.length || !(incoming && incoming.length)) return incoming || [];
+      const candidates = new Map();
+      for (const message of existing) {
+        for (const signature of this._messageContinuitySignatures(message)) {
+          if (!candidates.has(signature)) candidates.set(signature, []);
+          candidates.get(signature).push(message);
+        }
+      }
+      const used = new Set();
+      const result = incoming.slice();
+      // Tail windows can omit older duplicate prompts. Match newest-first so a
+      // repeated role+text pair inherits the live/current-tail key rather than
+      // an older cached bubble with the same text.
+      for (let i = result.length - 1; i >= 0; i--) {
+        const canonical = result[i];
+        let matched = null;
+        for (const signature of this._messageContinuitySignatures(canonical)) {
+          const queue = candidates.get(signature);
+          while (queue && queue.length && used.has(queue[queue.length - 1])) queue.pop();
+          if (queue && queue.length) {
+            matched = queue.pop();
+            break;
+          }
+        }
+        if (!matched || !matched._k) continue;
+        used.add(matched);
+        const mountedKey = matched._k;
+        const canonicalFields = { ...canonical };
+        delete canonicalFields._k;
+        Object.assign(matched, canonicalFields);
+        matched._k = mountedKey;
+        matched._noAnim = true;
+        result[i] = matched;
+      }
+      return result;
     },
     _assignLiveKey(st, m) {
       if (!m._k) m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
