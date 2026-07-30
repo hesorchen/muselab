@@ -652,3 +652,135 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
                 created_id,
             )
         context.close()
+
+
+def test_mobile_reopen_keeps_last_pane_while_terminal_restores(
+        browser: Browser, browser_name: str, backend_url: str, auth_token: str):
+    """A restored/reconnecting terminal must not route a phone away from chat/files."""
+    if browser_name != "chromium":
+        pytest.skip("mobile cold-start coverage runs on Chromium")
+
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        device_scale_factor=2,
+        has_touch=True,
+        is_mobile=True,
+    )
+    page = context.new_page()
+    created_id = ""
+    try:
+        _login(page, backend_url, auth_token)
+        created_id = page.evaluate(
+            """async () => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const result = await app.api("/api/terminals", {
+                method: "POST",
+                headers: app.fileHdr(),
+                json: {rows: 20, cols: 80, profile_id: ""},
+              });
+              if (!result.ok) throw new Error(result.error || "create failed");
+              app.terminals = [...app.terminals, result.data];
+              await app.openTerminal(result.data.id);
+              return result.data.id;
+            }"""
+        )
+        page.wait_for_function(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              .terminalConnection === "connected" """
+        )
+
+        def reopen_on(pane: str) -> dict:
+            page.evaluate(
+                """pane => {
+                  const app = document.querySelector("#app")._x_dataStack[0];
+                  app.setMobileTab(pane);
+                  app.savePrefs();
+                }""",
+                pane,
+            )
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_function(
+                """() => {
+                  const app = document.querySelector("#app")?._x_dataStack?.[0];
+                  return app?.authed
+                    && app.terminals.some(row => row.id === app.activeTerminalId)
+                    && app.terminalConnection === "connected";
+                }""",
+                # Earlier tests deliberately leave a very large current chat
+                # in the disposable backend. Its first render can occupy the
+                # mobile main thread even though terminal restore is already
+                # progressing, so use the suite's normal slow-start budget.
+                timeout=30000,
+            )
+            # Let the delayed terminal restore and preference coalescer settle;
+            # the old race changed both values shortly after initial paint.
+            page.wait_for_timeout(250)
+            return page.evaluate(
+                """() => {
+                  const app = document.querySelector("#app")._x_dataStack[0];
+                  const prefs = JSON.parse(
+                    localStorage.getItem("muselab_prefs") || "{}");
+                  return {
+                    mobileTab: app.mobileTab,
+                    storedTab: prefs.mobileTab,
+                    previewSurface: app.previewSurface,
+                    activeTerminalId: app.activeTerminalId,
+                    terminalConnected: app.terminalConnection === "connected",
+                    hiddenTerminalFocused:
+                      document.activeElement === app._terminal?.textarea,
+                  };
+                }"""
+            )
+
+        chat_state = reopen_on("chat")
+        assert chat_state == {
+            "mobileTab": "chat",
+            "storedTab": "chat",
+            "previewSurface": "terminal",
+            "activeTerminalId": created_id,
+            "terminalConnected": True,
+            "hiddenTerminalFocused": False,
+        }
+
+        # A transport reconnect uses the same openTerminal plumbing. It must
+        # remain a background repair while the terminal pane is hidden.
+        page.evaluate(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              ._terminalSocket.close()"""
+        )
+        page.wait_for_function(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              return app.terminalConnection === "connected"
+                && app.mobileTab === "chat";
+            }""",
+            timeout=10000,
+        )
+        page.wait_for_timeout(250)
+        assert page.evaluate(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              const prefs = JSON.parse(
+                localStorage.getItem("muselab_prefs") || "{}");
+              return app.mobileTab === "chat" && prefs.mobileTab === "chat"
+                && document.activeElement !== app._terminal?.textarea;
+            }"""
+        )
+
+        files_state = reopen_on("files")
+        assert files_state == {
+            "mobileTab": "files",
+            "storedTab": "files",
+            "previewSurface": "terminal",
+            "activeTerminalId": created_id,
+            "terminalConnected": True,
+            "hiddenTerminalFocused": False,
+        }
+    finally:
+        if created_id:
+            page.evaluate(
+                """id => document.querySelector("#app")?._x_dataStack?.[0]
+                  ?.closeTerminal(id, {confirm: false})""",
+                created_id,
+            )
+        context.close()

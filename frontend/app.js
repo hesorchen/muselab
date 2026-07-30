@@ -1927,13 +1927,7 @@ function portal() {
       // ensures the openFile-induced mobileTab="preview" assignment
       // settles before we override it back to the user's actual last tab.
       // Desktop ignores mobileTab entirely so this is a no-op there.
-      if (this._pendingMobileTab) {
-        const wantTab = this._pendingMobileTab;
-        this._pendingMobileTab = null;
-        this.$nextTick(() => {
-          if (this._isMobileLayout()) this.setMobileTab(wantTab);
-        });
-      }
+      this._restorePendingMobileTab();
       // Block readiness on context-info (the most important one for the
       // onboarding cards). Others come along in parallel.
       try {
@@ -4581,12 +4575,26 @@ function portal() {
                         { preview: !!(_restored && _restored.preview) })
               .catch(() => { /* file went away — nothing to do */ });
         }
+        // login() is the first-sign-in counterpart of _bootApp(). Keep the
+        // same ordering here: preview/terminal restoration may prepare a
+        // hidden surface, but it must not replace the mobile pane the user
+        // actually left visible.
+        this._restorePendingMobileTab();
         // First sign-in never routes through _bootApp (it inlines a subset of
         // the boot work above), so without this the new user has no heartbeat
         // / stale-JS reload / presence reporting / bell badge refresh until a
         // manual refresh. Shared with _bootApp; safe to call once here.
         this._startLiveConnections();
       } catch (e) { this.loginErr = e.message; }
+    },
+
+    _restorePendingMobileTab() {
+      if (!this._pendingMobileTab) return;
+      const wantTab = this._pendingMobileTab;
+      this._pendingMobileTab = null;
+      this.$nextTick(() => {
+        if (this._isMobileLayout()) this.setMobileTab(wantTab);
+      });
     },
 
     logout() {
@@ -15347,7 +15355,11 @@ function portal() {
         this._teardownTerminalView();
       }
       if (restore && this.previewSurface === "terminal" && activeExists) {
-        await this.openTerminal(this.activeTerminalId);
+        // Rebuild the terminal surface in the background without treating
+        // startup/workspace restoration like an explicit tap. In particular,
+        // a late terminal-list response must not overwrite the last mobile
+        // pane (chat/files) with "preview".
+        await this.openTerminal(this.activeTerminalId, { reveal: false });
       }
     },
     async createTerminal(profileId) {
@@ -15947,7 +15959,7 @@ function portal() {
         this._terminalTouchCleanup = null;
       };
     },
-    async openTerminal(id, { reconnect = false } = {}) {
+    async openTerminal(id, { reconnect = false, reveal = true } = {}) {
       const row = this.terminals.find(item => item.id === id);
       if (!row) return;
       this._teardownTerminalView();
@@ -15957,7 +15969,7 @@ function portal() {
       this.terminalManagerOpen = false;
       this.terminalConnection = "connecting";
       this.terminalExitCode = row.exit_code;
-      if (this._isMobileLayout()) this.setMobileTab("preview");
+      if (reveal && this._isMobileLayout()) this.setMobileTab("preview");
       this._scheduleSavePrefs();
       try {
         await this._loadTerminalLib();
@@ -16074,7 +16086,7 @@ function portal() {
           }
           return true;
         });
-        term.focus();
+        if (reveal || !this._isMobileLayout()) term.focus();
 
         const ticketResponse = await this.api(`/api/terminals/${id}/ticket`, {
           method: "POST",
@@ -16093,7 +16105,7 @@ function portal() {
           if (seq !== this._terminalConnectSeq) return;
           this.terminalConnection = "connected";
           sendSize();
-          term.focus();
+          if (reveal || !this._isMobileLayout()) term.focus();
         };
         socket.onmessage = event => {
           if (seq !== this._terminalConnectSeq) return;
@@ -16131,7 +16143,8 @@ function portal() {
             this.terminalConnection = "reconnecting";
             clearTimeout(this._terminalReconnectTimer);
             this._terminalReconnectTimer = setTimeout(
-              () => this.openTerminal(id, { reconnect: true }), reconnect ? 2200 : 1000);
+              () => this.openTerminal(id, { reconnect: true, reveal: false }),
+              reconnect ? 2200 : 1000);
           } else if (this.terminalConnection !== "exited") {
             this.terminalConnection = "disconnected";
           }

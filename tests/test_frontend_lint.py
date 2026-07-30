@@ -178,6 +178,22 @@ def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
     assert html.count("@click=\"setMobileTab('") == 3
 
 
+def test_terminal_restore_and_reconnect_do_not_hijack_mobile_tab():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    restore_start = app.index("async fetchTerminals(")
+    restore_end = app.index("\n    async createTerminal", restore_start)
+    restore = app[restore_start:restore_end]
+    terminal_start = app.index("async openTerminal(")
+    terminal_end = app.index("\n    _teardownTerminalView", terminal_start)
+    terminal = app[terminal_start:terminal_end]
+
+    assert "this._restorePendingMobileTab();" in app
+    assert "this.openTerminal(this.activeTerminalId, { reveal: false })" in restore
+    assert "async openTerminal(id, { reconnect = false, reveal = true } = {})" in terminal
+    assert 'if (reveal && this._isMobileLayout()) this.setMobileTab("preview")' in terminal
+    assert "this.openTerminal(id, { reconnect: true, reveal: false })" in terminal
+
+
 def test_primary_mobile_surfaces_keep_native_touch_scrolling():
     css = (FRONTEND / "styles.css").read_text()
     marker = "contract explicit on every primary mobile surface."
