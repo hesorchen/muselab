@@ -1405,6 +1405,69 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
     _assert_no_browser_errors(page, errors)
 
 
+def test_mobile_return_to_loaded_chat_has_no_blank_or_history_fade(
+    page: Page, backend_url, auth_token,
+):
+    """Every painted frame of a loaded mobile chat return keeps content visible."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    sid = "perf-mobile-no-flicker"
+    messages = _make_mixed_messages(80, "NO_FLICKER")
+    _route_windowed_session(page, sid, messages)
+    _login(page, backend_url, auth_token)
+    _bootstrap_session_for_real_load(page, sid, "No flicker")
+    _app_eval(page, "return app.loadSession(arg);", sid)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const pane = document.querySelector(".msg-pane");
+          return app.messagesReady === true && pane
+            && pane.querySelectorAll(".msg").length > 0;
+        }""",
+        timeout=10000,
+    )
+
+    _app_eval(page, 'app.setMobileTab("preview"); return true;')
+    page.wait_for_function(
+        """() => document.querySelector("#app")._x_dataStack[0].mobileTab === "preview" """
+    )
+
+    frames = page.evaluate(
+        """async () => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const samples = [];
+          app.setMobileTab("chat");
+          for (let i = 0; i < 8; i++) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const pane = Array.from(document.querySelectorAll(".msg-pane"))
+              .find(el => getComputedStyle(el).display !== "none");
+            const msgs = pane ? Array.from(pane.querySelectorAll(".msg"))
+              .filter(el => getComputedStyle(el).display !== "none") : [];
+            const skeleton = document.querySelector(".chat-skeleton");
+            samples.push({
+              ready: app.messagesReady,
+              hidden: document.querySelector(".chat-body").classList.contains("msgs-hidden"),
+              skeleton: skeleton ? getComputedStyle(skeleton).display : "missing",
+              messages: msgs.length,
+              transparent: msgs.filter(el => Number(getComputedStyle(el).opacity) < 0.99).length,
+              animations: msgs.reduce((total, el) => total + el.getAnimations()
+                .filter(anim => anim.animationName === "msg-in").length, 0),
+            });
+          }
+          return samples;
+        }"""
+    )
+
+    assert frames
+    assert all(frame["ready"] for frame in frames), frames
+    assert all(not frame["hidden"] for frame in frames), frames
+    assert all(frame["skeleton"] == "none" for frame in frames), frames
+    assert all(frame["messages"] > 0 for frame in frames), frames
+    assert all(frame["transparent"] == 0 for frame in frames), frames
+    assert all(frame["animations"] == 0 for frame in frames), frames
+    _assert_no_browser_errors(page, errors)
+
+
 def test_mobile_keyboard_close_without_viewport_event_restores_full_layout(
     page: Page, backend_url, auth_token,
 ):

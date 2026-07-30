@@ -168,7 +168,8 @@ def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
         "this._restorePreviewViewState(ownerPath, ownerLoadSeq)"
     ) < mobile_tab.index("this.mobileTab = next")
     assert "this._schedulePreviewViewRestore(ownerPath, ownerLoadSeq)" in mobile_tab
-    assert mobile_tab.index("this.messagesReady = false") < mobile_tab.index(
+    assert "this.messagesReady = false" not in mobile_tab
+    assert mobile_tab.index("this.messagesReady = true") < mobile_tab.index(
         "this.mobileTab = next"
     )
     assert "this._afterPaint(() => {" in mobile_tab
@@ -1114,13 +1115,13 @@ def test_long_chat_state_is_per_tab_bounded_and_generation_safe():
     assert "_laterMessages: []" in blank
     assert "_nextLiveKey: 1" in blank
     assert "_mountedMessageCap() { return this._isMobileLayout() ? 36 : 300; }" in app
-    assert "histLen >= Math.ceil(this._mountedMessageCap() / 2)" in app
+    assert "_noAnim: true" in app
     assert "_historyCacheCap() { return this._isMobileLayout() ? 120 : 800; }" in app
     assert "const budget = this._isMobileLayout() ? 1 : this._MAX_RESIDENT_PANES" in app
     assert "_MAX_RESIDENT_PANES: 4" in app
     assert "? (_coldEarly ? 8 : 15)" in app
     assert ": (_coldEarly ? 30 : 60)" in app
-    assert "&& histLen >= Math.ceil(this._mountedMessageCap() / 2)" in app
+    assert "for (const m of this._allPaneMessages(stCur))" in app
     assert "if (cst && cst.streaming) continue" not in app
     assert '"&history_generation="' in app
     assert "if (r.status === 409)" in app

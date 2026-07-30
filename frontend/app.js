@@ -5902,22 +5902,15 @@ function portal() {
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
       const tabSeq = this._mobileTabSeq = (this._mobileTabSeq || 0) + 1;
-      // A hidden `display:none` chat pane has no retained layout tree. Showing
-      // a rich history therefore makes the phone synchronously style/layout
-      // every mounted bubble before it can paint the tab change. Keep the
-      // bubbles behind the lightweight skeleton for one painted frame, then
-      // reveal them. This path is distinct from switchSession(): tapping the
-      // bottom Chat tab can reveal the already-current session without ever
-      // switching sessions, which used to bypass the existing protection.
       const chatState = next === "chat" && this.currentId
         ? this.tabState && this.tabState[this.currentId] : null;
-      const chatLen = (chatState && chatState.messages && chatState.messages.length) || 0;
-      // Even one envelope may contain a very large tool result or diff, so
-      // message count alone is not a safe complexity proxy on this reveal path.
-      const deferChat = next === "chat" && this._isMobileLayout() && chatLen > 0;
-      if (deferChat) {
-        chatState.messagesReady = false;
-        this.messagesReady = false;
+      // A loaded pane must remain visible while switching mobile tabs. Reusing
+      // the cold-history reveal gate here produced a real blank frame followed
+      // by a skeleton frame, and every historical bubble replayed `msg-in`.
+      // The mobile mounted window is already bounded, so reveal it directly.
+      if (chatState) {
+        chatState.messagesReady = true;
+        this.messagesReady = true;
       }
       if (previous === "preview" && next !== "preview") {
         this._capturePreviewViewState(ownerPath);
@@ -5930,19 +5923,12 @@ function portal() {
         this._restorePreviewViewState(ownerPath, ownerLoadSeq);
       }
       this.mobileTab = next;
-      if (deferChat) {
+      if (next === "chat" && chatState) {
         const target = this.currentId;
         this._afterPaint(() => {
           if (this._mobileTabSeq !== tabSeq || this.mobileTab !== "chat"
               || this.currentId !== target || this.tabState[target] !== chatState) return;
-          chatState.messagesReady = true;
-          this.messagesReady = true;
-          this._afterPaint(() => {
-            if (this._mobileTabSeq === tabSeq && this.mobileTab === "chat"
-                && this.currentId === target) {
-              this._restoreChatPosition(target);
-            }
-          });
+          this._restoreChatPosition(target);
         });
       }
       if (next === "preview" && previous !== "preview" && ownerPath) {
@@ -10422,19 +10408,6 @@ function portal() {
         const stCur = this.tabState && this.tabState[this.currentId];
         const shouldFollow = !stCur || stCur.atBottom !== false;
         this.atBottom = shouldFollow;
-        const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
-        // On mobile, heavy history keeps the bubbles display:none'd for one frame
-        // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
-        // messagesReady=false) so the tab-bar flip + a loading skeleton PAINT
-        // immediately with ZERO bubble layout. Then reveal on the next frame —
-        // the (unavoidable) layout of N bubbles now happens AFTER the switch is
-        // already on screen, so the click feels instant with a brief loading
-        // state. Desktop favours visual continuity and keeps warm panes visible;
-        // the wider resident set makes these switches a direct x-show flip.
-        // Guard the deferred callbacks against a rapid re-switch: if the user
-        // tabs away again before the next frame, the stale callback must not
-        // flip messagesReady / scroll / highlight for a tab that's no longer
-        // visible (it would clobber the now-current tab's state).
         const target = this.currentId;
         // Already-highlighted tabs don't need another full-body highlight pass
         // on every switch: the per-node data-hl sentinel already early-returns,
@@ -10449,30 +10422,13 @@ function portal() {
         // suppressed during it, so the default cap is cheap in the common case
         // while still landing correctly on tall histories.
         const settle = () => this._restoreChatPosition(target);
-        if (this._isMobileLayout()
-            && histLen >= Math.ceil(this._mountedMessageCap() / 2)
-            && shouldFollow) {
-          stCur.messagesReady = false;
-          this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            stCur.messagesReady = true;
-            this.messagesReady = true;         // reveal bubbles (layout now, post-switch-paint)
-            this._afterPaint(() => {
-              if (this.currentId !== target) return;
-              settle();
-              reHighlight();
-            });
-          });
-        } else {
-          stCur.messagesReady = true;
-          this.messagesReady = true;           // cheap reveal → no skeleton flash
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            settle();
-            reHighlight();
-          });
-        }
+        stCur.messagesReady = true;
+        this.messagesReady = true;
+        this._afterPaint(() => {
+          if (this.currentId !== target) return;
+          settle();
+          reHighlight();
+        });
       } else {
         // [resident-panes] REBUILD: history is loaded in tabState but this pane
         // was NOT mounted (LRU-evicted, or first activation of a tab opened in
@@ -10486,23 +10442,21 @@ function portal() {
         const stCur = this.tabState && this.tabState[this.currentId];
         const shouldFollow = !stCur || stCur.atBottom !== false;
         this.atBottom = shouldFollow;
-        // Hide bubbles for one frame so the tab-bar flip + skeleton paint
-        // instantly; reveal next frame so the O(M) fresh-mount layout lands AFTER
-        // the switch is on-screen (same trick as the heavy-warm path above).
-        stCur.messagesReady = false;
-        this.messagesReady = false;
+        // A fresh DOM mount would otherwise replay the CSS entrance animation
+        // for every old bubble. Keep historical content visually continuous;
+        // live messages still omit `_noAnim` and retain the normal animation.
+        for (const m of this._allPaneMessages(stCur)) {
+          if (m) m._noAnim = true;
+        }
+        stCur.messagesReady = true;
+        this.messagesReady = true;
         this._afterPaint(() => {
           if (this.currentId !== target) return;
-          stCur.messagesReady = true;
-          this.messagesReady = true;
-          this._afterPaint(() => {
-            if (this.currentId !== target) return;
-            this._restoreChatPosition(target);
-            // Fresh DOM → always (re)highlight; reset the sentinel first.
-            if (stCur) stCur._highlighted = false;
-            this.highlightCode(".chat-body");
-            if (stCur) stCur._highlighted = true;
-          });
+          this._restoreChatPosition(target);
+          // Fresh DOM → always (re)highlight; reset the sentinel first.
+          if (stCur) stCur._highlighted = false;
+          this.highlightCode(".chat-body");
+          if (stCur) stCur._highlighted = true;
         });
       }
     },
@@ -10753,7 +10707,10 @@ function portal() {
         // markdown→HTML pass is the dominant cost for long sessions, so we
         // defer it until the message is actually about to be shown.
         const buildEnvelope = (m) => {
-          const out = { ...m, _k: this._historyMessageKey(sid, m) };
+          // History is existing content, not a newly-arrived chat bubble.
+          // Suppress the per-message entrance animation on cold load and on a
+          // later LRU pane rebuild; live SSE messages intentionally omit this.
+          const out = { ...m, _k: this._historyMessageKey(sid, m), _noAnim: true };
           // Restore blob preview URLs on user messages with images
           if (m.role === "user" && m.images && m.images.length) {
             const key = (m.text || "") + ":" + m.images.length;
