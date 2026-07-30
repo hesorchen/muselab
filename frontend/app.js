@@ -351,6 +351,7 @@ function portal() {
     _terminalResizeObserver: null,
     _terminalTouchCleanup: null,
     _terminalSuppressMouseUntil: 0,
+    _terminalTouchWheelDispatching: false,
     _terminalReconnectTimer: null,
     _terminalConnectSeq: 0,
     _terminalSelectionCleanup: null,
@@ -15689,69 +15690,109 @@ function portal() {
     },
     _attachTerminalImeFallback(term) {
       const textarea = term && term.textarea;
-      const state = { pending: null, disposed: false };
+      const state = {
+        active229: false,
+        baseline: "",
+        composing: false,
+        disposed: false,
+        recovering: false,
+        settleTimer: null,
+      };
       if (!textarea) return state;
       const keyCode = event => Number(event.keyCode || event.which || 0);
-      const onKeyDown = event => {
-        // iOS Chinese IMEs report digits, punctuation and spaces through the
-        // keyCode=229 path. Their textarea value may update only by keyup,
-        // after xterm's keydown timer has already checked it.
-        if (keyCode(event) !== 229 || event.isComposing) return;
-        if (!state.pending) {
-          state.pending = {
-            baseline: textarea.value,
-            delivered: false,
-            recovering: false,
-          };
+      const flush = () => {
+        if (state.disposed || !state.active229 || state.composing) return;
+        const after = String(textarea.value || "");
+        const delta = this._terminalTextInputDelta(state.baseline, after);
+        state.baseline = after;
+        if (delta) {
+          state.recovering = true;
+          try { term.input(delta, true); }
+          finally { state.recovering = false; }
         }
       };
-      const onCompositionStart = () => { state.pending = null; };
-      const onKeyUp = event => {
-        if (keyCode(event) !== 229 || !state.pending) return;
-        const pending = state.pending;
-        setTimeout(() => {
-          if (state.disposed || state.pending !== pending || pending.delivered) return;
-          const delta = this._terminalTextInputDelta(
-            pending.baseline, textarea.value);
-          if (delta) {
-            pending.recovering = true;
-            term.input(delta, true);
+      const onKeyDown = event => {
+        // iOS Chinese IMEs report digits, punctuation and spaces through the
+        // keyCode=229 path. xterm handles that with one setTimeout snapshot per
+        // keydown; rapid keys can overlap and clear a later character's state.
+        // Own only the non-composing 229 path in capture phase, leaving the
+        // browser's default edit intact and using its actual input value below.
+        if (keyCode(event) !== 229 || event.isComposing || state.composing) {
+          if (state.active229) {
+            flush();
+            state.active229 = false;
           }
-          if (state.pending === pending) state.pending = null;
-        }, 0);
+          return;
+        }
+        clearTimeout(state.settleTimer);
+        flush();
+        state.active229 = true;
+        state.baseline = String(textarea.value || "");
       };
-      textarea.addEventListener("keydown", onKeyDown);
-      textarea.addEventListener("keyup", onKeyUp);
+      const onInput = () => { flush(); };
+      const onKeyUp = event => {
+        if (keyCode(event) !== 229 || !state.active229) return;
+        clearTimeout(state.settleTimer);
+        // Some iOS keyboards update the helper textarea after keyup instead of
+        // firing input synchronously. Keep a short fallback window; the next
+        // 229 keydown flushes this state first, so rapid digits cannot be lost.
+        state.settleTimer = setTimeout(() => {
+          flush();
+          state.active229 = false;
+          state.settleTimer = null;
+        }, 50);
+      };
+      const onCompositionStart = () => {
+        clearTimeout(state.settleTimer);
+        state.active229 = false;
+        state.composing = true;
+      };
+      const onCompositionEnd = () => { state.composing = false; };
+      textarea.addEventListener("keydown", onKeyDown, true);
+      textarea.addEventListener("keyup", onKeyUp, true);
+      textarea.addEventListener("input", onInput);
       textarea.addEventListener("compositionstart", onCompositionStart);
+      textarea.addEventListener("compositionend", onCompositionEnd);
       state.dispose = () => {
         state.disposed = true;
-        state.pending = null;
-        textarea.removeEventListener("keydown", onKeyDown);
-        textarea.removeEventListener("keyup", onKeyUp);
+        state.active229 = false;
+        clearTimeout(state.settleTimer);
+        state.settleTimer = null;
+        textarea.removeEventListener("keydown", onKeyDown, true);
+        textarea.removeEventListener("keyup", onKeyUp, true);
+        textarea.removeEventListener("input", onInput);
         textarea.removeEventListener("compositionstart", onCompositionStart);
+        textarea.removeEventListener("compositionend", onCompositionEnd);
       };
       return state;
     },
     _terminalNormalizeImeData(data, state, term) {
-      const pending = state && state.pending;
-      if (!pending || pending.recovering || typeof data !== "string") return data;
+      if (!state || !state.active229 || state.recovering
+          || typeof data !== "string") return data;
       const after = String(term?.textarea?.value || "");
-      const expected = this._terminalTextInputDelta(pending.baseline, after);
+      const expected = this._terminalTextInputDelta(state.baseline, after);
       if (!expected) return data;
-      // xterm 6's keyCode=229 fallback handles append-only edits, but for an
-      // equal-length IME replacement it emits the entire helper textarea.
-      // Rewrite only that exact legacy output; unrelated terminal data keeps
-      // flowing untouched.
-      const legacy = after.length > pending.baseline.length
-        ? after.replace(pending.baseline, "")
-        : after.length < pending.baseline.length ? "\x7f" : after;
-      if (data !== expected && data !== legacy) return data;
-      pending.delivered = true;
-      state.pending = null;
+      // The xterm input event normally emits only the inserted suffix, while
+      // an equal-length replacement emits the new textarea value without the
+      // DEL needed by the PTY. Normalize either shape to the authoritative
+      // before/after delta, then advance the baseline so our input listener
+      // sees that xterm already delivered this edit and does not duplicate it.
+      const native = after.length > state.baseline.length
+        ? after.replace(state.baseline, "")
+        : after.length < state.baseline.length ? "\x7f" : after;
+      if (data !== expected && data !== native) return data;
+      state.baseline = after;
       return expected;
     },
     _terminalHandleInput(data, term = this._terminal) {
       if (!this._terminalDataIsMouseReport(data)) {
+        this._terminalSend(data);
+        return;
+      }
+      // A vertical touch gesture in an alternate-buffer TUI is deliberately
+      // converted to xterm wheel input. It is the one mouse report allowed
+      // through while the post-touch click-suppression window is active.
+      if (this._terminalTouchWheelDispatching) {
         this._terminalSend(data);
         return;
       }
@@ -15897,6 +15938,28 @@ function portal() {
         remainder = 0;
         claimed = false;
       };
+      const dispatchTuiWheel = (touch, lines) => {
+        const screen = host.querySelector(".xterm-screen") || host;
+        const steps = Math.min(12, Math.max(1, Math.abs(lines)));
+        const deltaY = lines < 0 ? -100 : 100;
+        this._terminalTouchWheelDispatching = true;
+        try {
+          for (let i = 0; i < steps; i += 1) {
+            screen.dispatchEvent(new WheelEvent("wheel", {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              clientX: touch.clientX,
+              clientY: touch.clientY,
+              deltaX: 0,
+              deltaY,
+              deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+            }));
+          }
+        } finally {
+          this._terminalTouchWheelDispatching = false;
+        }
+      };
       const onStart = event => {
         if (event.touches.length !== 1) return reset();
         const touch = event.touches[0];
@@ -15929,7 +15992,15 @@ function portal() {
           : Math.ceil(remainder / linePx);
         if (!lines) return;
         remainder -= lines * linePx;
-        term.scrollLines(lines);
+        if (term.buffer?.active?.type === "alternate") {
+          // Full-screen TUIs have no xterm scrollback. Re-feed the gesture as
+          // real xterm wheel events so mouse-aware apps (Claude Code, vim,
+          // less) scroll their own pages; xterm falls back to cursor keys when
+          // the alternate-buffer app has not enabled mouse tracking.
+          dispatchTuiWheel(touch, lines);
+        } else {
+          term.scrollLines(lines);
+        }
       };
       const onEnd = event => {
         // Mobile browsers synthesize a mouse press/release after touchend.
@@ -16057,6 +16128,11 @@ function portal() {
         term.onResize(() => sendSize());
         term.attachCustomKeyEventHandler(event => {
           if (event.type !== "keydown") return true;
+          // Claim non-composing keyCode=229 before xterm's composition helper
+          // schedules its own textarea snapshot. The DOM input event remains
+          // untouched and _attachTerminalImeFallback reconciles/supplements it.
+          if (Number(event.keyCode || event.which || 0) === 229
+              && !event.isComposing && !imeFallback.composing) return false;
           const key = String(event.key || "").toLowerCase();
           // Copy deliberately does NOT take plain Ctrl+C: that is SIGINT, the
           // single most important key in a terminal. Cmd+C / Ctrl+Shift+C only.
@@ -16170,6 +16246,7 @@ function portal() {
       if (this._terminalImeCleanup) this._terminalImeCleanup();
       this._terminalImeCleanup = null;
       this._terminalSuppressMouseUntil = 0;
+      this._terminalTouchWheelDispatching = false;
       const socket = this._terminalSocket;
       this._terminalSocket = null;
       if (socket) {
@@ -22656,6 +22733,7 @@ function portal() {
       ];
     },
     ACTIVITY_GROUP_CAP: 5,
+    ACTIVITY_TIMELINE_CAP: 10,
     activityMatchesGroup(item, key) {
       if (!item) return false;
       if (key === "timeline") return true;
@@ -22688,11 +22766,15 @@ function portal() {
     activityEvents(group) {
       const all = this.activityAllEvents(group);
       if (this.activity.expanded[group.key]) return all;
-      return all.slice(0, this.ACTIVITY_GROUP_CAP);
+      return all.slice(0, this.activityGroupCap(group));
+    },
+    activityGroupCap(group) {
+      return group?.key === "timeline"
+        ? this.ACTIVITY_TIMELINE_CAP : this.ACTIVITY_GROUP_CAP;
     },
     activityHiddenCount(group) {
       return Math.max(
-        0, this.activityAllEvents(group).length - this.ACTIVITY_GROUP_CAP);
+        0, this.activityAllEvents(group).length - this.activityGroupCap(group));
     },
     toggleActivityGroup(key) {
       this.activity.expanded[key] = !this.activity.expanded[key];

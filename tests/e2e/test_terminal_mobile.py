@@ -430,9 +430,10 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
             }"""
         )
 
-        # iOS Chinese IMEs can update xterm's hidden textarea only at keyup
-        # for keyCode=229 digits/punctuation. Exercise that exact event shape,
-        # including an equal-length replacement which needs DEL + insert.
+        # iOS Chinese IMEs report digits/punctuation through keyCode=229 and
+        # can update xterm's hidden textarea at input or only after keyup.
+        # Exercise both paths plus rapid consecutive digits: none may be
+        # dropped or duplicated.
         ime_outbound = page.evaluate(
             """async () => {
               const app = document.querySelector("#app")._x_dataStack[0];
@@ -444,19 +445,44 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
                 Object.defineProperty(event, "which", {value: 229});
                 textarea.dispatchEvent(event);
               };
-              const run = async (before, after, key) => {
-                app.__terminalOutboundData = [];
+              const input229 = (before, after, key) => {
                 textarea.value = before;
                 dispatch229("keydown", key);
                 textarea.value = after;
+                textarea.dispatchEvent(new InputEvent("input", {
+                  bubbles: true, data: key, inputType: "insertText",
+                }));
                 dispatch229("keyup", key);
-                await new Promise(resolve => setTimeout(resolve, 30));
+              };
+              const run = async (before, after, key) => {
+                app.__terminalOutboundData = [];
+                input229(before, after, key);
+                await new Promise(resolve => setTimeout(resolve, 80));
                 return app.__terminalOutboundData.slice();
               };
+              app.__terminalOutboundData = [];
+              input229("", "1", "1");
+              input229("1", "12", "2");
+              input229("12", "123", "3");
+              input229("123", "123，", "，");
+              await new Promise(resolve => setTimeout(resolve, 80));
+              const rapid = app.__terminalOutboundData.slice();
+
+              // Keyup-only fallback: change the value after both keyboard
+              // events, with no input event, like delayed iOS helper updates.
+              app.__terminalOutboundData = [];
+              textarea.value = "";
+              dispatch229("keydown", "7");
+              dispatch229("keyup", "7");
+              textarea.value = "7";
+              await new Promise(resolve => setTimeout(resolve, 80));
+              const delayed = app.__terminalOutboundData.slice();
               const result = {
                 digit: await run("", "1", "1"),
                 punctuation: await run("", "，", "，"),
                 replacement: await run(" ", "。", "。"),
+                rapid,
+                delayed,
                 replayReply: app._terminalDataIsReplayReply("\\u001b[>0;276;0c"),
                 printable: app._terminalDataIsReplayReply("1，。"),
               };
@@ -468,6 +494,8 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
         assert "".join(ime_outbound["digit"]) == "1"
         assert "".join(ime_outbound["punctuation"]) == "，"
         assert "".join(ime_outbound["replacement"]) == "\x7f。"
+        assert "".join(ime_outbound["rapid"]) == "123，"
+        assert "".join(ime_outbound["delayed"]) == "7"
         assert ime_outbound["replayReply"] is True
         assert ime_outbound["printable"] is False
 
@@ -528,8 +556,9 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
         )
         assert not any(value.startswith("\x1b[<") for value in outbound)
 
-        # Touch gestures must never leak mouse-coordinate reports while a
-        # full-screen app has enabled the alternate buffer and SGR pixels.
+        # A vertical swipe in a full-screen TUI must become wheel input so the
+        # app can scroll its own page. A plain tap still must not leak its
+        # synthesized mouse click into the TUI.
         page.evaluate(
             """async () => {
               const app = document.querySelector("#app")._x_dataStack[0];
@@ -552,12 +581,68 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
             host_box["y"] + host_box["height"] * 0.35,
             host_box["y"] + host_box["height"] * 0.78,
         )
+        page.wait_for_timeout(250)
+        tui_wheel = page.evaluate(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              return {
+                raw: app.__terminalRawInput.slice(),
+                outbound: app.__terminalOutboundData.slice(),
+              };
+            }"""
+        )
+        assert any(
+            re.fullmatch(r"\x1b\[<64;\d+;\d+M", value)
+            for value in tui_wheel["raw"]
+        ), repr(tui_wheel)
+        assert any(
+            re.fullmatch(r"\x1b\[<64;\d+;\d+M", value)
+            for value in tui_wheel["outbound"]
+        ), repr(tui_wheel)
+        page.evaluate(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              app.__terminalRawInput = [];
+              app.__terminalOutboundData = [];
+            }"""
+        )
+        _touch_swipe_down(
+            page,
+            host_box["x"] + host_box["width"] / 2,
+            host_box["y"] + host_box["height"] * 0.78,
+            host_box["y"] + host_box["height"] * 0.35,
+        )
+        page.wait_for_timeout(250)
+        tui_wheel_down = page.evaluate(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              return {
+                raw: app.__terminalRawInput.slice(),
+                outbound: app.__terminalOutboundData.slice(),
+              };
+            }"""
+        )
+        assert any(
+            re.fullmatch(r"\x1b\[<65;\d+;\d+M", value)
+            for value in tui_wheel_down["raw"]
+        ), repr(tui_wheel_down)
+        assert any(
+            re.fullmatch(r"\x1b\[<65;\d+;\d+M", value)
+            for value in tui_wheel_down["outbound"]
+        ), repr(tui_wheel_down)
+        page.evaluate(
+            """() => {
+              const app = document.querySelector("#app")._x_dataStack[0];
+              app.__terminalRawInput = [];
+              app.__terminalOutboundData = [];
+            }"""
+        )
         _touch_tap(
             page,
             host_box["x"] + host_box["width"] / 2,
             host_box["y"] + host_box["height"] / 2,
         )
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(750)
         raw_touch_input = page.evaluate(
             """() => document.querySelector("#app")._x_dataStack[0]
               .__terminalRawInput"""
@@ -641,6 +726,23 @@ def test_mobile_terminal_sheet_create_and_real_touch_scrollback(
               return term && term.buffer.active.viewportY < before;
             }""",
             arg=before["viewportY"],
+        )
+        scrolled_viewport = page.evaluate(
+            """() => document.querySelector("#app")._x_dataStack[0]
+              ._terminal.buffer.active.viewportY"""
+        )
+        _touch_swipe_down(
+            page,
+            host_box["x"] + host_box["width"] / 2,
+            host_box["y"] + host_box["height"] * 0.78,
+            host_box["y"] + host_box["height"] * 0.35,
+        )
+        page.wait_for_function(
+            """before => {
+              const term = document.querySelector("#app")._x_dataStack[0]._terminal;
+              return term && term.buffer.active.viewportY > before;
+            }""",
+            arg=scrolled_viewport,
         )
     finally:
         if created_id:

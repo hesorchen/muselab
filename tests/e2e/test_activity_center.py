@@ -122,6 +122,18 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
               workspaces: [],
             },
           });
+          for (let index = 0; index < 9; index += 1) {
+            app.activity.events.push({
+              ...base,
+              id: `extra-${index}`,
+              session_id: `extra-session-${index}`,
+              task_summary: `Extra task ${index}`,
+              state: 'completed',
+              started_at: 90 - index,
+              finished_at: 90 - index,
+              updated_at: 90 - index,
+            });
+          }
           app.setActivityView('timeline');
         }"""
     )
@@ -130,12 +142,16 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
         "active"
     )
     labels = page.locator(".activity-group .activity-row strong")
-    expect(labels).to_have_count(3)
-    assert labels.all_text_contents() == [
+    expect(labels).to_have_count(10)
+    assert labels.all_text_contents()[:3] == [
         "Newest running task",
         "Newer failed task",
         "Older completed task",
     ]
+    more = page.locator(".activity-group-more")
+    expect(more).to_have_text("2 more")
+    more.click()
+    expect(labels).to_have_count(12)
 
 
 def test_terminal_event_wins_over_stale_tab_activity_snapshot(
