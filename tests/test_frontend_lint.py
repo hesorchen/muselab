@@ -694,6 +694,9 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'item.state === "completed" && !!item.read' in app
     assert 'item.state === "cancelled"' in app
     assert "ACTIVITY_GROUP_CAP: 5" in app
+    assert "ACTIVITY_TIMELINE_CAP: 10" in app
+    assert 'group?.key === "timeline"' in app
+    assert "this.activityGroupCap(group)" in app
     assert "activityHiddenCount(group)" in app
     assert '"/api/activity?limit=500"' in app
     assert "r.status === 304 && !opts.summaryOnly && !this.activity.events.length" in app
@@ -1238,6 +1241,9 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "_terminalTextInputDelta(before, after)" in app
     assert "_attachTerminalImeFallback(term)" in app
     assert "_terminalNormalizeImeData(data, state, term)" in app
+    assert 'textarea.addEventListener("keydown", onKeyDown, true)' in app
+    assert 'textarea.addEventListener("input", onInput)' in app
+    assert "Number(event.keyCode || event.which || 0) === 229" in app
     assert "_terminalHandleInput(data, term = this._terminal)" in app
     assert 'term.buffer?.active?.type !== "alternate"' in app
     assert '"\\x1b[?1000l\\x1b[?1002l\\x1b[?1003l\\x1b[?1005l"' in app
@@ -1262,6 +1268,9 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     assert "if (event.cancelable) event.preventDefault()" in app
     assert "event.stopPropagation()" in app
     assert "term.scrollLines(lines)" in app
+    assert 'new WheelEvent("wheel"' in app
+    assert "this._terminalTouchWheelDispatching = true" in app
+    assert "if (this._terminalTouchWheelDispatching)" in app
     assert "this._terminalSuppressMouseUntil = performance.now() + 500" in app
     assert "this._terminalSuppressMouseUntil = performance.now() + 800" in app
     assert "if (this._terminalTouchCleanup) this._terminalTouchCleanup()" in app
