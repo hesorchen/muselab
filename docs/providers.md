@@ -31,19 +31,18 @@ evolves faster than this page, so this table deliberately avoids model counts.
 
 ## Image generation
 
-The composer image button is not a chat provider. `MUSELAB_IMAGE_PROVIDER=auto`
-uses the native OpenAI Image API when `OPENAI_IMAGE_API_KEY` (or
-`OPENAI_API_KEY`) is configured. The local Codex `$imagegen` path is explicit
-opt-in: set `MUSELAB_IMAGE_PROVIDER=codex_imagegen` and
-`CODEX_IMAGEGEN_ENABLED=true` to use the logged-in `codex` CLI. Set
-`MUSELAB_IMAGE_PROVIDER=openai` to force the OpenAI-compatible path.
+The composer image button is separate from chat providers. It calls an
+OpenAI-compatible Images API configured with `OPENAI_IMAGE_API_KEY` (or the
+`OPENAI_API_KEY` fallback) and `OPENAI_IMAGE_BASE_URL`. The endpoint may be
+OpenAI itself or a narrow self-hosted adapter such as
+[codex-image-api](https://github.com/hesorchen/codex-image-api).
 
-Generated images are staged as normal muselab image attachments, so they can be
-previewed, annotated, and sent into the current chat. Image requests run as
-background jobs and are also kept in the image history drawer, so refreshing the
-page does not lose completed outputs. The Codex imagegen path is intended for
-localhost single-user deployments; do not expose a muselab instance with local
-Codex access to the public internet.
+muselab does not launch Codex or hold Codex OAuth state. Keeping image execution
+behind a dedicated API makes the credential and process boundary independent of
+the web application. Generated images are staged as ordinary muselab image
+attachments, so they can be previewed, annotated, and sent into the current
+chat. Requests run as background jobs and remain available in the image history
+drawer after a page refresh.
 
 ## Switching model mid-conversation
 

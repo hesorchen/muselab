@@ -72,14 +72,11 @@ and backup requirements.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `MUSELAB_IMAGE_PROVIDER` | `auto`, `openai`, or `codex_imagegen` | `auto` |
-| `OPENAI_IMAGE_API_KEY` | OpenAI Image API key; may fall back to `OPENAI_API_KEY` | Empty |
-| `OPENAI_IMAGE_BASE_URL` | OpenAI-compatible `/v1` base URL | `https://api.openai.com/v1` |
+| `OPENAI_IMAGE_API_KEY` | Images API key; may fall back to `OPENAI_API_KEY` | Empty |
+| `OPENAI_IMAGE_BASE_URL` | OpenAI-compatible `/v1` base URL, including self-hosted adapters | `https://api.openai.com/v1` |
 | `MUSELAB_IMAGE_GENERATION_TIMEOUT` | Image API timeout in seconds | `180` |
-| `CODEX_IMAGEGEN_ENABLED` | Allow a local Codex image process | `false` |
-| `CODEX_IMAGEGEN_TIMEOUT_SECONDS` | Local Codex timeout | `300` |
 
-Local Codex image generation is suitable only for trusted instances. Durable jobs and files live under `$MUSELAB_ROOT/.muselab/imagegen/`.
+muselab only acts as an Images API client; it does not launch a local image model or Codex process. Durable jobs and files live under `$MUSELAB_ROOT/.muselab/imagegen/`.
 
 ## Resource and behavior tuning
 
