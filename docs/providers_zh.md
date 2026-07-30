@@ -24,17 +24,16 @@ muselab 以 **Claude Agent SDK** 作为唯一对话后端。非 Claude 模型通
 
 ## 生图
 
-Composer 里的图片按钮不是聊天 provider。`MUSELAB_IMAGE_PROVIDER=auto` 时，
-如果配置了 `OPENAI_IMAGE_API_KEY`（或 `OPENAI_API_KEY`），会走 OpenAI Image
-API。本机 Codex `$imagegen` 通路必须显式 opt-in：设置
-`MUSELAB_IMAGE_PROVIDER=codex_imagegen` 与 `CODEX_IMAGEGEN_ENABLED=true` 后，
-才会调用已登录的 `codex` CLI。也可以设置 `MUSELAB_IMAGE_PROVIDER=openai`
-强制使用 OpenAI-compatible 通路。
+Composer 里的图片按钮独立于聊天 provider。它调用由 `OPENAI_IMAGE_API_KEY`
+（或回退的 `OPENAI_API_KEY`）和 `OPENAI_IMAGE_BASE_URL` 配置的
+OpenAI-compatible Images API。该端点可以是 OpenAI，也可以是狭窄职责的
+自托管适配器，例如
+[codex-image-api](https://github.com/hesorchen/codex-image-api)。
 
-生成结果会作为普通 muselab 图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。
-生图请求会作为后台任务执行，并保留在生图历史里，刷新页面也不会丢掉已完成结果。
-Codex imagegen 通路只适合 localhost 单用户部署；不要把带本机 Codex 能力的 muselab
-实例暴露到公网。
+muselab 不再直接启动 Codex，也不持有 Codex OAuth 状态。把生图执行放在独立 API
+之后，可以让凭据和进程边界与 Web 应用解耦。生成结果仍会作为普通 muselab
+图片附件暂存，因此可预览、画笔标注，并加入当前聊天发送。生图请求会作为后台
+任务执行，并保留在生图历史里，刷新页面也不会丢掉已完成结果。
 
 ## 对话中切换模型
 

@@ -47,7 +47,6 @@ from .settings import (
     env_float,
     env_int,
     is_chinese_locale,
-    locate_executable,
 )
 from . import sessions as sess
 from . import endpoints
@@ -7158,7 +7157,6 @@ class ImageGenerateReq(BaseModel):
 
 _IMAGE_SIZE_RE = re.compile(r"^(auto|[1-9][0-9]{2,3}x[1-9][0-9]{2,3})$")
 _IMAGE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
-_IMAGE_PROVIDER_VALUES = {"auto", "openai", "openai_image_api", "codex", "codex_imagegen"}
 _IMAGE_FILE_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -7195,7 +7193,6 @@ def _validate_image_size(size: str) -> str:
 def _openai_image_api_config() -> tuple[str, str]:
     key = (
         os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
-        or os.environ.get("CODEX_IMAGE_API_KEY", "").strip()
         or os.environ.get("OPENAI_API_KEY", "").strip()
     )
     if not key:
@@ -7205,7 +7202,6 @@ def _openai_image_api_config() -> tuple[str, str]:
         )
     base_url = (
         os.environ.get("OPENAI_IMAGE_BASE_URL", "").strip()
-        or os.environ.get("CODEX_IMAGE_BASE_URL", "").strip()
         or os.environ.get("OPENAI_BASE_URL", "").strip()
         or "https://api.openai.com/v1"
     ).rstrip("/")
@@ -7217,40 +7213,6 @@ def _openai_image_api_config() -> tuple[str, str]:
     if parsed.scheme == "http" and host in loopback_hosts:
         return key, base_url
     raise HTTPException(400, "OPENAI_IMAGE_BASE_URL must be https or loopback http")
-
-
-def _openai_image_api_key_present() -> bool:
-    return bool(
-        os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
-        or os.environ.get("CODEX_IMAGE_API_KEY", "").strip()
-        or os.environ.get("OPENAI_API_KEY", "").strip()
-    )
-
-
-def _env_enabled(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
-
-
-def _image_provider() -> str:
-    raw = os.environ.get("MUSELAB_IMAGE_PROVIDER", "auto").strip().lower()
-    if raw not in _IMAGE_PROVIDER_VALUES:
-        raise HTTPException(
-            400,
-            "invalid MUSELAB_IMAGE_PROVIDER "
-            "(expected auto, openai, or codex_imagegen)",
-        )
-    if raw in {"openai", "openai_image_api"}:
-        return "openai"
-    if raw in {"codex", "codex_imagegen"}:
-        return "codex"
-    if _openai_image_api_key_present():
-        return "openai"
-    if _env_enabled("CODEX_IMAGEGEN_ENABLED", False):
-        return "codex"
-    return "openai"
 
 
 def _image_error_message(status: int, body: str) -> str:
@@ -7503,26 +7465,15 @@ async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
     _imagegen_update_job(job_id, status="running", error="")
     try:
         prompt, model, size, quality, output_format, image_ids = _normalize_image_generate_req(req)
-        provider = _image_provider()
-        if provider == "codex":
-            result = await _generate_codex_imagegen(
-                req=req,
-                prompt=prompt,
-                size=size,
-                quality=quality,
-                output_format=output_format,
-                image_ids=image_ids,
-            )
-        else:
-            result = await _generate_openai_image_api(
-                req=req,
-                prompt=prompt,
-                model=model,
-                size=size,
-                quality=quality,
-                output_format=output_format,
-                image_ids=image_ids,
-            )
+        result = await _generate_openai_image_api(
+            req=req,
+            prompt=prompt,
+            model=model,
+            size=size,
+            quality=quality,
+            output_format=output_format,
+            image_ids=image_ids,
+        )
         with _imagegen_jobs_lock:
             jobs = _imagegen_load_jobs()
             job = jobs.get(job_id)
@@ -7539,167 +7490,6 @@ async def _run_imagegen_job(job_id: str, req: ImageGenerateReq) -> None:
         _imagegen_update_job(job_id, status="failed", error=str(e.detail))
     except Exception as e:
         _imagegen_update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
-
-
-def _image_file_mime(path: Path) -> str | None:
-    mime = _IMAGE_FILE_MIME.get(path.suffix.lower())
-    if not mime:
-        return None
-    try:
-        head = path.read_bytes()[:16]
-    except OSError:
-        return None
-    if mime == "image/png" and head.startswith(b"\x89PNG\r\n\x1a\n"):
-        return mime
-    if mime == "image/jpeg" and head.startswith(b"\xff\xd8\xff"):
-        return mime
-    if mime == "image/webp" and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
-        return mime
-    return None
-
-
-def _extract_json_object(text: str) -> dict | None:
-    if not text:
-        return None
-    candidates = [text.strip()]
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
-    if match:
-        candidates.insert(0, match.group(1).strip())
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(text[start:end + 1])
-    for cand in candidates:
-        try:
-            obj = json.loads(cand)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return None
-
-
-def _codex_imagegen_prompt(
-    *,
-    prompt: str,
-    size: str,
-    quality: str,
-    output_format: str,
-    n: int,
-    out_dir: Path,
-    has_refs: bool,
-) -> str:
-    ref_line = (
-        "Attached images are visual references or edit inputs for the user's prompt. "
-        if has_refs else ""
-    )
-    return f"""$imagegen
-
-You are fulfilling a local muselab image-generation request.
-Use the built-in Codex image generation skill/tool. Do not call OpenAI APIs,
-do not ask for API keys, and do not modify source files.
-
-User prompt:
-{prompt}
-
-Generation constraints:
-- Size: {size}
-- Quality target: {quality}
-- Output format requested by muselab: {output_format}
-- Number of final images: {n}
-- {ref_line}If the image tool saves files outside the requested directory, copy the final
-  selected image file(s) into this exact directory:
-  {out_dir}
-- Use simple filenames like image-1.png, image-2.png, image-1.jpg, or image-1.webp.
-- Put only final generated images in that directory.
-
-When finished, respond with only compact JSON in this shape:
-{{"images":[{{"path":"{out_dir}/image-1.png"}}]}}
-"""
-
-
-def _codex_imagegen_output_files(out_dir: Path, final_text: str) -> list[Path]:
-    files: list[Path] = []
-    parsed = _extract_json_object(final_text)
-    if isinstance(parsed, dict):
-        images = parsed.get("images")
-        if isinstance(images, list):
-            for item in images:
-                raw_path = item.get("path") if isinstance(item, dict) else item
-                if not isinstance(raw_path, str) or not raw_path:
-                    continue
-                try:
-                    p = Path(raw_path).resolve()
-                    p.relative_to(out_dir.resolve())
-                except Exception:
-                    continue
-                if p.is_file() and _image_file_mime(p):
-                    files.append(p)
-    if not files:
-        for p in sorted(out_dir.iterdir()):
-            if p.is_file() and _image_file_mime(p):
-                files.append(p)
-    seen: set[Path] = set()
-    deduped: list[Path] = []
-    for p in files:
-        if p not in seen:
-            seen.add(p)
-            deduped.append(p)
-    return deduped
-
-
-def _codex_generated_images_since(start_ts: float, limit: int) -> list[Path]:
-    root = Path(os.environ.get("CODEX_HOME", "").strip() or (Path.home() / ".codex"))
-    gen_root = root / "generated_images"
-    if not gen_root.exists():
-        return []
-    found: list[tuple[float, Path]] = []
-    min_mtime = start_ts - 2.0
-    try:
-        gen_root_resolved = gen_root.resolve()
-    except OSError:
-        return []
-    for p in gen_root.rglob("*"):
-        if not p.is_file() or not _image_file_mime(p):
-            continue
-        try:
-            resolved = p.resolve()
-            resolved.relative_to(gen_root_resolved)
-            mtime = p.stat().st_mtime
-        except OSError:
-            continue
-        except ValueError:
-            continue
-        if mtime >= min_mtime:
-            found.append((mtime, resolved))
-    found.sort(key=lambda item: item[0])
-    return [p for _, p in found[-limit:]]
-
-
-async def _prepare_codex_reference_images(image_ids: list[str], input_dir: Path) -> list[Path]:
-    if not image_ids:
-        return []
-    _gc_images()
-    refs: list[Path] = []
-    for idx, aid in enumerate(image_ids[:8], start=1):
-        entry = _image_store.get(aid)
-        if not entry or entry.get("kind") != "image" or not entry.get("b64"):
-            continue
-        try:
-            raw = base64.b64decode(entry["b64"])
-        except Exception:
-            continue
-        ext = {
-            "image/png": "png",
-            "image/jpeg": "jpg",
-            "image/webp": "webp",
-        }.get(entry.get("mime") or "image/png", "png")
-        p = input_dir / f"reference-{idx}.{ext}"
-        p.write_bytes(raw)
-        refs.append(p)
-    if not refs:
-        raise HTTPException(400, "reference images are missing or expired")
-    return refs
 
 
 async def _generate_openai_image_api(
@@ -7781,155 +7571,10 @@ async def _generate_openai_image_api(
     }
 
 
-async def _generate_codex_imagegen(
-    *,
-    req: ImageGenerateReq,
-    prompt: str,
-    size: str,
-    quality: str,
-    output_format: str,
-    image_ids: list[str],
-) -> dict:
-    codex_bin = os.environ.get("CODEX_BIN", "").strip() or locate_executable("codex")
-    if not codex_bin:
-        raise HTTPException(
-            400,
-            "missing OpenAI image API key and codex CLI was not found for codex_imagegen",
-        )
-    if not _env_enabled("CODEX_IMAGEGEN_ENABLED", False):
-        raise HTTPException(400, "codex_imagegen is disabled by CODEX_IMAGEGEN_ENABLED")
-
-    timeout = max(
-        30.0,
-        env_float(
-            "CODEX_IMAGEGEN_TIMEOUT_SECONDS",
-            env_float("MUSELAB_IMAGE_GENERATION_TIMEOUT", 300.0),
-        ),
-    )
-    start_ts = time.time()
-    with tempfile.TemporaryDirectory(prefix="muselab-codex-imagegen-") as td:
-        work_dir = Path(td)
-        out_dir = work_dir / "out"
-        input_dir = work_dir / "input"
-        out_dir.mkdir()
-        input_dir.mkdir()
-        ref_paths = await _prepare_codex_reference_images(image_ids, input_dir)
-        final_msg = work_dir / "final.json"
-        bridge_prompt = _codex_imagegen_prompt(
-            prompt=prompt,
-            size=size,
-            quality=quality,
-            output_format=output_format,
-            n=req.n,
-            out_dir=out_dir,
-            has_refs=bool(ref_paths),
-        )
-        cmd = [
-            codex_bin,
-            "exec",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "workspace-write",
-            "--cd",
-            str(work_dir),
-            "--output-last-message",
-            str(final_msg),
-        ]
-        for p in ref_paths:
-            cmd.extend(["--image", str(p)])
-        cmd.append("-")
-        env = {
-            name: value
-            for name, value in os.environ.items()
-            if name in {
-                "CODEX_HOME",
-                "HOME",
-                "LANG",
-                "LC_ALL",
-                "PATH",
-                "SSL_CERT_FILE",
-                "SSL_CERT_DIR",
-                "TERM",
-                "TMPDIR",
-            }
-        }
-        env["NO_COLOR"] = "1"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(bridge_prompt.encode("utf-8")),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()  # type: ignore[possibly-undefined]
-                await proc.wait()  # type: ignore[possibly-undefined]
-            except Exception:
-                pass
-            raise HTTPException(504, "codex image generation timed out") from None
-        except OSError as e:
-            raise HTTPException(502, f"failed to start codex imagegen: {e}") from None
-
-        final_text = ""
-        try:
-            final_text = final_msg.read_text(encoding="utf-8")
-        except OSError:
-            pass
-        if proc.returncode != 0:
-            detail = (stderr or stdout).decode("utf-8", "replace").strip()
-            if final_text.strip():
-                detail = final_text.strip()
-            raise HTTPException(
-                502,
-                "codex image generation failed" + (f": {detail[:500]}" if detail else ""),
-            )
-        files = _codex_imagegen_output_files(out_dir, final_text)
-        if not files:
-            files = _codex_generated_images_since(start_ts, req.n)
-        if not files:
-            raise HTTPException(502, "codex image generation returned no image file")
-        staged = []
-        for idx, path in enumerate(files[:req.n], start=1):
-            mime = _image_file_mime(path)
-            if not mime:
-                continue
-            try:
-                raw = path.read_bytes()
-            except OSError:
-                continue
-            staged.append(_stage_generated_image_bytes(raw, mime, idx))
-        if not staged:
-            raise HTTPException(502, "codex image generation returned no readable image file")
-    return {
-        "ok": True,
-        "provider": "codex_imagegen",
-        "model": "codex-imagegen",
-        "images": staged,
-        "usage": None,
-    }
-
-
 @router.post("/image-generate", dependencies=[Depends(require_token)])
 async def generate_image(req: ImageGenerateReq) -> dict:
     """Generate images and stage them as ordinary muselab image attachments."""
     prompt, model, size, quality, output_format, image_ids = _normalize_image_generate_req(req)
-    provider = _image_provider()
-    if provider == "codex":
-        return await _generate_codex_imagegen(
-            req=req,
-            prompt=prompt,
-            size=size,
-            quality=quality,
-            output_format=output_format,
-            image_ids=image_ids,
-        )
     return await _generate_openai_image_api(
         req=req,
         prompt=prompt,

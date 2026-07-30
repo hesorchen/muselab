@@ -70,14 +70,11 @@ Embedding、向量库和 reranker 凭据不写入 `.env`，设置页读取时也
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `MUSELAB_IMAGE_PROVIDER` | `auto`、`openai` 或 `codex_imagegen` | `auto` |
-| `OPENAI_IMAGE_API_KEY` | OpenAI Image API key；未设置时可复用 `OPENAI_API_KEY` | 空 |
-| `OPENAI_IMAGE_BASE_URL` | OpenAI-compatible `/v1` base URL | `https://api.openai.com/v1` |
+| `OPENAI_IMAGE_API_KEY` | Images API key；未设置时可复用 `OPENAI_API_KEY` | 空 |
+| `OPENAI_IMAGE_BASE_URL` | OpenAI-compatible `/v1` base URL，包括自托管适配器 | `https://api.openai.com/v1` |
 | `MUSELAB_IMAGE_GENERATION_TIMEOUT` | API 生图超时秒数 | `180` |
-| `CODEX_IMAGEGEN_ENABLED` | 是否允许启动本机 Codex 生图进程 | `false` |
-| `CODEX_IMAGEGEN_TIMEOUT_SECONDS` | 本机 Codex 生图超时 | `300` |
 
-本机 Codex 生图只适用于可信实例。持久化任务与图片位于 `$MUSELAB_ROOT/.muselab/imagegen/`。
+muselab 只作为 Images API 客户端，不再启动本地生图模型或 Codex 进程。持久化任务与图片位于 `$MUSELAB_ROOT/.muselab/imagegen/`。
 
 ## 资源与行为调优
 
