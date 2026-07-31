@@ -4632,9 +4632,9 @@ function portal() {
       if (cwd) headers["X-Muselab-Workspace"] = encodeURIComponent(cwd);
       return headers;
     },
-    fileHdr() {
+    fileHdr(path = "") {
       const headers = this.hdr();
-      const root = this.fileWorkspacePath();
+      const root = path || this.fileWorkspacePath();
       if (root) headers["X-Muselab-Workspace"] = encodeURIComponent(root);
       return headers;
     },
@@ -17424,6 +17424,14 @@ function portal() {
     },
     async createTerminal(profileId) {
       if (!this.terminalEnabled || this.terminalCreating) return;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
+      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!ownerWorkspace || !isOwner()) return;
+      const requestHeaders = this.fileHdr(ownerWorkspace);
       // Read the native select value at click time. Mobile browsers can commit
       // their picker value one event turn later than Alpine's x-model update;
       // relying only on terminalProfileId could therefore create the previous
@@ -17446,11 +17454,27 @@ function portal() {
       this._scheduleSavePrefs();
       this.terminalCreating = true;
       try {
+        // Load the local renderer before allocating a backend PTY. A mobile
+        // network can transiently fail a lazy script request; creating first
+        // used to leave one unreachable terminal behind for every retry.
+        try {
+          await this._loadTerminalLib();
+        } catch (error) {
+          if (!isOwner()) return;
+          const detail = error && error.message ? error.message : String(error || "");
+          this.toast((this.lang === "zh"
+            ? "终端资源加载失败，请检查网络后重试："
+            : "Terminal assets failed to load. Check the network and retry: ")
+            + detail, "error");
+          return;
+        }
+        if (!isOwner()) return;
         const { ok, data, error } = await this.api("/api/terminals", {
           method: "POST",
-          headers: this.fileHdr(),
+          headers: requestHeaders,
           json: { rows: 30, cols: 100, profile_id: selectedProfileId },
         });
+        if (!isOwner()) return;
         if (!ok) {
           this.toast((this.lang === "zh" ? "新建终端失败：" : "Could not create terminal: ")
             + (error || ""), "error");
@@ -17649,35 +17673,103 @@ function portal() {
     async _loadTerminalLib() {
       if (window.Terminal && window.FitAddon) return;
       if (this._terminalLoadPromise) return this._terminalLoadPromise;
-      const inject = (src) => new Promise((resolve, reject) => {
-        const selector = src.endsWith(".css")
-          ? `link[href="${src}"]` : `script[src="${src}"]`;
-        if (document.querySelector(selector)) {
-          const started = Date.now();
-          (function wait() {
-            if (src.endsWith(".css")
-                || (window.Terminal && (!src.includes("fit") || window.FitAddon))) {
-              resolve();
-            } else if (Date.now() - started > 5000) {
-              reject(new Error("terminal asset load timeout"));
-            } else {
-              setTimeout(wait, 50);
-            }
-          })();
+      const assetVersion = String(document.querySelector(
+        'meta[name="muselab-asset-version"]')?.content || "");
+      const timeoutMs = 15000;
+      const deadline = Date.now() + 30000;
+      const isReady = src => src.endsWith(".css")
+        || (src.includes("addon-fit") ? !!window.FitAddon : !!window.Terminal);
+      const loadOnce = (src, attempt) => new Promise((resolve, reject) => {
+        const isCss = src.endsWith(".css");
+        if (isReady(src) && !isCss) {
+          resolve();
           return;
         }
-        const node = src.endsWith(".css")
-          ? Object.assign(document.createElement("link"), { rel: "stylesheet", href: src })
-          : Object.assign(document.createElement("script"), { src });
-        node.onload = resolve;
-        node.onerror = () => reject(new Error("load failed: " + src));
+
+        // A failed <script> stays in the DOM but will never emit load again.
+        // Remove every unready copy so retrying means a real network request,
+        // including tags left by the pre-fix loader in a long-lived PWA tab.
+        const attr = isCss ? "href" : "src";
+        const candidates = document.querySelectorAll(isCss
+          ? 'link[rel="stylesheet"][href]' : "script[src]");
+        for (const existing of candidates) {
+          const raw = String(existing.getAttribute(attr) || "");
+          const sameAsset = existing.dataset.muselabTerminalAsset === src
+            || raw === src || raw.startsWith(src + "?");
+          if (!sameAsset) continue;
+          if (isCss && existing.sheet) {
+            resolve();
+            return;
+          }
+          existing.remove();
+        }
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          reject(new Error("terminal asset load deadline exceeded: " + src));
+          return;
+        }
+
+        const versioned = assetVersion && !assetVersion.startsWith("__")
+          ? `${src}?v=${encodeURIComponent(assetVersion)}` : src;
+        const requestUrl = attempt
+          ? `${versioned}${versioned.includes("?") ? "&" : "?"}retry=${Date.now()}`
+          : versioned;
+        const node = isCss
+          ? Object.assign(document.createElement("link"), {
+              rel: "stylesheet", href: requestUrl,
+            })
+          : Object.assign(document.createElement("script"), { src: requestUrl });
+        node.dataset.muselabTerminalAsset = src;
+        node.dataset.muselabTerminalState = "loading";
+        let settled = false;
+        const finish = error => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          node.onload = null;
+          node.onerror = null;
+          if (error) {
+            node.dataset.muselabTerminalState = "error";
+            node.remove();
+            reject(error);
+          } else {
+            node.dataset.muselabTerminalState = "loaded";
+            resolve();
+          }
+        };
+        const timer = setTimeout(
+          () => finish(new Error("terminal asset load timeout: " + src)),
+          Math.min(timeoutMs, remainingMs),
+        );
+        node.onload = () => finish(isReady(src) ? null : new Error(
+          "terminal asset globals missing: " + src));
+        node.onerror = () => finish(new Error("load failed: " + src));
         document.head.appendChild(node);
       });
+      const inject = async src => {
+        let lastError = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            await loadOnce(src, attempt);
+            return;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error("terminal asset load failed: " + src);
+      };
       this._terminalLoadPromise = (async () => {
-        await Promise.all([
+        // Wait for both parallel branches to settle before exposing a failed
+        // loader for retry. Promise.all rejected immediately and left its
+        // sibling alive; that stale branch could later remove the fresh DOM
+        // node created by the next click.
+        const initial = await Promise.allSettled([
           inject("/static/vendor/xterm/xterm.css"),
           inject("/static/vendor/xterm/xterm.js"),
         ]);
+        const failed = initial.find(result => result.status === "rejected");
+        if (failed) throw failed.reason;
         await inject("/static/vendor/xterm/addon-fit.js");
         if (!window.Terminal || !window.FitAddon) {
           throw new Error("terminal library globals missing");

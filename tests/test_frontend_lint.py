@@ -1649,6 +1649,25 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     for filename in ("xterm.js", "xterm.css", "addon-fit.js",
                      "xterm-LICENSE.txt", "addon-fit-LICENSE.txt"):
         assert (vendor / filename).is_file()
+    create_start = app.index("async createTerminal(profileId)")
+    create_end = app.index("\n    editTerminalProfile(", create_start)
+    create_terminal = app[create_start:create_end]
+    loader_start = app.index("async _loadTerminalLib()")
+    loader_end = app.index("\n    _terminalTheme()", loader_start)
+    terminal_loader = app[loader_start:loader_end]
+    # A transient mobile asset failure must be retried with a fresh DOM node,
+    # and the backend PTY may only be allocated after the renderer is ready.
+    assert create_terminal.index("await this._loadTerminalLib()") < \
+        create_terminal.index('this.api("/api/terminals"')
+    assert "const ownerWorkspace = this.currentWorkspacePath()" in create_terminal
+    assert "const requestHeaders = this.fileHdr(ownerWorkspace)" in create_terminal
+    assert create_terminal.count("if (!isOwner()) return") >= 3
+    assert "for (let attempt = 0; attempt < 2; attempt += 1)" in terminal_loader
+    assert "await Promise.allSettled([" in terminal_loader
+    assert "node.remove()" in terminal_loader
+    assert 'meta[name="muselab-asset-version"]' in terminal_loader
+    assert "const timeoutMs = 15000" in terminal_loader
+    assert "const deadline = Date.now() + 30000" in terminal_loader
     assert "async createTerminal(profileId)" in app
     assert "async renameTerminal(row)" in app
     assert "async closeTerminal(id" in app
