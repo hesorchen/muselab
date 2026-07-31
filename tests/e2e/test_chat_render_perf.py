@@ -2186,8 +2186,12 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
             """,
         )
         page.wait_for_function(
-            """() => document.querySelector(".chat-toolbar")
-              .classList.contains("has-stop")"""
+            """() => {
+              const toolbar = document.querySelector(".chat-toolbar");
+              const stop = document.querySelector(".chat-toolbar-stop");
+              return toolbar?.classList.contains("has-stop")
+                && stop?.getBoundingClientRect().width > 0;
+            }"""
         )
         busy = composer_metrics()
         assert busy["toolbarOverflow"] <= 1
