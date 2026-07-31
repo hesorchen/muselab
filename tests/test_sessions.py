@@ -5,11 +5,13 @@ locally — CLI's JSONL is source of truth. These tests cover muselab's
 metadata + per-message annotation sidecar layer only. End-to-end transcript
 flows require a live SDK and are not unit-testable here.
 """
+import asyncio
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -87,6 +89,7 @@ def test_session_lifecycle(client, auth):
     s = r.json()
     assert s["name"] == "t1"
     assert s["permission"] == "default"
+    assert s["plan_return_permission"] == ""
     # New session, no SDK turn yet → CLI JSONL doesn't exist → empty messages
     assert s["messages"] == []
 
@@ -98,6 +101,7 @@ def test_session_lifecycle(client, auth):
     r = client.get(f"/api/chat/sessions/{sid}", headers=auth)
     assert r.json()["name"] == "t2"
     assert r.json()["permission"] == "dontAsk"
+    assert r.json()["plan_return_permission"] == ""
 
     r = client.delete(f"/api/chat/sessions/{sid}", headers=auth)
     assert r.status_code == 200
@@ -138,6 +142,173 @@ def test_permission_patch_unknown_session_is_404(client, auth):
         json={"permission": "default"},
     )
     assert r.status_code == 404
+
+
+def test_plan_permission_captures_preserves_and_clears_return_mode(app_module):
+    from backend import sessions as sess
+
+    meta = sess.create_session(permission="bypassPermissions")
+    sid = meta["id"]
+    assert meta["plan_return_permission"] == ""
+
+    assert sess.update_permission(sid, "plan") is True
+    entered = sess.get_session(sid)
+    assert entered["permission"] == "plan"
+    assert entered["plan_return_permission"] == "bypassPermissions"
+
+    # A duplicate Plan update must not replace the captured prior mode.
+    assert sess.update_permission(sid, "plan") is True
+    assert sess.get_session(sid)["plan_return_permission"] == "bypassPermissions"
+
+    # An authoritative caller can replace the return mode while staying in Plan.
+    assert sess.update_permission(
+        sid,
+        "plan",
+        plan_return_permission="acceptEdits",
+    ) is True
+    assert sess.get_session(sid)["plan_return_permission"] == "acceptEdits"
+
+    # Once Plan ends, the return field is inert and must not remain as stale
+    # capability metadata.
+    assert sess.update_permission(sid, "dontAsk") is True
+    exited = sess.get_session(sid)
+    assert exited["permission"] == "dontAsk"
+    assert exited["plan_return_permission"] == ""
+
+    persisted = json.loads(sess.INDEX.read_text(encoding="utf-8"))
+    row = next(item for item in persisted if item["id"] == sid)
+    assert row["permission"] == "dontAsk"
+    assert row["plan_return_permission"] == ""
+
+
+def test_plan_exit_commit_is_compare_and_set(app_module):
+    from backend import sessions as sess
+
+    sid = sess.create_session(permission="bypassPermissions")["id"]
+    assert sess.update_permission(sid, "plan") is True
+    assert sess.commit_plan_exit(sid, "acceptEdits") is True
+    assert sess.get_session(sid)["permission"] == "acceptEdits"
+
+    # A delayed PostToolUse from an older Plan runtime must not overwrite a
+    # newer manual/cross-device choice.
+    assert sess.update_permission(sid, "plan") is True
+    assert sess.update_permission(sid, "dontAsk") is True
+    assert sess.commit_plan_exit(sid, "bypassPermissions") is False
+    current = sess.get_session(sid)
+    assert current["permission"] == "dontAsk"
+    assert current["plan_return_permission"] == ""
+
+    assert sess.commit_plan_exit(sid, "plan") is False
+    assert sess.commit_plan_exit(sid, "not-a-mode") is False
+
+
+def test_plan_exit_commit_rejects_stale_return_contract(app_module):
+    from backend import sessions as sess
+
+    meta = sess.create_session(
+        name="plan-stale-contract",
+        permission="plan",
+        plan_return_permission="acceptEdits",
+    )
+    sid = meta["id"]
+
+    assert sess.commit_plan_exit(
+        sid,
+        "acceptEdits",
+        expected_plan_return="bypassPermissions",
+    ) is False
+    current = sess.get_session(sid)
+    assert current["permission"] == "plan"
+    assert current["plan_return_permission"] == "acceptEdits"
+
+    assert sess.commit_plan_exit(
+        sid,
+        "acceptEdits",
+        expected_plan_return="acceptEdits",
+    ) is True
+
+
+def test_plan_return_permission_invalid_values_fail_closed(app_module):
+    from backend import sessions as sess
+
+    invalid = (None, "", "   ", "plan", "unknown", 42)
+    for value in invalid:
+        meta = sess.create_session(
+            permission="plan",
+            plan_return_permission=value,
+        )
+        assert meta["plan_return_permission"] == "default"
+        assert sess.get_session(meta["id"])["plan_return_permission"] == "default"
+
+
+def test_register_retry_preserves_existing_plan_return_permission(app_module):
+    from backend import sessions as sess
+
+    sid = "11111111-2222-4333-8444-555555555555"
+    original = sess.register_session(
+        sid,
+        permission="plan",
+        plan_return_permission="bypassPermissions",
+    )
+    retried = sess.register_session(sid, permission="plan")
+
+    assert original["plan_return_permission"] == "bypassPermissions"
+    assert retried["plan_return_permission"] == "bypassPermissions"
+    assert len(json.loads(sess.INDEX.read_text(encoding="utf-8"))) == 1
+
+
+def test_queue_plan_return_permission_roundtrip_and_legacy_migration(app_module):
+    from backend import sessions as sess
+
+    sid = "s-plan-queue"
+    queued = sess.enqueue_message(
+        sid,
+        "planned work",
+        permission="plan",
+        plan_return_permission="bypassPermissions",
+    )
+    assert queued["item"]["plan_return_permission"] == "bypassPermissions"
+    assert sess.dequeue_message(sid)["plan_return_permission"] == "bypassPermissions"
+
+    # The field is meaningless outside Plan and must be cleared even if a caller
+    # sends a stale value.
+    non_plan = sess.enqueue_message(
+        sid,
+        "ordinary work",
+        permission="default",
+        plan_return_permission="bypassPermissions",
+    )
+    assert non_plan["item"]["plan_return_permission"] == ""
+    sess.clear_queue(sid)
+
+    legacy = {
+        "items": [{
+            "id": "q-legacy",
+            "text": "old plan",
+            "image_ids": "",
+            "permission": "plan",
+            "enqueued_at": 1,
+        }],
+        "paused": False,
+    }
+    path = sess._queue_path(sid)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+
+    snapshot = sess.get_queue(sid)
+    assert snapshot["items"][0]["plan_return_permission"] == "default"
+    # Compatibility reads are non-destructive.
+    assert path.read_text(encoding="utf-8") == before
+
+    # The next normal mutation persists the canonical fail-closed value.
+    sess.set_queue_paused(sid, True)
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["items"][0]["plan_return_permission"] == "default"
+
+    restored = dict(persisted["items"][0])
+    restored["plan_return_permission"] = "plan"
+    requeued = sess.requeue_head(sid, restored)
+    assert requeued["items"][0]["plan_return_permission"] == "default"
 
 
 def test_sessions_list_conditional_get(client, auth):
@@ -325,12 +496,64 @@ def test_providers_includes_deepseek_after_key_set(client, auth, monkeypatch):
 
 def test_providers_marks_codex_effort_capability(client, auth, monkeypatch):
     monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    from backend import chat as chat_mod
+
+    async def capabilities(_models):
+        return {
+            "codex:gpt-5.5": {
+                "supported_reasoning_levels": [
+                    "low", "medium", "high", "xhigh",
+                ],
+                "service_tiers": ["priority"],
+            }
+        }
+
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capabilities", capabilities)
     r = client.get("/api/chat/providers", headers=auth)
     assert r.status_code == 200
     models = r.json()["models"]
     codex = next(m for m in models if m["model"] == "codex:gpt-5.5")
     assert codex["supports_effort"] is True
     assert codex["supports_thinking"] is False
+    assert codex["effort_levels"] == [
+        "auto", "low", "medium", "high", "xhigh",
+    ]
+    assert codex["service_tiers"] == ["fast"]
+    assert codex["supports_fast"] is True
+
+
+def test_provider_capability_batch_probes_unreachable_gateway_once(
+    app_module, monkeypatch,
+):
+    """One blackholed base must cost one timeout, not one per Codex model."""
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    from backend import chat as chat_mod
+
+    calls: list[str] = []
+
+    async def blackhole(model):
+        calls.append(model)
+        await asyncio.sleep(0.05)
+        return None
+
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability", blackhole)
+    chat_mod._CONTEXT_CAPABILITY_CACHE.clear()
+    started = time.monotonic()
+    models = [
+        f"codex:{slug}"
+        for slug in chat_mod._CODEX_CONTROL_FALLBACKS
+    ]
+    result = asyncio.run(
+        chat_mod._detect_gateway_context_capabilities(models),
+    )
+    elapsed = time.monotonic() - started
+
+    assert result == {}
+    assert len(calls) == 1
+    assert calls[0].startswith("codex:")
+    assert elapsed < 0.20
 
 
 def test_codex_legacy_raw_model_alias_resolves(app_module, monkeypatch):

@@ -29,7 +29,7 @@ Claude Agent SDK → claude CLI
 ## Key design decisions
 
 - **The SDK is the only model path.** Tool use, MCP, Skills, Subagents, plan mode, and `CLAUDE.md` come from the Claude Agent SDK. muselab does not create a parallel agent or system-prompt layer.
-- **Native instruction ownership.** Workspace goals, sources of truth, response style, and durable rules belong in the optional SDK-discovered `CLAUDE.md` hierarchy. Reusable workflows belong in Skills. Tool behavior belongs in tool descriptions and permission enforcement.
+- **Native instruction ownership.** Workspace goals, sources of truth, response style, and durable rules belong in the optional SDK-discovered `CLAUDE.md` hierarchy. Reusable workflows belong in Skills. Tool behavior belongs in tool descriptions and permission enforcement. A user-selected runtime mode may activate a bundled Skill through transient `UserPromptSubmit.additionalContext`; the hook only identifies the mode and Skill, while the original prompt/transcript stays unchanged and the workflow remains in `SKILL.md`.
 - **Workspace binding.** `MUSELAB_ROOT` is the default workspace and additional local directories may be registered. Files, previews, terminals, and new-session cwd follow the active workspace; every session stores its own cwd.
 - **Whole-file input.** The assistant reads complete workspace files on demand through Read, Grep, Edit, and related tools. muselab does not pre-embed or chunk them.
 - **Third-party provider isolation.** Each third-party provider receives per-request `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, and an isolated `CLAUDE_CONFIG_DIR`, preventing fallback to the wrong account.

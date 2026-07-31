@@ -25,15 +25,22 @@ def test_curator_starter_invokes_skill_in_both_locales(app_module):
     assert not any("一" <= c <= "鿿" for c in starter["en"])
 
 
-def test_chat_does_not_define_or_pass_a_muselab_system_prompt(app_module):
+def test_chat_activates_ultra_native_skill_without_system_prompt(app_module):
     chat = _chat(app_module)
     assert not hasattr(chat, "SYSTEM_PROMPT")
     source = inspect.getsource(chat._build_and_connect_client)
-    assert "system_prompt=" not in source
-    assert '"system_prompt"' not in source
+    assert 'opts_kwargs["system_prompt"]' not in source
+    assert "_build_ultra_skill_hook()" in source
+    assert 'effort == "ultra" and _is_codex_gateway_model(model)' in source
     assert 'setting_sources=["user", "project", "local"]' in source
     assert '"type": "local"' in source
     assert '"path": str(Path(__file__).resolve().parent.parent)' in source
+
+    skill = (Path(__file__).parents[1] / "skills" / "ultra-orchestrator" / "SKILL.md")
+    text = skill.read_text(encoding="utf-8")
+    assert "name: ultra-orchestrator" in text
+    assert "at most four concurrent subagents" in text
+    assert "does not broaden authority" in text
 
 
 def test_workspace_curator_skill_has_native_workflow(app_module):

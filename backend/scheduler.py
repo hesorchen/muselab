@@ -571,6 +571,7 @@ async def _run_sdk_task_turn(
         _session_runtime_lock_for,
         get_client,
     )
+    from . import sessions as session_store
 
     reply_text = ""
     error: str | None = None
@@ -586,10 +587,13 @@ async def _run_sdk_task_turn(
         # the service user's OS authority. Deployments that schedule prompts
         # over untrusted content must isolate the service account/container or
         # introduce an explicit non-interactive allow policy.
+        meta = session_store.get_session(session_id) or {}
         client = await get_client(
             session_id=session_id,
             model=model,
             permission="bypassPermissions",
+            effort=meta.get("effort") or "auto",
+            service_tier=meta.get("service_tier") or "",
         )
         await client.query(prompt)
         async for msg in client.receive_response():

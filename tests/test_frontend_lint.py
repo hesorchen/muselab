@@ -385,7 +385,18 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     end = app.index("\n    closeWorkspaceBrowser()", start)
     switch = app[start:end]
 
-    assert "await this._changeWorkspaceSurface(path)" in switch
+    assert "const surfaceReady = Promise.resolve(" in switch
+    assert "this._changeWorkspaceSurface(path)" in switch
+    assert "await this._pullWorkspaceSessions(path)" in switch
+    assert "await this._ensureSessionLoaded(target.id)" in switch
+    assert "await Promise.all([surfaceReady, targetReady])" in switch
+    assert "_pullAllSessions()" not in switch
+    target_ready = switch[switch.index("const targetReady"):switch.index(
+        "const [surfaceOk, target]")]
+    assert "this.currentId =" not in target_ready
+    assert "this.openTab(" not in target_ready
+    assert switch.index("await Promise.all([surfaceReady, targetReady])") < switch.index(
+        "await this.openTab(target.id)")
     assert "return this.currentWorkspacePath()" in app
     assert "workspaceSurfaces: this.workspaceSurfaces" in app
     files_start = html.index('<aside class="pane files"')
@@ -396,6 +407,87 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "activity-center-btn" not in html[files_start:files_end]
     assert "workspace-picker" not in html[chat_start:chat_end]
     assert "activity-center-btn" in html[chat_start:chat_end]
+
+
+def test_workspace_switch_uses_scoped_session_window_and_merges_it():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    pull_start = app.index("_mergeWorkspaceSessionList(raw, path)")
+    pull_end = app.index("\n    async _refreshSessionsAfterWorkspaceRegistryChange()", pull_start)
+    pull = app[pull_start:pull_end]
+
+    assert 'workspace_only: "1"' in pull
+    assert 'limit: "20"' in pull
+    assert "const remembered = this.workspaceLastSession[path]" in pull
+    assert "headers: this.conversationHdr(path)" in pull
+    assert "this._mergeWorkspaceSessionList" in pull
+    assert "olderTarget" not in pull
+
+    ensure_start = app.index("async _ensureSessionLoaded(sid)")
+    ensure_end = app.index("\n    async loadSession(sid", ensure_start)
+    ensure = app[ensure_start:ensure_end]
+    assert "const canonicalBehind = st._loaded" in ensure
+    assert "updated > seen" in ensure
+    assert "canonicalBehind ? { quiet: true } : {}" in ensure
+    assert "this._applySessionList([...incoming, ...otherWorkspaces])" in pull
+    assert "this._optimisticMetas && this._optimisticMetas[session.id]" in pull
+    assert "return { ok: true, sessions }" in pull
+    assert "this.sessions =" not in pull
+
+
+def test_boot_uses_workspace_registry_cache_without_blocking_revalidation():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    boot_start = app.index("async _bootApp()")
+    boot_end = app.index("\n    // Start the always-on", boot_start)
+    boot = app[boot_start:boot_end]
+
+    assert "const restoredWorkspaceRegistry = this._restoreSessionWorkspaceCache()" in boot
+    assert "restoreCache: false" in boot
+    assert "if (!restoredWorkspaceRegistry) await workspaceRegistryReady" in boot
+    assert "if (restoredWorkspaceRegistry)" in boot
+    assert "return this._changeWorkspaceSurface(result.fallback)" in boot
+    assert "!this._workspaceIsCurrent(result.requested)" in boot
+
+    restore_start = app.index("    _restoreSessionWorkspaceCache() {")
+    restore_end = app.index("\n    async fetchSessionWorkspaces(", restore_start)
+    restore = app[restore_start:restore_end]
+    assert "10 * 60_000" in restore
+    assert "return this.sessionWorkspaces.length > 0" in restore
+
+    fetch_start = app.index("async fetchSessionWorkspaces({")
+    fetch_end = app.index("\n    async _pullAllSessions()", fetch_start)
+    fetch_workspaces = app[fetch_start:fetch_end]
+    assert "const requestSeq = ++this._workspaceRegistrySeq" in fetch_workspaces
+    assert "if (requestSeq !== this._workspaceRegistrySeq) return false" in fetch_workspaces
+
+
+def test_chat_refresh_and_stats_requests_run_concurrently():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    refresh_start = app.index("async refreshChat()")
+    refresh_end = app.index("\n    // ===== prefs =====", refresh_start)
+    refresh = app[refresh_start:refresh_end]
+    stats_start = app.index("async fetchStats()")
+    stats_end = app.index("\n    async fetchCodexRateLimit", stats_start)
+    stats = app[stats_start:stats_end]
+
+    assert "void Promise.resolve(this.fetchStats())" in refresh
+    assert "await Promise.all([" in refresh
+    assert "this.fetchContextInfo()" in refresh
+    assert "this.refreshSessions()" in refresh
+    assert "this._reloadSessionCoalesced(sid, { quiet: true })" in refresh
+    assert refresh.index("this.fetchContextInfo()") < refresh.index(
+        "this._reloadSessionCoalesced")
+    assert "await Promise.allSettled([" in stats
+    assert "this.fetchMcp()" in stats
+    assert "this.fetchRateLimit()" in stats
+    assert "providers," in stats
+
+    reconcile_start = app.index("_reconcileOpenSession(next)")
+    reconcile_end = app.index("\n    // Field-level equality", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    assert "st._seenUpdated = Math.max" not in reconcile
+    assert "const stillBehind" in reconcile
+    assert "st._pendingExternalUpdate = true" in reconcile
+    assert "st._reconcileRetryTimer = setTimeout" in reconcile
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -624,8 +716,11 @@ def test_session_setting_writes_keep_their_tab_owner_and_order():
     serialize_end = app.index("\n    async onEffortChange", serialize_start)
     serialize = app[serialize_start:serialize_end]
     effort_start = app.index("async onEffortChange()")
-    effort_end = app.index("\n    async onThinkingChange", effort_start)
+    effort_end = app.index("\n    async onServiceTierChange", effort_start)
     effort = app[effort_start:effort_end]
+    tier_start = app.index("async onServiceTierChange", effort_end)
+    tier_end = app.index("\n    async onThinkingChange", tier_start)
+    tier = app[tier_start:tier_end]
     thinking_start = app.index("async onThinkingChange()")
     thinking_end = app.index("\n    modelGroups()", thinking_start)
     thinking = app[thinking_start:thinking_end]
@@ -636,7 +731,30 @@ def test_session_setting_writes_keep_their_tab_owner_and_order():
     assert "++st._effortPatchSeq" in effort
     assert "this.tabState[sid] !== st" in effort
     assert "st._effortPatchSeq !== seq" in effort
-    assert '"_effortPatchTail"' in effort
+    assert "_serializeRuntimeSettingPatch" in effort
+    assert "st._runtimeSettingsGeneration += 1" in effort
+    assert "if (this.workspaceSwitching)" in effort
+    assert "this._conversationWorkspaceIsCurrent(ownerWorkspace)" in effort
+    assert "service_tier: compatibleTier" in effort
+    assert "++st._serviceTierPatchSeq" in effort
+    assert effort.index("await this._ensureSessionRegistered(sid)") < effort.index(
+        "this._serializeRuntimeSettingPatch"
+    )
+    assert "const sid = this.currentId" in tier
+    assert "++st._serviceTierPatchSeq" in tier
+    assert "this.tabState[sid] !== st" in tier
+    assert "st._serviceTierPatchSeq !== seq" in tier
+    assert "_serializeRuntimeSettingPatch" in tier
+    assert "st._runtimeSettingsGeneration += 1" in tier
+    assert "if (this.workspaceSwitching)" in tier
+    assert "this._conversationWorkspaceIsCurrent(ownerWorkspace)" in tier
+    assert "effort: compatibleEffort" in tier
+    assert "++st._effortPatchSeq" in tier
+    assert tier.index("await this._ensureSessionRegistered(sid)") < tier.index(
+        "this._serializeRuntimeSettingPatch"
+    )
+    assert '"_runtimeSettingPatchTail"' in serialize
+    assert "while (this.tabState[sid] === st)" in serialize
     assert "const sid = this.currentId" in thinking
     assert "++st._thinkingPatchSeq" in thinking
     assert "this.tabState[sid] !== st" in thinking
@@ -651,8 +769,102 @@ def test_model_switch_new_session_keeps_workspace_and_does_not_hijack_active_tab
 
     assert "const sid = this.currentId" in model
     assert "const ownerWorkspace = this.currentWorkspacePath()" in model
+    assert "if (this.workspaceSwitching)" in model
+    assert "const ownsSelection = () => !this.workspaceSwitching" in model
+    assert "await this._ensureSessionRegistered(sid)" in model
+    assert "ownerState._modelPatchSeq !== seq" in model
+    assert "ownerState._modelExpected = expected" in model
     assert "name: \"\", model: newM, cwd: ownerWorkspace" in model
     assert "this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid" in model
+
+
+def test_effort_and_fast_controls_follow_per_model_capabilities():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+
+    start = app.index("_normalizeEffort(value)")
+    end = app.index("\n    _supportsThinking", start)
+    capabilities = app[start:end]
+    assert '["auto", "low", "medium", "high", "xhigh", "max", "ultra"]' in capabilities
+    assert "Array.isArray(meta.effort_levels)" in capabilities
+    assert "meta.supports_fast === true" in capabilities
+    assert "this._isClaudeModel(model)" in capabilities
+    assert 'level !== "ultra"' in capabilities
+    assert 'level !== "xhigh" || this._isClaudeXHighModel(model)' in capabilities
+
+    assert html.count('x-show="_showEffortControl(model)"') == 2
+    assert html.count('x-show="_showFastControl(model)"') == 2
+    assert "|| level === selected" in app
+    assert '|| this._normalizeEffort(this.effort) !== "auto"' in capabilities
+    assert '|| this._normalizeServiceTier(this.serviceTier) === "fast"' in capabilities
+    assert "onServiceTierChange(serviceTier !== 'fast')" in html
+    assert "onServiceTierChange($event.target.checked)" in html
+    assert html.count('x-model="effort"') == 2
+    assert i18n.count('"effort.ultra":') == 2
+    assert i18n.count('"service_tier.label": "Fast"') == 2
+
+
+def test_runtime_setting_writes_gate_send_and_restore_per_session():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    send_start = app.index("async send(opts = {})")
+    send = app[send_start:]
+    assert send.count("await this._awaitRuntimeSettingPatches(sendSid, sendState)") >= 3
+    assert "runtimeSettingsPending()" in html
+    model_control = html[html.index('<select x-model="model"'):
+                         html.index("</select>", html.index('<select x-model="model"'))]
+    assert ':disabled="workspaceSwitching"' in model_control
+    assert html.count('<select x-model="effort"') == 2
+    for marker in [
+        '<select x-model="effort"',
+        '<input type="checkbox" :checked="serviceTier === \'fast\'"',
+        '<button type="button"\n                    class="chat-toolbar-fast"',
+    ]:
+        start = html.index(marker)
+        end = html.index(">", start)
+        assert ':disabled="workspaceSwitching"' in html[start:end]
+
+    activate_start = app.index("_activateTabState(id)")
+    activate_end = app.index("\n    _paneElement", activate_start)
+    activate = app[activate_start:activate_end]
+    assert "this.effort = st.effort" in activate
+    assert "this.serviceTier = st.serviceTier" in activate
+
+    switch_start = app.index("async switchSession()")
+    switch_end = app.index("\n    _afterPaint", switch_start)
+    switch = app[switch_start:switch_end]
+    assert "curState._effortExpected" in switch
+    assert "curState._serviceTierExpected" in switch
+
+
+def test_new_and_model_switched_sessions_start_with_clean_runtime_settings():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    register_start = app.index("_registerOptimisticSession(meta)")
+    register_end = app.index("\n    async _ensureSessionRegistered", register_start)
+    register = app[register_start:register_end]
+    assert "effort: this._normalizeEffort(meta.effort)" in register
+    assert "service_tier: this._normalizeServiceTier(meta.service_tier)" in register
+    assert "this._retainExpectedSessionSettings({" in register
+
+    new_start = app.index("newSession(options = {})")
+    new_end = app.index("\n    // ===== tabs =====", new_start)
+    new_session = app[new_start:new_end]
+    assert 'effort: "auto"' in new_session
+    assert 'service_tier: ""' in new_session
+    assert "st.effort = meta.effort" in new_session
+    assert "st.serviceTier = meta.service_tier" in new_session
+
+    model_start = app.index("async onModelChange()")
+    model_end = app.index("\n    // ===== Effort knob", model_start)
+    model = app[model_start:model_end]
+    assert "this.onEffortChange()" not in model
+    assert 'effort: "auto", service_tier: ""' in model
+    cancel = model[model.index("if (!ok)"):model.index("try {", model.index("if (!ok)"))]
+    assert "effort" not in cancel
+    assert "serviceTier" not in cancel
 
 
 def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate():
@@ -717,6 +929,49 @@ def test_failed_transcript_refresh_preserves_last_good_messages():
     assert "return false" in failed
     assert "st.messages.length = 0" not in failed
     assert "this.messages = st.messages" not in failed
+
+
+def test_stale_session_read_cannot_overwrite_new_runtime_settings():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    state_start = app.index("_blankTabState()")
+    state_end = app.index("\n    // ===== Per-session message queue", state_start)
+    state = app[state_start:state_end]
+    load_start = app.index("async loadSession(sid, opts = {})")
+    load_end = app.index("\n    // Warm OPEN-but-inactive tabs", load_start)
+    load = app[load_start:load_end]
+
+    assert "_runtimeSettingsGeneration: 0" in state
+    assert "const runtimeSettingsGenerationAtLoad" in load
+    assert "const runtimeSettingsStillCurrent" in load
+    assert "runtimeSettingsStillCurrent ? s.effort : st.effort" in load
+    assert "runtimeSettingsStillCurrent ? s.service_tier : st.serviceTier" in load
+    assert "st._modelExpected" in load
+    assert "const resolvedModel = String(" in load
+    assert "loadedMeta.model = resolvedModel" in load
+    assert "if (resolvedModel) this.model = resolvedModel" in load
+    assert "loadedMeta.effort = resolvedEffort" in load
+    assert "loadedMeta.service_tier = resolvedServiceTier" in load
+
+
+def test_runtime_setting_expected_values_expire_and_accept_remote_truth():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    retain_start = app.index("_retainExpectedSessionSettings(meta)")
+    retain_end = app.index("\n    _retainExpectedSessionActivity", retain_start)
+    retain = app[retain_start:retain_end]
+    effort_start = app.index("async onEffortChange()")
+    effort_end = app.index("\n    async onServiceTierChange", effort_start)
+    tier_start = effort_end + 1
+    tier_end = app.index("\n    async onThinkingChange", tier_start)
+
+    assert "SESSION_SETTING_EXPECTED_TTL_MS: 15_000" in app
+    assert '["_modelExpected", "_runtimeSettingPatchTail", "model"' in retain
+    assert '["_effortExpected", "_runtimeSettingPatchTail", "effort"' in retain
+    assert '["_serviceTierExpected", "_runtimeSettingPatchTail", "service_tier"' in retain
+    assert "now - expectedAt" in retain
+    assert "> this.SESSION_SETTING_EXPECTED_TTL_MS" in retain
+    assert "st[expectedKey] = null" in retain
+    assert "at: Date.now()" in app[effort_start:effort_end]
+    assert "at: Date.now()" in app[tier_start:tier_end]
 
 
 def test_activity_center_groups_by_attention_order_and_read_state():
@@ -1394,6 +1649,25 @@ def test_terminal_preview_has_local_renderer_and_management_wiring():
     for filename in ("xterm.js", "xterm.css", "addon-fit.js",
                      "xterm-LICENSE.txt", "addon-fit-LICENSE.txt"):
         assert (vendor / filename).is_file()
+    create_start = app.index("async createTerminal(profileId)")
+    create_end = app.index("\n    editTerminalProfile(", create_start)
+    create_terminal = app[create_start:create_end]
+    loader_start = app.index("async _loadTerminalLib()")
+    loader_end = app.index("\n    _terminalTheme()", loader_start)
+    terminal_loader = app[loader_start:loader_end]
+    # A transient mobile asset failure must be retried with a fresh DOM node,
+    # and the backend PTY may only be allocated after the renderer is ready.
+    assert create_terminal.index("await this._loadTerminalLib()") < \
+        create_terminal.index('this.api("/api/terminals"')
+    assert "const ownerWorkspace = this.currentWorkspacePath()" in create_terminal
+    assert "const requestHeaders = this.fileHdr(ownerWorkspace)" in create_terminal
+    assert create_terminal.count("if (!isOwner()) return") >= 3
+    assert "for (let attempt = 0; attempt < 2; attempt += 1)" in terminal_loader
+    assert "await Promise.allSettled([" in terminal_loader
+    assert "node.remove()" in terminal_loader
+    assert 'meta[name="muselab-asset-version"]' in terminal_loader
+    assert "const timeoutMs = 15000" in terminal_loader
+    assert "const deadline = Date.now() + 30000" in terminal_loader
     assert "async createTerminal(profileId)" in app
     assert "async renameTerminal(row)" in app
     assert "async closeTerminal(id" in app
@@ -1656,9 +1930,13 @@ def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
     assert "params.set(\"cursor\", String(cursor))" in app
     assert "_queueWorkspaceEventPayload(payload, workspace)" in app
     assert "WORKSPACE_EVENT_BATCH_MOBILE_MS: 250" in app
-    assert "_flushWorkspaceEventBatch(ownerWorkspace)" in app
+    assert "workspaceGeneration = this._workspaceGeneration(ownerWorkspace)" in app
+    assert "_flushWorkspaceEventBatch(\n          ownerWorkspace, workspaceGeneration," in app
     assert "this._applyFileTreeDelta(fresh)" in app
-    assert "this._refreshParentInTree(path, ownerWorkspace)" in app
+    assert "path, ownerWorkspace, workspaceGeneration" in app
+    assert "this._fileEventsGeneration === workspaceGeneration" in app
+    assert "readyWorkspaceId !== expectedWorkspaceId" in app
+    assert "_recoverWorkspaceRegistrationMismatch(" in app
     assert "const delay = this._isMobileLayout() ? 650 : 250" in app
     assert "if (!this._fileTreeIsVisible())" in app
     assert "this._stopFileEvents(true)" in app
@@ -1695,6 +1973,17 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     sync_end = app.index("\n    _enqueueWorkspaceSync(", sync_start)
     sync = app[sync_start:sync_end]
     assert '`/api/files/delta?${query}`' in sync
+    assert 'fetch("/api/files/bootstrap", {' in sync
+    assert 'method: "POST"' in sync
+    assert 'show_hidden: !!this.showHidden' in sync
+    assert 'parents: expandedParents' in sync
+    assert "[404, 405, 501].includes(response.status)" in sync
+    assert 'ownerHeaders["X-Muselab-Workspace"]' in sync
+    fallback = sync[sync.index("if ([404, 405, 501].includes(response.status))"):]
+    assert fallback.index("treeSeq !== this._treeLoadSeq") < fallback.index(
+        '`/api/files/bootstrap${query ? `?${query}` : ""}`')
+    assert "{ headers: ownerHeaders }" in fallback
+    assert "this.fileHdr()" not in fallback
     assert '`/api/files/bootstrap${query ? `?${query}` : ""}`' in sync
     assert 'params.set("show_hidden", "true")' in sync
     assert "const hasCursor = hydrated && cursor != null" in sync
@@ -1722,15 +2011,20 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     persist = app[persist_start:persist_end]
     assert "WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500" in app
     assert "window.requestIdleCallback" in persist
-    assert 'if (this.previewSurface === "terminal") return' in persist
+    assert 'const token = Symbol("workspace-tree-persist")' in persist
+    assert "current.token !== token" in persist
+    assert 'if (this.previewSurface === "terminal") return' not in persist
     assert "Clone only after the trailing debounce" in persist
     assert 'const neededParents = new Set(["", ...expanded])' in persist
     assert "Object.entries(source.childCache || {}).map" not in persist
+    assert "workspaceId: this._workspaceRegistryId(ownerWorkspace)" in persist
+    assert "await cache.deleteWorkspaceSnapshot(ownerWorkspace)" in persist
 
     assert 'const DB_NAME = "muselab-persistent-cache-v1"' in cache
     assert 'const WORKSPACES = "workspaces"' in cache
     assert "getWorkspaceSnapshot(owner)" in cache
     assert "putWorkspaceSnapshot(owner, snapshot)" in cache
+    assert "deleteWorkspaceSnapshot(owner)" in cache
     assert "session-tail" not in cache
     assert "db.onversionchange = () => {" in cache
     assert "databasePromise = undefined" in cache
@@ -1742,14 +2036,38 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     boot = app[boot_start:boot_end]
     assert "Promise.resolve(this.loadRoot()).catch(() => false)" in boot
     assert "this._startLiveConnections({ fileEvents: false })" in boot
+    assert boot.index("this._startLiveConnections({ fileEvents: false })") < boot.index(
+        "await this.fetchContextInfo()")
     assert "await rootReady" not in boot
 
-    load_start = app.index("loadRoot({ runtimeSnapshot = false")
-    load_end = app.index("\n    reloadTree()", load_start)
+    load_start = app.index("loadRoot({\n      runtimeSnapshot = false")
+    load_end = app.index("\n    reloadTree(options = {})", load_start)
     load = app[load_start:load_end]
     assert "this._enqueueWorkspaceSync(" in load
     assert "_loadRootNow({" in app
     assert "treeSeq === this._treeLoadSeq" in load
+    assert "workspaceGeneration: generation" in load
+
+    purge_start = app.index("async _purgeWorkspaceTreeState(path)")
+    purge_end = app.index("\n    async _recoverWorkspaceRegistrationMismatch(", purge_start)
+    purge = app[purge_start:purge_end]
+    assert "this._workspaceEpochs.set(" in purge
+    assert "this._workspaceRuntimeCaches.delete(ownerWorkspace)" in purge
+    assert "this._workspaceTreeCursors.delete(ownerWorkspace)" in purge
+    assert "this._workspaceTreeCacheTimers.delete(ownerWorkspace)" in purge
+    assert "this._workspaceSyncChains.delete(ownerWorkspace)" in purge
+    assert "this._clearWorkspaceSyncRetry(ownerWorkspace)" in purge
+    assert "this._clearWorkspaceEventBatch(ownerWorkspace)" in purge
+    assert "this._childFetches.delete(key)" in purge
+    assert "await cache.deleteWorkspaceSnapshot(ownerWorkspace)" in purge
+
+    remove_start = app.index("async removeWorkspace(path)")
+    remove_end = app.index("\n    _registerOptimisticSession", remove_start)
+    remove = app[remove_start:remove_end]
+    assert remove.index("if (!response.ok)") < remove.index(
+        "await this._purgeWorkspaceTreeState(path)")
+    assert remove.index("await this._purgeWorkspaceTreeState(path)") < remove.index(
+        "await this.fetchSessionWorkspaces()")
 
 
 def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():
@@ -1949,9 +2267,9 @@ def test_composer_settings_panel_escapes_the_overflow_hidden_composer():
 def test_effort_field_uses_a_short_label_not_the_tooltip_prose():
     """`effort.title` is tooltip copy, not a field caption.
 
-    The zh string is 51 chars ("Effort — Anthropic 官方术语，控制推理预算与
-    agentic loop 深度（不译）"). Rendered as a visible <span> label it wrapped
-    to 3 lines and was the single largest contributor to the panel's height.
+    The localized string explains the model-dependent levels and Ultra's
+    proactive delegation semantics. Rendered as a visible <span> label it wraps
+    to multiple lines and becomes the largest contributor to panel height.
     Mirrors the existing thinking.label / thinking.title split.
     """
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1962,6 +2280,8 @@ def test_effort_field_uses_a_short_label_not_the_tooltip_prose():
     assert i18n.count('"effort.label": "Effort",') == 2
     for key in ("effort.label", "effort.title"):
         assert i18n.count(f'"{key}":') == 2, f"{key} missing from a locale"
+    assert "Ultra = 最大推理" in i18n
+    assert "Ultra combines maximum reasoning" in i18n
 
 
 def test_running_state_is_pinned_to_the_scroll_viewport_not_the_last_message():

@@ -465,6 +465,225 @@ def test_workspace_picker_switches_files_preview_and_conversation_together(
     )
 
 
+def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_activation(
+        page: Page, backend_url, auth_token):
+    """Cold switch latency is max(tree, sessions+transcript), not their sum."""
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originalCurrent = app.currentId;
+          const targetPath = `/parallel-switch-${Date.now()}-${Math.random()}`;
+          const targetId = `parallel-session-${Date.now()}`;
+          const staleId = `deleted-session-${Date.now()}`;
+          const targetMeta = {
+            id: targetId, name: 'parallel target', cwd: targetPath,
+            created_at: Date.now() / 1000, updated_at: Date.now() / 1000,
+            model: app.model, active: false, message_count: 1,
+          };
+          const staleMeta = {
+            ...targetMeta, id: staleId, name: 'deleted target',
+            updated_at: targetMeta.updated_at - 10,
+          };
+          const originals = {
+            loadRoot: app.loadRoot,
+            loadTrash: app.loadTrash,
+            fetchContextInfo: app.fetchContextInfo,
+            fetchTerminals: app.fetchTerminals,
+            pullWorkspaceSessions: app._pullWorkspaceSessions,
+            ensureSessionLoaded: app._ensureSessionLoaded,
+            openTab: app.openTab,
+            newSession: app.newSession,
+            startFileEvents: app._startFileEvents,
+            stopFileEvents: app._stopFileEvents,
+            savePrefs: app.savePrefs,
+            persist: app._scheduleWorkspaceTreePersist,
+            toast: app.toast,
+          };
+          const events = {};
+          const opened = [];
+          let newCount = 0;
+          app.sessionWorkspaces = [
+            ...app.sessionWorkspaces,
+            {path: targetPath, name: 'parallel', primary: false},
+          ];
+          app.sessions = [staleMeta, ...app.sessions];
+          app.workspaceLastSession = {
+            ...app.workspaceLastSession, [targetPath]: staleId,
+          };
+          app.workspaceSurfaces[targetPath] = {previewSurface: 'file'};
+          app.loadRoot = async () => {
+            events.treeStart = performance.now();
+            await new Promise(resolve => setTimeout(resolve, 240));
+            events.treeEnd = performance.now();
+            return true;
+          };
+          app.loadTrash = async () => true;
+          app.fetchContextInfo = async () => true;
+          app.fetchTerminals = async () => true;
+          app._pullWorkspaceSessions = async path => {
+            events.sessionsStart = performance.now();
+            await new Promise(resolve => setTimeout(resolve, 70));
+            const sessions = app._mergeWorkspaceSessionList([targetMeta], path);
+            events.sessionsEnd = performance.now();
+            return {ok: true, sessions};
+          };
+          app._ensureSessionLoaded = async sid => {
+            events.preloadStart = performance.now();
+            events.preloadedSid = sid;
+            events.currentAtPreloadStart = app.currentId;
+            await new Promise(resolve => setTimeout(resolve, 150));
+            events.preloadEnd = performance.now();
+            events.currentAtPreloadEnd = app.currentId;
+            return sid === targetId;
+          };
+          app.openTab = async sid => {
+            events.currentBeforeOpen = app.currentId;
+            opened.push(sid);
+            app.currentId = sid;
+          };
+          app.newSession = () => { newCount += 1; };
+          app._startFileEvents = () => {};
+          app._stopFileEvents = () => {};
+          app.savePrefs = () => {};
+          app._scheduleWorkspaceTreePersist = () => {};
+          app.toast = () => {};
+          try {
+            const started = performance.now();
+            await app.switchWorkspace(targetPath);
+            const elapsed = performance.now() - started;
+            return {
+              elapsed, events, originalCurrent, targetId,
+              current: app.currentId, opened, newCount,
+              stalePresent: app.sessions.some(row => row.id === staleId),
+              switching: app.workspaceSwitching,
+            };
+          } finally {
+            app.loadRoot = originals.loadRoot;
+            app.loadTrash = originals.loadTrash;
+            app.fetchContextInfo = originals.fetchContextInfo;
+            app.fetchTerminals = originals.fetchTerminals;
+            app._pullWorkspaceSessions = originals.pullWorkspaceSessions;
+            app._ensureSessionLoaded = originals.ensureSessionLoaded;
+            app.openTab = originals.openTab;
+            app.newSession = originals.newSession;
+            app._startFileEvents = originals.startFileEvents;
+            app._stopFileEvents = originals.stopFileEvents;
+            app.savePrefs = originals.savePrefs;
+            app._scheduleWorkspaceTreePersist = originals.persist;
+            app.toast = originals.toast;
+          }
+        }"""
+    )
+    events = result["events"]
+    tree_duration = events["treeEnd"] - events["treeStart"]
+    target_duration = events["preloadEnd"] - events["sessionsStart"]
+    concurrent_duration = max(events["treeEnd"], events["preloadEnd"]) \
+        - min(events["treeStart"], events["sessionsStart"])
+    assert abs(events["treeStart"] - events["sessionsStart"]) < 75
+    assert events["preloadStart"] < events["treeEnd"]
+    # Measure the network/preload window directly.  ``elapsed`` also includes
+    # synchronous Alpine surface teardown/capture before either mocked request
+    # starts, which grows under a CPU-starved browser and is unrelated to
+    # whether these two I/O chains overlap.
+    assert concurrent_duration < tree_duration + target_duration - 80
+    assert events["currentAtPreloadStart"] == result["originalCurrent"]
+    assert events["currentAtPreloadEnd"] == result["originalCurrent"]
+    assert events["currentBeforeOpen"] == result["originalCurrent"]
+    assert events["preloadedSid"] == result["targetId"]
+    assert result["stalePresent"] is False
+    assert result["opened"] == [result["targetId"]]
+    assert result["current"] == result["targetId"]
+    assert result["newCount"] == 0
+    assert result["switching"] is False
+
+
+def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
+        page: Page, backend_url, auth_token):
+    """A U2 list racing a U1 transcript must schedule a canonical retry."""
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const meta = app.sessions.find(row => row.id === sid);
+          const st = app._ensureTabState(sid);
+          if (st._reconcilePromise) await st._reconcilePromise;
+          if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
+          app._sessionsSyncTimer = null;
+          const originals = {
+            loadSession: app.loadSession,
+            updatedAt: meta.updated_at,
+            seen: st._seenUpdated,
+            target: st._reconcileTargetUpdated,
+            pending: st._pendingExternalUpdate,
+            loaded: st._loaded,
+          };
+          let retryLoads = 0;
+          meta.updated_at = 20;
+          st._seenUpdated = 10;
+          st._reconcileTargetUpdated = 10;
+          st._pendingExternalUpdate = false;
+          st._loaded = true;
+          st.streaming = false;
+          st.es = null;
+          const olderTranscript = new Promise(resolve => {
+            setTimeout(() => {
+              st._seenUpdated = 11;
+              delete app._sessionLoadPromises[sid];
+              resolve(true);
+            }, 20);
+          });
+          app._sessionLoadPromises[sid] = olderTranscript;
+          app.loadSession = async requested => {
+            retryLoads += 1;
+            if (requested === sid) st._seenUpdated = 20;
+            return requested === sid;
+          };
+          try {
+            app._reconcileOpenSession([meta]);
+            const first = st._reconcilePromise;
+            await first;
+            const afterFirst = {
+              seen: st._seenUpdated,
+              pending: st._pendingExternalUpdate,
+              retryScheduled: !!st._reconcileRetryTimer,
+            };
+            const deadline = performance.now() + 1500;
+            while ((retryLoads < 1 || st._reconcilePromise
+                    || st._reconcileRetryTimer)
+                   && performance.now() < deadline) {
+              await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            return {
+              afterFirst,
+              finalSeen: st._seenUpdated,
+              finalPending: st._pendingExternalUpdate,
+              retryLoads,
+            };
+          } finally {
+            app.loadSession = originals.loadSession;
+            delete app._sessionLoadPromises[sid];
+            if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+            st._reconcileRetryTimer = null;
+            meta.updated_at = originals.updatedAt;
+            st._seenUpdated = originals.seen;
+            st._reconcileTargetUpdated = originals.target;
+            st._pendingExternalUpdate = originals.pending;
+            st._loaded = originals.loaded;
+          }
+        }"""
+    )
+    assert result["afterFirst"] == {
+        "seen": 11,
+        "pending": True,
+        "retryScheduled": True,
+    }
+    assert result["retryLoads"] == 1
+    assert result["finalSeen"] == 20
+    assert result["finalPending"] is False
+
+
 def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
         page: Page, backend_url, auth_token, tmp_path):
     page.set_viewport_size({"width": 390, "height": 844})

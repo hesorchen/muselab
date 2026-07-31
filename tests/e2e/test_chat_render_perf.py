@@ -261,6 +261,573 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
     )
 
 
+def test_effort_fast_capabilities_and_session_restore(
+    page: Page, backend_url, auth_token,
+):
+    """Per-model levels, Fast, tab restore and clean new-session defaults agree."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    result = _app_eval(
+        page,
+        """
+        return (async () => {
+          const sidA = "runtime-settings-a";
+          const sidB = "runtime-settings-b";
+          app.availableModels = [
+            {
+              model: "codex:gpt-5.6-sol", label: "Sol", group: "Codex Gateway",
+              supports_effort: true,
+              effort_levels: ["auto", "low", "medium", "high", "xhigh", "max", "ultra"],
+              supports_fast: true,
+            },
+            {
+              model: "basic-model", label: "Basic", group: "Basic",
+              supports_effort: true, effort_levels: ["auto", "low"],
+              supports_fast: false,
+            },
+            {
+              model: "claude-sonnet-4-6", label: "Sonnet", group: "Claude",
+              supports_effort: true,
+              effort_levels: ["auto", "low", "medium", "high", "xhigh", "max", "ultra"],
+              supports_fast: false,
+            },
+            {
+              model: "claude-opus-4-8", label: "Opus", group: "Claude",
+              supports_effort: true,
+              effort_levels: ["auto", "low", "medium", "high", "xhigh", "max", "ultra"],
+              supports_fast: false,
+            },
+          ];
+          app.sessions = [
+            { id: sidA, name: "A", model: "codex:gpt-5.6-sol",
+              permission: "bypassPermissions", effort: "ultra",
+              service_tier: "fast", message_count: 2 },
+            { id: sidB, name: "B", model: "basic-model",
+              permission: "bypassPermissions", effort: "auto",
+              service_tier: "", message_count: 0 },
+          ];
+          app.openTabIds = [sidA, sidB];
+          app.tabState = {};
+          app.currentId = sidA;
+          app.model = "codex:gpt-5.6-sol";
+          app._activateTabState(sidA);
+          const sol = {
+            levels: app.effortChoices(app.model).map(item => item.value),
+            effort: app.effort,
+            tier: app.serviceTier,
+            fast: app._supportsFast(app.model),
+          };
+
+          app.currentId = sidB;
+          app.model = "basic-model";
+          app._activateTabState(sidB);
+          const basic = {
+            levels: app.effortChoices(app.model).map(item => item.value),
+            effort: app.effort,
+            tier: app.serviceTier,
+            fast: app._supportsFast(app.model),
+          };
+          // Capability drift must not hide the only escape hatch from a
+          // previously-persisted unsupported override.
+          app.effort = "ultra";
+          app.serviceTier = "fast";
+          const drift = {
+            effortVisible: app._showEffortControl(app.model),
+            fastVisible: app._showFastControl(app.model),
+            levels: app.effortChoices(app.model).map(item => item.value),
+          };
+          app.effort = "auto";
+          app.serviceTier = "";
+          const claude = {
+            sonnet: app.effortChoices("claude-sonnet-4-6").map(item => item.value),
+            opus: app.effortChoices("claude-opus-4-8").map(item => item.value),
+          };
+
+          // Cancelling a history-session model switch must not reset A's
+          // persisted effort/tier before confirmation.
+          app.currentId = sidA;
+          app.model = "codex:gpt-5.6-sol";
+          app._activateTabState(sidA);
+          app.model = "basic-model";
+          app.confirm = async () => false;
+          await app.onModelChange();
+          const source = app.sessions.find(session => session.id === sidA);
+          const afterCancel = {
+            model: app.model,
+            effort: source.effort,
+            tier: source.service_tier,
+          };
+
+          // A new tab is always server-compatible auto + standard tier, never
+          // inherited from the previously active ultra/Fast session.
+          app.defaultModel = "codex:gpt-5.6-sol";
+          const realRegister = app._registerOptimisticSession;
+          app._registerOptimisticSession = async () => true;
+          const fresh = app.newSession();
+          const freshState = {
+            metaEffort: fresh.effort,
+            metaTier: fresh.service_tier,
+            rootEffort: app.effort,
+            rootTier: app.serviceTier,
+          };
+          app._registerOptimisticSession = realRegister;
+          return { sol, basic, drift, claude, afterCancel, freshState };
+        })();
+        """,
+    )
+
+    assert result["sol"] == {
+        "levels": ["auto", "low", "medium", "high", "xhigh", "max", "ultra"],
+        "effort": "ultra",
+        "tier": "fast",
+        "fast": True,
+    }
+    assert result["basic"] == {
+        "levels": ["auto", "low"],
+        "effort": "auto",
+        "tier": "",
+        "fast": False,
+    }
+    assert result["drift"] == {
+        "effortVisible": True,
+        "fastVisible": True,
+        "levels": ["auto", "low", "ultra"],
+    }
+    assert result["claude"] == {
+        "sonnet": ["auto", "low", "medium", "high", "max"],
+        "opus": ["auto", "low", "medium", "high", "xhigh", "max"],
+    }
+    assert result["afterCancel"] == {
+        "model": "codex:gpt-5.6-sol",
+        "effort": "ultra",
+        "tier": "fast",
+    }
+    assert result["freshState"] == {
+        "metaEffort": "auto",
+        "metaTier": "",
+        "rootEffort": "auto",
+        "rootTier": "",
+    }
+
+    race = _app_eval(
+        page,
+        """
+        return (async () => {
+          const realFetch = window.fetch;
+          const realFetchTabUsage = app._fetchTabUsage;
+          const realCheckActiveTurn = app._checkActiveTurn;
+          const realScheduleIdlePreload = app._scheduleIdlePreload;
+          const realRefreshSessions = app.refreshSessions;
+          const realRefreshOutline = app.refreshOutlineFromBackend;
+          const realEffortAllowed = app._effortAllowed;
+          const realSupportsFast = app._supportsFast;
+          const response = payload => ({
+            ok: true,
+            status: 200,
+            headers: { get: () => null },
+            json: async () => payload,
+            text: async () => "",
+          });
+          try {
+            app._fetchTabUsage = async () => {};
+            app._checkActiveTurn = () => {};
+            app._scheduleIdlePreload = () => {};
+            app.refreshSessions = async () => true;
+            app.refreshOutlineFromBackend = async () => {};
+            app._effortAllowed = () => true;
+            app._supportsFast = () => true;
+            const runtimeModel = {
+              model: "codex:gpt-5.6-sol", label: "Sol", group: "Codex Gateway",
+              supports_effort: true,
+              effort_levels: ["auto", "low", "medium", "high", "xhigh", "max", "ultra"],
+              supports_fast: true,
+            };
+            const basicModel = {
+              model: "basic-model", label: "Basic", group: "Basic",
+              supports_effort: true, effort_levels: ["auto", "low"],
+              supports_fast: false,
+            };
+            app.availableModels = [runtimeModel, basicModel];
+
+            // Model uses the same optimistic-registration barrier: PATCH must
+            // not race ahead of the session POST and deterministically 404.
+            const modelSid = "runtime-model-optimistic-race";
+            const modelMeta = {
+              id: modelSid, name: "Model optimistic",
+              model: "codex:gpt-5.6-sol", permission: "bypassPermissions",
+              effort: "auto", service_tier: "", message_count: 0,
+            };
+            app.sessions = [{ ...modelMeta }];
+            app.openTabIds = [modelSid];
+            app.tabState = {};
+            app._optimisticMetas = { [modelSid]: { ...modelMeta } };
+            app._sessionRegistrationPromises = {};
+            app.currentId = modelSid;
+            app.model = modelMeta.model;
+            app.messages = app._ensureTabState(modelSid).messages;
+            const modelCalls = [];
+            let releaseModelRegistration;
+            const modelRegistrationGate = new Promise(resolve => {
+              releaseModelRegistration = resolve;
+            });
+            window.fetch = async (url, options = {}) => {
+              const path = String(url);
+              const method = options.method || "GET";
+              if (path === "/api/chat/sessions" && method === "POST") {
+                modelCalls.push("register:start");
+                await modelRegistrationGate;
+                modelCalls.push("register:return");
+                return response({ ...modelMeta });
+              }
+              if (path === "/api/chat/sessions/" + modelSid
+                  && method === "PATCH") {
+                modelCalls.push("patch:" + JSON.stringify(JSON.parse(options.body)));
+                return response({});
+              }
+              return realFetch(url, options);
+            };
+            app.model = "basic-model";
+            const modelWrite = app.onModelChange();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const modelBeforeRelease = [...modelCalls];
+            releaseModelRegistration();
+            const modelWriteResult = await modelWrite;
+            const modelRegistration = {
+              beforeRelease: modelBeforeRelease,
+              calls: modelCalls,
+              result: modelWriteResult,
+              rootModel: app.model,
+              metaModel: app.sessions.find(row => row.id === modelSid)?.model,
+            };
+
+            // An optimistic tab must finish POST registration before either
+            // runtime PATCH. Its stale auto/off response must also retain both
+            // values the user selected while registration was in flight.
+            const optimisticSid = "runtime-settings-optimistic-race";
+            const optimisticMeta = {
+              id: optimisticSid, name: "Optimistic", model: "codex:gpt-5.6-sol",
+              permission: "bypassPermissions", effort: "auto", service_tier: "",
+              message_count: 0,
+            };
+            app.sessions = [{ ...optimisticMeta }];
+            app.openTabIds = [optimisticSid];
+            app.tabState = {};
+            app._optimisticMetas = { [optimisticSid]: { ...optimisticMeta } };
+            app._sessionRegistrationPromises = {};
+            app.currentId = optimisticSid;
+            app.model = optimisticMeta.model;
+            app._activateTabState(optimisticSid);
+
+            const calls = [];
+            let releaseRegistration;
+            const registrationGate = new Promise(resolve => {
+              releaseRegistration = resolve;
+            });
+            window.fetch = async (url, options = {}) => {
+              const path = String(url);
+              const method = options.method || "GET";
+              if (path === "/api/chat/sessions" && method === "POST") {
+                calls.push("register:start");
+                await registrationGate;
+                calls.push("register:return");
+                return response({ ...optimisticMeta });
+              }
+              if (path === "/api/chat/sessions/" + optimisticSid
+                  && method === "PATCH") {
+                calls.push("patch:" + JSON.stringify(JSON.parse(options.body)));
+                return response({});
+              }
+              return realFetch(url, options);
+            };
+
+            app.effort = "ultra";
+            const effortWrite = app.onEffortChange();
+            app.serviceTier = "fast";
+            const tierWrite = app.onServiceTierChange(true);
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const beforeRelease = [...calls];
+            releaseRegistration();
+            const writeResults = await Promise.all([effortWrite, tierWrite]);
+            const optimisticState = app._ensureTabState(optimisticSid);
+            const optimisticRow = app.sessions.find(row => row.id === optimisticSid);
+            const optimistic = {
+              beforeRelease,
+              calls,
+              writeResults,
+              stateEffort: optimisticState.effort,
+              stateTier: optimisticState.serviceTier,
+              metaEffort: optimisticRow.effort,
+              metaTier: optimisticRow.service_tier,
+            };
+
+            // A GET that started before the two PATCH intents returns auto/off
+            // after their expected markers have already cleared. Generation
+            // ownership must keep both the tab state and loaded row on the new
+            // values instead of accepting that stale response.
+            const loadSid = "runtime-settings-load-race";
+            const loadMeta = {
+              id: loadSid, name: "Load race", model: "codex:gpt-5.6-sol",
+              permission: "bypassPermissions", effort: "auto", service_tier: "",
+              message_count: 0,
+            };
+            app.availableModels = [runtimeModel, basicModel];
+            app.sessions = [{ ...loadMeta }];
+            app.openTabIds = [loadSid];
+            app.tabState = {};
+            app._optimisticMetas = {};
+            app._sessionRegistrationPromises = {};
+            app.currentId = loadSid;
+            app.model = loadMeta.model;
+            app._activateTabState(loadSid);
+
+            let releaseLoad;
+            const loadGate = new Promise(resolve => { releaseLoad = resolve; });
+            let loadStarted = false;
+            let generationAtFetch = null;
+            window.fetch = async (url, options = {}) => {
+              const path = String(url);
+              const method = options.method || "GET";
+              if (path.startsWith("/api/chat/sessions/" + loadSid + "?")
+                  && method === "GET") {
+                loadStarted = true;
+                generationAtFetch = app._ensureTabState(loadSid)._runtimeSettingsGeneration;
+                await loadGate;
+                return response({
+                  ...loadMeta, messages: [], offset: 0, total: 0,
+                  history_generation: "stale-generation", updated_at: 1,
+                });
+              }
+              if (path === "/api/chat/sessions/" + loadSid
+                  && method === "PATCH") {
+                return response({});
+              }
+              return realFetch(url, options);
+            };
+
+            const staleLoad = app.loadSession(loadSid, { quiet: true });
+            app.model = "basic-model";
+            const modelOk = await app.onModelChange();
+            app.effort = "ultra";
+            const effortOk = await app.onEffortChange();
+            app.serviceTier = "fast";
+            const tierOk = await app.onServiceTierChange(true);
+            const loadState = app._ensureTabState(loadSid);
+            const generationAfterWrites = loadState._runtimeSettingsGeneration;
+            // Exercise generation ownership independently of the optimistic
+            // expected leases: even after those markers are gone, the old GET
+            // must not restore its pre-PATCH model/effort/tier snapshot.
+            loadState._modelExpected = null;
+            loadState._effortExpected = null;
+            loadState._serviceTierExpected = null;
+            releaseLoad();
+            const loadOk = await staleLoad;
+            const loadRow = app.sessions.find(row => row.id === loadSid);
+            const staleRead = {
+              loadStarted, modelOk, effortOk, tierOk, loadOk,
+              generationAtFetch,
+              generationAfterWrites,
+              generationAfterLoad: loadState._runtimeSettingsGeneration,
+              stateEffort: loadState.effort,
+              stateTier: loadState.serviceTier,
+              rootModel: app.model,
+              metaModel: loadRow.model,
+              metaEffort: loadRow.effort,
+              metaTier: loadRow.service_tier,
+            };
+
+            // A missed echo is only a short optimistic lease. Once expired,
+            // a cross-device authoritative value must flow through unchanged.
+            const ttlSid = "runtime-settings-ttl";
+            const ttlState = app._ensureTabState(ttlSid);
+            const expiredAt = Date.now()
+              - app.SESSION_SETTING_EXPECTED_TTL_MS - 1;
+            ttlState._modelExpected = {
+              value: "basic-model", fallback: "codex:gpt-5.6-sol",
+              at: expiredAt,
+            };
+            ttlState._effortExpected = {
+              value: "ultra", fallback: "auto", at: expiredAt,
+            };
+            ttlState._serviceTierExpected = {
+              value: "fast", fallback: "", at: expiredAt,
+            };
+            const retainedAfterTtl = app._retainExpectedSessionSettings({
+              id: ttlSid, model: "codex:gpt-5.6-sol",
+              effort: "low", service_tier: "",
+            });
+            const ttl = {
+              model: retainedAfterTtl.model,
+              effort: retainedAfterTtl.effort,
+              tier: retainedAfterTtl.service_tier,
+              modelExpected: ttlState._modelExpected,
+              effortExpected: ttlState._effortExpected,
+              tierExpected: ttlState._serviceTierExpected,
+            };
+
+            // If both persisted overrides became unsupported, either visible
+            // escape hatch must clear the complete tuple in one PATCH. Two
+            // partial PATCHes would each fail backend target validation on the
+            // other still-invalid value.
+            app._effortAllowed = realEffortAllowed;
+            app._supportsFast = realSupportsFast;
+            const contractionCalls = [];
+            window.fetch = async (url, options = {}) => {
+              if ((options.method || "GET") === "PATCH") {
+                contractionCalls.push(JSON.parse(options.body));
+                return response({});
+              }
+              return realFetch(url, options);
+            };
+            const contractionRun = async (sid, action) => {
+              app.sessions = [{
+                id: sid, model: "basic-model", effort: "ultra",
+                service_tier: "fast", message_count: 0,
+              }];
+              app.openTabIds = [sid];
+              app.tabState = {};
+              app.currentId = sid;
+              app.model = "basic-model";
+              app._activateTabState(sid);
+              const ok = await action();
+              const row = app.sessions[0];
+              return {ok, effort: row.effort, tier: row.service_tier};
+            };
+            const clearViaEffort = await contractionRun(
+              "runtime-contraction-effort",
+              async () => {
+                app.effort = "auto";
+                return await app.onEffortChange();
+              },
+            );
+            const clearViaTier = await contractionRun(
+              "runtime-contraction-tier",
+              async () => {
+                app.serviceTier = "";
+                return await app.onServiceTierChange(false);
+              },
+            );
+            const contraction = {
+              calls: contractionCalls, clearViaEffort, clearViaTier,
+            };
+
+            // x-model updates just before @change. Handler guards must restore
+            // the old owner mirrors and issue no request during a cold
+            // workspace transition, even if invoked programmatically.
+            const guardSid = "runtime-settings-workspace-guard";
+            app.sessions = [{
+              id: guardSid, model: "codex:gpt-5.6-sol",
+              effort: "low", service_tier: "", message_count: 0,
+            }];
+            app.openTabIds = [guardSid];
+            app.tabState = {};
+            app.currentId = guardSid;
+            app.model = "codex:gpt-5.6-sol";
+            app._activateTabState(guardSid);
+            let guardedFetches = 0;
+            window.fetch = async () => {
+              guardedFetches += 1;
+              return response({});
+            };
+            app.workspaceSwitching = true;
+            app.model = "basic-model";
+            const guardedModel = await app.onModelChange();
+            app.effort = "ultra";
+            const guardedEffort = await app.onEffortChange();
+            app.serviceTier = "fast";
+            const guardedTier = await app.onServiceTierChange(true);
+            app.workspaceSwitching = false;
+            const workspaceGuard = {
+              results: [guardedModel, guardedEffort, guardedTier],
+              fetches: guardedFetches,
+              model: app.model,
+              effort: app.effort,
+              tier: app.serviceTier,
+            };
+            return {
+              modelRegistration, optimistic, staleRead, ttl,
+              contraction, workspaceGuard,
+            };
+          } finally {
+            app.workspaceSwitching = false;
+            window.fetch = realFetch;
+            app._fetchTabUsage = realFetchTabUsage;
+            app._checkActiveTurn = realCheckActiveTurn;
+            app._scheduleIdlePreload = realScheduleIdlePreload;
+            app.refreshSessions = realRefreshSessions;
+            app.refreshOutlineFromBackend = realRefreshOutline;
+            app._effortAllowed = realEffortAllowed;
+            app._supportsFast = realSupportsFast;
+          }
+        })();
+        """,
+    )
+    assert race["modelRegistration"] == {
+        "beforeRelease": ["register:start"],
+        "calls": [
+            "register:start",
+            "register:return",
+            'patch:{"model":"basic-model","effort":"auto","service_tier":""}',
+        ],
+        "result": True,
+        "rootModel": "basic-model",
+        "metaModel": "basic-model",
+    }
+    assert race["optimistic"] == {
+        "beforeRelease": ["register:start"],
+        "calls": [
+            "register:start",
+            "register:return",
+            'patch:{"effort":"ultra","service_tier":""}',
+            'patch:{"effort":"ultra","service_tier":"fast"}',
+        ],
+        "writeResults": [True, True],
+        "stateEffort": "ultra",
+        "stateTier": "fast",
+        "metaEffort": "ultra",
+        "metaTier": "fast",
+    }
+    assert race["staleRead"] == {
+        "loadStarted": True,
+        "modelOk": True,
+        "effortOk": True,
+        "tierOk": True,
+        "loadOk": True,
+        "generationAtFetch": 0,
+        "generationAfterWrites": 3,
+        "generationAfterLoad": 3,
+        "stateEffort": "ultra",
+        "stateTier": "fast",
+        "rootModel": "basic-model",
+        "metaModel": "basic-model",
+        "metaEffort": "ultra",
+        "metaTier": "fast",
+    }
+    assert race["ttl"] == {
+        "model": "codex:gpt-5.6-sol",
+        "effort": "low",
+        "tier": "",
+        "modelExpected": None,
+        "effortExpected": None,
+        "tierExpected": None,
+    }
+    assert race["contraction"] == {
+        "calls": [
+            {"effort": "auto", "service_tier": ""},
+            {"effort": "auto", "service_tier": ""},
+        ],
+        "clearViaEffort": {"ok": True, "effort": "auto", "tier": ""},
+        "clearViaTier": {"ok": True, "effort": "auto", "tier": ""},
+    }
+    assert race["workspaceGuard"] == {
+        "results": [False, False, False],
+        "fetches": 0,
+        "model": "codex:gpt-5.6-sol",
+        "effort": "low",
+        "tier": "",
+    }
+    _assert_no_browser_errors(page, errors)
+
+
 def test_mobile_completed_turn_can_fork_from_that_point(
     page: Page, backend_url, auth_token,
 ):

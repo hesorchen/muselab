@@ -34,6 +34,24 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     assert [row["path"] for row in rows] == [str(temp_root.resolve())]
 
 
+def test_readding_same_path_gets_new_workspace_generation(
+    app_module,
+    tmp_path,
+):
+    from backend.workspaces import WorkspaceRegistry
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    other = _make_workspace(tmp_path)
+    registry = WorkspaceRegistry(primary)
+    first = registry.register(other)
+    registry.remove(other)
+    second = registry.register(other)
+
+    assert first.path == second.path
+    assert first.id != second.id
+
+
 def test_removed_workspace_sessions_keep_their_attachments(
     client, auth, temp_root, tmp_path,
 ):
@@ -290,6 +308,103 @@ def test_session_cwd_must_be_registered_and_is_returned(client, auth, tmp_path):
 
     rows = client.get("/api/chat/sessions", headers=auth).json()["sessions"]
     assert next(row for row in rows if row["id"] == sid)["cwd"] == str(other.resolve())
+
+
+def test_sessions_can_be_scoped_to_workspace_before_limit_and_ids(
+    client, auth, temp_root, tmp_path,
+):
+    other = _make_workspace(tmp_path)
+    empty_a = _make_workspace(tmp_path, "empty-a")
+    empty_b = _make_workspace(tmp_path, "empty-b")
+    for workspace in (other, empty_a, empty_b):
+        assert client.post(
+            "/api/chat/workspaces",
+            headers=auth,
+            json={"path": str(workspace)},
+        ).status_code == 200
+
+    primary_old = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "primary old", "cwd": str(temp_root)},
+    ).json()
+    primary_new = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "primary new", "cwd": str(temp_root)},
+    ).json()
+    other_old = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "other old", "cwd": str(other)},
+    ).json()
+    other_new = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "other new", "cwd": str(other)},
+    ).json()
+
+    # The default representation remains the unfiltered, cross-workspace list.
+    default = client.get("/api/chat/sessions", headers=auth)
+    assert default.status_code == 200
+    assert default.json()["total"] == 4
+    assert {row["id"] for row in default.json()["sessions"]} == {
+        primary_old["id"], primary_new["id"], other_old["id"], other_new["id"],
+    }
+
+    other_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(other.resolve()), safe=""),
+    }
+    scoped = client.get(
+        "/api/chat/sessions",
+        headers=other_headers,
+        params={
+            "workspace_only": "1",
+            "limit": 1,
+            # The local old row is force-included; the foreign id is ignored.
+            "ids": f'{other_old["id"]},{primary_old["id"]}',
+        },
+    )
+    assert scoped.status_code == 200
+    assert "X-Muselab-Workspace" in scoped.headers["vary"]
+    payload = scoped.json()
+    assert payload["total"] == 2
+    assert payload["returned"] == 2
+    assert {row["id"] for row in payload["sessions"]} == {
+        other_old["id"], other_new["id"],
+    }
+    assert all(row["cwd"] == str(other.resolve()) for row in payload["sessions"])
+
+    # Conditional requests are stable for one scoped representation.
+    etag = scoped.headers["etag"]
+    unchanged = client.get(
+        "/api/chat/sessions",
+        headers={**other_headers, "If-None-Match": etag},
+        params={
+            "workspace_only": "1",
+            "limit": 1,
+            "ids": f'{other_old["id"]},{primary_old["id"]}',
+        },
+    )
+    assert unchanged.status_code == 304
+    assert "X-Muselab-Workspace" in unchanged.headers["vary"]
+
+    # Header-selected workspaces are distinct ETag variants even when both
+    # bodies are the same empty list.
+    empty_responses = []
+    for workspace in (empty_a, empty_b):
+        empty_responses.append(client.get(
+            "/api/chat/sessions",
+            headers={
+                **auth,
+                "X-Muselab-Workspace": quote(str(workspace.resolve()), safe=""),
+            },
+            params={"workspace_only": "1"},
+        ))
+    assert all(response.status_code == 200 for response in empty_responses)
+    assert all(response.json()["total"] == 0 for response in empty_responses)
+    assert empty_responses[0].headers["etag"] != empty_responses[1].headers["etag"]
 
 
 def test_removing_workspace_hides_but_does_not_delete_its_session(

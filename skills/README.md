@@ -8,9 +8,9 @@ skills 是模型可发现的能力包。muselab 把本目录作为本地 Claude 
 plugin 暴露，并对所有 provider 默认启用 `skills="all"`；模型会按任务自主选用。
 运维人员可用 `MUSELAB_DISABLE_SKILLS=1` 全局关闭。
 
-## 预置的 12 个 skill
+## 预置的 13 个 skill
 
-下表列出 12 个当前 skill；另保留一个旧名称兼容入口。前 8 个为 muselab
+下表列出 13 个当前 skill；另保留一个旧名称兼容入口。前 9 个为 muselab
 自带，后 4 个为社区作者贡献（许可与出处见
 [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)）。
 
@@ -28,6 +28,7 @@ plugin 暴露，并对所有 provider 默认启用 `skills="all"`；模型会按
 | **translate** | 中英互译 | 保留格式的段落翻译 |
 | **meeting-notes** | 整理会议纪要 | 决议 / 行动项 / 待办抽取 |
 | **workspace-curator** | 整理当前工作区 | 先扫描与提案，确认后再安全执行 |
+| **ultra-orchestrator** | Codex Ultra 模式 | 最大推理 + 最多 4 个受限并发 Agent |
 
 `archive-curator` 暂时作为 `workspace-curator` 的 deprecated 兼容名称保留；
 它不再采集个人资料、补全 `CLAUDE.md` 或创建预设目录。

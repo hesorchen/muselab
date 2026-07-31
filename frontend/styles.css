@@ -1509,7 +1509,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      order would otherwise keep the gear hidden on phones. */
   .chat-toolbar-more { display: inline-flex !important; }
   .chat-toolbar-permission,
-  .chat-toolbar-effort { display: none !important; }
+  .chat-toolbar-effort,
+  .chat-toolbar-fast { display: none !important; }
   /* Model name truncates on phones (full name is in the dropdown anyway) — cap
      it so attach · model · gear · ring · rl · send all fit one row. */
   .chat-toolbar-select { max-width: 6.5em; }
@@ -5858,6 +5859,85 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .plan-body {
   font-size: var(--fs-sm); color: var(--c-fg-1);
 }
+.plan-approval-card {
+  flex: 1; min-width: 0; max-width: 100%;
+  border-left-color: var(--c-warn, #d97706);
+}
+.plan-approval-card.resolved { border-left-color: var(--c-accent); }
+.plan-approval-card.failed {
+  border-left-color: var(--c-error, #dc3545);
+}
+.plan-approval-card .plan-head { align-items: flex-start; }
+.plan-heading-copy {
+  display: flex; flex: 1; min-width: 0; flex-direction: column;
+  gap: 2px;
+}
+.plan-display-name,
+.plan-description,
+.plan-failure-detail,
+.plan-return-mode,
+.plan-approval-pending {
+  color: var(--c-fg-3); font-size: var(--fs-xs);
+}
+.plan-description {
+  margin: 2px 0 var(--sp-2);
+  white-space: pre-wrap; word-break: break-word;
+}
+.plan-failure-detail {
+  margin: 2px 0 var(--sp-2);
+  color: var(--c-error, #dc3545);
+  white-space: pre-wrap; word-break: break-word;
+}
+.plan-decision-tag {
+  flex-shrink: 0;
+  padding: 2px 8px; border-radius: var(--r-full);
+  font-size: var(--fs-xs); font-weight: var(--fw-semibold);
+}
+.plan-decision-tag.is-approved {
+  color: var(--c-accent-fg); background: var(--c-accent-soft);
+}
+.plan-decision-tag.is-denied {
+  color: var(--c-fg-2); background: var(--c-bg-3);
+}
+.plan-decision-tag.is-failed {
+  color: var(--c-error, #dc3545);
+  background: var(--c-error-soft, rgba(220, 53, 69, 0.1));
+}
+.plan-return-mode {
+  display: flex; align-items: center; gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.plan-return-mode code {
+  color: var(--c-fg-1); font-size: inherit;
+}
+.plan-approval-actions {
+  display: flex; justify-content: flex-end; flex-wrap: wrap;
+  gap: var(--sp-2); margin-top: var(--sp-3);
+}
+.plan-approval-actions button {
+  padding: 7px 12px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  background: var(--c-bg-0); color: var(--c-fg-0);
+  cursor: pointer; font: inherit; font-size: var(--fs-sm);
+}
+.plan-approval-actions .btn-plan-approve {
+  color: var(--c-on-accent);
+  background: var(--c-btn-primary-bg);
+  border-color: var(--c-btn-primary-bg);
+}
+.plan-approval-actions .btn-plan-approve:hover {
+  background: var(--c-btn-primary-hover);
+  border-color: var(--c-btn-primary-hover);
+}
+.plan-approval-actions .btn-keep-planning:hover {
+  color: var(--c-accent); border-color: var(--c-accent);
+  background: var(--c-accent-soft);
+}
+.plan-approval-actions button:disabled {
+  opacity: 0.5; cursor: wait;
+}
+.plan-approval-pending { margin-top: var(--sp-2); text-align: right; }
 
 /* ===== MCP / Skill tool prefix polish ===== */
 .tool-mcp { border-left: 3px solid #06b6d4; }
@@ -5894,6 +5974,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .perm-decision-allow { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .perm-decision-always { background: var(--c-accent-soft); color: var(--c-accent-fg); }
 .perm-decision-deny { background: var(--c-error-soft, rgba(220,53,69,0.1)); color: var(--c-error, #dc3545); }
+.perm-decision-expired { background: var(--c-error-soft, rgba(220,53,69,0.1)); color: var(--c-error, #dc3545); }
 .perm-body { margin-bottom: 0; }
 .perm-tool {
   display: flex; align-items: center; gap: 8px;
@@ -5925,6 +6006,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   cursor: pointer; font-family: inherit; font-size: var(--fs-sm);
   transition: background var(--t-fast), border-color var(--t-fast);
 }
+.perm-actions button:disabled { opacity: 0.5; cursor: wait; }
 .perm-actions .btn-deny:hover {
   background: var(--c-error-soft, rgba(220,53,69,0.1));
   border-color: var(--c-error, #dc3545);
@@ -6152,6 +6234,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-overflow: ellipsis;
 }
 .chat-toolbar-select:hover { background-color: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-toolbar-select:disabled {
+  opacity: 0.45; cursor: not-allowed;
+  background-color: transparent; color: var(--c-fg-3);
+}
 .chat-toolbar-select:focus {
   background-color: var(--c-bg-3); color: var(--c-fg-0);
   box-shadow: 0 0 0 2px var(--c-accent-soft);
@@ -6230,6 +6316,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: inherit;
   cursor: pointer;
 }
+.chat-toolbar-more-field select:disabled {
+  opacity: 0.5; cursor: not-allowed;
+}
 /* Thinking on/off toggle — sits beside the effort dropdown. Compact checkbox
    + label, same muted-fg / hover treatment as the toolbar selects. */
 .chat-toolbar-think {
@@ -6248,6 +6337,23 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .chat-toolbar-think:hover { background-color: var(--c-bg-3); color: var(--c-fg-0); }
 .chat-toolbar-think input { margin: 0; cursor: pointer; accent-color: var(--c-accent); }
+/* Fast is an independent service-tier button. It deliberately resembles a
+   compact toolbar toggle rather than another effort option. */
+.chat-toolbar-fast {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 26px; padding: 0 8px;
+  border: 1px solid transparent; border-radius: var(--r-md);
+  background: transparent; color: var(--c-fg-2);
+  font: inherit; font-size: var(--fs-xs); font-weight: 600;
+  cursor: pointer; flex-shrink: 0;
+  transition: background-color var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+.chat-toolbar-fast:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-toolbar-fast.active {
+  color: var(--c-accent); background: var(--c-accent-soft);
+  border-color: color-mix(in srgb, var(--c-accent) 35%, transparent);
+}
+.chat-toolbar-fast[aria-busy="true"] { cursor: progress; opacity: 0.72; }
 /* Context donut ring — replaces the earlier monospace chip. Just 18×18 SVG
    showing percentage used; numeric details live in the tooltip. Color
    shifts accent → warn (orange) → danger (red) at 70 / 90 %. */

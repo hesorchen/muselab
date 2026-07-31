@@ -19,13 +19,13 @@ An empty session with no CLI JSONL may heal to the current default when its orig
 
 ## SDK client pool
 
-Clients are cached by `(session_id, model, effort)`. The default live-client cap is 3 and can be changed with `MUSELAB_CLIENT_POOL_CAP`.
+Clients are cached by `(session_id, model, effort, service_tier)`. The default live-client cap is 3 and can be changed with `MUSELAB_CLIENT_POOL_CAP`.
 
 - A per-key lock collapses concurrent cache misses.
 - Cache hits refresh LRU order.
 - Permission mode is an SDK-process launch contract. A mismatch rebuilds the runtime at a safe boundary instead of silently retaining old authority.
 - Clients with active turns or SDK background tasks are not evicted; the pool may temporarily exceed its cap.
-- Model, effort, thinking, or permission changes rebuild the session runtime at the next safe point.
+- Model, effort, service tier, thinking, or permission changes rebuild the session runtime at the next safe point.
 - With external MCP servers configured, the first connection waits for a stable tool set before starting.
 
 Interactive turns, scheduled tasks, native compact, and other SDK operations for one session share a serialization lock so they cannot consume the same CLI stream concurrently.
@@ -116,7 +116,9 @@ The Activity Center persists each conversation's current state in `$MUSELAB_ROOT
 
 ## Effort and thinking
 
-- `effort` is stored per session and participates in the client cache key. Values are `low`, `medium`, `high`, `xhigh`, and `max`; empty uses the SDK default.
+- `effort` is stored per session and participates in the client cache key. Canonical values are `auto`, `low`, `medium`, `high`, `xhigh`, `max`, and model-dependent `ultra`; an empty legacy value is normalized to `auto`.
+- Codex `service_tier` is stored independently. The `fast` value maps to the Gateway's `priority` tier and also participates in the cache key, because the header is fixed when the SDK client starts.
+- Ultra uses wire-level `max` reasoning and activates the bundled `ultra-orchestrator` Skill through transient `UserPromptSubmit.additionalContext`; it never installs a custom system prompt or rewrites the user's transcript.
 - The extended-thinking budget defaults to 10,000 tokens and is configurable with `MUSELAB_THINKING_BUDGET`.
 - Provider capabilities for effort and thinking come from `/api/chat/providers`.
 - Some Anthropic-compatible providers omit the required `signature` key from thinking blocks. Vendor routes normalize the missing field to an empty in-memory parser sentinel so the SDK stream can finish, then remove the unverifiable thinking block from persisted JSONL. Native Claude routes keep strict SDK parsing; muselab never fabricates a valid signature.

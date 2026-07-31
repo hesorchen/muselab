@@ -10,7 +10,7 @@
 > intent lives in per-change specs; product roadmap and known issues live on
 > [GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
-- **Version:** 3.0.0
+- **Version:** 4.0.0
 - **Ratified:** 2026-05-31
 - **Last amended:** 2026-07-31
 - **Derived from:** `docs/architecture.md`,
@@ -110,12 +110,13 @@ The isolated config dir is mandatory: it blocks the CLI from silently falling
 back to Pro OAuth and billing third-party traffic to the user's Anthropic
 account. Any new provider path MUST preserve all three.
 
-### A4 — Client pool keyed by `(session_id, model, effort)`
+### A4 — Client pool keyed by `(session_id, model, effort, service_tier)`
 `chat.py` pools `ClaudeSDKClient` instances on exactly this key. The default LRU
 cap is 3 and may be adjusted through supported runtime configuration. Each
 assistant message stores its own `model` so badges stay accurate after reload.
-Changing the pool key is an architecture change (it interacts with MCP
-spawning — see A6).
+Effort and service tier are SDK/Gateway process-launch contracts; changing
+either MUST rebuild the matching session runtime. Changing the pool key is an
+architecture change (it interacts with MCP spawning — see A6).
 
 ### A5 — The UI protects model continuity by default
 The first real turn establishes the session model. For a non-empty session, the
@@ -160,7 +161,11 @@ identity, response preferences, and personal context belong in the
 SDK-discovered `CLAUDE.md` hierarchy. Reusable task workflows belong in Skills,
 and tool-specific behavior belongs in tool descriptions and enforced permission
 configuration. UI starter prompts MAY invoke those native capabilities without
-creating another instruction layer.
+creating another instruction layer. A user-selected runtime mode MAY activate
+a bundled Skill through SDK `UserPromptSubmit.additionalContext` only when the
+hook names the mode and Skill, leaves the canonical user prompt and transcript
+unchanged, and keeps the reusable behavior in `SKILL.md`; it MUST NOT carry a
+parallel identity, persona, or copy of the workflow itself.
 
 ---
 
@@ -301,6 +306,12 @@ following MUST be declined absent an explicit constitution amendment:
 
 ## 9. Amendment history
 
+- **4.0.0 (2026-07-31):** Expanded A4's exact client-pool key with
+  `service_tier` because Fast is fixed in the Gateway header contract at SDK
+  client launch; amended A9 so an explicitly selected runtime mode may activate
+  a bundled Skill through transient `UserPromptSubmit.additionalContext`, while
+  preserving the canonical prompt/transcript and keeping the workflow in
+  `SKILL.md` rather than a custom system prompt.
 - **3.0.0 (2026-07-31):** Repositioned muselab from its former personal-domain
   framing to a workspace-bound Agent workbench; removed domain-specific
   assumptions while retaining local-file, self-hosting, and safety invariants.

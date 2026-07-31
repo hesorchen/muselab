@@ -1,7 +1,7 @@
 """Client-pool behavior for chat.get_client / disconnect_client.
 
 These guard the long-lived state the rest of the chat surface depends on:
-the (sid, model, effort) -> ClaudeSDKClient cache plus its side registries
+the (sid, model, effort, service_tier) -> ClaudeSDKClient cache plus its side registries
 (_client_permission / _creation_locks / _client_lru).
 
 Production code spawns a real CLI subprocess in _build_and_connect_client;
@@ -16,10 +16,11 @@ import pytest
 class _FakeSDKClient:
     """Stands in for ClaudeSDKClient and records disconnects."""
 
-    def __init__(self, sid="s", model="m", effort=""):
+    def __init__(self, sid="s", model="m", effort="auto", service_tier=""):
         self.sid = sid
         self.model = model
         self.effort = effort
+        self.service_tier = service_tier
         self.disconnected = False
 
     async def disconnect(self):
@@ -45,6 +46,7 @@ def chat_mod(app_module):
     from backend import chat as chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
+    chat_mod._client_plan_return.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
     chat_mod._session_streams.clear()
@@ -54,6 +56,7 @@ def chat_mod(app_module):
     yield chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
+    chat_mod._client_plan_return.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
     chat_mod._session_streams.clear()
@@ -64,8 +67,11 @@ def chat_mod(app_module):
 
 def _patch_builder(monkeypatch, chat_mod):
     """Replace the slow CLI-spawning path with a fake-client factory."""
-    async def fake_build(session_id, model, permission, effort):
-        return _FakeSDKClient(session_id, model, effort)
+    async def fake_build(
+        session_id, model, permission, effort, service_tier="",
+        plan_return_permission="",
+    ):
+        return _FakeSDKClient(session_id, model, effort, service_tier)
 
     def fake_ensure(key, client):
         stream = chat_mod._session_streams.get(key)
@@ -91,26 +97,33 @@ def test_cache_hit_reuses_same_client(chat_mod, monkeypatch):
     c1, c2 = asyncio.run(run())
     assert c1 is c2, "cache miss on identical key — pool not reusing client"
     # Exactly one entry in the pool + LRU.
-    assert list(chat_mod._clients.keys()) == [("sid-1", "claude-sonnet-4-6", "")]
-    assert chat_mod._client_lru == [("sid-1", "claude-sonnet-4-6", "")]
+    assert list(chat_mod._clients.keys()) == [
+        ("sid-1", "claude-sonnet-4-6", "auto", "")]
+    assert chat_mod._client_lru == [
+        ("sid-1", "claude-sonnet-4-6", "auto", "")]
 
 
 def test_different_key_builds_new_client(chat_mod, monkeypatch):
-    """Switching model OR effort yields a distinct client (different key)."""
+    """Switching model, effort, or service tier builds a distinct runtime."""
     _patch_builder(monkeypatch, chat_mod)
+    monkeypatch.setattr(chat_mod, "_CLIENT_POOL_CAP", 8)
 
     async def run():
         a = await chat_mod.get_client("sid-1", "claude-sonnet-4-6", "bypassPermissions")
         b = await chat_mod.get_client("sid-1", "claude-haiku-4-5", "bypassPermissions")
         c = await chat_mod.get_client("sid-1", "claude-sonnet-4-6", "bypassPermissions", effort="high")
-        return a, b, c
+        d = await chat_mod.get_client(
+            "sid-1", "claude-sonnet-4-6", "bypassPermissions",
+            service_tier="fast")
+        return a, b, c, d
 
-    a, b, c = asyncio.run(run())
-    assert a is not b and a is not c and b is not c
+    a, b, c, d = asyncio.run(run())
+    assert len({id(a), id(b), id(c), id(d)}) == 4
     assert set(chat_mod._clients.keys()) == {
-        ("sid-1", "claude-sonnet-4-6", ""),
-        ("sid-1", "claude-haiku-4-5", ""),
-        ("sid-1", "claude-sonnet-4-6", "high"),
+        ("sid-1", "claude-sonnet-4-6", "auto", ""),
+        ("sid-1", "claude-haiku-4-5", "auto", ""),
+        ("sid-1", "claude-sonnet-4-6", "high", ""),
+        ("sid-1", "claude-sonnet-4-6", "auto", "fast"),
     }
 
 
@@ -121,7 +134,7 @@ def test_disconnect_client_evicts_entry_and_all_side_dicts(chat_mod, monkeypatch
 
     async def run():
         c = await chat_mod.get_client("sid-evict", "claude-sonnet-4-6", "bypassPermissions")
-        key = ("sid-evict", "claude-sonnet-4-6", "")
+        key = ("sid-evict", "claude-sonnet-4-6", "auto", "")
         # Ensure a creation lock got registered (get_client takes it on miss).
         assert key in chat_mod._creation_locks
         assert key in chat_mod._clients
@@ -145,7 +158,7 @@ def test_permission_switch_rebuilds_runtime(chat_mod, monkeypatch):
     _patch_builder(monkeypatch, chat_mod)
 
     async def run():
-        key = ("sid-flip", "claude-sonnet-4-6", "")
+        key = ("sid-flip", "claude-sonnet-4-6", "auto", "")
         c1 = await chat_mod.get_client("sid-flip", "claude-sonnet-4-6", "bypassPermissions")
         c2 = await chat_mod.get_client("sid-flip", "claude-sonnet-4-6", "default")
         assert c2 is not c1
@@ -155,6 +168,41 @@ def test_permission_switch_rebuilds_runtime(chat_mod, monkeypatch):
         assert c3 is not c2
         assert c2.disconnected is True
         assert chat_mod._client_permission[key] == "bypassPermissions"
+
+    asyncio.run(run())
+
+
+def test_plan_return_capability_participates_in_runtime_contract(
+    chat_mod, monkeypatch,
+):
+    _patch_builder(monkeypatch, chat_mod)
+
+    async def run():
+        key = ("sid-plan", "claude-sonnet-4-6", "auto", "")
+        first = await chat_mod.get_client(
+            "sid-plan",
+            "claude-sonnet-4-6",
+            "plan",
+            plan_return_permission="default",
+        )
+        reused = await chat_mod.get_client(
+            "sid-plan",
+            "claude-sonnet-4-6",
+            "plan",
+            plan_return_permission="default",
+        )
+        assert reused is first
+
+        elevated = await chat_mod.get_client(
+            "sid-plan",
+            "claude-sonnet-4-6",
+            "plan",
+            plan_return_permission="bypassPermissions",
+        )
+        assert elevated is not first
+        assert first.disconnected is True
+        assert chat_mod._client_permission[key] == "plan"
+        assert chat_mod._client_plan_return[key] == "bypassPermissions"
 
     asyncio.run(run())
 
@@ -173,14 +221,14 @@ def test_eviction_at_pool_cap_drops_oldest_and_its_side_dicts(chat_mod, monkeypa
         return a, b, c
 
     a, b, c = asyncio.run(run())
-    key_a = ("A", "claude-sonnet-4-6", "")
+    key_a = ("A", "claude-sonnet-4-6", "auto", "")
     assert a.disconnected is True, "oldest entry not disconnected on eviction"
     assert key_a not in chat_mod._clients
     assert key_a not in chat_mod._client_permission
     assert key_a not in chat_mod._client_lru
     # B and C survive.
-    assert ("B", "claude-sonnet-4-6", "") in chat_mod._clients
-    assert ("C", "claude-sonnet-4-6", "") in chat_mod._clients
+    assert ("B", "claude-sonnet-4-6", "auto", "") in chat_mod._clients
+    assert ("C", "claude-sonnet-4-6", "auto", "") in chat_mod._clients
 
 
 def test_lru_eviction_closes_and_drops_session_stream(chat_mod, monkeypatch):
@@ -215,7 +263,7 @@ def test_lru_eviction_closes_and_drops_session_stream(chat_mod, monkeypatch):
 
     asyncio.run(run())
 
-    key_a = ("A", "claude-sonnet-4-6", "")
+    key_a = ("A", "claude-sonnet-4-6", "auto", "")
     assert created[key_a].closed is True
     assert key_a not in chat_mod._session_streams
 
@@ -238,12 +286,12 @@ def test_eviction_skips_session_with_inflight_background_task(chat_mod, monkeypa
         return a, b, c
 
     a, b, c = asyncio.run(run())
-    key_a = ("A", "claude-sonnet-4-6", "")
-    key_b = ("B", "claude-sonnet-4-6", "")
+    key_a = ("A", "claude-sonnet-4-6", "auto", "")
+    key_b = ("B", "claude-sonnet-4-6", "auto", "")
     # A survives despite being oldest — the pin protected it.
     assert a.disconnected is False, "pinned client was wrongly disconnected"
     assert key_a in chat_mod._clients
     # B (next-oldest, unpinned) took the eviction instead.
     assert b.disconnected is True, "non-pinned oldest not evicted"
     assert key_b not in chat_mod._clients
-    assert ("C", "claude-sonnet-4-6", "") in chat_mod._clients
+    assert ("C", "claude-sonnet-4-6", "auto", "") in chat_mod._clients

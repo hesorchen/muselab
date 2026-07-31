@@ -614,6 +614,354 @@ def test_indexeddb_tree_hydrates_then_applies_owner_scoped_delta(
     }
 
 
+def test_workspace_remove_readd_rejects_old_path_generation(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const cache = await import('/static/modules/persistent-cache.mjs');
+          const suffix = `${Date.now()}-${Math.random()}`;
+          const owner = `/workspace-aba-${suffix}`;
+          const primary = `/workspace-primary-${suffix}`;
+          const oldId = `old-${suffix}`;
+          const newId = `new-${suffix}`;
+          const staleNode = {
+            path: 'stale.txt', name: 'stale.txt', is_dir: false,
+            size: 1, mtime: 1, depth: 0,
+          };
+          await cache.putWorkspaceSnapshot(owner, {
+            workspaceId: oldId, showHidden: false, cursor: 41,
+            visible: [staleNode], childCache: {}, expanded: [],
+          });
+
+          const originals = {
+            fetch: window.fetch,
+            persistentCache: app._persistentCache,
+            confirm: app.confirm,
+            changeWorkspace: app._changeWorkspaceSurface,
+            fetchWorkspaces: app.fetchSessionWorkspaces,
+            refreshSessions: app._refreshSessionsAfterWorkspaceRegistryChange,
+            savePrefs: app.savePrefs,
+          };
+          let releaseRead;
+          let readStartedResolve;
+          let releaseChain;
+          const readGate = new Promise(resolve => { releaseRead = resolve; });
+          const readStarted = new Promise(resolve => { readStartedResolve = resolve; });
+          const oldChain = new Promise(resolve => { releaseChain = resolve; });
+          const facade = {
+            ...cache,
+            getWorkspaceSnapshot: async path => {
+              const snapshot = await cache.getWorkspaceSnapshot(path);
+              if (path === owner) {
+                readStartedResolve();
+                await readGate;
+              }
+              return snapshot;
+            },
+          };
+          let registered = true;
+          let staleOperationRan = false;
+          let fileEventsClosed = false;
+          const persistTimer = setTimeout(() => {}, 60_000);
+          const retryTimer = setTimeout(() => {}, 60_000);
+          const batchTimer = setTimeout(() => {}, 60_000);
+          try {
+            app._persistentCache = async () => facade;
+            app.confirm = async () => true;
+            app.savePrefs = () => {};
+            app._refreshSessionsAfterWorkspaceRegistryChange = async () => true;
+            app._changeWorkspaceSurface = async path => {
+              app.activeWorkspace = path;
+              return true;
+            };
+            app.fetchSessionWorkspaces = async () => {
+              app.sessionWorkspaces = [
+                {path: primary, name: 'primary', primary: true, id: 'primary-id'},
+                ...(registered ? [{
+                  path: owner, name: 'owner', primary: false,
+                  id: registered === 'new' ? newId : oldId,
+                }] : []),
+              ];
+              return true;
+            };
+            window.fetch = async (url, init = {}) => {
+              const parsed = new URL(String(url), location.origin);
+              if (parsed.pathname === '/api/chat/workspaces'
+                  && init.method === 'DELETE') {
+                registered = false;
+                return new Response('{}', {status: 200});
+              }
+              if (parsed.pathname === '/api/chat/workspaces'
+                  && init.method === 'POST') {
+                registered = 'new';
+                return new Response(JSON.stringify({
+                  path: owner, name: 'owner', primary: false, id: newId,
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+              }
+              return originals.fetch(url, init);
+            };
+
+            app.sessionWorkspaces = [
+              {path: primary, name: 'primary', primary: true, id: 'primary-id'},
+              {path: owner, name: 'owner', primary: false, id: oldId},
+            ];
+            app.activeWorkspace = owner;
+            app.visible = [];
+            app.childCache = {};
+            app.expanded = new Set();
+            app._workspaceTreeCursors.set(owner, 41);
+            app._workspaceRuntimeCaches.set(owner, {visible: [staleNode]});
+            app._workspaceTreeCacheTimers.set(owner, {
+              timer: persistTimer, idle: null, token: Symbol('old'),
+            });
+            app._workspaceSyncRetryTimers.set(owner, {
+              timer: retryTimer, attempt: 0,
+            });
+            app._workspaceEventBatches.set(owner, {
+              timer: batchTimer, payloads: [],
+            });
+            app._childFetches = new Map([[
+              `${owner}${String.fromCharCode(0)}old-request`, Promise.resolve([]),
+            ]]);
+            app._fileEvents = {close: () => { fileEventsClosed = true; }};
+            app._fileEventsWorkspace = owner;
+            app._fileEventsGeneration = app._workspaceGeneration(owner);
+
+            const treeSeq = app._treeLoadSeq;
+            const oldGeneration = app._workspaceGeneration(owner);
+            const staleHydrate = app._hydrateWorkspaceTree(
+              owner, treeSeq, oldGeneration,
+            );
+            await readStarted;
+            app._workspaceSyncChains.set(owner, oldChain);
+            const staleTask = app._enqueueWorkspaceSync(
+              owner,
+              () => { staleOperationRan = true; return true; },
+              oldGeneration,
+            );
+
+            await app.removeWorkspace(owner);
+            const afterRemove = {
+              runtime: app._workspaceRuntimeCaches.has(owner),
+              cursor: app._workspaceTreeCursors.has(owner),
+              persist: app._workspaceTreeCacheTimers.has(owner),
+              retry: app._workspaceSyncRetryTimers.has(owner),
+              batch: app._workspaceEventBatches.has(owner),
+              chain: app._workspaceSyncChains.has(owner),
+              child: Array.from(app._childFetches.keys()).some(
+                key => key.startsWith(`${owner}${String.fromCharCode(0)}`)),
+            };
+            const entry = await app._registerWorkspacePath(owner);
+            app.activeWorkspace = owner;
+            app.visible = [];
+            releaseRead();
+            releaseChain();
+            const hydrated = await staleHydrate;
+            const staleTaskResult = await staleTask;
+            let freshOperationRan = false;
+            const freshTaskResult = await app._enqueueWorkspaceSync(
+              owner,
+              () => { freshOperationRan = true; return true; },
+              app._workspaceGeneration(owner),
+            );
+            const stored = await cache.getWorkspaceSnapshot(owner);
+            return {
+              entryId: entry?.id,
+              registryId: app._workspaceRegistryId(owner),
+              generationChanged: app._workspaceGeneration(owner) !== oldGeneration,
+              afterRemove,
+              fileEventsClosed,
+              hydrated,
+              staleTaskResult,
+              staleOperationRan,
+              freshTaskResult,
+              freshOperationRan,
+              staleVisible: app.visible.some(node => node.path === 'stale.txt'),
+              stored,
+            };
+          } finally {
+            releaseRead();
+            releaseChain();
+            clearTimeout(persistTimer);
+            clearTimeout(retryTimer);
+            clearTimeout(batchTimer);
+            app._clearWorkspaceSyncRetry(owner);
+            app._clearWorkspaceEventBatch(owner);
+            app._workspaceTreeCacheTimers.delete(owner);
+            app._workspaceSyncChains.delete(owner);
+            app._workspaceRuntimeCaches.delete(owner);
+            app._workspaceTreeCursors.delete(owner);
+            app._workspaceEpochs.delete(owner);
+            await cache.deleteWorkspaceSnapshot(owner);
+            window.fetch = originals.fetch;
+            app._persistentCache = originals.persistentCache;
+            app.confirm = originals.confirm;
+            app._changeWorkspaceSurface = originals.changeWorkspace;
+            app.fetchSessionWorkspaces = originals.fetchWorkspaces;
+            app._refreshSessionsAfterWorkspaceRegistryChange = originals.refreshSessions;
+            app.savePrefs = originals.savePrefs;
+          }
+        }"""
+    )
+    assert result["entryId"] == result["registryId"]
+    assert result["registryId"].startswith("new-")
+    assert result == {
+        "entryId": result["registryId"],
+        "registryId": result["entryId"],
+        "generationChanged": True,
+        "afterRemove": {
+            "runtime": False,
+            "cursor": False,
+            "persist": False,
+            "retry": False,
+            "batch": False,
+            "chain": False,
+            "child": False,
+        },
+        "fileEventsClosed": True,
+        "hydrated": False,
+        "staleTaskResult": False,
+        "staleOperationRan": False,
+        "freshTaskResult": True,
+        "freshOperationRan": True,
+        "staleVisible": False,
+        "stored": None,
+    }
+
+
+def test_sse_ready_workspace_id_mismatch_forces_cold_tree_recovery(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const cache = await import('/static/modules/persistent-cache.mjs');
+          const suffix = `${Date.now()}-${Math.random()}`;
+          const owner = `/workspace-sse-aba-${suffix}`;
+          const primary = `/workspace-sse-primary-${suffix}`;
+          const oldId = `old-${suffix}`;
+          const newId = `new-${suffix}`;
+          const staleNode = {
+            path: 'stale.txt', name: 'stale.txt', is_dir: false,
+            size: 1, mtime: 1, depth: 0,
+          };
+          const originals = {
+            EventSource: window.EventSource,
+            fetch: window.fetch,
+            capabilities: app._fileCapabilities,
+            visible: app._fileTreeIsVisible,
+            loadRoot: app.loadRoot,
+          };
+          const streams = [];
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 1;
+              this.closed = false;
+              streams.push(this);
+            }
+            close() {
+              this.closed = true;
+              this.readyState = 2;
+            }
+          }
+          let coldLoad = false;
+          let loadCalls = 0;
+          try {
+            app._stopFileEvents(false);
+            window.EventSource = FakeEventSource;
+            app._fileCapabilities = async () => ({
+              mintTicket: async () => 'fake-ticket',
+            });
+            app._fileTreeIsVisible = () => true;
+            window.fetch = async (url, init = {}) => {
+              const parsed = new URL(String(url), location.origin);
+              if (parsed.pathname === '/api/chat/workspaces'
+                  && (!init.method || init.method === 'GET')) {
+                return new Response(JSON.stringify({workspaces: [
+                  {path: primary, name: 'primary', primary: true, id: 'primary-id'},
+                  {path: owner, name: 'owner', primary: false, id: newId},
+                ]}), {status: 200, headers: {'Content-Type': 'application/json'}});
+              }
+              return originals.fetch(url, init);
+            };
+            app.loadRoot = async options => {
+              loadCalls += 1;
+              coldLoad = options?.runtimeSnapshot === false
+                && app.visible.length === 0
+                && Object.keys(app.childCache).length === 0
+                && !app._workspaceTreeCursors.has(owner)
+                && !app._workspaceRuntimeCaches.has(owner);
+              return true;
+            };
+            app.sessionWorkspaces = [
+              {path: primary, name: 'primary', primary: true, id: 'primary-id'},
+              {path: owner, name: 'owner', primary: false, id: oldId},
+            ];
+            app.activeWorkspace = owner;
+            app.visible = [staleNode];
+            app.childCache = {':false': [staleNode]};
+            app.expanded = new Set();
+            app._workspaceTreeCursors.set(owner, 0);
+            app._workspaceRuntimeCaches.set(owner, {visible: [staleNode]});
+            await cache.putWorkspaceSnapshot(owner, {
+              workspaceId: oldId, showHidden: false, cursor: 0,
+              visible: [staleNode], childCache: {}, expanded: [],
+            });
+            const oldGeneration = app._workspaceGeneration(owner);
+            await app._startFileEvents();
+            const first = streams[0];
+            first.dispatchEvent(new MessageEvent('ready', {
+              data: JSON.stringify({
+                ready: true, cursor: 0, workspace_id: newId,
+              }),
+            }));
+            for (let i = 0; i < 100 && streams.length < 2; i += 1) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            const stored = await cache.getWorkspaceSnapshot(owner);
+            return {
+              streams: streams.length,
+              firstClosed: first.closed,
+              loadCalls,
+              coldLoad,
+              registryId: app._workspaceRegistryId(owner),
+              generationChanged: app._workspaceGeneration(owner) !== oldGeneration,
+              activeGeneration: app._fileEventsGeneration
+                === app._workspaceGeneration(owner),
+              staleVisible: app.visible.some(node => node.path === 'stale.txt'),
+              stored,
+            };
+          } finally {
+            app._stopFileEvents(false);
+            app._workspaceRuntimeCaches.delete(owner);
+            app._workspaceTreeCursors.delete(owner);
+            app._workspaceEpochs.delete(owner);
+            await cache.deleteWorkspaceSnapshot(owner);
+            window.EventSource = originals.EventSource;
+            window.fetch = originals.fetch;
+            app._fileCapabilities = originals.capabilities;
+            app._fileTreeIsVisible = originals.visible;
+            app.loadRoot = originals.loadRoot;
+          }
+        }"""
+    )
+    # Layout watchers may race one extra same-generation reconnect, but the
+    # stale stream must be replaced and the active stream must own the new id.
+    assert result["streams"] >= 2
+    assert result["firstClosed"] is True
+    assert result["loadCalls"] == 1
+    assert result["coldLoad"] is True
+    assert result["registryId"].startswith("new-")
+    assert result["generationChanged"] is True
+    assert result["activeGeneration"] is True
+    assert result["staleVisible"] is False
+    assert result["stored"] is None
+
+
 def test_warm_workspace_surface_does_not_wait_for_slow_delta(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
@@ -830,6 +1178,159 @@ def test_workspace_switch_only_waits_for_cold_tree_not_auxiliary_refreshes(
     assert result["runtime"]["pending"] == ["runtime-terminals"]
     assert result["runtime"]["surface"] == "terminal"
     assert result["runtime"]["terminalId"] == "terminal-slow"
+
+
+def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const owner = app.fileWorkspacePath();
+          const realFetch = window.fetch;
+          const originalPersist = app._scheduleWorkspaceTreePersist;
+          const originalExpanded = app.expanded;
+          const originalVisible = app.visible;
+          const originalChildCache = app.childCache;
+          const originalShowHidden = app.showHidden;
+          const calls = [];
+          const node = (path, isDir = false) => ({
+            path, name: path.split('/').pop(), is_dir: isDir,
+            size: 1, mtime: 1, mtime_ns: 1,
+          });
+          app.showHidden = true;
+          app.expanded = new Set(['src', 'src/deep']);
+          app.visible = [];
+          app.childCache = {};
+          app._workspaceTreeCursors.delete(owner);
+          app._scheduleWorkspaceTreePersist = () => {};
+          window.fetch = async (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname !== '/api/files/bootstrap') {
+              return realFetch(url, init);
+            }
+            const method = String(init.method || 'GET').toUpperCase();
+            calls.push({
+              method,
+              query: parsed.search,
+              body: init.body ? JSON.parse(init.body) : null,
+              workspace: decodeURIComponent(
+                new Headers(init.headers).get('X-Muselab-Workspace') || ''),
+            });
+            if (method === 'POST') return new Response('', {status: 405});
+            return new Response(JSON.stringify({
+              cursor: 9,
+              entries: [
+                node('src', true), node('.hidden'),
+                node('src/deep', true), node('src/deep/file.txt'),
+              ],
+            }), {status: 200, headers: {'Content-Type': 'application/json'}});
+          };
+          try {
+            const ok = await app._syncWorkspaceTree(
+              owner, app._treeLoadSeq, false);
+            return {
+              ok, calls, owner,
+              visible: app.visible.map(row => row.path),
+              cursor: app._workspaceTreeCursors.get(owner),
+            };
+          } finally {
+            window.fetch = realFetch;
+            app._scheduleWorkspaceTreePersist = originalPersist;
+            app.expanded = originalExpanded;
+            app.visible = originalVisible;
+            app.childCache = originalChildCache;
+            app.showHidden = originalShowHidden;
+          }
+        }"""
+    )
+    assert result["ok"] is True
+    assert {call["workspace"] for call in result["calls"]} == {result["owner"]}
+    calls = [
+        {key: value for key, value in call.items() if key != "workspace"}
+        for call in result["calls"]
+    ]
+    assert calls == [
+        {
+            "method": "POST",
+            "query": "",
+            "body": {
+                "show_hidden": True,
+                "parents": ["src", "src/deep"],
+            },
+        },
+        {"method": "GET", "query": "?show_hidden=true", "body": None},
+    ]
+    assert result["visible"] == ["src", "src/deep", "src/deep/file.txt", ".hidden"]
+    assert result["cursor"] == 9
+
+
+def test_terminal_foreground_still_persists_cursor_matched_tree_snapshot(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          // Use an isolated owner so unrelated boot/session filesystem events
+          // cannot keep replacing this owner's debounce handle.
+          const owner = `/terminal-persist-${Date.now()}-${Math.random()}`;
+          const originals = {
+            debounce: app.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS,
+            surface: app.previewSurface,
+            requestIdle: window.requestIdleCallback,
+            cancelIdle: window.cancelIdleCallback,
+          };
+          let stored = null;
+          let idleCalls = 0;
+          const cache = await app._persistentCache();
+          app.previewSurface = 'terminal';
+          const captured = {
+            showHidden: false,
+            cursor: 17,
+            visible: [{
+              path: 'src', name: 'src', is_dir: true,
+              size: 0, mtime: 1, depth: 0,
+            }],
+            childCache: {
+              ':false': [{
+                path: 'src', name: 'src', is_dir: true,
+                size: 0, mtime: 1,
+              }],
+              'src:false': [{
+                path: 'src/a.txt', name: 'a.txt', is_dir: false,
+                size: 1, mtime: 1,
+              }],
+            },
+            expanded: ['src'],
+          };
+          app.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS = 0;
+          window.requestIdleCallback = callback => {
+            idleCalls += 1;
+            return setTimeout(callback, 0);
+          };
+          window.cancelIdleCallback = handle => clearTimeout(handle);
+          try {
+            app._scheduleWorkspaceTreePersist(owner, captured);
+            const deadline = performance.now() + 4000;
+            while (!stored && performance.now() < deadline) {
+              await new Promise(resolve => setTimeout(resolve, 50));
+              stored = await cache.getWorkspaceSnapshot(owner);
+            }
+            return {stored, idleCalls};
+          } finally {
+            app.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS = originals.debounce;
+            app.previewSurface = originals.surface;
+            window.requestIdleCallback = originals.requestIdle;
+            window.cancelIdleCallback = originals.cancelIdle;
+          }
+        }"""
+    )
+    assert result["stored"] is not None, result
+    assert result["idleCalls"] >= 1
+    snapshot = result["stored"]
+    assert snapshot["cursor"] == 17
+    assert snapshot["expanded"] == ["src"]
+    assert set(snapshot["childCache"]) == {":false", "src:false"}
 
 
 def test_workspace_sync_orders_snapshot_events_and_batches_linear_delta(
@@ -1212,7 +1713,13 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
           window.fetch = (url, init = {}) => {
             const parsed = new URL(String(url), location.origin);
             if (parsed.pathname === '/api/files/bootstrap') {
-              calls.push(`bootstrap:${parsed.searchParams.get('show_hidden') || 'false'}`);
+              const payload = init.body ? JSON.parse(String(init.body)) : {};
+              calls.push({
+                endpoint: 'bootstrap',
+                method: String(init.method || 'GET').toUpperCase(),
+                showHidden: !!payload.show_hidden,
+                parents: payload.parents || [],
+              });
               return Promise.resolve(new Response(JSON.stringify({
                 cursor: 1,
                 entries: [{
@@ -1256,7 +1763,12 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
     )
     assert result == {
         "ok": True,
-        "calls": ["bootstrap:true"],
+        "calls": [{
+            "endpoint": "bootstrap",
+            "method": "POST",
+            "showHidden": True,
+            "parents": [],
+        }],
         "showHidden": True,
         "expanded": [],
         "paths": [".hidden-root"],

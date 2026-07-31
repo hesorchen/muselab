@@ -96,7 +96,7 @@ def test_mem0_never_rewrites_canonical_user_query(
     )]
     fake = _FakeStreamClient(messages)
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     async def must_not_search_here(*args, **kwargs):
@@ -188,7 +188,7 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
         ),
     ]
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return _FakeStreamClient(messages)
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -271,7 +271,7 @@ def test_tool_only_turn_persists_completion_annotation(
     ]
 
     async def fake_get_client(
-        session_id, model, permission="bypassPermissions", effort="",
+        session_id, model, permission="bypassPermissions", effort="", service_tier="",
     ):
         return _FakeStreamClient(messages)
 
@@ -438,7 +438,7 @@ def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
     ]
     fake = _FakeBatchedStreamClient([stale_batch, current_batch])
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -548,7 +548,7 @@ def test_preflight_compact_failure_blocks_original_prompt(stream_env, client, mo
 
     fake.get_context_usage = near_limit_context
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -579,7 +579,7 @@ def test_stream_done_classifies_synthetic_context_error(stream_env, client, monk
     ]
     fake = _FakeStreamClient(messages)
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -619,7 +619,7 @@ def test_stream_pdf_attachment_persists_path_fallback(stream_env, client, monkey
     ]
     fake = _FakeStreamClient(messages)
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -674,7 +674,7 @@ def test_stream_text_attachment_goes_to_disk_not_into_prompt(
         ),
     ])
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -757,7 +757,7 @@ def test_stream_background_task_messages_flow_through(stream_env, client, monkey
         ),
     ]
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return _FakeStreamClient(messages)
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -1819,7 +1819,7 @@ def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch
             raise RuntimeError("HTTP 401 invalid api key")
             yield  # pragma: no cover  (makes this an async generator)
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return _BoomClient()
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -1847,7 +1847,7 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     sid = _make_session(client)
     activity_transitions = []
 
-    async def boom_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def boom_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         from claude_agent_sdk import ClaudeSDKError
         raise ClaudeSDKError("Claude model requires auth: run `claude login`")
 
@@ -1918,7 +1918,7 @@ def test_turn_has_no_wall_clock_cap_by_default(stream_env, client, monkeypatch):
     monkeypatch.setattr(_asyncio, "timeout", spy)
     monkeypatch.delenv("MUSELAB_TURN_TIMEOUT_S", raising=False)
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return _FakeStreamClient(_ok_turn(sid))
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -1944,7 +1944,7 @@ def test_turn_cap_is_opt_in_via_env(stream_env, client, monkeypatch):
             for m in self._messages:
                 yield m
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return _SlowClient(_ok_turn(sid))
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -2210,7 +2210,7 @@ def test_preflight_compact_announces_itself_over_sse(stream_env, client, monkeyp
 
     fake.get_context_usage = near_limit_context
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
@@ -2270,7 +2270,7 @@ def test_sdk_command_reads_through_the_session_pump(stream_env):
 
     async def go():
         fake = PumpedClient()
-        chat_mod._ensure_session_stream(("sid", "m", ""), fake)
+        chat_mod._ensure_session_stream(("sid", "m", "auto", ""), fake)
         try:
             # The bug's signature was a hang, so the bound is the assertion.
             got = await asyncio.wait_for(
@@ -2307,7 +2307,7 @@ def test_failed_session_stream_evicts_dead_cached_client(stream_env):
             self.disconnected = True
 
     async def go():
-        key = ("dead-session", "glm-5.2-internal", "")
+        key = ("dead-session", "glm-5.2-internal", "auto", "")
         client = BrokenClient()
         async with chat_mod._lock:
             chat_mod._clients[key] = client
@@ -2351,7 +2351,7 @@ def test_park_unconsumed_hands_leftovers_back_to_the_orphan_park(stream_env):
             yield  # pragma: no cover — never reached
 
     async def go():
-        stream = chat_mod._SessionStream(("sid", "m", ""), IdleClient())
+        stream = chat_mod._SessionStream(("sid", "m", "auto", ""), IdleClient())
         try:
             q = stream.attach_turn()
             q.put_nowait(later)
@@ -2408,7 +2408,7 @@ def test_preflight_compact_trusts_the_token_count_over_the_verdict(
 
     fake.get_context_usage = shrinking_context
 
-    async def fake_get_client(session_id, model, permission="bypassPermissions", effort=""):
+    async def fake_get_client(session_id, model, permission="bypassPermissions", effort="", service_tier=""):
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)

@@ -16,7 +16,7 @@ import urllib.parse
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, Iterable, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
@@ -29,7 +29,7 @@ from claude_agent_sdk import (
     TaskUpdatedMessage, TERMINAL_TASK_STATUSES,
     RateLimitEvent,
     ClaudeSDKError,
-    ThinkingConfigEnabled, ThinkingConfigDisabled,
+    ThinkingConfigEnabled, ThinkingConfigDisabled, ThinkingConfigAdaptive,
     EffortLevel,
     get_session_messages,
     project_key_for_directory,
@@ -103,11 +103,55 @@ def _validate_permission(permission: str) -> str:
 # the SDK gives us no async variant for the default store.
 _vendor_msg_lock = threading.Lock()
 
-# Valid `effort` overrides, sourced from the SDK's own EffortLevel literal
-# so a new tier added upstream is honored automatically (A-level SDK-as-truth
-# fix — was a hardcoded tuple that would silently drop unknown values). ""
-# (SDK adaptive default) is intentionally NOT here; callers guard `if effort`.
-_VALID_EFFORT = get_args(EffortLevel)
+# The SDK/CLI currently accept low..max. MuseLab adds two protocol-level values:
+# ``auto`` asks CLIProxyAPI to use the selected Codex model's catalog default,
+# while ``ultra`` is supported by newer Codex models but not yet by Claude's
+# public SDK literal. Those two values travel in a private request header and
+# are handled by the Gateway after Claude's request translator has run.
+_SDK_EFFORT_LEVELS = tuple(get_args(EffortLevel))
+_VALID_EFFORT = ("auto", *_SDK_EFFORT_LEVELS, "ultra")
+_VALID_SERVICE_TIERS = frozenset({"", "fast"})
+
+# Codex Ultra is a client-level mode, not a raw Responses API effort literal:
+# the provider wire contract currently tops out at ``max``. Ultra combines
+# that maximum reasoning level with the bundled ``ultra-orchestrator`` Skill.
+# The hook below activates that native workflow without adding a muselab-owned
+# system prompt or rewriting the canonical user message/transcript.
+_ULTRA_SKILL_CONTEXT = (
+    "MuseLab Ultra mode is selected for this turn. Invoke and follow the "
+    "bundled ultra-orchestrator Skill for the user's original request."
+)
+
+
+def _normalize_effort(effort: str | None) -> str:
+    """Canonicalize the legacy empty-string spelling to ``auto``."""
+    value = (effort or "").strip()
+    return value or "auto"
+
+
+def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
+    """Build Claude CLI's newline-delimited custom-header environment value.
+
+    Values have already passed closed-set validation; keeping this helper
+    intentionally tiny also makes it straightforward to capture/assert the
+    exact CLI request without exposing credentials.
+    """
+    lines = [f"X-MuseLab-Effort: {_normalize_effort(effort)}"]
+    if service_tier == "fast":
+        lines.append("X-MuseLab-Service-Tier: fast")
+    return "\n".join(lines)
+
+
+def _build_ultra_skill_hook():
+    """Activate Ultra's native Skill through transient SDK context."""
+    async def ultra_skill_hook(_input_data, _tool_use_id, _context):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": _ULTRA_SKILL_CONTEXT,
+            }
+        }
+    return ultra_skill_hook
 
 
 def _cli_project_roots() -> list[Path]:
@@ -383,14 +427,22 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # fan-out for the privacy rationale.
 
 
-# Clients keyed by (session_id, model, effort).
-_ClientKey = tuple[str, str, str]
+# Clients keyed by (session_id, model, effort, service_tier). Both controls are
+# launch-time request plumbing, so a runtime created for standard service must
+# never be reused after the session switches to Fast (or vice versa).
+_ClientKey = tuple[str, str, str, str]
 _clients: dict[_ClientKey, ClaudeSDKClient] = {}
 # Tracks the permission_mode the cached client was launched with. Permission
 # is launch-sensitive (notably default -> bypassPermissions cannot always be
 # enabled dynamically), so a mismatch rebuilds the runtime instead of trying
 # to mutate it in place.
 _client_permission: dict[_ClientKey, str] = {}
+# A client launched in Plan Mode has one more capability bit: whether it may
+# return to bypassPermissions after ExitPlanMode. The CLI only permits that
+# transition when the process was started with
+# --allow-dangerously-skip-permissions, so two otherwise-identical `plan`
+# runtimes with different return modes must never share a pooled client.
+_client_plan_return: dict[_ClientKey, str] = {}
 
 
 # Cap on token deltas queued for a single attached subscriber. Deltas are the
@@ -915,7 +967,7 @@ def _get_recent_turn(session_id: str) -> TurnBroadcast | None:
 # LRU bookkeeping. Each CLI subprocess holds ~30-50 MB RSS; without a cap
 # muselab leaks memory as users open more sessions. New clients append to
 # the tail; on cache miss with len > cap, oldest gets disconnected.
-_client_lru: list[_ClientKey] = []   # (session_id, model, effort)
+_client_lru: list[_ClientKey] = []   # (session_id, model, effort, service_tier)
 _CLIENT_POOL_CAP = env_int("MUSELAB_CLIENT_POOL_CAP", 3, min_value=1)
 _lock = asyncio.Lock()
 
@@ -1293,6 +1345,15 @@ def _canonical_context_model(model: str) -> str:
     value = (model or "").strip()
     if value.startswith("codex:"):
         return value
+    # A bare GPT id can be an explicit first-class provider route (currently
+    # the Zhipu-backed OpenAI group), not a damaged Codex transcript id. Exact
+    # provider membership wins over the compatibility alias so that route does
+    # not inherit CLIProxy-specific capabilities or private headers.
+    provider = endpoints.lookup(value)
+    if provider is not None and any(
+        model_id == value for model_id, _label in provider.models
+    ):
+        return value
     candidate = f"codex:{value}"
     if candidate in MODEL_CONTEXT_LIMITS:
         return candidate
@@ -1300,10 +1361,25 @@ def _canonical_context_model(model: str) -> str:
 
 
 def _is_codex_gateway_model(model: str) -> bool:
-    model = _canonical_context_model(model)
-    if model.startswith("codex:"):
+    raw_model = (model or "").strip()
+    if raw_model.startswith("codex:"):
         return True
-    provider = endpoints.lookup(model or "")
+    provider = endpoints.lookup(raw_model)
+    # Exact non-Codex provider declarations take precedence over the legacy
+    # raw-transcript alias. Provider identity/env key is more reliable than
+    # model-name shape (`gpt-*` is shared by multiple routes).
+    if provider is not None and any(
+        model_id == raw_model for model_id, _label in provider.models
+    ):
+        return bool(
+            provider.prefix.startswith("codex:")
+            or provider.env_key == "CODEX_GATEWAY_API_KEY"
+            or provider.env_key == "MUSELAB_PROVIDER_CODEX_API_KEY"
+            or "codex" in (provider.display or "").lower()
+        )
+    canonical = _canonical_context_model(raw_model)
+    if canonical.startswith("codex:"):
+        return True
     return bool(
         provider
         and provider.supports_effort
@@ -1339,7 +1415,7 @@ def _context_limit_env_override(model: str) -> int:
 
 
 def _parse_codex_gateway_catalog(body: Any) -> dict[str, dict]:
-    """Parse CLIProxyAPI's Codex-client catalog into meter capabilities.
+    """Parse CLIProxyAPI's Codex-client catalog into model capabilities.
 
     `context_window` is the currently selected raw window, while
     `max_context_window` is only the ceiling for an explicit client override.
@@ -1365,6 +1441,21 @@ def _parse_codex_gateway_catalog(body: Any) -> dict[str, dict]:
             pct = CODEX_DEFAULT_EFFECTIVE_CONTEXT_PERCENT
         effective = max(1, raw * pct // 100)
         auto_compact = _positive_int(item.get("auto_compact_token_limit"))
+        reasoning_levels: list[str] = []
+        for level in item.get("supported_reasoning_levels") or []:
+            effort = str(
+                level.get("effort") if isinstance(level, dict) else level
+            ).strip()
+            if effort in _VALID_EFFORT and effort != "auto" \
+                    and effort not in reasoning_levels:
+                reasoning_levels.append(effort)
+        service_tiers: list[str] = []
+        for tier in item.get("service_tiers") or []:
+            tier_id = str(
+                tier.get("id") if isinstance(tier, dict) else tier
+            ).strip()
+            if tier_id and tier_id not in service_tiers:
+                service_tiers.append(tier_id)
         parsed[slug] = {
             "context_limit": effective,
             "context_raw_limit": raw,
@@ -1374,8 +1465,73 @@ def _parse_codex_gateway_catalog(body: Any) -> dict[str, dict]:
                 min(auto_compact, effective) if auto_compact else 0),
             "context_limit_source": "gateway_catalog",
             "context_limit_is_estimate": False,
+            "supported_reasoning_levels": reasoning_levels,
+            "service_tiers": service_tiers,
         }
     return parsed
+
+
+# Read-only compatibility when the live catalog is temporarily unavailable.
+# This mirrors CLIProxyAPI 7.2.111; the dynamic catalog always wins so a
+# Gateway upgrade changes the UI without a MuseLab release.
+_CODEX_CONTROL_FALLBACKS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "gpt-5.6-sol": (("low", "medium", "high", "xhigh", "max", "ultra"),
+                    ("priority",)),
+    "gpt-5.6-terra": (("low", "medium", "high", "xhigh", "max", "ultra"),
+                      ("priority",)),
+    "gpt-5.6-luna": (("low", "medium", "high", "xhigh", "max"),
+                     ("priority",)),
+    "gpt-5.5": (("low", "medium", "high", "xhigh"), ("priority",)),
+    "gpt-5.4": (("low", "medium", "high", "xhigh"), ("priority",)),
+    "gpt-5.4-mini": (("low", "medium", "high", "xhigh"), ()),
+    "gpt-5.3-codex-spark": (("low", "medium", "high", "xhigh"), ()),
+}
+
+
+def _model_control_capability(
+    model: str, capability: dict | None = None,
+) -> dict[str, Any]:
+    """Return the frontend's exact per-model effort/Fast capability."""
+    provider = endpoints.lookup(model or "")
+    if provider is None and not endpoints.is_third_party(model):
+        return {
+            "effort_levels": ["auto", *_SDK_EFFORT_LEVELS],
+            "service_tiers": [],
+            "supports_fast": False,
+        }
+    if not provider or not provider.supports_effort:
+        return {"effort_levels": [], "service_tiers": [],
+                "supports_fast": False}
+    if _is_codex_gateway_model(model):
+        slug = endpoints.normalize_model_id(_canonical_context_model(model))
+        fallback_levels, fallback_tiers = _CODEX_CONTROL_FALLBACKS.get(
+            slug, ((), ()))
+        levels = tuple(
+            capability.get("supported_reasoning_levels") or ()
+            if capability is not None
+            and "supported_reasoning_levels" in capability
+            else fallback_levels
+        )
+        # An empty live list is authoritative (e.g. gpt-5.4-mini has no
+        # priority service). Do not let truthiness accidentally re-enable the
+        # static fallback in that case.
+        tiers = tuple(
+            capability.get("service_tiers") or ()
+            if capability is not None and "service_tiers" in capability
+            else fallback_tiers
+        )
+        return {
+            "effort_levels": ["auto", *levels],
+            # The UI uses the human-facing value `fast`; Gateway calls the
+            # corresponding native Codex service tier `priority`.
+            "service_tiers": ["fast"] if "priority" in tiers else [],
+            "supports_fast": "priority" in tiers,
+        }
+    return {
+        "effort_levels": ["auto", *_SDK_EFFORT_LEVELS],
+        "service_tiers": [],
+        "supports_fast": False,
+    }
 
 
 def _capability_from_model_item(item: Any, *, source: str) -> dict | None:
@@ -1487,6 +1643,72 @@ async def _detect_gateway_context_capability(model: str) -> dict | None:
             f"{type(e).__name__}\n")
     _CONTEXT_CAPABILITY_CACHE[cache_key] = (now, None)
     return None
+
+
+def _cached_gateway_context_capability(model: str) -> dict | None:
+    """Return one fresh catalog cache entry without starting network I/O."""
+    if not _is_codex_gateway_model(model):
+        return None
+    canonical = _canonical_context_model(model)
+    env = endpoints.env_override(canonical) or {}
+    base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
+    if not base:
+        return None
+    cached = _CONTEXT_CAPABILITY_CACHE.get((base, canonical))
+    if cached is None:
+        return None
+    cached_at, capability = cached
+    ttl = (_CONTEXT_CAPABILITY_CACHE_TTL if capability
+           else _CONTEXT_CAPABILITY_FAILURE_TTL)
+    if time.monotonic() - cached_at >= ttl:
+        return None
+    return dict(capability) if capability else None
+
+
+async def _detect_gateway_context_capabilities(
+    models: Iterable[str],
+) -> dict[str, dict]:
+    """Resolve a model list with at most one catalog probe per Gateway base.
+
+    The primary CLIProxyAPI endpoint returns the complete Codex catalog and
+    `_detect_gateway_context_capability()` fills every model cache entry from
+    that one response. Provider discovery must therefore never repeat the same
+    timeout once per dropdown item when the local Gateway is unavailable.
+    """
+    capabilities: dict[str, dict] = {}
+    unresolved_by_base: dict[str, list[str]] = {}
+    for model in dict.fromkeys(models):
+        if not _is_codex_gateway_model(model):
+            continue
+        cached = _cached_gateway_context_capability(model)
+        if cached is not None:
+            capabilities[model] = cached
+            continue
+        canonical = _canonical_context_model(model)
+        env = endpoints.env_override(canonical) or {}
+        base = (env.get("ANTHROPIC_BASE_URL") or "").rstrip("/")
+        if base:
+            unresolved_by_base.setdefault(base, []).append(model)
+
+    async def probe(group: list[str]) -> tuple[str, dict | None]:
+        first = group[0]
+        return first, await _detect_gateway_context_capability(first)
+
+    if unresolved_by_base:
+        probed = await asyncio.gather(*(
+            probe(group) for group in unresolved_by_base.values()
+        ))
+        for first, capability in probed:
+            if capability is not None:
+                capabilities[first] = capability
+        # A successful catalog probe populated sibling entries. A failed one
+        # deliberately leaves every sibling on the static control fallback.
+        for group in unresolved_by_base.values():
+            for model in group:
+                cached = _cached_gateway_context_capability(model)
+                if cached is not None:
+                    capabilities[model] = cached
+    return capabilities
 
 
 def _context_limit_details(
@@ -1700,7 +1922,7 @@ def _budget_usd() -> float:
     return env_float("MUSELAB_BUDGET_USD", 0.0)
 
 
-# Per-(sid, model, effort) creation lock. Coalesces parallel cache misses
+# Per-(sid, model, effort, service-tier) creation lock. Coalesces cache misses
 # on the same key (so we don't spawn two CLI subprocesses for one tab) while
 # leaving DIFFERENT keys free to build concurrently. Replaces the global
 # _lock-across-await pattern that froze every other request for 3-5 s while
@@ -1712,8 +1934,171 @@ def _creation_lock_for(key: _ClientKey) -> asyncio.Lock:
     return _creation_locks.setdefault(key, asyncio.Lock())
 
 
+def _normalize_plan_return_permission(
+    permission: str,
+    plan_return_permission: str | None,
+) -> str:
+    """Return the fail-closed Plan Mode return target for a runtime request."""
+    if permission != "plan":
+        return ""
+    target = (plan_return_permission or "").strip()
+    if target in _VALID_PERMISSION_MODES and target != "plan":
+        return target
+    return "default"
+
+
+def _build_plan_exit_hooks(
+    session_id: str,
+    plan_return_permission: str = "default",
+) -> tuple[Any, Any]:
+    """Build the success/failure hooks that commit an ExitPlanMode transition.
+
+    `can_use_tool` only records the user's selected SDK suggestion. The durable
+    session mode changes here, after the CLI confirms ExitPlanMode itself
+    completed. This keeps a failed/cancelled tool call from leaving MuseLab's
+    metadata ahead of the real runtime.
+    """
+
+    def _stop_ambiguous_transition(reason: str) -> dict[str, Any]:
+        # A failed/stale ExitPlanMode may already have changed the live CLI's
+        # permission. Do not let that ambiguous process continue the same turn
+        # and potentially write while durable metadata still says Plan.
+        return {
+            "continue_": False,
+            "stopReason": reason,
+        }
+
+    async def _post_tool_use(input_data, tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tid = str(data.get("tool_use_id") or tool_use_id or "")
+        transition = perm.consume_plan_transition(session_id, tid)
+        target = getattr(transition, "mode", None)
+        externally_resolved = not bool(target)
+        if externally_resolved:
+            # User/project hooks loaded through setting_sources may approve
+            # ExitPlanMode before can_use_tool runs. PostToolUse still fires,
+            # so use the SDK-reported current mode when it is concrete.
+            candidate = data.get("permission_mode")
+            target = (
+                candidate
+                if isinstance(candidate, str)
+                and candidate in _VALID_PERMISSION_MODES
+                and candidate != "plan"
+                else None
+            )
+
+        # ExitPlanMode can mutate the live CLI even when MuseLab's callback was
+        # bypassed by an external PermissionRequest/PreToolUse hook. Always
+        # discard this runtime before metadata I/O or target inference.
+        _pending_runtime_rebuilds.add(session_id)
+        if not target:
+            await perm.emit_session_event(
+                session_id,
+                "permission_mode_change_failed",
+                {
+                    "permission": (
+                        (sess.get_session(session_id) or {}).get("permission")
+                        or "plan"
+                    ),
+                    "source": "external_hook",
+                    "tool_use_id": tid,
+                    "message": "ExitPlanMode did not report a non-Plan mode.",
+                },
+            )
+            return _stop_ambiguous_transition(
+                "ExitPlanMode completed without a verifiable target mode.")
+        try:
+            previous = "plan"
+            if not sess.commit_plan_exit(
+                session_id,
+                target,
+                expected_plan_return=plan_return_permission,
+            ):
+                current = sess.get_session(session_id) or {}
+                await perm.emit_session_event(
+                    session_id,
+                    "permission_mode_change_failed",
+                    {
+                        "permission": current.get("permission") or "plan",
+                        "requested_permission": target,
+                        "source": (
+                            "external_hook"
+                            if externally_resolved else "exit_plan"
+                        ),
+                        "tool_use_id": tid,
+                        "message": (
+                            "Plan mode changed in another client; "
+                            "the stale approval was not applied."
+                        ),
+                    },
+                )
+                return _stop_ambiguous_transition(
+                    "A newer permission change superseded this plan approval.")
+        except Exception as exc:
+            sys.stderr.write(
+                f"[plan-mode] persist failed sid={session_id[:8]} "
+                f"target={target}: {type(exc).__name__}: {exc}\n")
+            await perm.emit_session_event(
+                session_id,
+                "permission_mode_change_failed",
+                {
+                    "permission": "plan",
+                    "requested_permission": target,
+                    "source": (
+                        "external_hook" if externally_resolved else "exit_plan"
+                    ),
+                    "tool_use_id": tid,
+                    "message": "Could not persist the Plan mode transition.",
+                },
+            )
+            return _stop_ambiguous_transition(
+                "MuseLab could not persist the Plan mode transition.")
+
+        # The current process may continue this turn under the SDK's new mode,
+        # but the next turn must use a freshly-launched client whose permission
+        # contract matches persisted state (especially for bypass capability).
+        await perm.emit_session_event(
+            session_id,
+            "permission_mode_changed",
+            {
+                "permission": target,
+                "previous_permission": previous,
+                "source": (
+                    "external_hook" if externally_resolved else "exit_plan"
+                ),
+                "tool_use_id": tid,
+            },
+        )
+        return {}
+
+    async def _post_tool_use_failure(input_data, tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tid = str(data.get("tool_use_id") or tool_use_id or "")
+        transition = perm.discard_plan_transition(session_id, tid)
+        # External hooks can apply a mode before a later ExitPlanMode failure,
+        # too. Its live state is ambiguous even without a staged transition.
+        _pending_runtime_rebuilds.add(session_id)
+        current = sess.get_session(session_id) or {}
+        await perm.emit_session_event(
+            session_id,
+            "permission_mode_change_failed",
+            {
+                "permission": current.get("permission") or "plan",
+                "source": "exit_plan" if transition else "external_hook",
+                "tool_use_id": tid,
+                "message": str(data.get("error") or ""),
+            },
+        )
+        return _stop_ambiguous_transition(
+            "ExitPlanMode failed; the runtime will be rebuilt safely.")
+
+    return _post_tool_use, _post_tool_use_failure
+
+
 async def _build_and_connect_client(
     session_id: str, model: str, permission: str, effort: str,
+    service_tier: str = "",
+    plan_return_permission: str = "",
 ) -> ClaudeSDKClient:
     """The slow path: build ClaudeAgentOptions, instantiate ClaudeSDKClient,
     call .connect() with retry. NEVER holds _lock — multi-second CLI
@@ -1721,6 +2106,14 @@ async def _build_and_connect_client(
     for serialising concurrent misses on the same key via _creation_lock_for().
     """
     sess_data = sess.get_session(session_id) or {}
+    effort = _normalize_effort(effort)
+    service_tier = (service_tier or "").strip()
+    if effort not in _VALID_EFFORT:
+        raise ValueError(f"invalid effort: {effort}")
+    if service_tier not in _VALID_SERVICE_TIERS:
+        raise ValueError(f"invalid service tier: {service_tier}")
+    plan_return_permission = _normalize_plan_return_permission(
+        permission, plan_return_permission)
     workspace_root = sess.session_workspace(session_id)
     # New CLI rule: session_id + resume/continue conflict unless fork_session
     # is set. So we use resume alone — it both loads existing state AND
@@ -1760,6 +2153,15 @@ async def _build_and_connect_client(
         sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
         sys.stderr.flush()
 
+    post_exit_hook, post_exit_failure_hook = _build_plan_exit_hooks(
+        session_id, plan_return_permission)
+    skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in (
+        "1", "true", "yes",
+    )
+    user_prompt_hooks = [mem0.build_recall_hook(session_id)]
+    if (effort == "ultra" and _is_codex_gateway_model(model)
+            and not skills_off):
+        user_prompt_hooks.append(_build_ultra_skill_hook())
     opts_kwargs = dict(
         cwd=str(workspace_root),
         model=endpoints.normalize_model_id(model),
@@ -1829,17 +2231,31 @@ async def _build_and_connect_client(
         # titles, transcript search, exports, and every later resume.
         hooks={
             "UserPromptSubmit": [HookMatcher(
-                hooks=[mem0.build_recall_hook(session_id)],
+                hooks=user_prompt_hooks,
                 timeout=mem0.RECALL_HOOK_TIMEOUT,
+            )],
+            "PostToolUse": [HookMatcher(
+                matcher="ExitPlanMode",
+                hooks=[post_exit_hook],
+            )],
+            "PostToolUseFailure": [HookMatcher(
+                matcher="ExitPlanMode",
+                hooks=[post_exit_failure_hook],
             )],
         },
     )
+    if permission == "plan" and plan_return_permission == "bypassPermissions":
+        # The CLI refuses a later setMode(bypassPermissions) unless this
+        # capability was granted at process launch. This flag permits the
+        # transition without starting the client itself in bypass mode.
+        opts_kwargs["extra_args"] = {
+            "allow-dangerously-skip-permissions": None,
+        }
     # Let the SDK expose every discovered Skill for every provider, including
     # Anthropic-compatible third-party gateways:
     # users expect an explicitly named local skill (e.g. galatea) to be usable
     # regardless of the selected model. Operators who hit vendor payload limits
     # can still opt out globally via MUSELAB_DISABLE_SKILLS=1.
-    skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in ("1", "true", "yes")
     if not skills_off:
         opts_kwargs["skills"] = "all"
     # Optional model params from env (UI-editable via /api/settings).
@@ -1870,6 +2286,31 @@ async def _build_and_connect_client(
         for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
             env_ovr[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = routed_model
         if _is_codex_gateway_model(model):
+            # Claude Agent SDK has no public Ultra or service-tier field, and
+            # CLIProxyAPI's Claude translator historically collapses disabled
+            # thinking to medium. Claude CLI *does* support custom headers, so
+            # carry the canonical MuseLab controls out-of-band and let Gateway
+            # apply them after translation. Ultra maps to the provider's wire-
+            # level `max`; its proactive-delegation half is provided by the
+            # bundled Skill activated through UserPromptSubmit above.
+            # Send `auto` too: Gateway removes
+            # the translator's synthetic medium so the model catalog default
+            # (Sol=low, others may differ) remains authoritative.
+            env_ovr["ANTHROPIC_CUSTOM_HEADERS"] = (
+                _muselab_gateway_headers(effort, service_tier)
+            )
+            if effort == "ultra":
+                # The Skill guides the main agent, but subagents do not inherit
+                # it. Enforce the runtime boundary too: no nested fan-out and at
+                # most four concurrent workers. Explicit operator overrides are
+                # preserved; invalid/zero values fall back to a safe positive
+                # integer through env_int().
+                env_ovr["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = str(
+                    env_int("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", 1,
+                            min_value=1))
+                env_ovr["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(
+                    env_int("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", 4,
+                            min_value=1))
             # Claude CLI cannot infer Codex/GPT windows from its native model
             # table and otherwise hard-codes 200K (auto-compact around 167K).
             # Feed it the same effective window used by muselab's meter so its
@@ -1959,7 +2400,17 @@ async def _build_and_connect_client(
     # calls disconnect_client) so the next turn rebuilds with this setting.
     thinking_pref = bool(sess_data.get("thinking", True))
     supports_thinking = ((provider is None) or provider.supports_thinking) and thinking_pref
-    if supports_thinking:
+    codex_effort_transport = (
+        _is_codex_gateway_model(model) and effort != "auto"
+    )
+    if codex_effort_transport:
+        # CLIProxyAPI only reads Claude's output_config.effort when thinking is
+        # adaptive/auto. This is transport plumbing, not a request to render a
+        # visible thinking block, hence display=omitted. The private header is
+        # still final authority (including Ultra's wire-level max mapping).
+        opts_kwargs["thinking"] = ThinkingConfigAdaptive(
+            type="adaptive", display="omitted")
+    elif supports_thinking:
         # Fixed at 10000 — no UI knob (2026-05-28). Power users can still
         # override via the env var if they really need to.
         budget = env_int("MUSELAB_THINKING_BUDGET", 10000, min_value=0)
@@ -1970,23 +2421,27 @@ async def _build_and_connect_client(
             type="enabled", budget_tokens=budget, display="summarized")
     else:
         opts_kwargs["thinking"] = ThinkingConfigDisabled(type="disabled")
-    # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
-    # picks an effort automatically; this override lets users force a
-    # deeper budget on specific tabs (e.g. xhigh for research). SDK
-    # rejects unknown strings, so guard against its OWN literal set
-    # (derived from EffortLevel) — if the SDK adds a new tier, this picks
-    # it up automatically instead of silently dropping the user's choice.
-    # ("" = SDK adaptive default; the `if effort` guard handles it, so it
-    # need not appear in _VALID_EFFORT.)
-    if effort and effort in _VALID_EFFORT:
-        opts_kwargs["effort"] = effort
+    # SDK-native effort is still used where possible. Ultra is not in SDK
+    # 0.2.128 (nor in the current provider wire contract), so its reasoning
+    # half is `max`; the native Skill above supplies proactive delegation.
+    # `auto` omits the SDK option. Gateway's post-translation header rule remains
+    # final authority for every Codex wire-level effort.
+    if effort != "auto":
+        sdk_effort = "max" if effort == "ultra" else effort
+        if sdk_effort in _SDK_EFFORT_LEVELS:
+            opts_kwargs["effort"] = sdk_effort
     # can_use_tool resolves SDK permission prompts; it is not a universal tool
     # hook. In bypassPermissions the SDK approves tools before consulting the
     # callback, so wiring it there only creates a false AskUserQuestion promise
     # plus CanUseToolShadowedWarning noise. Interactive questions use the
     # dedicated muselab MCP tool in every mode.
     if permission != "bypassPermissions":
-        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
+        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
+            session_id,
+            plan_return_permission=(
+                plan_return_permission if permission == "plan" else None
+            ),
+        )
     # Third-party Anthropic-compatible endpoints may emit a `thinking` block
     # without the signature key that the SDK parser requires.  Use the narrow
     # compatibility client only for vendor routes; native Claude stays on the
@@ -2207,26 +2662,36 @@ def _has_enabled_external_mcp() -> bool:
 
 
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
-                     effort: str = "") -> ClaudeSDKClient:
-    """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
-    Switching model OR effort in the UI yields a fresh client; resume=session_id
-    loads the same on-disk conversation history into the new client.
+                     effort: str = "",
+                     service_tier: str = "",
+                     plan_return_permission: str = "") -> ClaudeSDKClient:
+    """Create or fetch a client for a session/model/effort/service-tier key.
+    Switching model, effort, or service tier yields a fresh client;
+    resume=session_id loads the same on-disk conversation history.
 
     Concurrency: _lock is only held across synchronous dict / LRU operations.
     The slow `await client.connect()` runs OUTSIDE _lock under a per-key
-    creation lock — concurrent callers for different (sid, model, effort)
+    creation lock — concurrent callers for different runtime keys
     keys never block each other; concurrent callers for the SAME key
     coalesce so we don't spawn two CLI subprocesses for one tab.
 
-    effort: "" (SDK adaptive) / "low" / "medium" / "high" / "xhigh" / "max".
-    Anything else is ignored — invalid values fall back to the SDK default."""
+    effort: "auto" / "low" / "medium" / "high" / "xhigh" / "max" / "ultra".
+    Empty string remains accepted as a legacy spelling of ``auto``."""
     if session_id in _pending_runtime_rebuilds:
         # Callers that operate a session hold its runtime lock. Consuming the
         # marker here closes the race where a new turn reserves the active slot
         # just before the previous turn's cleanup tries to rebuild.
         await disconnect_client(session_id)
 
-    key = (session_id, model, effort)
+    effort = _normalize_effort(effort)
+    service_tier = (service_tier or "").strip()
+    if effort not in _VALID_EFFORT:
+        raise ValueError(f"invalid effort: {effort}")
+    if service_tier not in _VALID_SERVICE_TIERS:
+        raise ValueError(f"invalid service tier: {service_tier}")
+    key = (session_id, model, effort, service_tier)
+    plan_return_permission = _normalize_plan_return_permission(
+        permission, plan_return_permission)
 
     # Fast path: cache hit. Lock just long enough to read + touch LRU.
     async with _lock:
@@ -2236,6 +2701,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 _client_lru.remove(key)
             _client_lru.append(key)
         cached_perm = _client_permission.get(key) if cached is not None else None
+        cached_plan_return = (
+            _client_plan_return.get(key, "") if cached is not None else "")
 
     if cached is not None:
         # Permission is part of the runtime's launch contract even though it
@@ -2243,10 +2710,14 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         # default mode may reject a later switch to bypassPermissions. Never
         # return a stale client after a failed control request: replace the
         # session runtime deterministically.
-        if cached_perm != permission:
+        if (cached_perm != permission
+                or (permission == "plan"
+                    and cached_plan_return != plan_return_permission)):
             await disconnect_client(session_id)
             return await get_client(
-                session_id, model, permission, effort=effort)
+                session_id, model, permission, effort=effort,
+                service_tier=service_tier,
+                plan_return_permission=plan_return_permission)
         return cached
 
     # Cache miss: build a new client OUTSIDE _lock. Per-key creation
@@ -2263,18 +2734,27 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 _client_lru.append(key)
             cached_perm = (
                 _client_permission.get(key) if cached is not None else None)
+            cached_plan_return = (
+                _client_plan_return.get(key, "") if cached is not None else "")
 
         # Two callers can race on the same storage key while requesting
         # different launch modes. The creation lock coalesces them, but the
         # waiter must still reject the runtime built with the other mode.
         if cached is not None:
-            if cached_perm == permission:
+            if (cached_perm == permission
+                    and (permission != "plan"
+                         or cached_plan_return == plan_return_permission)):
                 return cached
             await disconnect_client(session_id)
 
         # Slow path — no awaits hold _lock.
-        client = await _build_and_connect_client(
-            session_id, model, permission, effort)
+        if permission == "plan":
+            client = await _build_and_connect_client(
+                session_id, model, permission, effort, service_tier,
+                plan_return_permission=plan_return_permission)
+        else:
+            client = await _build_and_connect_client(
+                session_id, model, permission, effort, service_tier)
 
         # Wedge gate: freeze the tool-set before anyone can run a turn on this
         # client. Runs under the per-key creation lock (blocks only same-key
@@ -2298,6 +2778,10 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         async with _lock:
             _clients[key] = client
             _client_permission[key] = permission
+            if permission == "plan":
+                _client_plan_return[key] = plan_return_permission
+            else:
+                _client_plan_return.pop(key, None)
             # Start the sole reader for this client BEFORE anyone can consume
             # it. Turns and the background-task watcher both attach to this
             # pump instead of opening their own iterator over the same stream.
@@ -2326,6 +2810,7 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 old_key = _client_lru.pop(candidate_idx)
                 old_client = _clients.pop(old_key, None)
                 _client_permission.pop(old_key, None)
+                _client_plan_return.pop(old_key, None)
                 # Drop the per-key creation lock too — otherwise evicted
                 # keys leak Lock objects in _creation_locks forever
                 # (disconnect_client clears it, but LRU eviction didn't).
@@ -2511,6 +2996,7 @@ async def _evict_failed_session_stream(stream: _SessionStream) -> None:
         if _clients.get(key) is client:
             _clients.pop(key, None)
             _client_permission.pop(key, None)
+            _client_plan_return.pop(key, None)
             if key in _client_lru:
                 _client_lru.remove(key)
         if _session_streams.get(key) is stream:
@@ -2571,6 +3057,7 @@ async def disconnect_client(session_id: str) -> None:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
+            _client_plan_return.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -2616,6 +3103,7 @@ async def shutdown_runtime() -> None:
         clients = list({id(client): client for client in _clients.values()}.values())
         _clients.clear()
         _client_permission.clear()
+        _client_plan_return.clear()
         _creation_locks.clear()
         _client_lru.clear()
         _pending_runtime_rebuilds.clear()
@@ -2834,6 +3322,8 @@ def list_sessions_api(
     limit: int = Query(0, ge=0, le=2000),
     ids: str = Query(""),
     q: str = Query(""),
+    workspace_only: bool = Query(False),
+    workspace_root: Path = Depends(resolve_workspace_root),
 ):
     # P2 (perf): paginate. `list_sessions()` returns ALL sessions (sorted
     # pinned→updated_at desc); shipping every one was 147 KB / 391 rows on a
@@ -2846,6 +3336,16 @@ def list_sessions_api(
     # limit=0 (the default) preserves the old "return everything" behaviour for
     # any caller that doesn't opt in.
     full = sess.list_sessions()
+    # A workspace switch only needs that workspace's recent sessions.  Filter
+    # before applying q/limit/ids so an open-tab id owned by another workspace
+    # can never be pulled into this response.  Legacy rows without cwd belong
+    # to ROOT, matching sessions._build_sessions_list().
+    if workspace_only:
+        workspace_path = str(workspace_root)
+        full = [
+            s for s in full
+            if str(s.get("cwd") or ROOT) == workspace_path
+        ]
     total = len(full)
     q_norm = (q or "").strip().lower()
     if q_norm:
@@ -2924,6 +3424,8 @@ def list_sessions_api(
         limit,
         ids,
         q_norm,
+        workspace_only,
+        str(workspace_root) if workspace_only else "",
         frozenset(turn_active_sids),
         frozenset(background_active_sids),
     )
@@ -2932,13 +3434,25 @@ def list_sessions_api(
         etag = _hit[1]
     else:
         try:
-            _payload = json.dumps(body, sort_keys=True, default=str,
+            # Keep the historical default validator byte-for-byte stable, but
+            # salt filtered representations with their workspace.  Two empty
+            # workspaces otherwise have identical bodies and could incorrectly
+            # validate each other's header-driven representation.
+            _etag_payload: Any = body
+            if workspace_only:
+                _etag_payload = {
+                    "workspace": str(workspace_root),
+                    "body": body,
+                }
+            _payload = json.dumps(_etag_payload, sort_keys=True, default=str,
                                   ensure_ascii=False).encode("utf-8")
             etag = 'W/"' + hashlib.md5(_payload).hexdigest() + '"'
         except (TypeError, ValueError):
             etag = ""
         if etag:
             _LIST_ETAG_CACHE["v"] = (_etag_key, etag)
+    if workspace_only:
+        response.headers["Vary"] = "X-Muselab-Workspace"
     if etag:
         # If-None-Match may carry a list ("tag1", "tag2") or "*". Weak-compare by
         # stripping the W/ prefix from both sides and matching the opaque value.
@@ -2950,7 +3464,17 @@ def list_sessions_api(
             wanted = _bare(etag)
             if any(_bare(p) == wanted for p in inm.split(",")):
                 # 304 must echo the validator and carry no body.
-                return Response(status_code=304, headers={"ETag": etag})
+                return Response(
+                    status_code=304,
+                    headers={
+                        "ETag": etag,
+                        **(
+                            {"Vary": "X-Muselab-Workspace"}
+                            if workspace_only
+                            else {}
+                        ),
+                    },
+                )
         response.headers["ETag"] = etag
     return body
 
@@ -4605,6 +5129,9 @@ class QueueEnqueueReq(BaseModel):
     # the headless drain replays the turn under the same mode instead of
     # falling back to the server default (see _maybe_drain_queue).
     permission: str = ""
+    # Plan Mode additionally snapshots the mode ExitPlanMode should return to.
+    # Legacy/malformed values are normalized to fail-closed `default`.
+    plan_return_permission: str | None = None
 
 
 class QueuePauseReq(BaseModel):
@@ -4653,8 +5180,25 @@ def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
     # headless failure when the drain replays the item later.
     if (req.permission or "").strip():
         _validate_permission(req.permission)
-    res = sess.enqueue_message(sid, text, req.image_ids or "",
-                               permission=req.permission or "")
+    plan_return_permission = req.plan_return_permission
+    if req.permission == "plan" and plan_return_permission is None:
+        # Cached clients predating this field still preserve the current
+        # session's complete Plan contract. If they enqueue Plan while the
+        # session is non-Plan, capture that current mode just like a direct
+        # send entering Plan Mode would.
+        current = sess.get_session(sid) or {}
+        plan_return_permission = (
+            current.get("plan_return_permission")
+            if current.get("permission") == "plan"
+            else current.get("permission")
+        )
+    res = sess.enqueue_message(
+        sid,
+        text,
+        req.image_ids or "",
+        permission=req.permission or "",
+        plan_return_permission=plan_return_permission,
+    )
     if not res.get("ok"):
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
@@ -4761,10 +5305,12 @@ class SessionPatchReq(BaseModel):
     tag: str | None = None
     # Pin to top of the session picker. None = no change, True/False = set.
     pinned: bool | None = None
-    # Reasoning effort knob — "" / "low" / "medium" / "high" / "xhigh" / "max".
-    # Empty string clears the override (SDK picks adaptive). Changing effort
-    # invalidates cached clients so the next turn rebuilds with the new value.
+    # Reasoning effort knob. Empty string is accepted only as a legacy spelling
+    # of canonical `auto`; Ultra is transported to Codex Gateway by header.
     effort: str | None = None
+    # User-facing service class. Empty = standard; `fast` maps to Codex's
+    # priority tier inside Gateway. It is deliberately separate from effort.
+    service_tier: str | None = None
     # Extended-thinking on/off for this session. None = no change. False
     # disables thinking (escape hatch for the streaming-interleaving 400);
     # rebuilds the client so the next turn picks it up.
@@ -4773,6 +5319,59 @@ class SessionPatchReq(BaseModel):
 
 @router.patch("/sessions/{sid}", dependencies=[Depends(require_token)])
 async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
+    # Model, effort, and service tier form one runtime contract. Validate the
+    # complete *target* tuple before mutating any field in this request; this
+    # makes a rejected cross-model combination side-effect free.
+    current_meta = sess.get_session(sid)
+    runtime_controls_requested = any(
+        value is not None
+        for value in (req.model, req.effort, req.service_tier)
+    )
+    target_model = (
+        req.model if req.model is not None
+        else ((current_meta or {}).get("model") or "")
+    )
+    target_effort = (
+        _normalize_effort(req.effort)
+        if req.effort is not None
+        else _normalize_effort((current_meta or {}).get("effort"))
+    )
+    target_tier = (
+        (req.service_tier or "").strip()
+        if req.service_tier is not None
+        else ((current_meta or {}).get("service_tier") or "").strip()
+    )
+    runtime_controls_changed = False
+    model_changed = False
+    if runtime_controls_requested:
+        if current_meta is None:
+            raise HTTPException(404, "session not found")
+        if target_effort not in _VALID_EFFORT:
+            raise HTTPException(400, f"invalid effort: {req.effort}")
+        if target_tier not in _VALID_SERVICE_TIERS:
+            raise HTTPException(
+                400, f"invalid service tier: {req.service_tier}")
+        capability = await _detect_gateway_context_capability(target_model)
+        controls = _model_control_capability(target_model, capability)
+        if (target_effort != "auto"
+                and target_effort not in controls["effort_levels"]):
+            raise HTTPException(
+                400,
+                f"effort {target_effort} is not supported by {target_model}",
+            )
+        if target_tier == "fast" and not controls["supports_fast"]:
+            raise HTTPException(
+                400, f"fast service is not supported by {target_model}")
+        current_effort = _normalize_effort(current_meta.get("effort"))
+        current_tier = (current_meta.get("service_tier") or "").strip()
+        current_model = (current_meta.get("model") or "").strip()
+        model_changed = target_model != current_model
+        runtime_controls_changed = (
+            model_changed
+            or target_effort != current_effort
+            or target_tier != current_tier
+        )
+
     ok = False
     if req.name is not None:
         ok = sess.rename_session(sid, req.name) or ok
@@ -4803,25 +5402,48 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         ok = True
     if req.permission is not None:
         permission = _validate_permission(req.permission)
-        ok = sess.update_permission(sid, permission) or ok
-    if req.effort is not None:
-        # Validate against SDK literal set; empty string is a deliberate
-        # "clear override" signal so the user can revert to adaptive.
-        valid = {"", "low", "medium", "high", "xhigh", "max"}
-        if req.effort not in valid:
-            raise HTTPException(400, f"invalid effort: {req.effort}")
-        # No-op guard: effort is baked into ClaudeAgentOptions at construction,
-        # so a change requires a full client rebuild — which also drops the
-        # Anthropic prompt cache (one cache-miss turn). Skip all of that when
-        # the requested value already matches what's persisted, so a stray
-        # PATCH (e.g. FE re-emitting the current selection on session load)
-        # doesn't gratuitously cost a cache miss.
-        cur_effort = ((sess.get_session(sid) or {}).get("effort") or "")
-        if req.effort != cur_effort:
-            sess.update_effort(sid, req.effort)
-            # The next stream() call picks up the new value via get_session().
+        current_meta = sess.get_session(sid) or {}
+        current_permission = (current_meta.get("permission") or "").strip()
+        changed = current_permission != permission
+        updated = sess.update_permission(sid, permission)
+        ok = updated or ok
+        if updated and changed:
+            # Permission is a launch contract. A busy session defers the
+            # replacement to its turn boundary; an idle one is evicted now so
+            # the next send cannot reuse a process with stale capabilities.
             await _rebuild_session_runtime(sid)
-        ok = True
+    if runtime_controls_requested:
+        # A model swap may race a live CLI writing the same JSONL. Preserve the
+        # existing interrupt-before-rebuild safety, but only after the complete
+        # target tuple has passed validation.
+        if model_changed:
+            bc = _active_turns.get(sid)
+            if bc is not None and not bc.done:
+                async with _lock:
+                    live_clients = [
+                        c for k, c in _clients.items() if k[0] == sid
+                    ]
+                for c in live_clients:
+                    try:
+                        await c.interrupt()
+                    except Exception as _e:
+                        sys.stderr.write(
+                            f"[chat] interrupt before model swap failed for "
+                            f"{sid}: {type(_e).__name__}: {_e}\n")
+        if runtime_controls_changed:
+            updated = sess.update_runtime_controls(
+                sid,
+                model=target_model,
+                effort=target_effort,
+                service_tier=target_tier,
+            )
+            ok = updated or ok
+            if updated:
+                # All three values are baked into launch/request plumbing; one
+                # atomic index write and one runtime rebuild is sufficient.
+                await _rebuild_session_runtime(sid)
+        else:
+            ok = True
     if req.thinking is not None:
         # No-op guard, same rationale as effort: toggling thinking forces a
         # client rebuild (thinking config is fixed at construction). Skip when
@@ -4830,44 +5452,6 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         if bool(req.thinking) != cur_thinking:
             sess.update_thinking(sid, bool(req.thinking))
             await _rebuild_session_runtime(sid)
-        ok = True
-    if req.model is not None and req.model == ((sess.get_session(sid) or {}).get("model") or ""):
-        # No-op: re-selecting the current model would otherwise interrupt a
-        # live turn + rebuild the client (cache miss) for nothing. Report
-        # success without doing the work (a model-only PATCH must still 200).
-        ok = True
-    elif req.model is not None:
-        # Model switch is allowed any time — including mid-session. The next
-        # turn will use the new model (frontend captures `streamingModel`
-        # per-request so old bubbles keep their original model badge).
-        # Caveats (frontend warns about cross-vendor):
-        #   - cross-vendor switches can hit thinking-signature errors on the
-        #     next reply if the prior turn had thinking blocks
-        #   - prompt cache resets when model changes (first turn slower)
-        # If a turn is still streaming for this session, interrupt it
-        # first. Otherwise the old CLI subprocess is still actively
-        # writing to the session JSONL and disconnect_client below would
-        # race with that — leading to "Session ID already in use" on the
-        # next stream's CLI spawn (eg. GLM → MiniMax mid-reply).
-        bc = _active_turns.get(sid)
-        if bc is not None and not bc.done:
-            async with _lock:
-                live_clients = [c for k, c in _clients.items() if k[0] == sid]
-            for c in live_clients:
-                try:
-                    await c.interrupt()
-                except Exception as _e:
-                    sys.stderr.write(
-                        f"[chat] interrupt before model swap failed for "
-                        f"{sid}: {type(_e).__name__}: {_e}\n")
-        sess.update_model(sid, req.model)
-        # Model identity participates in several launch-time settings beyond
-        # the top-level --model flag: provider URL/auth, subagent aliases,
-        # context-window override, thinking support, and output limits. The
-        # SDK's set_model() control request updates only the top-level model,
-        # so even a same-provider swap must rebuild the runtime to keep those
-        # values coherent.
-        await _rebuild_session_runtime(sid)
         ok = True
     if not ok:
         raise HTTPException(404, "session not found or no changes")
@@ -5069,7 +5653,7 @@ async def usage() -> dict:
     cache_pct = round(cr / (cr + in_t) * 100, 1) if (cr + in_t) > 0 else 0
     # Snapshot under _lock — iterating _clients.keys() unlocked can RuntimeError
     # if another coroutine resizes the dict mid-iteration. Also expose only the
-    # session_id (k[0]), not the raw (sid, model, effort) tuple, to avoid
+    # session_id (k[0]), not the raw runtime key, to avoid
     # leaking internal pool structure in the response.
     async with _lock:
         active_session_ids = sorted({k[0] for k in _clients})
@@ -5974,14 +6558,24 @@ async def _native_compact_session_locked(sid: str) -> dict:
     if meta is None:
         raise HTTPException(404, "session not found")
     model = (meta.get("model") or "").strip() or MODEL
-    effort = (meta.get("effort") or "").strip()
+    effort = _normalize_effort(meta.get("effort"))
+    service_tier = (meta.get("service_tier") or "").strip()
     # /compact is a CLI control command, not an agent tool call. Preserve the
-    # current runtime permission instead of escalating to bypassPermissions;
-    # a cold compact uses fail-closed default. This avoids a launch-sensitive
-    # permission transition for an operation that does not need one.
-    prior_perm = _client_permission.get((sid, model, effort))
-    client = await get_client(
-        sid, model, prior_perm or "default", effort=effort)
+    # warm runtime contract, or use the durable session contract on a cold
+    # start. In particular, Plan's return capability is part of that contract.
+    runtime_key = (sid, model, effort, service_tier)
+    prior_perm = _client_permission.get(runtime_key)
+    permission = prior_perm or (meta.get("permission") or "default")
+    client_kwargs: dict[str, Any] = {
+        "effort": effort, "service_tier": service_tier,
+    }
+    if permission == "plan":
+        client_kwargs["plan_return_permission"] = (
+            _client_plan_return.get(runtime_key)
+            or meta.get("plan_return_permission")
+            or "default"
+        )
+    client = await get_client(sid, model, permission, **client_kwargs)
     before_total = 0
     post_compact_usage: dict | None = None
     try:
@@ -6152,10 +6746,12 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         name=new_name,
         model=src_meta.get("model") or MODEL,
         permission=src_meta.get("permission") or "",
+        plan_return_permission=src_meta.get("plan_return_permission"),
         auto_named=False,
         message_count=forked_count,
         turn_count=forked_turns,
-        effort=src_meta.get("effort") or "",
+        effort=_normalize_effort(src_meta.get("effort")),
+        service_tier=src_meta.get("service_tier") or "",
         thinking=src_meta.get("thinking") is not False,
         forked_from=sid,
         forked_from_name=source_name,
@@ -6671,6 +7267,7 @@ async def reset(session_id: str | None = None) -> dict:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
+            _client_plan_return.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -6679,7 +7276,7 @@ async def reset(session_id: str | None = None) -> dict:
                     await c.disconnect()
                 except Exception:
                     pass
-    # key is a 3-tuple (session_id, model, effort) — unpack the first two.
+    # Runtime key begins with (session_id, model); keep only those public bits.
     return {"ok": True, "reset": [f"{k[0]}@{k[1]}" for k in keys]}
 
 
@@ -8893,6 +9490,7 @@ async def _start_turn(
     *,
     model: str = "",
     permission: str = "bypassPermissions",
+    plan_return_permission: str = "",
     image_ids: str = "",
     persist_permission: bool = True,
 ) -> "TurnBroadcast":
@@ -8917,13 +9515,13 @@ async def _start_turn(
     #
     # GRANULARITY NOTE (audit E/249): the busy mutex here is keyed by
     # `session_id` ALONE, while the SDK client pool is keyed by the wider
-    # `(sid, model, effort)` 3-tuple. So two turns on the same sid but
+    # `(sid, model, effort, service-tier)` tuple. So two turns on the same sid but
     # different effort would resolve to two *different* cached clients yet
     # collide on this single `_active_turns[sid]` slot — the second is
     # rejected as "previous turn still running." That is intentionally
     # SAFE today (it errs toward refusing a legitimate concurrent turn,
     # never toward two clients racing). But it is also why we must NOT
-    # relax this check to per-(sid,model,effort): two clients pumping the
+    # relax this check to a runtime key: two clients pumping the
     # same session would both append to the same on-disk JSONL and corrupt
     # it. Keep the mutex coarse (per-sid) until JSONL writes are serialized.
     #
@@ -9012,10 +9610,21 @@ async def _start_turn(
     # snapshot without rolling the session's newer selection back afterward.
     if persist_permission:
         sess.update_permission(session_id, permission)
+        # update_permission captures the previous non-plan mode atomically when
+        # entering Plan Mode. Re-read so this very first plan turn launches with
+        # the correct ExitPlanMode return capability.
+        s = sess.get_session(session_id) or s
+        plan_return_to_use = _normalize_plan_return_permission(
+            permission, s.get("plan_return_permission"))
+    else:
+        plan_return_to_use = _normalize_plan_return_permission(
+            permission, plan_return_permission)
 
-    # Effort is per-session; read from metadata (settable via PATCH). Empty
-    # string = SDK adaptive default, which is what the existing behavior was.
-    effort_to_use = (s.get("effort") or "").strip()
+    # Reasoning effort and Fast service are per-session launch controls.
+    # Legacy empty effort is normalized to canonical `auto` before it reaches
+    # either the client-pool key or Gateway custom header.
+    effort_to_use = _normalize_effort(s.get("effort"))
+    service_tier_to_use = (s.get("service_tier") or "").strip()
     # "Running" means the backend accepted and exclusively reserved the turn,
     # not that a cold CLI/MCP client has already finished starting. Publishing
     # here removes the user-visible startup gap while the terminal cleanup
@@ -9034,10 +9643,16 @@ async def _start_turn(
         # The active-turn reservation above is visible before we wait here, so
         # those paths can fail cleanly instead of mutating this runtime.
         async with _session_runtime_lock_for(session_id):
+            client_kwargs: dict[str, Any] = {
+                "effort": effort_to_use,
+                "service_tier": service_tier_to_use,
+            }
+            if permission == "plan":
+                client_kwargs["plan_return_permission"] = plan_return_to_use
             startup_task = asyncio.create_task(
                 get_client(
                     session_id, model_to_use, permission,
-                    effort=effort_to_use))
+                    **client_kwargs))
             broadcast.startup_task = startup_task
             try:
                 client = await asyncio.wait_for(startup_task, timeout=60.0)
@@ -9652,9 +10267,43 @@ async def _start_turn(
             try:
                 while True:
                     evt = await src_q.get()
-                    await merge_q.put(("side", evt))
+                    try:
+                        await merge_q.put(("side", evt))
+                    finally:
+                        src_q.task_done()
             except asyncio.CancelledError:
                 pass
+
+        async def _prepare_side_event(payload):
+            if isinstance(payload, dict) and payload.get("event") in {
+                "ask_user_question", "permission_request"
+            }:
+                try:
+                    from .activity import activity as _activity
+                    await asyncio.to_thread(
+                        _activity.set_state, session_id,
+                        "waiting_approval", detail="Waiting for user input")
+                except Exception as e:
+                    sys.stderr.write(
+                        f"[activity] waiting state failed sid={session_id}: {e}\n")
+            return payload
+
+        async def _flush_side_channels():
+            """Move hook/approval events ahead of the terminal SSE boundary.
+
+            ExitPlanMode hooks enqueue their mode event before the SDK emits
+            ResultMessage, but the independent side pump may not have run yet.
+            Queue.join() provides a real hand-off barrier; a scheduler race can
+            no longer let `done` overtake permission resolution.
+            """
+            await asyncio.gather(side_q.join(), perm_q.join())
+            while True:
+                try:
+                    queued_kind, queued_payload = merge_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if queued_kind == "side":
+                    yield await _prepare_side_event(queued_payload)
 
         # ====== message-type-specific handlers ======
         # Three nested async generators, one per SDK message type. They share
@@ -10458,21 +11107,12 @@ async def _start_turn(
             while True:
                 kind, payload = await merge_q.get()
                 if kind == "side":
-                    if isinstance(payload, dict) and payload.get("event") in {
-                        "ask_user_question", "permission_request"
-                    }:
-                        try:
-                            from .activity import activity as _activity
-                            await asyncio.to_thread(
-                                _activity.set_state, session_id,
-                                "waiting_approval", detail="Waiting for user input")
-                        except Exception as e:
-                            sys.stderr.write(
-                                f"[activity] waiting state failed sid={session_id}: {e}\n")
                     # Already shaped as {"event": "...", "data": "..."} — pass through.
-                    yield payload
+                    yield await _prepare_side_event(payload)
                     continue
                 if kind == "error":
+                    async for side_event in _flush_side_channels():
+                        yield side_event
                     # If the user interrupted this turn and the force-stop
                     # watchdog tore the CLI down, receive_response() raises a
                     # transport error that lands here. That's an expected
@@ -10485,6 +11125,8 @@ async def _start_turn(
                         yield _error_event(payload)
                     break
                 if kind == "done":
+                    async for side_event in _flush_side_channels():
+                        yield side_event
                     break
                 # kind == "claude" — dispatch by SDK message type to the
                 # per-type helper async generators defined above. Each
@@ -10553,7 +11195,10 @@ async def _start_turn(
             perm_task.cancel()
             claude_task.cancel()
             unregister_session_queue(session_id)
-            perm.unregister_session_queue(session_id)
+            if perm.unregister_session_queue(session_id):
+                # Approval returned updatedPermissions but no terminal tool hook
+                # arrived. The CLI's live mode is ambiguous; never reuse it.
+                _pending_runtime_rebuilds.add(session_id)
 
     # Background-completion + reconnect-streaming design:
     #
@@ -10805,6 +11450,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
             session_id,
             item.get("text", ""),
             permission=perm,
+            plan_return_permission=item.get("plan_return_permission", ""),
             image_ids=item.get("image_ids", ""),
             persist_permission=False,
         )
@@ -11003,6 +11649,8 @@ async def submit_answer_api(session_id: str, question_id: str, req: AnswerReq) -
 class PermissionDecisionReq(BaseModel):
     decision: str           # "allow" | "deny" | "always"
     message: str | None = None
+    # ExitPlanMode only: one of the SDK-provided setMode suggestions.
+    mode: str | None = None
 
 
 @router.post("/permission/{session_id}/{request_id}",
@@ -11011,7 +11659,9 @@ async def submit_permission_decision_api(
     session_id: str, request_id: str, req: PermissionDecisionReq
 ) -> dict:
     """Frontend POSTs Allow / Deny / Always-allow click here."""
-    if not perm.submit_decision(session_id, request_id, req.decision, req.message):
+    if not perm.submit_decision(
+        session_id, request_id, req.decision, req.message, mode=req.mode,
+    ):
         raise HTTPException(404, "no pending permission request with that id "
                                   "(may have timed out or been answered already)")
     return {"ok": True}
@@ -11020,17 +11670,35 @@ async def submit_permission_decision_api(
 
 
 @router.get("/providers", dependencies=[Depends(require_token)])
-def providers_list() -> dict:
+async def providers_list() -> dict:
     """Available model groups based on which provider API keys are configured."""
     groups = endpoints.available_groups()
+    codex_capabilities = await _detect_gateway_context_capabilities(
+        i["model"]
+        for group in groups
+        for i in group["items"]
+        if _is_codex_gateway_model(i["model"])
+    )
     # Flatten to the {group, label, model} shape the frontend expects.
     # supports_thinking / supports_effort are provider-level (see
     # available_groups) — the FE uses them to show/hide per-session controls so
     # models on vendors that reject or ignore the knobs don't get no-op switches.
-    flat = [{"group": g["group"], "label": i["label"], "model": i["model"],
-             "supports_thinking": g.get("supports_thinking", True),
-             "supports_effort": g.get("supports_effort", False)}
-            for g in groups for i in g["items"]]
+    flat: list[dict[str, Any]] = []
+    for g in groups:
+        for i in g["items"]:
+            model = i["model"]
+            capability = codex_capabilities.get(model)
+            controls = _model_control_capability(model, capability)
+            flat.append({
+                "group": g["group"],
+                "label": i["label"],
+                "model": model,
+                "supports_thinking": g.get("supports_thinking", True),
+                "supports_effort": g.get("supports_effort", False),
+                "effort_levels": controls["effort_levels"],
+                "service_tiers": controls["service_tiers"],
+                "supports_fast": controls["supports_fast"],
+            })
     # default_model: the configured "new-session default" (MUSELAB_MODEL),
     # already narrowed to a reachable model by _resolve_default_model. The
     # frontend seeds each new chat from this instead of the currently-viewed

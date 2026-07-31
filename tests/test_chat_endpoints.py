@@ -1,7 +1,7 @@
 """Endpoint tests for chat control routes: reset / interrupt / probe.
 
 These hit the FastAPI routes through TestClient with the pool pre-seeded
-with fake clients, so the route logic (3-tuple key handling, disconnect
+with fake clients, so the route logic (4-tuple key handling, disconnect
 fan-out, response shape) runs for real without spawning a CLI.
 """
 import asyncio
@@ -66,24 +66,24 @@ def _seed(chat_mod, key, client=None):
 
 def test_reset_single_session(chat_mod, client):
     """reset?session_id=X disconnects that session and returns [X]."""
-    c = _seed(chat_mod, ("sid-A", "claude-sonnet-4-6", ""))
+    c = _seed(chat_mod, ("sid-A", "claude-sonnet-4-6", "auto", ""))
     r = client.post(f"/api/chat/reset?session_id=sid-A&token={TEST_TOKEN}")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
     assert body["reset"] == ["sid-A"]
     assert c.disconnected is True
-    assert ("sid-A", "claude-sonnet-4-6", "") not in chat_mod._clients
+    assert ("sid-A", "claude-sonnet-4-6", "auto", "") not in chat_mod._clients
 
 
-def test_reset_all_with_multiple_three_tuple_keys(chat_mod, client):
+def test_reset_all_with_multiple_runtime_keys(chat_mod, client):
     """L183 regression: reset() with NO session_id iterates every pooled
-    client. The cache keys are 3-tuples (sid, model, effort); the response
+    client. The cache keys are 4-tuples (sid, model, effort, service tier); the response
     builder must index key[0]/key[1] (NOT unpack into 2 vars) or it raises
     'too many values to unpack'. Must return ['sid@model', ...]."""
-    c1 = _seed(chat_mod, ("sidX", "claude-sonnet-4-6", ""))
-    c2 = _seed(chat_mod, ("sidY", "claude-haiku-4-5", "high"))
-    c3 = _seed(chat_mod, ("sidX", "deepseek-v4-pro", ""))
+    c1 = _seed(chat_mod, ("sidX", "claude-sonnet-4-6", "auto", ""))
+    c2 = _seed(chat_mod, ("sidY", "claude-haiku-4-5", "high", ""))
+    c3 = _seed(chat_mod, ("sidX", "deepseek-v4-pro", "auto", ""))
 
     r = client.post(f"/api/chat/reset?token={TEST_TOKEN}")
     assert r.status_code == 200, r.text   # would be 500 if unpack regressed
@@ -108,9 +108,84 @@ def test_reset_all_empty_pool(chat_mod, client):
     assert r.json() == {"ok": True, "reset": []}
 
 
+def test_session_effort_and_fast_patch_persist_and_rebuild(
+    chat_mod, client, monkeypatch,
+):
+    created = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "controls"},
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["effort"] == "auto"
+    assert body["service_tier"] == ""
+    sid = body["id"]
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+
+    async def capability(_model):
+        return {
+            "supported_reasoning_levels": [
+                "low", "medium", "high", "xhigh", "max", "ultra",
+            ],
+            "service_tiers": ["priority"],
+        }
+
+    rebuilt = []
+
+    async def rebuild(_sid):
+        rebuilt.append(_sid)
+
+    monkeypatch.setattr(chat_mod, "_detect_gateway_context_capability", capability)
+    monkeypatch.setattr(chat_mod, "_rebuild_session_runtime", rebuild)
+    headers = {"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"}
+
+    before = dict(chat_mod.sess.get_session(sid))
+    invalid_combo = client.patch(
+        f"/api/chat/sessions/{sid}", headers=headers,
+        json={
+            "model": "claude-sonnet-4-6",
+            "effort": "ultra",
+            "service_tier": "fast",
+        },
+    )
+    assert invalid_combo.status_code == 400
+    unchanged = chat_mod.sess.get_session(sid)
+    assert unchanged["model"] == before["model"]
+    assert unchanged["effort"] == before["effort"]
+    assert unchanged["service_tier"] == before["service_tier"]
+    assert rebuilt == []
+
+    combined = client.patch(
+        f"/api/chat/sessions/{sid}", headers=headers,
+        json={
+            "model": "codex:gpt-5.6-sol",
+            "effort": "ultra",
+            "service_tier": "fast",
+        },
+    )
+    assert combined.status_code == 200, combined.text
+    meta = chat_mod.sess.get_session(sid)
+    assert meta["effort"] == "ultra"
+    assert meta["service_tier"] == "fast"
+    assert rebuilt == [sid]
+
+    # Canonical `auto` accepts the old empty spelling and still rebuilds once.
+    auto = client.patch(
+        f"/api/chat/sessions/{sid}", headers=headers, json={"effort": ""})
+    assert auto.status_code == 200, auto.text
+    assert chat_mod.sess.get_session(sid)["effort"] == "auto"
+    assert rebuilt == [sid, sid]
+
+    invalid = client.patch(
+        f"/api/chat/sessions/{sid}", headers=headers,
+        json={"service_tier": "turbo"})
+    assert invalid.status_code == 400
+
+
 def test_same_provider_model_switch_rebuilds_client(chat_mod, client):
     sid = _make_compact_session(client)
-    key = (sid, "claude-sonnet-4-6", "")
+    key = (sid, "claude-sonnet-4-6", "auto", "")
     fake = _seed(chat_mod, key)
 
     r = client.patch(
@@ -125,10 +200,30 @@ def test_same_provider_model_switch_rebuilds_client(chat_mod, client):
     assert chat_mod.sess.get_session(sid)["model"] == "claude-haiku-4-5"
 
 
+def test_permission_patch_enters_plan_and_rebuilds_client(chat_mod, client):
+    sid = _make_compact_session(client)
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    fake = _seed(chat_mod, key)
+
+    before = chat_mod.sess.get_session(sid)
+    response = client.patch(
+        f"/api/chat/sessions/{sid}",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={"permission": "plan"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert fake.disconnected is True
+    assert key not in chat_mod._clients
+    current = chat_mod.sess.get_session(sid)
+    assert current["permission"] == "plan"
+    assert current["plan_return_permission"] == before["permission"]
+
+
 @pytest.mark.asyncio
 async def test_runtime_rebuild_defers_while_turn_is_reserved(chat_mod):
     sid = "sid-deferred-rebuild"
-    key = (sid, "claude-sonnet-4-6", "")
+    key = (sid, "claude-sonnet-4-6", "auto", "")
     fake = _seed(chat_mod, key)
     active = chat_mod.TurnBroadcast(sid)
     chat_mod._active_turns[sid] = active
@@ -150,7 +245,7 @@ async def test_runtime_rebuild_defers_while_turn_is_reserved(chat_mod):
 async def test_runtime_rebuild_defers_while_background_watcher_owns_client(
         chat_mod):
     sid = "sid-watcher-rebuild"
-    key = (sid, "claude-sonnet-4-6", "")
+    key = (sid, "claude-sonnet-4-6", "auto", "")
     fake = _seed(chat_mod, key)
     watcher = asyncio.create_task(asyncio.sleep(60))
     chat_mod._task_watchers[sid] = watcher
@@ -203,7 +298,7 @@ def test_interrupt_no_live_client(chat_mod, client):
 def test_interrupt_calls_sdk_and_marks_pending(chat_mod, client):
     """interrupt must call client.interrupt(), record 'sid@model', and set
     the pending-interrupt flag (used to suppress the turn-done push)."""
-    c = _seed(chat_mod, ("sid-int", "claude-sonnet-4-6", ""))
+    c = _seed(chat_mod, ("sid-int", "claude-sonnet-4-6", "auto", ""))
     r = client.post(f"/api/chat/interrupt?session_id=sid-int&token={TEST_TOKEN}")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -219,7 +314,7 @@ def test_interrupt_swallows_sdk_error_but_still_marks_pending(chat_mod, client):
     is set BEFORE the SDK call, so it stays set (better early than late)."""
     c = _FakeSDKClient()
     c._raise_on_interrupt = True
-    _seed(chat_mod, ("sid-boom", "claude-sonnet-4-6", ""), client=c)
+    _seed(chat_mod, ("sid-boom", "claude-sonnet-4-6", "auto", ""), client=c)
     r = client.post(f"/api/chat/interrupt?session_id=sid-boom&token={TEST_TOKEN}")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -237,7 +332,7 @@ def test_interrupt_does_not_inherit_sdk_60_second_ack_timeout(
         async def interrupt(self):
             await asyncio.Event().wait()
 
-    _seed(chat_mod, (sid, "claude-sonnet-4-6", ""), client=SlowClient())
+    _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""), client=SlowClient())
     monkeypatch.setattr(chat_mod, "_INTERRUPT_ACK_TIMEOUT_S", 0.01)
 
     response = client.post(
@@ -318,7 +413,7 @@ def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
     from backend import sessions as sess
 
     sid = "sid-queued-stop"
-    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", ""))
+    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
     sess.enqueue_message(sid, "do not auto-run")
     observed = []
 
@@ -375,7 +470,7 @@ async def test_force_stop_tears_down_stuck_turn(chat_mod):
     subsequent send with 'previous turn still running'. The force-stop watchdog
     must, after the grace window, kill the client and free the slot itself."""
     sid = "sid-stuck"
-    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", ""))
+    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
     bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
     chat_mod._active_turns[sid] = bc
     try:
@@ -396,7 +491,7 @@ async def test_force_stop_noop_when_turn_drained_naturally(chat_mod):
     watchdog must not tear down the (now warm) client — that would needlessly
     drop the CLI subprocess on every successful interrupt."""
     sid = "sid-drained"
-    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", ""))
+    c = _seed(chat_mod, (sid, "claude-sonnet-4-6", "auto", ""))
     bc = chat_mod.TurnBroadcast(session_id=sid, model="claude-sonnet-4-6")
     bc.finish()   # turn ended naturally before grace elapsed
     # _active_turns no longer holds it (the pump's finally popped it).
@@ -517,7 +612,7 @@ def test_native_compact_rejects_in_band_context_error(chat_mod, client, monkeypa
         return fake
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
-    key = (sid, "claude-sonnet-4-6", "")
+    key = (sid, "claude-sonnet-4-6", "auto", "")
     chat_mod._client_permission[key] = "default"
 
     r = client.post(
@@ -593,12 +688,14 @@ def test_fork_inherits_session_settings_and_records_lineage(
         json={
             "name": "source chat",
             "model": "claude-sonnet-4-6",
-            "permission": "plan",
+            "permission": "bypassPermissions",
         },
     )
     assert source.status_code == 200, source.text
     sid = source.json()["id"]
+    chat_mod.sess.update_permission(sid, "plan")
     chat_mod.sess.update_effort(sid, "high")
+    chat_mod.sess.update_service_tier(sid, "fast")
     chat_mod.sess.update_thinking(sid, False)
     chat_mod.sess.bump_session(sid, message_count=12, turn_count=3)
     new_sid = "11111111-2222-4333-8444-555555555555"
@@ -620,7 +717,9 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["session_id"] == new_sid
     assert body["name"] == "source chat · 分支"
     assert body["permission"] == "plan"
+    assert body["plan_return_permission"] == "bypassPermissions"
     assert body["effort"] == "high"
+    assert body["service_tier"] == "fast"
     assert body["thinking"] is False
     # A point-in-time fork starts with unknown presentation counts. The
     # existing session-read self-heal fills the exact values on first open

@@ -64,6 +64,11 @@ def _entry(path: str, is_dir: bool, stat: os.stat_result) -> dict[str, Any]:
     }
 
 
+def _parent_path(path: str) -> str:
+    """Return the normalized logical parent used by the SQLite covering index."""
+    return path.rpartition("/")[0]
+
+
 def is_ignored_descendant(path: str | Path) -> bool:
     """Return whether a path sits below an intentionally opaque subtree."""
     return any(
@@ -133,6 +138,10 @@ class WorkspaceStore:
                 return
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as db:
+                # WAL is persistent for the database. Setting it once here
+                # avoids taking the journal-mode lock on every short-lived
+                # read connection used by bootstrap/delta hot paths.
+                db.execute("PRAGMA journal_mode = WAL")
                 db.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS workspaces (
@@ -147,6 +156,7 @@ class WorkspaceStore:
                     CREATE TABLE IF NOT EXISTS files (
                         workspace_id TEXT NOT NULL,
                         path TEXT NOT NULL,
+                        parent TEXT NOT NULL DEFAULT '',
                         name TEXT NOT NULL,
                         is_dir INTEGER NOT NULL,
                         size INTEGER NOT NULL,
@@ -191,6 +201,28 @@ class WorkspaceStore:
                         "ALTER TABLE files "
                         "ADD COLUMN inode INTEGER NOT NULL DEFAULT 0"
                     )
+                if "parent" not in columns:
+                    db.execute(
+                        "ALTER TABLE files "
+                        "ADD COLUMN parent TEXT NOT NULL DEFAULT ''"
+                    )
+                    # `name` is already the path basename, so this backfill is
+                    # deterministic and stays inside one SQLite transaction.
+                    db.execute(
+                        """
+                        UPDATE files
+                        SET parent = CASE
+                            WHEN instr(path, '/') = 0 THEN ''
+                            ELSE substr(path, 1, length(path) - length(name) - 1)
+                        END
+                        """
+                    )
+                db.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS files_workspace_parent_path
+                    ON files(workspace_id, parent, path)
+                    """
+                )
             self._secure_database_files()
             self._ready = True
 
@@ -203,7 +235,31 @@ class WorkspaceStore:
         primary: bool = False,
     ) -> None:
         self.initialize()
-        with self._lock, self._connect() as db:
+        resolved_root = str(root.resolve())
+        primary_value = int(primary)
+        with self._workspace_lock(workspace_id), self._connect() as db:
+            # A remove/re-add can allocate a fresh generation for the same
+            # path.  If the previous process exited after updating the
+            # registry but before deleting its SQLite row, recover here
+            # instead of failing the new registration on UNIQUE(path).
+            db.execute(
+                "DELETE FROM workspaces WHERE path = ? AND id <> ?",
+                (resolved_root, workspace_id),
+            )
+            current = db.execute(
+                """
+                SELECT path, name, primary_workspace
+                FROM workspaces WHERE id = ?
+                """,
+                (workspace_id,),
+            ).fetchone()
+            if (
+                current is not None
+                and current["path"] == resolved_root
+                and current["name"] == name
+                and int(current["primary_workspace"]) == primary_value
+            ):
+                return
             db.execute(
                 """
                 INSERT INTO workspaces(id, path, name, primary_workspace)
@@ -213,13 +269,13 @@ class WorkspaceStore:
                     name=excluded.name,
                     primary_workspace=excluded.primary_workspace
                 """,
-                (workspace_id, str(root.resolve()), name, int(primary)),
+                (workspace_id, resolved_root, name, primary_value),
             )
 
     def remove_workspace(self, workspace_id: str) -> None:
         self.initialize()
         with self._workspace_lock(workspace_id):
-            with self._lock, self._connect() as db:
+            with self._connect() as db:
                 db.execute(
                     "DELETE FROM workspaces WHERE id = ?",
                     (workspace_id,),
@@ -228,7 +284,7 @@ class WorkspaceStore:
     def state(self, workspace_id: str) -> dict[str, Any]:
         """Return lightweight initialization and cursor state."""
         self.initialize()
-        with self._lock, self._connect() as db:
+        with self._connect() as db:
             row = db.execute(
                 """
                 SELECT initialized, current_seq
@@ -260,7 +316,7 @@ class WorkspaceStore:
         """
         self.initialize()
         root = root.resolve()
-        with self._lock, self._connect() as db:
+        with self._connect() as db:
             known = db.execute(
                 """
                 SELECT path
@@ -313,7 +369,7 @@ class WorkspaceStore:
                 name,
                 primary=primary,
             )
-            with self._lock, self._connect() as db:
+            with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 state = db.execute(
                     """
@@ -443,7 +499,7 @@ class WorkspaceStore:
 
         with self._workspace_lock(workspace_id):
             self.initialize()
-            with self._lock, self._connect() as db:
+            with self._connect() as db:
                 existing_at_start = {
                     path: db.execute(
                         """
@@ -518,7 +574,7 @@ class WorkspaceStore:
                     current_paths.add(child_path)
                 scanned_subtrees[path] = current_paths
 
-            with self._lock, self._connect() as db:
+            with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 state = db.execute(
                     """
@@ -711,30 +767,59 @@ class WorkspaceStore:
         workspace_id: str,
         *,
         show_hidden: bool = True,
+        parents: Iterable[str] | None = None,
     ) -> dict[str, Any]:
+        """Return a cursor-consistent file snapshot.
+
+        ``parents is None`` preserves the legacy full-tree response. Passing a
+        collection returns only root children and direct children of the
+        expanded parents, which keeps refresh and cold workspace switches
+        bounded even for very large indexes.
+        """
         self.initialize()
-        with self._lock, self._connect() as db:
-            workspace = db.execute(
-                """
-                SELECT id, path, name, primary_workspace, current_seq
-                FROM workspaces WHERE id = ?
-                """,
-                (workspace_id,),
-            ).fetchone()
-            if workspace is None:
-                raise KeyError(f"unknown workspace: {workspace_id}")
-            entries = [
-                {
-                    key: value
-                    for key, value in row.items()
-                    if key not in {"ctime_ns", "inode"}
-                }
-                for row in self._file_rows(
-                    db,
-                    workspace_id,
-                    show_hidden=show_hidden,
+        normalized_parents = (
+            None
+            if parents is None
+            else self._expanded_parent_paths(parents)
+        )
+        with self._connect() as db:
+            db.execute("BEGIN")
+            try:
+                workspace = db.execute(
+                    """
+                    SELECT id, path, name, primary_workspace, current_seq
+                    FROM workspaces WHERE id = ?
+                    """,
+                    (workspace_id,),
+                ).fetchone()
+                if workspace is None:
+                    raise KeyError(f"unknown workspace: {workspace_id}")
+                rows = (
+                    self._file_rows(
+                        db,
+                        workspace_id,
+                        show_hidden=show_hidden,
+                    )
+                    if normalized_parents is None
+                    else self._file_rows_for_parents(
+                        db,
+                        workspace_id,
+                        normalized_parents,
+                        show_hidden=show_hidden,
+                    )
                 )
-            ]
+                entries = [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"ctime_ns", "inode"}
+                    }
+                    for row in rows
+                ]
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
         return {
             "workspace_id": workspace["id"],
             "root": workspace["path"],
@@ -742,6 +827,14 @@ class WorkspaceStore:
             "primary": bool(workspace["primary_workspace"]),
             "cursor": workspace["current_seq"],
             "entries": entries,
+            **(
+                {
+                    "partial": True,
+                    "parents": normalized_parents,
+                }
+                if normalized_parents is not None
+                else {}
+            ),
         }
 
     def delta(
@@ -754,49 +847,56 @@ class WorkspaceStore:
         self.initialize()
         cursor = max(0, int(cursor))
         limit = max(1, min(int(limit), 5000))
-        with self._lock, self._connect() as db:
-            state = db.execute(
-                """
-                SELECT current_seq
-                FROM workspaces WHERE id = ?
-                """,
-                (workspace_id,),
-            ).fetchone()
-            if state is None:
-                raise KeyError(f"unknown workspace: {workspace_id}")
-            current = int(state["current_seq"])
-            oldest = db.execute(
-                """
-                SELECT MIN(seq)
-                FROM events WHERE workspace_id = ?
-                """,
-                (workspace_id,),
-            ).fetchone()[0]
-            if (
-                cursor > current
-                or (oldest is None and cursor < current)
-                or (
-                    oldest is not None
-                    and cursor < int(oldest) - 1
+        with self._connect() as db:
+            db.execute("BEGIN")
+            try:
+                state = db.execute(
+                    """
+                    SELECT current_seq
+                    FROM workspaces WHERE id = ?
+                    """,
+                    (workspace_id,),
+                ).fetchone()
+                if state is None:
+                    raise KeyError(f"unknown workspace: {workspace_id}")
+                current = int(state["current_seq"])
+                oldest = db.execute(
+                    """
+                    SELECT MIN(seq)
+                    FROM events WHERE workspace_id = ?
+                    """,
+                    (workspace_id,),
+                ).fetchone()[0]
+                needs_resync = (
+                    cursor > current
+                    or (oldest is None and cursor < current)
+                    or (
+                        oldest is not None
+                        and cursor < int(oldest) - 1
+                    )
                 )
-            ):
-                return {
-                    "workspace_id": workspace_id,
-                    "cursor": current,
-                    "changes": [],
-                    "resync": True,
-                    "has_more": False,
-                }
-            rows = db.execute(
-                """
-                SELECT seq, type, path, name, is_dir, size, mtime, mtime_ns
-                FROM events
-                WHERE workspace_id = ? AND seq > ?
-                ORDER BY seq
-                LIMIT ?
-                """,
-                (workspace_id, cursor, limit + 1),
-            ).fetchall()
+                rows = [] if needs_resync else db.execute(
+                    """
+                    SELECT seq, type, path, name, is_dir, size, mtime, mtime_ns
+                    FROM events
+                    WHERE workspace_id = ? AND seq > ?
+                    ORDER BY seq
+                    LIMIT ?
+                    """,
+                    (workspace_id, cursor, limit + 1),
+                ).fetchall()
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        if needs_resync:
+            return {
+                "workspace_id": workspace_id,
+                "cursor": current,
+                "changes": [],
+                "resync": True,
+                "has_more": False,
+            }
         has_more = len(rows) > limit
         rows = rows[:limit]
         changes = [self._event_wire(row) for row in rows]
@@ -832,9 +932,7 @@ class WorkspaceStore:
         )
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
-        db.execute("PRAGMA journal_mode = WAL")
         db.execute("PRAGMA synchronous = NORMAL")
-        self._secure_database_files()
         return db
 
     def _secure_database_files(self) -> None:
@@ -897,6 +995,73 @@ class WorkspaceStore:
         ]
 
     @staticmethod
+    def _expanded_parent_paths(parents: Iterable[str]) -> list[str]:
+        """Normalize expanded paths and retain their ancestor chain.
+
+        The API layer rejects malformed input. This defensive normalization is
+        also used by direct callers and ensures a compact snapshot can always
+        materialize every requested parent from the root down.
+        """
+        expanded: set[str] = set()
+        for raw in parents:
+            value = str(raw).strip()
+            if not value or value.startswith(("/", "\\")) or "\\" in value:
+                continue
+            parts = value.split("/")
+            if any(part in {"", ".", ".."} for part in parts):
+                continue
+            for depth in range(1, len(parts) + 1):
+                expanded.add("/".join(parts[:depth]))
+        # Keep SQLite bind counts bounded. Sorting shallow-first guarantees an
+        # included descendant never loses the ancestor needed to render it.
+        return sorted(
+            expanded,
+            key=lambda path: (path.count("/"), path),
+        )[:100]
+
+    @staticmethod
+    def _file_rows_for_parents(
+        db: sqlite3.Connection,
+        workspace_id: str,
+        parents: Iterable[str],
+        *,
+        show_hidden: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Read root and expanded-directory children through a bounded index."""
+        selected_parents = ["", *dict.fromkeys(parents)]
+        placeholders = ", ".join("?" for _ in selected_parents)
+        parameters: list[Any] = [workspace_id, *selected_parents]
+        hidden_clause = ""
+        if not show_hidden:
+            hidden_clause = (
+                " AND path NOT GLOB '.*'"
+                " AND path NOT GLOB '*/.*'"
+            )
+        rows = db.execute(
+            f"""
+            SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode
+            FROM files INDEXED BY files_workspace_parent_path
+            WHERE workspace_id = ?
+              AND parent IN ({placeholders}){hidden_clause}
+            ORDER BY path
+            """,
+            parameters,
+        ).fetchall()
+        return [
+            {
+                "path": row["path"],
+                "name": row["name"],
+                "is_dir": bool(row["is_dir"]),
+                "size": row["size"],
+                "mtime": row["mtime"],
+                "mtime_ns": row["mtime_ns"],
+                "ctime_ns": row["ctime_ns"],
+                "inode": row["inode"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
     def _subtree_pattern(path: str) -> str:
         escaped = (
             path
@@ -938,14 +1103,15 @@ class WorkspaceStore:
         db.executemany(
             """
             INSERT INTO files(
-                workspace_id, path, name, is_dir, size, mtime, mtime_ns,
+                workspace_id, path, parent, name, is_dir, size, mtime, mtime_ns,
                 ctime_ns, inode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
                     workspace_id,
                     row["path"],
+                    _parent_path(row["path"]),
                     row["name"],
                     int(row["is_dir"]),
                     row["size"],
@@ -967,10 +1133,11 @@ class WorkspaceStore:
         db.execute(
             """
             INSERT INTO files(
-                workspace_id, path, name, is_dir, size, mtime, mtime_ns,
+                workspace_id, path, parent, name, is_dir, size, mtime, mtime_ns,
                 ctime_ns, inode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(workspace_id, path) DO UPDATE SET
+                parent=excluded.parent,
                 name=excluded.name,
                 is_dir=excluded.is_dir,
                 size=excluded.size,
@@ -982,6 +1149,7 @@ class WorkspaceStore:
             (
                 workspace_id,
                 row["path"],
+                _parent_path(row["path"]),
                 row["name"],
                 int(row["is_dir"]),
                 row["size"],

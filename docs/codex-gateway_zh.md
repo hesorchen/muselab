@@ -6,8 +6,8 @@ muselab 通过**本地 Anthropic 兼容网关**支持 Codex 后端模型。网�
 
 muselab **不保存 Codex OAuth 凭据**，也**不直接调用 OpenAI 原生接口**。
 
-截至 2026-07-16，已验证的兼容基线是 CLIProxyAPI `v7.2.80`、Claude Agent
-SDK `0.2.120` 以及其内置 Claude CLI `2.1.211`。新版 CLIProxyAPI 对这条
+截至 2026-07-31，已验证的兼容基线是 CLIProxyAPI `v7.2.111`、Claude Agent
+SDK `0.2.128` 以及其内置 Claude CLI `2.1.220`。新版 CLIProxyAPI 对这条
 链路相关的 Codex 缓存 token 统计、reasoning effort、工具调用回放和
 Anthropic 响应转换都有修复。
 
@@ -30,7 +30,18 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 | 内部前缀 | `codex:` |
 | 模型 | `codex:gpt-5.6-sol`、`codex:gpt-5.6-terra`、`codex:gpt-5.6-luna`、`codex:gpt-5.5`、`codex:gpt-5.4`、`codex:gpt-5.4-mini`、`codex:gpt-5.3-codex-spark` |
 
-`codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab 里的 `codex:gpt-5.6-sol` 到网关侧会变成 `gpt-5.6-sol`。Codex Gateway 也会在 muselab 里打开按会话设置的 reasoning `effort` 下拉；muselab 通过 Claude Agent SDK 透传所选值，sidecar 负责把它映射到 Codex/OpenAI 后端的推理强度参数。
+`codex:` 前缀只供 muselab 内部路由使用。发给网关前会被剥掉，所以 muselab
+里的 `codex:gpt-5.6-sol` 到网关侧会变成 `gpt-5.6-sol`。Codex Gateway 也会
+打开按会话设置的 reasoning `effort` 和与其独立的 **Fast** 服务层。Claude
+Agent SDK 没有 `auto`、`ultra` 或 Fast 的原生字段，因此 muselab 通过
+`X-MuseLab-Effort` 与 `X-MuseLab-Service-Tier` 携带规范值；推荐配置里的
+`payload` 规则在 Anthropic→Codex 协议转换后应用这些控制：
+
+- `auto` 删除 translator 合成的 effort，让模型 catalog 默认值继续生效；
+- `low` 到 `max` 直接映射到 `reasoning.effort`；
+- `ultra` 在线路上映射为 `max`，并激活 muselab 原生
+  `ultra-orchestrator` Skill 做受限并发编排；
+- Fast 独立映射为 `service_tier: priority`。
 
 ## 启用方式
 
@@ -44,7 +55,9 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 2. 编辑 `~/.cli-proxy-muselab/config.yaml`：
 
    - 把 `replace-with-a-random-local-token` 换成高强度本地 token；
-   - 除非你明确希望 proxy 额外增加本地冷却窗口，否则保留 `disable-cooling: true` 和 `session-affinity: false`。
+   - 除非你明确希望 proxy 额外增加本地冷却窗口，否则保留 `disable-cooling: true` 和 `session-affinity: false`；
+   - 保留示例中的 `payload.override` 与 `payload.filter` 规则；删除后
+     effort／Fast 会在协议转换后静默退化。
 
 3. 在本机启动 CLIProxyAPI，并只监听 loopback：
 
@@ -63,6 +76,34 @@ muselab → Claude Agent SDK → Anthropic Messages 请求
 5. 如果是手动编辑 `.env`，重启 muselab；如果在 **Settings → Providers → Codex Gateway** 里粘贴 key，则无需重启。
 
 6. 在聊天模型下拉里选择 `codex:*` 模型。
+
+## 升级已有 Gateway 配置
+
+复制示例只发生在首次安装：升级 muselab **不会**改写
+`~/.cli-proxy-muselab/config.yaml`。已有安装必须把当前
+`examples/cli-proxy-muselab.config.yaml` 中完整的 `payload:` 区块合并到
+现有配置，同时保留自己的 token、auth 目录与路由设置；随后用本机原有的
+supervisor 重启 sidecar。
+
+重启前运行下面的静态检查；输出应同时包含 effort header、服务层 header、
+`reasoning.effort` 与 `service_tier` 规则：
+
+```bash
+rg -n 'X-MuseLab-Effort|X-MuseLab-Service-Tier|reasoning\.effort|service_tier' \
+  ~/.cli-proxy-muselab/config.yaml
+```
+
+重启后，用 muselab 配置的同一个本地 token 验证 sidecar 与 Codex catalog：
+
+```bash
+curl -fsS \
+  -H "x-api-key: ${CODEX_GATEWAY_API_KEY}" \
+  'http://127.0.0.1:8317/v1/models?client_version' >/dev/null
+```
+
+catalog 请求成功说明新配置已经启动；静态规则检查则证明必须的协议转换后
+映射仍在。规则缺失时，UI 仍可能发现模型能力，但 Auto、Ultra 与 Fast 会
+静默退回 translator 默认行为。
 
 推荐的 CLIProxyAPI 模板关闭了 proxy 自己的 auth/model cooldown 调度。这样可以避免上游失败后被本地 proxy 额外放大成黑窗期，体验更接近直接使用 Codex app/CLI。它不能绕过真实的上游额度限制或模型级 429。
 
@@ -98,6 +139,7 @@ muselab 采用的参考方案是把 **CLIProxyAPI** 放在 muselab 旁边作为�
 | `session-affinity` | `false` | 默认不把 muselab 会话绑定到某个 credential |
 | `logging-to-file` | `false` | 降低把 prompt / token / 上游错误落盘的风险 |
 | `remote-management.allow-remote` | `false` | 禁止远程管理面板 |
+| `payload` 规则 | 保留示例区块 | 在协议转换后映射 muselab 的 effort／Fast header |
 
 `usage-statistics-enabled` 刻意保留为 `false`。CLIProxyAPI `v7.2.80` 虽然
 提供 `/v0/management/usage-queue` 请求明细，但它要求打开管理接口、只短暂
@@ -128,7 +170,10 @@ sidecar 至少要实现 Anthropic Messages API 中 agent loop 需要的部分：
 - `tool_use` 与 `tool_result` 往返；
 - auth、quota、invalid model、network failure 等错误的 Anthropic 风格响应；
 - 接受 muselab 发送的 `x-api-key` 和 / 或 `Authorization: Bearer`；
-- 支持 Claude Agent SDK 发出的 reasoning `effort` 字段，并至少把 `low`、`medium`、`high`、`max` 映射到 Codex/OpenAI 后端等价的推理强度控制。
+- 支持推荐配置中的 header-aware `payload` 规则：在协议转换后把
+  `X-MuseLab-Effort` 映射为 `reasoning.effort`，为 `auto` 删除该字段，把
+  Ultra 映射为 `max`，并把 `X-MuseLab-Service-Tier: fast` 映射为
+  `service_tier: priority`。
 
 如果普通聊天可用但工具调用失败，说明该 gateway 仍是 chat-only，不能作为完整 muselab agent 支持来宣传。
 

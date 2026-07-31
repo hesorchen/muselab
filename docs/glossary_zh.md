@@ -22,9 +22,11 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **CLAUDE_CONFIG_DIR isolation（CLAUDE_CONFIG_DIR 隔离）** — 对于第三方提供商，muselab 将 `CLAUDE_CONFIG_DIR` 设置为持久的每用户状态目录（`${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/`），其中不含 `credentials.json`。这既可防止 CLI 静默回退到 Claude Pro OAuth、避免将第三方流量计入你的 Anthropic 账单，也能跨重启保留第三方会话。参见 [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md)。
 
-**client pool（客户端池）** — 活跃 `ClaudeSDKClient` 实例的内存缓存，以 `(session_id, model, effort)` 为键。默认容量为 3 个条目（可通过 `MUSELAB_CLIENT_POOL_CAP` 配置）；超出上限时按最近最少使用（LRU）策略淘汰，但有活跃回合或后台任务进行中的条目除外。参见 [`routing.md — The Client Pool`](routing.md)。
+**client pool（客户端池）** — 活跃 `ClaudeSDKClient` 实例的内存缓存，以 `(session_id, model, effort, service_tier)` 为键。默认容量为 3 个条目（可通过 `MUSELAB_CLIENT_POOL_CAP` 配置）；超出上限时按最近最少使用（LRU）策略淘汰，但有活跃回合或后台任务进行中的条目除外。参见 [`routing.md — The Client Pool`](routing.md)。
 
-**effort（推理强度）** — 传给 `ClaudeAgentOptions` 的推理强度等级。有效值为 `"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` 或 `""`（SDK 自适应默认值）。按会话存储于 `$MUSELAB_SESSIONS_DIR/index.json`；修改后会断开缓存的 client，下次回合以新值重建。effort 是 client pool 缓存键的组成部分。参见 [`routing.md — Reasoning Effort and Extended Thinking`](routing.md)。
+**effort（推理强度）** — 按会话保存的推理等级。规范值为 `"auto"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` 和按模型开放的 `"ultra"`；旧空值会规范化为 `"auto"`。SDK 原生等级传给 `ClaudeAgentOptions`，Codex 专属传输值由 Gateway payload 规则完成；修改 effort 会重建缓存 client。参见 [`routing.md — Effort and thinking`](routing.md)。
+
+**service tier（服务层）** — 与 effort 独立的 Codex 会话级传输控制。`"fast"` 映射为 Gateway 的 `service_tier: priority`，空值使用标准服务。它是 client-pool key 的组成部分，因为 custom header 在 SDK client 启动时即固定。参见 [`codex-gateway_zh.md`](codex-gateway_zh.md)。
 
 **extended thinking / thinking signature（扩展思考 / 思考签名）** — `ThinkingConfigEnabled` 激活时 Claude 产生的推理轨迹。thinking 块通过 `thinking` SSE 事件流式传输。签名是不可修改的不透明令牌；muselab 将会话锁定到单一模型以避免跨提供商的签名损坏。对于 Opus 4.7+，需要 `display="summarized"` 才能获得纯文本 thinking 块，而非仅有签名。参见 [`routing.md — budget_tokens and display`](routing.md)。
 
