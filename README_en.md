@@ -27,13 +27,11 @@
 <table align="center">
 <tr>
 <td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="180" alt="Mobile file browser"></a></td>
-<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="180" alt="Mobile light-theme preview"></a></td>
 <td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="180" alt="Mobile Agent conversation"></a></td>
 <td align="center"><a href="promo/media/screenshot-mobile.png"><img src="promo/media/screenshot-mobile.png" width="180" alt="Mobile dark-theme preview"></a></td>
 </tr>
 <tr>
 <td align="center">Mobile · files</td>
-<td align="center">Mobile · light preview</td>
 <td align="center">Mobile · Agent conversation</td>
 <td align="center">Mobile · dark theme</td>
 </tr>

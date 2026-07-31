@@ -27,13 +27,11 @@
 <table align="center">
 <tr>
 <td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="180" alt="移动端文件区"></a></td>
-<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="180" alt="移动端浅色预览"></a></td>
 <td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="180" alt="移动端 Agent 对话"></a></td>
 <td align="center"><a href="promo/media/screenshot-mobile.png"><img src="promo/media/screenshot-mobile.png" width="180" alt="移动端深色预览"></a></td>
 </tr>
 <tr>
 <td align="center">移动端 · 文件区</td>
-<td align="center">移动端 · 浅色预览</td>
 <td align="center">移动端 · Agent 对话</td>
 <td align="center">移动端 · 深色主题</td>
 </tr>
