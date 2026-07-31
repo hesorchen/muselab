@@ -1713,7 +1713,13 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
           window.fetch = (url, init = {}) => {
             const parsed = new URL(String(url), location.origin);
             if (parsed.pathname === '/api/files/bootstrap') {
-              calls.push(`bootstrap:${parsed.searchParams.get('show_hidden') || 'false'}`);
+              const payload = init.body ? JSON.parse(String(init.body)) : {};
+              calls.push({
+                endpoint: 'bootstrap',
+                method: String(init.method || 'GET').toUpperCase(),
+                showHidden: !!payload.show_hidden,
+                parents: payload.parents || [],
+              });
               return Promise.resolve(new Response(JSON.stringify({
                 cursor: 1,
                 entries: [{
@@ -1757,7 +1763,12 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
     )
     assert result == {
         "ok": True,
-        "calls": ["bootstrap:true"],
+        "calls": [{
+            "endpoint": "bootstrap",
+            "method": "POST",
+            "showHidden": True,
+            "parents": [],
+        }],
         "showHidden": True,
         "expanded": [],
         "paths": [".hidden-root"],

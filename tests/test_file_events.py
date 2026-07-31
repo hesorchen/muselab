@@ -699,6 +699,10 @@ async def test_watcher_uses_shallow_indexed_directories_and_closes_refresh_gap(
         primary=True,
         initialized=True,
     )
+    # This test drives the private watcher loop directly, so install the state
+    # just as ``ensure_workspace`` would. The scheduler intentionally ignores
+    # detached generations to prevent a removed workspace from being revived.
+    manager._states[state.root] = state
     watch_task = asyncio.create_task(manager._watch(state))
     state.task = watch_task
     await asyncio.wait_for(second_started.wait(), timeout=2)
