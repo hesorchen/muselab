@@ -42,7 +42,7 @@ Global state remains only under the primary `MUSELAB_ROOT/.muselab/`; it is not 
 | Path | Content |
 |---|---|
 | `<repo>/.env` | Token, provider keys, and deployment configuration; contains secrets |
-| `<repo>/sessions/` | Session index, sidecars, queues, active-turn sentinels, and derived indexes |
+| `$MUSELAB_SESSIONS_DIR/` | Session index, sidecars, queues, active-turn sentinels, and derived indexes; defaults to `<repo>/sessions/` |
 | `<repo>/mcp.json` | MCP server configuration, possibly with credentials |
 | `<repo>/provider_overrides.json` | Built-in provider edits and custom providers |
 
@@ -85,7 +85,7 @@ process during a rolling restart: unique records are appended safely.
 1. Install the same or a newer muselab version on the new machine.
 2. Stop the service.
 3. Restore the primary workspace, required additional workspaces, repository state, `~/.claude/`, and isolated transcripts when third-party providers are used.
-4. Check `MUSELAB_ROOT` in `.env` and update stale absolute paths through the workspace picker.
+4. Check `MUSELAB_ROOT` and `MUSELAB_SESSIONS_DIR` in `.env`, then update stale workspace paths through the workspace picker.
 5. Verify ownership and permissions, especially for `.env`, Claude credentials, VAPID keys, and terminal profiles.
 6. Start the service and test workspaces, session history, attachments, scheduled tasks, terminal profiles, image history, and Push.
 7. Run `bash scripts/doctor.sh` for a basic health check.

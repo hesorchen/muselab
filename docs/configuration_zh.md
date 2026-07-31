@@ -16,17 +16,22 @@ muselab 的配置分成四层。不要把所有状态都理解为 `.env`：
 | 变量 | 作用 | 默认 |
 |---|---|---|
 | `MUSELAB_TOKEN` | UI 与 API 的共享鉴权 token，至少 16 字符 | 必填 |
-| `MUSELAB_ROOT` | 主工作目录，也是 `.muselab` 全局状态的根目录 | 原生部署必填 |
+| `MUSELAB_ROOT` | 主工作区，也是 `.muselab` 全局状态的根目录 | 原生部署必填 |
 | `MUSELAB_HOST` | uvicorn 监听接口 | `127.0.0.1` |
 | `MUSELAB_PORT` | 监听端口 | `8765` |
 | `MUSELAB_URL` | 可选远程客户端使用的公开 HTTPS origin | 本机 origin |
 | `MUSELAB_ENV_PATH` | 设置 API 读写的 `.env` 路径；测试或特殊部署使用 | `<repo>/.env` |
+| `MUSELAB_SESSIONS_DIR` | 持久化会话元数据目录 | `<repo>/sessions` |
 | `MUSELAB_MODEL` | 新会话默认模型；未设置时使用内置 Claude 默认值 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | 设置面板保存的默认模型，与 `MUSELAB_MODEL` 同步 | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_PERMISSION` | 新会话默认 SDK 权限模式 | `bypassPermissions` |
 | `MUSELAB_MEMORY_DIR` | 可选的长期记忆 Registry／配置目录 | `$MUSELAB_ROOT/.muselab/memory` |
 
-`MUSELAB_ROOT` 必须存在。`/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等系统级根路径会被拒绝；用户自己的 home 或其子目录可以使用。
+`MUSELAB_ROOT` 必须存在。`/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等系统级根路径会被拒绝；用户自己的 home 或其子目录可以使用。旧版本文档曾称它为 archive root；环境变量名为兼容已有部署而保留，当前产品概念统一为“主工作区”。
+
+`MUSELAB_SESSIONS_DIR` 保存 muselab 的会话索引、sidecar、队列与重启恢复哨兵，
+不保存 CLI transcript 正文。原生安装脚本会把当前 checkout 的绝对
+`<repo>/sessions` 路径写入 `.env`；未设置时仍回退到仓库内默认目录，以兼容旧部署。
 
 ## 多工作区
 
@@ -118,7 +123,7 @@ Profile 保存在 `$MUSELAB_ROOT/.muselab/terminal_profiles.json`，在所有工
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `ARCHIVE_DIR` | 挂载到容器 `/data` 的宿主目录 | `./data` |
+| `ARCHIVE_DIR` | 挂载到容器 `/data` 的宿主机工作区；名称仅为 Docker Compose 向后兼容保留 | `./data` |
 | `CLAUDE_HOME` | 宿主机 Claude CLI 配置目录 | `${HOME}/.claude` |
 | `MUSELAB_BIND` | 宿主机发布端口绑定地址 | `127.0.0.1` |
 
@@ -127,7 +132,7 @@ Profile 保存在 `$MUSELAB_ROOT/.muselab/terminal_profiles.json`，在所有工
 | 变量 | 作用 | 默认 |
 |---|---|---|
 | `MUSELAB_NONINTERACTIVE` | 安装脚本采用默认值并跳过交互 | `0` |
-| `MUSELAB_LOCALE` | 安装引导与初始模板语言 | 从 `LANG` 自动判断 |
+| `MUSELAB_LOCALE` | 可选 `scripts/intake.sh` 生成工作区模板时使用的语言 | 从 `LANG` 自动判断 |
 | `MUSELAB_SKIP_SERVICE` | 只安装文件与依赖，不注册或启动 systemd／launchd 服务 | `0` |
 | `MUSELAB_NO_BROWSER` | 安装完成后不自动打开浏览器 | `0` |
 

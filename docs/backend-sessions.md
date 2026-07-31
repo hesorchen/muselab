@@ -15,7 +15,7 @@ Claude CLI and muselab jointly own each session:
 ${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects/<cwd-key>/<sid>.jsonl
     Isolated CLI transcripts for third-party providers
 
-<repo>/sessions/
+$MUSELAB_SESSIONS_DIR/
 ├── index.json
 ├── <sid>.sidecar.json
 ├── <sid>.queue.json
@@ -28,12 +28,16 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 - CLI JSONL is the source of truth for conversation content. Claude and
   third-party providers use different configuration roots. The third-party
   root is persistent user state and should be included in backups.
-- `sessions/index.json` holds muselab-specific display and runtime settings.
+- `$MUSELAB_SESSIONS_DIR/index.json` holds muselab-specific display and runtime settings.
 - A sidecar holds per-message cost, model, time, attachment, and context annotations.
 - A queue file holds pending messages.
 - Attachments live under the primary `MUSELAB_ROOT`, even when the session belongs to another registered workspace.
 
 Every layer uses the same session UUID.
+
+`MUSELAB_SESSIONS_DIR` defaults to `<repo>/sessions`. Native installers write
+that repo-local location to `.env` as an absolute path; existing deployments
+that leave it unset retain the same default.
 
 ## Multiple workspaces
 
@@ -45,7 +49,7 @@ New interactive, forked, and scheduled sessions persist an explicit `cwd`. Exist
 
 ## Session index
 
-Primary fields in `sessions/index.json`:
+Primary fields in `$MUSELAB_SESSIONS_DIR/index.json`:
 
 | Field | Meaning |
 |---|---|
@@ -131,7 +135,7 @@ Deleting a session also removes:
 
 ## Restart recovery
 
-Starting a turn writes `sessions/active_turns/<sid>.json`; normal completion removes it. If the process is killed, startup marks leftover rows as interrupted and lets the user decide whether to resend. muselab does not spend tokens by retrying automatically.
+Starting a turn writes `$MUSELAB_SESSIONS_DIR/active_turns/<sid>.json`; normal completion removes it. If the process is killed, startup marks leftover rows as interrupted and lets the user decide whether to resend. muselab does not spend tokens by retrying automatically.
 
 | State | Behavior after restart |
 |---|---|

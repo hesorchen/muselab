@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # muselab — Linux uninstaller. Stops & removes the systemd --user service.
-# Leaves .env, sessions/, and your archive untouched.
+# Leaves .env, sessions/, and your workspace files untouched.
 set -euo pipefail
 
 UNIT="$HOME/.config/systemd/user/muselab.service"

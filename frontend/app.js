@@ -281,7 +281,7 @@ function portal() {
     _fileEventsVisibilityBound: false,
     dragOver: "",
     // Highlight flag for the sticky root bar while a tree node / OS file is
-    // dragged over it (drop = move/upload to archive root).
+    // dragged over it (drop = move/upload to the workspace root).
     dragOverRoot: false,
     // ===== multi-select (desktop) =====
     // `selectedPaths` is the batch set (paths); `selected` stays the single
@@ -563,7 +563,7 @@ function portal() {
 
     // ===== command palette (Cmd/Ctrl+K) =====
     // Single fuzzy-search dropdown across: quick actions, open sessions,
-    // and any file under the archive root (via /api/files/search). Action
+    // and any file under the workspace root (via /api/files/search). Action
     // items have a `run` closure; selecting an item fires it and closes
     // the palette.
     palette: {
@@ -748,22 +748,18 @@ function portal() {
     _sendWaitingForUpload: false,
     dragHover: false,
 
-    // What Muse can see — populated from /api/chat/context-info on login.
-    // Drives the onboarding hints (claude_md chip, "drop a doc here" cards).
+    // Workspace + provider capabilities populated from /api/chat/context-info.
+    // `archive_root` is a temporary compatibility fallback for older servers;
+    // new UI code prefers the current session workspace or `workspace_root`.
     contextInfo: {
+      workspace_root: "",
       archive_root: "",
-      claude_md_exists: false,
-      claude_md_lines: 0,
-      claude_md_mtime: 0,
-      archive_empty: true,
-      subdir_present: {},
       has_claude_oauth: false,
       has_anthropic_api: false,
       third_party_configured: [],
       has_any_provider: false,
-      // Guard so onboarding chips ("⚠ 未配档案" / "no provider") don't
-      // flash to the user while the first contextInfo fetch is still in
-      // flight. UI conditions check `_fetched && !X` rather than `!X`.
+      // Guard so the provider setup card does not flash while the first
+      // context-info request is still in flight.
       _fetched: false,
     },
 
@@ -828,62 +824,16 @@ function portal() {
     // ===== Muse mascot =====
     // 九缪斯（Nine Muses of Greek mythology）。视觉仍是抽象几何，名字承载典故：
     // 每个缪斯对应一种艺术 / 学科，几何形象选有意义关联的（如 Urania 天文 → orbit 行星）。
-    //
-    // Each muse has TWO conversation-opener strings, deliberately split
-    // by perspective (the previous single-string design conflated them
-    // and produced grammatically wrong fills — "聊聊你的..." in the
-    // user's input box reads as the user asking Muse to talk about
-    // herself):
-    //   - invite:  Muse → user (card preview). "讲讲你的..." / "聊聊你..."
-    //   - prompt:  user → Muse (prefilled into chat input on click).
-    //              "我想聊聊..." — first-person, statement (not question)
-    //              so user can hit Enter immediately or tweak before sending.
     MASCOTS: [
-      { id: "hex",      greek: "Calliope",    zhName: "卡利俄佩",       domain: { zh: "史诗", en: "Epic poetry" },
-        invite: { zh: "讲讲你的大故事——这一年你最在意的三件事是什么?",
-                  en: "Tell me the big story — what are the 3 things you care most about this year?" },
-        prompt: { zh: "我想和你聊聊这一年我最在意的三件事",
-                  en: "I want to talk through the 3 things I care most about this year" } },
-      { id: "bars",     greek: "Clio",        zhName: "克利俄",         domain: { zh: "历史", en: "History" },
-        invite: { zh: "整理一下你的时间线——过去半年最关键的变化是什么?",
-                  en: "Walk me through your timeline — what changed most in the last six months?" },
-        prompt: { zh: "帮我整理一下过去半年最关键的变化",
-                  en: "Help me walk through what changed most in the last six months" } },
-      { id: "lens",     greek: "Erato",       zhName: "厄拉托",         domain: { zh: "情诗", en: "Love poetry" },
-        invite: { zh: "聊聊你在乎的人——最近谁需要你多一点注意?",
-                  en: "Tell me about who matters to you — who needs your attention right now?" },
-        prompt: { zh: "想聊聊我在乎的人——感觉最近有谁需要我多一点注意",
-                  en: "I want to talk about people who matter to me — someone might need more attention from me right now" } },
-      { id: "wave",     greek: "Euterpe",     zhName: "欧忒耳佩",       domain: { zh: "音乐", en: "Music" },
-        invite: { zh: "讲讲你的节奏——最近哪件日常的小事做得最顺?",
-                  en: "Talk about your rhythm — what daily thing has been clicking lately?" },
-        prompt: { zh: "想聊聊我最近的节奏——哪件日常小事做得最顺",
-                  en: "Let me talk about my rhythm lately — a daily thing that's been clicking" } },
-      { id: "crescent", greek: "Melpomene",   zhName: "墨尔波墨涅",     domain: { zh: "悲剧", en: "Tragedy" },
-        invite: { zh: "聊聊最近的烦恼——什么事让你睡不踏实?",
-                  en: "Tell me what's weighing on you — what's been keeping you up?" },
-        prompt: { zh: "想聊聊最近的烦恼——有件事让我睡不踏实",
-                  en: "Want to talk about what's been weighing on me — something's keeping me up" } },
-      { id: "halo",     greek: "Polyhymnia",  zhName: "波吕许谟尼亚",   domain: { zh: "圣诗", en: "Sacred hymns" },
-        invite: { zh: "聊聊你的信念——什么事让你觉得「必须做」?",
-                  en: "Talk about what you believe in — what feels non-negotiable to you?" },
-        prompt: { zh: "想聊聊我的信念——有件事让我觉得「必须做」",
-                  en: "Want to talk about what I believe in — something feels non-negotiable to me" } },
-      { id: "trio",     greek: "Terpsichore", zhName: "忒耳普西科瑞",   domain: { zh: "舞蹈", en: "Dance" },
-        invite: { zh: "讲讲你的身体——最近的状态怎么样?",
-                  en: "Tell me about your body — how are you feeling lately?" },
-        prompt: { zh: "想聊聊我最近身体的状态",
-                  en: "Want to talk about how my body's been feeling lately" } },
-      { id: "spark",    greek: "Thalia",      zhName: "塔利亚",         domain: { zh: "喜剧", en: "Comedy" },
-        invite: { zh: "来点轻松的——最近有什么有意思的事?",
-                  en: "Lighten things up — what's something fun that happened recently?" },
-        prompt: { zh: "来点轻松的——最近有件有意思的事想跟你说",
-                  en: "Let's lighten things up — something fun happened recently I want to share" } },
-      { id: "orbit",    greek: "Urania",      zhName: "乌拉尼亚",       domain: { zh: "天文", en: "Astronomy" },
-        invite: { zh: "聊聊你的好奇心——什么大问题最近一直在想?",
-                  en: "Talk about what you're curious about — what big question is on your mind?" },
-        prompt: { zh: "想聊聊我最近的好奇心——有个大问题一直在脑子里",
-                  en: "Want to talk about something I'm curious about — a big question that's been on my mind" } },
+      { id: "hex",      greek: "Calliope",    zhName: "卡利俄佩",       domain: { zh: "史诗", en: "Epic poetry" } },
+      { id: "bars",     greek: "Clio",        zhName: "克利俄",         domain: { zh: "历史", en: "History" } },
+      { id: "lens",     greek: "Erato",       zhName: "厄拉托",         domain: { zh: "情诗", en: "Love poetry" } },
+      { id: "wave",     greek: "Euterpe",     zhName: "欧忒耳佩",       domain: { zh: "音乐", en: "Music" } },
+      { id: "crescent", greek: "Melpomene",   zhName: "墨尔波墨涅",     domain: { zh: "悲剧", en: "Tragedy" } },
+      { id: "halo",     greek: "Polyhymnia",  zhName: "波吕许谟尼亚",   domain: { zh: "圣诗", en: "Sacred hymns" } },
+      { id: "trio",     greek: "Terpsichore", zhName: "忒耳普西科瑞",   domain: { zh: "舞蹈", en: "Dance" } },
+      { id: "spark",    greek: "Thalia",      zhName: "塔利亚",         domain: { zh: "喜剧", en: "Comedy" } },
+      { id: "orbit",    greek: "Urania",      zhName: "乌拉尼亚",       domain: { zh: "天文", en: "Astronomy" } },
     ],
     mascotIdx: 0,
     mascotGreet: false,
@@ -1529,15 +1479,6 @@ function portal() {
         if (mq.addEventListener) mq.addEventListener("change", handler);
         else if (mq.addListener) mq.addListener(handler);
       }
-      // Per-session-load seed so the inspire prompts feel fresh each
-      // time the user lands on the empty chat screen, rather than
-      // always showing the same first 5. shuffleInspirePrompts() bumps
-      // this on demand for "give me another batch".
-      this._inspireSeed = Math.floor(Math.random() * 1e9);
-      // Welcome-card visibility — Alpine-reactive so dismissWelcome()
-      // immediately re-renders the chat-body. localStorage flag persists
-      // dismissal across reloads / PWA reopens.
-      this._welcomeDismissed = localStorage.getItem("muselab_welcome_dismissed") === "1";
       // Restore the preview zoom level so it sticks across reloads / PWA
       // reopens, like a browser's per-site zoom. Clamp the stored value in
       // case the bounds changed between versions.
@@ -3835,16 +3776,45 @@ function portal() {
       const next = arr[i + 1];
       return !next || next.role === "user";
     },
+    // Resolve a persisted message UUID for a footer mounted on the actual turn
+    // tail. Agentic turns often end in a tool_result/status bubble; the backend
+    // accepts any persisted message boundary, so prefer the tail's own UUID and
+    // otherwise walk backward within the same contiguous muse-side run.
+    // Non-tail calls return immediately, keeping the x-for cost O(messages)
+    // overall.
+    turnForkMessageId(paneMsgs, i) {
+      const arr = paneMsgs || [];
+      if (i < 0 || i >= arr.length) return "";
+      const tail = arr[i];
+      if (!tail || tail.role === "user") return "";
+      const next = arr[i + 1];
+      if (next && next.role !== "user") return "";
+      for (let k = i; k >= 0; k -= 1) {
+        const message = arr[k];
+        if (!message || message.role === "user") break;
+        // Headless background continuations have no user row separating them
+        // from the launch turn. _markDone stamps the current assistant/tail
+        // with one shared completion time, so an older different stamp is the
+        // boundary: never fall through to that previous turn's fork UUID.
+        if (k < i && tail.ts && message.ts && message.ts !== tail.ts) break;
+        if (message.forkUuid) return message.forkUuid;
+        if (message.uuid) return message.uuid;
+      }
+      return "";
+    },
     // Normalize a model-emitted path into something openByPathToasted can hand
     // to /api/files/list. Handles three things the model commonly does wrong:
-    //   - absolute path under ROOT  →  strip ROOT prefix
+    //   - absolute path under the workspace root → strip the root prefix
     //   - "~/..." path              →  return "" (we don't know HOME-vs-ROOT)
-    //   - path prefixed by ROOT's basename (e.g. "muselab-archive/health/x.md"
-    //     when ROOT itself is /home/u/muselab-archive) → strip the duplicate
+    //   - path prefixed by the workspace basename → strip the duplicate
     // Returns "" for paths we can't safely open (would 403 / 404 on backend).
-    _normalizeArchivePath(p) {
+    _normalizeWorkspacePath(p) {
       if (!p) return "";
-      const root = (this.contextInfo && this.contextInfo.archive_root) || "";
+      const info = this.contextInfo || {};
+      const root = this.currentWorkspacePath()
+        || info.workspace_root
+        || info.archive_root
+        || "";
       if (p.startsWith("/")) {
         if (root && (p === root || p.startsWith(root + "/"))) {
           return p.slice(root.length).replace(/^\/+/, "");
@@ -3852,10 +3822,9 @@ function portal() {
         return "";
       }
       if (p.startsWith("~/")) return "";
-      // Model often writes "<root-basename>/foo/bar.md" thinking the archive
-      // root is the parent of the archive directory. Strip the basename of
-      // ROOT if it's the first segment and stripping leaves a non-empty
-      // remainder.
+      // Model often writes "<root-basename>/foo/bar.md" as if the workspace
+      // root were its parent. Strip the duplicated basename if doing so
+      // leaves a non-empty remainder.
       if (root) {
         const base = root.split("/").pop();
         if (base && p.startsWith(base + "/")) {
@@ -3868,7 +3837,7 @@ function portal() {
     // Rewrite author-relative <img src> in rendered-markdown HTML to the backend
     // raw endpoint. A README's `![](promo/media/x.png)` is relative to the file,
     // but once injected into the preview pane the browser resolves it against the
-    // SPA origin (http://host:port/promo/media/x.png) — which 404s, since archive
+    // SPA origin (http://host:port/promo/media/x.png) — which 404s, since workspace
     // files are only reachable through /api/files/raw. We resolve each relative
     // src against the directory of the file being previewed (this.selected) and
     // swap in rawUrl(). Absolute/external/data/blob/root-absolute/anchor srcs —
@@ -3877,7 +3846,7 @@ function portal() {
     _resolveMdImages(html) {
       if (!html || html.indexOf("<img") < 0) return html;
       // Directory of the previewed file, ROOT-relative (drop the filename).
-      const baseSegs = this._normalizeArchivePath(this.selected || "")
+      const baseSegs = this._normalizeWorkspacePath(this.selected || "")
         .split("/").slice(0, -1);
       const tmp = document.createElement("div");
       tmp.innerHTML = html;
@@ -3913,7 +3882,7 @@ function portal() {
       if (!_FILE_TOOLS.has(m.name)) return "";
       const inp = m.input || {};
       const path = inp.file_path || inp.notebook_path || "";
-      return this._normalizeArchivePath(path);
+      return this._normalizeWorkspacePath(path);
     },
     // Render mcp__<server>__<tool> nicely: drop the mcp__ prefix, replace __ with " · "
     renderToolName(name) {
@@ -4309,7 +4278,7 @@ function portal() {
       // Ext must START with a letter to avoid eating version strings like 1.2.3.
       // \p{L}\p{N} (unicode flag) so Chinese/Japanese filenames also match.
       const RE = /^([\p{L}\p{N}_@./~+-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::(\d+))?(?::\d+)?$/u;
-      const toRel = (p) => this._normalizeArchivePath(p);
+      const toRel = (p) => this._normalizeWorkspacePath(p);
       // 1) inline <code> whose text looks like a path
       const codes = rootEl.querySelectorAll("code");
       for (const code of codes) {
@@ -4370,7 +4339,7 @@ function portal() {
     onChatClick(ev) {
       const a = ev.target.closest && ev.target.closest("a[href]");
       if (!a) return;
-      // .file-link → open via archive preview
+      // .file-link → open via the workspace preview
       if (a.classList.contains("file-link")) {
         ev.preventDefault();
         const path = a.dataset.path || "";
@@ -4398,13 +4367,13 @@ function portal() {
       // basename duplicated as prefix). If that returns "" (e.g. /etc/passwd),
       // fall back to the raw href minus leading slash so the user at least
       // gets a "not found" toast instead of silent navigation.
-      let p = this._normalizeArchivePath(href);
+      let p = this._normalizeWorkspacePath(href);
       if (!p) p = href.replace(/^\/+/, "");
       this.openByPathToasted(p);
     },
 
     // Fallback resolver for chat-link clicks whose path doesn't resolve
-    // ROOT-relative. Searches the archive by basename and returns every
+    // workspace-relative. Searches the workspace by basename and returns every
     // ROOT-relative path whose full path ends with the clicked path (same
     // file, just a missing prefix). Caller decides: 0 → not-found toast,
     // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
@@ -4463,9 +4432,9 @@ function portal() {
           hit = (data.entries || []).find(e => e.name === name) || null;
         }
         // Direct ROOT-relative lookup missed. The model commonly emits a path
-        // relative to a SUBDIR of the archive root (e.g. "learning/x.html"
+        // relative to a subdirectory of the workspace root (e.g. "learning/x.html"
         // when the file actually lives at "claude_space/learning/x.html").
-        // Search the archive by basename and accept a UNIQUE hit whose full
+        // Search the workspace by basename and accept a UNIQUE hit whose full
         // path ends with the clicked path — same file, just a missing prefix.
         // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
         if (!hit) {
@@ -4515,8 +4484,8 @@ function portal() {
     },
 
     // Open a background-task result file. Its output_file lives under
-    // /tmp/claude-<uid>/.../tasks/<id>.output — OUTSIDE the archive root, so
-    // the archive-scoped /api/files/read (and openByPathToasted's parent-dir
+    // /tmp/claude-<uid>/.../tasks/<id>.output — outside the workspace root, so
+    // the workspace-scoped /api/files/read (and openByPathToasted's parent-dir
     // list) can't reach it. Route through the dedicated /api/chat/task-output
     // endpoint via openFile's readUrl override. No tree reveal (not in tree).
     async openTaskOutput(ts) {
@@ -6079,7 +6048,7 @@ function portal() {
     // to whatever turn the server started, so the user sees it stream live.
     // Name kept so existing call sites (done / compact-finally / activateTab)
     // don't change.
-    _drainPendingQueue(sid) {
+    _drainPendingQueue(sid, completedTurnId = "") {
       if (!sid) return;
       if (sid !== this.currentId) {
         // Not the visible tab — just refresh its mirror; activateTab will
@@ -6087,14 +6056,14 @@ function portal() {
         this._syncQueueFromServer(sid);
         return;
       }
-      this._attachToServerTurn(sid, 8);
+      this._attachToServerTurn(sid, 8, completedTurnId);
     },
     // Poll /active + re-subscribe to a server-started turn. Retries a few
     // times because the server's drain runs a beat AFTER it publishes the
     // previous turn's `done` (in the background task's finally), so /active
     // can flip to true just after we land here. Stops once we attach, run
     // out of tries, or the queue turns out empty/paused.
-    async _attachToServerTurn(sid, tries) {
+    async _attachToServerTurn(sid, tries, completedTurnId = "") {
       const st0 = this.tabState[sid];
       if (this.currentId !== sid || this.streaming) {
         if (st0) st0._draining = false;
@@ -6129,6 +6098,26 @@ function portal() {
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      // `done` is intentionally emitted before slow post-turn persistence
+      // finishes, so /active can briefly still expose the broadcast that just
+      // completed. Never mistake that SAME turn for the next queue item and
+      // reconnect it: doing so flips the composer back to "replying" and
+      // removes the footer fields we just rendered. A genuinely drained queue
+      // turn has a different immutable turn_id and remains attachable below.
+      if (active && completedTurnId
+          && (!turnId || turnId === completedTurnId)) {
+        if (expect && tries > 1 && !this.streaming && this.currentId === sid) {
+          setTimeout(
+            () => this._attachToServerTurn(
+              sid, tries - 1, completedTurnId,
+            ),
+            350,
+          );
+        } else if (st) {
+          st._draining = false;
+        }
+        return;
+      }
       if (active && background && !attachable) {
         if (st) st._draining = false;
         if (st && turnId) st.activeTurnId = turnId;
@@ -6190,7 +6179,12 @@ function portal() {
         return;
       }
       if (expect && tries > 1 && !this.streaming && this.currentId === sid) {
-        setTimeout(() => this._attachToServerTurn(sid, tries - 1), 350);
+        setTimeout(
+          () => this._attachToServerTurn(
+            sid, tries - 1, completedTurnId,
+          ),
+          350,
+        );
       } else if (st) {
         st._draining = false;
       }
@@ -6377,14 +6371,16 @@ function portal() {
         delete this._bgContPollers[sid];
       }
     },
-    _reconcileCompletedContinuation(sid, ownerState, expectedText = "", attempt = 0) {
-      // The live continuation is an optimistic rendering of the server-owned
-      // transcript. Do not replace it until the canonical tail contains the
-      // final assistant text we just rendered; this avoids a persistence race
-      // making the reply disappear during the very reconciliation meant to fix it.
+    _reconcileCompletedTurn(sid, ownerState, expectedText = "", attempt = 0) {
+      // The live turn is an optimistic rendering of the server-owned
+      // transcript. `done` deliberately arrives before slow UUID/annotation
+      // bookkeeping, so poll the cheap tail until it contains a persisted
+      // boundary for THIS turn, then merge it through quiet loadSession. This
+      // gives the footer a fork id without waiting for the 10s session-list
+      // poll and never blanks/remounts the live bubbles.
       const retry = () => {
-        if (attempt < 20) {
-          this._reconcileCompletedContinuation(
+        if (attempt < 30) {
+          this._reconcileCompletedTurn(
             sid, ownerState, expectedText, attempt + 1,
           );
         }
@@ -6396,27 +6392,43 @@ function portal() {
         const stillOwned = () => this.tabState[sid] === ownerState
           && !ownerState.streaming && !ownerState.es;
         try {
-          const activeResponse = await fetch("/api/chat/sessions/" + sid + "/active", {
-            headers: this.hdr(), signal: controller.signal,
-          });
+          // `done` is intentionally early; wait for the detached backend pump
+          // to retire before swapping canonical history. The footer already
+          // has done.assistant_uuid/completed_at_ms/duration_ms, so this wait
+          // does not delay any visible completion affordance.
+          const activeResponse = await fetch(
+            "/api/chat/sessions/" + sid + "/active",
+            { headers: this.hdr(), signal: controller.signal },
+          );
           if (!stillOwned()) return;
           if (!activeResponse.ok || !!(await activeResponse.json()).active) {
             retry();
             return;
           }
-          if (expectedText) {
-            const historyResponse = await fetch(
-              "/api/chat/sessions/" + sid + "?tail=80",
-              { headers: this.hdr(), signal: controller.signal },
-            );
-            if (!stillOwned()) return;
-            if (!historyResponse.ok) { retry(); return; }
-            const history = await historyResponse.json();
-            const hasFinal = (history.messages || []).some(
-              m => m && m.role === "assistant" && (m.text || "") === expectedText,
-            );
-            if (!hasFinal) { retry(); return; }
+          const historyResponse = await fetch(
+            "/api/chat/sessions/" + sid + "?tail=80",
+            { headers: this.hdr(), signal: controller.signal },
+          );
+          if (!stillOwned()) return;
+          if (!historyResponse.ok) { retry(); return; }
+          const history = await historyResponse.json();
+          const messages = Array.isArray(history.messages) ? history.messages : [];
+          let turnStart = 0;
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            if (messages[i] && messages[i].role === "user") {
+              turnStart = i + 1;
+              break;
+            }
           }
+          const canonicalTurn = messages.slice(turnStart);
+          const hasBoundary = canonicalTurn.some(
+            m => m && m.role !== "user" && m.uuid,
+          );
+          const hasFinal = !expectedText || canonicalTurn.some(
+            m => m && m.role === "assistant" && m.uuid
+              && (m.text || "") === expectedText,
+          );
+          if (!hasBoundary || !hasFinal) { retry(); return; }
           if (!stillOwned()) return;
           const loaded = await this.loadSession(sid, { quiet: true });
           if (!loaded) retry();
@@ -6425,7 +6437,15 @@ function portal() {
         } finally {
           clearTimeout(timeout);
         }
-      }, attempt ? 250 : 80);
+      // Post-turn context accounting/transcript annotation can legitimately
+      // take tens of seconds on large sessions. Back off to a 2s ceiling for
+      // an overall ~45s barrier without generating a hot polling loop.
+      }, attempt ? Math.min(2000, 250 + attempt * 100) : 80);
+    },
+    _reconcileCompletedContinuation(sid, ownerState, expectedText = "", attempt = 0) {
+      return this._reconcileCompletedTurn(
+        sid, ownerState, expectedText, attempt,
+      );
     },
     async removePendingQueueItem(sid, idx) {
       const st = this.tabState[sid];
@@ -6754,7 +6774,20 @@ function portal() {
     // a direct fetch. Both call paths cache the latest ETag so the next
     // conditional poll always compares against a fresh baseline.
     async _pullSessionList(conditional = false, extraIds = "") {
-      if (this._sessionListPullPromise) return this._sessionListPullPromise;
+      if (this._sessionListPullPromise) {
+        const sharedResult = await this._sessionListPullPromise;
+        const requestedIds = String(extraIds || "").split(",").filter(Boolean);
+        if (!requestedIds.length
+            || requestedIds.every(id => this.sessions.some(s => s.id === id))) {
+          return sharedResult;
+        }
+        // The in-flight request was assembled before this targeted id arrived,
+        // so it cannot satisfy an out-of-window deep link. Bypass coalescing
+        // once the owner settles and issue the required id-bearing request
+        // directly; this is deterministic even before the owner's finally
+        // callback clears `_sessionListPullPromise`.
+        return await this._pullSessionListOnce(false, requestedIds.join(","));
+      }
       this._sessionListPullPromise = this._pullSessionListOnce(conditional, extraIds);
       try {
         return await this._sessionListPullPromise;
@@ -6769,7 +6802,7 @@ function portal() {
       }
       // P2 (perf): window the list to the recent N + always-include open tabs.
       // Without this every poll shipped ALL sessions (147 KB / 391 rows on a
-      // heavy archive) and the frontend re-processed all N on each assignment.
+      // large workspace) and the frontend re-processed all N on each assignment.
       // `ids` guarantees an open tab that fell outside the recent window still
       // arrives, so this.sessions.find(openTabId) never misses (tab title /
       // model resolve). The ETag is hashed over THIS windowed body server-side,
@@ -8061,60 +8094,6 @@ function portal() {
       return meta;
     },
 
-    // Create a curator-mode session and kick off the workflow. As of
-    // 2026-05-23 this covers BOTH archive tidying AND CLAUDE.md profile
-    // gap completion (the old startProfileIntake was merged in — two
-    // near-identical entry points were confusing, the curator prompt
-    // step 3b now walks the user through any blank profile sections).
-    // Confirms first (this creates a NEW session), POSTs to
-    // /api/sessions/organize, switches to it, auto-sends the bilingual
-    // initial message.
-    async startOrganize() {
-      const zh = this.lang === "zh";
-      const ok = await this.confirm({
-        title: zh ? "整理档案" : "Organize archive",
-        body: zh
-          ? "将新建一个 [整理档案] 会话：Muse 会扫描 archive、提出整理建议，并对 CLAUDE.md 里还没填的章节逐项问你。每一步动文件前都会等你确认。"
-          : "Will create a new [Organize] session: Muse scans the archive, proposes tidy-up changes, and walks through any blank CLAUDE.md profile sections. Every file-modifying step waits for your confirmation.",
-        okText: zh ? "开始" : "Start",
-      });
-      if (!ok) return;
-      const r = await fetch("/api/chat/sessions/organize", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.model, cwd: this.currentWorkspacePath() }),
-      });
-      if (!r.ok) {
-        this.toast(this.lang === "zh"
-          ? "创建失败：" + (await r.text())
-          : "Create failed: " + (await r.text()), "error", 4000);
-        return;
-      }
-      const meta = await r.json();
-      await this.refreshSessions();
-      this._captureChatPosition(this.currentId);
-      this.currentId = meta.id;
-      if (meta.cwd || this.currentWorkspacePath()) {
-        const cwd = meta.cwd || this.currentWorkspacePath();
-        this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: meta.id };
-      }
-      const st = this._ensureTabState(meta.id);
-      st.messages.length = 0;
-      st._loaded = true;
-      this._activateTabState(meta.id);
-      if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
-      this._fetchTabUsage(meta.id);
-      this.savePrefs();
-      // Auto-send the short Skill invocation returned by the backend.
-      const lang = this.lang === "en" ? "en" : "zh";
-      const initialMsg = (meta.initial_message && meta.initial_message[lang])
-        || meta.initial_message?.zh || "开始";
-      this.input = initialMsg;
-      // Defer a tick so the new session's tabState is fully wired into
-      // Alpine reactivity before send() reads `this.currentId`.
-      this.$nextTick(() => { this.send(); });
-    },
-
     // ===== tabs =====
     // Switch to (and if needed open) a tab. Used by the picker dropdown to
     // promote a history session into a tab.
@@ -8149,19 +8128,38 @@ function portal() {
     // (?session=… on cold start, or a SW postMessage on an already-open
     // tab). Guard against stale/deleted ids so a tapped-but-since-deleted
     // notification doesn't push a phantom tab.
-    async _openSessionFromDeeplink(id) {
-      if (!id) return;
+    async _openSessionFromDeeplink(id, workspace = "") {
+      if (!id) return false;
       try {
+        // Activity rows carry the owning workspace even when their session is
+        // old enough to have fallen outside the windowed session list. Restore
+        // that surface first so the eventual activation updates files,
+        // previews and chat together. Ignore stale/unregistered paths.
+        if (workspace && workspace !== this.currentWorkspacePath()
+            && this.sessionWorkspaces.some(w => w.path === workspace)) {
+          await this._changeWorkspaceSurface(workspace);
+        }
         if (!this.sessions.find(s => s.id === id)) {
           // P2: the windowed list won't include an OLD session unless we ask
           // for it by id. Force-include the deep-link target so a still-living
           // (but out-of-window) session resolves — and a since-deleted one
           // still won't appear, preserving the phantom-tab guard below.
+          // _pullSessionList detects when a normal 10s poll already owns the
+          // shared request and deterministically follows it with an id-bearing
+          // fetch; no timing-dependent retry loop is needed here.
           await this._pullSessionList(false, id);
-          if (!this.sessions.find(s => s.id === id)) return;
+          if (!this.sessions.find(s => s.id === id)) return false;
         }
-        await this.openTab(id);
-      } catch (_) { /* best-effort; ignore */ }
+        await this.activateTab(id);
+        if (this.currentId !== id) return false;
+        // activateTab intentionally no-ops when the requested tab is already
+        // current. Activity/deep-link navigation must still reveal chat on
+        // mobile and clear a stale unread dot in that case.
+        const st = this.tabState && this.tabState[id];
+        if (st && st.unread) st.unread = false;
+        if (this._isMobileLayout()) this.setMobileTab("chat");
+        return true;
+      } catch (_) { return false; }
     },
 
     // Close a tab. If it was active, hop to a neighbor; if the strip would be
@@ -9751,7 +9749,7 @@ function portal() {
       const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) return;
-      // Always upload to the archive root (MUSELAB_ROOT), regardless of
+      // Always upload to the current workspace root, regardless of
       // which file is currently open in the preview pane. Earlier this
       // dropped into the previewed file's parent directory, but that
       // made it easy to accidentally pollute deep sub-folders (`health/
@@ -9985,7 +9983,7 @@ function portal() {
       const belongsHere = s => s && (s.cwd || primary) === cwd;
       const local = this.workspaceSessions();
       if (!q) return local;
-      // Server search has answered for THIS exact query → use the full-archive
+      // Server search has answered for THIS exact query → use the full-workspace
       // result set (reaches sessions outside the recent window).
       if (this._sessionSearchQuery === q && Array.isArray(this._sessionSearchResults)) {
         return this._sessionSearchResults.filter(belongsHere);
@@ -11321,6 +11319,10 @@ function portal() {
     _preserveCanonicalMessageIdentity(st, incoming) {
       const existing = this._allPaneMessages(st);
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
+      const existingTail = existing[existing.length - 1];
+      const liveFooter = existingTail && existingTail.role !== "user"
+        ? { ts: existingTail.ts, elapsed: existingTail.elapsed }
+        : null;
       const candidates = new Map();
       for (const message of existing) {
         for (const signature of this._messageContinuitySignatures(message)) {
@@ -11347,12 +11349,37 @@ function portal() {
         if (!matched || !matched._k) continue;
         used.add(matched);
         const mountedKey = matched._k;
+        // Canonical history can become readable one request before its
+        // completion annotation sidecar. Keep the already-visible live footer
+        // facts while adopting canonical uuid/text/tool fields; a later quiet
+        // refresh may supply the same values but must never blank or jump them.
+        const liveFields = mountedKey.includes(":live:") ? {
+          ts: matched.ts,
+          elapsed: matched.elapsed,
+          memoryRecall: matched.memoryRecall,
+        } : null;
         const canonicalFields = { ...canonical };
         delete canonicalFields._k;
         Object.assign(matched, canonicalFields);
+        if (liveFields) {
+          if (liveFields.ts) matched.ts = liveFields.ts;
+          if (liveFields.elapsed) matched.elapsed = liveFields.elapsed;
+          if (liveFields.memoryRecall) matched.memoryRecall = liveFields.memoryRecall;
+        }
         matched._k = mountedKey;
         matched._noAnim = true;
         result[i] = matched;
+      }
+      // If the canonical shaper split/combined the final tool block
+      // differently, signature matching may not reuse the exact live tail.
+      // The footer still belongs to the canonical tail, so carry its immediate
+      // done-time stamp across without overwriting authoritative fields.
+      const canonicalTail = result[result.length - 1];
+      if (liveFooter && canonicalTail && canonicalTail.role !== "user") {
+        if (!canonicalTail.ts && liveFooter.ts) canonicalTail.ts = liveFooter.ts;
+        if (!canonicalTail.elapsed && liveFooter.elapsed) {
+          canonicalTail.elapsed = liveFooter.elapsed;
+        }
       }
       return result;
     },
@@ -11378,6 +11405,14 @@ function portal() {
       return false;
     },
     _appendLiveMessage(st, m) {
+      // Alpine must see footer dependencies when the live object first enters
+      // the reactive array. Tool/status messages can become the visual turn
+      // tail, so declaring these only on assistant bubbles makes a done-time
+      // assignment invisible until some unrelated render (often a refresh).
+      if (!Object.prototype.hasOwnProperty.call(m, "uuid")) m.uuid = "";
+      if (!Object.prototype.hasOwnProperty.call(m, "forkUuid")) m.forkUuid = "";
+      if (!Object.prototype.hasOwnProperty.call(m, "ts")) m.ts = null;
+      if (!Object.prototype.hasOwnProperty.call(m, "elapsed")) m.elapsed = 0;
       this._assignLiveKey(st, m);
       const target = (st._laterMessages && st._laterMessages.length)
         ? st._laterMessages : st.messages;
@@ -12480,74 +12515,6 @@ function portal() {
       return d.toLocaleDateString(this.lang === "zh" ? "zh-CN" : "en-US",
               { year: "numeric", month: "short", day: "numeric" });
     },
-    // ===== Muse main-chat empty-state opener + muse grid =====
-    // museOpener() picks a state-aware first line for Muse to render as
-    // a UI-only "Muse said" bubble at the top of a fresh chat. It's NOT a
-    // real LLM call — it's a fixed template per archive state, chosen from
-    // the new contextInfo fields (claude_md_meaningfully_filled + subdir
-    // counts). Hidden the moment the user starts typing so it doesn't
-    // distract from their own first message.
-    museOpener() {
-      const ci = this.contextInfo;
-      if (!ci || !ci._fetched) return "";
-      if (!ci.has_any_provider) return "";  // provider-warn card handles this state
-      // Count filled subdirs (excludes "archives" which is purely cold storage)
-      const subs = ci.subdir_present || {};
-      const subdir_count = Object.entries(subs).filter(
-        ([k, v]) => v && k !== "archives"
-      ).length;
-      // Files at archive root counted by archive_empty toggling false even
-      // when no subdir has content (root-level docs)
-      const has_root_files = !ci.archive_empty;
-      const profile_filled = !!ci.claude_md_meaningfully_filled;
-
-      // State 4: archive rich — ≥4 subdirs with content
-      if (subdir_count >= 4) return this.t("muse_opener.rich");
-      // State 3: some files — at least 1 subdir or root-level docs
-      if (subdir_count >= 1 || (has_root_files && profile_filled)) {
-        // Count total non-readme files across all subdirs (rough est.)
-        // archive_empty was the only sub-count we get; use subdir count as proxy
-        const n = subdir_count > 0 ? subdir_count : 1;
-        return this.t("muse_opener.some_files", { n });
-      }
-      // State 2: only profile filled, no archive files
-      if (profile_filled) return this.t("muse_opener.profile_only");
-      // State 1: nothing filled — even if CLAUDE.md *file* exists (template)
-      return this.t("muse_opener.empty");
-    },
-    museOpenerAction() {
-      // State 1 + 2 get an action button to open / fill CLAUDE.md inline.
-      const ci = this.contextInfo;
-      if (!ci || !ci._fetched || !ci.has_any_provider) return null;
-      const subs = ci.subdir_present || {};
-      const subdir_count = Object.values(subs).filter(Boolean).length;
-      if (subdir_count >= 1 || !ci.archive_empty) return null;  // states 3/4
-      return {
-        label: this.t("muse_opener.action_open_profile"),
-        // Reuse the existing /organize workflow — it walks CLAUDE.md gaps too
-        handler: () => this.startOrganize(),
-      };
-    },
-    // Click any muse in the grid → switch mascot + prefill the chat input.
-    // CRITICAL: prefill uses `m.prompt` (user-voice, "我想聊聊...") NOT
-    // `m.invite` (Muse-voice, "聊聊你..."). The card preview displays
-    // invite so it reads naturally as Muse asking; the input box gets
-    // the first-person rewrite so the grammar / perspective is correct
-    // when the user hits Enter. Falls back to invite if a muse hasn't
-    // been given a prompt yet (forward-compat safety, all 9 currently
-    // have one).
-    pickMascotAndAsk(idx) {
-      const m = this.MASCOTS[idx];
-      if (!m) return;
-      this.mascotIdx = idx;
-      try { localStorage.setItem("muselab_mascot_idx", String(idx)); } catch {}
-      this.mascotGreet = true;
-      setTimeout(() => { this.mascotGreet = false; }, 900);
-      const src = m.prompt || m.invite || null;
-      const text = src ? (src[this.lang] || src.zh) : "";
-      this.useSuggestedPrompt(text);
-    },
-
     claudeAuthPlanLabel() {
       const s = this.claudeAuth.subscription_type;
       if (!s) return "—";
@@ -17371,9 +17338,9 @@ function portal() {
         }
       }
       else {
-        // `opts.readUrl` lets callers point at a non-archive backend route
+        // `opts.readUrl` lets callers point at a non-workspace backend route
         // (e.g. bg-task .output files under /tmp via /api/chat/task-output)
-        // that the archive-scoped /api/files/read can't reach.
+        // that the workspace-scoped /api/files/read can't reach.
         const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
         const r = await fetch(readUrl, {
           headers: this.fileHdr(), signal: controller.signal,
@@ -18839,7 +18806,7 @@ function portal() {
     // ===== upload / drag-drop / mkdir =====
     async upload(ev) {
       // Multi-file picker: upload all selected files in parallel to the
-      // archive root and refresh the tree ONCE, mirroring onPreviewDrop.
+      // workspace root and refresh the tree ONCE, mirroring onPreviewDrop.
       // Previously this read files[0] only, so picking several files via
       // the upload button silently uploaded just the first one.
       const files = Array.from(ev.target.files || []);
@@ -19083,7 +19050,7 @@ function portal() {
       await this._uploadFilesToDir(targetDir, files);
     },
     // Parallel-upload a set of OS files into `targetDir` (empty string =
-    // archive root), then refresh the tree once and surface a single
+    // workspace root), then refresh the tree once and surface a single
     // result toast. Shared by onDrop (drop onto a node) and onTreeRootDrop
     // (drop onto the sticky root bar) so the two stay behaviorally in sync.
     // Same parallel-upload + batched-refresh pattern as onPreviewDrop so a
@@ -19126,7 +19093,7 @@ function portal() {
           : `Uploaded ${ok} files to ${intoLabel}`, "success", 2200);
       }
     },
-    // Drag-over / drop on the sticky root bar = target the archive root
+    // Drag-over / drop on the sticky root bar = target the workspace root
     // (targetDir = ""). This is the ONLY way to reach root when the top
     // level has no plain files to drop onto (e.g. only folders) — dropping
     // onto a folder lands INSIDE it, never at root.
@@ -19153,7 +19120,7 @@ function portal() {
         await this.moveTreeItems(srcs, "");
         return;
       }
-      // OS file upload → archive root.
+      // OS file upload → workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
       await this._uploadFilesToDir("", files);
     },
@@ -19434,9 +19401,9 @@ function portal() {
       const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建目录" : "New directory",
-        body: zh ? "输入相对根的路径，例如 archives/2026"
-                 : "Path relative to root, e.g. archives/2026",
-        placeholder: "archives/2026",
+        body: zh ? "输入相对根的路径，例如 reports/2026"
+                 : "Path relative to root, e.g. reports/2026",
+        placeholder: "reports/2026",
       });
       if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       let r;
@@ -20091,7 +20058,7 @@ function portal() {
             `### ${this.t("help.sec_layout")}`,
             this.t("help.layout_list"),
             "",
-            `${this.t("help.docs_link")} → [docs/personalize-claude-md.md](docs/personalize-claude-md.md)`,
+            `${this.t("help.docs_link")} → [README.md](README.md)`,
           ].join("\n");
           this._injectAssistantNote(md);
           return;
@@ -20217,61 +20184,13 @@ function portal() {
       this.scrollToBottom(true);
     },
 
-    // Suggest a few subdirs the user could fill in first, based on what's
-    // missing. Order: health → work → money → people → notes (most common
-    // first for a personal-archive use case).
-    onboardingSubdirs() {
-      const sp = this.contextInfo.subdir_present || {};
-      const hints = {
-        health: this.t("onboard.dir_health"),
-        work:   this.t("onboard.dir_work"),
-        money:  this.t("onboard.dir_money"),
-        people: this.t("onboard.dir_people"),
-        notes:  this.t("onboard.dir_notes"),
-      };
-      return ["health", "work", "money", "people", "notes"]
-        .filter(k => sp[k])     // only show subdirs that actually exist
-        .map(k => ({ name: k, hint: hints[k] }));
-    },
-
-    // Suggested first questions when the user has set things up but hasn't
-    // chatted yet. Tailored a bit to what data they've dropped in.
-    // Skill chips for the onboarding card — give a short, friendly example
-    // prompt that triggers each known skill (matches the 7 presets in skills/).
-    // The 7 preset skills shipped under skills/. Only labels are bespoke; the
-    // inserted prompt comes from _skillSeed() so every skill reads identically.
-    SKILL_TRIGGERS: [
-      { name: "web-search",         label_zh: "查时效数据",   label_en: "live web fact" },
-      { name: "markdown-formatter", label_zh: "整理 markdown", label_en: "clean markdown" },
-      { name: "mermaid-helper",     label_zh: "画架构图",     label_en: "draw a diagram" },
-      { name: "code-reviewer",      label_zh: "code review",  label_en: "code review" },
-      { name: "citation-formatter", label_zh: "格式化引用",   label_en: "format a citation" },
-      { name: "task-decomposer",    label_zh: "拆任务",       label_en: "decompose a goal" },
-      { name: "summary-distiller",  label_zh: "长文摘要",     label_en: "summarize" },
-    ],
-
     // Single source of truth for the prompt we seed when a user picks a skill
-    // (onboarding chip OR a skill card's "Try this"). Naming the skill
+    // from a skill card's "Try this" action. Naming the skill
     // explicitly ("用 X skill 帮我" / "Use the X skill to") makes the model read
     // it as an instruction to INVOKE that skill; the bare "用 X 帮我" form
-    // triggered less reliably. Kept identical across every entry point so the
-    // wording stays consistent everywhere.
+    // triggered less reliably.
     _skillSeed(name) {
       return this.lang === "zh" ? `用 ${name} skill 帮我：` : `Use the ${name} skill to: `;
-    },
-
-    skillSuggestions() {
-      const loaded = new Set(this.settings.skills.map(s => s.name));
-      const lang = this.lang;
-      return this.SKILL_TRIGGERS
-        .filter(t => loaded.has(t.name))
-        .map(t => ({
-          name: t.name,
-          label: lang === "zh" ? t.label_zh : t.label_en,
-          prompt: this._skillSeed(t.name),   // uniform seed across all skills
-          description: lang === "zh" ? "触发 skill: " + t.name : "Triggers skill: " + t.name,
-        }))
-        .slice(0, 6);
     },
 
     // Filter the Settings → Skills grid by free-text search (name /
@@ -20343,7 +20262,7 @@ function portal() {
         "claude_user_global":   zh ? "Claude Code 用户全局（~/.claude.json）" : "Claude Code user-global (~/.claude.json)",
         "claude_user_settings": zh ? "Claude Code 用户设置（~/.claude/settings.json）" : "Claude Code user-settings (~/.claude/settings.json)",
         "claude_user_project":  zh ? "Claude Code 项目级（~/.claude.json 的 projects）" : "Claude Code per-project (~/.claude.json projects)",
-        "archive_project":      zh ? "档案根 .mcp.json" : "archive root .mcp.json",
+        "archive_project":      zh ? "当前工作区 .mcp.json" : "current workspace .mcp.json",
       };
       return m[src] || (src || "unknown");
     },
@@ -20389,40 +20308,6 @@ function portal() {
       } catch (e) { /* network / first-boot — silent fail */ }
     },
 
-    onboardingPrompts() {
-      // Inspire prompts come from window.MUSELAB_INSPIRE_PROMPTS (a 30+
-      // tagged bilingual list). Filter to those whose tags either match
-      // an existing archive subdir or are tagged "general" (always-on).
-      // Shuffle and slice — gives a fresh-feeling sample each time the
-      // chat-empty state renders. _inspireSeed is bumped by
-      // shuffleInspirePrompts() so the user can ask for "another round"
-      // without reloading.
-      const list = window.MUSELAB_INSPIRE_PROMPTS || [];
-      const sp = this.contextInfo.subdir_present || {};
-      const lang = this.lang;
-      const eligible = list.filter(p => {
-        if (!p.tags || p.tags.length === 0) return true;
-        return p.tags.some(t => t === "general" || sp[t]);
-      });
-      // Seeded shuffle (Fisher-Yates with a tiny linear-congruential PRNG
-      // seeded by _inspireSeed) — keeps the chosen set stable as Alpine
-      // re-renders during typing, but flips on shuffleInspirePrompts().
-      const seed = this._inspireSeed || 1;
-      const a = eligible.slice();
-      let s = seed;
-      for (let i = a.length - 1; i > 0; i--) {
-        s = (s * 1664525 + 1013904223) & 0xffffffff;
-        const j = Math.abs(s) % (i + 1);
-        [a[i], a[j]] = [a[j], a[i]];
-      }
-      return a.slice(0, 5).map(p => p[lang] || p.zh);
-    },
-    shuffleInspirePrompts() {
-      // Bump the seed so onboardingPrompts() picks a different sample.
-      // +1 each time; the LCG inside onboardingPrompts spreads it.
-      this._inspireSeed = (this._inspireSeed || 1) + 1;
-    },
-
     async quickNewNote() {
       const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
@@ -20433,7 +20318,7 @@ function portal() {
       if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const trimmed = name.trim();
       if (!trimmed) return;
-      // Create empty file at archive root
+      // Create an empty file at the current workspace root.
       let r;
       try {
         r = await fetch("/api/files/write", {
@@ -20459,47 +20344,6 @@ function portal() {
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.toast(this.t("toast.saved"), "success", 1200);
     },
-
-    useSuggestedPrompt(q) {
-      this.input = q;
-      if (this.$refs.chatInput) {
-        this.$refs.chatInput.focus();
-        this.autoGrow(this.$refs.chatInput);
-      }
-    },
-
-    claudeMdChipTitle() {
-      const i = this.contextInfo;
-      if (!i.claude_md_exists) {
-        return this.t("ctx.no_claude_md", { root: i.archive_root });
-      }
-      const d = i.claude_md_mtime ? new Date(i.claude_md_mtime * 1000).toLocaleDateString() : "";
-      return this.t("ctx.claude_md_tip", { root: i.archive_root, date: d });
-    },
-    openClaudeMdHelp() {
-      this.modal = {
-        show: true,
-        title: this.t("ctx.no_claude_md_title"),
-        body: this.t("ctx.no_claude_md_body", { root: this.contextInfo.archive_root }),
-        input: null, danger: false,
-        okText: this.t("btn.confirm"),
-        confirm: () => { this.modal.show = false; },
-        cancel: () => { this.modal.show = false; },
-      };
-    },
-
-    // 2026-05-23: startProfileIntake removed — 「设置档案」按钮已合并入
-    // 「整理档案」(startOrganize). 整理档案 workflow 现在由
-    // archive-curator Skill 同时覆盖 archive 整理和 CLAUDE.md profile
-    // 补全。后端 /sessions/profile-intake 端点保留向后兼容，forward 到
-    // /sessions/organize。
-
-    // 2026-05-24: showWelcomeCard / dismissWelcome removed.
-    // The pre-setup "what is muselab + 3 steps" card was replaced by the
-    // Muse opener bubble + nine-muses grid (always-visible conversation
-    // entry points). _welcomeDismissed key is still read at init for
-    // back-compat but no longer drives any UI — safe to leave the
-    // localStorage entry in place for existing installs.
 
     // Pretty-print a USD amount for the cost badge.
     //   0          → "$0"
@@ -20842,7 +20686,7 @@ function portal() {
         // With query: filter open tabs first (substring match against name/
         // path), then run the server-side fuzzy search. Merge with open
         // matches up front so "open and matching" wins over "elsewhere in
-        // archive and matching".
+        // workspace and matching".
         const ql = q.toLowerCase();
         const openMatches = openTabs.filter(t =>
           (t.name || "").toLowerCase().includes(ql)
@@ -22310,6 +22154,7 @@ function portal() {
         cancelled = false,
         backgroundPending = false,
         authoritativeTerminal = false,
+        completionMeta = null,
       ) => {
         streamState.streaming = false;
         streamState._continuationAwaitingReaction = false;
@@ -22352,28 +22197,31 @@ function portal() {
         // Stamp the tail of the just-finished turn with completion
         // timestamp + total elapsed seconds. A "turn" = contiguous run
         // of muse-side messages between two user messages; only the tail
-        // assistant TEXT bubble carries .ts / .elapsed so .turn-footer
-        // (HH:MM · 2m50s) renders under the actual reply, not a stray
-        // tool_result row that happened to close the turn. Walk backwards
-        // past tool_use / tool_result / thinking blocks until we hit an
-        // assistant text or hit the user message that started the turn.
+        // actual tail carries .ts / .elapsed so .turn-footer
+        // (HH:MM · 2m50s) is immediately reactive even when a tool_result or
+        // status row closes the turn. We also stamp the latest assistant text
+        // as continuity metadata for the live→canonical merge.
         //
-        // elapsed: use the FE-tracked streamElapsed (matches the value
-        // the user just watched tick up next to the dots). Backend's
-        // d.duration_ms could differ slightly (covers SDK round-trip
-        // only, not the local send→connect lag), and seeing the number
-        // jump after "done" lands would feel like a bug.
-        const _now = Date.now();
-        const _elapsed = streamState.streamElapsed || 0;
+        // Prefer the backend's SDK-reported duration so the immediate footer
+        // and persisted sidecar agree after canonical reload. Fall back to the
+        // frontend timer only for older servers that omit duration_ms.
+        const meta = completionMeta || {};
+        const completedAtMs = Number(meta.completedAtMs) || 0;
+        const durationMs = Number(meta.durationMs) || 0;
+        const assistantUuid = String(meta.assistantUuid || "");
+        const _now = completedAtMs > 0 ? completedAtMs : Date.now();
+        const _elapsed = durationMs > 0
+          ? durationMs / 1000
+          : (streamState.streamElapsed || 0);
         const turnMessages = this._allPaneMessages(streamState);
         const _stamp = (m) => {
-          m.ts = _now;
+          if (!m.ts) m.ts = _now;
           if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
         };
         // Tail-most muse-side message of THIS turn, used when the turn has no
         // assistant text bubble of its own to hang the footer on.
         let tailCandidate = null;
-        let stamped = false;
+        let stampedAssistant = null;
         for (let k = turnMessages.length - 1; k >= 0; k--) {
           const m = turnMessages[k];
           if (m.role === "user") break;          // entered the previous turn
@@ -22385,15 +22233,24 @@ function portal() {
           // earlier, finished turn — we've walked out of this one.
           if (m.ts) break;
           _stamp(m);                              // found the tail text bubble
-          stamped = true;
+          stampedAssistant = m;
           break;                                  // stop after the first one (most recent)
         }
-        // Turns whose visible tail is not an assistant text bubble — notably a
-        // background-task continuation that only reported the task result —
-        // used to leave the footer with nothing in it: the walk above found
-        // the PREVIOUS turn's already-stamped bubble and bailed, so this
-        // turn's tail never got a time. Stamp it directly.
-        if (!stamped && tailCandidate && !tailCandidate.ts) _stamp(tailCandidate);
+        // The footer is mounted on the actual turn-tail node. Stamp that node
+        // regardless of whether an assistant bubble was found above; otherwise
+        // tool-ending turns only gain their time after a later refresh.
+        if (tailCandidate && tailCandidate !== stampedAssistant) {
+          _stamp(tailCandidate);
+        }
+        // `done` can carry the persisted assistant boundary before the
+        // canonical transcript/sidecar is readable. Put it on the reactive
+        // visual tail too so the fork affordance appears in the same frame.
+        // Keep it separate from `.uuid`: a tool_result's canonical identity is
+        // not the assistant boundary, and polluting it would make continuity
+        // matching reuse the wrong DOM node during quiet reconciliation.
+        if (tailCandidate && assistantUuid && !tailCandidate.forkUuid) {
+          tailCandidate.forkUuid = assistantUuid;
+        }
         if (this.currentId === streamSid) {
           this.streaming = false;
           this.es = null;
@@ -22509,17 +22366,28 @@ function portal() {
         // stop — stop closes the ES). The relevant case for this branch
         // is page-reload-then-reconnect picking up a turn that finished
         // after being cancelled before reload.
-        const continuationFinalText = isContinuation && ownsCurBubble()
-          ? (curBubble.text || "") : "";
+        const completedFinalText = ownsCurBubble() ? (curBubble.text || "") : "";
+        const continuationFinalText = isContinuation ? completedFinalText : "";
         const backgroundPending = !d.cancelled
           ? Math.max(0, Number(d.background_tasks_pending) || 0)
           : 0;
+        const completedTurnId = String(
+          d.turn_id || streamState.activeTurnId || expectedTurnId || "",
+        );
         es.close();
-        _markDone(!!d.cancelled, backgroundPending, true);
+        _markDone(!!d.cancelled, backgroundPending, true, {
+          assistantUuid: d.assistant_uuid,
+          completedAtMs: d.completed_at_ms,
+          durationMs: d.duration_ms,
+        });
         _stopTimer();
         if (isContinuation && !d.cancelled) {
           this._reconcileCompletedContinuation(
             streamSid, streamState, continuationFinalText,
+          );
+        } else if (!d.cancelled) {
+          this._reconcileCompletedTurn(
+            streamSid, streamState, completedFinalText,
           );
         }
         const _viewedStream = this.currentId === streamSid
@@ -22568,7 +22436,9 @@ function portal() {
             }, 800);
           }
         } else {
-          this.$nextTick(() => this._drainPendingQueue(streamSid));
+          this.$nextTick(
+            () => this._drainPendingQueue(streamSid, completedTurnId),
+          );
         }
         // If this turn left an SDK background task running (its card is still
         // ⏳), start polling /active so the server's continuation turn (card
@@ -23308,7 +23178,7 @@ function portal() {
       }
     },
     // Fetch files matching the current palette query against the whole
-    // archive (not just loaded tree rows). Called from the palette input's
+    // workspace (not just loaded tree rows). Called from the palette input's
     // debounced @input. Idempotent — skips if the query hasn't changed.
     async _fetchPaletteFiles() {
       const q = this.palette.query.trim();
@@ -23386,7 +23256,7 @@ function portal() {
         });
       }
 
-      // 3) Files — server-side search across the whole archive (not
+      // 3) Files — server-side search across the whole workspace (not
       // limited to the loaded tree view). Results in palette.fileResults
       // are pre-filtered server-side by name match; we still pass them
       // through the substring scorer below so they get ordered together
@@ -23846,7 +23716,15 @@ function portal() {
       this.activity.show = false;
       const ack = this.ackActivityEvent(item);
       const sid = item.session_id || item.thread_id;
-      if (sid) await this._openSessionFromDeeplink(sid);
+      const opened = sid
+        ? await this._openSessionFromDeeplink(
+          sid, item.workspace || item.cwd || "",
+        )
+        : false;
+      if (!opened) {
+        this.toast(this.lang === "zh" ? "关联会话不可用或已删除" :
+          "The linked session is unavailable or was deleted", "warn", 3000);
+      }
       await ack;
       this._syncAppBadge();
     },
@@ -24643,6 +24521,19 @@ function portal() {
       const sid = (t && t.session_id) || t;
       if (!sid) return;
       await this._openSessionFromDeeplink(sid);
+    },
+    async openSchedRunSession(run) {
+      const sid = run && run.session_id;
+      if (!sid) return false;
+      this.closeScheduler();
+      const opened = await this._openSessionFromDeeplink(
+        sid, run.workspace || run.cwd || "",
+      );
+      if (!opened) {
+        this.toast(this.lang === "zh" ? "此次运行的会话不可用或已删除" :
+          "This run's session is unavailable or was deleted", "warn", 3000);
+      }
+      return opened;
     },
     fmtSchedTime(ts) {
       if (!ts) return "—";

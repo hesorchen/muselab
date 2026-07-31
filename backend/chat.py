@@ -2680,16 +2680,16 @@ _ORPHAN_GC_INTERVAL_S = 3600   # at most hourly
 def _attachments_base() -> Path:
     """Root dir for user-uploaded image originals.
 
-    Lives under the user's ARCHIVE ROOT (`MUSELAB_ROOT`), not inside the
+    Lives under the primary workspace (`MUSELAB_ROOT`), not inside the
     muselab repo. Two reasons:
       1. The repo's `sessions/` dir was already gitignored, but conceptually
          user-data shouldn't sit in the install dir at all — uninstall /
          reinstall / git clean should never touch the user's files.
-      2. archive root is where the user already keeps their docs; this
-         keeps "everything personal" in one place that's easy to back up.
+      2. The workspace is already the user-selected data boundary, keeping
+         source files and generated attachments together for backup.
 
     Hidden (dot-prefixed) so it doesn't clutter the user's file browser
-    or archive UI tree.
+    or workspace file tree.
     """
     return ROOT / ".muselab-attach"
 
@@ -3118,78 +3118,15 @@ def create_session_api(req: CreateReq) -> dict:
     return meta
 
 
-def _seed_claude_md_and_archive_skeleton(root: Path = ROOT) -> None:
-    """If CLAUDE.md / archive skeleton dirs are missing under ROOT, seed
-    them from the locale-aware template files in scripts/templates/.
-    Idempotent — every step skips if the target already exists. Called
-    by /sessions/organize (and historically by /sessions/profile-intake)
-    so the curator agent's first Read tool call has something to read on
-    a brand-new install.
-    """
-    import datetime as _dt
-
-    project_claude_md = root / "CLAUDE.md"
-    is_zh = is_chinese_locale()
-    repo_root = Path(__file__).resolve().parent.parent
-
-    if not project_claude_md.exists():
-        tpl_name = "default-CLAUDE.md" if is_zh else "default-CLAUDE.en.md"
-        tpl_path = repo_root / "scripts" / "templates" / tpl_name
-        if tpl_path.exists():
-            content = tpl_path.read_text(encoding="utf-8")
-            content = content.replace(
-                "%DATE%", _dt.datetime.now().strftime("%Y-%m-%d"))
-            try:
-                project_claude_md.write_text(content, encoding="utf-8")
-            except OSError as e:
-                # Don't block session creation — agent will fail more
-                # informatively when it tries to Read a non-existent file.
-                sys.stderr.write(
-                    f"[organize] couldn't seed CLAUDE.md: {e}\n")
-                sys.stderr.flush()
-
-    # Drop archive-skeleton subdirs so the user's first interaction has
-    # the right shape on disk. Skip ones that already exist. Mirrors
-    # what scripts/install-*.sh and intake.* do — README + concrete
-    # _example-*.md per supported subdir, so the chat-driven path
-    # produces the same starter skeleton as the installer path.
-    skel_root = repo_root / "scripts" / "templates" / "archive-skeleton"
-    readme_src = "README.md" if is_zh else "README.en.md"
-    example_suffix = ".zh.md" if is_zh else ".en.md"
-    examples_for_sub = {
-        "health":  "_example-checkup",
-        "work":    "_example-project-log",
-        "money":   "_example-budget",
-        "notes":   "_example-weekly-review",
-        "people":  "_example-person-card",
-        # archives/ intentionally has no example — it's a raw-source dir
-    }
-    for sub in ("health", "work", "money", "people", "notes", "archives"):
-        sd = root / sub
-        if not sd.exists():
-            try:
-                sd.mkdir(parents=True, exist_ok=True)
-                src = skel_root / sub / readme_src
-                if src.exists():
-                    shutil.copy(src, sd / "README.md")
-                ex_basename = examples_for_sub.get(sub)
-                if ex_basename:
-                    ex_src = skel_root / sub / (ex_basename + example_suffix)
-                    ex_dst = sd / (ex_basename + ".md")
-                    if ex_src.exists() and not ex_dst.exists():
-                        shutil.copy(ex_src, ex_dst)
-            except OSError:
-                pass
-
-
 @router.post("/sessions/organize", dependencies=[Depends(require_token)])
 def create_organize_session_api(req: CreateReq | None = None) -> dict:
     """Create a normal SDK session and return a Skill-invoking starter.
 
-    The ``archive-curator`` Skill does BOTH archive tidying AND CLAUDE.md
-    profile completion. No custom system prompt is attached to the session.
-    If CLAUDE.md / archive subdirs are missing, they're seeded from templates
-    so the Skill's first Read tool call has something to work with.
+    The ``workspace-curator`` Skill inventories the selected workspace and
+    proposes reversible organization changes. This endpoint deliberately
+    creates no files or directories: organizing a workspace must not opt the
+    user into a personal-profile template or a predefined directory taxonomy.
+    No custom system prompt is attached to the session.
 
     Returns session metadata + an initial_message the frontend should
     auto-send to kick off the workflow. See backend/prompts.py."""
@@ -3199,10 +3136,9 @@ def create_organize_session_api(req: CreateReq | None = None) -> dict:
         workspace = workspace_registry.resolve(req.cwd if req else None)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    _seed_claude_md_and_archive_skeleton(workspace)
-    # Locale-aware default label so English users don't see "[整理档案]" in
-    # their tab strip. Mirrors install scripts.
-    _label = "[整理档案] " if is_chinese_locale() else "[Organize] "
+    # Locale-aware default label, expressed in workspace rather than personal
+    # archive terms.
+    _label = "[整理工作区] " if is_chinese_locale() else "[Organize workspace] "
     name = (req.name if req else None) or (
         _label + _dt.datetime.now().strftime("%m-%d %H:%M"))
     model = (req.model if req else None) or MODEL
@@ -3216,14 +3152,12 @@ def create_organize_session_api(req: CreateReq | None = None) -> dict:
 
 @router.post("/sessions/profile-intake", dependencies=[Depends(require_token)])
 def create_profile_intake_session_api(req: CreateReq | None = None) -> dict:
-    """DEPRECATED 2026-05-23 — kept for external API back-compat. The
-    profile-intake flow has been merged into /sessions/organize (single
-    button in the UI). New callers should hit /sessions/organize; this
-    endpoint now just forwards to it so any old saved bookmark / curl
-    script still works.
+    """Deprecated compatibility forward to the generic organizer.
 
-    The old profile-specific system prompt was removed; the shared
-    ``archive-curator`` Skill now owns this workflow."""
+    New callers should use ``/sessions/organize``. This route intentionally
+    performs no profile intake and creates no ``CLAUDE.md`` or personal-data
+    directory; it only preserves old bookmarks and API clients.
+    """
     return create_organize_session_api(req)
 
 
@@ -6244,10 +6178,9 @@ def _claude_md_filled_ratio(path: Path) -> tuple[int, float]:
 
     Returns (filled_content_lines, fill_ratio_0_to_1).
 
-    The install script seeds CLAUDE.md with a 100+ line bilingual template
-    full of section headers and empty placeholders ("Name:", "Birth year:",
-    bullet labels with nothing after the colon). Just checking `lines > 0`
-    is a lie — that's "file exists", not "user actually told Muse anything."
+    Older releases and optional intake helpers could seed a long template full
+    of section headers and empty placeholders. Just checking ``lines > 0``
+    would confuse "file exists" with "contains effective instructions."
 
     We count a line as "filled" only if it carries user content:
       - skip blank lines, pure markdown punctuation (---, ===, |...|)
@@ -6293,9 +6226,9 @@ def _claude_md_filled_ratio(path: Path) -> tuple[int, float]:
         total_content += 1
         # "Label:" with nothing meaningful after → unfilled prompt
         # Examples seeded by template:
-        #   "- Name / how you'd like Muse to address you:"
-        #   "- Birth year (an age range is fine):"
-        #   "姓名 / 你希望 Muse 如何称呼你："
+        #   "- Project name:"
+        #   "- Validation command:"
+        #   "项目名称："
         # If the line ends in ":" or "：", or has only label-colon-whitespace,
         # it's an unfilled prompt.
         if s.endswith(":") or s.endswith("："):
@@ -6337,38 +6270,33 @@ def _scan_claude_md_source(scope: str, path: Path) -> dict | None:
 def context_info(
     workspace_root: Path = Depends(resolve_workspace_root),
 ) -> dict:
-    """Information about what Muse can see — used by the UI's onboarding
-    hints (does the user have a CLAUDE.md? archive empty? skills loaded?
-    has any working auth?). All paths relative to ROOT for safety.
+    """Information about the selected workspace and available model context.
 
     SDK options pass `setting_sources=["user", "project", "local"]`, so
-    "Muse knows you" if any of these CLAUDE.md sources exist:
-      - project scope: ROOT/CLAUDE.md  (the user's autobiographical brief)
-      - project local override: ROOT/CLAUDE.local.md  (gitignored personal)
-      - project dot scope: ROOT/.claude/CLAUDE.md  (rarer, but SDK loads it)
-      - user scope: ~/.claude/CLAUDE.md  (cross-archive global)
-      - per-subdir: ROOT/{subdir}/CLAUDE.md  (e.g. health/CLAUDE.md to
-        scope rules to one domain; the SDK loads these lazily when Muse
-        Reads inside the dir)
+    project instructions can come from these CLAUDE.md sources:
+      - project scope: workspace/CLAUDE.md
+      - project local override: workspace/CLAUDE.local.md
+      - project dot scope: workspace/.claude/CLAUDE.md
+      - user scope: ~/.claude/CLAUDE.md
+      - per-subdir: workspace/{subdir}/CLAUDE.md
 
     We also distinguish "file exists" from "file actually has user content"
     via a filled-ratio heuristic — the install script seeds a long bilingual
-    template, so plain `lines > 0` would falsely report "yes, Muse knows
-    you" right after install.
+    template, so plain ``lines > 0`` is not a useful readiness signal.
     """
-    # Project-scope candidates at archive root
+    # Project-scope candidates in the selected workspace.
     candidates: list[tuple[str, Path]] = [
         ("project",       workspace_root / "CLAUDE.md"),
         ("project_local", workspace_root / "CLAUDE.local.md"),
         ("project_dot",   workspace_root / ".claude" / "CLAUDE.md"),
         ("user",          Path.home() / ".claude" / "CLAUDE.md"),
     ]
-    # Per-subdirectory CLAUDE.md (one level deep, skip hidden / archives)
+    # Per-subdirectory CLAUDE.md (one level deep, skip hidden control dirs).
     try:
         for sub in sorted(workspace_root.iterdir()):
             if not sub.is_dir():
                 continue
-            if sub.name.startswith(".") or sub.name == "archives":
+            if sub.name.startswith("."):
                 continue
             candidates.append((f"subdir:{sub.name}", sub / "CLAUDE.md"))
     except OSError:
@@ -6407,51 +6335,50 @@ def context_info(
     # the existing UI keeps working without changes.
     total_lines = sum(s["lines"] for s in sources)
     latest_mtime = max((s["mtime"] for s in sources), default=0.0)
-    # NEW: distinguish "file present" from "user actually filled it".
-    # Onboarding logic needs this: a freshly-installed CLAUDE.md is a
-    # 100+ line template with zero user content — UI should still treat
-    # the profile as empty and prompt the user to fill it out.
+    # Distinguish "file present" from "contains effective instructions".
+    # A freshly installed template can be long while containing no configured
+    # values, so consumers need a readiness signal beyond file existence.
     meaningfully_filled = any(s["meaningfully_filled"] for s in sources)
+    workspace_empty = True
+    subdir_present: dict[str, bool] = {}
+    try:
+        for item in workspace_root.iterdir():
+            # Hidden entries are workspace/runtime control state from the file
+            # browser's default perspective. Instruction files are reported
+            # separately above and do not by themselves make a workspace ready
+            # for file organization.
+            if (
+                item.name.startswith(".")
+                or item.name in {"CLAUDE.md", "CLAUDE.local.md"}
+            ):
+                continue
+            workspace_empty = False
+            if item.is_dir():
+                subdir_present[item.name] = True
+    except OSError:
+        pass
+
     info: dict = {
-        "archive_root": str(workspace_root),
         "workspace_root": str(workspace_root),
+        "workspace_empty": workspace_empty,
         "claude_md_exists": len(sources) > 0,
         "claude_md_lines": total_lines,
         "claude_md_mtime": latest_mtime,
         "claude_md_sources": sources,
         "claude_md_meaningfully_filled": meaningfully_filled,
-        "archive_empty": True,
-        "subdir_present": {},
         "has_claude_oauth": claude_oauth,
         "has_anthropic_api": anthropic_api,
         "third_party_configured": third_party_configured,
         "has_any_provider": (
             claude_oauth or anthropic_api or len(third_party_configured) > 0
         ),
+        # Deprecated for one compatibility cycle. New consumers must use the
+        # workspace_* names; subdir_present is now a dynamic directory map and
+        # no longer advertises a predefined directory taxonomy.
+        "archive_root": str(workspace_root),
+        "archive_empty": workspace_empty,
+        "subdir_present": subdir_present,
     }
-    # Subdirs the install scripts create — used to nudge "drop a doc into X"
-    for sub in ("health", "work", "money", "people", "notes", "archives"):
-        d = workspace_root / sub
-        present = d.exists() and d.is_dir()
-        info["subdir_present"][sub] = present
-        if present:
-            # Count any file other than the README to decide "empty"
-            try:
-                non_readme = [p for p in d.iterdir()
-                              if p.is_file() and p.name.lower() != "readme.md"]
-                if non_readme:
-                    info["archive_empty"] = False
-            except OSError:
-                pass
-    # If the root itself has user docs (not a subdir-only setup), also count
-    if info["archive_empty"]:
-        try:
-            for p in workspace_root.iterdir():
-                if p.is_file() and p.name not in ("CLAUDE.md",):
-                    info["archive_empty"] = False
-                    break
-        except OSError:
-            pass
     return info
 
 
@@ -8292,7 +8219,9 @@ def _render_continuation_message(msg, state: dict):
         right per-tool renderer.
       - "streamed": list of text chunks already emitted via text_delta, so the
         AssistantMessage TextBlock only tail-emits the suffix the stream skipped
-        (mirrors event_gen's streamed_in_bubble dedup)."""
+        (mirrors event_gen's streamed_in_bubble dedup).
+      - "assistant_uuid": latest persisted AssistantMessage UUID, exposed in
+        the terminal done payload so the live footer can fork immediately."""
     if isinstance(msg, StreamEvent):
         ev = getattr(msg, "event", None) or {}
         if ev.get("type") != "content_block_delta":
@@ -8309,6 +8238,9 @@ def _render_continuation_message(msg, state: dict):
             if chunk:
                 yield {"event": "thinking", "data": json.dumps({"text": chunk})}
     elif isinstance(msg, AssistantMessage):
+        assistant_uuid = getattr(msg, "uuid", None)
+        if assistant_uuid:
+            state["assistant_uuid"] = str(assistant_uuid)
         for block in msg.content:
             if isinstance(block, TextBlock):
                 full = getattr(block, "text", "") or ""
@@ -8416,6 +8348,7 @@ async def _watch_inflight_tasks(
         cont_state = {
             "tool_use_names": {},
             "streamed": [],
+            "assistant_uuid": "",
             # Claude Code normally reacts to a terminal TaskNotification
             # automatically. Some provider/CLI combinations persist the
             # notification and then close receive_messages() before that
@@ -8425,7 +8358,10 @@ async def _watch_inflight_tasks(
             "incomplete_error": None,
         }
 
-    async def _close_continuation(cancelled: bool = False) -> None:
+    async def _close_continuation(
+        cancelled: bool = False,
+        duration_ms: int | None = None,
+    ) -> None:
         """Emit a terminal `done`, finish the broadcast, drop it from
         _active_turns (identity-checked so we never pop a newer turn's slot),
         and grace-keep it for a slightly-late FE reconnect."""
@@ -8437,10 +8373,14 @@ async def _watch_inflight_tasks(
         if b is None:
             return
         incomplete_error = (state or {}).get("incomplete_error")
+        completed_at_ms = int(time.time() * 1000)
         done_payload = {
             "cancelled": cancelled,
             "model": b.model,
             "continuation": True,
+            "duration_ms": duration_ms,
+            "assistant_uuid": (state or {}).get("assistant_uuid") or "",
+            "completed_at_ms": completed_at_ms,
             "background_tasks_pending": len(pending),
         }
         if incomplete_error:
@@ -8478,13 +8418,17 @@ async def _watch_inflight_tasks(
                     # reply of its own resolves to the previous turn's
                     # assistant message, which already has that timestamp.
                     if "ts" not in (existing.get(asst_uuid) or {}):
-                        cont_elapsed = round(
-                            max(0.0, time.time() - b.started_at), 1)
+                        cont_elapsed = (
+                            round(duration_ms / 1000, 1)
+                            if duration_ms
+                            else round(
+                                max(0.0, time.time() - b.started_at), 1)
+                        )
                         await asyncio.to_thread(
                             sess.set_message_annotation,
                             session_id, asst_uuid,
                             model=b.model,
-                            ts=int(time.time() * 1000),
+                            ts=completed_at_ms,
                             elapsed_s=(
                                 cont_elapsed if cont_elapsed >= 1 else None),
                         )
@@ -8752,7 +8696,8 @@ async def _watch_inflight_tasks(
                     # End of the CLI's auto-continue reaction — close the
                     # continuation. If tasks remain in flight, keep reading for
                     # their (later) notifications; otherwise we're done.
-                    await _close_continuation()
+                    await _close_continuation(
+                        duration_ms=getattr(msg, "duration_ms", None))
                     if not pending:
                         break
                 else:
@@ -9305,6 +9250,11 @@ async def _start_turn(
     # is read only for truthiness at the end; streamed_in_bubble's content is
     # joined once per AssistantMessage (infrequent). (perf: RED — chat.py O(n²))
     assistant_acc: list[str] = []
+    # The SDK gives the persisted transcript UUID on AssistantMessage before
+    # ResultMessage closes the turn. Retain the latest one so the early `done`
+    # event can identify the reply immediately, without waiting for the slower
+    # post-turn transcript scan below.
+    last_assistant_uuid = ""
     # Set only after a Memory write has been accepted by the tracked scheduler.
     # The detached pump uses this to retain failure/cancel evidence if a forced
     # interrupt prevents the SDK from emitting its terminal ResultMessage.
@@ -9742,13 +9692,16 @@ async def _start_turn(
               3. Iterate content blocks — tail-emit TextBlock suffix the
                  stream may have skipped; forward tool_use / tool_result.
             """
-            nonlocal assistant_acc, streamed_in_bubble
+            nonlocal assistant_acc, streamed_in_bubble, last_assistant_uuid
             if error_info := _sdk_assistant_error(msg):
                 turn_sdk_errors.append(error_info)
                 # Synthetic API-error assistants often carry the raw error as a
                 # TextBlock. Do not render it as if it were a normal Muse reply;
                 # the terminal done event below surfaces the classified failure.
                 return
+            assistant_uuid = getattr(msg, "uuid", None)
+            if assistant_uuid:
+                last_assistant_uuid = str(assistant_uuid)
             a_usage = getattr(msg, "usage", None) or {}
             if a_usage:
                 in_t = int(a_usage.get("input_tokens", 0) or 0)
@@ -10055,8 +10008,8 @@ async def _start_turn(
 
         async def _handle_result_message(msg):
             """ResultMessage = turn complete. Update cumulative cost / stats,
-            write per-message sidecar annotations, bump session metadata, then
-            yield the consolidated 'done' SSE event the FE awaits."""
+            yield the consolidated 'done' SSE event the FE awaits, then finish
+            slower per-message annotations and session metadata bookkeeping."""
             nonlocal memory_outcome_scheduled
             cost = getattr(msg, "total_cost_usd", None) or 0.0
             u = getattr(msg, "usage", {}) or {}
@@ -10120,8 +10073,14 @@ async def _start_turn(
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
             )
+            # Capture once at the SDK's authoritative terminal boundary. The
+            # sidecar write happens after slower context/transcript work, but it
+            # must persist the same completion instant the browser saw in done.
+            _completed_at_ms = int(time.time() * 1000)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
+                "assistant_uuid": last_assistant_uuid,
+                "completed_at_ms": _completed_at_ms,
                 "total_cost_usd": cost,
                 "model": model_to_use,
                 "stats": _stats,
@@ -10285,7 +10244,7 @@ async def _start_turn(
                             new_user_uuid = sm.uuid
                     if new_asst_uuid and new_user_uuid:
                         break
-            if new_asst_uuid and assistant_acc:
+            if new_asst_uuid:
                 # ts (ms epoch) stamps the turn's completion time. The
                 # frontend's turn-footer (.turn-footer in index.html)
                 # reads it via fmtHM() → "HH:MM" under the last muse
@@ -10304,7 +10263,7 @@ async def _start_turn(
                 sess.set_message_annotation(
                     session_id, new_asst_uuid,
                     cost=f"${cost:.4f}", model=model_to_use,
-                    ts=int(time.time() * 1000),
+                    ts=_completed_at_ms,
                     elapsed_s=_elapsed_s)
             if new_user_uuid and (persisted_imgs or persisted_docs):
                 sess.set_message_annotation(
@@ -10409,14 +10368,13 @@ async def _start_turn(
                                     break
                         except Exception:
                             pass
-                        # Body intentionally carries NO reply content. A
-                        # personal-archive reply often contains health /
-                        # money / private details; a 120-char preview would
-                        # surface on the lock screen for anyone to read. The
-                        # actual reply is one tap away in-app. (This matches
-                        # the "No preview text" comment above — an earlier
-                        # version put a 120-char reply preview here, leaking
-                        # exactly that content and contradicting the comment.)
+                        # Body intentionally carries NO reply content. Workspace
+                        # replies can contain private source text, credentials-
+                        # adjacent details, or unpublished work; a preview would
+                        # surface it on the lock screen. The actual reply is one
+                        # tap away in-app. (This matches the "No preview text"
+                        # comment above — an earlier version put reply text here
+                        # and contradicted that privacy boundary.)
                         _body = "Muse 已回复"
                         # pywebpush does synchronous per-subscription HTTPS
                         # (TTL + retries); offload to a thread so a slow/dead

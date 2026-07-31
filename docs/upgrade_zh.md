@@ -41,7 +41,11 @@ git add uv.lock pyproject.toml && git commit -m "chore: bump claude-agent-sdk"
 
 ## 保留的内容
 
-升级永远不动 `.env`、`sessions/` 或你的归档。被锁定的 `claude` CLI 版本在 `scripts/versions.env`（并在 Dockerfile 里镜像一份）；`upgrade.sh` 会把你带到最新。没有 schema 迁移步骤 —— JSON 状态文件向前兼容，少数确实存在的迁移（如 VAPID 密钥格式）在后端启动时自动执行。
+升级不会删除 `.env`、配置的会话元数据目录或工作区数据。重跑对应平台的安装脚本
+会保留 `.env` 已有值，仅在缺少 `MUSELAB_SESSIONS_DIR` 时补入当前 checkout 的绝对
+`sessions/` 路径。被锁定的 `claude` CLI 版本在 `scripts/versions.env`（并在
+Dockerfile 里镜像一份）；`upgrade.sh` 会把你带到最新。没有 schema 迁移步骤——
+JSON 状态文件向前兼容，少数确实存在的迁移（如 VAPID 密钥格式）在后端启动时自动执行。
 
 ## Docker
 
@@ -51,4 +55,4 @@ git add uv.lock pyproject.toml && git commit -m "chore: bump claude-agent-sdk"
 docker compose pull && docker compose up -d
 ```
 
-你的归档和 `.env` 是 bind-mount 挂载的，重建后依然保留。
+宿主机工作区和 `.env` 是 bind-mount 挂载的，重建后依然保留。

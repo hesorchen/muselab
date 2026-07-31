@@ -1153,7 +1153,7 @@ def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
 # Default 100 MB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
 MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 100, min_value=1) * 1024 * 1024
 # Filename extensions that are likely to be hostile or pointless to host in
-# a personal archive. Block at upload (cleaner than after-the-fact cleanup).
+# a local workspace. Block at upload (cleaner than after-the-fact cleanup).
 UPLOAD_BLOCKED_SUFFIX = {
     ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".cmd",
     ".ps1",  # PowerShell scripts — block by default; allow via .env override later
@@ -1545,7 +1545,7 @@ MAX_GREP_TIME_SEC = 8            # soft time budget
 _DIR_CACHE: dict[str, tuple[float, list[tuple[str, bool]]]] = {}
 _DIR_CACHE_LOCK = threading.Lock()
 # Bound the cache so a pathological archive (millions of dirs) can't
-# OOM the process. Typical personal archives have 50-500 dirs total,
+# OOM the process. Typical local workspaces have 50-500 dirs total,
 # so this rarely matters. On overflow we drop the oldest insertion.
 _DIR_CACHE_MAX = 5000
 

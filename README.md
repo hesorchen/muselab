@@ -15,29 +15,16 @@
 
 <table align="center">
 <tr>
-<td align="center"><a href="promo/media/screenshot-desktop.png"><img src="promo/media/screenshot-desktop.png" width="470" alt="桌面端完整工作台"></a></td>
-<td align="center"><a href="promo/media/screenshot-desktop-terminal.png"><img src="promo/media/screenshot-desktop-terminal.png" width="470" alt="桌面端真实 Unix PTY 终端"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="210" alt="移动端浅色预览"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile.png"><img src="promo/media/screenshot-mobile.png" width="210" alt="移动端深色预览"></a></td>
 </tr>
 <tr>
-<td align="center">桌面端 · 文件、预览与对话</td>
-<td align="center">桌面端 · 真实 Unix PTY 终端</td>
+<td align="center">移动端 · 浅色主题</td>
+<td align="center">移动端 · 深色主题</td>
 </tr>
 </table>
 
-<table align="center">
-<tr>
-<td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="210" alt="移动端文件区"></a></td>
-<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="210" alt="移动端预览区"></a></td>
-<td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="210" alt="移动端对话区"></a></td>
-</tr>
-<tr>
-<td align="center">移动端 · 文件区</td>
-<td align="center">移动端 · 原生预览</td>
-<td align="center">移动端 · Agent 对话</td>
-</tr>
-</table>
-
-<p align="center"><sub>点击任意图片查看原图</sub></p>
+<p align="center"><sub>公开演示数据；点击图片查看原图</sub></p>
 
 ## 核心特性
 
@@ -82,13 +69,11 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 
 ## 会话实践
 
-> 「这是我今年的体检报告，你帮我和去年那份对比一下，把指标变化做成一页 HTML 趋势报告。」
+> 「检查这个项目最近的改动，找出测试变慢的原因，修复后跑验证，并把结论写到 `docs/performance-note.md`。」
 
-Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带图表的单文件 HTML——预览区直接渲染。你接着说：
+Muse 在当前工作目录中读取代码和 Git diff，通过真实终端运行定向测试，修改相关文件并复验；生成的说明文档可以直接在预览区查看。切换到另一个工作目录后，文件树、终端、新会话和上下文也会随之切换。
 
-> 「再结合 `money/` 里的保单，看看这些变化指标有没有保障缺口。」
-
-两个领域的档案在同一个会话里交叉分析，提供具体指导。
+代码、研究资料或知识库都可以作为普通工作目录使用，不要求固定目录结构。
 
 🌐 更多场景演示见 [muselab 介绍页](https://hesorchen.github.io/muselab/promo/)。
 
@@ -96,9 +81,9 @@ Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带
 
 | 方案 | 局限 | muselab 怎么做 |
 |---|---|---|
-| ChatGPT / Claude.ai | 文件临时上传、记忆内容黑盒 | 归档文件常驻本地，白盒记忆机制 |
-| Claude Code | 生在终端、为代码而生 | 同一套 Agent Harness，面向生活，电脑手机多端可用 |
-| RAG 文档问答 | 切块 + 检索，跨文档语义有损，适合海量文档 | 保存资料文档，完整文件理解，零语义损耗 |
+| ChatGPT / Claude.ai | 文件通常需要上传，工作目录与执行环境不连续 | 本地工作目录、生成文件和可检查的上下文持续保留 |
+| Claude Code | 终端优先，适合直接在本机 CLI 中工作 | 同一套 Agent Harness，增加浏览器文件、预览、真实终端、多工作目录与移动端访问 |
+| RAG 文档问答 | 切块 + 检索适合海量文档，但不提供完整执行环境 | Agent 按需读取完整文件，并可通过工具与终端执行多步骤任务 |
 
 完整对比（Open WebUI / LobeChat / AnythingLLM / claudecodeui 等）见[同类对比](docs/comparison_zh.md)。
 
@@ -121,7 +106,7 @@ Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带
 **[📚 完整文档索引](docs/README_zh.md)**
 
 - **上手：** [快速入门](docs/quickstart_zh.md) · [Linux 安装](docs/install-linux_zh.md) · [macOS 安装](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
-- **使用：** [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [终端](docs/terminal_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
+- **使用：** [配置工作区 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [终端](docs/terminal_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
 - **模型：** [Providers](docs/providers_zh.md) · [Codex Gateway](docs/codex-gateway_zh.md) · [接入新 provider](docs/add-provider_zh.md) · [模型路由](docs/routing_zh.md)
 - **内部机制：** [架构](docs/architecture_zh.md) · [会话](docs/backend-sessions_zh.md) · [Files API](docs/backend-files_zh.md) · [安全模型](docs/backend-security_zh.md) · [前端](docs/frontend_zh.md) · [基础设施](docs/infrastructure_zh.md)
 - **参考：** [配置](docs/configuration_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [排错](docs/troubleshooting_zh.md) · [词汇表](docs/glossary_zh.md)

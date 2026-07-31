@@ -5,7 +5,70 @@ locally — CLI's JSONL is source of truth. These tests cover muselab's
 metadata + per-message annotation sidecar layer only. End-to-end transcript
 flows require a live SDK and are not unit-testable here.
 """
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
+
+
+def _imported_session_paths(
+    tmp_path: Path, sessions_dir: str | None,
+) -> dict[str, str]:
+    root = tmp_path / "root"
+    root.mkdir(exist_ok=True)
+    env = os.environ.copy()
+    env.update({
+        "MUSELAB_TOKEN": "test-token-1234567890abcdef-secure-min-32",
+        "MUSELAB_ROOT": str(root),
+    })
+    if sessions_dir is None:
+        # An explicit empty value is equivalent to "unset" and prevents a
+        # developer's worktree-local .env from affecting this subprocess.
+        env["MUSELAB_SESSIONS_DIR"] = ""
+    else:
+        env["MUSELAB_SESSIONS_DIR"] = sessions_dir
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; from backend import sessions; "
+                "print(json.dumps({'dir': str(sessions.SESS_DIR), "
+                "'index': str(sessions.INDEX)}))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_sessions_directory_can_be_overridden_by_environment(tmp_path):
+    configured = tmp_path / "durable-state" / "sessions"
+
+    paths = _imported_session_paths(tmp_path, str(configured))
+
+    assert paths == {
+        "dir": str(configured.resolve()),
+        "index": str(configured.resolve() / "index.json"),
+    }
+    assert configured.is_dir()
+
+
+def test_sessions_directory_default_remains_repo_local(tmp_path):
+    paths = _imported_session_paths(tmp_path, None)
+    expected = Path(__file__).resolve().parents[1] / "sessions"
+
+    assert paths == {
+        "dir": str(expected),
+        "index": str(expected / "index.json"),
+    }
 
 
 def test_session_lifecycle(client, auth):

@@ -14,14 +14,14 @@
 |------|------|------------|
 | `versions.env` | 固定外部工具版本的唯一真相源。由两个平台安装脚本引用；Dockerfile 中镜像同一版本号，需手动保持同步。| — |
 | `quick-install.sh` | 一行引导脚本（`curl … \| bash`）。拒绝 root 执行，检测 OS，若缺少 `uv` 则安装，提示克隆目标目录，然后通过 `exec bash` 并重新挂载 `/dev/tty` 移交给平台安装脚本，保证管道环境下交互式提示正常工作。| `MUSELAB_NONINTERACTIVE=1` |
-| `install-linux.sh` | 完整的 Linux/WSL2 安装脚本。五个阶段：前置检查 → `uv sync --frozen` → 写入 `.env`（随机 token、端口、归档目录）→ 注册 systemd 用户单元 → 检查/提示 linger。包含 7 个问题的档案配置向导，负责写入 `CLAUDE.md` 与归档子目录骨架。| `MUSELAB_NONINTERACTIVE=1`、`MUSELAB_LOCALE=zh\|en`、`MUSELAB_SKIP_SERVICE=1`、`MUSELAB_NO_BROWSER=1` |
-| `install-macos.sh` | 结构上与 Linux 安装脚本相同，但注册的是 launchd LaunchAgent 而非 systemd 单元。端口冲突检测使用 `lsof` 而非 `ss`；Node 安装优先用 `brew`，失败则回退到 `fnm`。| 同上四个变量 |
-| `uninstall-linux.sh` | 停止并移除 systemd 单元；保留 `.env`、`sessions/` 与归档目录。| — |
+| `install-linux.sh` | 完整的 Linux/WSL2 安装脚本。五个阶段：前置检查 → `uv sync --frozen` → 选择主工作区并写入 `.env`（随机 token、端口及仓库内会话元数据绝对路径）→ 注册 systemd 用户单元 → 检查/提示 linger。已有 `.env` 缺少该变量时也会补写，但不覆盖已有值；不会创建 `CLAUDE.md` 或固定目录结构。| `MUSELAB_NONINTERACTIVE=1`、`MUSELAB_SKIP_SERVICE=1`、`MUSELAB_NO_BROWSER=1` |
+| `install-macos.sh` | 结构上与 Linux 安装脚本相同，但注册的是 launchd LaunchAgent 而非 systemd 单元。端口冲突检测使用 `lsof` 而非 `ss`；Node 安装优先用 `brew`，失败则回退到 `fnm`。| 同上三个变量 |
+| `uninstall-linux.sh` | 停止并移除 systemd 单元；保留 `.env`、配置的会话元数据目录与工作区数据。| — |
 | `uninstall-macos.sh` | 卸载并移除 LaunchAgent plist；数据保留策略与 Linux 版本相同。| — |
 | `upgrade.sh` | 升级 `claude-agent-sdk`（`uv lock --upgrade-package`）和 `claude` CLI（`npm install -g … @latest`），以 `pytest` 做冒烟测试，失败则中止并打印回滚提示。不自动提交或重启服务，详见 [升级](upgrade_zh.md)。| — |
-| `doctor.sh` | 诊断脚本（`set -uo pipefail`，不用 `-e`，以便在部分失败时继续运行）。六项检查：前置依赖 → `.env`/配置 → Python 依赖（`uv sync --frozen`）→ 服务状态 → HTTP + 鉴权探测 → provider API 密钥。阻塞性失败退出码为 1，仅有警告则退出码为 0。| — |
+| `doctor.sh` | 诊断脚本（`set -uo pipefail`，不用 `-e`，以便在部分失败时继续运行）。六项检查：前置依赖 → 通用工作区与会话目录可写性／可选 `CLAUDE.md` → Python 依赖（`uv sync --frozen`）→ 服务状态 → HTTP + 鉴权探测 → provider API 密钥。不会读取会话内容；阻塞性失败退出码为 1，仅有警告则退出码为 0。| — |
 | `setup-https.sh` | 仅 Linux。在已有安装前增加 Caddy 反向代理，配置 SSE 安全的 `flush_interval -1`、HSTS 与 `ufw` 规则。| — |
-| `intake.sh` | 独立运行 7 问题 `CLAUDE.md` 档案配置向导。覆写前会备份已有的 `CLAUDE.md`。| — |
+| `intake.sh` | 可选生成通用工作区 `CLAUDE.md`；不创建其他目录，覆写前会备份已有文件。| `MUSELAB_LOCALE=zh\|en` |
 | `lint.sh` | 对已追踪文件执行静态检查与隐私泄露检测。| `MUSELAB_LEAK_BLACKLIST` |
 
 ---
@@ -73,7 +73,7 @@ tail -f ~/Library/Logs/muselab/stderr.log
 | Compose 配置 | 默认值 | 覆盖方式 |
 |-------------|--------|---------|
 | 端口绑定 | `127.0.0.1:8765:8765` | `MUSELAB_BIND`、`MUSELAB_PORT` |
-| 归档卷 | `./data:/data` | `ARCHIVE_DIR` |
+| 宿主机工作区卷 | `./data:/data` | `ARCHIVE_DIR`（旧兼容变量名） |
 | Claude 凭据 | `~/.claude:/home/muse/.claude` | `CLAUDE_HOME` |
 | 会话卷 | `./sessions:/app/sessions` | — |
 | 内存限制 | 硬限 `4g` / 预留 `1g` | — |
@@ -135,9 +135,9 @@ make run
 - 将 `MUSELAB_ENV_PATH` 重定向到临时文件，保证测试永远不会触及真实的 `.env`
 - 清除所有 provider API key 环境变量
 - 删除 `sys.modules` 中所有 `backend.*` 条目以强制完整重导入
-- 将 `sessions/` 隔离到临时目录
+- 将 `MUSELAB_SESSIONS_DIR` 隔离到临时目录
 
-`temp_root` fixture 创建一个临时归档树，包含 `notes/` 子目录、一个 `.secret` 文件和一个 `.env` 文件，专门用于路径穿越安全测试。
+`temp_root` fixture 创建一个临时工作区树，包含 `notes/` 子目录、一个 `.secret` 文件和一个 `.env` 文件，专门用于路径穿越安全测试。
 
 ### 主要测试文件
 
@@ -171,7 +171,7 @@ make run
 | `e2e` | ubuntu-latest | 否 | Playwright/Chromium，通过 `pytest-rerunfailures` 重试 2 次 |
 | `docker` | ubuntu-latest | 是（push job）| PR：单架构构建，不推送。main/tag：多架构构建并推送至 `ghcr.io` |
 
-CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、`MUSELAB_ROOT=${{ github.workspace }}/.ci-archive`。
+CI 测试环境变量：`MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`、`MUSELAB_ROOT=${{ github.workspace }}/.ci-workspace`。
 
 ### install-test.yml
 

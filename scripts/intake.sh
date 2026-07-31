@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# muselab intake — (re)run the 7-question profile setup and update CLAUDE.md.
-# Use when:
-#   - your first install skipped the intake (answered "n")
-#   - you want to refresh the profile after life changes
-#   - you cloned an existing .env from elsewhere but never set up CLAUDE.md
+# muselab workspace instructions — create or refresh an optional CLAUDE.md.
+# The platform installers deliberately do not create CLAUDE.md or impose a
+# directory taxonomy. Run this helper only when a workspace needs durable
+# project instructions. Existing files are backed up before replacement.
 # Linux + macOS + WSL2.
 set -euo pipefail
 
@@ -22,122 +21,99 @@ if [[ ! -f .env ]]; then
 fi
 
 # Portable .env value extraction (BSD/macOS grep lacks -P/\K).
-ARCHIVE="$(grep -E '^MUSELAB_ROOT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
-if [[ -z "$ARCHIVE" || ! -d "$ARCHIVE" ]]; then
-  err "MUSELAB_ROOT in .env is missing or not a directory: '$ARCHIVE'"
+WORKSPACE="$(grep -E '^MUSELAB_ROOT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+if [[ -z "$WORKSPACE" || ! -d "$WORKSPACE" ]]; then
+  err "MUSELAB_ROOT in .env is missing or not a directory: '$WORKSPACE'"
   exit 1
 fi
 
-# Locale detection — Chinese template if shell locale is zh, else English.
-if [[ "${LANG:-}${LC_ALL:-}${LC_MESSAGES:-}" == *zh* ]]; then
-  MUSE_LOCALE=zh
-  MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.md"
-  MUSE_README_SRC="README.md"
-else
-  MUSE_LOCALE=en
-  MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.en.md"
-  MUSE_README_SRC="README.en.md"
+# Template language can be selected explicitly. Otherwise follow the shell
+# locale. This affects only the generated CLAUDE.md, not the app UI.
+MUSE_LOCALE="${MUSELAB_LOCALE:-}"
+if [[ "$MUSE_LOCALE" != "zh" && "$MUSE_LOCALE" != "en" ]]; then
+  if [[ "${LANG:-}${LC_ALL:-}${LC_MESSAGES:-}" == *zh* ]]; then
+    MUSE_LOCALE=zh
+  else
+    MUSE_LOCALE=en
+  fi
 fi
-
 if [[ "$MUSE_LOCALE" == "zh" ]]; then
-  bold "muselab 入门问答 — archive 在 $ARCHIVE"
+  MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.md"
+  bold "muselab 工作区说明 — 主工作区：$WORKSPACE"
 else
-  bold "muselab intake — archive at $ARCHIVE"
+  MUSE_CLAUDE_TPL="scripts/templates/default-CLAUDE.en.md"
+  bold "muselab workspace instructions — primary workspace: $WORKSPACE"
 fi
 echo
 
-# Confirm overwrite if CLAUDE.md already exists
-if [[ -f "$ARCHIVE/CLAUDE.md" ]]; then
-  warn "$ARCHIVE/CLAUDE.md already exists"
+if [[ -f "$WORKSPACE/CLAUDE.md" ]]; then
+  warn "$WORKSPACE/CLAUDE.md already exists"
   if [[ "$MUSE_LOCALE" == "zh" ]]; then
-    PROMPT_OVERWRITE='覆盖为新模板？（旧内容会备份到 CLAUDE.md.bak） [y/N]:'
+    PROMPT_OVERWRITE='用通用工作区模板覆盖？（旧内容会备份到 CLAUDE.md.bak） [y/N]:'
   else
-    PROMPT_OVERWRITE='Overwrite with a fresh template? (existing content goes to CLAUDE.md.bak) [y/N]:'
+    PROMPT_OVERWRITE='Replace it with the generic workspace template? (existing content goes to CLAUDE.md.bak) [y/N]:'
   fi
   REPLY="$(ask "$PROMPT_OVERWRITE" 'N')"
   if [[ ! "$REPLY" =~ ^[Yy] ]]; then
     if [[ "$MUSE_LOCALE" == "zh" ]]; then
-      echo "  已取消。如果只是想做小幅修改，直接编辑 $ARCHIVE/CLAUDE.md。"
+      echo "  已取消。可以直接编辑 $WORKSPACE/CLAUDE.md。"
     else
-      echo "  Aborted. Edit $ARCHIVE/CLAUDE.md manually if you just want to tweak it."
+      echo "  Aborted. Edit $WORKSPACE/CLAUDE.md directly if you only need a small change."
     fi
     exit 0
   fi
-  cp "$ARCHIVE/CLAUDE.md" "$ARCHIVE/CLAUDE.md.bak"
+  cp "$WORKSPACE/CLAUDE.md" "$WORKSPACE/CLAUDE.md.bak"
   ok "backed up existing CLAUDE.md → CLAUDE.md.bak"
 fi
 
-# Subdirs — create only the ones missing (don't overwrite existing READMEs)
-for sub in health work money people notes archives; do
-  if [[ ! -d "$ARCHIVE/$sub" ]]; then
-    mkdir -p "$ARCHIVE/$sub"
-    cp "scripts/templates/archive-skeleton/$sub/$MUSE_README_SRC" "$ARCHIVE/$sub/README.md"
-    ok "created $sub/"
-  fi
-done
-
 echo
 if [[ "$MUSE_LOCALE" == "zh" ]]; then
-  echo "  --- 入门问答（任意题回车跳过）---"
-  INTAKE_NAME="$(ask 'Muse 该怎么称呼你？' '')"
-  INTAKE_BIRTH="$(ask '出生年份（或大致年龄段）:' '')"
-  INTAKE_CITY="$(ask '你现在住在哪？' '')"
-  echo "  这一周你的时间主要用在哪里？（学业 / 工作 / 自由职业 / 照护家人 / 退休 / 其他）"
-  INTAKE_DOING="$(ask '' '')"
-  echo "  用一句话描述你当下的人生阶段"
-  INTAKE_STAGE="$(ask '' '')"
-  INTAKE_GOAL="$(ask '这一年最想做成的一件事:' '')"
-  INTAKE_HEALTH="$(ask '当前最关心的健康问题（无则填 none）:' '')"
+  echo "  --- 可选工作区信息（任意题回车跳过）---"
+  WORKSPACE_PURPOSE="$(ask '这个工作区主要用于什么？' '')"
+  WORKSPACE_SOURCES="$(ask '主要事实来源（文件或目录）:' '')"
+  WORKSPACE_COMMANDS="$(ask '常用运行命令:' '')"
+  WORKSPACE_VERIFY="$(ask '任务完成前应运行什么验证？' '')"
+  WORKSPACE_OUTPUT="$(ask '产物通常写到哪里？' '')"
 else
-  echo "  --- Quick intake (press Enter to skip any) ---"
-  INTAKE_NAME="$(ask 'How should Muse address you?' '')"
-  INTAKE_BIRTH="$(ask 'Birth year (or age range):' '')"
-  INTAKE_CITY="$(ask 'Where do you live?' '')"
-  echo "  What occupies most of your week? (study / job / freelance / care / retirement / …)"
-  INTAKE_DOING="$(ask '' '')"
-  echo "  One sentence about your life stage right now"
-  INTAKE_STAGE="$(ask '' '')"
-  INTAKE_GOAL="$(ask 'One main goal for this year:' '')"
-  INTAKE_HEALTH="$(ask 'Top health concern right now (or "none"):' '')"
+  echo "  --- Optional workspace details (press Enter to skip any) ---"
+  WORKSPACE_PURPOSE="$(ask 'What is this workspace mainly for?' '')"
+  WORKSPACE_SOURCES="$(ask 'Primary sources of truth (files or directories):' '')"
+  WORKSPACE_COMMANDS="$(ask 'Common run commands:' '')"
+  WORKSPACE_VERIFY="$(ask 'What should be verified before completion?' '')"
+  WORKSPACE_OUTPUT="$(ask 'Where should artifacts usually be written?' '')"
 fi
 
 sed -e "s|%DATE%|$(date +%Y-%m-%d)|" \
-  "$MUSE_CLAUDE_TPL" > "$ARCHIVE/CLAUDE.md"
+  "$MUSE_CLAUDE_TPL" > "$WORKSPACE/CLAUDE.md"
 
-# Patch with whole-line awk equality — robust against any chars in the
-# label (slashes, parens, full-width punctuation).
 _patch() {
   local label="$1" value="$2"
   [[ -z "$value" ]] && return
   awk -v lbl="$label" -v val=" $value" '
     !done && $0 == lbl { print lbl val; done=1; next } { print }
-  ' "$ARCHIVE/CLAUDE.md" > "$ARCHIVE/CLAUDE.md.tmp" \
-    && mv "$ARCHIVE/CLAUDE.md.tmp" "$ARCHIVE/CLAUDE.md"
+  ' "$WORKSPACE/CLAUDE.md" > "$WORKSPACE/CLAUDE.md.tmp" \
+    && mv "$WORKSPACE/CLAUDE.md.tmp" "$WORKSPACE/CLAUDE.md"
 }
 if [[ "$MUSE_LOCALE" == "zh" ]]; then
-  _patch "- 称呼："                     "$INTAKE_NAME"
-  _patch "- 出生年份："                 "$INTAKE_BIRTH"
-  _patch "- 现在住在："                 "$INTAKE_CITY"
-  _patch "- 一句话当前人生阶段："       "$INTAKE_STAGE"
-  _patch "- 主要在做："                 "$INTAKE_DOING"
-  _patch "- 这一年最想做成的一件事："   "$INTAKE_GOAL"
-  _patch "- 当前最关心的健康问题："     "$INTAKE_HEALTH"
+  _patch "- 工作区用途：" "$WORKSPACE_PURPOSE"
+  _patch "- 主要事实来源：" "$WORKSPACE_SOURCES"
+  _patch "- 常用运行命令：" "$WORKSPACE_COMMANDS"
+  _patch "- 完成前验证：" "$WORKSPACE_VERIFY"
+  _patch "- 产物目录：" "$WORKSPACE_OUTPUT"
 else
-  _patch "- Name:"                      "$INTAKE_NAME"
-  _patch "- Birth year:"                "$INTAKE_BIRTH"
-  _patch "- Lives in:"                  "$INTAKE_CITY"
-  _patch "- Life stage (one line):"     "$INTAKE_STAGE"
-  _patch "- Main activity:"             "$INTAKE_DOING"
-  _patch "- Main goal this year:"       "$INTAKE_GOAL"
-  _patch "- Top health concern:"        "$INTAKE_HEALTH"
+  _patch "- Purpose:" "$WORKSPACE_PURPOSE"
+  _patch "- Primary sources of truth:" "$WORKSPACE_SOURCES"
+  _patch "- Common commands:" "$WORKSPACE_COMMANDS"
+  _patch "- Verification before completion:" "$WORKSPACE_VERIFY"
+  _patch "- Artifact/output directory:" "$WORKSPACE_OUTPUT"
 fi
 
-ok "CLAUDE.md updated"
+ok "CLAUDE.md → $WORKSPACE/CLAUDE.md"
 echo
 if [[ "$MUSE_LOCALE" == "zh" ]]; then
-  echo "  下一步: 打开 $ARCHIVE/CLAUDE.md 把空字段填完。"
-  echo "  Muse 下一次对话时会自动加载（不用重启服务）。"
+  echo "  这是可选工作区说明；脚本没有创建或修改其他目录。"
+  echo "  下一次在该工作区开始对话时会自动加载，无需重启服务。"
 else
-  echo "  Next: open $ARCHIVE/CLAUDE.md and fill in the blanks."
-  echo "  Muse picks it up on the next chat — no restart needed."
+  echo "  This is an optional workspace guide; no other directories were created or changed."
+  echo "  It is loaded on the next conversation in this workspace; no service restart is needed."
 fi

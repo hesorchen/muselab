@@ -26,15 +26,18 @@ SEL_MOBILE_TAB = ".mobile-tab-bar button"
 
 def _login(page: Page, base: str, token: str) -> None:
     page.goto(base, wait_until="domcontentloaded")
-    page.wait_for_selector(f"{SEL_LOGIN}, {SEL_TABS}", state="visible", timeout=5000)
+    page.wait_for_selector(
+        f"{SEL_LOGIN}, {SEL_TABS}", state="visible", timeout=15000
+    )
     if page.locator(SEL_LOGIN).is_visible():
         page.fill(SEL_LOGIN_INPUT, token)
         page.keyboard.press("Enter")
-    expect(page.locator(SEL_TABS)).to_be_visible(timeout=5000)
+    expect(page.locator(SEL_TABS)).to_be_visible(timeout=15000)
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.currentId
+          return app && app.authed === true && app.appReady
+            && app._sessionsInitialized && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
     )
@@ -1293,6 +1296,297 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     assert result["frames"]
     assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
     assert all(frame["visible"] and frame["count"] > 0 for frame in result["frames"]), result
+    _assert_no_browser_errors(page, errors)
+
+
+def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
+    page: Page, backend_url, auth_token,
+):
+    """Early done metadata completes the visual tail without touching identity."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    sid = "perf-tool-tail-done-metadata"
+    assistant_uuid = "tool-tail-assistant-boundary"
+    completed_at_ms = int(time.time() * 1000)
+    duration_ms = 125_000
+    active_requests: list[str] = []
+    history_requests: list[str] = []
+
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"tool-tail-done-ticket"}',
+        ),
+    )
+    page.route(
+        "**/api/chat/providers",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "models": [{
+                    "model": "e2e-model",
+                    "label": "E2E model",
+                    "group": "e2e",
+                    "supports_thinking": True,
+                }],
+                "default_model": "e2e-model",
+                "default_permission": "bypassPermissions",
+            }),
+        ),
+    )
+
+    def active_stays_true(route):
+        active_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"active":true}',
+        )
+
+    def unexpected_history(route):
+        history_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Tool tail done",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "messages": [],
+                "offset": 0,
+                "total": 0,
+                "has_more": False,
+                "history_generation": "blocked-canonical-e2e",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/active", active_stays_true)
+    page.route(f"**/api/chat/sessions/{sid}?*", unexpected_history)
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.ackCurrentActivity = () => {};
+        // The app's 10s cross-device poll would correctly interpret this
+        // test's intentionally permanent /active=true response as a stalled
+        // stream and reconnect it. Disable that unrelated timer so the test
+        // observes only the done-time canonical barrier under test.
+        if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
+        app._sessionsSyncTimer = null;
+        app._syncSessionListQuiet = async () => false;
+        app.appReady = true;
+        app.availableModels = [{
+          model: 'e2e-model', label: 'E2E model', group: 'e2e',
+          supports_thinking: true,
+        }];
+        app.model = 'e2e-model';
+        app.defaultModel = 'e2e-model';
+        app.sessions = [{
+          id: sid,
+          name: 'Tool tail done',
+          updated_at: 1,
+          model: 'e2e-model',
+          permission: 'bypassPermissions',
+          thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app._activateTabState(sid);
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app.mobileTab = 'chat';
+        app.input = 'Finish on a tool result';
+        app.atBottom = true;
+        return true;
+        """,
+        {"sid": sid},
+    )
+
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """() => {
+          window.__emitSse('text', {
+            text: 'TOOL_TAIL_ASSISTANT_TEXT',
+            turn_id: 'tool-tail-turn',
+            event_seq: 1,
+          });
+          window.__emitSse('tool_use', {
+            id: 'toolu_tool_tail',
+            name: 'Bash',
+            summary: 'produce final status',
+            input: {command: 'printf done'},
+            turn_id: 'tool-tail-turn',
+            event_seq: 2,
+          });
+          window.__emitSse('tool_result', {
+            id: 'toolu_tool_tail',
+            tool_name: 'Bash',
+            preview: 'done',
+            text: 'done\\n',
+            truncated: false,
+            is_error: false,
+            bash: {stdout: 'done\\n', stderr: '', exit_code: 0},
+            turn_id: 'tool-tail-turn',
+            event_seq: 3,
+          });
+        }"""
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const tail = app.messages[app.messages.length - 1];
+          return app.streaming && tail?.role === 'tool_result';
+        }"""
+    )
+    before_done = _app_eval(
+        page,
+        """
+        const tail = app.messages[app.messages.length - 1];
+        const assistant = [...app.messages].reverse()
+          .find(message => message.role === 'assistant');
+        return {
+          tailKey: tail._k,
+          tailUuid: tail.uuid,
+          tailForkUuid: tail.forkUuid,
+          assistantUuid: assistant?.uuid || '',
+        };
+        """,
+    )
+    tail_key = before_done.pop("tailKey")
+    assert ":live:" in tail_key
+    assert before_done == {
+        "tailUuid": "",
+        "tailForkUuid": "",
+        "assistantUuid": "",
+    }
+
+    with page.expect_request(
+        lambda request: request.url.endswith(
+            f"/api/chat/sessions/{sid}/active"
+        ),
+        timeout=5000,
+    ):
+        page.evaluate(
+            """arg => window.__emitSse('done', {
+              assistant_uuid: arg.assistantUuid,
+              completed_at_ms: arg.completedAtMs,
+              duration_ms: arg.durationMs,
+              total_cost_usd: 0.001,
+              session_usage: {
+                context_used_pct: 5,
+                context_used: 500,
+                context_limit: 100000,
+              },
+              turn_id: 'tool-tail-turn',
+              event_seq: 4,
+            })""",
+            {
+                "assistantUuid": assistant_uuid,
+                "completedAtMs": completed_at_ms,
+                "durationMs": duration_ms,
+            },
+        )
+
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const tail = app.messages[app.messages.length - 1];
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
+          const tailNode = pane?.querySelector(
+            `.msg[data-message-key="${CSS.escape(arg.tailKey)}"]`);
+          const footer = tailNode?.querySelector('.turn-footer');
+          return !app.streaming
+            && tail?.role === 'tool_result'
+            && tail.ts === arg.completedAtMs
+            && tail.elapsed === arg.durationMs / 1000
+            && tail.forkUuid === arg.assistantUuid
+            && tailNode?.classList.contains('tool_result')
+            && footer?.getClientRects().length
+            && footer.querySelector('.msg-ts')?.textContent
+              === app.fmtTurnTime(arg.completedAtMs)
+            && footer.querySelector('.msg-elapsed')?.textContent === '· 2m05s';
+        }""",
+        arg={
+            "sid": sid,
+            "tailKey": tail_key,
+            "assistantUuid": assistant_uuid,
+            "completedAtMs": completed_at_ms,
+            "durationMs": duration_ms,
+        },
+        timeout=5000,
+    )
+    footer = page.locator(
+        f'.msg-pane[data-tid="{sid}"] '
+        f'.msg[data-message-key="{tail_key}"] .turn-footer'
+    )
+    expect(footer).to_be_visible()
+    expected_time = _app_eval(
+        page, "return app.fmtTurnTime(arg);", completed_at_ms
+    )
+    expect(footer.locator(".msg-ts")).to_have_text(expected_time)
+    expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
+    expect(footer.locator(".turn-fork-btn")).to_be_visible()
+
+    state = _app_eval(
+        page,
+        """
+        const tail = app.messages[app.messages.length - 1];
+        const assistant = [...app.messages].reverse()
+          .find(message => message.role === 'assistant');
+        return {
+          role: tail.role,
+          tailUuid: tail.uuid,
+          tailForkUuid: tail.forkUuid,
+          assistantUuid: assistant?.uuid || '',
+          forkBoundary: app.turnForkMessageId(
+            app.messages, app.messages.length - 1),
+          ts: tail.ts,
+          elapsed: tail.elapsed,
+          liveKey: tail._k,
+          streaming: app.streaming,
+        };
+        """,
+    )
+    live_key = state.pop("liveKey")
+    assert state == {
+        "role": "tool_result",
+        "tailUuid": "",
+        "tailForkUuid": assistant_uuid,
+        # done metadata is an affordance, not canonical message identity.
+        "assistantUuid": "",
+        "forkBoundary": assistant_uuid,
+        "ts": completed_at_ms,
+        "elapsed": duration_ms / 1000,
+        "streaming": False,
+    }
+    assert ":live:" in live_key
+    assert active_requests, "canonical barrier never checked /active"
+    assert history_requests == [], (
+        "canonical history loaded even though /active still reported true"
+    )
     _assert_no_browser_errors(page, errors)
 
 

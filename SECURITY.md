@@ -8,13 +8,13 @@ muselab is a single-user, self-hosted web application. Whoever holds the
 - Read, write, upload, and delete files under `MUSELAB_ROOT` and every directory registered in the workspace picker
 - Drive a Claude Agent SDK session running with `permission_mode="bypassPermissions"` and the selected workspace as `cwd`
 
-This is intentional — muselab is an AI archive manager, not a sandbox. The
+This is intentional — muselab is a local Agent workbench, not a sandbox. The
 practical implication is that **a leaked token is equivalent to remote code
 execution with the service user's OS permissions**, not merely file-API access
 inside a workspace. Operate accordingly:
 
 - Run the service as a dedicated unprivileged user (not `root`, not your login account)
-- Point `MUSELAB_ROOT` at a dedicated directory you own, and register only intended project/archive directories (broad system roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot` are refused)
+- Point `MUSELAB_ROOT` at a dedicated directory you own, and register only intended workspace directories (broad system roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot` are refused)
 - Place it behind nginx or Caddy with HTTPS; never expose port `8765` directly to the public internet
 - Treat `MUSELAB_TOKEN` like a password: keep it long, random, and rotate it if a leak is suspected
 - Add HTTP basic auth as a second factor in front of muselab when exposed beyond your LAN

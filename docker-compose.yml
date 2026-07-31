@@ -19,12 +19,15 @@ services:
       # Force the Agent SDK to use OAuth (subscription), not console API key.
       ANTHROPIC_API_KEY: ""
       ANTHROPIC_AUTH_TOKEN: ""
-      # Inside the container the archive is always /data; the host path is
-      # configured via ARCHIVE_DIR below.
+      # Inside the container the default workspace is always /data; the host
+      # path uses the legacy-compatible ARCHIVE_DIR variable below.
       MUSELAB_ROOT: /data
+      # Never inherit a native-install host path from .env. Container session
+      # state is persisted by the /app/sessions bind mount below.
+      MUSELAB_SESSIONS_DIR: /app/sessions
     volumes:
-      # The directory the portal exposes for browsing / editing.
-      # Set ARCHIVE_DIR in .env (defaults to ./data).
+      # The default workspace exposed for browsing / editing.
+      # Set the legacy-compatible ARCHIVE_DIR in .env (defaults to ./data).
       - ${ARCHIVE_DIR:-./data}:/data
       # Reuse the host's claude CLI OAuth credentials.
       # Default: ~/.claude. Override CLAUDE_HOME in .env for non-standard locations.

@@ -6,23 +6,25 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 ---
 
-**active-turn sidecar** — 每次回合开始时写入 `sessions/active_turns/<sid>.json` 的小型 JSON 文件，干净完成后删除。若 muselab 在回合进行中被强制退出，该文件会保留下来，并在下次浏览器会话打开时显示「未完成的回合」提示条。参见 [`backend-sessions.md — Active-turn sidecars`](backend-sessions.md)。
+**active-turn sidecar** — 每次回合开始时写入 `$MUSELAB_SESSIONS_DIR/active_turns/<sid>.json` 的小型 JSON 文件，干净完成后删除。若 muselab 在回合进行中被强制退出，该文件会保留下来，并在下次浏览器会话打开时显示「未完成的回合」提示条。参见 [`backend-sessions.md — Active-turn sidecars`](backend-sessions.md)。
 
 **active turn** — 当前正在流式传输的聊天回合。muselab 在 `_active_turns[sid]` 中追踪活跃回合；一个会话同时最多只能有一个活跃回合。尝试在一个回合运行时启动第二个回合会引发 `_TurnBusy`。参见 [`routing.md — The SSE Turn Loop`](routing.md)。
 
-**archive root（MUSELAB_ROOT）** — `MUSELAB_ROOT` 所指向的目录。这里存放你自己的文件：`CLAUDE.md`、子目录、附件（`.muselab-attach/`）、定时任务状态（`.muselab/`）以及回收站（`.muselab-dustbin/`）。它刻意位于仓库根目录之外，使数据和代码可以独立备份或迁移。参见 [`architecture_zh.md`](architecture_zh.md)。
+**primary workspace（主工作区，MUSELAB_ROOT）** — `MUSELAB_ROOT` 所指向的默认工作区。这里可以放项目或资料文件、可选 `CLAUDE.md`、附件（`.muselab-attach/`）、全局状态（`.muselab/`）和回收站（`.muselab-dustbin/`）。旧文档中的 archive root 指同一概念；变量名继续兼容已有部署。参见 [`architecture_zh.md`](architecture_zh.md)。
+
+**ARCHIVE_DIR** — Docker Compose 使用的旧兼容变量名，表示挂载到容器 `/data` 的宿主机工作区；它不规定任何子目录结构。
 
 **cost capture（成本记录）** — 每次回合结束后，`ResultMessage.total_cost_usd` 的值会累加到进程级聚合计数器和每会话累计值中，并作为每条消息的注解写入 sidecar。成本字段仅在 Claude（Anthropic）模型中有值；第三方提供商返回 0。参见 [`routing.md`](routing.md)。
 
-**cwd-key** — Claude CLI 用于在 `~/.claude/projects/` 下为 JSONL 文件命名空间的哈希化目录路径。对于给定的归档根目录，该键形如 `-home-alice-archive`。muselab 使用相同的推导方式，使其会话 ID 与 CLI 文件名一一对应。参见 [`backend-sessions.md — Two-layer store`](backend-sessions.md)。
+**cwd-key** — Claude CLI 用于在 `~/.claude/projects/` 下为 JSONL 文件命名空间的哈希化目录路径。对于给定工作区，该键可能形如 `-home-alice-project`。muselab 使用相同的推导方式，使其会话 ID 与 CLI 文件名一一对应。参见 [`backend-sessions.md — Two-layer store`](backend-sessions.md)。
 
-**CLAUDE.md** — 位于归档根目录的纯文本 Markdown 文件。Claude Agent SDK 在每次对话时自动将其作为上下文加载，使其成为个性化 Muse 行为的主要渠道。参见 [`personalize-claude-md.md`](personalize-claude-md.md)。
+**CLAUDE.md** — 位于工作区中的可选 Markdown 指令文件。Claude Agent SDK 按原生作用域规则加载它，用于项目目标、事实来源、边界和验证约定。参见 [`personalize-claude-md_zh.md`](personalize-claude-md_zh.md)。
 
 **CLAUDE_CONFIG_DIR isolation（CLAUDE_CONFIG_DIR 隔离）** — 对于第三方提供商，muselab 将 `CLAUDE_CONFIG_DIR` 设置为持久的每用户状态目录（`${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/`），其中不含 `credentials.json`。这既可防止 CLI 静默回退到 Claude Pro OAuth、避免将第三方流量计入你的 Anthropic 账单，也能跨重启保留第三方会话。参见 [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md)。
 
 **client pool（客户端池）** — 活跃 `ClaudeSDKClient` 实例的内存缓存，以 `(session_id, model, effort)` 为键。默认容量为 3 个条目（可通过 `MUSELAB_CLIENT_POOL_CAP` 配置）；超出上限时按最近最少使用（LRU）策略淘汰，但有活跃回合或后台任务进行中的条目除外。参见 [`routing.md — The Client Pool`](routing.md)。
 
-**effort（推理强度）** — 传给 `ClaudeAgentOptions` 的推理强度等级。有效值为 `"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` 或 `""`（SDK 自适应默认值）。按会话存储于 `sessions/index.json`；修改后会断开缓存的 client，下次回合以新值重建。effort 是 client pool 缓存键的组成部分。参见 [`routing.md — Reasoning Effort and Extended Thinking`](routing.md)。
+**effort（推理强度）** — 传给 `ClaudeAgentOptions` 的推理强度等级。有效值为 `"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"` 或 `""`（SDK 自适应默认值）。按会话存储于 `$MUSELAB_SESSIONS_DIR/index.json`；修改后会断开缓存的 client，下次回合以新值重建。effort 是 client pool 缓存键的组成部分。参见 [`routing.md — Reasoning Effort and Extended Thinking`](routing.md)。
 
 **extended thinking / thinking signature（扩展思考 / 思考签名）** — `ThinkingConfigEnabled` 激活时 Claude 产生的推理轨迹。thinking 块通过 `thinking` SSE 事件流式传输。签名是不可修改的不透明令牌；muselab 将会话锁定到单一模型以避免跨提供商的签名损坏。对于 Opus 4.7+，需要 `display="summarized"` 才能获得纯文本 thinking 块，而非仅有签名。参见 [`routing.md — budget_tokens and display`](routing.md)。
 
@@ -34,9 +36,11 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **MCP（Model Context Protocol，模型上下文协议）** — 将外部工具服务器附加到 agent 的标准。muselab 在「设置 → MCP」中暴露 MCP 配置，并将自身的 `mcp.json` 与 Claude Code 的全局配置合并。`ask_user_question` MCP 工具受到特殊处理：muselab 不会阻塞它，而是通过进程内队列重新路由，以便浏览器能在行内显示问题。
 
-**message queue（消息队列）** — 每会话的 FIFO 队列（`sessions/<sid>.queue.json`），在一个回合已在运行时暂存提交的 prompt。当前回合完成后，排空循环自动启动下一个回合。最大深度为 10。若回合出错或被取消，队列自动暂停。参见 [`backend-sessions.md — The message queue`](backend-sessions.md)。
+**message queue（消息队列）** — 每会话的 FIFO 队列（`$MUSELAB_SESSIONS_DIR/<sid>.queue.json`），在一个回合已在运行时暂存提交的 prompt。当前回合完成后，排空循环自动启动下一个回合。最大深度为 10。若回合出错或被取消，队列自动暂停。参见 [`backend-sessions.md — The message queue`](backend-sessions.md)。
 
-**model continuity（模型连续性）** — 第一次成功回合后，模型 ID 写入 `sessions/index.json`。非空会话切换模型时，前端创建独立的空会话，防止跨提供商 thinking signature 损坏；管理 API 仍可显式修改模型并断开缓存的 client，调用者需要自行承担 transcript 兼容性风险。参见 [`routing.md`](routing.md)。
+**model continuity（模型连续性）** — 第一次成功回合后，模型 ID 写入 `$MUSELAB_SESSIONS_DIR/index.json`。非空会话切换模型时，前端创建独立的空会话，防止跨提供商 thinking signature 损坏；管理 API 仍可显式修改模型并断开缓存的 client，调用者需要自行承担 transcript 兼容性风险。参见 [`routing.md`](routing.md)。
+
+**MUSELAB_SESSIONS_DIR** — muselab 的持久化会话元数据目录，包含索引、sidecar、队列和活动回合哨兵，不包含 CLI transcript。默认 `<repo>/sessions`；原生安装器会把这个仓库内位置保存为绝对路径。
 
 **no-build frontend（无构建前端）** — 前端以纯 HTML + JavaScript + CSS 提供服务，无需打包工具、编译器或 `npm install`。经过审查的第三方库已提交至 `frontend/vendor/`；部分在浏览器空闲时预热，Mermaid 与 xterm.js 等保持按需加载。参见 [`architecture_zh.md`](architecture_zh.md)。
 
@@ -50,7 +54,7 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **pending attachment queue（待处理附件队列）** — sidecar 中的 `pending_attachments` 列表，在 SDK 写入用户消息 UUID 之前暂存上传元数据。由于 CLI 异步追加 JSONL 记录，上传时消息 UUID 尚不可知；muselab 在下次读取会话时将附件绑定到正确的消息 UUID。参见 [`backend-sessions.md — Pending attachment queue`](backend-sessions.md)。
 
-**repo root（仓库根目录）** — 包含 muselab checkout 的目录（`backend/`、`frontend/`、`sessions/`、`.env` 等）。与归档根目录（archive root）不同。仓库是安装本身；归档是你的数据。参见 [`architecture_zh.md — 目录地图`](architecture_zh.md)。
+**repo root（仓库根目录）** — 包含 muselab checkout 的目录（`backend/`、`frontend/`、`.env` 和默认的 `sessions/` 等）。它与主工作区不同：前者是安装代码和实例配置，后者是 Agent 操作的默认目录及 `.muselab` 全局状态根。参见 [`architecture_zh.md — 目录地图`](architecture_zh.md)。
 
 **safe_resolve** — `backend/files.py` 中的路径验证函数，每个 `/api/files/*` 端点在操作文件系统前都会调用它。它会阻止 `..` 路径穿越、符号链接逃逸、NUL 字节注入以及敏感文件名。所有路径必须解析为所选工作区根目录的后代路径。参见 [`backend-files.md — safe_resolve in depth`](backend-files.md)。
 
@@ -60,9 +64,9 @@ muselab 代码库与文档中使用的专有术语，集中定义，供各处引
 
 **session（会话）** — 对话的顶级单元。一个会话拥有一个 UUID，该 UUID 由 muselab 索引条目、sidecar 文件、CLI JSONL 和消息队列文件共用。会话保存 cwd、模型、权限、effort 和思考设置；显式 Fork 的会话还会保存来源关系。参见 [`backend-sessions_zh.md`](backend-sessions_zh.md)。
 
-**session index（会话索引）** — 文件 `sessions/index.json`（位于仓库内，而非工作区中）。它是 muselab 对于 CLI 未追踪的每会话元数据的真相源：cwd、模型、权限模式、effort、thinking 开关、置顶状态和自动命名标志。对话记录由 CLI JSONL 持有；Claude 与第三方 Provider 可能使用不同的配置根。参见 [`backend-sessions.md`](backend-sessions.md)。
+**session index（会话索引）** — 文件 `$MUSELAB_SESSIONS_DIR/index.json`（位于工作区之外，默认在仓库内）。它是 muselab 对于 CLI 未追踪的每会话元数据的真相源：cwd、模型、权限模式、effort、thinking 开关、置顶状态和自动命名标志。对话记录由 CLI JSONL 持有；Claude 与第三方 Provider 可能使用不同的配置根。参见 [`backend-sessions.md`](backend-sessions.md)。
 
-**sidecar** — 文件 `sessions/<sid>.sidecar.json`，存储叠加在 CLI JSONL 之上的每条消息注解：成本（USD）、模型标识、时间戳、上传图片缩略图和文档引用。每次回合后写入；从不存储对话记录本身。参见 [`backend-sessions.md — Sidecar files`](backend-sessions.md)。
+**sidecar** — 文件 `$MUSELAB_SESSIONS_DIR/<sid>.sidecar.json`，存储叠加在 CLI JSONL 之上的每条消息注解：成本（USD）、模型标识、时间戳、上传图片缩略图和文档引用。每次回合后写入；从不存储对话记录本身。参见 [`backend-sessions.md — Sidecar files`](backend-sessions.md)。
 
 **setting_sources** — 在 `ClaudeAgentOptions` 中传入的 SDK 参数 `["user", "project", "local"]`，告知 Claude Agent SDK 要加载哪些配置作用域。活动工作区中的 `CLAUDE.md` 和 Claude 配置按这些作用域加载；muselab 的内置 `skills/` 则通过本地 plugin 暴露。
 

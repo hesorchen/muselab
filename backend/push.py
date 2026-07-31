@@ -2,10 +2,10 @@
 
 Two persistent bits live on disk:
 
-  <archive>/.muselab/vapid.json       generated once at startup; the
+  <workspace>/.muselab/vapid.json     generated once at startup; the
                                        keypair muselab uses to sign every
                                        push so push services accept it
-  <archive>/.muselab/push_subs.json   active subscriptions (one per
+  <workspace>/.muselab/push_subs.json active subscriptions (one per
                                        device, identified by endpoint)
 
 Both are JSON, neither has to migrate between muselab versions: regenerate

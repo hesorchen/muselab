@@ -15,7 +15,7 @@
 ${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/projects/<cwd-key>/<sid>.jsonl
     第三方 Provider 的隔离 CLI transcript
 
-<repo>/sessions/
+$MUSELAB_SESSIONS_DIR/
 ├── index.json
 ├── <sid>.sidecar.json
 ├── <sid>.queue.json
@@ -27,12 +27,15 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 
 - CLI JSONL 是对话正文的事实来源。Claude 与第三方 Provider 使用不同配置根；
   第三方根属于持久用户状态，应纳入备份。
-- `sessions/index.json` 保存 muselab 专属的展示和运行设置。
+- `$MUSELAB_SESSIONS_DIR/index.json` 保存 muselab 专属的展示和运行设置。
 - sidecar 保存逐消息费用、模型、时间、附件和上下文容量等标注。
 - queue 文件保存待处理消息。
 - 附件统一放在主 `MUSELAB_ROOT` 下，即使会话属于其他已登记工作目录。
 
 所有层使用同一个会话 UUID。
+
+`MUSELAB_SESSIONS_DIR` 默认 `<repo>/sessions`。原生安装器会把这个仓库内位置以
+绝对路径写入 `.env`；旧部署未设置时仍使用相同默认值。
 
 ## 多工作区
 
@@ -44,7 +47,7 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 
 ## 会话索引
 
-`sessions/index.json` 主要字段：
+`$MUSELAB_SESSIONS_DIR/index.json` 主要字段：
 
 | 字段 | 说明 |
 |---|---|
@@ -130,7 +133,7 @@ $MUSELAB_ROOT/.muselab-attach/<sid>/
 
 ## 重启恢复
 
-回合开始后会写入 `sessions/active_turns/<sid>.json`，正常结束时删除。若进程被强制终止，启动扫描会把残留回合标记为中断并提示用户决定是否重发；muselab 不会自动消耗 token 重试。
+回合开始后会写入 `$MUSELAB_SESSIONS_DIR/active_turns/<sid>.json`，正常结束时删除。若进程被强制终止，启动扫描会把残留回合标记为中断并提示用户决定是否重发；muselab 不会自动消耗 token 重试。
 
 | 状态 | 重启后行为 |
 |---|---|

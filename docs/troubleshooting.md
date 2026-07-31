@@ -88,7 +88,7 @@ app to your Home Screen *first*, then enable notifications. Full walkthrough:
 [Mobile (PWA)](mobile.md).
 
 **Push stopped working for every device at once.** The VAPID keypair at
-`<archive>/.muselab/vapid.json` is unreadable. muselab won't silently
+`<primary-workspace>/.muselab/vapid.json` is unreadable. muselab won't silently
 regenerate it (that would invalidate all subscriptions). Restore it from backup,
 or delete it deliberately to mint a new keypair — every device then re-subscribes.
 

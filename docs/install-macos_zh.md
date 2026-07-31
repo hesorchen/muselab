@@ -30,12 +30,16 @@ bash scripts/install-macos.sh
 
 1. 校验 `uv`（缺 `claude` 会警告）
 2. 执行 `uv sync`
-3. **询问你**的 archive 目录（Muse 可读写的目录），默认 `~/muselab-archive`
-4. 生成 `.env`（含随机 `MUSELAB_TOKEN` 和 `MUSELAB_HOST=127.0.0.1`）
+3. **询问你**的主工作区（muselab 可读写的项目或资料目录），默认 `~/muselab-workspace`
+4. 生成 `.env`（含随机 `MUSELAB_TOKEN`、`MUSELAB_HOST=127.0.0.1`，以及指向当前仓库内会话目录的绝对 `MUSELAB_SESSIONS_DIR`）
 5. 写入 `~/Library/LaunchAgents/com.muselab.plist` 并 `launchctl load -w`
 6. curl `localhost:8765` 确认服务就绪
 
-如果 `.env` 已存在，脚本会保留不动（可安全重跑）。
+如果 `.env` 已存在，脚本会保留所有已有值；仅当缺少
+`MUSELAB_SESSIONS_DIR` 时追加 `<当前 checkout>/sessions`，不会覆盖自定义会话路径，
+因此可安全重跑。
+安装器不采集个人资料、不创建预设目录，也不会自动写入 `CLAUDE.md`。
+登录后在 Settings 中选择或配置 Provider。
 
 ## 连接远程 Linux 服务：只安装菜单栏客户端
 
@@ -51,7 +55,7 @@ MUSELAB_URL=https://muse.example.com bash scripts/install-macos-statusbar.sh
 `~/Library/Application Support/muselab/statusbar.env`，并启动
 `com.muselab.statusbar`。状态栏每 10 秒轮询一次；点击后会在同一服务地址打开
 `/?activity=1`，网页随即显示全局任务中心。请使用 HTTPS 反向代理或 Tailscale
-等可信 VPN；该 token 可以访问你的档案，不应通过不可信网络的明文 HTTP 传输。
+等可信 VPN；该 token 可以访问已登记工作区，不应通过不可信网络的明文 HTTP 传输。
 
 ## 验证
 
@@ -79,8 +83,11 @@ launchctl load -w ~/Library/LaunchAgents/com.muselab.plist   # 再次启动
 tail -f ~/Library/Logs/muselab/stderr.log              # tail 日志
 
 bash scripts/doctor.sh                                  # 重新校验安装并探测服务
-bash scripts/intake.sh                                  # 重做 profile intake / 刷新 CLAUDE.md
+bash scripts/intake.sh                                  # 可选：创建或刷新工作区 CLAUDE.md
 ```
+
+`intake.sh` 只生成通用工作区说明，不会创建固定目录。现有 `CLAUDE.md` 会在确认覆盖后
+备份为 `CLAUDE.md.bak`。详见[配置工作区 CLAUDE.md](personalize-claude-md_zh.md)。
 
 ## 暴露到 LAN（可选）
 
@@ -106,8 +113,8 @@ macOS 防火墙：System Settings → Network → Firewall。如果开启了，�
 bash scripts/uninstall-macos.sh
 ```
 
-卸载并删除 plist。`.env`、`sessions/`、archive 目录、日志目录**不会**被动。
-彻底删除请直接删除仓库。
+卸载并删除 plist。`.env`、配置的会话元数据目录、主工作区、日志目录**不会**被删除。
+彻底删除时需分别删除这些数据。
 
 ## macOS 专属排错
 

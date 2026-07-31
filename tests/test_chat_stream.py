@@ -167,6 +167,7 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
             usage={"input_tokens": 100, "output_tokens": 20,
                    "cache_read_input_tokens": 0,
                    "cache_creation_input_tokens": 0},
+            uuid="assistant-final-uuid",
         ),
         # SDK emits the tool result wrapped in the AssistantMessage's
         # follow-up; here we send it as a ToolResultBlock-bearing assistant
@@ -191,6 +192,12 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
         return _FakeStreamClient(messages)
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod,
+        "_recent_turn_uuids",
+        lambda _sid, _want_image_user: (
+            "assistant-final-uuid", "user-final-uuid"),
+    )
 
     r = client.get(f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
                    f"&prompt=hi&model=claude-sonnet-4-6")
@@ -224,10 +231,70 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
     assert done["total_cost_usd"] == pytest.approx(0.0042)
     assert done["model"] == "claude-sonnet-4-6"
     assert done["cancelled"] is False
+    assert done["duration_ms"] == 1500
+    assert done["assistant_uuid"] == "assistant-final-uuid"
+    assert isinstance(done["completed_at_ms"], int)
+    assert done["completed_at_ms"] > 0
     assert "session_usage" in done
+    annotations = chat_mod.sess.get_message_annotations(sid)
+    assert annotations["assistant-final-uuid"]["ts"] == done["completed_at_ms"]
+    assert annotations["assistant-final-uuid"]["elapsed_s"] == 1.5
 
     # Turn reservation released after completion.
     assert sid not in chat_mod._active_turns
+
+
+def test_tool_only_turn_persists_completion_annotation(
+        stream_env, client, monkeypatch):
+    """Completion metadata must survive turns with no streamed assistant text."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    assistant_uuid = "assistant-tool-only-uuid"
+    messages = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tu_tool_only",
+                    name="Read",
+                    input={"file_path": "/tmp/tool-only.txt"},
+                ),
+            ],
+            model="claude-sonnet-4-6",
+            usage={},
+            uuid=assistant_uuid,
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=2500, duration_api_ms=2400,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={},
+        ),
+    ]
+
+    async def fake_get_client(
+        session_id, model, permission="bypassPermissions", effort="",
+    ):
+        return _FakeStreamClient(messages)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        chat_mod,
+        "_recent_turn_uuids",
+        lambda _sid, _want_image_user: (
+            assistant_uuid, "user-tool-only-uuid"),
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        f"&prompt=inspect&model=claude-sonnet-4-6")
+    assert response.status_code == 200, response.text
+    events = _parse_sse(response.text)
+    done = next(json.loads(data) for event, data in events if event == "done")
+
+    assert done["assistant_uuid"] == assistant_uuid
+    assert done["duration_ms"] == 2500
+    annotations = chat_mod.sess.get_message_annotations(sid)
+    assert annotations[assistant_uuid]["ts"] == done["completed_at_ms"]
+    assert annotations[assistant_uuid]["elapsed_s"] == 2.5
 
 
 def test_done_is_published_before_slow_post_turn_bookkeeping(
@@ -849,7 +916,8 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
     # CLI auto-continue: the model reacts to the finished task.
     reaction = AssistantMessage(
         content=[TextBlock(text="Background research finished — summary above.")],
-        model="claude-sonnet-4-6", usage={})
+        model="claude-sonnet-4-6", usage={},
+        uuid="continuation-assistant-uuid")
     result = ResultMessage(
         subtype="success", duration_ms=120, duration_api_ms=100,
         is_error=False, num_turns=1, session_id=sid,
@@ -873,6 +941,12 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         assert "task_notification" in kinds, f"no card flip: {kinds}"
         assert "text" in kinds, f"no reaction text: {kinds}"
         assert kinds[-1] == "done", f"missing terminal done: {kinds}"
+        done_ev = next(e for e in bc.events if e.get("event") == "done")
+        done = json.loads(done_ev["data"])
+        assert done["duration_ms"] == 120
+        assert done["assistant_uuid"] == "continuation-assistant-uuid"
+        assert isinstance(done["completed_at_ms"], int)
+        assert done["completed_at_ms"] > 0
         # The task_notification carries the launching card's tool_use_id so the
         # FE can flip it, plus the terminal status + artifact link.
         notif_ev = next(e for e in bc.events

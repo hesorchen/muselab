@@ -462,21 +462,18 @@ def test_robots_txt_disallows_all(client):
 
 
 # ============================================================================
-# Profile-intake session: chat-driven CLAUDE.md setup (replaces direct edit UI)
+# Workspace organizer and deprecated profile-intake compatibility route
 # ============================================================================
 
-def test_profile_intake_session_seeds_template_when_claude_md_missing(
+def test_organize_session_does_not_seed_profile_or_personal_directories(
     client, auth, temp_root
 ):
-    """First-time user with no CLAUDE.md should get one seeded from the
-    template when they start a profile-intake session — so the agent's
-    first Read tool call succeeds. The chat workflow assumes the file
-    exists; if it doesn't, the agent would fail on the first turn."""
+    """Starting the generic organizer must be side-effect free."""
     claude_md = temp_root / "CLAUDE.md"
-    assert not claude_md.exists()  # fixture starts clean
+    assert not claude_md.exists()
 
     r = client.post(
-        "/api/chat/sessions/profile-intake",
+        "/api/chat/sessions/organize",
         headers={**auth, "Content-Type": "application/json"},
         json={},
     )
@@ -488,20 +485,33 @@ def test_profile_intake_session_seeds_template_when_claude_md_missing(
     assert "initial_message" in body
     assert "zh" in body["initial_message"]
     assert "en" in body["initial_message"]
-    # The file should now exist with the template content (date substituted).
-    assert claude_md.exists()
-    content = claude_md.read_text(encoding="utf-8")
-    assert "CLAUDE.md" in content  # template header
-    assert "%DATE%" not in content  # date placeholder was substituted
+    assert "workspace-curator skill" in body["initial_message"]["en"]
+    assert not claude_md.exists()
+    for name in ("health", "work", "money", "people", "archives"):
+        assert not (temp_root / name).exists()
+
+
+def test_profile_intake_is_a_side_effect_free_compatibility_forward(
+    client, auth, temp_root
+):
+    claude_md = temp_root / "CLAUDE.md"
+    r = client.post(
+        "/api/chat/sessions/profile-intake",
+        headers={**auth, "Content-Type": "application/json"},
+        json={},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "workspace-curator skill" in body["initial_message"]["en"]
+    assert not claude_md.exists()
+    for name in ("health", "work", "money", "people", "archives"):
+        assert not (temp_root / name).exists()
 
 
 def test_profile_intake_session_doesnt_clobber_existing_claude_md(
     client, auth, temp_root
 ):
-    """If the user already has a CLAUDE.md (from the install-time CLI
-    intake or a previous profile-intake session), the new session must
-    NOT overwrite it — the in-chat workflow is meant to refine, not
-    reset."""
+    """The compatibility forward must leave existing instructions untouched."""
     claude_md = temp_root / "CLAUDE.md"
     custom_content = "# my hand-edited profile\n\n- name: Alice\n"
     claude_md.write_text(custom_content, encoding="utf-8")

@@ -42,7 +42,7 @@ jobs:
         env:
           # Use a minimal env so backend.settings doesn't refuse to import.
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.ci-archive
+          MUSELAB_ROOT: ${{ github.workspace }}/.ci-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run pytest tests/ -v
@@ -57,7 +57,7 @@ jobs:
         continue-on-error: true
         env:
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-archive
+          MUSELAB_ROOT: ${{ github.workspace }}/.ci-cov-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --with pytest-cov pytest tests/ -q \
@@ -164,7 +164,7 @@ jobs:
         env:
           RUN_E2E: "1"
           MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
-          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-archive
+          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-workspace
         run: |
           mkdir -p $MUSELAB_ROOT
           uv run --with pytest-playwright --with pytest-rerunfailures \

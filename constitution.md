@@ -10,12 +10,12 @@
 > intent lives in per-change specs; product roadmap and known issues live on
 > [GitHub Issues](https://github.com/hesorchen/muselab/issues).
 
-- **Version:** 2.0.0
+- **Version:** 3.0.0
 - **Ratified:** 2026-05-31
-- **Last amended:** 2026-07-23
+- **Last amended:** 2026-07-31
 - **Derived from:** `docs/architecture.md`,
   `CONTRIBUTING.md`, `SECURITY.md`, `pyproject.toml`, and the backend/frontend
-  source as of 2026-07-23.
+  source as of 2026-07-31.
 
 Normative keywords **MUST / MUST NOT / SHOULD / MAY** follow RFC 2119.
 
@@ -58,7 +58,7 @@ SDK-discovered `CLAUDE.md` hierarchy for the active cwd plus on-demand reads.
 ### P6 — Personal data is radioactive in shipped artifacts
 This is an open-source repo. No real personal data MAY appear in code, docs,
 commits, test fixtures, examples, or README copy. Tests MUST run against a
-throwaway archive directory.
+throwaway workspace directory.
 
 ---
 
@@ -259,19 +259,20 @@ form):
 - [ ] Frontend visual changes documented with a before/after note in the PR
       (no visual-regression harness yet).
 - [ ] No secrets; no additions to `.env` / `sessions/`.
-- [ ] Tests MUST pass against a throwaway archive — never real personal data.
+- [ ] Tests MUST pass against a throwaway workspace — never real personal data.
 
 ---
 
 ## 7. Scope Boundaries (Non-Goals)
 
-muselab is a **personal-workspace assistant**, not a generic AI platform. The
+muselab is a **self-hosted, workspace-bound Agent workbench**, not a generic
+hosted AI platform. The
 following MUST be declined absent an explicit constitution amendment:
 
 - A build step of any kind (violates P2).
 - A document-RAG / crawled-content pipeline over user workspaces (violates P5).
-- Generic chat-UI features outside the personal-workspace scope (plugin
-  marketplace, etc.).
+- Generic chat-UI features unrelated to workspace execution (hosted accounts,
+  social feeds, etc.).
 - OpenAI-only protocol providers (violates §3 / A3).
 - Presetting heavy/developer-only or write/trade-capable MCP servers by default
   (violates A6 — e.g. GitHub MCP, DB-write, brokerage).
@@ -300,6 +301,9 @@ following MUST be declined absent an explicit constitution amendment:
 
 ## 9. Amendment history
 
+- **3.0.0 (2026-07-31):** Repositioned muselab from its former personal-domain
+  framing to a workspace-bound Agent workbench; removed domain-specific
+  assumptions while retaining local-file, self-hosting, and safety invariants.
 - **2.0.0 (2026-07-23):** Replaced the single-archive model with registered
   workspaces; added the real terminal, short-lived real-time tickets, and
   Activity modules; defined model continuity as frontend fork-by-default with

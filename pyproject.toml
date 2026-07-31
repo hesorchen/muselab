@@ -1,7 +1,7 @@
 [project]
 name = "muselab"
 version = "1.2.0"
-description = "Self-hosted web UI for the Claude Agent SDK — talk to your own files with Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo."
+description = "Self-hosted multi-model Agent workbench for local workspaces, files, terminals, and artifacts."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
@@ -15,7 +15,7 @@ keywords = [
     "self-hosted",
     "llm",
     "ai-assistant",
-    "personal-archive",
+    "agent-workspace",
     "deepseek",
     "pwa",
 ]

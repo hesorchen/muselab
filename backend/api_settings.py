@@ -1389,7 +1389,7 @@ async def trigger_upgrade(req: UpgradeReq) -> dict:
       hooks), so anyone who can reach this endpoint can achieve code execution
       as the muselab process user. That is acceptable ONLY because the route
       is gated behind `require_token` — the same admin token that already
-      grants full archive read/write and unattended bypassPermissions agent
+      grants full workspace read/write and unattended bypassPermissions agent
       runs. In muselab's single-tenant, self-hosted threat model the token
       holder is the owner, so /upgrade grants no privilege they don't already
       have. The args are fixed string literals (no user-controlled package

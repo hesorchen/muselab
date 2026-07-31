@@ -29,9 +29,9 @@ Claude Agent SDK → claude CLI
 ## Key design decisions
 
 - **The SDK is the only model path.** Tool use, MCP, Skills, Subagents, plan mode, and `CLAUDE.md` come from the Claude Agent SDK. muselab does not create a parallel agent or system-prompt layer.
-- **Native instruction ownership.** Persistent identity, response style, personal context, and durable rules belong in the SDK-discovered `CLAUDE.md` hierarchy. Reusable workflows belong in Skills. Tool behavior belongs in tool descriptions and permission enforcement.
+- **Native instruction ownership.** Workspace goals, sources of truth, response style, and durable rules belong in the optional SDK-discovered `CLAUDE.md` hierarchy. Reusable workflows belong in Skills. Tool behavior belongs in tool descriptions and permission enforcement.
 - **Workspace binding.** `MUSELAB_ROOT` is the default workspace and additional local directories may be registered. Files, previews, terminals, and new-session cwd follow the active workspace; every session stores its own cwd.
-- **Whole-file input.** The assistant reads complete files on demand through Read, Grep, Edit, and related tools. muselab does not pre-embed or chunk the archive.
+- **Whole-file input.** The assistant reads complete workspace files on demand through Read, Grep, Edit, and related tools. muselab does not pre-embed or chunk them.
 - **Third-party provider isolation.** Each third-party provider receives per-request `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, and an isolated `CLAUDE_CONFIG_DIR`, preventing fallback to the wrong account.
 - **No frontend build step.** The browser runs the HTML, JavaScript, and CSS directly. Browser dependencies are vendored under `frontend/vendor/`.
 - **Short-lived tickets for real-time connections.** Chat obtains a one-time SSE ticket through an authenticated POST. Terminals obtain a one-time WebSocket ticket. Prompts and long-lived tokens do not enter real-time connection URLs.
@@ -66,10 +66,10 @@ muselab/
 ├── docs/                          # user and public technical docs
 ├── .claude/docs/                  # maintainer docs
 ├── .env                           # instance configuration and secrets
-└── sessions/                      # session metadata, queues, attachments
+└── sessions/                      # default session metadata directory
 
 $MUSELAB_ROOT/
-├── CLAUDE.md                      # default-workspace instructions and context
+├── CLAUDE.md                      # optional default-workspace instructions and context
 ├── user files
 ├── .muselab/
 │   ├── workspaces.json
@@ -86,7 +86,14 @@ $MUSELAB_ROOT/
 └── .muselab-dustbin/
 ```
 
-Repository state, the default workspace, and additional workspaces are separate backup units. Conversation transcripts belong to the Claude CLI. Claude sessions normally live under its standard configuration directory, while third-party-provider sessions may live under isolated configuration roots. muselab's `sessions/` stores layered metadata such as name, cwd, model, cost, attachments, and queue.
+Repository state, the default workspace, and additional workspaces are separate
+backup units. Conversation transcripts belong to the Claude CLI. Claude
+sessions normally live under its standard configuration directory, while
+third-party-provider sessions may live under isolated configuration roots.
+`MUSELAB_SESSIONS_DIR` stores muselab's layered metadata such as name, cwd,
+model, cost, attachments, and queue. It defaults to `<repo>/sessions`; native
+installers persist that location as an absolute path so a changed service
+working directory cannot move the state root.
 
 ## A chat turn
 

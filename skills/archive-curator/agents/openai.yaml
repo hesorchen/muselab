@@ -1,4 +1,4 @@
 interface:
-  display_name: "Archive Curator"
-  short_description: "整理个人 archive 并补全 CLAUDE.md 档案"
-  default_prompt: "Use $archive-curator to scan and organize my archive safely."
+  display_name: "Archive Curator (Deprecated)"
+  short_description: "workspace-curator 的旧名称兼容入口"
+  default_prompt: "Use $archive-curator as a compatibility alias to organize the current workspace safely."

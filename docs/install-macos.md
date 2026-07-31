@@ -33,13 +33,20 @@ The script will:
 
 1. Verify `uv` (and warn if `claude` missing)
 2. Run `uv sync`
-3. **Ask you** for the archive directory (where Muse can read/write),
-   defaults to `~/muselab-archive`
-4. Generate `.env` with a random `MUSELAB_TOKEN` and `MUSELAB_HOST=127.0.0.1`
+3. **Ask you** for the primary workspace (the project or data directory
+   muselab can read and modify), defaulting to `~/muselab-workspace`
+4. Generate `.env` with a random `MUSELAB_TOKEN`,
+   `MUSELAB_HOST=127.0.0.1`, and an absolute repo-local
+   `MUSELAB_SESSIONS_DIR`
 5. Write `~/Library/LaunchAgents/com.muselab.plist` and `launchctl load -w`
 6. Curl `localhost:8765` to confirm it's up
 
-If `.env` already exists, the script keeps it (re-running is safe).
+If `.env` already exists, the script preserves every existing value. It only
+appends `MUSELAB_SESSIONS_DIR=<current-checkout>/sessions` when that key is
+missing, so re-running is safe and a custom session path is never overwritten.
+The installer collects no personal profile, creates no predefined directories,
+and does not write `CLAUDE.md` automatically.
+Choose or configure a Provider in Settings after logging in.
 
 ## Remote Linux server: menu-bar client only
 
@@ -57,7 +64,7 @@ The installer verifies `/api/activity/summary`, stores the URL and token in
 starts `com.muselab.statusbar`. The helper polls every 10 seconds; clicking it
 opens the same origin with `/?activity=1`, so the web UI opens the global
 activity center. Use an HTTPS reverse proxy or a trusted VPN such as Tailscale;
-the token grants access to your archive and must not cross an untrusted network
+the token grants access to registered workspaces and must not cross an untrusted network
 in plain HTTP.
 
 ## Verify
@@ -87,8 +94,12 @@ launchctl load -w ~/Library/LaunchAgents/com.muselab.plist   # start again
 tail -f ~/Library/Logs/muselab/stderr.log              # tail logs
 
 bash scripts/doctor.sh                                  # re-verify install + probe service
-bash scripts/intake.sh                                  # (re)run profile intake / refresh CLAUDE.md
+bash scripts/intake.sh                                  # optional: create or refresh workspace CLAUDE.md
 ```
+
+`intake.sh` writes only generic workspace instructions and creates no fixed
+directory structure. After confirmation, an existing `CLAUDE.md` is backed up
+to `CLAUDE.md.bak`. See [Configure workspace CLAUDE.md](personalize-claude-md.md).
 
 ## Expose to LAN (optional)
 
@@ -114,8 +125,9 @@ without HTTPS + an auth layer in front (nginx basic-auth, Tailscale, …).
 bash scripts/uninstall-macos.sh
 ```
 
-Unloads and removes the plist. `.env`, `sessions/`, your archive directory, and
-the log dir are **not** touched. Delete the repo to remove fully.
+Unloads and removes the plist. `.env`, the configured session metadata
+directory, the primary workspace, and the log dir are **not** touched. Delete
+them separately to remove fully.
 
 ## macOS-specific troubleshooting
 

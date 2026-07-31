@@ -29,11 +29,15 @@ bash scripts/install-linux.sh
 
 1. 校验 `uv` 和 `systemctl` 可用
 2. 执行 `uv sync` 安装 Python 依赖
-3. **询问你**的 archive 目录（Muse 可读写的文件夹），默认 `~/muselab-archive`
-4. 生成 `.env`（含随机 `MUSELAB_TOKEN` 和 `MUSELAB_HOST=127.0.0.1`）
+3. **询问你**的主工作区（muselab 可读写的项目或资料目录），默认 `~/muselab-workspace`
+4. 生成 `.env`（含随机 `MUSELAB_TOKEN`、`MUSELAB_HOST=127.0.0.1`，以及指向当前仓库内会话目录的绝对 `MUSELAB_SESSIONS_DIR`）
 5. 写入 `~/.config/systemd/user/muselab.service` 并执行 `systemctl --user enable --now`
 
-如果 `.env` 已存在，脚本会保留不动（可安全重跑）。
+如果 `.env` 已存在，脚本会保留所有已有值；仅当缺少
+`MUSELAB_SESSIONS_DIR` 时追加 `<当前 checkout>/sessions`，不会覆盖自定义会话路径，
+因此可安全重跑。
+安装器不采集个人资料、不创建预设目录，也不会自动写入 `CLAUDE.md`。
+登录后在 Settings 中选择或配置 Provider。
 
 ## 验证
 
@@ -65,19 +69,19 @@ journalctl --user -u muselab -f       # tail 日志
 journalctl --user -u muselab -n 200   # 最近 200 行
 
 bash scripts/doctor.sh                # 重新校验安装并探测服务
-bash scripts/intake.sh                # 重做 profile intake / 更新 CLAUDE.md
+bash scripts/intake.sh                # 可选：创建或刷新工作区 CLAUDE.md
 ```
 
-## 重做 intake / 刷新档案
+## 可选：配置工作区说明
 
-installer 的 7 问 intake 可以随时重跑：
+如需为主工作区记录长期项目约定，可显式运行：
 
 ```bash
 bash scripts/intake.sh
 ```
 
-生活变化（换工作 / 搬家 / 新增家庭成员）后或安装时跳过了 intake 时很有用。
-现有 `CLAUDE.md` 会在覆盖前备份到 `CLAUDE.md.bak`。
+脚本只生成通用 `CLAUDE.md`，不会创建固定目录结构。现有文件会在确认覆盖后备份到
+`CLAUDE.md.bak`。详见[配置工作区 CLAUDE.md](personalize-claude-md_zh.md)。
 
 ## 校验安装 / 调试异常
 
@@ -136,8 +140,8 @@ muselab。不开防火墙、不暴露认证、零额外组件。
 bash scripts/uninstall-linux.sh
 ```
 
-停止服务并删除 unit 文件。`.env`、`sessions/`、archive 目录**不会**被动。
-彻底删除请直接删除仓库。
+停止服务并删除 unit 文件。`.env`、配置的会话元数据目录、主工作区**不会**被删除。
+彻底删除时需分别删除这些数据。
 
 ## 排错
 
