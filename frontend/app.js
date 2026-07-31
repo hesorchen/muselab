@@ -597,6 +597,7 @@ function portal() {
     },
     workspaceLastSession: {},
     _loadedPrefsSchema: 5,
+    _workspaceRegistrySeq: 0,
     workspaceSurfaces: {},
     _workspaceRuntimeCaches: new Map(),
     _workspaceTreeCacheTimers: new Map(),
@@ -1825,14 +1826,37 @@ function portal() {
       }, 8000);
 
       this.loadPrefs();
-      // Resolve the persisted workspace before the first file request; file
-      // paths are relative and must never flash content from the primary root.
-      await this.fetchSessionWorkspaces();
+      // A fresh sessionStorage registry is sufficient to resolve the first
+      // owner immediately. Revalidate it in the background; a network failure
+      // must not throw away the last known-good workspace list or hold the
+      // splash on a request that is independent of the first paint.
+      const restoredWorkspaceRegistry = this._restoreSessionWorkspaceCache();
+      const workspaceRegistryReady = Promise.resolve(this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: !restoredWorkspaceRegistry,
+        returnResolution: true,
+      })).catch(() => false);
+      if (!restoredWorkspaceRegistry) await workspaceRegistryReady;
       const rootOwner = this.fileWorkspacePath();
       // Attach the rejection handler immediately: the rest of boot awaits
       // context/session work before it observes this promise, and a fast tree
       // failure must never surface as an unhandled rejection in that gap.
       const rootReady = Promise.resolve(this.loadRoot()).catch(() => false);
+      if (restoredWorkspaceRegistry) {
+        void workspaceRegistryReady.then(result => {
+          if (!result || !result.invalidActive || !result.fallback
+              || !this._workspaceIsCurrent(result.requested)
+              || result.fallback === result.requested) return;
+          // The cached owner was removed on another device. The remote list was
+          // applied without mutating activeWorkspace, so the normal owner-
+          // scoped switch path can invalidate the stale bootstrap safely.
+          return this._changeWorkspaceSurface(result.fallback);
+        }).catch(() => false);
+      }
+      // Chat/session/activity transports do not depend on the file index or
+      // context cards. Start them before either slow request; the file stream
+      // remains gated on rootReady below so its cursor is always trustworthy.
+      this._startLiveConnections({ fileEvents: false });
       this.fetchTerminals({ restore: true });
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
@@ -1889,10 +1913,6 @@ function portal() {
       } catch (e) {
         // Will retry via heartbeat
       }
-      // Chat/session/activity connections are independent of the filesystem.
-      // Start them immediately; only the file replay stream waits for a trusted
-      // snapshot/cursor so a slow workspace cannot delay the rest of the app.
-      this._startLiveConnections({ fileEvents: false });
       void rootReady.then(treeOk => {
         if (!this._workspaceIsCurrent(rootOwner)) return;
         this._fileTreeDirty = treeOk !== true;
@@ -4861,14 +4881,16 @@ function portal() {
     async refreshChat() {
       this.toast(this.lang === "zh" ? "刷新中…" : "Refreshing…", "info", 1500);
       // Manual refresh re-pulls server-side data (context, session list,
-      // stats) and reloads the current session. The tab strip is
-      // device-local, so there's no cross-device tab state to merge.
+      // transcript) concurrently. Stats are independent toolbar decoration;
+      // refresh them in the background so four unrelated endpoints cannot
+      // hold the visible conversation refresh behind a waterfall.
+      const sid = this.currentId;
+      void Promise.resolve(this.fetchStats()).catch(() => {});
       await Promise.all([
         this.fetchContextInfo(),
         this.refreshSessions(),
-        this.fetchStats(),
+        sid ? this._reloadSessionCoalesced(sid, { quiet: true }) : Promise.resolve(true),
       ]);
-      if (this.currentId) await this.loadSession(this.currentId);
     },
 
     // ===== prefs =====
@@ -5025,30 +5047,38 @@ function portal() {
     },
 
     async fetchStats() {
-      try {
-        const r = await fetch("/api/chat/usage", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.stats = { ...this.stats, total_cost_usd: d.total_cost_usd, total_messages: d.total_messages };
-        }
-      } catch {}
-      await this.fetchMcp();
-      await this.fetchRateLimit();
-      try {
-        const r = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.availableModels = d.models || [];
-          this._modelsLoaded = true;
-          if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
-          if (d.default_permission) {
-            this.defaultPermission = d.default_permission;
-            this.savePrefs();
+      const usage = (async () => {
+        try {
+          const r = await fetch("/api/chat/usage", { headers: this.hdr() });
+          if (r.ok) {
+            const d = await r.json();
+            this.stats = { ...this.stats, total_cost_usd: d.total_cost_usd, total_messages: d.total_messages };
           }
-          this._ensureValidModel();
-          await this._rebindModelSelect();
-        }
-      } catch {}
+        } catch {}
+      })();
+      const providers = (async () => {
+        try {
+          const r = await fetch("/api/chat/providers", { headers: this.hdr() });
+          if (r.ok) {
+            const d = await r.json();
+            this.availableModels = d.models || [];
+            this._modelsLoaded = true;
+            if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
+            if (d.default_permission) {
+              this.defaultPermission = d.default_permission;
+              this.savePrefs();
+            }
+            this._ensureValidModel();
+            await this._rebindModelSelect();
+          }
+        } catch {}
+      })();
+      await Promise.allSettled([
+        usage,
+        this.fetchMcp(),
+        this.fetchRateLimit(),
+        providers,
+      ]);
     },
 
     async fetchCodexRateLimit(opts = {}) {
@@ -7367,8 +7397,6 @@ function portal() {
           Number(st._reconcileTargetUpdated) || 0,
           newU,
         );
-        const acceptedTarget = Number(st._reconcileTargetUpdated) || newU;
-
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
         if (cur.active) st._serverActiveObserved = true;
@@ -7410,10 +7438,11 @@ function portal() {
             }
             succeeded = true;
             st._loaded = true;
-            st._seenUpdated = Math.max(
-              Number(st._seenUpdated) || 0,
-              acceptedTarget,
-            );
+            // loadSession records the revision carried by the transcript it
+            // actually read. Never advance that cursor to the session-list
+            // target here: a concurrent list request can observe U2 while an
+            // already-in-flight transcript still contains U1. The finally
+            // block detects that gap and schedules the existing quiet retry.
             if (attach) await this._checkActiveTurn(sid);
           } catch (_) {
             st._pendingExternalUpdate = true;
@@ -7567,48 +7596,71 @@ function portal() {
           JSON.stringify(this.sessionWorkspaces.map(workspace => workspace.path)));
       } catch (_) {}
     },
-    async fetchSessionWorkspaces() {
+    _applySessionWorkspaceRegistry(workspaces, { validateActive = true } = {}) {
+      this.sessionWorkspaces = this._applySavedWorkspaceOrder(
+        Array.isArray(workspaces) ? workspaces : [],
+      );
+      const primaryFileRoot = this.primaryWorkspacePath();
+      if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
+        const surface = this.workspaceSurfaces[primaryFileRoot];
+        if (surface && typeof surface === "object") {
+          this.tabs = this._workspacePreviewTabs(surface);
+          this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+            ? surface.previewSelected : "";
+          this.showHidden = typeof surface.showHidden === "boolean"
+            ? surface.showHidden : this.showHidden;
+          this.openFilesCollapsed = !!surface.openFilesCollapsed;
+          this.openFilesHeight = typeof surface.openFilesHeight === "number"
+            ? surface.openFilesHeight : null;
+          this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
+        } else if (this.activeWorkspace && this.activeWorkspace !== primaryFileRoot) {
+          this.tabs = [];
+          this._pendingPreviewSelected = "";
+          this._pendingExpanded = [];
+        }
+        this._loadedPrefsSchema = 4;
+      }
+      const valid = new Set(this.sessionWorkspaces.map(w => w.path));
+      const session = this.sessions.find(s => s.id === this.currentId);
+      const fallback = (session && valid.has(session.cwd) && session.cwd)
+        || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+      const requested = this.activeWorkspace;
+      const invalidActive = !valid.has(requested);
+      if (invalidActive && validateActive) this.activeWorkspace = fallback;
+      return { invalidActive, requested, fallback };
+    },
+    _restoreSessionWorkspaceCache() {
       const cacheKey = "muselab_workspace_registry_v1";
       try {
         const cached = JSON.parse(sessionStorage.getItem(cacheKey) || "null");
         if (cached && Array.isArray(cached.workspaces)
             && Date.now() - Number(cached.savedAt || 0) < 10 * 60_000) {
-          this.sessionWorkspaces = this._applySavedWorkspaceOrder(cached.workspaces);
+          this._applySessionWorkspaceRegistry(cached.workspaces);
+          return this.sessionWorkspaces.length > 0;
         }
       } catch (_) {}
+      return false;
+    },
+    async fetchSessionWorkspaces({
+      restoreCache = true,
+      validateActive = true,
+      returnResolution = false,
+    } = {}) {
+      if (restoreCache) this._restoreSessionWorkspaceCache();
+      const cacheKey = "muselab_workspace_registry_v1";
+      const requestSeq = ++this._workspaceRegistrySeq;
       try {
         const response = await fetch("/api/chat/workspaces", { headers: this.hdr() });
         if (!response.ok) return false;
         const payload = await response.json();
-        this.sessionWorkspaces = this._applySavedWorkspaceOrder(payload.workspaces);
+        // A newer add/remove/reorder refresh owns the registry. Never let this
+        // older response restore a directory the user has already moved past.
+        if (requestSeq !== this._workspaceRegistrySeq) return false;
+        const resolution = this._applySessionWorkspaceRegistry(
+          payload.workspaces, { validateActive },
+        );
         try { sessionStorage.setItem(cacheKey, JSON.stringify({ savedAt: Date.now(), workspaces: this.sessionWorkspaces })); } catch (_) {}
-        const primaryFileRoot = this.primaryWorkspacePath();
-        if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
-          const surface = this.workspaceSurfaces[primaryFileRoot];
-          if (surface && typeof surface === "object") {
-            this.tabs = this._workspacePreviewTabs(surface);
-            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
-              ? surface.previewSelected : "";
-            this.showHidden = typeof surface.showHidden === "boolean"
-              ? surface.showHidden : this.showHidden;
-            this.openFilesCollapsed = !!surface.openFilesCollapsed;
-            this.openFilesHeight = typeof surface.openFilesHeight === "number"
-              ? surface.openFilesHeight : null;
-            this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
-          } else if (this.activeWorkspace && this.activeWorkspace !== primaryFileRoot) {
-            this.tabs = [];
-            this._pendingPreviewSelected = "";
-            this._pendingExpanded = [];
-          }
-          this._loadedPrefsSchema = 4;
-        }
-        const valid = new Set(this.sessionWorkspaces.map(w => w.path));
-        const session = this.sessions.find(s => s.id === this.currentId);
-        const fallback = (session && valid.has(session.cwd) && session.cwd)
-          || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
-        const requested = this.activeWorkspace;
-        if (!valid.has(requested)) this.activeWorkspace = fallback;
-        return true;
+        return returnResolution ? { ok: true, ...resolution } : true;
       } catch (_) {
         return false;
       }
@@ -7624,6 +7676,60 @@ function portal() {
         return true;
       } catch (_) {
         return false;
+      }
+    },
+    _mergeWorkspaceSessionList(raw, path) {
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const belongs = session => session
+        && (session.cwd || primary) === path;
+      const incoming = (Array.isArray(raw) ? raw : [])
+        .filter(session => session && typeof session.id === "string" && session.id);
+      const incomingIds = new Set(incoming.map(session => session.id));
+      // A successful scoped response is authoritative for this workspace's
+      // top window plus every forced remembered/open id. Replace that slice so
+      // a session deleted on another device cannot survive as a phantom row.
+      // _applySessionList re-injects open optimistic rows from _optimisticMetas,
+      // preserving sessions whose registration POST is still in flight.
+      const otherWorkspaces = (this.sessions || []).filter(
+        session => !belongs(session) && !incomingIds.has(session.id));
+      this._applySessionList([...incoming, ...otherWorkspaces]);
+      const confirmedIds = new Set(incomingIds);
+      return this.workspaceSessions(path).filter(session =>
+        confirmedIds.has(session.id)
+        || !!(this._optimisticMetas && this._optimisticMetas[session.id]));
+    },
+    async _pullWorkspaceSessions(path) {
+      if (!path) return { ok: false, sessions: [] };
+      const forcedIds = new Set(this.openTabIds || []);
+      const remembered = this.workspaceLastSession[path];
+      if (remembered) forcedIds.add(remembered);
+      const params = new URLSearchParams({
+        limit: "20",
+        workspace_only: "1",
+        ids: Array.from(forcedIds).join(","),
+      });
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+      );
+      try {
+        const response = await fetch(`/api/chat/sessions?${params.toString()}`, {
+          headers: this.conversationHdr(path),
+          signal: controller.signal,
+        });
+        if (!response.ok) return { ok: false, sessions: [] };
+        let data = null;
+        try { data = await response.json(); }
+        catch (_) { return { ok: false, sessions: [] }; }
+        const sessions = this._mergeWorkspaceSessionList(
+          (data && data.sessions) || [], path,
+        );
+        return { ok: true, sessions };
+      } catch (_) {
+        return { ok: false, sessions: [] };
+      } finally {
+        clearTimeout(timeout);
       }
     },
     async _refreshSessionsAfterWorkspaceRegistryChange() {
@@ -7823,13 +7929,29 @@ function portal() {
       this.workspaceSwitching = true;
       try {
         // A workspace owns the conversation cwd, file tree, preview tabs, and
-        // editor together. Preserve the old surface and restore the target one.
-        await this._changeWorkspaceSurface(path);
-        if (!this.workspaceSessions(path).length) await this._pullAllSessions();
-        const remembered = this.workspaceLastSession[path];
-        const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
-          || this.workspaceOpenTabIds(path).map(id => this.sessions.find(s => s.id === id)).find(Boolean)
-          || this.workspaceSessions(path)[0];
+        // editor together. Start the tree request first (it changes the owner
+        // synchronously), then fetch the target's small session window and
+        // prewarm its transcript while the tree is still loading.
+        const surfaceReady = Promise.resolve(
+          this._changeWorkspaceSurface(path),
+        ).catch(() => false);
+        const targetReady = (async () => {
+          const pulled = await this._pullWorkspaceSessions(path);
+          const remembered = this.workspaceLastSession[path];
+          // A 200 scoped response is authoritative: select only a row it
+          // confirmed (or an explicitly preserved optimistic row). On a
+          // transport/server failure, retain the previous offline fallback.
+          const workspaceRows = pulled && pulled.ok
+            ? pulled.sessions : this.workspaceSessions(path);
+          const target = workspaceRows.find(s => s.id === remembered)
+            || this.workspaceOpenTabIds(path)
+              .map(id => this.sessions.find(s => s.id === id)).find(Boolean)
+            || workspaceRows[0];
+          if (target) await this._ensureSessionLoaded(target.id);
+          return target || null;
+        })().catch(() => null);
+        const [surfaceOk, target] = await Promise.all([surfaceReady, targetReady]);
+        if (!surfaceOk || !this._workspaceIsCurrent(path)) return;
         if (target) await this.openTab(target.id);
         else this.newSession({ cwd: path });
         this.toast((this.lang === "zh" ? "已切换到 " : "Switched to ")
@@ -10887,15 +11009,14 @@ function portal() {
       }, 300);
     },
 
-    async _ensureSessionLoaded(sid) {
+    async _reloadSessionCoalesced(sid, opts = {}) {
       if (!sid) return false;
-      const st = this._ensureTabState(sid);
-      if (st._loaded) return true;
       if (this._sessionLoadPromises[sid]) {
         return this._sessionLoadPromises[sid];
       }
+      const st = this._ensureTabState(sid);
       const task = (async () => {
-        const ok = await this.loadSession(sid);
+        const ok = await this.loadSession(sid, opts);
         if (ok) st._loaded = true;
         return !!ok;
       })();
@@ -10907,6 +11028,25 @@ function portal() {
           delete this._sessionLoadPromises[sid];
         }
       }
+    },
+    async _ensureSessionLoaded(sid) {
+      if (!sid) return false;
+      const st = this._ensureTabState(sid);
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      const seen = Number(st._seenUpdated);
+      const updated = Number(meta && meta.updated_at) || 0;
+      const canonicalBehind = st._loaded
+        && st._seenUpdated !== undefined
+        && Number.isFinite(seen)
+        && updated > seen;
+      if (st._loaded && !canonicalBehind) return true;
+      // A workspace can have a warm tab whose transcript predates the scoped
+      // session row we just fetched. Refresh it off-screen while the tree is
+      // loading; quiet mode also keeps an already-visible pane intact when
+      // this helper is reused by another reconciliation path.
+      return await this._reloadSessionCoalesced(
+        sid, canonicalBehind ? { quiet: true } : {},
+      );
     },
 
     async loadSession(sid, opts = {}) {
@@ -13700,19 +13840,25 @@ function portal() {
           window.cancelIdleCallback(previous.idle);
         }
       }
-      const handle = { timer: null, idle: null };
+      // Alpine's reactive Map wraps object values on read, so comparing the
+      // retrieved handle object by identity can reject the still-current job.
+      // A Symbol remains stable through that proxy boundary.
+      const token = Symbol("workspace-tree-persist");
+      const handle = { timer: null, idle: null, token };
       const persist = async () => {
-        if (this._workspaceTreeCacheTimers.get(ownerWorkspace) !== handle) return;
+        const current = this._workspaceTreeCacheTimers.get(ownerWorkspace);
+        if (!current || current.token !== token) return;
         this._workspaceTreeCacheTimers.delete(ownerWorkspace);
         // A captured snapshot belongs to an inactive workspace. If that owner
         // became current again before idle time, loadRoot/delta will schedule a
         // fresh, cursor-consistent snapshot instead.
         if (capturedSnapshot && this._workspaceIsCurrent(ownerWorkspace)) return;
         if (!capturedSnapshot && !this._workspaceIsCurrent(ownerWorkspace)) return;
-        // IndexedDB is optional acceleration. Never serialize a complete tree
-        // while xterm is the foreground surface; the old snapshot/cursor remains
-        // valid and the next delta can catch it up.
-        if (this.previewSurface === "terminal") return;
+        // IndexedDB is optional acceleration. This runs after both the trailing
+        // debounce and an idle callback, so persisting the slim, cursor-matched
+        // snapshot is safe even while xterm is the foreground surface. Skipping
+        // it there left an old cursor behind and forced a large replay/resync on
+        // the next refresh.
         const source = capturedSnapshot || {
           showHidden: !!this.showHidden,
           cursor: this._workspaceTreeCursors.get(ownerWorkspace) ?? null,
@@ -14011,6 +14157,13 @@ function portal() {
     async _syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated) {
       const cursor = this._workspaceTreeCursors.get(ownerWorkspace);
       const hasCursor = hydrated && cursor != null && cursor !== "";
+      // Pin every request in this sync pass to its initiating owner. fileHdr()
+      // resolves the live workspace and is therefore unsafe for a second
+      // compatibility request after an awaited POST.
+      const ownerHeaders = this.hdr();
+      if (ownerWorkspace) {
+        ownerHeaders["X-Muselab-Workspace"] = encodeURIComponent(ownerWorkspace);
+      }
       const params = new URLSearchParams();
       if (hasCursor) {
         params.set("cursor", String(cursor));
@@ -14018,12 +14171,48 @@ function portal() {
         params.set("show_hidden", "true");
       }
       const query = params.toString();
-      const endpoint = hasCursor
-        ? `/api/files/delta?${query}`
-        : `/api/files/bootstrap${query ? `?${query}` : ""}`;
       let response;
       try {
-        response = await fetch(endpoint, { headers: this.fileHdr() });
+        if (hasCursor) {
+          response = await fetch(`/api/files/delta?${query}`, {
+            headers: ownerHeaders,
+          });
+        } else {
+          // Request only root children plus the child listings needed to paint
+          // currently-expanded branches. Parents are depth-sorted so a bounded
+          // backend cap always retains ancestors before deeper descendants.
+          const expandedParentSet = new Set();
+          for (const rawPath of Array.from(this.expanded || [])) {
+            if (typeof rawPath !== "string" || !rawPath
+                || rawPath.startsWith("/") || rawPath.split("/").includes("..")) continue;
+            const parts = rawPath.split("/").filter(Boolean);
+            for (let depth = 1; depth <= parts.length; depth++) {
+              expandedParentSet.add(parts.slice(0, depth).join("/"));
+            }
+          }
+          const expandedParents = Array.from(expandedParentSet)
+            .sort((a, b) => a.split("/").length - b.split("/").length
+              || a.localeCompare(b))
+            .slice(0, 100);
+          response = await fetch("/api/files/bootstrap", {
+            method: "POST",
+            headers: { ...ownerHeaders, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              show_hidden: !!this.showHidden,
+              parents: expandedParents,
+            }),
+          });
+          if ([404, 405, 501].includes(response.status)) {
+            if (treeSeq !== this._treeLoadSeq
+                || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+            // Rolling deploy compatibility with a backend that only knows the
+            // original full-snapshot GET contract.
+            response = await fetch(
+              `/api/files/bootstrap${query ? `?${query}` : ""}`,
+              { headers: ownerHeaders },
+            );
+          }
+        }
       } catch (_) { return false; }
       if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
       if (response.status === 404 || response.status === 405 || response.status === 501) return false;

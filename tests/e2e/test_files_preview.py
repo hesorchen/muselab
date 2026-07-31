@@ -832,6 +832,159 @@ def test_workspace_switch_only_waits_for_cold_tree_not_auxiliary_refreshes(
     assert result["runtime"]["terminalId"] == "terminal-slow"
 
 
+def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const owner = app.fileWorkspacePath();
+          const realFetch = window.fetch;
+          const originalPersist = app._scheduleWorkspaceTreePersist;
+          const originalExpanded = app.expanded;
+          const originalVisible = app.visible;
+          const originalChildCache = app.childCache;
+          const originalShowHidden = app.showHidden;
+          const calls = [];
+          const node = (path, isDir = false) => ({
+            path, name: path.split('/').pop(), is_dir: isDir,
+            size: 1, mtime: 1, mtime_ns: 1,
+          });
+          app.showHidden = true;
+          app.expanded = new Set(['src', 'src/deep']);
+          app.visible = [];
+          app.childCache = {};
+          app._workspaceTreeCursors.delete(owner);
+          app._scheduleWorkspaceTreePersist = () => {};
+          window.fetch = async (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname !== '/api/files/bootstrap') {
+              return realFetch(url, init);
+            }
+            const method = String(init.method || 'GET').toUpperCase();
+            calls.push({
+              method,
+              query: parsed.search,
+              body: init.body ? JSON.parse(init.body) : null,
+              workspace: decodeURIComponent(
+                new Headers(init.headers).get('X-Muselab-Workspace') || ''),
+            });
+            if (method === 'POST') return new Response('', {status: 405});
+            return new Response(JSON.stringify({
+              cursor: 9,
+              entries: [
+                node('src', true), node('.hidden'),
+                node('src/deep', true), node('src/deep/file.txt'),
+              ],
+            }), {status: 200, headers: {'Content-Type': 'application/json'}});
+          };
+          try {
+            const ok = await app._syncWorkspaceTree(
+              owner, app._treeLoadSeq, false);
+            return {
+              ok, calls, owner,
+              visible: app.visible.map(row => row.path),
+              cursor: app._workspaceTreeCursors.get(owner),
+            };
+          } finally {
+            window.fetch = realFetch;
+            app._scheduleWorkspaceTreePersist = originalPersist;
+            app.expanded = originalExpanded;
+            app.visible = originalVisible;
+            app.childCache = originalChildCache;
+            app.showHidden = originalShowHidden;
+          }
+        }"""
+    )
+    assert result["ok"] is True
+    assert {call["workspace"] for call in result["calls"]} == {result["owner"]}
+    calls = [
+        {key: value for key, value in call.items() if key != "workspace"}
+        for call in result["calls"]
+    ]
+    assert calls == [
+        {
+            "method": "POST",
+            "query": "",
+            "body": {
+                "show_hidden": True,
+                "parents": ["src", "src/deep"],
+            },
+        },
+        {"method": "GET", "query": "?show_hidden=true", "body": None},
+    ]
+    assert result["visible"] == ["src", "src/deep", "src/deep/file.txt", ".hidden"]
+    assert result["cursor"] == 9
+
+
+def test_terminal_foreground_still_persists_cursor_matched_tree_snapshot(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          // Use an isolated owner so unrelated boot/session filesystem events
+          // cannot keep replacing this owner's debounce handle.
+          const owner = `/terminal-persist-${Date.now()}-${Math.random()}`;
+          const originals = {
+            debounce: app.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS,
+            surface: app.previewSurface,
+            requestIdle: window.requestIdleCallback,
+            cancelIdle: window.cancelIdleCallback,
+          };
+          let stored = null;
+          let idleCalls = 0;
+          const cache = await app._persistentCache();
+          app.previewSurface = 'terminal';
+          const captured = {
+            showHidden: false,
+            cursor: 17,
+            visible: [{
+              path: 'src', name: 'src', is_dir: true,
+              size: 0, mtime: 1, depth: 0,
+            }],
+            childCache: {
+              ':false': [{
+                path: 'src', name: 'src', is_dir: true,
+                size: 0, mtime: 1,
+              }],
+              'src:false': [{
+                path: 'src/a.txt', name: 'a.txt', is_dir: false,
+                size: 1, mtime: 1,
+              }],
+            },
+            expanded: ['src'],
+          };
+          app.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS = 0;
+          window.requestIdleCallback = callback => {
+            idleCalls += 1;
+            return setTimeout(callback, 0);
+          };
+          window.cancelIdleCallback = handle => clearTimeout(handle);
+          try {
+            app._scheduleWorkspaceTreePersist(owner, captured);
+            const deadline = performance.now() + 4000;
+            while (!stored && performance.now() < deadline) {
+              await new Promise(resolve => setTimeout(resolve, 50));
+              stored = await cache.getWorkspaceSnapshot(owner);
+            }
+            return {stored, idleCalls};
+          } finally {
+            app.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS = originals.debounce;
+            app.previewSurface = originals.surface;
+            window.requestIdleCallback = originals.requestIdle;
+            window.cancelIdleCallback = originals.cancelIdle;
+          }
+        }"""
+    )
+    assert result["stored"] is not None, result
+    assert result["idleCalls"] >= 1
+    snapshot = result["stored"]
+    assert snapshot["cursor"] == 17
+    assert snapshot["expanded"] == ["src"]
+    assert set(snapshot["childCache"]) == {":false", "src:false"}
+
+
 def test_workspace_sync_orders_snapshot_events_and_batches_linear_delta(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)

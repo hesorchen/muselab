@@ -3051,6 +3051,8 @@ def list_sessions_api(
     limit: int = Query(0, ge=0, le=2000),
     ids: str = Query(""),
     q: str = Query(""),
+    workspace_only: bool = Query(False),
+    workspace_root: Path = Depends(resolve_workspace_root),
 ):
     # P2 (perf): paginate. `list_sessions()` returns ALL sessions (sorted
     # pinned→updated_at desc); shipping every one was 147 KB / 391 rows on a
@@ -3063,6 +3065,16 @@ def list_sessions_api(
     # limit=0 (the default) preserves the old "return everything" behaviour for
     # any caller that doesn't opt in.
     full = sess.list_sessions()
+    # A workspace switch only needs that workspace's recent sessions.  Filter
+    # before applying q/limit/ids so an open-tab id owned by another workspace
+    # can never be pulled into this response.  Legacy rows without cwd belong
+    # to ROOT, matching sessions._build_sessions_list().
+    if workspace_only:
+        workspace_path = str(workspace_root)
+        full = [
+            s for s in full
+            if str(s.get("cwd") or ROOT) == workspace_path
+        ]
     total = len(full)
     q_norm = (q or "").strip().lower()
     if q_norm:
@@ -3141,6 +3153,8 @@ def list_sessions_api(
         limit,
         ids,
         q_norm,
+        workspace_only,
+        str(workspace_root) if workspace_only else "",
         frozenset(turn_active_sids),
         frozenset(background_active_sids),
     )
@@ -3149,13 +3163,25 @@ def list_sessions_api(
         etag = _hit[1]
     else:
         try:
-            _payload = json.dumps(body, sort_keys=True, default=str,
+            # Keep the historical default validator byte-for-byte stable, but
+            # salt filtered representations with their workspace.  Two empty
+            # workspaces otherwise have identical bodies and could incorrectly
+            # validate each other's header-driven representation.
+            _etag_payload: Any = body
+            if workspace_only:
+                _etag_payload = {
+                    "workspace": str(workspace_root),
+                    "body": body,
+                }
+            _payload = json.dumps(_etag_payload, sort_keys=True, default=str,
                                   ensure_ascii=False).encode("utf-8")
             etag = 'W/"' + hashlib.md5(_payload).hexdigest() + '"'
         except (TypeError, ValueError):
             etag = ""
         if etag:
             _LIST_ETAG_CACHE["v"] = (_etag_key, etag)
+    if workspace_only:
+        response.headers["Vary"] = "X-Muselab-Workspace"
     if etag:
         # If-None-Match may carry a list ("tag1", "tag2") or "*". Weak-compare by
         # stripping the W/ prefix from both sides and matching the opaque value.
@@ -3167,7 +3193,17 @@ def list_sessions_api(
             wanted = _bare(etag)
             if any(_bare(p) == wanted for p in inm.split(",")):
                 # 304 must echo the validator and carry no body.
-                return Response(status_code=304, headers={"ETag": etag})
+                return Response(
+                    status_code=304,
+                    headers={
+                        "ETag": etag,
+                        **(
+                            {"Vary": "X-Muselab-Workspace"}
+                            if workspace_only
+                            else {}
+                        ),
+                    },
+                )
         response.headers["ETag"] = etag
     return body
 

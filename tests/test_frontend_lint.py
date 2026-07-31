@@ -385,7 +385,18 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     end = app.index("\n    closeWorkspaceBrowser()", start)
     switch = app[start:end]
 
-    assert "await this._changeWorkspaceSurface(path)" in switch
+    assert "const surfaceReady = Promise.resolve(" in switch
+    assert "this._changeWorkspaceSurface(path)" in switch
+    assert "await this._pullWorkspaceSessions(path)" in switch
+    assert "await this._ensureSessionLoaded(target.id)" in switch
+    assert "await Promise.all([surfaceReady, targetReady])" in switch
+    assert "_pullAllSessions()" not in switch
+    target_ready = switch[switch.index("const targetReady"):switch.index(
+        "const [surfaceOk, target]")]
+    assert "this.currentId =" not in target_ready
+    assert "this.openTab(" not in target_ready
+    assert switch.index("await Promise.all([surfaceReady, targetReady])") < switch.index(
+        "await this.openTab(target.id)")
     assert "return this.currentWorkspacePath()" in app
     assert "workspaceSurfaces: this.workspaceSurfaces" in app
     files_start = html.index('<aside class="pane files"')
@@ -396,6 +407,87 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "activity-center-btn" not in html[files_start:files_end]
     assert "workspace-picker" not in html[chat_start:chat_end]
     assert "activity-center-btn" in html[chat_start:chat_end]
+
+
+def test_workspace_switch_uses_scoped_session_window_and_merges_it():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    pull_start = app.index("_mergeWorkspaceSessionList(raw, path)")
+    pull_end = app.index("\n    async _refreshSessionsAfterWorkspaceRegistryChange()", pull_start)
+    pull = app[pull_start:pull_end]
+
+    assert 'workspace_only: "1"' in pull
+    assert 'limit: "20"' in pull
+    assert "const remembered = this.workspaceLastSession[path]" in pull
+    assert "headers: this.conversationHdr(path)" in pull
+    assert "this._mergeWorkspaceSessionList" in pull
+    assert "olderTarget" not in pull
+
+    ensure_start = app.index("async _ensureSessionLoaded(sid)")
+    ensure_end = app.index("\n    async loadSession(sid", ensure_start)
+    ensure = app[ensure_start:ensure_end]
+    assert "const canonicalBehind = st._loaded" in ensure
+    assert "updated > seen" in ensure
+    assert "canonicalBehind ? { quiet: true } : {}" in ensure
+    assert "this._applySessionList([...incoming, ...otherWorkspaces])" in pull
+    assert "this._optimisticMetas && this._optimisticMetas[session.id]" in pull
+    assert "return { ok: true, sessions }" in pull
+    assert "this.sessions =" not in pull
+
+
+def test_boot_uses_workspace_registry_cache_without_blocking_revalidation():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    boot_start = app.index("async _bootApp()")
+    boot_end = app.index("\n    // Start the always-on", boot_start)
+    boot = app[boot_start:boot_end]
+
+    assert "const restoredWorkspaceRegistry = this._restoreSessionWorkspaceCache()" in boot
+    assert "restoreCache: false" in boot
+    assert "if (!restoredWorkspaceRegistry) await workspaceRegistryReady" in boot
+    assert "if (restoredWorkspaceRegistry)" in boot
+    assert "return this._changeWorkspaceSurface(result.fallback)" in boot
+    assert "!this._workspaceIsCurrent(result.requested)" in boot
+
+    restore_start = app.index("    _restoreSessionWorkspaceCache() {")
+    restore_end = app.index("\n    async fetchSessionWorkspaces(", restore_start)
+    restore = app[restore_start:restore_end]
+    assert "10 * 60_000" in restore
+    assert "return this.sessionWorkspaces.length > 0" in restore
+
+    fetch_start = app.index("async fetchSessionWorkspaces({")
+    fetch_end = app.index("\n    async _pullAllSessions()", fetch_start)
+    fetch_workspaces = app[fetch_start:fetch_end]
+    assert "const requestSeq = ++this._workspaceRegistrySeq" in fetch_workspaces
+    assert "if (requestSeq !== this._workspaceRegistrySeq) return false" in fetch_workspaces
+
+
+def test_chat_refresh_and_stats_requests_run_concurrently():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    refresh_start = app.index("async refreshChat()")
+    refresh_end = app.index("\n    // ===== prefs =====", refresh_start)
+    refresh = app[refresh_start:refresh_end]
+    stats_start = app.index("async fetchStats()")
+    stats_end = app.index("\n    async fetchCodexRateLimit", stats_start)
+    stats = app[stats_start:stats_end]
+
+    assert "void Promise.resolve(this.fetchStats())" in refresh
+    assert "await Promise.all([" in refresh
+    assert "this.fetchContextInfo()" in refresh
+    assert "this.refreshSessions()" in refresh
+    assert "this._reloadSessionCoalesced(sid, { quiet: true })" in refresh
+    assert refresh.index("this.fetchContextInfo()") < refresh.index(
+        "this._reloadSessionCoalesced")
+    assert "await Promise.allSettled([" in stats
+    assert "this.fetchMcp()" in stats
+    assert "this.fetchRateLimit()" in stats
+    assert "providers," in stats
+
+    reconcile_start = app.index("_reconcileOpenSession(next)")
+    reconcile_end = app.index("\n    // Field-level equality", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    assert "st._seenUpdated = Math.max" not in reconcile
+    assert "const stillBehind" in reconcile
+    assert "st._pendingExternalUpdate = true" in reconcile
+    assert "st._reconcileRetryTimer = setTimeout" in reconcile
 
 
 def test_session_history_and_workspace_use_distinct_icons():
@@ -1695,6 +1787,17 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     sync_end = app.index("\n    _enqueueWorkspaceSync(", sync_start)
     sync = app[sync_start:sync_end]
     assert '`/api/files/delta?${query}`' in sync
+    assert 'fetch("/api/files/bootstrap", {' in sync
+    assert 'method: "POST"' in sync
+    assert 'show_hidden: !!this.showHidden' in sync
+    assert 'parents: expandedParents' in sync
+    assert "[404, 405, 501].includes(response.status)" in sync
+    assert 'ownerHeaders["X-Muselab-Workspace"]' in sync
+    fallback = sync[sync.index("if ([404, 405, 501].includes(response.status))"):]
+    assert fallback.index("treeSeq !== this._treeLoadSeq") < fallback.index(
+        '`/api/files/bootstrap${query ? `?${query}` : ""}`')
+    assert "{ headers: ownerHeaders }" in fallback
+    assert "this.fileHdr()" not in fallback
     assert '`/api/files/bootstrap${query ? `?${query}` : ""}`' in sync
     assert 'params.set("show_hidden", "true")' in sync
     assert "const hasCursor = hydrated && cursor != null" in sync
@@ -1722,7 +1825,9 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     persist = app[persist_start:persist_end]
     assert "WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500" in app
     assert "window.requestIdleCallback" in persist
-    assert 'if (this.previewSurface === "terminal") return' in persist
+    assert 'const token = Symbol("workspace-tree-persist")' in persist
+    assert "current.token !== token" in persist
+    assert 'if (this.previewSurface === "terminal") return' not in persist
     assert "Clone only after the trailing debounce" in persist
     assert 'const neededParents = new Set(["", ...expanded])' in persist
     assert "Object.entries(source.childCache || {}).map" not in persist
@@ -1742,6 +1847,8 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     boot = app[boot_start:boot_end]
     assert "Promise.resolve(this.loadRoot()).catch(() => false)" in boot
     assert "this._startLiveConnections({ fileEvents: false })" in boot
+    assert boot.index("this._startLiveConnections({ fileEvents: false })") < boot.index(
+        "await this.fetchContextInfo()")
     assert "await rootReady" not in boot
 
     load_start = app.index("loadRoot({ runtimeSnapshot = false")
