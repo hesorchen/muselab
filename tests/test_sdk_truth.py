@@ -19,8 +19,10 @@ def test_cli_encode_cwd_delegates_to_sdk():
 
 
 def test_valid_effort_sourced_from_sdk():
-    from backend.chat import _VALID_EFFORT
-    assert tuple(_VALID_EFFORT) == tuple(get_args(EffortLevel))
-    # "" (SDK adaptive default) must NOT be in the gate set — callers guard it
-    # via `if effort` so it falls through to the SDK default.
+    from backend.chat import _SDK_EFFORT_LEVELS, _VALID_EFFORT
+    assert tuple(_SDK_EFFORT_LEVELS) == tuple(get_args(EffortLevel))
+    assert tuple(_VALID_EFFORT) == (
+        "auto", *get_args(EffortLevel), "ultra",
+    )
+    # Empty is legacy input only; session/API output uses canonical `auto`.
     assert "" not in _VALID_EFFORT

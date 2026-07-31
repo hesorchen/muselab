@@ -7,7 +7,7 @@
 >
 > 范围：本文约束的是 *工程不变量*，不是功能愿望清单。功能意图写进每次改动的 spec，产品路线图与已知问题见 [GitHub Issues](https://github.com/hesorchen/muselab/issues)。
 
-- **版本：** 3.0.0
+- **版本：** 4.0.0
 - **批准日：** 2026-05-31
 - **最近修订：** 2026-07-31
 - **派生自：** `docs/architecture.md`、`CONTRIBUTING.md`、`SECURITY.md`、`pyproject.toml`，以及截至 2026-07-31 的前后端源码。
@@ -80,8 +80,8 @@ muselab 通过 **Claude Agent SDK**（与 Claude Code 同一引擎）驱动 Clau
 ### A3 — per-session env 覆盖 + 配置隔离
 第三方 provider 通过每请求设置 `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + 一个**隔离的** `CLAUDE_CONFIG_DIR` 来接入。隔离配置目录是强制的：它阻止 CLI 静默回退到 Pro OAuth、把第三方流量计费到用户的 Anthropic 账号上。任何新 provider 路径**必须**保留这三者。
 
-### A4 — client 池以 `(session_id, model, effort)` 为 key
-`chat.py` 正是以这个 key 池化 `ClaudeSDKClient` 实例，默认 LRU 上限为 3，也可通过受支持的运行配置调整。每条助手消息存自己的 `model`，使刷新后徽标依旧准确。改动池的 key 属于架构变更（它与 MCP 进程派生相互作用——见 A6）。
+### A4 — client 池以 `(session_id, model, effort, service_tier)` 为 key
+`chat.py` 正是以这个 key 池化 `ClaudeSDKClient` 实例，默认 LRU 上限为 3，也可通过受支持的运行配置调整。每条助手消息存自己的 `model`，使刷新后徽标依旧准确。effort 与 service tier 都是 SDK／Gateway 进程启动契约；修改任一项都**必须**重建对应会话运行时。改动池的 key 属于架构变更（它与 MCP 进程派生相互作用——见 A6）。
 
 ### A5 — UI 默认保护模型连续性
 首个真实回合确定会话模型。前端在非空会话切换不兼容模型时**必须** fork 新会话，避免跨 vendor thinking-block 签名导致不可恢复的 `400`。管理 API 可以显式修改会话模型，但调用者必须承担 transcript 兼容性风险。在任何 provider 存在之前创建的会话，会在首次发送时自愈到某个已配置模型。
@@ -101,7 +101,7 @@ muselab 通过 **Claude Agent SDK**（与 Claude Code 同一引擎）驱动 Clau
 对话 transcript 由 Claude CLI 所有：Claude 会话通常位于默认配置根，第三方 Provider 会话可能位于隔离的配置根。muselab 的 `sessions/` 只持有叠加在其上的 sidecar 元数据（名称、cwd、每消息 model 徽标、成本、附件）。muselab **禁止**复制或分叉 transcript 本身的所有权。
 
 ### A9 — 原生指令归属
-muselab **禁止**注入全局或会话级自定义 system prompt。持久身份、回复偏好与个人上下文属于 SDK 自动发现的 `CLAUDE.md` 层级；可复用任务工作流属于 Skill；工具特有行为属于工具描述与代码强制的权限配置。UI 可以用开场 Prompt 调用这些原生能力，但**禁止**再建立一层行为指令体系。
+muselab **禁止**注入全局或会话级自定义 system prompt。持久身份、回复偏好与个人上下文属于 SDK 自动发现的 `CLAUDE.md` 层级；可复用任务工作流属于 Skill；工具特有行为属于工具描述与代码强制的权限配置。UI 可以用开场 Prompt 调用这些原生能力，但**禁止**再建立一层行为指令体系。用户主动选择的运行模式只有在 hook 仅标识模式与 Skill、保持规范 user prompt 与 transcript 不变、并把可复用行为留在 `SKILL.md` 时，才可以通过 SDK `UserPromptSubmit.additionalContext` 激活内置 Skill；hook **禁止**携带另一套身份、persona 或工作流副本。
 
 ---
 
@@ -188,6 +188,7 @@ muselab 是一个**自托管、以工作区为边界的 Agent 工作台**，不�
 
 ## 9. 修订记录
 
+- **4.0.0（2026-07-31）：** Fast 在 SDK client 启动时即固定进 Gateway header 契约，因此为 A4 的精确 client-pool key 加入 `service_tier`；同时修订 A9，允许用户显式选择的运行模式通过临时 `UserPromptSubmit.additionalContext` 激活内置 Skill，但必须保持规范 prompt／transcript 不变，并把工作流留在 `SKILL.md`，而不是注入自定义 system prompt。
 - **3.0.0（2026-07-31）：** 将 muselab 从原有个人领域定位调整为以工作区为边界的 Agent 工作台；移除领域预设，同时保留本地文件、自托管与安全不变量。
 - **2.0.0（2026-07-23）：** 将单 archive 模型更新为多工作区；纳入真实终端、短期实时连接 ticket 与 Activity 模块；把模型连续性明确为前端默认 fork、管理 API 显式覆盖；固化 CLAUDE.md／Skills／工具权限的原生指令归属。
 

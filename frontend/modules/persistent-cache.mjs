@@ -86,3 +86,16 @@ export async function putWorkspaceSnapshot(owner, snapshot) {
     transaction.onabort = () => resolve(false);
   });
 }
+
+export async function deleteWorkspaceSnapshot(owner) {
+  if (!owner) return false;
+  const db = await database();
+  if (!db) return false;
+  return new Promise(resolve => {
+    const transaction = db.transaction(WORKSPACES, "readwrite");
+    transaction.objectStore(WORKSPACES).delete(namespace(owner));
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => resolve(false);
+    transaction.onabort = () => resolve(false);
+  });
+}

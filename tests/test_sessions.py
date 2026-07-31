@@ -5,11 +5,13 @@ locally — CLI's JSONL is source of truth. These tests cover muselab's
 metadata + per-message annotation sidecar layer only. End-to-end transcript
 flows require a live SDK and are not unit-testable here.
 """
+import asyncio
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -494,12 +496,64 @@ def test_providers_includes_deepseek_after_key_set(client, auth, monkeypatch):
 
 def test_providers_marks_codex_effort_capability(client, auth, monkeypatch):
     monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    from backend import chat as chat_mod
+
+    async def capabilities(_models):
+        return {
+            "codex:gpt-5.5": {
+                "supported_reasoning_levels": [
+                    "low", "medium", "high", "xhigh",
+                ],
+                "service_tiers": ["priority"],
+            }
+        }
+
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capabilities", capabilities)
     r = client.get("/api/chat/providers", headers=auth)
     assert r.status_code == 200
     models = r.json()["models"]
     codex = next(m for m in models if m["model"] == "codex:gpt-5.5")
     assert codex["supports_effort"] is True
     assert codex["supports_thinking"] is False
+    assert codex["effort_levels"] == [
+        "auto", "low", "medium", "high", "xhigh",
+    ]
+    assert codex["service_tiers"] == ["fast"]
+    assert codex["supports_fast"] is True
+
+
+def test_provider_capability_batch_probes_unreachable_gateway_once(
+    app_module, monkeypatch,
+):
+    """One blackholed base must cost one timeout, not one per Codex model."""
+    monkeypatch.setenv("CODEX_GATEWAY_API_KEY", "local-secret")
+    from backend import chat as chat_mod
+
+    calls: list[str] = []
+
+    async def blackhole(model):
+        calls.append(model)
+        await asyncio.sleep(0.05)
+        return None
+
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability", blackhole)
+    chat_mod._CONTEXT_CAPABILITY_CACHE.clear()
+    started = time.monotonic()
+    models = [
+        f"codex:{slug}"
+        for slug in chat_mod._CODEX_CONTROL_FALLBACKS
+    ]
+    result = asyncio.run(
+        chat_mod._detect_gateway_context_capabilities(models),
+    )
+    elapsed = time.monotonic() - started
+
+    assert result == {}
+    assert len(calls) == 1
+    assert calls[0].startswith("codex:")
+    assert elapsed < 0.20
 
 
 def test_codex_legacy_raw_model_alias_resolves(app_module, monkeypatch):

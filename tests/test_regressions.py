@@ -182,6 +182,10 @@ def test_codex_gateway_catalog_parser_preserves_raw_and_max_windows(app_module):
             "slug": "gpt-5.4",
             "context_window": 272_000,
             "max_context_window": 1_000_000,
+            "supported_reasoning_levels": [
+                {"effort": "low"}, {"effort": "xhigh"},
+            ],
+            "service_tiers": [{"id": "priority"}],
         }],
     })
     cap = parsed["gpt-5.4"]
@@ -191,6 +195,14 @@ def test_codex_gateway_catalog_parser_preserves_raw_and_max_windows(app_module):
     assert cap["context_effective_percent"] == 95
     assert cap["context_limit_source"] == "gateway_catalog"
     assert cap["context_limit_is_estimate"] is False
+    assert cap["supported_reasoning_levels"] == ["low", "xhigh"]
+    assert cap["service_tiers"] == ["priority"]
+    assert chat_mod._model_control_capability(
+        "codex:gpt-5.4", cap) == {
+            "effort_levels": ["auto", "low", "xhigh"],
+            "service_tiers": ["fast"],
+            "supports_fast": True,
+        }
 
 
 def test_codex_usage_catalog_overrides_stale_200k_session(

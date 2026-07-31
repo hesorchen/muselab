@@ -64,6 +64,11 @@ def _entry(path: str, is_dir: bool, stat: os.stat_result) -> dict[str, Any]:
     }
 
 
+def _parent_path(path: str) -> str:
+    """Return the normalized logical parent used by the SQLite covering index."""
+    return path.rpartition("/")[0]
+
+
 def is_ignored_descendant(path: str | Path) -> bool:
     """Return whether a path sits below an intentionally opaque subtree."""
     return any(
@@ -151,6 +156,7 @@ class WorkspaceStore:
                     CREATE TABLE IF NOT EXISTS files (
                         workspace_id TEXT NOT NULL,
                         path TEXT NOT NULL,
+                        parent TEXT NOT NULL DEFAULT '',
                         name TEXT NOT NULL,
                         is_dir INTEGER NOT NULL,
                         size INTEGER NOT NULL,
@@ -195,6 +201,28 @@ class WorkspaceStore:
                         "ALTER TABLE files "
                         "ADD COLUMN inode INTEGER NOT NULL DEFAULT 0"
                     )
+                if "parent" not in columns:
+                    db.execute(
+                        "ALTER TABLE files "
+                        "ADD COLUMN parent TEXT NOT NULL DEFAULT ''"
+                    )
+                    # `name` is already the path basename, so this backfill is
+                    # deterministic and stays inside one SQLite transaction.
+                    db.execute(
+                        """
+                        UPDATE files
+                        SET parent = CASE
+                            WHEN instr(path, '/') = 0 THEN ''
+                            ELSE substr(path, 1, length(path) - length(name) - 1)
+                        END
+                        """
+                    )
+                db.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS files_workspace_parent_path
+                    ON files(workspace_id, parent, path)
+                    """
+                )
             self._secure_database_files()
             self._ready = True
 
@@ -210,6 +238,14 @@ class WorkspaceStore:
         resolved_root = str(root.resolve())
         primary_value = int(primary)
         with self._workspace_lock(workspace_id), self._connect() as db:
+            # A remove/re-add can allocate a fresh generation for the same
+            # path.  If the previous process exited after updating the
+            # registry but before deleting its SQLite row, recover here
+            # instead of failing the new registration on UNIQUE(path).
+            db.execute(
+                "DELETE FROM workspaces WHERE path = ? AND id <> ?",
+                (resolved_root, workspace_id),
+            )
             current = db.execute(
                 """
                 SELECT path, name, primary_workspace
@@ -991,16 +1027,10 @@ class WorkspaceStore:
         *,
         show_hidden: bool = True,
     ) -> list[dict[str, Any]]:
-        """Read root and expanded-directory children without scanning all rows."""
-        clauses = ["instr(path, '/') = 0"]
-        parameters: list[Any] = [workspace_id]
-        for parent in parents:
-            prefix = f"{parent}/"
-            clauses.append(
-                "(substr(path, 1, ?) = ? "
-                "AND instr(substr(path, ?), '/') = 0)"
-            )
-            parameters.extend((len(prefix), prefix, len(prefix) + 1))
+        """Read root and expanded-directory children through a bounded index."""
+        selected_parents = ["", *dict.fromkeys(parents)]
+        placeholders = ", ".join("?" for _ in selected_parents)
+        parameters: list[Any] = [workspace_id, *selected_parents]
         hidden_clause = ""
         if not show_hidden:
             hidden_clause = (
@@ -1010,9 +1040,9 @@ class WorkspaceStore:
         rows = db.execute(
             f"""
             SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode
-            FROM files
+            FROM files INDEXED BY files_workspace_parent_path
             WHERE workspace_id = ?
-              AND ({' OR '.join(clauses)}){hidden_clause}
+              AND parent IN ({placeholders}){hidden_clause}
             ORDER BY path
             """,
             parameters,
@@ -1073,14 +1103,15 @@ class WorkspaceStore:
         db.executemany(
             """
             INSERT INTO files(
-                workspace_id, path, name, is_dir, size, mtime, mtime_ns,
+                workspace_id, path, parent, name, is_dir, size, mtime, mtime_ns,
                 ctime_ns, inode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
                     workspace_id,
                     row["path"],
+                    _parent_path(row["path"]),
                     row["name"],
                     int(row["is_dir"]),
                     row["size"],
@@ -1102,10 +1133,11 @@ class WorkspaceStore:
         db.execute(
             """
             INSERT INTO files(
-                workspace_id, path, name, is_dir, size, mtime, mtime_ns,
+                workspace_id, path, parent, name, is_dir, size, mtime, mtime_ns,
                 ctime_ns, inode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(workspace_id, path) DO UPDATE SET
+                parent=excluded.parent,
                 name=excluded.name,
                 is_dir=excluded.is_dir,
                 size=excluded.size,
@@ -1117,6 +1149,7 @@ class WorkspaceStore:
             (
                 workspace_id,
                 row["path"],
+                _parent_path(row["path"]),
                 row["name"],
                 int(row["is_dir"]),
                 row["size"],

@@ -29,7 +29,7 @@ Claude Agent SDK → claude CLI
 ## 关键设计
 
 - **SDK 是唯一模型入口。** 工具调用、MCP、Skills、Subagent、plan mode 与 `CLAUDE.md` 均由 Claude Agent SDK 提供。muselab 不建立另一套 Agent 或 system prompt 体系。
-- **原生指令归属。** 工作区目标、事实来源、回复风格与长期规则放在 SDK 自动发现的可选 `CLAUDE.md` 层级；可复用工作流放在 Skills；工具行为由工具描述和权限配置约束。
+- **原生指令归属。** 工作区目标、事实来源、回复风格与长期规则放在 SDK 自动发现的可选 `CLAUDE.md` 层级；可复用工作流放在 Skills；工具行为由工具描述和权限配置约束。用户主动选择的运行模式可以通过临时 `UserPromptSubmit.additionalContext` 激活内置 Skill；hook 只标识模式与 Skill，原始 prompt／transcript 保持不变，具体工作流仍归 `SKILL.md` 所有。
 - **工作区绑定。** `MUSELAB_ROOT` 是默认工作区，也可登记其他本地目录。文件面板、预览、终端和新会话 cwd 随当前工作区切换；每个会话保存自己的 cwd。
 - **整文件输入。** 助手通过 Read、Grep、Edit 等工具按需读取完整文件，不预先向量化或切块。
 - **第三方 Provider 隔离。** 每个第三方 Provider 按请求设置 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` 与隔离的 `CLAUDE_CONFIG_DIR`，避免 CLI 回退到错误账户。

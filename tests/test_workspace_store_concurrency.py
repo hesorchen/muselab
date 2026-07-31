@@ -7,6 +7,26 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+
+def test_register_workspace_replaces_stale_generation_for_same_path(
+    app_module,
+    temp_root: Path,
+):
+    from backend.workspace_store import WorkspaceStore
+
+    store = WorkspaceStore(temp_root)
+    store.register_workspace("stale-generation", temp_root, "old")
+    store.register_workspace("fresh-generation", temp_root, "new")
+
+    with pytest.raises(KeyError, match="unknown workspace"):
+        store.state("stale-generation")
+    assert store.state("fresh-generation") == {
+        "initialized": False,
+        "cursor": 0,
+    }
+
 
 def test_compact_bootstrap_reads_only_root_and_expanded_children(
     app_module,
@@ -70,6 +90,22 @@ def test_compact_bootstrap_reads_only_root_and_expanded_children(
     assert "other/omitted.txt" not in {
         row["path"] for row in expanded["entries"]
     }
+
+    with store._connect() as db:
+        plan = db.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT path, name
+            FROM files INDEXED BY files_workspace_parent_path
+            WHERE workspace_id = ? AND parent IN (?, ?)
+            ORDER BY path
+            """,
+            (workspace_id, "", "docs"),
+        ).fetchall()
+    assert any(
+        "files_workspace_parent_path" in str(row["detail"])
+        for row in plan
+    ), plan
 
     complete = store.bootstrap(workspace_id)
     assert "partial" not in complete

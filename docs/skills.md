@@ -19,10 +19,10 @@ automatically.
 
 ## Bundled skills
 
-Muselab ships 12 supported skills out of the box: eight muselab-native
+Muselab ships 13 supported skills out of the box: nine muselab-native
 (MIT) and four community-contributed. A deprecated native compatibility
 alias remains discoverable for one transition cycle, so the repository
-contains 13 skill directories in total. See `THIRD_PARTY_LICENSES.md` for
+contains 14 skill directories in total. See `THIRD_PARTY_LICENSES.md` for
 upstream URLs and license details.
 
 | Skill | What it does | Origin | External deps |
@@ -35,6 +35,7 @@ upstream URLs and license details.
 | `task-decomposer` | Turns a vague goal into an ordered task list with size estimates, a Definition of Done, critical-path steps, and flagged unknowns | muselab-native | none |
 | `summary-distiller` | Picks the right summary shape (TL;DR, key points, structured, action items) based on source type; preserves numbers, names, and dates verbatim | muselab-native | none |
 | `workspace-curator` | Organises the active workspace with a scan-first, proposal-first workflow and explicit confirmation before material changes | muselab-native | none |
+| `ultra-orchestrator` | Applies maximum reasoning and bounded parallel Agent/Task delegation when the user selects Codex Ultra mode | muselab-native | none |
 | `archive-curator` | Deprecated compatibility alias for `workspace-curator`, with the same proposal and safety boundaries | muselab-native | none |
 | `pptx` | Generates PowerPoint files by writing and running inline Python with `python-pptx` via the Bash tool | community | `python-pptx` (`pip install python-pptx`) |
 | `csv-analyzer` | Loads a CSV with `pandas`, profiles column types, generates conditional charts (PNG), outputs a complete analysis in one response | community | `pandas`; `matplotlib`/`seaborn` optional |

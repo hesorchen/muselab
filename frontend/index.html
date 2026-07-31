@@ -3119,9 +3119,11 @@
           <!-- `effort.label`, not `effort.title`: the latter is tooltip prose
                ("Effort — Anthropic 官方术语，控制推理预算与…") and was being
                rendered as a visible field label. -->
-          <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
+          <label class="chat-toolbar-more-field" x-show="_showEffortControl(model)">
             <span x-text="t('effort.label')" :title="t('effort.title')"></span>
-            <select x-model="effort" @change="onEffortChange()">
+            <select x-model="effort" @change="onEffortChange()"
+                    :disabled="workspaceSwitching"
+                    :aria-busy="runtimeSettingsPending()">
               <!-- effortOptLabel, not t(): the raw labels carry an "Effort · "
                    prefix for the unlabelled desktop select, which under this
                    field's own "Effort" label printed the word twice. -->
@@ -3129,6 +3131,17 @@
                 <option :value="opt.value" x-text="effortOptLabel(opt)"></option>
               </template>
             </select>
+          </label>
+          <label class="chat-toolbar-more-field row" x-show="_showFastControl(model)"
+                 :title="t('service_tier.title')">
+            <span x-text="t('service_tier.label')"></span>
+            <span class="switch sm">
+              <input type="checkbox" :checked="serviceTier === 'fast'"
+                     :disabled="workspaceSwitching"
+                     @change="onServiceTierChange($event.target.checked)"
+                     :aria-busy="runtimeSettingsPending()">
+              <span class="switch-slider"></span>
+            </span>
           </label>
           <!-- Concise mode. A device preference, not a session one — it sits
                here rather than in Settings because the screen it fixes is the
@@ -3323,6 +3336,7 @@
             <!-- Model selector -->
             <select x-model="model" @change="onModelChange()"
                     class="chat-toolbar-select"
+                    :disabled="workspaceSwitching"
                     :title="lang==='zh' ? '切换模型' : 'Switch model'">
               <template x-if="model && !availableModels.some(m => m.model === model)">
                 <option :value="model" x-text="model"></option>
@@ -3348,24 +3362,33 @@
               <option value="auto">auto</option>
               <option value="plan">plan</option>
             </select>
-            <!-- Reasoning effort. Empty = SDK adaptive default (Opus 4.7's
-                 adaptive thinking picks per turn). Overrides apply session-
-                 wide and trigger a client rebuild on next turn.
-
-                 Options visibility tracks current model/provider metadata:
-                 Claude models always show it; non-Claude providers show it
-                 only when /api/chat/providers marks supports_effort=true
-                 (currently Codex Gateway). xhigh remains Opus-only — SDK
-                 falls back to high elsewhere, so we hide rather than mislead.
-                 See _supportsEffort / _effortAllowed in app.js. -->
+            <!-- Reasoning effort. Options come from this model's exact
+                 /api/chat/providers effort_levels capability list. This keeps
+                 Codex Sol's xhigh/max/ultra visible without implying that every
+                 model supports them. `auto` delegates to the runtime. -->
             <select x-model="effort" @change="onEffortChange()"
-                    x-show="_supportsEffort(model)"
+                    x-show="_showEffortControl(model)"
                     class="chat-toolbar-select chat-toolbar-effort"
+                    :disabled="workspaceSwitching"
+                    :aria-busy="runtimeSettingsPending()"
                     :title="t('effort.title')">
-              <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
+              <template x-for="opt in effortChoices(model)" :key="opt.value">
                 <option :value="opt.value" x-text="t(opt.labelKey)"></option>
               </template>
             </select>
+            <!-- Fast is a provider service tier, independent from reasoning
+                 effort. It appears only when the selected model advertises
+                 supports_fast and is persisted per session. -->
+            <button type="button"
+                    class="chat-toolbar-fast"
+                    :class="{ active: serviceTier === 'fast' }"
+                    x-show="_showFastControl(model)"
+                    :disabled="workspaceSwitching"
+                    :aria-pressed="serviceTier === 'fast'"
+                    :aria-busy="runtimeSettingsPending()"
+                    @click="onServiceTierChange(serviceTier !== 'fast')"
+                    :title="t('service_tier.title')"
+                    x-text="t('service_tier.label')"></button>
             <!-- Mobile-only gear: on phones the permission + effort selects
                  above are hidden (CSS) and collapsed in here, so the composer
                  toolbar stays a single row instead of wrapping to two. Desktop
@@ -3377,7 +3400,7 @@
                       class="chat-toolbar-btn chat-toolbar-more-btn"
                       :class="{ active: composerSettingsOpen }"
                       @click.stop="composerSettingsOpen = !composerSettingsOpen"
-                      :title="lang==='zh' ? '会话设置（权限 / Effort）' : 'Session settings (permission / effort)'">
+                      :title="lang==='zh' ? '会话设置（权限 / Effort / Fast）' : 'Session settings (permission / effort / Fast)'">
                 <svg><use href="#i-sliders"/></svg>
               </button>
               <!-- The panel itself is NOT here — see .chat-toolbar-more-pop
@@ -3471,7 +3494,7 @@
                  shows while streaming. Same shape + size + fill — they
                  read as a sibling pair (blue send / red stop). -->
             <button @click="send()"
-                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._permissionChangePending || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
                     :aria-label="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')"
                     :title="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')">

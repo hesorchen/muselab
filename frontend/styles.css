@@ -1509,7 +1509,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      order would otherwise keep the gear hidden on phones. */
   .chat-toolbar-more { display: inline-flex !important; }
   .chat-toolbar-permission,
-  .chat-toolbar-effort { display: none !important; }
+  .chat-toolbar-effort,
+  .chat-toolbar-fast { display: none !important; }
   /* Model name truncates on phones (full name is in the dropdown anyway) — cap
      it so attach · model · gear · ring · rl · send all fit one row. */
   .chat-toolbar-select { max-width: 6.5em; }
@@ -6336,6 +6337,23 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .chat-toolbar-think:hover { background-color: var(--c-bg-3); color: var(--c-fg-0); }
 .chat-toolbar-think input { margin: 0; cursor: pointer; accent-color: var(--c-accent); }
+/* Fast is an independent service-tier button. It deliberately resembles a
+   compact toolbar toggle rather than another effort option. */
+.chat-toolbar-fast {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 26px; padding: 0 8px;
+  border: 1px solid transparent; border-radius: var(--r-md);
+  background: transparent; color: var(--c-fg-2);
+  font: inherit; font-size: var(--fs-xs); font-weight: 600;
+  cursor: pointer; flex-shrink: 0;
+  transition: background-color var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+}
+.chat-toolbar-fast:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-toolbar-fast.active {
+  color: var(--c-accent); background: var(--c-accent-soft);
+  border-color: color-mix(in srgb, var(--c-accent) 35%, transparent);
+}
+.chat-toolbar-fast[aria-busy="true"] { cursor: progress; opacity: 0.72; }
 /* Context donut ring — replaces the earlier monospace chip. Just 18×18 SVG
    showing percentage used; numeric details live in the tooltip. Color
    shifts accent → warn (orange) → danger (red) at 70 / 90 %. */

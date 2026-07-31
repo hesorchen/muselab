@@ -830,6 +830,153 @@ async def test_ensure_workspace_hot_path_skips_registry_sqlite_roundtrips(
 
 
 @pytest.mark.asyncio
+async def test_remove_serializes_with_inflight_first_ensure(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    """A slow registration cannot reinstall state after registry deletion."""
+    import backend.file_events as file_events
+    from backend.workspaces import registry
+
+    extra_root = temp_root.parent / "workspace-remove-race"
+    extra_root.mkdir(exist_ok=True)
+    entry = registry.register(extra_root, "race")
+    store = file_events.WorkspaceStore(temp_root)
+    manager = file_events.FileWatchManager(store)
+    register_started = threading.Event()
+    allow_register = threading.Event()
+    real_register = store.register_workspace
+
+    def paused_register(*args, **kwargs):
+        register_started.set()
+        assert allow_register.wait(timeout=2)
+        return real_register(*args, **kwargs)
+
+    monkeypatch.setattr(store, "register_workspace", paused_register)
+    ensure_task = asyncio.create_task(manager.ensure_workspace(extra_root))
+    assert await asyncio.to_thread(register_started.wait, 2)
+
+    registry.remove(extra_root)
+    remove_task = asyncio.create_task(
+        manager.remove_workspace(entry.id, extra_root),
+    )
+    await asyncio.sleep(0)
+    assert not remove_task.done()
+    allow_register.set()
+
+    with pytest.raises(ValueError, match="workspace is not registered"):
+        await ensure_task
+    await asyncio.wait_for(remove_task, timeout=2)
+
+    assert extra_root.resolve() not in manager._states
+    with pytest.raises(KeyError, match="unknown workspace"):
+        store.state(entry.id)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_remove_waits_for_inflight_reconcile_thread(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    """A cancelled outer task must not let its worker resurrect SQLite state."""
+    import backend.file_events as file_events
+    from backend.workspaces import registry
+
+    extra_root = temp_root.parent / "workspace-reconcile-remove-race"
+    extra_root.mkdir(exist_ok=True)
+    (extra_root / "tracked.txt").write_text("data", encoding="utf-8")
+    entry = registry.register(extra_root, "race")
+    store = file_events.WorkspaceStore(temp_root)
+    manager = file_events.FileWatchManager(store)
+    reconcile_started = threading.Event()
+    allow_reconcile = threading.Event()
+    real_reconcile = store.reconcile
+
+    def paused_reconcile(*args, **kwargs):
+        reconcile_started.set()
+        assert allow_reconcile.wait(timeout=2)
+        return real_reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(store, "reconcile", paused_reconcile)
+    state = await manager.ensure_workspace(extra_root)
+    assert await asyncio.to_thread(reconcile_started.wait, 2)
+
+    registry.remove(extra_root)
+    remove_task = asyncio.create_task(
+        manager.remove_workspace(entry.id, extra_root),
+    )
+    await asyncio.sleep(0.05)
+    assert not remove_task.done()
+    allow_reconcile.set()
+    await asyncio.wait_for(remove_task, timeout=2)
+
+    assert state.reconcile_task is None
+    assert extra_root.resolve() not in manager._states
+    with pytest.raises(KeyError, match="unknown workspace"):
+        store.state(entry.id)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delete_and_same_path_readd_are_one_lifecycle(
+    app_module,
+    temp_root,
+    monkeypatch,
+):
+    """POST cannot publish a new generation before DELETE finishes cleanup."""
+    import backend.file_events as file_events
+    from backend.workspaces import registry
+
+    extra_root = temp_root.parent / "workspace-delete-readd-race"
+    extra_root.mkdir(exist_ok=True)
+    store = file_events.WorkspaceStore(temp_root)
+    manager = file_events.FileWatchManager(store)
+    first = await manager.register_workspace(extra_root, "first")
+    first_state = manager._states[extra_root.resolve()]
+    if first_state.reconcile_task is not None:
+        await asyncio.wait_for(first_state.reconcile_task, timeout=2)
+
+    remove_started = threading.Event()
+    allow_remove = threading.Event()
+    real_remove = store.remove_workspace
+
+    def paused_remove(*args, **kwargs):
+        remove_started.set()
+        assert allow_remove.wait(timeout=2)
+        return real_remove(*args, **kwargs)
+
+    monkeypatch.setattr(store, "remove_workspace", paused_remove)
+    delete_task = asyncio.create_task(
+        manager.unregister_workspace(extra_root),
+    )
+    assert await asyncio.to_thread(remove_started.wait, 2)
+    readd_task = asyncio.create_task(
+        manager.register_workspace(extra_root, "second"),
+    )
+    await asyncio.sleep(0.05)
+    assert not readd_task.done()
+
+    allow_remove.set()
+    await asyncio.wait_for(delete_task, timeout=2)
+    second = await asyncio.wait_for(readd_task, timeout=2)
+
+    assert second.id != first.id
+    assert registry.id_for(extra_root) == second.id
+    assert store.state(second.id)["cursor"] >= 0
+    with pytest.raises(KeyError, match="unknown workspace"):
+        store.state(first.id)
+
+    second_state = manager._states[extra_root.resolve()]
+    if second_state.reconcile_task is not None:
+        await asyncio.wait_for(second_state.reconcile_task, timeout=2)
+    await manager.unregister_workspace(extra_root)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_failed_initial_reconcile_retries_on_next_ensure(
     app_module,
     temp_root,
@@ -896,6 +1043,7 @@ async def test_sse_ready_uses_lightweight_cursor_not_bootstrap(
     ready = await asyncio.wait_for(anext(stream), timeout=1)
     assert ready.event == "ready"
     assert '"cursor":0' in ready.data
+    assert f'"workspace_id":"{workspace_id}"' in ready.data
     await stream.aclose()
     await local_manager.shutdown()
 

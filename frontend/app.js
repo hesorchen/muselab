@@ -273,11 +273,13 @@ function portal() {
     // workspace and coalesces structural changes before touching Alpine state.
     _fileEvents: null,
     _fileEventsWorkspace: "",
+    _fileEventsGeneration: "",
     _fileEventsSeq: 0,
     _fileEventsTimer: null,
     _fileEventsPending: null,
     _fileTreeDirty: false,
     _fileTreeRefreshBusy: false,
+    _fileTreeRefreshGeneration: "",
     _fileEventsVisibilityBound: false,
     dragOver: "",
     // Highlight flag for the sticky root bar while a tree node / OS file is
@@ -602,6 +604,7 @@ function portal() {
     _workspaceRuntimeCaches: new Map(),
     _workspaceTreeCacheTimers: new Map(),
     _workspaceTreeCursors: new Map(),
+    _workspaceEpochs: new Map(),
     _workspaceSyncChains: new Map(),
     _workspaceSyncRetryTimers: new Map(),
     _workspaceEventBatches: new Map(),
@@ -609,6 +612,7 @@ function portal() {
     WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500,
     WORKSPACE_EVENT_BATCH_DESKTOP_MS: 40,
     WORKSPACE_EVENT_BATCH_MOBILE_MS: 250,
+    SESSION_SETTING_EXPECTED_TTL_MS: 15_000,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
     _sessionLoadPromises: {},
@@ -670,10 +674,15 @@ function portal() {
     // behind a gear in the composer toolbar so the row stays single-line on
     // narrow phones. Desktop shows those selects inline and ignores this.
     composerSettingsOpen: false,
-    // Reasoning effort override for the current session — "" means let the
-    // SDK pick adaptively (the existing default). Persisted on the session
-    // via PATCH so each tab keeps its own setting across reloads.
-    effort: "",
+    // Reasoning effort for the current session. `auto` delegates the choice to
+    // the runtime; every explicit level is advertised per model by
+    // /api/chat/providers. Persisted on the session so each tab restores its
+    // own value after reloads and workspace switches.
+    effort: "auto",
+    // Fast is an independent service-tier choice, not another effort level.
+    // Empty means the provider's standard tier; "fast" requests priority
+    // service when the selected model advertises supports_fast=true.
+    serviceTier: "",
     // Extended thinking on/off for the current session — default true.
     // NOTE this is NOT the old `showThinking` (which controlled DISPLAY of
     // thinking blocks and was removed 2026-05-20). This toggles the backend
@@ -5253,19 +5262,40 @@ function portal() {
       const sid = this.currentId;
       const ownerWorkspace = this.currentWorkspacePath();
       const cur = this.sessions.find(s => s.id === sid);
-      const oldM = cur ? cur.model : "";
-      if (newM === oldM) return;
-      // If the new model doesn't honor the current effort (e.g. switched
-      // from Opus 4.7 → Sonnet with effort=xhigh, or to any non-Claude
-      // vendor), reset to "" (auto). Without this the option becomes
-      // hidden by _effortAllowed but the select still reports the stale
-      // value, and the backend would forward a no-op effort param on
-      // every turn. Fire-and-forget the PATCH — the local reset already
-      // makes the UI consistent.
-      if (!this._effortAllowed(this.effort, newM)) {
-        this.effort = "";
-        this.onEffortChange();
+      let oldM = cur ? cur.model : "";
+      if (this.workspaceSwitching) {
+        this.model = oldM;
+        return false;
       }
+      if (newM === oldM) return;
+      const ownerState = this._ensureTabState(sid);
+      const ownsSelection = () => !this.workspaceSwitching
+        && this.currentId === sid
+        && this.tabState[sid] === ownerState
+        && this._conversationWorkspaceIsCurrent(ownerWorkspace);
+      // Finish any already-requested effort/tier write before deciding what the
+      // current session owns. Crucially, do not PATCH a compatibility reset yet:
+      // a history-session model switch still has a confirm step, and Cancel must
+      // leave the source session byte-for-byte unchanged.
+      if (!await this._awaitRuntimeSettingPatches(sid, ownerState)) return;
+      if (!ownsSelection()) {
+        if (this.currentId === sid) this.model = oldM;
+        return false;
+      }
+      const ownerMeta = this.sessions.find(s => s.id === sid) || {};
+      // A prior serialized runtime write may have completed while we waited.
+      // Roll back to that latest owner value, never the pre-wait snapshot.
+      oldM = ownerMeta.model || oldM;
+      const currentEffort = this._normalizeEffort(
+        ownerMeta.effort || ownerState.effort,
+      );
+      const currentTier = this._normalizeServiceTier(
+        Object.prototype.hasOwnProperty.call(ownerMeta, "service_tier")
+          ? ownerMeta.service_tier : ownerState.serviceTier,
+      );
+      const nextEffort = this._effortAllowed(currentEffort, newM)
+        ? currentEffort : "auto";
+      const nextTier = this._supportsFast(newM) ? currentTier : "";
 
       // Decide empty vs has-messages from BOTH the persisted message_count
       // AND the in-memory messages array — take the max. Two failure modes
@@ -5286,33 +5316,86 @@ function portal() {
       // Empty session — switch in place (no point creating an empty fork).
       // Still toast so the user gets visual confirmation the switch happened.
       if (persistedCount === 0) {
-        try {
-          const r = await fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
-            method: "PATCH",
-            headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ model: newM }),
-          });
-          if (!r.ok) {
+        const seq = ++ownerState._modelPatchSeq;
+        ownerState._runtimeSettingsGeneration += 1;
+        const expected = {
+          seq,
+          value: newM,
+          fallback: oldM,
+          at: Date.now(),
+        };
+        ownerState._modelExpected = expected;
+        const abandon = () => {
+          if (this.tabState[sid] === ownerState
+              && ownerState._modelPatchSeq === seq
+              && ownerState._modelExpected === expected) {
+            ownerState._modelExpected = null;
             if (this.currentId === sid) this.model = oldM;
+          }
+          return false;
+        };
+        try {
+          if (!await this._ensureSessionRegistered(sid)) {
+            throw new Error("session registration failed");
+          }
+          // Registration can take long enough for a workspace/tab switch or a
+          // newer model intent. Never send this PATCH to that stale owner.
+          if (!ownsSelection() || ownerState._modelPatchSeq !== seq) {
+            return abandon();
+          }
+          const r = await this._serializeRuntimeSettingPatch(ownerState, async () => {
+            if (!ownsSelection() || ownerState._modelPatchSeq !== seq) return null;
+            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+              method: "PATCH",
+              headers: { ...this.hdr(), "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: newM,
+                effort: nextEffort,
+                service_tier: nextTier,
+              }),
+            });
+          });
+          if (!r) return abandon();
+          if (!r.ok) {
+            abandon();
             if (this.currentId === sid) this.toast(this.t("slash.failed"), "error");
-            return;
+            return false;
+          }
+          if (this.tabState[sid] !== ownerState
+              || ownerState._modelPatchSeq !== seq) return false;
+          const active = this.sessions.find(s => s.id === sid);
+          if (active) {
+            active.model = newM;
+            active.effort = nextEffort;
+            active.service_tier = nextTier;
+          }
+          ownerState.effort = nextEffort;
+          ownerState.serviceTier = nextTier;
+          if (ownerState._modelExpected) {
+            ownerState._modelExpected.fallback = newM;
+          }
+          if (ownsSelection()) {
+            this.model = newM;
+            this.effort = nextEffort;
+            this.serviceTier = nextTier;
           }
           await this.refreshSessions();
-          if (this.currentId === sid) this.savePrefs();
+          if (ownsSelection()) this.savePrefs();
           const label = this.modelLabel(newM);
-          if (this.currentId === sid) {
+          if (ownsSelection()) {
             this.toast(this.lang === "zh"
               ? `已切到 ${label}（空会话，无需新建）`
               : `Switched to ${label} (empty session, no fork needed)`,
               "success", 1800);
           }
         } catch (e) {
-          if (this.currentId === sid) {
-            this.model = oldM;
+          abandon();
+          if (ownsSelection()) {
             this.toast(this.t("slash.failed"), "error");
           }
+          return false;
         }
-        return;
+        return true;
       }
 
       // Session has history — confirm + create new.
@@ -5326,6 +5409,10 @@ function portal() {
         if (this.currentId === sid) this.model = oldM;
         return;
       }
+      if (!ownsSelection()) {
+        if (this.currentId === sid) this.model = oldM;
+        return false;
+      }
       try {
         const r = await fetch("/api/chat/sessions", {
           method: "POST",
@@ -5334,6 +5421,7 @@ function portal() {
           // also creates a session, which triggers the empty-session recycler).
           body: JSON.stringify({
             name: "", model: newM, cwd: ownerWorkspace,
+            effort: "auto", service_tier: "",
             open_ids: this.openTabIds || [],
           }),
         });
@@ -5349,6 +5437,8 @@ function portal() {
         const newSt = this._ensureTabState(meta.id);
         newSt.messages.length = 0;
         newSt._loaded = true;
+        newSt.effort = this._normalizeEffort(meta.effort);
+        newSt.serviceTier = this._normalizeServiceTier(meta.service_tier);
         if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
         if (this._conversationWorkspaceIsCurrent(ownerWorkspace) && this.currentId === sid) {
           this._captureComposerState(sid);
@@ -5374,18 +5464,10 @@ function portal() {
     // Backend disconnects the cached client so the next turn rebuilds with
     // the new value.
     //
-    // Effort support varies by model. Per claude_agent_sdk types.py:
-    //   - "low"/"medium"/"high"/"max"  → all Anthropic models honor
-    //   - "xhigh"                       → Opus 4.7 / 4.8 only; SDK silently
-    //                                     falls back to "high" on Sonnet / Haiku
-    //   - non-Claude providers           → show only when /api/chat/providers
-    //                                     marks supports_effort=true. Codex
-    //                                     Gateway opts in because its sidecar
-    //                                     translates the Anthropic-compatible
-    //                                     request to a Codex/OpenAI backend.
-    // Per "无效的直接隐藏" feedback (2026-05-22) we don't grey-out — we
-    // hide. User feedback: greyed options still look pick-able and waste
-    // dropdown space.
+    // Effort support is model-specific. The backend publishes the exact list
+    // as `effort_levels`; the UI must not infer Codex/Claude capability from a
+    // model name (Sol, for example, exposes xhigh/max/ultra). Legacy backends
+    // without the list retain the old conservative fallback below.
     _modelMeta(model) {
       const m = model || "";
       const list = this.availableModels || [];
@@ -5405,26 +5487,74 @@ function portal() {
     _isClaudeModel(model) {
       return (model || "").startsWith("claude-");
     },
+    _isClaudeXHighModel(model) {
+      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(model || "");
+    },
     _isCodexModel(model) {
       const m = model || "";
       if (m.startsWith("codex:")) return true;
       const meta = this._modelMeta(m);
       return !!(meta && /codex/i.test(meta.group || ""));
     },
-    _isOpus47(model) {
-      // Misnomer kept for blast-radius reasons: this gate fires for any
-      // Opus model that supports the `xhigh` effort level. Per Anthropic's
-      // effort-level docs, that is Opus 4.7 AND Opus 4.8 — both are listed
-      // as "Available on Claude Opus 4.8 and Claude Opus 4.7". Future
-      // Opus models will likely keep the privilege; extend this match
-      // when they ship.
-      const m = (model || "");
-      return m.startsWith("claude-opus-4-7") || m.startsWith("claude-opus-4-8");
+    _normalizeEffort(value) {
+      const level = String(value || "auto").trim() || "auto";
+      return ["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
+        .includes(level) ? level : "auto";
+    },
+    _normalizeServiceTier(value) {
+      return String(value || "").trim() === "fast" ? "fast" : "";
+    },
+    _effortLevels(model) {
+      const meta = this._modelMeta(model);
+      if (meta && Array.isArray(meta.effort_levels)) {
+        const valid = new Set(
+          meta.effort_levels.map(level => this._normalizeEffort(level)),
+        );
+        // Auto is the universal escape hatch that clears an explicit override.
+        valid.add("auto");
+        let levels = ["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
+          .filter(level => valid.has(level));
+        // The Claude SDK may publish its full enum even though Ultra is a
+        // Codex-only UI choice and xhigh is only valid for Opus 4.7/4.8.
+        // Keep this product contract at the model boundary instead of trusting
+        // a provider-wide capability list verbatim.
+        if (this._isClaudeModel(model)) {
+          levels = levels.filter(level =>
+            level !== "ultra"
+            && (level !== "xhigh" || this._isClaudeXHighModel(model)));
+        }
+        return levels;
+      }
+      // Compatibility with a pre-capability-list backend. Keep this branch
+      // conservative; current servers always return effort_levels.
+      if (this._isClaudeModel(model)) {
+        const levels = ["auto", "low", "medium", "high", "max"];
+        if (this._isClaudeXHighModel(model)) levels.splice(4, 0, "xhigh");
+        return levels;
+      }
+      if (meta && meta.supports_effort === true) {
+        return ["auto", "low", "medium", "high", "max"];
+      }
+      return ["auto"];
     },
     _supportsEffort(model) {
-      if (this._isClaudeModel(model)) return true;
+      return this._effortLevels(model).some(level => level !== "auto");
+    },
+    _supportsFast(model) {
       const meta = this._modelMeta(model);
-      return !!(meta && meta.supports_effort === true);
+      return !!(meta && meta.supports_fast === true);
+    },
+    _showEffortControl(model = this.model) {
+      // A catalog refresh can withdraw a capability while an existing session
+      // still persists an explicit value. Keep the control visible so the user
+      // can clear that now-unsupported override back to auto.
+      return this._supportsEffort(model)
+        || this._normalizeEffort(this.effort) !== "auto";
+    },
+    _showFastControl(model = this.model) {
+      // Same escape hatch for a persisted Fast tier after capability drift.
+      return this._supportsFast(model)
+        || this._normalizeServiceTier(this.serviceTier) === "fast";
     },
     _supportsThinking(model) {
       // Thinking toggle shows for any provider whose endpoint honors the
@@ -5438,18 +5568,17 @@ function portal() {
       return meta.supports_thinking !== false;
     },
     _effortAllowed(level, model) {
-      if (level === "") return true;            // "auto" always available
-      if (!this._supportsEffort(model)) return false;
-      if (level === "xhigh") return this._isOpus47(model);
-      return true;                              // low / medium / high / max
+      return this._effortLevels(model).includes(this._normalizeEffort(level));
     },
     effortChoices(model) {
       // Avoid x-show directly on <option>: iOS Safari's native picker can cache
       // or ignore dynamically hidden option nodes, leaving only the selected
       // "auto" visible. Render the filtered option list instead.
-      return ["", "low", "medium", "high", "xhigh", "max"]
-        .filter(level => this._effortAllowed(level, model))
-        .map(level => ({ value: level, labelKey: "effort." + (level || "auto") }));
+      const selected = model === this.model
+        ? this._normalizeEffort(this.effort) : "auto";
+      return ["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
+        .filter(level => this._effortAllowed(level, model) || level === selected)
+        .map(level => ({ value: level, labelKey: "effort." + level }));
     },
     // Label for the 📦 compact-in-progress bubble. An auto-compact rides the
     // turn's own stream, so streamElapsed (already ticking once a second) is
@@ -5483,6 +5612,27 @@ function portal() {
       } finally {
         if (st[tailKey] === run) st[tailKey] = null;
       }
+    },
+    async _serializeRuntimeSettingPatch(st, work) {
+      // Effort and service tier both rebuild the same session runtime. Put them
+      // on ONE queue so two quick control changes cannot overtake each other.
+      return this._serializeTabSettingPatch(st, "_runtimeSettingPatchTail", work);
+    },
+    runtimeSettingsPending(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      return !!(st && st._runtimeSettingPatchTail);
+    },
+    async _awaitRuntimeSettingPatches(sid, st = this.tabState && this.tabState[sid]) {
+      if (!sid || !st) return true;
+      // A second setting can be queued while the first request is in flight.
+      // Follow the moving tail until the exact session has no writes pending.
+      while (this.tabState[sid] === st) {
+        const tail = st._runtimeSettingPatchTail;
+        if (!tail) return true;
+        try { await tail; } catch (_) { /* change handler restores fallback */ }
+        if (st._runtimeSettingPatchTail === tail) return true;
+      }
+      return false;
     },
     _normalizePermissionMode(value, fallback = "") {
       const mode = String(value || "");
@@ -5667,51 +5817,275 @@ function portal() {
       if (!this.currentId) return false;
       const sid = this.currentId;
       const st = this._ensureTabState(sid);
-      const seq = ++st._effortPatchSeq;
-      const e = this.effort || "";
       const session = this.sessions.find(s => s.id === sid);
-      const previous = (session && session.effort) || "";
+      if (this.workspaceSwitching) {
+        this.effort = this._normalizeEffort(
+          st._effortExpected
+            ? st._effortExpected.value
+            : ((session && session.effort) || st.effort),
+        );
+        return false;
+      }
+      const ownerWorkspace = this.currentWorkspacePath();
+      const seq = ++st._effortPatchSeq;
+      st._runtimeSettingsGeneration += 1;
+      const requested = this._normalizeEffort(this.effort);
+      const e = this._effortAllowed(requested, this.model) ? requested : "auto";
+      this.effort = e;
+      const previous = this._normalizeEffort(
+        (session && session.effort) || st.effort,
+      );
       const priorExpected = st._effortExpected;
+      const priorTierExpected = st._serviceTierExpected;
+      const previousTier = this._normalizeServiceTier(
+        priorTierExpected
+          ? priorTierExpected.value
+          : (session && Object.prototype.hasOwnProperty.call(
+            session, "service_tier") ? session.service_tier : st.serviceTier),
+      );
+      const compatibleTier = this._supportsFast(this.model)
+        ? previousTier : "";
+      const resetsTier = compatibleTier !== previousTier;
+      const companionTierSeq = resetsTier
+        ? ++st._serviceTierPatchSeq : st._serviceTierPatchSeq;
       const expected = {
         seq, value: e,
         fallback: priorExpected ? priorExpected.fallback : previous,
+        at: Date.now(),
       };
       st._effortExpected = expected;
+      st.effort = e;
+      const tierExpected = resetsTier ? {
+        seq: companionTierSeq,
+        value: compatibleTier,
+        fallback: priorTierExpected
+          ? priorTierExpected.fallback : previousTier,
+        at: Date.now(),
+      } : null;
+      if (tierExpected) {
+        st._serviceTierExpected = tierExpected;
+        st.serviceTier = compatibleTier;
+        this.serviceTier = compatibleTier;
+      }
+      const ownsIntent = () => !this.workspaceSwitching
+        && this.currentId === sid
+        && this.tabState[sid] === st
+        && st._effortPatchSeq === seq
+        && (!tierExpected
+          || st._serviceTierPatchSeq === companionTierSeq)
+        && this._conversationWorkspaceIsCurrent(ownerWorkspace);
+      const abandon = () => {
+        if (this.tabState[sid] === st && st._effortPatchSeq === seq
+            && st._effortExpected === expected) {
+          st._effortExpected = null;
+          st.effort = expected.fallback;
+          if (this.currentId === sid) this.effort = expected.fallback;
+        }
+        if (tierExpected && this.tabState[sid] === st
+            && st._serviceTierPatchSeq === companionTierSeq
+            && st._serviceTierExpected === tierExpected) {
+          st._serviceTierExpected = null;
+          st.serviceTier = tierExpected.fallback;
+          if (this.currentId === sid) {
+            this.serviceTier = tierExpected.fallback;
+          }
+        }
+        return false;
+      };
       try {
-        const r = await this._serializeTabSettingPatch(
-          st, "_effortPatchTail", async () => {
-            if (this.tabState[sid] !== st || st._effortPatchSeq !== seq) return null;
+        if (!await this._ensureSessionRegistered(sid)) {
+          throw new Error("session registration failed");
+        }
+        if (!ownsIntent()) return abandon();
+        const r = await this._serializeRuntimeSettingPatch(
+          st, async () => {
+            if (!ownsIntent()) return null;
             return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
               method: "PATCH",
               headers: { ...this.hdr(), "Content-Type": "application/json" },
-              body: JSON.stringify({ effort: e }),
+              body: JSON.stringify({
+                effort: e,
+                service_tier: compatibleTier,
+              }),
             });
           },
         );
-        if (!r) return false;
+        if (!r) return abandon();
         if (!r.ok) throw new Error(await r.text());
-        if (this.tabState[sid] !== st) return false;
+        if (!ownsIntent()) return false;
         const cur = this.sessions.find(s => s.id === sid);
-        if (cur) cur.effort = e;
+        if (cur) {
+          cur.effort = e;
+          cur.service_tier = compatibleTier;
+        }
+        st.effort = e;
+        st.serviceTier = compatibleTier;
         if (st._effortExpected) {
           st._effortExpected.fallback = e;
-          if (st._effortExpected.seq === seq && st._effortExpected.echoed) {
-            st._effortExpected = null;
-          }
+        }
+        if (tierExpected && st._serviceTierExpected === tierExpected) {
+          st._serviceTierExpected.fallback = compatibleTier;
         }
         if (st._effortPatchSeq !== seq) return false;
-        const label = this.t("effort." + (e || "auto"));
-        this.toast(this.t("effort.changed", { label }), "info", 1800);
-        if (this.currentId === sid) this.effort = e;
+        const label = this.t("effort." + e);
+        if (ownsIntent()) {
+          this.toast(this.t("effort.changed", { label }), "info", 1800);
+          this.effort = e;
+          this.serviceTier = compatibleTier;
+        }
         return true;
       } catch (err) {
         if (this.tabState[sid] !== st || st._effortPatchSeq !== seq) return false;
         const fallback = expected.fallback;
-        if (st._effortExpected === expected) st._effortExpected = null;
+        const rollsBackTier = !!(tierExpected
+          && st._serviceTierPatchSeq === companionTierSeq
+          && st._serviceTierExpected === tierExpected);
+        abandon();
         const actual = this.sessions.find(s => s.id === sid);
-        if (actual) actual.effort = fallback;
+        if (actual) {
+          actual.effort = fallback;
+          if (rollsBackTier) actual.service_tier = tierExpected.fallback;
+        }
+        st.effort = fallback;
         if (this.currentId === sid) this.effort = fallback;
-        this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        if (ownsIntent()) {
+          this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        }
+        return false;
+      }
+    },
+    async onServiceTierChange(enabled = this.serviceTier === "fast") {
+      if (!this.currentId) return false;
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      const session = this.sessions.find(s => s.id === sid);
+      if (this.workspaceSwitching) {
+        this.serviceTier = this._normalizeServiceTier(
+          st._serviceTierExpected
+            ? st._serviceTierExpected.value
+            : (session && Object.prototype.hasOwnProperty.call(
+              session, "service_tier") ? session.service_tier : st.serviceTier),
+        );
+        return false;
+      }
+      const ownerWorkspace = this.currentWorkspacePath();
+      const seq = ++st._serviceTierPatchSeq;
+      st._runtimeSettingsGeneration += 1;
+      const tier = enabled && this._supportsFast(this.model) ? "fast" : "";
+      this.serviceTier = tier;
+      const previous = this._normalizeServiceTier(
+        session && Object.prototype.hasOwnProperty.call(session, "service_tier")
+          ? session.service_tier : st.serviceTier,
+      );
+      const priorExpected = st._serviceTierExpected;
+      const priorEffortExpected = st._effortExpected;
+      const previousEffort = this._normalizeEffort(
+        priorEffortExpected
+          ? priorEffortExpected.value
+          : ((session && session.effort) || st.effort),
+      );
+      const compatibleEffort = this._effortAllowed(
+        previousEffort, this.model,
+      ) ? previousEffort : "auto";
+      const resetsEffort = compatibleEffort !== previousEffort;
+      const companionEffortSeq = resetsEffort
+        ? ++st._effortPatchSeq : st._effortPatchSeq;
+      const expected = {
+        seq, value: tier,
+        fallback: priorExpected ? priorExpected.fallback : previous,
+        at: Date.now(),
+      };
+      st._serviceTierExpected = expected;
+      st.serviceTier = tier;
+      const effortExpected = resetsEffort ? {
+        seq: companionEffortSeq,
+        value: compatibleEffort,
+        fallback: priorEffortExpected
+          ? priorEffortExpected.fallback : previousEffort,
+        at: Date.now(),
+      } : null;
+      if (effortExpected) {
+        st._effortExpected = effortExpected;
+        st.effort = compatibleEffort;
+        this.effort = compatibleEffort;
+      }
+      const ownsIntent = () => !this.workspaceSwitching
+        && this.currentId === sid
+        && this.tabState[sid] === st
+        && st._serviceTierPatchSeq === seq
+        && (!effortExpected
+          || st._effortPatchSeq === companionEffortSeq)
+        && this._conversationWorkspaceIsCurrent(ownerWorkspace);
+      const abandon = () => {
+        if (this.tabState[sid] === st && st._serviceTierPatchSeq === seq
+            && st._serviceTierExpected === expected) {
+          st._serviceTierExpected = null;
+          st.serviceTier = expected.fallback;
+          if (this.currentId === sid) this.serviceTier = expected.fallback;
+        }
+        if (effortExpected && this.tabState[sid] === st
+            && st._effortPatchSeq === companionEffortSeq
+            && st._effortExpected === effortExpected) {
+          st._effortExpected = null;
+          st.effort = effortExpected.fallback;
+          if (this.currentId === sid) this.effort = effortExpected.fallback;
+        }
+        return false;
+      };
+      try {
+        if (!await this._ensureSessionRegistered(sid)) {
+          throw new Error("session registration failed");
+        }
+        if (!ownsIntent()) return abandon();
+        const r = await this._serializeRuntimeSettingPatch(st, async () => {
+          if (!ownsIntent()) return null;
+          return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+            method: "PATCH",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({
+              effort: compatibleEffort,
+              service_tier: tier,
+            }),
+          });
+        });
+        if (!r) return abandon();
+        if (!r.ok) throw new Error(await r.text());
+        if (!ownsIntent()) return false;
+        const cur = this.sessions.find(s => s.id === sid);
+        if (cur) {
+          cur.effort = compatibleEffort;
+          cur.service_tier = tier;
+        }
+        st.effort = compatibleEffort;
+        st.serviceTier = tier;
+        if (st._serviceTierExpected) {
+          st._serviceTierExpected.fallback = tier;
+        }
+        if (effortExpected && st._effortExpected === effortExpected) {
+          st._effortExpected.fallback = compatibleEffort;
+        }
+        if (st._serviceTierPatchSeq !== seq) return false;
+        if (ownsIntent()) {
+          this.effort = compatibleEffort;
+          this.serviceTier = tier;
+          this.toast(this.t(tier === "fast" ? "service_tier.on" : "service_tier.off"), "info", 1800);
+        }
+        return true;
+      } catch (_) {
+        if (this.tabState[sid] !== st || st._serviceTierPatchSeq !== seq) return false;
+        const fallback = expected.fallback;
+        const rollsBackEffort = !!(effortExpected
+          && st._effortPatchSeq === companionEffortSeq
+          && st._effortExpected === effortExpected);
+        abandon();
+        const actual = this.sessions.find(s => s.id === sid);
+        if (actual) {
+          if (rollsBackEffort) actual.effort = effortExpected.fallback;
+          actual.service_tier = fallback;
+        }
+        st.serviceTier = fallback;
+        if (this.currentId === sid) this.serviceTier = fallback;
+        if (ownsIntent()) this.toast(this.t("service_tier.failed"), "error");
         return false;
       }
     },
@@ -5869,16 +6243,23 @@ function portal() {
         // into root `permission`; background tabs never read another tab's
         // selector value.
         permission: "",
+        effort: "auto",
+        serviceTier: "",
         _permissionChangePending: false,
         _permissionPatchSeq: 0,
+        _modelPatchSeq: 0,
         _effortPatchSeq: 0,
+        _serviceTierPatchSeq: 0,
         _thinkingPatchSeq: 0,
         _queueSyncSeq: 0,
         _queueAppliedSeq: 0,
         _permissionExpected: null,
+        _modelExpected: null,
         _effortExpected: null,
+        _serviceTierExpected: null,
         _thinkingExpected: null,
-        _effortPatchTail: null,
+        _runtimeSettingsGeneration: 0,
+        _runtimeSettingPatchTail: null,
         _permissionPatchTail: null,
         _thinkingPatchTail: null,
         _loaded: false,   // set true after first loadSession populates messages
@@ -5982,6 +6363,16 @@ function portal() {
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
       if (st.permission === undefined) st.permission = "";
+      if (st.effort === undefined) st.effort = "auto";
+      if (st.serviceTier === undefined) st.serviceTier = "";
+      if (!Number.isFinite(st._modelPatchSeq)) st._modelPatchSeq = 0;
+      if (st._modelExpected === undefined) st._modelExpected = null;
+      if (!Number.isFinite(st._serviceTierPatchSeq)) st._serviceTierPatchSeq = 0;
+      if (st._serviceTierExpected === undefined) st._serviceTierExpected = null;
+      if (!Number.isFinite(st._runtimeSettingsGeneration)) {
+        st._runtimeSettingsGeneration = 0;
+      }
+      if (st._runtimeSettingPatchTail === undefined) st._runtimeSettingPatchTail = null;
       if (st._permissionChangePending === undefined) {
         st._permissionChangePending = false;
       }
@@ -6756,6 +7147,9 @@ function portal() {
     _activateTabState(id) {
       const st = this._ensureTabState(id);
       const meta = (this.sessions || []).find(s => s.id === id);
+      const selectedModel = st._modelExpected
+        ? st._modelExpected.value : (meta && meta.model);
+      if (selectedModel) this.model = selectedModel;
       const mode = this._normalizePermissionMode(
         st._permissionExpected
           ? st._permissionExpected.value
@@ -6764,6 +7158,19 @@ function portal() {
       );
       st.permission = mode;
       this.permission = mode;
+      st.effort = this._normalizeEffort(
+        st._effortExpected
+          ? st._effortExpected.value
+          : ((meta && meta.effort) || st.effort),
+      );
+      this.effort = st.effort;
+      st.serviceTier = this._normalizeServiceTier(
+        st._serviceTierExpected
+          ? st._serviceTierExpected.value
+          : (meta && Object.prototype.hasOwnProperty.call(meta, "service_tier")
+            ? meta.service_tier : st.serviceTier),
+      );
+      this.serviceTier = st.serviceTier;
       this._activateComposerState(id);
       this.messages = st.messages;
       this.sessionUsage = st.sessionUsage;
@@ -7060,19 +7467,43 @@ function portal() {
       const permissionExpected = st._permissionExpected;
       const fields = [
         ["_permissionExpected", "_permissionPatchTail", "permission",
-          value => value || "default"],
-        ["_effortExpected", "_effortPatchTail", "effort",
-          value => value || ""],
+          value => value || "default", false],
+        ["_modelExpected", "_runtimeSettingPatchTail", "model",
+          value => String(value || ""), true],
+        ["_effortExpected", "_runtimeSettingPatchTail", "effort",
+          value => this._normalizeEffort(value), true],
+        ["_serviceTierExpected", "_runtimeSettingPatchTail", "service_tier",
+          value => this._normalizeServiceTier(value), true],
         ["_thinkingExpected", "_thinkingPatchTail", "thinking",
-          value => value !== false],
+          value => value !== false, false],
       ];
-      for (const [expectedKey, tailKey, field, normalize] of fields) {
+      const now = Date.now();
+      for (const [expectedKey, tailKey, field, normalize, bounded] of fields) {
         const expected = st[expectedKey];
         if (!expected) continue;
+        if (bounded) {
+          const expectedAt = Number(expected.at);
+          if (!Number.isFinite(expectedAt) || expectedAt <= 0) {
+            expected.at = now;
+          } else if (now - expectedAt
+              > this.SESSION_SETTING_EXPECTED_TTL_MS) {
+            // A successful local write normally clears as soon as the server
+            // echoes it. Bound the optimistic shadow when that echo is missed,
+            // otherwise a later cross-device authoritative value is hidden for
+            // the lifetime of this browser tab.
+            st[expectedKey] = null;
+            continue;
+          }
+        }
         const incoming = normalize(meta[field]);
         if (incoming === expected.value) {
           expected.fallback = incoming;
-          if (st[tailKey]) expected.echoed = true;
+          if (bounded) {
+            // Keep the short lease even after the first matching echo: an HTTP
+            // response that started before the PATCH can still arrive later.
+            // The fixed TTL is the bound that eventually yields to remote truth.
+            expected.echoed = true;
+          } else if (st[tailKey]) expected.echoed = true;
           else st[expectedKey] = null;
           continue;
         }
@@ -7155,6 +7586,13 @@ function portal() {
             : (meta.permission || st.permission || this.defaultPermission),
           "default",
         );
+        st.effort = this._normalizeEffort(
+          st._effortExpected ? st._effortExpected.value : meta.effort,
+        );
+        st.serviceTier = this._normalizeServiceTier(
+          st._serviceTierExpected
+            ? st._serviceTierExpected.value : meta.service_tier,
+        );
       }
       const activeMeta = next.find(meta => meta.id === this.currentId);
       if (activeMeta) {
@@ -7167,6 +7605,8 @@ function portal() {
           "default",
         );
         activeState.permission = this.permission;
+        this.effort = activeState.effort;
+        this.serviceTier = activeState.serviceTier;
       }
       // Keep the OPEN conversation's messages live too — not just the session
       // LIST. Runs BEFORE the equality early-return so it fires every pull even
@@ -7490,7 +7930,9 @@ function portal() {
         if ((x.permission || "") !== (y.permission || "")) return false;
         if ((x.plan_return_permission || "")
             !== (y.plan_return_permission || "")) return false;
-        if ((x.effort || "") !== (y.effort || "")) return false;
+        if (this._normalizeEffort(x.effort) !== this._normalizeEffort(y.effort)) return false;
+        if (this._normalizeServiceTier(x.service_tier)
+            !== this._normalizeServiceTier(y.service_tier)) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
         if ((x.cwd || "") !== (y.cwd || "")) return false;
         if ((x.forked_from || "") !== (y.forked_from || "")) return false;
@@ -7735,6 +8177,141 @@ function portal() {
     async _refreshSessionsAfterWorkspaceRegistryChange() {
       this._sessionsEtag = "";
       return await this._pullAllSessions();
+    },
+    _workspaceEpoch(path) {
+      const value = Number(this._workspaceEpochs.get(path));
+      return Number.isFinite(value) ? value : 0;
+    },
+    _workspaceRegistryId(path) {
+      const entry = (this.sessionWorkspaces || []).find(
+        workspace => workspace && workspace.path === path,
+      );
+      return String((entry && entry.id) || "");
+    },
+    _workspaceGeneration(path) {
+      return `${this._workspaceEpoch(path)}\0${this._workspaceRegistryId(path)}`;
+    },
+    _workspaceGenerationIsCurrent(path, generation) {
+      return this._workspaceGeneration(path) === String(generation || "");
+    },
+    async _purgeWorkspaceTreeState(path) {
+      const ownerWorkspace = String(path || "");
+      if (!ownerWorkspace) return false;
+      const wasCurrent = this._workspaceIsCurrent(ownerWorkspace);
+
+      // A registered workspace is identified by its path, so remove -> re-add
+      // is an ABA transition. Keep a process-local epoch even after deleting all
+      // cached state: late work from the old registration must not become valid
+      // merely because the same path is current again.
+      this._workspaceEpochs.set(
+        ownerWorkspace, this._workspaceEpoch(ownerWorkspace) + 1,
+      );
+      this._workspaceRuntimeCaches.delete(ownerWorkspace);
+      this._workspaceTreeCursors.delete(ownerWorkspace);
+
+      const pendingPersist = this._workspaceTreeCacheTimers.get(ownerWorkspace);
+      if (pendingPersist) {
+        if (pendingPersist.timer) clearTimeout(pendingPersist.timer);
+        if (pendingPersist.idle != null && typeof window !== "undefined"
+            && window.cancelIdleCallback) {
+          window.cancelIdleCallback(pendingPersist.idle);
+        }
+      }
+      this._workspaceTreeCacheTimers.delete(ownerWorkspace);
+      this._clearWorkspaceSyncRetry(ownerWorkspace);
+      this._clearWorkspaceEventBatch(ownerWorkspace);
+      // Promises cannot be cancelled, but dropping the owner chain lets a new
+      // registration start immediately. The epoch checks make the detached old
+      // chain fail closed when it eventually resumes.
+      this._workspaceSyncChains.delete(ownerWorkspace);
+      if (this._childFetches) {
+        const prefix = `${ownerWorkspace}\0`;
+        for (const key of Array.from(this._childFetches.keys())) {
+          if (String(key).startsWith(prefix)) this._childFetches.delete(key);
+        }
+      }
+      if (this._fileEventsWorkspace === ownerWorkspace) {
+        this._stopFileEvents(false);
+      }
+      if (wasCurrent) {
+        // Runtime tree state is not keyed, so explicitly empty it when another
+        // tab replaced the registration that currently owns this surface.
+        // The next bootstrap is intentionally cold and cannot reuse old rows.
+        ++this._treeLoadSeq;
+        this.visible = [];
+        this.childCache = {};
+        this.expanded = new Set();
+        this._pendingExpanded = [];
+        this._fileEventsPending = new Map();
+        this._fileTreeRefreshBusy = false;
+        this._fileTreeRefreshGeneration = "";
+        this.treeLoading = false;
+        this.treeError = "";
+        this._fileTreeDirty = true;
+        this._scheduleFileTreeViewportSync(true);
+      }
+
+      try {
+        const cache = await this._persistentCache();
+        await cache.deleteWorkspaceSnapshot(ownerWorkspace);
+      } catch (_) { /* persistent cache is an optional acceleration */ }
+      return true;
+    },
+    async _recoverWorkspaceRegistrationMismatch(
+      ownerWorkspace,
+      observedWorkspaceId,
+      workspaceGeneration,
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
+
+      // A second tab can remove and re-add the same path while this tab still
+      // owns an SSE stream and a cursor from the old registration. Path-only
+      // checks cannot distinguish that ABA transition. Purge first, then read
+      // the registry without restoring sessionStorage's stale copy.
+      await this._purgeWorkspaceTreeState(ownerWorkspace);
+      const resolution = await this.fetchSessionWorkspaces({
+        restoreCache: false,
+        validateActive: false,
+        returnResolution: true,
+      });
+      if (!resolution || resolution.ok !== true) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this._fileEventsTimer = setTimeout(
+            () => this._startFileEvents(), 1500,
+          );
+        }
+        return false;
+      }
+      if (resolution.invalidActive) {
+        if (resolution.fallback
+            && this._workspaceIsCurrent(ownerWorkspace)) {
+          await this._changeWorkspaceSurface(resolution.fallback);
+          // _changeWorkspaceSurface captures the outgoing surface. Remove that
+          // newly-created empty runtime entry for the no-longer registered path.
+          await this._purgeWorkspaceTreeState(ownerWorkspace);
+        }
+        return false;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+
+      const registeredWorkspaceId = this._workspaceRegistryId(ownerWorkspace);
+      if (observedWorkspaceId && registeredWorkspaceId
+          && observedWorkspaceId !== registeredWorkspaceId) {
+        // The registry changed yet again while it was being refreshed. Reopen
+        // the stream and let its authoritative ready event identify the winner.
+        this._fileEventsTimer = setTimeout(
+          () => this._startFileEvents(), 1500,
+        );
+        return false;
+      }
+      const loaded = await this.loadRoot({ runtimeSnapshot: false });
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      this._fileTreeDirty = loaded !== true;
+      this._startFileEvents();
+      return loaded === true;
     },
     workspaceOpenTabIds(path = "") {
       const cwd = path || this.currentWorkspacePath();
@@ -8134,7 +8711,9 @@ function portal() {
         st._reconcileRetryTimer = null;
         st._reconcilePromise = null;
         st._permissionPatchSeq = (Number(st._permissionPatchSeq) || 0) + 1;
+        st._modelPatchSeq = (Number(st._modelPatchSeq) || 0) + 1;
         st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
+        st._serviceTierPatchSeq = (Number(st._serviceTierPatchSeq) || 0) + 1;
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
         if (this.currentId === id && this.es === ownedEs) {
           this.es = null;
@@ -8260,6 +8839,7 @@ function portal() {
           { method: "DELETE", headers: this.hdr() },
         );
         if (!response.ok) throw new Error(await response.text());
+        await this._purgeWorkspaceTreeState(path);
         const removedIds = new Set(this.sessions.filter(s => s.cwd === path).map(s => s.id));
         for (const id of removedIds) this._disposeTabRuntime(id);
         this.openTabIds = this.openTabIds.filter(id => !removedIds.has(id));
@@ -8299,6 +8879,8 @@ function portal() {
             body: JSON.stringify({
               id, name: meta.name, model: meta.model || "", cwd: meta.cwd || "",
               permission: meta.permission || this.defaultPermission || "bypassPermissions",
+              effort: this._normalizeEffort(meta.effort),
+              service_tier: this._normalizeServiceTier(meta.service_tier),
               open_ids: this.openTabIds || [],
             }),
           });
@@ -8308,7 +8890,11 @@ function portal() {
           delete this._optimisticMetas[id];
           if (srv && srv.id === id) {
             const i = this.sessions.findIndex(s => s.id === id);
-            if (i >= 0) this.sessions[i] = { ...this.sessions[i], ...srv };
+            if (i >= 0) {
+              this.sessions[i] = this._retainExpectedSessionSettings({
+                ...this.sessions[i], ...srv,
+              });
+            }
           }
           this._fetchTabUsage(id);
           return true;
@@ -8374,6 +8960,8 @@ function portal() {
         model: seedModel,
         permission: this.defaultPermission || "bypassPermissions",
         plan_return_permission: options.plan_return_permission || "",
+        effort: "auto",
+        service_tier: "",
         created_at: ts,
         updated_at: ts,
         message_count: 0,
@@ -8399,6 +8987,8 @@ function portal() {
       st.messages.length = 0;
       st._loaded = true;
       st.permission = meta.permission;
+      st.effort = meta.effort;
+      st.serviceTier = meta.service_tier;
       this._activateTabState(id);
       if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
       if (this._isMobileLayout()) this.setMobileTab("chat");
@@ -10777,8 +11367,10 @@ function portal() {
         if (cwd) {
           this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: cur.id };
         }
-        if (cur.model) this.model = cur.model;
         const curState = this._ensureTabState(cur.id);
+        const curModel = curState._modelExpected
+          ? curState._modelExpected.value : cur.model;
+        if (curModel) this.model = curModel;
         const curPermission = this._normalizePermissionMode(
           curState._permissionExpected
             ? curState._permissionExpected.value
@@ -10787,10 +11379,16 @@ function portal() {
         );
         curState.permission = curPermission;
         this.permission = curPermission;
-        // effort: explicit assignment even when empty — switching from
-        // a high-effort tab to one with no override should clear the
-        // dropdown, not inherit the old value.
-        this.effort = cur.effort || "";
+        // Explicitly restore both independent runtime controls. Legacy empty
+        // effort normalizes to auto; an empty service tier must clear Fast.
+        this.effort = curState.effort = this._normalizeEffort(
+          curState._effortExpected
+            ? curState._effortExpected.value : cur.effort,
+        );
+        this.serviceTier = curState.serviceTier = this._normalizeServiceTier(
+          curState._serviceTierExpected
+            ? curState._serviceTierExpected.value : cur.service_tier,
+        );
         // thinking: default true when the field is absent (legacy sessions).
         this.thinkingEnabled = cur.thinking !== false;
       }
@@ -11064,6 +11662,7 @@ function portal() {
       // and tab switches keep the normal skeleton + chunked-reveal path.
       const quiet = !!opts.quiet;
       const st = this._ensureTabState(sid);
+      const runtimeSettingsGenerationAtLoad = st._runtimeSettingsGeneration;
       // A live stream owns st.messages and every SSE closure points directly at
       // objects inside that array. No load mode may clear/splice it while the
       // owner is active — continuation text otherwise keeps mutating an orphaned
@@ -11341,8 +11940,30 @@ function portal() {
             : (s.permission || st.permission || this.defaultPermission),
           "default",
         );
+        const runtimeSettingsStillCurrent =
+          st._runtimeSettingsGeneration === runtimeSettingsGenerationAtLoad;
         const loadedMeta = (this.sessions || []).find(row => row.id === sid);
+        const resolvedModel = String(
+          st._modelExpected
+            ? st._modelExpected.value
+            : (runtimeSettingsStillCurrent
+              ? (s.model || (loadedMeta && loadedMeta.model) || "")
+              : ((sid === this.currentId ? this.model : "")
+                || (loadedMeta && loadedMeta.model)
+                || s.model || "")),
+        );
+        const resolvedEffort = this._normalizeEffort(
+          st._effortExpected
+            ? st._effortExpected.value
+            : (runtimeSettingsStillCurrent ? s.effort : st.effort),
+        );
+        const resolvedServiceTier = this._normalizeServiceTier(
+          st._serviceTierExpected
+            ? st._serviceTierExpected.value
+            : (runtimeSettingsStillCurrent ? s.service_tier : st.serviceTier),
+        );
         if (loadedMeta) {
+          if (resolvedModel) loadedMeta.model = resolvedModel;
           loadedMeta.permission = st.permission;
           if (permissionExpected
               && permissionExpected.planReturnPermission !== undefined) {
@@ -11352,7 +11973,11 @@ function portal() {
             s, "plan_return_permission")) {
             loadedMeta.plan_return_permission = s.plan_return_permission || "";
           }
+          loadedMeta.effort = resolvedEffort;
+          loadedMeta.service_tier = resolvedServiceTier;
         }
+        st.effort = resolvedEffort;
+        st.serviceTier = resolvedServiceTier;
         if (sid === this.currentId) {
           this.messages = st.messages;
           // Background-completion: if there's an in-flight turn on this
@@ -11363,13 +11988,12 @@ function portal() {
           // live streaming" UI is a larger refactor; for now we just
           // surface the state. The user can wait + reload to see more.
           this._checkActiveTurn(sid);
-          if (s.model) this.model = s.model;
+          if (resolvedModel) this.model = resolvedModel;
           // Per-tab state owns the primitive; root permission is only the
           // currently visible selector mirror.
           this.permission = st.permission;
-          // effort defaults to "" (adaptive); always assign so switching from
-          // a high-effort tab to a fresh one doesn't leave the old value visible.
-          this.effort = s.effort || "";
+          this.effort = st.effort;
+          this.serviceTier = st.serviceTier;
           // thinking: default true when absent (legacy sessions had no field).
           this.thinkingEnabled = s.thinking !== false;
           if (quiet) {
@@ -13777,6 +14401,7 @@ function portal() {
       }
       this._fileEvents = null;
       this._fileEventsWorkspace = "";
+      this._fileEventsGeneration = "";
       if (workspace) this._clearWorkspaceEventBatch(workspace);
       if (this._fileEventsTimer) clearTimeout(this._fileEventsTimer);
       this._fileEventsTimer = null;
@@ -13804,7 +14429,11 @@ function portal() {
       }
       return this._persistentCachePromise;
     },
-    async _hydrateWorkspaceTree(ownerWorkspace, treeSeq) {
+    async _hydrateWorkspaceTree(
+      ownerWorkspace,
+      treeSeq,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
       if (!ownerWorkspace || this.visible.length) return false;
       let cached;
       try {
@@ -13814,6 +14443,11 @@ function portal() {
       if (!cached || cached.owner !== ownerWorkspace
           || !!cached.showHidden !== !!this.showHidden
           || treeSeq !== this._treeLoadSeq
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )
+          || (this._workspaceRegistryId(ownerWorkspace)
+            && cached.workspaceId !== this._workspaceRegistryId(ownerWorkspace))
           || !this._workspaceIsCurrent(ownerWorkspace)) return false;
       const visible = Array.isArray(cached.visible) ? cached.visible : [];
       const childCache = cached.childCache && typeof cached.childCache === "object"
@@ -13832,6 +14466,7 @@ function portal() {
       ownerWorkspace = this.fileWorkspacePath(), capturedSnapshot = null,
     ) {
       if (!ownerWorkspace) return;
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
       const previous = this._workspaceTreeCacheTimers.get(ownerWorkspace);
       if (previous) {
         if (previous.timer) clearTimeout(previous.timer);
@@ -13844,11 +14479,14 @@ function portal() {
       // retrieved handle object by identity can reject the still-current job.
       // A Symbol remains stable through that proxy boundary.
       const token = Symbol("workspace-tree-persist");
-      const handle = { timer: null, idle: null, token };
+      const handle = { timer: null, idle: null, token, workspaceGeneration };
       const persist = async () => {
         const current = this._workspaceTreeCacheTimers.get(ownerWorkspace);
         if (!current || current.token !== token) return;
         this._workspaceTreeCacheTimers.delete(ownerWorkspace);
+        if (!this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )) return;
         // A captured snapshot belongs to an inactive workspace. If that owner
         // became current again before idle time, loadRoot/delta will schedule a
         // fresh, cursor-consistent snapshot instead.
@@ -13883,6 +14521,7 @@ function portal() {
           }
         }
         const snapshot = {
+          workspaceId: this._workspaceRegistryId(ownerWorkspace),
           showHidden,
           cursor: source.cursor ?? null,
           visible: (source.visible || []).map(node => ({ ...node })),
@@ -13891,7 +14530,18 @@ function portal() {
         };
         try {
           const cache = await this._persistentCache();
+          if (!this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
           await cache.putWorkspaceSnapshot(ownerWorkspace, snapshot);
+          // Deletion can race the IndexedDB transaction after the pre-write
+          // generation check. If so, make the stale writer clean up its own
+          // late row so remove remains authoritative on disk as well.
+          if (!this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) {
+            await cache.deleteWorkspaceSnapshot(ownerWorkspace);
+          }
         } catch (_) { /* persistent cache is an optional acceleration */ }
       };
       handle.timer = setTimeout(() => {
@@ -14154,7 +14804,16 @@ function portal() {
       }
       return true;
     },
-    async _syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated) {
+    async _syncWorkspaceTree(
+      ownerWorkspace,
+      treeSeq,
+      hydrated,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceGenerationIsCurrent(
+        ownerWorkspace, workspaceGeneration,
+      )) return false;
+      const expectedWorkspaceId = this._workspaceRegistryId(ownerWorkspace);
       const cursor = this._workspaceTreeCursors.get(ownerWorkspace);
       const hasCursor = hydrated && cursor != null && cursor !== "";
       // Pin every request in this sync pass to its initiating owner. fileHdr()
@@ -14204,7 +14863,10 @@ function portal() {
           });
           if ([404, 405, 501].includes(response.status)) {
             if (treeSeq !== this._treeLoadSeq
-                || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+                || !this._workspaceIsCurrent(ownerWorkspace)
+                || !this._workspaceGenerationIsCurrent(
+                  ownerWorkspace, workspaceGeneration,
+                )) return false;
             // Rolling deploy compatibility with a backend that only knows the
             // original full-snapshot GET contract.
             response = await fetch(
@@ -14214,13 +14876,24 @@ function portal() {
           }
         }
       } catch (_) { return false; }
-      if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (treeSeq !== this._treeLoadSeq
+          || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
       if (response.status === 404 || response.status === 405 || response.status === 501) return false;
       if (response.status === 204) return !!hydrated;
       if (!response.ok) return false;
       let payload;
       try { payload = await response.json(); } catch (_) { return false; }
-      if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (treeSeq !== this._treeLoadSeq
+          || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
+      const responseWorkspaceId = String(payload.workspace_id || "");
+      if (expectedWorkspaceId && responseWorkspaceId
+          && responseWorkspaceId !== expectedWorkspaceId) return false;
       const nextCursor = payload.cursor ?? payload.next_cursor ?? payload.nextCursor;
       let applied = false;
       if (!hasCursor && Array.isArray(payload.entries)) {
@@ -14235,7 +14908,9 @@ function portal() {
         applied = true;
       } else if (payload.resync === true) {
         this._workspaceTreeCursors.delete(ownerWorkspace);
-        return await this._syncWorkspaceTree(ownerWorkspace, treeSeq, false);
+        return await this._syncWorkspaceTree(
+          ownerWorkspace, treeSeq, false, workspaceGeneration,
+        );
       } else if (Array.isArray(payload.changes) && hydrated) {
         applied = payload.changes.length
           ? this._applyFileTreeDelta(payload.changes) : true;
@@ -14252,7 +14927,9 @@ function portal() {
       }
       if (payload.has_more === true) {
         if (nextCursor == null || String(nextCursor) === String(cursor ?? "")) return false;
-        return await this._syncWorkspaceTree(ownerWorkspace, treeSeq, true);
+        return await this._syncWorkspaceTree(
+          ownerWorkspace, treeSeq, true, workspaceGeneration,
+        );
       }
       this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
@@ -14262,40 +14939,77 @@ function portal() {
       if (pending && pending.timer) clearTimeout(pending.timer);
       this._workspaceSyncRetryTimers.delete(ownerWorkspace);
     },
-    _scheduleWorkspaceSyncRetry(ownerWorkspace, attempt = 0) {
-      if (!ownerWorkspace || !this._workspaceIsCurrent(ownerWorkspace)) return;
+    _scheduleWorkspaceSyncRetry(
+      ownerWorkspace,
+      attempt = 0,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!ownerWorkspace || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
       // One retry owner at a time. A later successful bootstrap clears it;
       // repeated SSE failures must not reset exponential backoff to zero.
-      if (this._workspaceSyncRetryTimers.has(ownerWorkspace)) return;
+      const existing = this._workspaceSyncRetryTimers.get(ownerWorkspace);
+      if (existing && existing.workspaceGeneration === workspaceGeneration) return;
+      if (existing && existing.timer) clearTimeout(existing.timer);
       const delay = Math.min(8000, 600 * (2 ** Math.min(attempt, 4)));
-      const record = { timer: null, attempt };
+      const record = { timer: null, attempt, workspaceGeneration };
       record.timer = setTimeout(() => {
         if (this._workspaceSyncRetryTimers.get(ownerWorkspace) !== record) return;
         this._workspaceSyncRetryTimers.delete(ownerWorkspace);
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || !this._workspaceGenerationIsCurrent(
+              ownerWorkspace, workspaceGeneration,
+            )) return;
         void Promise.resolve(this.loadRoot({ scheduleRetry: false }))
           .catch(() => false)
           .then(ok => {
-            if (ok !== true && this._workspaceIsCurrent(ownerWorkspace)) {
-              this._scheduleWorkspaceSyncRetry(ownerWorkspace, attempt + 1);
+            if (ok !== true && this._workspaceIsCurrent(ownerWorkspace)
+                && this._workspaceGenerationIsCurrent(
+                  ownerWorkspace, workspaceGeneration,
+                )) {
+              this._scheduleWorkspaceSyncRetry(
+                ownerWorkspace, attempt + 1, workspaceGeneration,
+              );
             }
           });
       }, delay);
       this._workspaceSyncRetryTimers.set(ownerWorkspace, record);
     },
-    _markWorkspaceTreeSynced(ownerWorkspace) {
+    _markWorkspaceTreeSynced(
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceGenerationIsCurrent(
+        ownerWorkspace, workspaceGeneration,
+      )) return;
       this._clearWorkspaceSyncRetry(ownerWorkspace);
       if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = false;
     },
-    async _recoverWorkspaceTree(ownerWorkspace, { hydrated = false } = {}) {
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+    async _recoverWorkspaceTree(
+      ownerWorkspace,
+      { hydrated = false } = {},
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
       this._fileTreeDirty = true;
       if (!hydrated) this._workspaceTreeCursors.delete(ownerWorkspace);
       const seq = ++this._treeLoadSeq;
-      const ok = await this._syncWorkspaceTree(ownerWorkspace, seq, hydrated);
-      if (ok) this._markWorkspaceTreeSynced(ownerWorkspace);
+      const ok = await this._syncWorkspaceTree(
+        ownerWorkspace, seq, hydrated, workspaceGeneration,
+      );
+      if (!this._workspaceGenerationIsCurrent(
+        ownerWorkspace, workspaceGeneration,
+      )) return false;
+      if (ok) this._markWorkspaceTreeSynced(ownerWorkspace, workspaceGeneration);
       else if (this._workspaceIsCurrent(ownerWorkspace)) {
-        this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+        this._scheduleWorkspaceSyncRetry(
+          ownerWorkspace, 0, workspaceGeneration,
+        );
       }
       return ok;
     },
@@ -14304,12 +15018,18 @@ function portal() {
       if (batch && batch.timer) clearTimeout(batch.timer);
       this._workspaceEventBatches.delete(ownerWorkspace);
     },
-    _flushWorkspaceEventBatch(ownerWorkspace) {
+    _flushWorkspaceEventBatch(
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
       const batch = this._workspaceEventBatches.get(ownerWorkspace);
-      if (!batch) return;
+      if (!batch || batch.workspaceGeneration !== workspaceGeneration) return;
       this._workspaceEventBatches.delete(ownerWorkspace);
       if (batch.timer) clearTimeout(batch.timer);
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
       const changes = [];
       let cursor = null;
       for (const payload of batch.payloads) {
@@ -14324,16 +15044,27 @@ function portal() {
         () => this._applyWorkspaceEventPayload(
           { changes, ...(cursor == null ? {} : { cursor }) },
           ownerWorkspace,
+          workspaceGeneration,
         ),
+        workspaceGeneration,
       );
       void task.catch(() => {
-        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || !this._workspaceGenerationIsCurrent(
+              ownerWorkspace, workspaceGeneration,
+            )) return;
         this._fileTreeDirty = true;
-        this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+        this._scheduleWorkspaceSyncRetry(
+          ownerWorkspace, 0, workspaceGeneration,
+        );
       });
     },
     _queueWorkspaceEventPayload(payload, ownerWorkspace) {
-      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
+      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return;
       if (payload.resync === true) {
         this._clearWorkspaceEventBatch(ownerWorkspace);
         const task = this._enqueueWorkspaceSync(
@@ -14341,12 +15072,19 @@ function portal() {
           () => this._applyWorkspaceEventPayload(
             { ...payload, resync: true },
             ownerWorkspace,
+            workspaceGeneration,
           ),
+          workspaceGeneration,
         );
         void task.catch(() => {
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          if (!this._workspaceIsCurrent(ownerWorkspace)
+              || !this._workspaceGenerationIsCurrent(
+                ownerWorkspace, workspaceGeneration,
+              )) return;
           this._fileTreeDirty = true;
-          this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+          this._scheduleWorkspaceSyncRetry(
+            ownerWorkspace, 0, workspaceGeneration,
+          );
         });
         return;
       }
@@ -14355,12 +15093,15 @@ function portal() {
         !Number.isFinite(Number(change && change.seq)))) {
         // Compatibility with the pre-cursor backend keeps its existing
         // structural debounce and lazy parent refresh behavior.
-        this._queueFileChanges(payload.changes, ownerWorkspace);
+        this._queueFileChanges(
+          payload.changes, ownerWorkspace, workspaceGeneration,
+        );
         return;
       }
       let batch = this._workspaceEventBatches.get(ownerWorkspace);
-      if (!batch) {
-        batch = { payloads: [], timer: null };
+      if (!batch || batch.workspaceGeneration !== workspaceGeneration) {
+        if (batch && batch.timer) clearTimeout(batch.timer);
+        batch = { payloads: [], timer: null, workspaceGeneration };
         this._workspaceEventBatches.set(ownerWorkspace, batch);
       }
       batch.payloads.push(payload);
@@ -14369,13 +15110,24 @@ function portal() {
         ? this.WORKSPACE_EVENT_BATCH_MOBILE_MS
         : this.WORKSPACE_EVENT_BATCH_DESKTOP_MS;
       batch.timer = setTimeout(
-        () => this._flushWorkspaceEventBatch(ownerWorkspace),
+        () => this._flushWorkspaceEventBatch(
+          ownerWorkspace, workspaceGeneration,
+        ),
         delay,
       );
     },
-    _enqueueWorkspaceSync(ownerWorkspace, operation) {
+    _enqueueWorkspaceSync(
+      ownerWorkspace,
+      operation,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
       const previous = this._workspaceSyncChains.get(ownerWorkspace) || Promise.resolve();
-      const task = previous.catch(() => {}).then(operation);
+      const task = previous.catch(() => {}).then(() => {
+        if (!this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )) return false;
+        return operation();
+      });
       this._workspaceSyncChains.set(ownerWorkspace, task);
       const release = () => {
         if (this._workspaceSyncChains.get(ownerWorkspace) === task) {
@@ -14388,10 +15140,19 @@ function portal() {
       void task.then(release, release);
       return task;
     },
-    async _applyWorkspaceEventPayload(payload, ownerWorkspace) {
-      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+    async _applyWorkspaceEventPayload(
+      payload,
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) return false;
       if (payload.resync === true) {
-        return await this._recoverWorkspaceTree(ownerWorkspace, { hydrated: false });
+        return await this._recoverWorkspaceTree(
+          ownerWorkspace, { hydrated: false }, workspaceGeneration,
+        );
       }
       if (!Array.isArray(payload.changes)) return false;
       const current = Number(this._workspaceTreeCursors.get(ownerWorkspace) || 0);
@@ -14403,7 +15164,9 @@ function portal() {
       const sequenced = Array.from(bySeq.values())
         .sort((a, b) => Number(a.seq) - Number(b.seq));
       if (!sequenced.length && payload.changes.length) {
-        this._queueFileChanges(payload.changes, ownerWorkspace);
+        this._queueFileChanges(
+          payload.changes, ownerWorkspace, workspaceGeneration,
+        );
         return true;
       }
       const fresh = sequenced.filter(change => Number(change.seq) > current);
@@ -14412,6 +15175,7 @@ function portal() {
         if (Number(change.seq) !== expected) {
           return await this._recoverWorkspaceTree(
             ownerWorkspace, { hydrated: true },
+            workspaceGeneration,
           );
         }
         expected += 1;
@@ -14434,11 +15198,13 @@ function portal() {
       if (Number.isFinite(advertisedCursor) && advertisedCursor > replayedCursor) {
         return await this._recoverWorkspaceTree(
           ownerWorkspace, { hydrated: true },
+          workspaceGeneration,
         );
       }
       if (fresh.length && !this._applyFileTreeDelta(fresh)) {
         return await this._recoverWorkspaceTree(
           ownerWorkspace, { hydrated: true },
+          workspaceGeneration,
         );
       }
       this._workspaceTreeCursors.set(
@@ -14449,19 +15215,22 @@ function portal() {
           Number.isFinite(advertisedCursor) ? advertisedCursor : current,
         ),
       );
-      this._markWorkspaceTreeSynced(ownerWorkspace);
+      this._markWorkspaceTreeSynced(ownerWorkspace, workspaceGeneration);
       this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
     },
     async _startFileEvents() {
       const workspace = this.fileWorkspacePath();
       if (!this.token || !workspace || typeof EventSource === "undefined") return;
+      const workspaceGeneration = this._workspaceGeneration(workspace);
       if (!this._fileTreeIsVisible()) {
         this._stopFileEvents(true);
         this._fileTreeDirty = true;
         return;
       }
-      if (this._fileEvents && this._fileEventsWorkspace === workspace) return;
+      if (this._fileEvents
+          && this._fileEventsWorkspace === workspace
+          && this._fileEventsGeneration === workspaceGeneration) return;
       this._stopFileEvents(false);
       const seq = ++this._fileEventsSeq;
       let ticket;
@@ -14472,26 +15241,48 @@ function portal() {
           this.fileHdr(),
         );
       } catch (_) {
-        if (seq === this._fileEventsSeq && this._fileTreeIsVisible()) {
+        if (seq === this._fileEventsSeq && this._fileTreeIsVisible()
+            && this._workspaceGenerationIsCurrent(
+              workspace, workspaceGeneration,
+            )) {
           this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
         }
         return;
       }
-      if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket) return;
+      if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket
+          || !this._workspaceGenerationIsCurrent(
+            workspace, workspaceGeneration,
+          )) return;
       const params = new URLSearchParams({ ticket, workspace });
       const cursor = this._workspaceTreeCursors.get(workspace);
       if (cursor != null && cursor !== "") params.set("cursor", String(cursor));
       const es = new EventSource(`/api/files/events?${params.toString()}`);
       this._fileEvents = es;
       this._fileEventsWorkspace = workspace;
+      this._fileEventsGeneration = workspaceGeneration;
       this._fileEventsPending = this._fileEventsPending || new Map();
       const owns = () => seq === this._fileEventsSeq
         && this._fileEvents === es
-        && this._workspaceIsCurrent(workspace);
+        && this._fileEventsGeneration === workspaceGeneration
+        && this._workspaceIsCurrent(workspace)
+        && this._workspaceGenerationIsCurrent(
+          workspace, workspaceGeneration,
+        );
       es.addEventListener("ready", (ev) => {
         if (!owns()) return;
         let payload = {};
         try { payload = JSON.parse(ev.data); } catch (_) {}
+        const readyWorkspaceId = String(payload.workspace_id || "");
+        const expectedWorkspaceId = this._workspaceRegistryId(workspace);
+        if (readyWorkspaceId && expectedWorkspaceId
+            && readyWorkspaceId !== expectedWorkspaceId) {
+          void this._recoverWorkspaceRegistrationMismatch(
+            workspace,
+            readyWorkspaceId,
+            workspaceGeneration,
+          );
+          return;
+        }
         const localCursor = Number(this._workspaceTreeCursors.get(workspace));
         const readyCursor = Number(payload.cursor ?? payload.latest_cursor);
         if (!Number.isFinite(readyCursor)) {
@@ -14530,6 +15321,7 @@ function portal() {
         try { es.close(); } catch (_) {}
         this._fileEvents = null;
         this._fileEventsWorkspace = "";
+        this._fileEventsGeneration = "";
         if (this._fileTreeIsVisible()) {
           this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
         }
@@ -14547,8 +15339,16 @@ function portal() {
         window.addEventListener("pageshow", () => this._startFileEvents());
       }
     },
-    _queueFileChanges(changes, ownerWorkspace) {
-      if (!this._workspaceIsCurrent(ownerWorkspace) || !Array.isArray(changes)) return;
+    _queueFileChanges(
+      changes,
+      ownerWorkspace,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || !this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )
+          || !Array.isArray(changes)) return;
       this._fileEventsPending = this._fileEventsPending || new Map();
       for (const row of changes) {
         if (!row || typeof row.path !== "string") continue;
@@ -14587,16 +15387,24 @@ function portal() {
       const delay = this._isMobileLayout() ? 650 : 250;
       this._fileEventsTimer = setTimeout(() => {
         this._fileEventsTimer = null;
-        this._flushFileChanges(ownerWorkspace);
+        this._flushFileChanges(ownerWorkspace, workspaceGeneration);
       }, delay);
     },
-    async _flushFileChanges(ownerWorkspace = this.fileWorkspacePath()) {
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+    async _flushFileChanges(
+      ownerWorkspace = this.fileWorkspacePath(),
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
+    ) {
+      const isCurrent = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
       if (!this._fileTreeIsVisible()) {
         this._fileTreeDirty = true;
         return false;
       }
-      if (this._fileTreeRefreshBusy) {
+      if (this._fileTreeRefreshBusy
+          && this._fileTreeRefreshGeneration === workspaceGeneration) {
         this._fileTreeDirty = true;
         return false;
       }
@@ -14613,25 +15421,32 @@ function portal() {
         }
       }
       this._fileTreeRefreshBusy = true;
+      this._fileTreeRefreshGeneration = workspaceGeneration;
       let ok = true;
       try {
         // Root changes require rebuilding the root slice; a large multi-dir
         // burst is also cheaper as one transactional reload than N subtree
         // refreshes. loadRoot preserves expanded paths and last-good content.
         if (representativeByParent.has("") || representativeByParent.size > 6) {
-          ok = await this.reloadTree();
+          ok = await this.reloadTree({ workspaceGeneration });
         } else {
           const rows = Array.from(representativeByParent.entries())
             .sort((a, b) => a[0].split("/").length - b[0].split("/").length);
           for (const [, path] of rows) {
-            const refreshed = await this._refreshParentInTree(path, ownerWorkspace);
-            if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+            const refreshed = await this._refreshParentInTree(
+              path, ownerWorkspace, workspaceGeneration,
+            );
+            if (!isCurrent()) return false;
             if (refreshed === false) ok = false;
           }
         }
       } finally {
-        this._fileTreeRefreshBusy = false;
+        if (this._fileTreeRefreshGeneration === workspaceGeneration) {
+          this._fileTreeRefreshBusy = false;
+          this._fileTreeRefreshGeneration = "";
+        }
       }
+      if (!isCurrent()) return false;
       this._fileTreeDirty = !ok;
       if (ok) this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return ok;
@@ -14640,15 +15455,23 @@ function portal() {
       if (!this._fileTreeDirty || !this._fileTreeIsVisible()) return false;
       if (this._fileTreeRefreshBusy) return false;
       const ownerWorkspace = this.fileWorkspacePath();
+      const workspaceGeneration = this._workspaceGeneration(ownerWorkspace);
       this._fileTreeRefreshBusy = true;
+      this._fileTreeRefreshGeneration = workspaceGeneration;
       this._fileEventsPending = new Map();
       let ok = false;
       try {
-        ok = await this.reloadTree();
+        ok = await this.reloadTree({ workspaceGeneration });
       } finally {
-        this._fileTreeRefreshBusy = false;
+        if (this._fileTreeRefreshGeneration === workspaceGeneration) {
+          this._fileTreeRefreshBusy = false;
+          this._fileTreeRefreshGeneration = "";
+        }
       }
-      if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = !ok;
+      if (this._workspaceIsCurrent(ownerWorkspace)
+          && this._workspaceGenerationIsCurrent(
+            ownerWorkspace, workspaceGeneration,
+          )) this._fileTreeDirty = !ok;
       return ok;
     },
     _fileTreeRowHeight() {
@@ -14751,7 +15574,14 @@ function portal() {
       runtimeSnapshot = false,
       ownerWorkspace = this.fileWorkspacePath(),
       treeSeq = this._treeLoadSeq,
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
     } = {}) {
+      const isCurrent = () => treeSeq === this._treeLoadSeq
+        && this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
       this.treeLoading = true;
       this.treeError = "";
       // A warm workspace already owns an in-memory tree and cursor; an empty
@@ -14759,12 +15589,14 @@ function portal() {
       // from IndexedDB. Either path can revalidate with a small delta instead
       // of downloading and rebuilding the full workspace snapshot.
       const hydrated = !!runtimeSnapshot
-        || await this._hydrateWorkspaceTree(ownerWorkspace, treeSeq);
-      if (treeSeq !== this._treeLoadSeq
-          || !this._workspaceIsCurrent(ownerWorkspace)) return false;
-      if (await this._syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated)) {
-        if (treeSeq !== this._treeLoadSeq
-            || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+        || await this._hydrateWorkspaceTree(
+          ownerWorkspace, treeSeq, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
+      if (await this._syncWorkspaceTree(
+        ownerWorkspace, treeSeq, hydrated, workspaceGeneration,
+      )) {
+        if (!isCurrent()) return false;
         this.treeLoading = false;
         this.treeError = "";
         return true;
@@ -14780,9 +15612,10 @@ function portal() {
         // any failure.
         children = await this.fetchChildren("", {
           force: true, cache: false, treeSeq, ownerWorkspace,
+          workspaceGeneration,
         });
       } catch (_e) {
-        if (treeSeq === this._treeLoadSeq) {
+        if (isCurrent()) {
           this.treeLoading = false;
           this.treeError = this.lang === "zh"
             ? "文件列表加载失败，请检查连接后重试。"
@@ -14794,7 +15627,7 @@ function portal() {
         }
         return false;
       }
-      if (treeSeq !== this._treeLoadSeq) return false;
+      if (!isCurrent()) return false;
       const nextCache = { [`:${showHidden}`]: children };
       const nextExpanded = new Set();
       let nestedRefreshFailed = false;
@@ -14802,7 +15635,7 @@ function portal() {
       const buildRows = async (items, depth) => {
         const rows = [];
         for (const child of this._uniqueFileNodes(items)) {
-          if (treeSeq !== this._treeLoadSeq) return rows;
+          if (!isCurrent()) return rows;
           const node = { ...child, depth };
           rows.push(node);
           if (!node.is_dir || !wantedExpanded.has(node.path)) continue;
@@ -14811,13 +15644,14 @@ function portal() {
           try {
             grandchildren = await this.fetchChildren(node.path, {
               force: true, cache: false, treeSeq, ownerWorkspace,
+              workspaceGeneration,
             });
           } catch (_e) {
             nestedRefreshFailed = true;
             grandchildren = oldChildCache[cacheKey];
             if (!Array.isArray(grandchildren)) continue;
           }
-          if (treeSeq !== this._treeLoadSeq) return rows;
+          if (!isCurrent()) return rows;
           nextCache[cacheKey] = grandchildren;
           nextExpanded.add(node.path);
           rows.push(...await buildRows(grandchildren, depth + 1));
@@ -14825,7 +15659,7 @@ function portal() {
         return rows;
       };
       const nextVisible = await buildRows(children, 0);
-      if (treeSeq !== this._treeLoadSeq) return false;
+      if (!isCurrent()) return false;
       this.childCache = nextCache;
       this.visible = nextVisible;
       this.expanded = nextExpanded;
@@ -14841,9 +15675,15 @@ function portal() {
       this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
     },
-    loadRoot({ runtimeSnapshot = false, scheduleRetry = true } = {}) {
+    loadRoot({
+      runtimeSnapshot = false,
+      scheduleRetry = true,
+      workspaceGeneration = "",
+    } = {}) {
       const ownerWorkspace = this.fileWorkspacePath();
       if (!ownerWorkspace) return Promise.resolve(false);
+      const generation = workspaceGeneration
+        || this._workspaceGeneration(ownerWorkspace);
       // Allocate the generation before queueing so a newer manual refresh can
       // invalidate an older queued request immediately. The operation itself
       // shares the same owner chain as SSE replay/resync, preventing a snapshot
@@ -14852,25 +15692,34 @@ function portal() {
       const task = this._enqueueWorkspaceSync(
         ownerWorkspace,
         () => this._loadRootNow({
-          runtimeSnapshot, ownerWorkspace, treeSeq,
+          runtimeSnapshot,
+          ownerWorkspace,
+          treeSeq,
+          workspaceGeneration: generation,
         }),
+        generation,
       );
       return Promise.resolve(task).catch(() => false).then(ok => {
-        const current = this._workspaceIsCurrent(ownerWorkspace);
+        const current = this._workspaceIsCurrent(ownerWorkspace)
+          && this._workspaceGenerationIsCurrent(ownerWorkspace, generation);
         const latest = treeSeq === this._treeLoadSeq;
         if (ok === true && current) {
-          this._markWorkspaceTreeSynced(ownerWorkspace);
+          this._markWorkspaceTreeSynced(ownerWorkspace, generation);
         } else if (current && latest) {
           this.treeLoading = false;
           this._fileTreeDirty = true;
-          if (scheduleRetry) this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+          if (scheduleRetry) {
+            this._scheduleWorkspaceSyncRetry(
+              ownerWorkspace, 0, generation,
+            );
+          }
         }
         return ok === true;
       });
     },
-    reloadTree() {
+    reloadTree(options = {}) {
       this._pendingExpanded = Array.from(this.expanded);
-      return this.loadRoot();
+      return this.loadRoot(options);
     },
     // In-place removal of a node (and its descendants, if a dir) from the
     // visible flat-list. Avoids the full reloadTree() that delete used to
@@ -14921,15 +15770,20 @@ function portal() {
     async _refreshParentInTree(
       restoredPath,
       ownerWorkspace = this.fileWorkspacePath(),
+      workspaceGeneration = this._workspaceGeneration(ownerWorkspace),
     ) {
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
-      if (!restoredPath) return this.reloadTree();
+      const isCurrent = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        );
+      if (!isCurrent()) return false;
+      if (!restoredPath) return this.reloadTree({ workspaceGeneration });
       const parent = restoredPath.split("/").slice(0, -1).join("/");
       delete this.childCache[`${parent}:true`];
       delete this.childCache[`${parent}:false`];
       if (!parent) {
         // Root-level restore: re-merge root children, preserving expanded subtrees.
-        return this.reloadTree();
+        return this.reloadTree({ workspaceGeneration });
       }
       if (!this.expanded.has(parent)) {
         // Parent is collapsed → nothing visible changes; expanding later
@@ -14937,7 +15791,7 @@ function portal() {
         return;
       }
       const parentIdx = this.visible.findIndex(n => n.path === parent);
-      if (parentIdx < 0) return this.reloadTree();
+      if (parentIdx < 0) return this.reloadTree({ workspaceGeneration });
       const parentNode = this.visible[parentIdx];
       // Snapshot inner-expanded subtrees so we can restore them after
       // re-rendering the parent's children.
@@ -14948,17 +15802,17 @@ function portal() {
       let children;
       try {
         children = await this.fetchChildren(parent, {
-          force: true, ownerWorkspace,
+          force: true, ownerWorkspace, workspaceGeneration,
         });
       } catch (e) {
-        if (!e.staleWorkspace && this._workspaceIsCurrent(ownerWorkspace)) {
+        if (!e.staleWorkspace && isCurrent()) {
           this.toast(this.lang === "zh"
             ? "目录刷新失败，已保留原内容"
             : "Could not refresh folder; kept the previous contents", "error", 3500);
         }
         return false;
       }
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (!isCurrent()) return false;
       // Splice out parent's current rendered subtree.
       let end = parentIdx + 1;
       while (end < this.visible.length
@@ -14980,8 +15834,10 @@ function portal() {
       for (const p of innerExpanded.sort((a, b) => a.length - b.length)) {
         const node = this.visible.find(n => n.path === p);
         if (node && node.is_dir) {
-          await this.expand(node, { ownerWorkspace, quiet: true });
-          if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+          await this.expand(node, {
+            ownerWorkspace, workspaceGeneration, quiet: true,
+          });
+          if (!isCurrent()) return false;
         }
       }
       this.expanded = new Set(this.expanded);
@@ -14990,7 +15846,12 @@ function portal() {
     },
     async fetchChildren(path, opts = {}) {
       const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const workspaceGeneration = opts.workspaceGeneration
+        || this._workspaceGeneration(ownerWorkspace);
       const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )
         && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
       if (!isOwner()) {
         const stale = new Error("stale workspace file request");
@@ -15003,7 +15864,7 @@ function portal() {
         return this.childCache[cacheKey];
       }
       if (!this._childFetches) this._childFetches = new Map();
-      const pendingKey = `${ownerWorkspace}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
+      const pendingKey = `${ownerWorkspace}\0${workspaceGeneration}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
       if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
         + (showHidden ? "&show_hidden=true" : "");
@@ -15272,22 +16133,27 @@ function portal() {
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
       const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
+      const workspaceGeneration = opts.workspaceGeneration
+        || this._workspaceGeneration(ownerWorkspace);
+      const isCurrent = () => this._workspaceIsCurrent(ownerWorkspace)
+        && this._workspaceGenerationIsCurrent(
+          ownerWorkspace, workspaceGeneration,
+        )
+        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
       let children;
       try {
         children = await this.fetchChildren(n.path, {
-          treeSeq: opts.treeSeq, ownerWorkspace,
+          treeSeq: opts.treeSeq, ownerWorkspace, workspaceGeneration,
         });
       } catch (e) {
         if (!opts.quiet && !e.staleWorkspace
-            && this._workspaceIsCurrent(ownerWorkspace)
-            && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)) {
+            && isCurrent()) {
           this.toast(this.lang === "zh"
             ? `无法展开 /${n.path}` : `Could not open /${n.path}`, "error", 3000);
         }
         return false;
       }
-      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
-      if (opts.treeSeq != null && opts.treeSeq !== this._treeLoadSeq) return false;
+      if (!isCurrent()) return false;
       if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
@@ -21475,6 +22341,13 @@ function portal() {
         this.toast(this.t("perm.switching"), "warn", 2000);
         return false;
       }
+      // Effort and Fast are persisted session launch settings, not fields on the
+      // stream ticket. Wait for their shared PATCH queue before minting a turn;
+      // otherwise a quick select→Send can race and launch with the old runtime.
+      if (!opts.reconnect
+          && !await this._awaitRuntimeSettingPatches(sendSid, sendState)) {
+        return false;
+      }
       const sendDraft = sendState.draft;
       // Snapshot the pinned session's draft before any await. Every later read,
       // clear, upload wait and enqueue remains owned by this exact state object.
@@ -21663,6 +22536,10 @@ function portal() {
           return false;
         }
       }
+      if (!isReconnect
+          && !await this._awaitRuntimeSettingPatches(sendSid, sendState)) {
+        return false;
+      }
       // Busy: streaming OR compacting → park on the pinned session's queue.
       // Upload waiting and failure validation happen first so a programmatic
       // send can never enqueue a text-only fallback while its attachment fails.
@@ -21697,6 +22574,7 @@ function portal() {
           const latestLoaded = await this.returnToLatest(sendSid);
           if (!latestLoaded || this.tabState[sendSid] !== sendState) return false;
         }
+        if (!await this._awaitRuntimeSettingPatches(sendSid, sendState)) return false;
         // Trim the live backlog before growing it again — keeps long
         // sessions from ballooning the DOM past the mobile crash point.
         this._capLiveMessages(sendState);

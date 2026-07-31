@@ -10,9 +10,9 @@ Skills 是 SKILL.md 指令包，由 Claude Agent SDK 在启动时加载并提供
 
 ## 内置 Skills
 
-Muselab 开箱即附 12 个正式支持的 skill：8 个 muselab 原生 skill（MIT
+Muselab 开箱即附 13 个正式支持的 skill：9 个 muselab 原生 skill（MIT
 许可）和 4 个社区贡献 skill。另有 1 个弃用的原生兼容别名，在一个过渡周期
-内仍可发现，因此仓库中共有 13 个 skill 目录。上游 URL 和许可证详情见
+内仍可发现，因此仓库中共有 14 个 skill 目录。上游 URL 和许可证详情见
 `THIRD_PARTY_LICENSES.md`。
 
 | Skill | 功能 | 来源 | 外部依赖 |
@@ -25,6 +25,7 @@ Muselab 开箱即附 12 个正式支持的 skill：8 个 muselab 原生 skill（
 | `task-decomposer` | 将模糊目标拆解为有序任务列表，附带规模估算、完成标准、关键路径步骤和已标记的未知项 | muselab 原生 | 无 |
 | `summary-distiller` | 根据来源类型选择合适的摘要形式（TL;DR、要点、结构化、行动项）；逐字保留数字、人名和日期 | muselab 原生 | 无 |
 | `workspace-curator` | 以先扫描、先提案的方式整理当前工作区，执行实质性变更前须明确确认 | muselab 原生 | 无 |
+| `ultra-orchestrator` | 用户选择 Codex Ultra 模式时，使用最大推理与受限的并行 Agent/Task 编排 | muselab 原生 | 无 |
 | `archive-curator` | `workspace-curator` 的弃用兼容别名；沿用相同的提案确认与安全边界 | muselab 原生 | 无 |
 | `pptx` | 通过 Bash 工具编写并运行内联 Python（`python-pptx`）生成 PowerPoint 文件 | 社区 | `python-pptx`（`pip install python-pptx`）|
 | `csv-analyzer` | 用 `pandas` 加载 CSV，分析列类型，生成条件图表（PNG），在单次响应中输出完整分析 | 社区 | `pandas`；`matplotlib` / `seaborn` 可选 |

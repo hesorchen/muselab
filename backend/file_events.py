@@ -190,6 +190,11 @@ class FileWatchManager:
         self._states: dict[Path, _WatchState] = {}
         self._idle_watchers: OrderedDict[Path, None] = OrderedDict()
         self._lock = asyncio.Lock()
+        # Registration/state I/O intentionally runs outside `_lock`, but an
+        # ensure and remove for the same path must still be one lifecycle.
+        # Otherwise a slow first registration can reinstall an orphan state
+        # and SQLite row after the registry/API deletion has completed.
+        self._lifecycle_locks: dict[Path, asyncio.Lock] = {}
         # Full scans are deliberately process-bounded. On the small machines
         # MuseLab commonly runs on, parallel recursive scans only create disk,
         # SQLite, and scheduler contention while delaying foreground reads.
@@ -300,6 +305,38 @@ class FileWatchManager:
                 self._started = False
             raise
 
+    @staticmethod
+    def _resolved_lifecycle_root(root: Path) -> Path:
+        candidate = Path(root).expanduser()
+        if not candidate.is_absolute():
+            candidate = registry.primary / candidate
+        return candidate.resolve()
+
+    async def register_workspace(
+        self,
+        root: Path,
+        name: str | None = None,
+    ):
+        """Atomically register the registry and durable watcher generation."""
+        resolved_root = self._resolved_lifecycle_root(root)
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            resolved_root, asyncio.Lock())
+        async with lifecycle_lock:
+            entry = registry.register(resolved_root, name)
+            await self._ensure_workspace_serialized(resolved_root)
+            return entry
+
+    async def unregister_workspace(self, root: Path):
+        """Atomically remove registry, watcher, and durable index state."""
+        resolved_root = self._resolved_lifecycle_root(root)
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            resolved_root, asyncio.Lock())
+        async with lifecycle_lock:
+            entry = registry.entry_for(resolved_root)
+            registry.remove(resolved_root)
+            await self._remove_workspace_serialized(entry.id)
+            return entry
+
     async def ensure_workspace(
         self,
         root: Path,
@@ -308,6 +345,23 @@ class FileWatchManager:
         rescan: bool = False,
     ) -> _WatchState:
         root = root.resolve()
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            root, asyncio.Lock())
+        async with lifecycle_lock:
+            return await self._ensure_workspace_serialized(
+                root,
+                start_watcher=start_watcher,
+                rescan=rescan,
+            )
+
+    async def _ensure_workspace_serialized(
+        self,
+        root: Path,
+        *,
+        start_watcher: bool | None = None,
+        rescan: bool = False,
+    ) -> _WatchState:
+        """Ensure one root while holding its lifecycle lock."""
         entry = registry.entry_for(root)
         should_watch = bool(start_watcher)
         cancelled_stops: list[asyncio.Task[None]] = []
@@ -353,6 +407,28 @@ class FileWatchManager:
         )
         status = await asyncio.to_thread(self.store.state, entry.id)
 
+        # Registry mutation happens before the workspace API calls into this
+        # manager. Revalidate after slow SQLite I/O: a concurrent deletion must
+        # not install state from the stale pre-I/O registry snapshot.
+        try:
+            current_entry = registry.entry_for(root)
+        except ValueError:
+            await asyncio.to_thread(
+                self.store.remove_workspace,
+                entry.id,
+            )
+            raise
+        if current_entry != entry:
+            entry = current_entry
+            await asyncio.to_thread(
+                self.store.register_workspace,
+                entry.id,
+                root,
+                entry.name,
+                primary=entry.primary,
+            )
+            status = await asyncio.to_thread(self.store.state, entry.id)
+
         async with self._lock:
             # Another concurrent first request may have installed the state
             # while SQLite I/O was in flight. Reuse it and only refresh metadata.
@@ -390,31 +466,67 @@ class FileWatchManager:
             await asyncio.gather(*cancelled_stops, return_exceptions=True)
         return state
 
-    async def remove_workspace(self, workspace_id: str) -> None:
-        tasks: list[asyncio.Task[None]] = []
+    async def remove_workspace(
+        self,
+        workspace_id: str,
+        root: Path | None = None,
+    ) -> None:
+        resolved_root = root.resolve() if root is not None else None
+        if resolved_root is None:
+            async with self._lock:
+                resolved_root = next((
+                    candidate
+                    for candidate, state in self._states.items()
+                    if state.workspace_id == workspace_id
+                ), None)
+        if resolved_root is None:
+            await asyncio.to_thread(
+                self.store.remove_workspace,
+                workspace_id,
+            )
+            return
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            resolved_root, asyncio.Lock())
+        async with lifecycle_lock:
+            await self._remove_workspace_serialized(workspace_id)
+
+    async def _remove_workspace_serialized(self, workspace_id: str) -> None:
+        """Remove watcher and durable state under the root lifecycle lock."""
+        cancel_tasks: list[asyncio.Task[None]] = []
+        reconcile_task: asyncio.Task[None] | None = None
         async with self._lock:
             for root, state in tuple(self._states.items()):
                 if state.workspace_id != workspace_id:
                     continue
                 self._states.pop(root, None)
                 self._idle_watchers.pop(root, None)
-                tasks = [
+                cancel_tasks = [
                     task
                     for task in (
                         self._detach_watcher_locked(state),
-                        state.reconcile_task,
                         state.stop_task,
                     )
                     if task is not None
                 ]
+                if (
+                    state.reconcile_task is not None
+                    and not state.reconcile_task.done()
+                ):
+                    reconcile_task = state.reconcile_task
+                state.reconcile_pending = False
                 state.reconcile_task = None
                 state.stop_task = None
                 self._close_subscribers(state)
                 break
-        for task in tasks:
+        for task in cancel_tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if cancel_tasks:
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
+        if reconcile_task is not None:
+            # Cancelling an asyncio task that is inside `to_thread()` does not
+            # stop the worker thread. Await the mutation to settle, then delete
+            # its durable row so a late reconcile cannot resurrect it.
+            await asyncio.gather(reconcile_task, return_exceptions=True)
         await asyncio.to_thread(
             self.store.remove_workspace,
             workspace_id,
@@ -550,6 +662,19 @@ class FileWatchManager:
             self.store.current_cursor,
             state.workspace_id,
         )
+
+    async def ready_state(self, root: Path) -> dict[str, Any]:
+        """Return one generation-bound cursor for an SSE ready event."""
+        state = await self.ensure_workspace(root)
+        await self._await_baseline(state)
+        cursor = await asyncio.to_thread(
+            self.store.current_cursor,
+            state.workspace_id,
+        )
+        return {
+            "workspace_id": state.workspace_id,
+            "cursor": cursor,
+        }
 
     async def delta(
         self,
@@ -729,6 +854,8 @@ class FileWatchManager:
 
     async def _schedule_reconcile(self, state: _WatchState) -> None:
         async with self._lock:
+            if self._states.get(state.root) is not state:
+                return
             self._queue_reconcile_locked(state)
 
     @staticmethod
@@ -1007,11 +1134,12 @@ async def _event_stream(
     async with manager.subscribe(root) as queue:
         # Do not call bootstrap here: on a home-directory workspace that used
         # to materialize and JSON-encode tens of MB for every SSE connection.
-        ready_cursor = await manager.current_cursor(root)
+        ready_state = await manager.ready_state(root)
+        ready_cursor = ready_state["cursor"]
         yield ServerSentEvent(
             event="ready",
             data=json.dumps(
-                {"ready": True, "cursor": ready_cursor},
+                {"ready": True, **ready_state},
                 separators=(",", ":"),
             ),
         )

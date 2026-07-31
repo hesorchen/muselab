@@ -116,11 +116,19 @@ def _normalize_plan_return_permission(permission: Any, value: Any) -> str:
 
 
 def _normalize_session_permission_fields(row: dict) -> dict:
-    """Return a copy with the Plan return-mode invariant made explicit."""
+    """Return a copy with all per-session launch invariants explicit."""
     normalized = dict(row)
     normalized["plan_return_permission"] = _normalize_plan_return_permission(
         normalized.get("permission"),
         normalized.get("plan_return_permission"),
+    )
+    # `""` was the historical spelling of automatic effort. Keep reads
+    # backward-compatible but expose one canonical value to API consumers.
+    normalized["effort"] = (
+        str(normalized.get("effort") or "").strip() or "auto"
+    )
+    normalized["service_tier"] = (
+        "fast" if normalized.get("service_tier") == "fast" else ""
     )
     return normalized
 
@@ -405,9 +413,10 @@ def _merge_sdk_with_index(
         # muselab-local knobs the SDK doesn't know about. MUST be merged in
         # here or they vanish the moment a JSONL exists on disk (the SDK path
         # wins over the raw index entry), silently reverting the per-session
-        # override to defaults. effort: "" = SDK adaptive. thinking: extended
+        # override to defaults. effort: auto = model default. thinking: extended
         # thinking on/off — default True so existing sessions keep reasoning.
-        "effort": m.get("effort", ""),
+        "effort": str(m.get("effort") or "").strip() or "auto",
+        "service_tier": "fast" if m.get("service_tier") == "fast" else "",
         "thinking": bool(m.get("thinking", True)),
         # Fork lineage is muselab-only metadata. The SDK owns the copied
         # transcript but does not expose the source relationship when listing
@@ -583,7 +592,8 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      auto_named: bool = True,
                      message_count: int = 0,
                      turn_count: int | None = None,
-                     effort: str = "",
+                     effort: str = "auto",
+                     service_tier: str = "",
                      thinking: bool = True,
                      forked_from: str = "",
                      forked_from_name: str = "",
@@ -612,7 +622,8 @@ def register_session(sid: str, *, name: str = "", model: str = "",
             else max(0, message_count // 2)
         ),
         "auto_named": auto_named,
-        "effort": effort,
+        "effort": str(effort or "").strip() or "auto",
+        "service_tier": "fast" if service_tier == "fast" else "",
         "thinking": bool(thinking),
         "cwd": str(workspace),
     }
@@ -850,6 +861,27 @@ def update_model(sid: str, model: str) -> None:
                 return
 
 
+def update_runtime_controls(
+    sid: str, *, model: str, effort: str, service_tier: str,
+) -> bool:
+    """Persist the coupled model/effort/service selection in one index write.
+
+    The API validates the complete target combination before calling this
+    function. Keeping the three fields in one locked mutation prevents a
+    rejected model switch from leaving only effort or Fast changed on disk.
+    """
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["model"] = model
+                s["effort"] = effort
+                s["service_tier"] = service_tier
+                _save_index(idx)
+                return True
+        return False
+
+
 def update_permission(
     sid: str,
     permission: str,
@@ -931,18 +963,26 @@ def commit_plan_exit(
         return False
 
 
-# effort is one of: "" (auto/SDK default) | "low" | "medium" | "high" | "xhigh" | "max"
-# Empty string means "let the SDK pick" — same as no override. Stored on the
-# session so picking a deep-research effort on one tab doesn't leak into others.
-# The non-empty values mirror the SDK's EffortLevel literal; the authoritative
-# gate lives in chat.py (_VALID_EFFORT = get_args(EffortLevel)). This comment is
-# documentation only — keep it in sync if the SDK adds a tier.
+# effort is canonical auto | low | medium | high | xhigh | max | ultra.
+# `auto` asks Gateway to retain the chosen model's catalog default. Stored per
+# session so a deep-research effort on one tab doesn't leak into others.
 def update_effort(sid: str, effort: str) -> None:
     with _INDEX_LOCK:
         idx = _load_index()
         for s in idx:
             if s["id"] == sid:
                 s["effort"] = effort
+                _save_index(idx)
+                return
+
+
+def update_service_tier(sid: str, service_tier: str) -> None:
+    """Persist the user-facing service tier (empty/default or ``fast``)."""
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] == sid:
+                s["service_tier"] = service_tier
                 _save_index(idx)
                 return
 

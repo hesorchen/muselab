@@ -34,6 +34,24 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     assert [row["path"] for row in rows] == [str(temp_root.resolve())]
 
 
+def test_readding_same_path_gets_new_workspace_generation(
+    app_module,
+    tmp_path,
+):
+    from backend.workspaces import WorkspaceRegistry
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    other = _make_workspace(tmp_path)
+    registry = WorkspaceRegistry(primary)
+    first = registry.register(other)
+    registry.remove(other)
+    second = registry.register(other)
+
+    assert first.path == second.path
+    assert first.id != second.id
+
+
 def test_removed_workspace_sessions_keep_their_attachments(
     client, auth, temp_root, tmp_path,
 ):

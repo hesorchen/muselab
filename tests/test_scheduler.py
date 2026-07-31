@@ -112,6 +112,45 @@ def test_sdk_turn_rejects_session_with_interactive_owner(
         chat._session_runtime_locks.pop(sid, None)
 
 
+def test_sdk_turn_preserves_session_effort_and_service_tier(
+    app_module, monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat, sessions
+
+    sid = "scheduled-fast-session"
+    observed = {}
+
+    class FakeClient:
+        async def query(self, prompt):
+            observed["prompt"] = prompt
+
+        async def receive_response(self):
+            if False:
+                yield None
+
+    async def fake_get_client(**kwargs):
+        observed.update(kwargs)
+        return FakeClient()
+
+    monkeypatch.setattr(
+        sessions, "get_session",
+        lambda _sid: {"effort": "ultra", "service_tier": "fast"},
+    )
+    monkeypatch.setattr(chat, "get_client", fake_get_client)
+    try:
+        reply, error = asyncio.run(
+            sched._run_sdk_task_turn(sid, "codex:gpt-5.6-sol", "prompt"))
+    finally:
+        chat._session_runtime_locks.pop(sid, None)
+
+    assert (reply, error) == ("", None)
+    assert observed["effort"] == "ultra"
+    assert observed["service_tier"] == "fast"
+    assert observed["permission"] == "bypassPermissions"
+    assert observed["prompt"] == "prompt"
+
+
 def _execution_task(tid: str = "exec-task") -> dict:
     return {
         "id": tid,
