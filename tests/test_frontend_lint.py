@@ -1491,11 +1491,103 @@ def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
     assert 'es.addEventListener("changes"' in app
     assert 'es.addEventListener("resync"' in app
     assert "this._workspaceIsCurrent(ownerWorkspace)" in app
+    assert "params.set(\"cursor\", String(cursor))" in app
+    assert "_queueWorkspaceEventPayload(payload, workspace)" in app
+    assert "WORKSPACE_EVENT_BATCH_MOBILE_MS: 250" in app
+    assert "_flushWorkspaceEventBatch(ownerWorkspace)" in app
+    assert "this._applyFileTreeDelta(fresh)" in app
     assert "this._refreshParentInTree(path, ownerWorkspace)" in app
     assert "const delay = this._isMobileLayout() ? 650 : 250" in app
     assert "if (!this._fileTreeIsVisible())" in app
     assert "this._stopFileEvents(true)" in app
-    assert 'if (t === "files") this._flushFileTreeDirty()' in app
+    assert 'if (t === "files") this._flushFileTreeDirty()' not in app
+
+
+def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    cache = (FRONTEND / "modules" / "persistent-cache.mjs").read_text(
+        encoding="utf-8")
+    makefile = (FRONTEND.parent / "Makefile").read_text(encoding="utf-8")
+
+    change_start = app.index("async _changeWorkspaceSurface(path)")
+    change_end = app.index("\n    async switchWorkspace(path)", change_start)
+    change = app[change_start:change_end]
+    assert "this.loadRoot({ runtimeSnapshot: !!runtime })" in change
+    assert "coldTreeOk = await treeReady" in change
+    assert "Promise.allSettled" not in change
+    assert "await terminalRefresh" not in change
+    assert "this.fetchTerminals({ restore: true })" in change
+    assert "{ preview: !!tab.preview, reveal: false }" in change
+    assert "void treeReady.then(startFileEvents)" in change
+    assert "this._fileTreeDirty = treeOk !== true" in change
+    assert "this._scheduleWorkspaceSyncRetry(path)" in change
+    assert "\n      await refresh;" not in change
+
+    capture_start = app.index("_captureWorkspaceSurface(path")
+    capture = app[capture_start:change_start]
+    assert "visible: this.visible || []" in capture
+    assert "childCache: this.childCache || {}" in capture
+    assert "visible: (this.visible || []).map" not in capture
+
+    sync_start = app.index("async _syncWorkspaceTree(")
+    sync_end = app.index("\n    _enqueueWorkspaceSync(", sync_start)
+    sync = app[sync_start:sync_end]
+    assert '`/api/files/delta?${query}`' in sync
+    assert '`/api/files/bootstrap${query ? `?${query}` : ""}`' in sync
+    assert 'params.set("show_hidden", "true")' in sync
+    assert "const hasCursor = hydrated && cursor != null" in sync
+    assert "void task.then(release, release)" in app
+    assert "task.finally(" not in app
+
+    delta_start = app.index("_applyFileTreeDelta(changes)")
+    delta_end = app.index("\n    async _syncWorkspaceTree(", delta_start)
+    delta = app[delta_start:delta_end]
+    assert delta.index('part => part.startsWith(".")') < delta.index(
+        "const nodes = new Map()")
+    assert "const nodes = new Map()" in delta
+    assert "const finalNodes = new Map()" in delta
+    assert "const affectedParents = new Set()" in delta
+    assert "!knownParents.has(parent)" in delta
+    assert "findIndex(" not in delta
+    assert ".splice(" not in delta
+    assert "(this.visible || []).map(node => ({ ...node }))" not in delta
+    assert "if (visibleChanged)" in delta
+    assert "const nextExpanded = new Set(" in delta
+    assert "this._pendingExpanded = Array.from(nextExpanded)" in delta
+
+    persist_start = app.index("_scheduleWorkspaceTreePersist(")
+    persist_end = app.index("\n    _materializeFileSnapshot(", persist_start)
+    persist = app[persist_start:persist_end]
+    assert "WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500" in app
+    assert "window.requestIdleCallback" in persist
+    assert 'if (this.previewSurface === "terminal") return' in persist
+    assert "Clone only after the trailing debounce" in persist
+    assert 'const neededParents = new Set(["", ...expanded])' in persist
+    assert "Object.entries(source.childCache || {}).map" not in persist
+
+    assert 'const DB_NAME = "muselab-persistent-cache-v1"' in cache
+    assert 'const WORKSPACES = "workspaces"' in cache
+    assert "getWorkspaceSnapshot(owner)" in cache
+    assert "putWorkspaceSnapshot(owner, snapshot)" in cache
+    assert "session-tail" not in cache
+    assert "db.onversionchange = () => {" in cache
+    assert "databasePromise = undefined" in cache
+    assert "db.close()" in cache
+    assert "persistent-cache.mjs" in makefile
+
+    boot_start = app.index("async _bootApp()")
+    boot_end = app.index("\n    // Start the always-on", boot_start)
+    boot = app[boot_start:boot_end]
+    assert "Promise.resolve(this.loadRoot()).catch(() => false)" in boot
+    assert "this._startLiveConnections({ fileEvents: false })" in boot
+    assert "await rootReady" not in boot
+
+    load_start = app.index("loadRoot({ runtimeSnapshot = false")
+    load_end = app.index("\n    reloadTree()", load_start)
+    load = app[load_start:load_end]
+    assert "this._enqueueWorkspaceSync(" in load
+    assert "_loadRootNow({" in app
+    assert "treeSeq === this._treeLoadSeq" in load
 
 
 def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():

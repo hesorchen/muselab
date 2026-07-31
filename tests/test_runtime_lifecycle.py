@@ -111,6 +111,17 @@ def test_chat_shutdown_disconnects_each_client_once(app_module):
     asyncio.run(scenario())
 
 
+def test_workspace_index_start_is_fail_soft(app_module, capsys):
+    class BrokenIndex:
+        async def start(self):
+            raise RuntimeError("synthetic index failure")
+
+    assert asyncio.run(
+        app_module._start_workspace_index(BrokenIndex())
+    ) is False
+    assert "continuing with chat/terminal" in capsys.readouterr().err
+
+
 def test_runtime_shutdown_cancels_background_and_drains_services(
     app_module,
     monkeypatch,

@@ -541,6 +541,490 @@ def test_html_preview_lru_reuses_four_live_frames_without_refetch(
     assert Counter(raw_requests)["cache-1.html"] == 2
 
 
+def test_indexeddb_tree_hydrates_then_applies_owner_scoped_delta(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const cache = await import('/static/modules/persistent-cache.mjs');
+          const suffix = `${Date.now()}-${Math.random()}`;
+          const owner = `/persistent-tree-owner-${suffix}`;
+          const other = `/persistent-tree-other-${suffix}`;
+          const node = path => ({
+            path, name: path.split('/').pop(), is_dir: false,
+            size: 1, mtime: 1, depth: 0,
+          });
+          await cache.putWorkspaceSnapshot(owner, {
+            showHidden: false, cursor: 1,
+            visible: [node('stale.txt')], childCache: {}, expanded: [],
+          });
+          await cache.putWorkspaceSnapshot(other, {
+            showHidden: false, cursor: 99,
+            visible: [node('other-secret.txt')], childCache: {}, expanded: [],
+          });
+          app.activeWorkspace = owner;
+          app.showHidden = false;
+          app.visible = [];
+          app.childCache = {};
+          app.expanded = new Set();
+          app._pendingExpanded = [];
+          app._workspaceTreeCursors = new Map();
+          const realFetch = window.fetch;
+          const calls = [];
+          window.fetch = async (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/delta') {
+              calls.push(`delta:${parsed.searchParams.get('cursor') || ''}`);
+              return new Response(JSON.stringify({
+                cursor: 2, has_more: false, resync: false,
+                changes: [{seq: 2, type: 'added', ...node('fresh.txt')}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            if (parsed.pathname === '/api/files/bootstrap') calls.push('bootstrap');
+            if (parsed.pathname === '/api/files/list') calls.push('list');
+            return realFetch(url, init);
+          };
+          try {
+            const ok = await app.loadRoot();
+            return {
+              ok,
+              calls,
+              paths: app.visible.map(item => item.path).sort(),
+              cursor: app._workspaceTreeCursors.get(owner),
+              leaked: app.visible.some(item => item.path === 'other-secret.txt'),
+            };
+          } finally {
+            window.fetch = realFetch;
+            const pending = app._workspaceTreeCacheTimers.get(owner);
+            if (pending?.timer) clearTimeout(pending.timer);
+            if (pending?.idle != null && window.cancelIdleCallback) {
+              window.cancelIdleCallback(pending.idle);
+            }
+            app._workspaceTreeCacheTimers.delete(owner);
+          }
+        }"""
+    )
+    assert result == {
+        "ok": True,
+        "calls": ["delta:1"],
+        "paths": ["fresh.txt", "stale.txt"],
+        "cursor": 2,
+        "leaked": False,
+    }
+
+
+def test_warm_workspace_surface_does_not_wait_for_slow_delta(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const target = `/warm-workspace-${Date.now()}-${Math.random()}`;
+          const cached = {
+            path: 'cached.txt', name: 'cached.txt', is_dir: false,
+            size: 1, mtime: 1, depth: 0,
+          };
+          app.workspaceSurfaces[target] = {previewSurface: 'file'};
+          app._workspaceRuntimeCaches.set(target, {
+            visible: [cached], childCache: {}, previewCache: [],
+            previewCacheBytes: 0,
+            trash: {items: [], count: 0, loading: false},
+          });
+          app._workspaceTreeCursors.set(target, 7);
+
+          const realFetch = window.fetch;
+          const originals = {
+            fetchTerminals: app.fetchTerminals,
+            loadTrash: app.loadTrash,
+            fetchContextInfo: app.fetchContextInfo,
+            startFileEvents: app._startFileEvents,
+            savePrefs: app.savePrefs,
+            persist: app._scheduleWorkspaceTreePersist,
+            loadRoot: app.loadRoot,
+            scheduleRetry: app._scheduleWorkspaceSyncRetry,
+          };
+          const calls = [];
+          window.fetch = async (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/delta') {
+              calls.push(`delta:${parsed.searchParams.get('cursor') || ''}`);
+              await new Promise(resolve => setTimeout(resolve, 800));
+              return new Response(JSON.stringify({
+                cursor: 7, has_more: false, resync: false, changes: [],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            if (parsed.pathname === '/api/files/bootstrap') calls.push('bootstrap');
+            return realFetch(url, init);
+          };
+          app.fetchTerminals = async () => true;
+          app.loadTrash = async () => true;
+          app.fetchContextInfo = async () => true;
+          app._startFileEvents = () => {};
+          app.savePrefs = () => {};
+          app._scheduleWorkspaceTreePersist = () => {};
+          try {
+            const started = performance.now();
+            const ok = await app._changeWorkspaceSurface(target);
+            const elapsed = performance.now() - started;
+            const immediatePaths = app.visible.map(item => item.path);
+            await new Promise(resolve => setTimeout(resolve, 900));
+
+            const failedTarget = `${target}-failed`;
+            app.workspaceSurfaces[failedTarget] = {previewSurface: 'file'};
+            app._workspaceRuntimeCaches.set(failedTarget, {
+              visible: [cached], childCache: {}, previewCache: [],
+              previewCacheBytes: 0,
+              trash: {items: [], count: 0, loading: false},
+            });
+            let retryCount = 0;
+            let dirtyWhenEventsStarted = null;
+            app.loadRoot = async () => false;
+            app._scheduleWorkspaceSyncRetry = () => { retryCount += 1; };
+            app._startFileEvents = () => {
+              dirtyWhenEventsStarted = app._fileTreeDirty;
+            };
+            const failedOk = await app._changeWorkspaceSurface(failedTarget);
+            await new Promise(resolve => setTimeout(resolve, 20));
+            return {
+              ok, elapsed, immediatePaths, calls,
+              failure: {failedOk, retryCount, dirtyWhenEventsStarted},
+            };
+          } finally {
+            window.fetch = realFetch;
+            app.fetchTerminals = originals.fetchTerminals;
+            app.loadTrash = originals.loadTrash;
+            app.fetchContextInfo = originals.fetchContextInfo;
+            app._startFileEvents = originals.startFileEvents;
+            app.savePrefs = originals.savePrefs;
+            app._scheduleWorkspaceTreePersist = originals.persist;
+            app.loadRoot = originals.loadRoot;
+            app._scheduleWorkspaceSyncRetry = originals.scheduleRetry;
+          }
+        }"""
+    )
+    assert result["ok"] is True
+    assert result["elapsed"] < 400
+    assert result["immediatePaths"] == ["cached.txt"]
+    assert result["calls"] == ["delta:7"]
+    assert result["failure"] == {
+        "failedOk": True,
+        "retryCount": 1,
+        "dirtyWhenEventsStarted": True,
+    }
+
+
+def test_workspace_switch_only_waits_for_cold_tree_not_auxiliary_refreshes(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    # _bootApp intentionally no longer awaits its initial file bootstrap.
+    # Settle that independent owner chain before timing a later user switch so
+    # first-load DOM work is not charged to this path.
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return !app.treeLoading && app._workspaceSyncChains.size === 0;
+        }""",
+        timeout=5000,
+    )
+    page.evaluate(
+        """() => new Promise(resolve =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)))"""
+    )
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originals = {
+            loadRoot: app.loadRoot,
+            loadTrash: app.loadTrash,
+            fetchContextInfo: app.fetchContextInfo,
+            fetchTerminals: app.fetchTerminals,
+            startFileEvents: app._startFileEvents,
+            savePrefs: app.savePrefs,
+            persist: app._scheduleWorkspaceTreePersist,
+          };
+          let pending = new Map();
+          const deferred = label => new Promise(resolve => {
+            pending.set(label, resolve);
+          });
+          const finishPending = () => {
+            for (const resolve of pending.values()) resolve(true);
+            pending.clear();
+          };
+          app._startFileEvents = () => {};
+          app.savePrefs = () => {};
+          app._scheduleWorkspaceTreePersist = () => {};
+          try {
+            const coldTarget = `/cold-aux-${Date.now()}-${Math.random()}`;
+            app.workspaceSurfaces[coldTarget] = {previewSurface: 'file'};
+            let coldTreeCalls = 0;
+            app.loadRoot = async () => {
+              coldTreeCalls += 1;
+              await new Promise(resolve => setTimeout(resolve, 25));
+              return true;
+            };
+            app.loadTrash = () => deferred('trash');
+            app.fetchContextInfo = () => deferred('context');
+            app.fetchTerminals = () => deferred('terminals');
+            const coldStarted = performance.now();
+            const coldOk = await app._changeWorkspaceSurface(coldTarget);
+            const cold = {
+              ok: coldOk,
+              elapsed: performance.now() - coldStarted,
+              treeCalls: coldTreeCalls,
+              pending: Array.from(pending.keys()).sort(),
+              dirty: app._fileTreeDirty,
+            };
+            finishPending();
+            await Promise.resolve();
+
+            const terminalTarget = `${coldTarget}-terminal`;
+            app.workspaceSurfaces[terminalTarget] = {
+              previewSurface: 'terminal',
+              activeTerminalId: 'terminal-slow',
+            };
+            app._workspaceRuntimeCaches.set(terminalTarget, {
+              visible: [], childCache: {}, previewCache: [],
+              previewCacheBytes: 0,
+              trash: {items: [], count: 0, loading: false},
+            });
+            let finishRuntimeTree;
+            app.loadRoot = () => new Promise(resolve => {
+              finishRuntimeTree = resolve;
+            });
+            app.loadTrash = async () => true;
+            app.fetchContextInfo = async () => true;
+            app.fetchTerminals = () => deferred('runtime-terminals');
+            const runtimeStarted = performance.now();
+            const runtimeOk = await app._changeWorkspaceSurface(terminalTarget);
+            const runtime = {
+              ok: runtimeOk,
+              elapsed: performance.now() - runtimeStarted,
+              pending: Array.from(pending.keys()).sort(),
+              surface: app.previewSurface,
+              terminalId: app.activeTerminalId,
+            };
+            finishRuntimeTree(true);
+            finishPending();
+            await new Promise(resolve => setTimeout(resolve, 20));
+            return {cold, runtime};
+          } finally {
+            finishPending();
+            app.loadRoot = originals.loadRoot;
+            app.loadTrash = originals.loadTrash;
+            app.fetchContextInfo = originals.fetchContextInfo;
+            app.fetchTerminals = originals.fetchTerminals;
+            app._startFileEvents = originals.startFileEvents;
+            app.savePrefs = originals.savePrefs;
+            app._scheduleWorkspaceTreePersist = originals.persist;
+          }
+        }"""
+    )
+    assert result["cold"]["ok"] is True
+    assert result["cold"]["elapsed"] < 500, result
+    assert result["cold"]["treeCalls"] == 1
+    assert result["cold"]["pending"] == ["context", "terminals", "trash"]
+    assert result["cold"]["dirty"] is False
+    assert result["runtime"]["ok"] is True
+    assert result["runtime"]["elapsed"] < 400
+    assert result["runtime"]["pending"] == ["runtime-terminals"]
+    assert result["runtime"]["surface"] == "terminal"
+    assert result["runtime"]["terminalId"] == "terminal-slow"
+
+
+def test_workspace_sync_orders_snapshot_events_and_batches_linear_delta(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const owner = `/ordered-tree-${Date.now()}-${Math.random()}`;
+          const node = (path, extra = {}) => ({
+            path, name: path.split('/').pop(), is_dir: false,
+            size: 1, mtime: 1, mtime_ns: 1, ...extra,
+          });
+          const realFetch = window.fetch;
+          const originals = {
+            persist: app._scheduleWorkspaceTreePersist,
+            mobile: app._isMobileLayout,
+            apply: app._applyWorkspaceEventPayload,
+            sync: app._syncWorkspaceTree,
+            retry: app._scheduleWorkspaceSyncRetry,
+            mobileDelay: app.WORKSPACE_EVENT_BATCH_MOBILE_MS,
+          };
+          app.activeWorkspace = owner;
+          app.showHidden = false;
+          app.visible = [node('old.txt', {depth: 0})];
+          app.childCache = {':false': [node('old.txt')]};
+          app.expanded = new Set();
+          app._pendingExpanded = [];
+          app._workspaceTreeCursors.delete(owner);
+          app._scheduleWorkspaceTreePersist = () => {};
+
+          let bootstrapStarted = false;
+          window.fetch = async (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/bootstrap') {
+              bootstrapStarted = true;
+              await new Promise(resolve => setTimeout(resolve, 100));
+              return new Response(JSON.stringify({
+                cursor: 1, entries: [node('snapshot.txt')],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return realFetch(url, init);
+          };
+          try {
+            const loading = app.loadRoot();
+            while (!bootstrapStarted) {
+              await new Promise(resolve => setTimeout(resolve, 1));
+            }
+            const event = app._enqueueWorkspaceSync(
+              owner,
+              () => app._applyWorkspaceEventPayload({
+                cursor: 2,
+                changes: [{...node('late.txt'), type: 'added', seq: 2}],
+              }, owner),
+            );
+            await Promise.all([loading, event]);
+            const ordered = {
+              paths: app.visible.map(row => row.path),
+              cursor: app._workspaceTreeCursors.get(owner),
+            };
+
+            const files = Array.from({length: 20000}, (_, i) =>
+              node(`file-${String(i).padStart(5, '0')}.txt`, {depth: 0}));
+            const directory = node('z-dir', {is_dir: true, depth: 0});
+            const child = node('z-dir/child.txt', {depth: 1});
+            app.visible = [...files, directory, child];
+            app.childCache = {
+              ':false': [...files.map(({depth, ...row}) => row),
+                (({depth, ...row}) => row)(directory)],
+              'z-dir:false': [(({depth, ...row}) => row)(child)],
+            };
+            app.expanded = new Set(['z-dir']);
+            app._pendingExpanded = ['z-dir'];
+            const changes = Array.from({length: 1000}, (_, i) => {
+              const changed = node(
+                `file-${String(19000 + i).padStart(5, '0')}.txt`,
+                {mtime: 2},
+              );
+              delete changed.mtime_ns;  // compatibility with an older event wire
+              return {...changed, type: 'modified'};
+            });
+            changes.push({type: 'deleted', path: 'z-dir'});
+            changes.push({...node('aaa-dir', {is_dir: true}), type: 'added'});
+            const started = performance.now();
+            const applied = app._applyFileTreeDelta(changes);
+            const updated = app.visible.find(row => row.path === 'file-19999.txt');
+            const linear = {
+              applied,
+              elapsed: performance.now() - started,
+              first: app.visible[0]?.path,
+              count: app.visible.length,
+              deleted: app.visible.some(row => row.path.startsWith('z-dir')),
+              expanded: Array.from(app.expanded),
+              pendingExpanded: app._pendingExpanded,
+              updatedMtime: updated?.mtime,
+              updatedMtimeNs: updated?.mtime_ns,
+            };
+
+            const collapsed = node('collapsed', {is_dir: true, depth: 0});
+            app.visible = [collapsed];
+            app.childCache = {
+              ':false': [(({depth, ...row}) => row)(collapsed)],
+            };
+            app.expanded = new Set();
+            app._applyFileTreeDelta([
+              {...node('collapsed/new.txt'), type: 'added'},
+            ]);
+            const partialCache = Object.prototype.hasOwnProperty.call(
+              app.childCache, 'collapsed:false');
+
+            app.visible = [];
+            app.childCache = {':false': []};
+            app._workspaceTreeCursors.set(owner, 0);
+            app._workspaceEventBatches = new Map();
+            app._workspaceSyncChains = new Map();
+            const batches = [];
+            app._applyWorkspaceEventPayload = async payload => {
+              batches.push(payload);
+              return true;
+            };
+            app._isMobileLayout = () => true;
+            app.WORKSPACE_EVENT_BATCH_MOBILE_MS = 60;
+            app._queueWorkspaceEventPayload({
+              cursor: 1,
+              changes: [{...node('one.txt'), type: 'added', seq: 1}],
+            }, owner);
+            app._queueWorkspaceEventPayload({
+              cursor: 2,
+              changes: [{...node('two.txt'), type: 'added', seq: 2}],
+            }, owner);
+            await new Promise(resolve => setTimeout(resolve, 20));
+            const beforeBatchDeadline = batches.length;
+            await new Promise(resolve => setTimeout(resolve, 80));
+            const batched = {
+              beforeBatchDeadline,
+              calls: batches.length,
+              changes: batches[0]?.changes.length,
+              cursor: batches[0]?.cursor,
+            };
+
+            app._applyWorkspaceEventPayload = originals.apply;
+            app._syncWorkspaceTree = async () => false;
+            let retries = 0;
+            app._scheduleWorkspaceSyncRetry = () => { retries += 1; };
+            app._workspaceTreeCursors.set(owner, 2);
+            const recovered = await originals.apply.call(
+              app, {resync: true, changes: []}, owner);
+            const failure = {
+              recovered,
+              retries,
+              dirty: app._fileTreeDirty,
+              hasCursor: app._workspaceTreeCursors.has(owner),
+            };
+            return {ordered, linear, partialCache, batched, failure};
+          } finally {
+            window.fetch = realFetch;
+            app._clearWorkspaceEventBatch(owner);
+            app._clearWorkspaceSyncRetry(owner);
+            app._scheduleWorkspaceTreePersist = originals.persist;
+            app._isMobileLayout = originals.mobile;
+            app._applyWorkspaceEventPayload = originals.apply;
+            app._syncWorkspaceTree = originals.sync;
+            app._scheduleWorkspaceSyncRetry = originals.retry;
+            app.WORKSPACE_EVENT_BATCH_MOBILE_MS = originals.mobileDelay;
+          }
+        }"""
+    )
+    assert result["ordered"] == {
+        "paths": ["late.txt", "snapshot.txt"],
+        "cursor": 2,
+    }
+    assert result["linear"]["applied"] is True
+    assert result["linear"]["elapsed"] < 3000
+    assert result["linear"]["first"] == "aaa-dir"
+    assert result["linear"]["count"] == 20001
+    assert result["linear"]["deleted"] is False
+    assert result["linear"]["expanded"] == []
+    assert result["linear"]["pendingExpanded"] == []
+    assert result["linear"]["updatedMtime"] == 2
+    assert result["linear"]["updatedMtimeNs"] == 0
+    assert result["partialCache"] is False
+    assert result["batched"] == {
+        "beforeBatchDeadline": 0,
+        "calls": 1,
+        "changes": 2,
+        "cursor": 2,
+    }
+    assert result["failure"] == {
+        "recovered": False,
+        "retries": 1,
+        "dirty": True,
+        "hasCursor": False,
+    }
+
+
 def test_tree_refresh_failure_keeps_rows_and_search_ignores_stale_results(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
@@ -571,7 +1055,8 @@ def test_tree_refresh_failure_keeps_rows_and_search_ignores_stale_results(
             if (s.includes('/api/files/grep?q=beta')) {
               return delayedJson({hits: [{path: 'new.txt', name: 'new.txt', line: 1}]}, 5, init.signal);
             }
-            if (s.includes('/api/files/list?path=')) {
+            if (s.includes('/api/files/bootstrap') || s.includes('/api/files/delta')
+                || s.includes('/api/files/list?path=')) {
               return Promise.reject(new TypeError('tree offline'));
             }
             return realFetch(url, init);
@@ -628,6 +1113,10 @@ def test_tree_refresh_restores_all_expanded_branches(page: Page,
           const calls = [];
           window.fetch = (url, init = {}) => {
             const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/bootstrap'
+                || parsed.pathname === '/api/files/delta') {
+              return Promise.resolve(new Response('', {status: 404}));
+            }
             if (parsed.pathname === '/api/files/list') {
               const path = parsed.searchParams.get('path') || '';
               calls.push(path);
@@ -722,6 +1211,16 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
           const calls = [];
           window.fetch = (url, init = {}) => {
             const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/bootstrap') {
+              calls.push(`bootstrap:${parsed.searchParams.get('show_hidden') || 'false'}`);
+              return Promise.resolve(new Response(JSON.stringify({
+                cursor: 1,
+                entries: [{
+                  path: '.hidden-root', name: '.hidden-root',
+                  is_dir: false, size: 1, mtime: 1,
+                }],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
             if (parsed.pathname === '/api/files/list') {
               calls.push(parsed.searchParams.get('path') || '');
               return Promise.resolve(new Response(JSON.stringify({
@@ -757,7 +1256,7 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
     )
     assert result == {
         "ok": True,
-        "calls": [""],
+        "calls": ["bootstrap:true"],
         "showHidden": True,
         "expanded": [],
         "paths": [".hidden-root"],

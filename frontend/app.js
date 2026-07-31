@@ -600,6 +600,14 @@ function portal() {
     workspaceSurfaces: {},
     _workspaceRuntimeCaches: new Map(),
     _workspaceTreeCacheTimers: new Map(),
+    _workspaceTreeCursors: new Map(),
+    _workspaceSyncChains: new Map(),
+    _workspaceSyncRetryTimers: new Map(),
+    _workspaceEventBatches: new Map(),
+    _persistentCachePromise: null,
+    WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500,
+    WORKSPACE_EVENT_BATCH_DESKTOP_MS: 40,
+    WORKSPACE_EVENT_BATCH_MOBILE_MS: 250,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
     _sessionLoadPromises: {},
@@ -1382,7 +1390,6 @@ function portal() {
           document.body.classList.remove("preview-immersive");
         }
         this.$nextTick(() => {
-          if (t === "files") this._flushFileTreeDirty();
           this._startFileEvents();
         });
         this.savePrefs();
@@ -1880,7 +1887,11 @@ function portal() {
       // Resolve the persisted workspace before the first file request; file
       // paths are relative and must never flash content from the primary root.
       await this.fetchSessionWorkspaces();
-      this.loadRoot();
+      const rootOwner = this.fileWorkspacePath();
+      // Attach the rejection handler immediately: the rest of boot awaits
+      // context/session work before it observes this promise, and a fast tree
+      // failure must never surface as an unhandled rejection in that gap.
+      const rootReady = Promise.resolve(this.loadRoot()).catch(() => false);
       this.fetchTerminals({ restore: true });
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
@@ -1937,7 +1948,16 @@ function portal() {
       } catch (e) {
         // Will retry via heartbeat
       }
-      this._startLiveConnections();
+      // Chat/session/activity connections are independent of the filesystem.
+      // Start them immediately; only the file replay stream waits for a trusted
+      // snapshot/cursor so a slow workspace cannot delay the rest of the app.
+      this._startLiveConnections({ fileEvents: false });
+      void rootReady.then(treeOk => {
+        if (!this._workspaceIsCurrent(rootOwner)) return;
+        this._fileTreeDirty = treeOk !== true;
+        if (treeOk !== true) this._scheduleWorkspaceSyncRetry(rootOwner);
+        this._startFileEvents();
+      });
     },
 
     // Start the always-on background connections: conn heartbeat (drives
@@ -1948,11 +1968,11 @@ function portal() {
     // of only after a manual refresh. Both underlying starts are idempotent
     // (clearInterval before re-arming), but this is only ever called once per
     // boot path, so there's no double-start.
-    _startLiveConnections() {
+    _startLiveConnections({ fileEvents = true } = {}) {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
-      this._startFileEvents();
+      if (fileEvents) this._startFileEvents();
       this.fetchActivity();
       this._startActivityEvents();
       this._startMemoryMonitor();
@@ -5015,10 +5035,12 @@ function portal() {
     },
 
     async fetchContextInfo() {
+      const ownerWorkspace = this.currentWorkspacePath();
       const { ok, data } = await this.api("/api/chat/context-info", {
         headers: this.conversationHdr(),
       });
-      if (!ok || !data) return;
+      if (!ok || !data
+          || !this._conversationWorkspaceIsCurrent(ownerWorkspace)) return;
       data._fetched = true;
       this.contextInfo = data;
       // First successful load: if the user hasn't configured any provider,
@@ -7433,9 +7455,12 @@ function portal() {
       };
       this._workspaceRuntimeCaches.delete(cwd);
       this._workspaceRuntimeCaches.set(cwd, {
-        visible: (this.visible || []).map(node => ({ ...node })),
-        childCache: Object.fromEntries(Object.entries(this.childCache || {}).map(
-          ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows])),
+        // The old workspace becomes inactive synchronously below, and every
+        // outstanding tree request is owner/sequence guarded. Retaining its
+        // arrays is therefore safe and avoids cloning the complete tree twice
+        // on every round trip merely to move it through this runtime LRU.
+        visible: this.visible || [],
+        childCache: this.childCache || {},
         previewCache: this._previewCache ? Array.from(this._previewCache.entries()) : [],
         previewCacheBytes: Number(this._previewCacheBytes) || 0,
         trash: { ...this.trash, items: (this.trash.items || []).map(item => ({ ...item })) },
@@ -7443,6 +7468,14 @@ function portal() {
       while (this._workspaceRuntimeCaches.size > 12) {
         this._workspaceRuntimeCaches.delete(this._workspaceRuntimeCaches.keys().next().value);
       }
+      const capturedTree = this._workspaceRuntimeCaches.get(cwd);
+      this._scheduleWorkspaceTreePersist(cwd, {
+        showHidden: !!this.showHidden,
+        cursor: this._workspaceTreeCursors.get(cwd) ?? null,
+        visible: (capturedTree && capturedTree.visible) || [],
+        childCache: (capturedTree && capturedTree.childCache) || {},
+        expanded: Array.from(this.expanded || []),
+      });
     },
     async _changeWorkspaceSurface(path) {
       if (!path || path === this.activeWorkspace) return true;
@@ -7481,9 +7514,8 @@ function portal() {
       const keepMobileTab = this.mobileTab;
       this.activeWorkspace = path;
       this.clearSearch();
-      this.visible = runtime ? runtime.visible.map(node => ({ ...node })) : [];
-      this.childCache = runtime ? Object.fromEntries(Object.entries(runtime.childCache || {}).map(
-        ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows])) : {};
+      this.visible = runtime ? runtime.visible : [];
+      this.childCache = runtime ? runtime.childCache || {} : {};
       this.treeError = "";
       this.treeFocusPath = "";
       this.selectedPaths = new Set();
@@ -7509,24 +7541,50 @@ function portal() {
       this.previewSurface = surface.previewSurface === "terminal" ? "terminal" : "file";
       this.activeTerminalId = typeof surface.activeTerminalId === "string"
         ? surface.activeTerminalId : "";
-      const terminalRefresh = this.fetchTerminals({ restore: true });
-      const refresh = Promise.allSettled([
-        this.loadRoot(), this.loadTrash(), this.fetchContextInfo(), terminalRefresh,
-      ]);
-      if (!runtime) await refresh;
-      else if (this.previewSurface === "terminal") await terminalRefresh;
+      // The tree is the only workspace-switch prerequisite. Trash, context,
+      // and terminal discovery are independent owner-scoped refreshes; keeping
+      // them off the awaited path prevents a slow PTY probe from holding the
+      // workspace picker spinner after the files are already ready.
+      const treeReady = Promise.resolve(
+        this.loadRoot({ runtimeSnapshot: !!runtime }),
+      ).catch(() => false);
+      void Promise.resolve(this.loadTrash()).catch(() => false);
+      void Promise.resolve(this.fetchContextInfo()).catch(() => false);
+      void Promise.resolve(
+        this.fetchTerminals({ restore: true }),
+      ).catch(() => false);
+      let coldTreeOk = null;
+      if (!runtime) {
+        coldTreeOk = await treeReady;
+      }
       if (this.previewSurface === "file"
           && selected && this.tabs.some(t => t.path === selected)) {
         const tab = this.tabs.find(t => t.path === selected);
-        await this.openFile(
+        // Restored preview content is optional and owner/sequence guarded.
+        // Let the switch complete once the tree is ready; a large markdown or
+        // XLSX preview can finish in the background without changing the last
+        // mobile pane.
+        void Promise.resolve(this.openFile(
           { path: selected, name: tab.name || selected.split("/").pop() },
-          { preview: !!tab.preview },
-        );
+          { preview: !!tab.preview, reveal: false },
+        )).catch(() => false);
       }
       this.setMobileTab(keepMobileTab);
-      this._fileTreeDirty = false;
-      this._fileEventsPending = new Map();
-      this._startFileEvents();
+      const startFileEvents = treeOk => {
+        if (!this._workspaceIsCurrent(path)) return;
+        this._fileTreeDirty = treeOk !== true;
+        this._fileEventsPending = new Map();
+        if (treeOk !== true) this._scheduleWorkspaceSyncRetry(path);
+        this._startFileEvents();
+      };
+      if (runtime) {
+        // The restored runtime tree paints synchronously. Revalidate it in the
+        // background and only then open the cursor replay stream; switching the
+        // workspace must not wait for a bootstrap/delta round trip.
+        void treeReady.then(startFileEvents);
+      } else {
+        startFileEvents(coldTreeOk);
+      }
       this.savePrefs();
       return true;
     },
@@ -13385,12 +13443,14 @@ function portal() {
       return !!this.leftOpen && !this.desktopFullPane;
     },
     _stopFileEvents(markDirty = false) {
+      const workspace = this._fileEventsWorkspace;
       ++this._fileEventsSeq;
       if (this._fileEvents) {
         try { this._fileEvents.close(); } catch (_) {}
       }
       this._fileEvents = null;
       this._fileEventsWorkspace = "";
+      if (workspace) this._clearWorkspaceEventBatch(workspace);
       if (this._fileEventsTimer) clearTimeout(this._fileEventsTimer);
       this._fileEventsTimer = null;
       if (markDirty) this._fileTreeDirty = true;
@@ -13405,6 +13465,617 @@ function portal() {
         });
       }
       return this._fileCapabilitiesPromise;
+    },
+    _persistentCache() {
+      if (!this._persistentCachePromise) {
+        this._persistentCachePromise = import(
+          "/static/modules/persistent-cache.mjs"
+        ).catch(error => {
+          this._persistentCachePromise = null;
+          throw error;
+        });
+      }
+      return this._persistentCachePromise;
+    },
+    async _hydrateWorkspaceTree(ownerWorkspace, treeSeq) {
+      if (!ownerWorkspace || this.visible.length) return false;
+      let cached;
+      try {
+        const cache = await this._persistentCache();
+        cached = await cache.getWorkspaceSnapshot(ownerWorkspace);
+      } catch (_) { return false; }
+      if (!cached || cached.owner !== ownerWorkspace
+          || !!cached.showHidden !== !!this.showHidden
+          || treeSeq !== this._treeLoadSeq
+          || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      const visible = Array.isArray(cached.visible) ? cached.visible : [];
+      const childCache = cached.childCache && typeof cached.childCache === "object"
+        ? cached.childCache : {};
+      this.visible = visible.map(node => ({ ...node }));
+      this.childCache = Object.fromEntries(Object.entries(childCache).map(
+        ([key, rows]) => [key, Array.isArray(rows) ? rows.map(row => ({ ...row })) : rows]));
+      this.expanded = new Set(Array.isArray(cached.expanded) ? cached.expanded : []);
+      this._pendingExpanded = Array.from(this.expanded);
+      if (cached.cursor != null) this._workspaceTreeCursors.set(ownerWorkspace, cached.cursor);
+      this.treeError = "";
+      this._scheduleFileTreeViewportSync(true);
+      return true;
+    },
+    _scheduleWorkspaceTreePersist(
+      ownerWorkspace = this.fileWorkspacePath(), capturedSnapshot = null,
+    ) {
+      if (!ownerWorkspace) return;
+      const previous = this._workspaceTreeCacheTimers.get(ownerWorkspace);
+      if (previous) {
+        if (previous.timer) clearTimeout(previous.timer);
+        if (previous.idle != null && typeof window !== "undefined"
+            && window.cancelIdleCallback) {
+          window.cancelIdleCallback(previous.idle);
+        }
+      }
+      const handle = { timer: null, idle: null };
+      const persist = async () => {
+        if (this._workspaceTreeCacheTimers.get(ownerWorkspace) !== handle) return;
+        this._workspaceTreeCacheTimers.delete(ownerWorkspace);
+        // A captured snapshot belongs to an inactive workspace. If that owner
+        // became current again before idle time, loadRoot/delta will schedule a
+        // fresh, cursor-consistent snapshot instead.
+        if (capturedSnapshot && this._workspaceIsCurrent(ownerWorkspace)) return;
+        if (!capturedSnapshot && !this._workspaceIsCurrent(ownerWorkspace)) return;
+        // IndexedDB is optional acceleration. Never serialize a complete tree
+        // while xterm is the foreground surface; the old snapshot/cursor remains
+        // valid and the next delta can catch it up.
+        if (this.previewSurface === "terminal") return;
+        const source = capturedSnapshot || {
+          showHidden: !!this.showHidden,
+          cursor: this._workspaceTreeCursors.get(ownerWorkspace) ?? null,
+          visible: this.visible || [],
+          childCache: this.childCache || {},
+          expanded: Array.from(this.expanded || []),
+        };
+        // Clone only after the trailing debounce and idle callback both win.
+        // Persist only rows the next paint can actually use: root children plus
+        // children of expanded directories. Bootstrap owns a complete index,
+        // but cloning every collapsed subtree merely duplicates tens of
+        // thousands of inert rows on the main thread.
+        const expanded = Array.from(source.expanded || []);
+        const showHidden = !!source.showHidden;
+        const neededParents = new Set(["", ...expanded]);
+        const slimChildCache = {};
+        for (const parent of neededParents) {
+          const key = `${parent}:${showHidden}`;
+          const rows = (source.childCache || {})[key];
+          if (Array.isArray(rows)) {
+            slimChildCache[key] = rows.map(row => ({ ...row }));
+          }
+        }
+        const snapshot = {
+          showHidden,
+          cursor: source.cursor ?? null,
+          visible: (source.visible || []).map(node => ({ ...node })),
+          childCache: slimChildCache,
+          expanded,
+        };
+        try {
+          const cache = await this._persistentCache();
+          await cache.putWorkspaceSnapshot(ownerWorkspace, snapshot);
+        } catch (_) { /* persistent cache is an optional acceleration */ }
+      };
+      handle.timer = setTimeout(() => {
+        handle.timer = null;
+        if (typeof window !== "undefined" && window.requestIdleCallback) {
+          handle.idle = window.requestIdleCallback(
+            persist, { timeout: 4000 },
+          );
+        } else {
+          void persist();
+        }
+      }, this.WORKSPACE_TREE_PERSIST_DEBOUNCE_MS);
+      this._workspaceTreeCacheTimers.set(ownerWorkspace, handle);
+    },
+    _materializeFileSnapshot(entries, expandedPaths = []) {
+      const byParent = new Map();
+      const showHidden = !!this.showHidden;
+      for (const raw of this._uniqueFileNodes(entries)) {
+        const path = String(raw.path || "").replace(/^\/+/, "");
+        if (!path) continue;
+        if (!showHidden && path.split("/").some(part => part.startsWith("."))) continue;
+        const parent = path.split("/").slice(0, -1).join("/");
+        if (!byParent.has(parent)) byParent.set(parent, []);
+        byParent.get(parent).push({ ...raw, path });
+      }
+      const sortRows = rows => rows.sort((a, b) =>
+        (Number(!a.is_dir) - Number(!b.is_dir))
+        || String(a.name || a.path).localeCompare(String(b.name || b.path)));
+      const childCache = {};
+      for (const [parent, rows] of byParent) {
+        childCache[`${parent}:${showHidden}`] = sortRows(rows);
+      }
+      const availableDirs = new Set((entries || [])
+        .filter(row => row && row.is_dir).map(row => String(row.path || "")));
+      const expanded = new Set((expandedPaths || []).filter(path => availableDirs.has(path)));
+      const visible = [];
+      const append = (parent, depth) => {
+        for (const row of childCache[`${parent}:${showHidden}`] || []) {
+          visible.push({ ...row, depth });
+          if (row.is_dir && expanded.has(row.path)) append(row.path, depth + 1);
+        }
+      };
+      append("", 0);
+      return { visible, childCache, expanded };
+    },
+    _applyFileTreeDelta(changes) {
+      if (!Array.isArray(changes)) return false;
+      // A durable event log intentionally retains hidden-path changes so a
+      // show-hidden client can replay them. Filter before touching `visible`;
+      // otherwise a burst under .git/.local rebuilds the rendered tree even
+      // though not one row can change.
+      const relevant = [];
+      for (const change of changes) {
+        const path = String(change && change.path || "").replace(/^\/+/, "");
+        const type = change && change.type;
+        if (!path || !["added", "modified", "deleted"].includes(type)) continue;
+        if (!this.showHidden
+            && path.split("/").some(part => part.startsWith("."))) continue;
+        relevant.push({ change, path, type });
+      }
+      if (!relevant.length) return true;
+
+      const rawValue = value => (
+        typeof window !== "undefined"
+        && window.Alpine
+        && typeof window.Alpine.raw === "function"
+      ) ? window.Alpine.raw(value) : value;
+      const showHidden = !!this.showHidden;
+      const cacheSuffix = `:${showHidden}`;
+      const hidden = path => !showHidden
+        && path.split("/").some(part => part.startsWith("."));
+      const parentOf = path => path.split("/").slice(0, -1).join("/");
+      const nodes = new Map();
+      const knownParents = new Set([""]);
+      const sourceChildCache = rawValue(this.childCache) || {};
+      const sourceVisible = rawValue(this.visible) || [];
+
+      // Build one path index, then apply the complete batch against it. The old
+      // per-change findIndex/splice loop was O(tree × changes): a 50k tree with
+      // a 2k replay spent seconds doing repeated linear scans.
+      for (const [key, rows] of Object.entries(sourceChildCache)) {
+        if (!key.endsWith(cacheSuffix) || !Array.isArray(rows)) continue;
+        knownParents.add(key.slice(0, -cacheSuffix.length));
+        for (const proxiedRow of rawValue(rows)) {
+          const row = rawValue(proxiedRow);
+          const path = String(row && row.path || "");
+          if (path && !hidden(path) && !nodes.has(path)) nodes.set(path, row);
+        }
+      }
+      for (const proxiedRow of sourceVisible) {
+        const row = rawValue(proxiedRow);
+        const path = String(row && row.path || "");
+        if (path && !hidden(path) && !nodes.has(path)) nodes.set(path, row);
+      }
+
+      const deletedAt = new Map();
+      const upsertedAt = new Map();
+      const affectedParents = new Set();
+      let eventOrder = 0;
+      for (const { change, path, type } of relevant) {
+        eventOrder += 1;
+        const parent = parentOf(path);
+        if (type === "deleted") {
+          deletedAt.set(path, eventOrder);
+          continue;
+        }
+        const previous = nodes.get(path);
+        // A modified row outside every materialized/visible branch is not an
+        // implicit add. Expanding that branch later fetches canonical children.
+        if (!previous && type !== "added") continue;
+        // A collapsed branch restored from the slim persistent cache may not
+        // own a child listing yet. Do not turn one live "added" event into a
+        // partial cache that hides all of its pre-existing siblings on expand.
+        if (!previous && type === "added" && !knownParents.has(parent)) continue;
+        const raw = change.entry || change.node || change;
+        nodes.set(path, {
+          ...(previous || {}),
+          path,
+          name: typeof raw.name === "string"
+            ? raw.name : ((previous && previous.name) || path.split("/").pop()),
+          is_dir: raw.is_dir == null
+            ? !!(previous && previous.is_dir) : !!raw.is_dir,
+          size: raw.size == null ? Number(previous && previous.size) || 0 : raw.size,
+          mtime: raw.mtime == null ? Number(previous && previous.mtime) || 0 : raw.mtime,
+          mtime_ns: raw.mtime_ns == null
+            ? (raw.mtime == null
+              ? Number(previous && previous.mtime_ns) || 0
+              // Older event wires sent only second-resolution mtime. Do not
+              // retain a now-stale nanosecond value that would mask the update.
+              : 0)
+            : raw.mtime_ns,
+        });
+        // Existing rows are already sorted. A content/mtime-only modification
+        // preserves that order; only additions or sort-key changes need the
+        // affected sibling group sorted again.
+        if (type === "added"
+            || (previous && (
+              (typeof raw.name === "string" && raw.name !== previous.name)
+              || (raw.is_dir != null && !!raw.is_dir !== !!previous.is_dir)
+            ))) {
+          affectedParents.add(parent);
+        }
+        upsertedAt.set(path, eventOrder);
+      }
+
+      const latestAncestorDelete = path => {
+        let latest = deletedAt.get(path) || -1;
+        let slash = path.lastIndexOf("/");
+        while (slash >= 0) {
+          const ancestor = path.slice(0, slash);
+          latest = Math.max(latest, deletedAt.get(ancestor) || -1);
+          slash = ancestor.lastIndexOf("/");
+        }
+        return latest;
+      };
+      const finalNodes = new Map();
+      for (const [path, row] of nodes) {
+        if (latestAncestorDelete(path) > (upsertedAt.get(path) || -1)) continue;
+        let clean = row;
+        if (Object.prototype.hasOwnProperty.call(row, "depth")
+            || Object.prototype.hasOwnProperty.call(row, "seq")
+            || Object.prototype.hasOwnProperty.call(row, "type")) {
+          clean = { ...row };
+          delete clean.depth;
+          delete clean.seq;
+          delete clean.type;
+        }
+        finalNodes.set(path, clean);
+      }
+      for (const parent of Array.from(knownParents)) {
+        const row = finalNodes.get(parent);
+        if (parent && (
+          latestAncestorDelete(parent) > (upsertedAt.get(parent) || -1)
+          || !row
+          || !row.is_dir
+        )) {
+          knownParents.delete(parent);
+        }
+      }
+
+      const currentExpanded = rawValue(this.expanded) || new Set();
+      const nextExpanded = new Set(Array.from(currentExpanded).filter(path => {
+        const row = finalNodes.get(path);
+        return !!(row && row.is_dir);
+      }));
+      for (const path of nextExpanded) knownParents.add(path);
+
+      const byParent = new Map();
+      for (const parent of knownParents) byParent.set(parent, []);
+      for (const row of finalNodes.values()) {
+        const parent = parentOf(row.path);
+        const siblings = byParent.get(parent);
+        // Only materialize complete child listings already owned by the
+        // snapshot/cache. Unknown collapsed parents stay lazy and canonical.
+        if (siblings) siblings.push(row);
+      }
+      const sortRows = rows => rows.sort((a, b) =>
+        (Number(!a.is_dir) - Number(!b.is_dir))
+        || String(a.name || a.path).localeCompare(String(b.name || b.path))
+        || String(a.path).localeCompare(String(b.path)));
+      for (const parent of affectedParents) {
+        const rows = byParent.get(parent);
+        if (rows) sortRows(rows);
+      }
+
+      const nextCache = {};
+      for (const [key, rows] of Object.entries(sourceChildCache)) {
+        if (!key.endsWith(cacheSuffix)) nextCache[key] = rows;
+      }
+      for (const [parent, rows] of byParent) {
+        nextCache[`${parent}:${showHidden}`] = rows;
+      }
+
+      const nextVisible = [];
+      const previousByPath = new Map(sourceVisible.map(proxiedRow => {
+        const row = rawValue(proxiedRow);
+        return [row.path, row];
+      }));
+      const sameNode = (left, right) => left.path === right.path
+        && left.name === right.name
+        && !!left.is_dir === !!right.is_dir
+        && Number(left.size || 0) === Number(right.size || 0)
+        && Number(left.mtime_ns || 0) === Number(right.mtime_ns || 0)
+        && Number(left.mtime || 0) === Number(right.mtime || 0);
+      const append = (parent, depth) => {
+        for (const row of byParent.get(parent) || []) {
+          const previous = previousByPath.get(row.path);
+          nextVisible.push(
+            previous
+            && Number(previous.depth || 0) === depth
+            && sameNode(previous, row)
+              ? previous
+              : { ...row, depth },
+          );
+          if (row.is_dir && nextExpanded.has(row.path)) {
+            append(row.path, depth + 1);
+          }
+        }
+      };
+      append("", 0);
+      const visibleChanged = sourceVisible.length !== nextVisible.length
+        || sourceVisible.some((proxiedRow, index) => {
+          const row = rawValue(proxiedRow);
+          const next = nextVisible[index];
+          return !next || Number(row.depth || 0) !== Number(next.depth || 0)
+            || !sameNode(row, next);
+        });
+
+      this.childCache = nextCache;
+      if (nextExpanded.size !== currentExpanded.size
+          || Array.from(nextExpanded).some(path => !currentExpanded.has(path))) {
+        this.expanded = nextExpanded;
+      }
+      if (this._pendingExpanded != null) {
+        this._pendingExpanded = Array.from(nextExpanded);
+      }
+      if (visibleChanged) {
+        this.visible = nextVisible;
+        this._scheduleFileTreeViewportSync();
+      }
+      return true;
+    },
+    async _syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated) {
+      const cursor = this._workspaceTreeCursors.get(ownerWorkspace);
+      const hasCursor = hydrated && cursor != null && cursor !== "";
+      const params = new URLSearchParams();
+      if (hasCursor) {
+        params.set("cursor", String(cursor));
+      } else if (this.showHidden) {
+        params.set("show_hidden", "true");
+      }
+      const query = params.toString();
+      const endpoint = hasCursor
+        ? `/api/files/delta?${query}`
+        : `/api/files/bootstrap${query ? `?${query}` : ""}`;
+      let response;
+      try {
+        response = await fetch(endpoint, { headers: this.fileHdr() });
+      } catch (_) { return false; }
+      if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (response.status === 404 || response.status === 405 || response.status === 501) return false;
+      if (response.status === 204) return !!hydrated;
+      if (!response.ok) return false;
+      let payload;
+      try { payload = await response.json(); } catch (_) { return false; }
+      if (treeSeq !== this._treeLoadSeq || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      const nextCursor = payload.cursor ?? payload.next_cursor ?? payload.nextCursor;
+      let applied = false;
+      if (!hasCursor && Array.isArray(payload.entries)) {
+        const tree = this._materializeFileSnapshot(
+          payload.entries, Array.from(this.expanded || []),
+        );
+        this.visible = tree.visible;
+        this.childCache = tree.childCache;
+        this.expanded = tree.expanded;
+        this._pendingExpanded = Array.from(this.expanded);
+        this._scheduleFileTreeViewportSync(true);
+        applied = true;
+      } else if (payload.resync === true) {
+        this._workspaceTreeCursors.delete(ownerWorkspace);
+        return await this._syncWorkspaceTree(ownerWorkspace, treeSeq, false);
+      } else if (Array.isArray(payload.changes) && hydrated) {
+        applied = payload.changes.length
+          ? this._applyFileTreeDelta(payload.changes) : true;
+      }
+      if (!applied) return false;
+      if (nextCursor != null) {
+        const currentCursor = Number(this._workspaceTreeCursors.get(ownerWorkspace) || 0);
+        const numericCursor = Number(nextCursor);
+        if (Number.isFinite(numericCursor)) {
+          this._workspaceTreeCursors.set(
+            ownerWorkspace, hasCursor ? Math.max(currentCursor, numericCursor) : numericCursor,
+          );
+        }
+      }
+      if (payload.has_more === true) {
+        if (nextCursor == null || String(nextCursor) === String(cursor ?? "")) return false;
+        return await this._syncWorkspaceTree(ownerWorkspace, treeSeq, true);
+      }
+      this._scheduleWorkspaceTreePersist(ownerWorkspace);
+      return true;
+    },
+    _clearWorkspaceSyncRetry(ownerWorkspace) {
+      const pending = this._workspaceSyncRetryTimers.get(ownerWorkspace);
+      if (pending && pending.timer) clearTimeout(pending.timer);
+      this._workspaceSyncRetryTimers.delete(ownerWorkspace);
+    },
+    _scheduleWorkspaceSyncRetry(ownerWorkspace, attempt = 0) {
+      if (!ownerWorkspace || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      // One retry owner at a time. A later successful bootstrap clears it;
+      // repeated SSE failures must not reset exponential backoff to zero.
+      if (this._workspaceSyncRetryTimers.has(ownerWorkspace)) return;
+      const delay = Math.min(8000, 600 * (2 ** Math.min(attempt, 4)));
+      const record = { timer: null, attempt };
+      record.timer = setTimeout(() => {
+        if (this._workspaceSyncRetryTimers.get(ownerWorkspace) !== record) return;
+        this._workspaceSyncRetryTimers.delete(ownerWorkspace);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        void Promise.resolve(this.loadRoot({ scheduleRetry: false }))
+          .catch(() => false)
+          .then(ok => {
+            if (ok !== true && this._workspaceIsCurrent(ownerWorkspace)) {
+              this._scheduleWorkspaceSyncRetry(ownerWorkspace, attempt + 1);
+            }
+          });
+      }, delay);
+      this._workspaceSyncRetryTimers.set(ownerWorkspace, record);
+    },
+    _markWorkspaceTreeSynced(ownerWorkspace) {
+      this._clearWorkspaceSyncRetry(ownerWorkspace);
+      if (this._workspaceIsCurrent(ownerWorkspace)) this._fileTreeDirty = false;
+    },
+    async _recoverWorkspaceTree(ownerWorkspace, { hydrated = false } = {}) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      this._fileTreeDirty = true;
+      if (!hydrated) this._workspaceTreeCursors.delete(ownerWorkspace);
+      const seq = ++this._treeLoadSeq;
+      const ok = await this._syncWorkspaceTree(ownerWorkspace, seq, hydrated);
+      if (ok) this._markWorkspaceTreeSynced(ownerWorkspace);
+      else if (this._workspaceIsCurrent(ownerWorkspace)) {
+        this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+      }
+      return ok;
+    },
+    _clearWorkspaceEventBatch(ownerWorkspace) {
+      const batch = this._workspaceEventBatches.get(ownerWorkspace);
+      if (batch && batch.timer) clearTimeout(batch.timer);
+      this._workspaceEventBatches.delete(ownerWorkspace);
+    },
+    _flushWorkspaceEventBatch(ownerWorkspace) {
+      const batch = this._workspaceEventBatches.get(ownerWorkspace);
+      if (!batch) return;
+      this._workspaceEventBatches.delete(ownerWorkspace);
+      if (batch.timer) clearTimeout(batch.timer);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      const changes = [];
+      let cursor = null;
+      for (const payload of batch.payloads) {
+        changes.push(...(Array.isArray(payload.changes) ? payload.changes : []));
+        const candidate = Number(payload.cursor);
+        if (Number.isFinite(candidate)) {
+          cursor = cursor == null ? candidate : Math.max(cursor, candidate);
+        }
+      }
+      const task = this._enqueueWorkspaceSync(
+        ownerWorkspace,
+        () => this._applyWorkspaceEventPayload(
+          { changes, ...(cursor == null ? {} : { cursor }) },
+          ownerWorkspace,
+        ),
+      );
+      void task.catch(() => {
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        this._fileTreeDirty = true;
+        this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+      });
+    },
+    _queueWorkspaceEventPayload(payload, ownerWorkspace) {
+      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (payload.resync === true) {
+        this._clearWorkspaceEventBatch(ownerWorkspace);
+        const task = this._enqueueWorkspaceSync(
+          ownerWorkspace,
+          () => this._applyWorkspaceEventPayload(
+            { ...payload, resync: true },
+            ownerWorkspace,
+          ),
+        );
+        void task.catch(() => {
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          this._fileTreeDirty = true;
+          this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+        });
+        return;
+      }
+      if (!Array.isArray(payload.changes)) return;
+      if (payload.changes.some(change =>
+        !Number.isFinite(Number(change && change.seq)))) {
+        // Compatibility with the pre-cursor backend keeps its existing
+        // structural debounce and lazy parent refresh behavior.
+        this._queueFileChanges(payload.changes, ownerWorkspace);
+        return;
+      }
+      let batch = this._workspaceEventBatches.get(ownerWorkspace);
+      if (!batch) {
+        batch = { payloads: [], timer: null };
+        this._workspaceEventBatches.set(ownerWorkspace, batch);
+      }
+      batch.payloads.push(payload);
+      if (batch.timer) return;
+      const delay = this._isMobileLayout()
+        ? this.WORKSPACE_EVENT_BATCH_MOBILE_MS
+        : this.WORKSPACE_EVENT_BATCH_DESKTOP_MS;
+      batch.timer = setTimeout(
+        () => this._flushWorkspaceEventBatch(ownerWorkspace),
+        delay,
+      );
+    },
+    _enqueueWorkspaceSync(ownerWorkspace, operation) {
+      const previous = this._workspaceSyncChains.get(ownerWorkspace) || Promise.resolve();
+      const task = previous.catch(() => {}).then(operation);
+      this._workspaceSyncChains.set(ownerWorkspace, task);
+      const release = () => {
+        if (this._workspaceSyncChains.get(ownerWorkspace) === task) {
+          this._workspaceSyncChains.delete(ownerWorkspace);
+        }
+      };
+      // `finally()` creates a second promise that mirrors rejection. Leaving
+      // that promise unobserved turns a recoverable sync failure into a browser
+      // `unhandledrejection`; attach both outcomes directly instead.
+      void task.then(release, release);
+      return task;
+    },
+    async _applyWorkspaceEventPayload(payload, ownerWorkspace) {
+      if (!payload || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (payload.resync === true) {
+        return await this._recoverWorkspaceTree(ownerWorkspace, { hydrated: false });
+      }
+      if (!Array.isArray(payload.changes)) return false;
+      const current = Number(this._workspaceTreeCursors.get(ownerWorkspace) || 0);
+      const bySeq = new Map();
+      for (const change of payload.changes) {
+        const seq = Number(change && change.seq);
+        if (Number.isFinite(seq)) bySeq.set(seq, change);
+      }
+      const sequenced = Array.from(bySeq.values())
+        .sort((a, b) => Number(a.seq) - Number(b.seq));
+      if (!sequenced.length && payload.changes.length) {
+        this._queueFileChanges(payload.changes, ownerWorkspace);
+        return true;
+      }
+      const fresh = sequenced.filter(change => Number(change.seq) > current);
+      let expected = current + 1;
+      for (const change of fresh) {
+        if (Number(change.seq) !== expected) {
+          return await this._recoverWorkspaceTree(
+            ownerWorkspace, { hydrated: true },
+          );
+        }
+        expected += 1;
+      }
+      for (const change of fresh) {
+        if (change.type === "modified" && change.path === this.selected) {
+          this._previewCacheDel(change.path);
+          if (this.editing) {
+            this._previewNeedsReload = change.path;
+            this.loadSelectedMeta(change.path);
+          } else if (this.previewSurface === "file"
+              && (!this._isMobileLayout() || this.mobileTab === "preview")) {
+            this._maybeReloadPreview(change.path, ownerWorkspace);
+          }
+        }
+      }
+      const advertisedCursor = Number(payload.cursor);
+      const replayedCursor = fresh.length
+        ? Number(fresh[fresh.length - 1].seq) : current;
+      if (Number.isFinite(advertisedCursor) && advertisedCursor > replayedCursor) {
+        return await this._recoverWorkspaceTree(
+          ownerWorkspace, { hydrated: true },
+        );
+      }
+      if (fresh.length && !this._applyFileTreeDelta(fresh)) {
+        return await this._recoverWorkspaceTree(
+          ownerWorkspace, { hydrated: true },
+        );
+      }
+      this._workspaceTreeCursors.set(
+        ownerWorkspace,
+        Math.max(
+          current,
+          replayedCursor,
+          Number.isFinite(advertisedCursor) ? advertisedCursor : current,
+        ),
+      );
+      this._markWorkspaceTreeSynced(ownerWorkspace);
+      this._scheduleWorkspaceTreePersist(ownerWorkspace);
+      return true;
     },
     async _startFileEvents() {
       const workspace = this.fileWorkspacePath();
@@ -13432,6 +14103,8 @@ function portal() {
       }
       if (seq !== this._fileEventsSeq || !this._fileTreeIsVisible() || !ticket) return;
       const params = new URLSearchParams({ ticket, workspace });
+      const cursor = this._workspaceTreeCursors.get(workspace);
+      if (cursor != null && cursor !== "") params.set("cursor", String(cursor));
       const es = new EventSource(`/api/files/events?${params.toString()}`);
       this._fileEvents = es;
       this._fileEventsWorkspace = workspace;
@@ -13439,20 +14112,39 @@ function portal() {
       const owns = () => seq === this._fileEventsSeq
         && this._fileEvents === es
         && this._workspaceIsCurrent(workspace);
-      es.addEventListener("ready", () => {
+      es.addEventListener("ready", (ev) => {
         if (!owns()) return;
-        if (this._fileTreeDirty) this._flushFileTreeDirty();
+        let payload = {};
+        try { payload = JSON.parse(ev.data); } catch (_) {}
+        const localCursor = Number(this._workspaceTreeCursors.get(workspace));
+        const readyCursor = Number(payload.cursor ?? payload.latest_cursor);
+        if (!Number.isFinite(readyCursor)) {
+          // An older backend ignores durable cursors. Even if IndexedDB still
+          // holds a cursor from a newer deployment, it cannot replay downtime.
+          if (this._fileTreeDirty) this._flushFileTreeDirty();
+        } else if (Number.isFinite(localCursor)
+            && readyCursor <= localCursor) {
+          this._fileTreeDirty = false;
+        } else if (this._fileTreeDirty
+                   && !this._workspaceTreeCursors.has(workspace)) {
+          // Compatibility path for an older backend with no durable cursor.
+          this._flushFileTreeDirty();
+        }
       });
       es.addEventListener("changes", (ev) => {
         if (!owns()) return;
         let payload;
         try { payload = JSON.parse(ev.data); } catch (_) { return; }
-        this._queueFileChanges(payload.changes, workspace);
+        this._queueWorkspaceEventPayload(payload, workspace);
       });
-      es.addEventListener("resync", () => {
+      es.addEventListener("resync", (ev) => {
         if (!owns()) return;
-        this._fileTreeDirty = true;
-        this._flushFileTreeDirty();
+        let payload = { resync: true };
+        try { payload = JSON.parse(ev.data); } catch (_) {}
+        this._queueWorkspaceEventPayload(
+          { ...payload, resync: true },
+          workspace,
+        );
       });
       es.onerror = () => {
         if (!owns()) return;
@@ -13462,7 +14154,9 @@ function portal() {
         try { es.close(); } catch (_) {}
         this._fileEvents = null;
         this._fileEventsWorkspace = "";
-        this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+        if (this._fileTreeIsVisible()) {
+          this._fileEventsTimer = setTimeout(() => this._startFileEvents(), 1500);
+        }
       };
       if (!this._fileEventsVisibilityBound) {
         this._fileEventsVisibilityBound = true;
@@ -13474,6 +14168,7 @@ function portal() {
           }
         });
         window.addEventListener("pagehide", () => this._stopFileEvents(false));
+        window.addEventListener("pageshow", () => this._startFileEvents());
       }
     },
     _queueFileChanges(changes, ownerWorkspace) {
@@ -13562,6 +14257,7 @@ function portal() {
         this._fileTreeRefreshBusy = false;
       }
       this._fileTreeDirty = !ok;
+      if (ok) this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return ok;
     },
     async _flushFileTreeDirty() {
@@ -13675,19 +14371,39 @@ function portal() {
       this._syncFileTreeViewport(list);
       return true;
     },
-    async loadRoot() {
-      const treeSeq = ++this._treeLoadSeq;
+    async _loadRootNow({
+      runtimeSnapshot = false,
+      ownerWorkspace = this.fileWorkspacePath(),
+      treeSeq = this._treeLoadSeq,
+    } = {}) {
       this.treeLoading = true;
       this.treeError = "";
+      // A warm workspace already owns an in-memory tree and cursor; an empty
+      // runtime tree is valid too. Cold boots may hydrate the same contract
+      // from IndexedDB. Either path can revalidate with a small delta instead
+      // of downloading and rebuilding the full workspace snapshot.
+      const hydrated = !!runtimeSnapshot
+        || await this._hydrateWorkspaceTree(ownerWorkspace, treeSeq);
+      if (treeSeq !== this._treeLoadSeq
+          || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+      if (await this._syncWorkspaceTree(ownerWorkspace, treeSeq, hydrated)) {
+        if (treeSeq !== this._treeLoadSeq
+            || !this._workspaceIsCurrent(ownerWorkspace)) return false;
+        this.treeLoading = false;
+        this.treeError = "";
+        return true;
+      }
       const pendingExpanded = [...new Set(this._pendingExpanded || [])];
       const wantedExpanded = new Set(pendingExpanded);
       const oldChildCache = this.childCache;
       const showHidden = this.showHidden;
       let children;
       try {
-        // Keep the last-good tree visible until the complete refresh succeeds.
+        // Older backends have no bootstrap/delta endpoint. Preserve the legacy
+        // list path as a compatibility fallback and keep the last-good tree on
+        // any failure.
         children = await this.fetchChildren("", {
-          force: true, cache: false, treeSeq,
+          force: true, cache: false, treeSeq, ownerWorkspace,
         });
       } catch (_e) {
         if (treeSeq === this._treeLoadSeq) {
@@ -13718,7 +14434,7 @@ function portal() {
           let grandchildren;
           try {
             grandchildren = await this.fetchChildren(node.path, {
-              force: true, cache: false, treeSeq,
+              force: true, cache: false, treeSeq, ownerWorkspace,
             });
           } catch (_e) {
             nestedRefreshFailed = true;
@@ -13746,7 +14462,35 @@ function portal() {
         "warn", 3500);
       }
       this.treeLoading = false;
+      this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
+    },
+    loadRoot({ runtimeSnapshot = false, scheduleRetry = true } = {}) {
+      const ownerWorkspace = this.fileWorkspacePath();
+      if (!ownerWorkspace) return Promise.resolve(false);
+      // Allocate the generation before queueing so a newer manual refresh can
+      // invalidate an older queued request immediately. The operation itself
+      // shares the same owner chain as SSE replay/resync, preventing a snapshot
+      // from overwriting an event that arrived while its fetch was in flight.
+      const treeSeq = ++this._treeLoadSeq;
+      const task = this._enqueueWorkspaceSync(
+        ownerWorkspace,
+        () => this._loadRootNow({
+          runtimeSnapshot, ownerWorkspace, treeSeq,
+        }),
+      );
+      return Promise.resolve(task).catch(() => false).then(ok => {
+        const current = this._workspaceIsCurrent(ownerWorkspace);
+        const latest = treeSeq === this._treeLoadSeq;
+        if (ok === true && current) {
+          this._markWorkspaceTreeSynced(ownerWorkspace);
+        } else if (current && latest) {
+          this.treeLoading = false;
+          this._fileTreeDirty = true;
+          if (scheduleRetry) this._scheduleWorkspaceSyncRetry(ownerWorkspace);
+        }
+        return ok === true;
+      });
     },
     reloadTree() {
       this._pendingExpanded = Array.from(this.expanded);
@@ -14183,6 +14927,7 @@ function portal() {
       this.expanded.add(n.path);
       this.expanded = new Set(this.expanded);
       this._scheduleFileTreeViewportSync();
+      this._scheduleWorkspaceTreePersist(ownerWorkspace);
       return true;
     },
     collapse(n) {
@@ -14199,6 +14944,7 @@ function portal() {
       }
       this.expanded = new Set(this.expanded);
       this._scheduleFileTreeViewportSync();
+      this._scheduleWorkspaceTreePersist();
     },
     // ===== context menu =====
     openCtxMenu(ev, n) {
@@ -16468,7 +17214,9 @@ function portal() {
       this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
-      if (this._isMobileLayout()) this.setMobileTab("preview");
+      if (this._isMobileLayout() && opts.reveal !== false) {
+        this.setMobileTab("preview");
+      }
       // When many files are open, the active row/tab can end up off-screen
       // in both the Open files list (vertical scroll) and the preview tab
       // bar (horizontal scroll). Scroll the active item into view so users

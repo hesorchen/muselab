@@ -104,7 +104,8 @@ jobs:
           set -e
           for f in frontend/app.js frontend/sw.js \
                    frontend/data/constants.js frontend/i18n/index.js \
-                   frontend/modules/file-capabilities.mjs; do
+                   frontend/modules/file-capabilities.mjs \
+                   frontend/modules/persistent-cache.mjs; do
             echo "node --check $f"
             node --check "$f"
           done

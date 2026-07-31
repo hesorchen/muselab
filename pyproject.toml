@@ -58,8 +58,8 @@ dependencies = [
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.49.0",
     # Live file-tree refresh for Agent / terminal / external-editor changes.
-    # One native watcher is shared per active workspace and released when the
-    # last browser disconnects.
+    # One on-demand watcher per subscribed workspace feeds the durable SQLite
+    # index; offline reconciliation runs when that workspace is reactivated.
     "watchfiles>=1.1.1",
     # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
     # native deps; safe to ship in the muselab Docker image.
