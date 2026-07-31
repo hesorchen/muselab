@@ -4,7 +4,7 @@ Each task: a fixed prompt that fires on a daily schedule, dispatches
 against the same muselab session every time (so history accumulates),
 and the user gets a "X tasks ran" bell badge in the top bar.
 
-Persistence: archive/.muselab/scheduler.json — same shape as muselab's
+Persistence: workspace/.muselab/scheduler.json — same shape as muselab's
 other sidecar metadata. Survives muselab restart; next_run is
 recomputed on startup in case the process was down through a fire
 window.

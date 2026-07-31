@@ -11,7 +11,7 @@
 
 ## Use
 
-- [Personalize your CLAUDE.md](personalize-claude-md.md) — teach Muse about you
+- [Configure workspace CLAUDE.md](personalize-claude-md.md) — add optional durable project instructions
 - [Skills](skills.md) — what ships out of the box, and how to add your own
 - [Mobile (PWA)](mobile.md) — install to home screen, push notifications, HTTPS
 - [Terminal](terminal.md) — real PTY, terminal list, Profiles, and mobile controls

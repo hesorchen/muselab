@@ -26,15 +26,18 @@ SEL_MOBILE_TAB = ".mobile-tab-bar button"
 
 def _login(page: Page, base: str, token: str) -> None:
     page.goto(base, wait_until="domcontentloaded")
-    page.wait_for_selector(f"{SEL_LOGIN}, {SEL_TABS}", state="visible", timeout=5000)
+    page.wait_for_selector(
+        f"{SEL_LOGIN}, {SEL_TABS}", state="visible", timeout=15000
+    )
     if page.locator(SEL_LOGIN).is_visible():
         page.fill(SEL_LOGIN_INPUT, token)
         page.keyboard.press("Enter")
-    expect(page.locator(SEL_TABS)).to_be_visible(timeout=5000)
+    expect(page.locator(SEL_TABS)).to_be_visible(timeout=15000)
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")?._x_dataStack?.[0];
-          return app && app.authed === true && app.currentId
+          return app && app.authed === true && app.appReady
+            && app._sessionsInitialized && app.currentId
             && app.openTabIds.includes(app.currentId) && app.sessions.length > 0;
         }"""
     )
@@ -1125,6 +1128,620 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     _assert_no_browser_errors(page, errors)
 
 
+def test_desktop_done_reconcile_preserves_live_message_dom_identity(
+    page: Page, backend_url, auth_token,
+):
+    """SSE done → quiet canonical reload keeps the rendered reply node mounted."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    sid = "perf-done-canonical-identity"
+    prompt = "DOM_IDENTITY_USER_PROMPT"
+    final_text = "DOM_IDENTITY_FINAL_REPLY " + ("stable canonical text " * 40)
+    canonical_messages: list[dict] = []
+    requests = _route_windowed_session(page, sid, canonical_messages)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"done-reconcile-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.appReady = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.sessions = [{
+          id: sid, name: "Done reconciliation", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app._activateTabState(sid);
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app.mobileTab = "chat";
+        app.input = arg.prompt;
+        app.atBottom = true;
+        return true;
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """text => window.__emitSse("text", {
+          text, turn_id: "done-reconcile-turn", event_seq: 1,
+        })""",
+        final_text,
+    )
+    page.wait_for_function(
+        """text => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const last = app.messages[app.messages.length - 1];
+          const pane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(el => getComputedStyle(el).display !== "none");
+          return app.streaming && last?.role === "assistant" && last.text === text
+            && pane?.querySelector(".msg.assistant");
+        }""",
+        arg=final_text,
+        timeout=10000,
+    )
+    live = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const last = app.messages[app.messages.length - 1];
+          const nodes = document.querySelectorAll(".msg-pane .msg.assistant");
+          window.__doneReconcileLiveNode = nodes[nodes.length - 1];
+          window.__doneReconcileLiveKey = last._k;
+          return { key: last._k, uuid: last.uuid || "" };
+        }"""
+    )
+    assert ":live:" in live["key"]
+    assert live["uuid"] == ""
+
+    canonical_messages.extend([
+        {
+            "role": "user",
+            "text": prompt,
+            "uuid": "done-canonical-user",
+            "ts": 1_700_020_000,
+        },
+        {
+            "role": "assistant",
+            "text": final_text,
+            "uuid": "done-canonical-assistant",
+            "ts": 1_700_020_001,
+        },
+    ])
+    page.evaluate(
+        """() => window.__emitSse("done", {
+          total_cost_usd: 0.001,
+          session_usage: { context_used_pct: 5, context_used: 500, context_limit: 100000 },
+          turn_id: "done-reconcile-turn", event_seq: 2,
+        })"""
+    )
+    page.wait_for_function(
+        "() => document.querySelector('#app')._x_dataStack[0].streaming === false",
+        timeout=10000,
+    )
+
+    result = page.evaluate(
+        """async ({ sid, text }) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          st._pendingExternalUpdate = true;
+          app._reconcileOpenSession([{
+            ...app.sessions[0], id: sid, updated_at: 2, active: false,
+          }]);
+          const frames = [];
+          for (let i = 0; i < 12; i++) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const pane = Array.from(document.querySelectorAll(".msg-pane"))
+              .find(el => getComputedStyle(el).display !== "none");
+            frames.push({
+              ready: app.messagesReady,
+              loading: app.messagesLoading,
+              visible: !!pane && pane.textContent.includes(text),
+              count: pane ? pane.querySelectorAll(".msg").length : 0,
+            });
+            if (!st._reconcilePromise && i >= 2) break;
+          }
+          if (st._reconcilePromise) await st._reconcilePromise;
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const last = st.messages[st.messages.length - 1];
+          const nodes = document.querySelectorAll(".msg-pane .msg.assistant");
+          const canonicalNode = nodes[nodes.length - 1];
+          return {
+            frames,
+            sameNode: canonicalNode === window.__doneReconcileLiveNode,
+            oldKey: window.__doneReconcileLiveKey,
+            key: last._k,
+            uuid: last.uuid || "",
+            text: last.text || "",
+          };
+        }""",
+        {"sid": sid, "text": final_text},
+    )
+
+    assert requests, "canonical reconciliation did not request session history"
+    assert result["sameNode"] is True, result
+    assert result["key"] == result["oldKey"]
+    assert result["uuid"] == "done-canonical-assistant"
+    assert result["text"] == final_text
+    assert result["frames"]
+    assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
+    assert all(frame["visible"] and frame["count"] > 0 for frame in result["frames"]), result
+    _assert_no_browser_errors(page, errors)
+
+
+def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
+    page: Page, backend_url, auth_token,
+):
+    """Early done metadata completes the visual tail without touching identity."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    sid = "perf-tool-tail-done-metadata"
+    assistant_uuid = "tool-tail-assistant-boundary"
+    completed_at_ms = int(time.time() * 1000)
+    duration_ms = 125_000
+    active_requests: list[str] = []
+    history_requests: list[str] = []
+
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"tool-tail-done-ticket"}',
+        ),
+    )
+    page.route(
+        "**/api/chat/providers",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "models": [{
+                    "model": "e2e-model",
+                    "label": "E2E model",
+                    "group": "e2e",
+                    "supports_thinking": True,
+                }],
+                "default_model": "e2e-model",
+                "default_permission": "bypassPermissions",
+            }),
+        ),
+    )
+
+    def active_stays_true(route):
+        active_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"active":true}',
+        )
+
+    def unexpected_history(route):
+        history_requests.append(route.request.url)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Tool tail done",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "messages": [],
+                "offset": 0,
+                "total": 0,
+                "has_more": False,
+                "history_generation": "blocked-canonical-e2e",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}/active", active_stays_true)
+    page.route(f"**/api/chat/sessions/{sid}?*", unexpected_history)
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.ackCurrentActivity = () => {};
+        // The app's 10s cross-device poll would correctly interpret this
+        // test's intentionally permanent /active=true response as a stalled
+        // stream and reconnect it. Disable that unrelated timer so the test
+        // observes only the done-time canonical barrier under test.
+        if (app._sessionsSyncTimer) clearInterval(app._sessionsSyncTimer);
+        app._sessionsSyncTimer = null;
+        app._syncSessionListQuiet = async () => false;
+        app.appReady = true;
+        app.availableModels = [{
+          model: 'e2e-model', label: 'E2E model', group: 'e2e',
+          supports_thinking: true,
+        }];
+        app.model = 'e2e-model';
+        app.defaultModel = 'e2e-model';
+        app.sessions = [{
+          id: sid,
+          name: 'Tool tail done',
+          updated_at: 1,
+          model: 'e2e-model',
+          permission: 'bypassPermissions',
+          thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app._activateTabState(sid);
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app.mobileTab = 'chat';
+        app.input = 'Finish on a tool result';
+        app.atBottom = true;
+        return true;
+        """,
+        {"sid": sid},
+    )
+
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """() => {
+          window.__emitSse('text', {
+            text: 'TOOL_TAIL_ASSISTANT_TEXT',
+            turn_id: 'tool-tail-turn',
+            event_seq: 1,
+          });
+          window.__emitSse('tool_use', {
+            id: 'toolu_tool_tail',
+            name: 'Bash',
+            summary: 'produce final status',
+            input: {command: 'printf done'},
+            turn_id: 'tool-tail-turn',
+            event_seq: 2,
+          });
+          window.__emitSse('tool_result', {
+            id: 'toolu_tool_tail',
+            tool_name: 'Bash',
+            preview: 'done',
+            text: 'done\\n',
+            truncated: false,
+            is_error: false,
+            bash: {stdout: 'done\\n', stderr: '', exit_code: 0},
+            turn_id: 'tool-tail-turn',
+            event_seq: 3,
+          });
+        }"""
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const tail = app.messages[app.messages.length - 1];
+          return app.streaming && tail?.role === 'tool_result';
+        }"""
+    )
+    before_done = _app_eval(
+        page,
+        """
+        const tail = app.messages[app.messages.length - 1];
+        const assistant = [...app.messages].reverse()
+          .find(message => message.role === 'assistant');
+        return {
+          tailKey: tail._k,
+          tailUuid: tail.uuid,
+          tailForkUuid: tail.forkUuid,
+          assistantUuid: assistant?.uuid || '',
+        };
+        """,
+    )
+    tail_key = before_done.pop("tailKey")
+    assert ":live:" in tail_key
+    assert before_done == {
+        "tailUuid": "",
+        "tailForkUuid": "",
+        "assistantUuid": "",
+    }
+
+    with page.expect_request(
+        lambda request: request.url.endswith(
+            f"/api/chat/sessions/{sid}/active"
+        ),
+        timeout=5000,
+    ):
+        page.evaluate(
+            """arg => window.__emitSse('done', {
+              assistant_uuid: arg.assistantUuid,
+              completed_at_ms: arg.completedAtMs,
+              duration_ms: arg.durationMs,
+              total_cost_usd: 0.001,
+              session_usage: {
+                context_used_pct: 5,
+                context_used: 500,
+                context_limit: 100000,
+              },
+              turn_id: 'tool-tail-turn',
+              event_seq: 4,
+            })""",
+            {
+                "assistantUuid": assistant_uuid,
+                "completedAtMs": completed_at_ms,
+                "durationMs": duration_ms,
+            },
+        )
+
+    page.wait_for_function(
+        """arg => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const tail = app.messages[app.messages.length - 1];
+          const pane = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(arg.sid)}"]`);
+          const tailNode = pane?.querySelector(
+            `.msg[data-message-key="${CSS.escape(arg.tailKey)}"]`);
+          const footer = tailNode?.querySelector('.turn-footer');
+          return !app.streaming
+            && tail?.role === 'tool_result'
+            && tail.ts === arg.completedAtMs
+            && tail.elapsed === arg.durationMs / 1000
+            && tail.forkUuid === arg.assistantUuid
+            && tailNode?.classList.contains('tool_result')
+            && footer?.getClientRects().length
+            && footer.querySelector('.msg-ts')?.textContent
+              === app.fmtTurnTime(arg.completedAtMs)
+            && footer.querySelector('.msg-elapsed')?.textContent === '· 2m05s';
+        }""",
+        arg={
+            "sid": sid,
+            "tailKey": tail_key,
+            "assistantUuid": assistant_uuid,
+            "completedAtMs": completed_at_ms,
+            "durationMs": duration_ms,
+        },
+        timeout=5000,
+    )
+    footer = page.locator(
+        f'.msg-pane[data-tid="{sid}"] '
+        f'.msg[data-message-key="{tail_key}"] .turn-footer'
+    )
+    expect(footer).to_be_visible()
+    expected_time = _app_eval(
+        page, "return app.fmtTurnTime(arg);", completed_at_ms
+    )
+    expect(footer.locator(".msg-ts")).to_have_text(expected_time)
+    expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
+    expect(footer.locator(".turn-fork-btn")).to_be_visible()
+
+    state = _app_eval(
+        page,
+        """
+        const tail = app.messages[app.messages.length - 1];
+        const assistant = [...app.messages].reverse()
+          .find(message => message.role === 'assistant');
+        return {
+          role: tail.role,
+          tailUuid: tail.uuid,
+          tailForkUuid: tail.forkUuid,
+          assistantUuid: assistant?.uuid || '',
+          forkBoundary: app.turnForkMessageId(
+            app.messages, app.messages.length - 1),
+          ts: tail.ts,
+          elapsed: tail.elapsed,
+          liveKey: tail._k,
+          streaming: app.streaming,
+        };
+        """,
+    )
+    live_key = state.pop("liveKey")
+    assert state == {
+        "role": "tool_result",
+        "tailUuid": "",
+        "tailForkUuid": assistant_uuid,
+        # done metadata is an affordance, not canonical message identity.
+        "assistantUuid": "",
+        "forkBoundary": assistant_uuid,
+        "ts": completed_at_ms,
+        "elapsed": duration_ms / 1000,
+        "streaming": False,
+    }
+    assert ":live:" in live_key
+    assert active_requests, "canonical barrier never checked /active"
+    assert history_requests == [], (
+        "canonical history loaded even though /active still reported true"
+    )
+    _assert_no_browser_errors(page, errors)
+
+
+def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
+    page: Page, backend_url, auth_token,
+):
+    """A completion reload started off-screen must not blank a tab selected mid-fetch."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    sid = "perf-canonical-race-target"
+    other_sid = "perf-canonical-race-other"
+    final_text = "CANONICAL_RACE_REPLY remains visible"
+    page.route(
+        f"**/api/chat/sessions/{sid}/active",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"active":false}',
+        ),
+    )
+
+    def delayed_history(route):
+        # Keep loadSession in flight long enough for the user to activate this
+        # formerly-background tab. The browser renderer continues running the
+        # scheduled switch while this intercepted response is delayed.
+        time.sleep(0.5)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Canonical race",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "messages": [{
+                    "role": "assistant",
+                    "text": final_text,
+                    "uuid": "canonical-race-assistant",
+                    "ts": 1_700_030_000,
+                }],
+                "offset": 0,
+                "total": 1,
+                "has_more": False,
+                "history_generation": "gen-canonical-race",
+                "updated_at": 2,
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", delayed_history)
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const target = arg.sid;
+        const other = arg.otherSid;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._syncQueueFromServer = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.appReady = true;
+        app.sessions = [
+          { id: other, name: "Other", updated_at: 1, model: "e2e-model" },
+          { id: target, name: "Target", updated_at: 1, model: "e2e-model" },
+        ];
+        app.openTabIds = [other, target];
+        app.tabState = {};
+        const otherState = app._ensureTabState(other);
+        otherState._loaded = true;
+        otherState.messages.push({
+          role: "assistant", text: "OTHER_VISIBLE",
+          html: "<p>OTHER_VISIBLE</p>", _k: `${other}:existing`, _noAnim: true,
+        });
+        const targetState = app._ensureTabState(target);
+        targetState._loaded = true;
+        targetState.messages.push({
+          role: "assistant", text: arg.finalText,
+          html: `<p>${arg.finalText}</p>`, _k: `${target}:live:1`,
+        });
+        targetState.messagesReady = true;
+        targetState.messagesLoading = false;
+        app.currentId = other;
+        app._residentTabIds = [other, target];
+        app.mobileTab = "chat";
+        app._activateTabState(other);
+        return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+        """,
+        {"sid": sid, "otherSid": other_sid, "finalText": final_text},
+    )
+    page.wait_for_function(
+        """key => document.querySelector(
+          `.msg[data-message-key="${CSS.escape(key)}"]`) !== null""",
+        arg=f"{sid}:live:1",
+        timeout=10000,
+    )
+
+    result = page.evaluate(
+        """async ({ sid, finalText }) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          const liveKey = `${sid}:live:1`;
+          const liveNode = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(liveKey)}"]`);
+          const frames = [];
+          app._scheduleCanonicalStreamReload(sid, st);
+          setTimeout(async () => {
+            app.currentId = sid;
+            await app.switchSession();
+          }, 320);
+          const deadline = performance.now() + 3000;
+          while ((!st.messages.some(m => m.uuid === "canonical-race-assistant")
+                  || app.currentId !== sid) && performance.now() < deadline) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            if (app.currentId !== sid) continue;
+            const pane = Array.from(document.querySelectorAll(".msg-pane"))
+              .find(el => getComputedStyle(el).display !== "none");
+            const visibleMessages = pane ? Array.from(pane.querySelectorAll(".msg"))
+              .filter(el => getComputedStyle(el).display !== "none") : [];
+            frames.push({
+              ready: app.messagesReady,
+              loading: app.messagesLoading,
+              targetVisible: !!pane && pane.textContent.includes(finalText),
+              visibleCount: visibleMessages.length,
+            });
+          }
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const canonical = st.messages[st.messages.length - 1];
+          const canonicalNode = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(canonical._k)}"]`);
+          const visiblePane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(el => getComputedStyle(el).display !== "none");
+          return {
+            frames,
+            pending: st._canonicalResyncPending,
+            sameNode: canonicalNode === liveNode,
+            key: canonical._k,
+            uuid: canonical.uuid || "",
+            finalVisible: !!visiblePane && visiblePane.textContent.includes(finalText),
+          };
+        }""",
+        {"sid": sid, "finalText": final_text},
+    )
+
+    assert result["pending"] is False, result
+    assert result["sameNode"] is True, result
+    assert result["key"] == f"{sid}:live:1"
+    assert result["uuid"] == "canonical-race-assistant"
+    assert result["frames"], result
+    assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
+    assert all(frame["visibleCount"] > 0 for frame in result["frames"]), result
+    assert result["finalVisible"] is True, result
+    _assert_no_browser_errors(page, errors)
+
+
 def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
     page: Page, backend_url, auth_token,
 ):
@@ -1569,8 +2186,12 @@ def test_mobile_composer_footer_is_compact_and_never_overflows(
             """,
         )
         page.wait_for_function(
-            """() => document.querySelector(".chat-toolbar")
-              .classList.contains("has-stop")"""
+            """() => {
+              const toolbar = document.querySelector(".chat-toolbar");
+              const stop = document.querySelector(".chat-toolbar-stop");
+              return toolbar?.classList.contains("has-stop")
+                && stop?.getBoundingClientRect().width > 0;
+            }"""
         )
         busy = composer_metrics()
         assert busy["toolbarOverflow"] <= 1

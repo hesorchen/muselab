@@ -29,7 +29,7 @@ Claude Agent SDK → claude CLI
 ## 关键设计
 
 - **SDK 是唯一模型入口。** 工具调用、MCP、Skills、Subagent、plan mode 与 `CLAUDE.md` 均由 Claude Agent SDK 提供。muselab 不建立另一套 Agent 或 system prompt 体系。
-- **原生指令归属。** 持久身份、回复风格、个人背景与长期规则放在 SDK 自动发现的 `CLAUDE.md` 层级；可复用工作流放在 Skills；工具行为由工具描述和权限配置约束。
+- **原生指令归属。** 工作区目标、事实来源、回复风格与长期规则放在 SDK 自动发现的可选 `CLAUDE.md` 层级；可复用工作流放在 Skills；工具行为由工具描述和权限配置约束。
 - **工作区绑定。** `MUSELAB_ROOT` 是默认工作区，也可登记其他本地目录。文件面板、预览、终端和新会话 cwd 随当前工作区切换；每个会话保存自己的 cwd。
 - **整文件输入。** 助手通过 Read、Grep、Edit 等工具按需读取完整文件，不预先向量化或切块。
 - **第三方 Provider 隔离。** 每个第三方 Provider 按请求设置 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` 与隔离的 `CLAUDE_CONFIG_DIR`，避免 CLI 回退到错误账户。
@@ -66,10 +66,10 @@ muselab/
 ├── docs/                          # 用户与公开技术文档
 ├── .claude/docs/                  # 维护者文档
 ├── .env                           # 实例配置与密钥
-└── sessions/                      # 会话元数据、队列与附件
+└── sessions/                      # 默认会话元数据目录
 
 $MUSELAB_ROOT/
-├── CLAUDE.md                      # 默认工作区指令与个人上下文
+├── CLAUDE.md                      # 可选的默认工作区指令与上下文
 ├── 用户文件
 ├── .muselab/
 │   ├── workspaces.json
@@ -86,7 +86,11 @@ $MUSELAB_ROOT/
 └── .muselab-dustbin/
 ```
 
-仓库状态、默认工作区和其他工作区是不同的备份单元。对话 transcript 由 Claude CLI 所有；Claude 会话通常在其配置目录下，第三方 Provider 会话可能在隔离的配置目录下。muselab 的 `sessions/` 保存名称、cwd、模型、成本、附件和队列等叠加元数据。
+仓库状态、默认工作区和其他工作区是不同的备份单元。对话 transcript 由 Claude CLI
+所有；Claude 会话通常在其配置目录下，第三方 Provider 会话可能在隔离的配置目录下。
+`MUSELAB_SESSIONS_DIR` 保存名称、cwd、模型、成本、附件和队列等 muselab
+叠加元数据。它默认指向 `<repo>/sessions`；原生安装器会把该位置以绝对路径持久化，
+避免服务工作目录变化时状态根随之漂移。
 
 ## 对话回合
 

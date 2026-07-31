@@ -6,23 +6,25 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 ---
 
-**active-turn sidecar** — A small JSON file written to `sessions/active_turns/<sid>.json` at the start of each turn and deleted on clean completion. If muselab is killed mid-turn the file survives and surfaces a "unfinished turn" toast on the next browser session. See [`backend-sessions.md — Active-turn sidecars`](backend-sessions.md).
+**active-turn sidecar** — A small JSON file written to `$MUSELAB_SESSIONS_DIR/active_turns/<sid>.json` at the start of each turn and deleted on clean completion. If muselab is killed mid-turn the file survives and surfaces a "unfinished turn" toast on the next browser session. See [`backend-sessions.md — Active-turn sidecars`](backend-sessions.md).
 
 **active turn** — A chat turn that is currently streaming. muselab tracks active turns in `_active_turns[sid]`; a session can have at most one active turn at a time. An attempt to start a second turn while one is running raises `_TurnBusy`. See [`routing.md — The SSE Turn Loop`](routing.md).
 
-**archive root** — The directory pointed to by `MUSELAB_ROOT`. This is where your own files live: `CLAUDE.md`, subdirectories, attachments (`.muselab-attach/`), scheduler state (`.muselab/`), and the trash (`.muselab-dustbin/`). It is deliberately outside the repo root so data and code can be backed up or moved independently. See [`architecture.md`](architecture.md).
+**primary workspace (`MUSELAB_ROOT`)** — The default workspace selected by `MUSELAB_ROOT`. It may contain project or data files, an optional `CLAUDE.md`, attachments (`.muselab-attach/`), global state (`.muselab/`), and trash (`.muselab-dustbin/`). Older documentation called it the archive root; the variable name remains compatible with existing deployments. See [`architecture.md`](architecture.md).
+
+**ARCHIVE_DIR** — A legacy Docker Compose variable name for the host workspace mounted at container `/data`; it imposes no directory structure.
 
 **cost capture** — After each turn, the `ResultMessage.total_cost_usd` value is added to a process-wide aggregate and a per-session accumulator, and written to the sidecar as a per-message annotation. Cost is only populated for Claude (Anthropic) models; third-party vendors return 0. See [`routing.md`](routing.md).
 
-**cwd-key** — The hashed directory path used by the Claude CLI to namespace JSONL files under `~/.claude/projects/`. For a given archive root the key looks like `-home-alice-archive`. muselab uses the same derivation so its session IDs map 1-to-1 to CLI filenames. See [`backend-sessions.md — Two-layer store`](backend-sessions.md).
+**cwd-key** — The hashed directory path used by the Claude CLI to namespace JSONL files under `~/.claude/projects/`. For a given workspace the key may look like `-home-alice-project`. muselab uses the same derivation so its session IDs map 1-to-1 to CLI filenames. See [`backend-sessions.md — Two-layer store`](backend-sessions.md).
 
-**CLAUDE.md** — A plain-text Markdown file at the root of the archive. The Claude Agent SDK auto-loads it as context on every conversation, making it the primary channel for personalising Muse's behaviour. See [`personalize-claude-md.md`](personalize-claude-md.md).
+**CLAUDE.md** — An optional Markdown instruction file in a workspace. The Claude Agent SDK loads it through its native scope rules for project goals, sources of truth, boundaries, and verification conventions. See [`personalize-claude-md.md`](personalize-claude-md.md).
 
 **CLAUDE_CONFIG_DIR isolation** — For third-party providers, muselab sets `CLAUDE_CONFIG_DIR` to persistent per-user state (`${XDG_STATE_HOME:-~/.local/state}/muselab/vendor-cli/`) that contains no `credentials.json`. This prevents the CLI from silently falling back to Claude Pro OAuth and routing third-party traffic through your Anthropic account while retaining vendor transcripts across restarts. See [`routing.md — CLAUDE_CONFIG_DIR isolation`](routing.md).
 
 **client pool** — The in-memory cache of live `ClaudeSDKClient` instances, keyed by `(session_id, model, effort)`. Default capacity is 3 entries (configurable via `MUSELAB_CLIENT_POOL_CAP`); least-recently-used entries are evicted when the cap is exceeded, except for entries with an active turn or in-flight background task. See [`routing.md — The Client Pool`](routing.md).
 
-**effort** — The reasoning effort level passed to `ClaudeAgentOptions`. Valid values are `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `""` (SDK adaptive default). Stored per-session in `sessions/index.json`; changing it disconnects the cached client so the next turn rebuilds with the new value. Effort is part of the client pool cache key. See [`routing.md — Reasoning Effort and Extended Thinking`](routing.md).
+**effort** — The reasoning effort level passed to `ClaudeAgentOptions`. Valid values are `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `""` (SDK adaptive default). Stored per-session in `$MUSELAB_SESSIONS_DIR/index.json`; changing it disconnects the cached client so the next turn rebuilds with the new value. Effort is part of the client pool cache key. See [`routing.md — Reasoning Effort and Extended Thinking`](routing.md).
 
 **extended thinking / thinking signature** — The reasoning trace produced by Claude when `ThinkingConfigEnabled` is active. The thinking block is streamed via `thinking` SSE events. Signatures are opaque tokens that must not be modified; muselab locks a session to a single model to avoid cross-vendor signature corruption. For Opus 4.7+, `display="summarized"` is required to get plaintext thinking blocks rather than signatures-only. See [`routing.md — budget_tokens and display`](routing.md).
 
@@ -34,9 +36,11 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **MCP (Model Context Protocol)** — A standard for attaching external tool servers to the agent. muselab surfaces MCP configuration at `Settings → MCP` and merges its own `mcp.json` with Claude Code's global configs. The `ask_user_question` MCP tool is handled specially: muselab does not block it, instead re-routing it through an in-process queue so the browser can display the question inline.
 
-**message queue** — A per-session FIFO queue (`sessions/<sid>.queue.json`) that holds prompts submitted while a turn is already running. The drain loop starts the next turn automatically when the current one finishes. Max depth is 10. The queue auto-pauses if a turn errors or is cancelled. See [`backend-sessions.md — The message queue`](backend-sessions.md).
+**message queue** — A per-session FIFO queue (`$MUSELAB_SESSIONS_DIR/<sid>.queue.json`) that holds prompts submitted while a turn is already running. The drain loop starts the next turn automatically when the current one finishes. Max depth is 10. The queue auto-pauses if a turn errors or is cancelled. See [`backend-sessions.md — The message queue`](backend-sessions.md).
 
-**model continuity** — After the first successful turn, the model ID is written to `sessions/index.json`. For a non-empty session, the frontend creates a separate empty session when switching models, preventing cross-provider thinking-signature corruption. The management API may still update the model and disconnect the cached client; callers own transcript-compatibility risk. See [`routing.md`](routing.md).
+**model continuity** — After the first successful turn, the model ID is written to `$MUSELAB_SESSIONS_DIR/index.json`. For a non-empty session, the frontend creates a separate empty session when switching models, preventing cross-provider thinking-signature corruption. The management API may still update the model and disconnect the cached client; callers own transcript-compatibility risk. See [`routing.md`](routing.md).
+
+**MUSELAB_SESSIONS_DIR** — The durable muselab session-metadata directory. It contains the index, sidecars, queues, and active-turn sentinels, but not CLI transcripts. It defaults to `<repo>/sessions`; native installers save that repo-local location as an absolute path.
 
 **no-build frontend** — The frontend is served as plain HTML + JavaScript + CSS with no bundler, compiler, or `npm install` required. Vetted third-party libraries are checked in under `frontend/vendor/`; some warm during browser idle time while Mermaid, xterm.js, and similar features remain on demand. See [`architecture.md`](architecture.md).
 
@@ -50,7 +54,7 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **pending attachment queue** — A `pending_attachments` list in the sidecar that holds upload metadata until the SDK writes the user-message UUID. Because the CLI appends the JSONL record asynchronously, the message UUID is not known at upload time; muselab binds the attachment to the correct message UUID on the next session read. See [`backend-sessions.md — Pending attachment queue`](backend-sessions.md).
 
-**repo root** — The directory containing the muselab checkout (`backend/`, `frontend/`, `sessions/`, `.env`, etc.). Distinct from the archive root. The repo is the install; the archive is your data. See [`architecture.md — Directory map`](architecture.md).
+**repo root** — The directory containing the muselab checkout (`backend/`, `frontend/`, `.env`, and the default `sessions/`, etc.). It is distinct from the primary workspace: the former contains installation code and instance configuration; the latter is the Agent's default working directory and global `.muselab` state root. See [`architecture.md — Directory map`](architecture.md).
 
 **safe_resolve** — The path-validation function in `backend/files.py` that every `/api/files/*` endpoint calls before touching the filesystem. It blocks `..` traversal, symlink escapes, NUL byte injection, and sensitive filenames. All paths must resolve to a descendant of the selected workspace root. See [`backend-files.md — safe_resolve in depth`](backend-files.md).
 
@@ -60,9 +64,9 @@ Terms of art used across the muselab codebase and docs, defined once and linked 
 
 **session** — The top-level unit of a conversation. A session has a UUID shared by the muselab index entry, sidecar file, CLI JSONL, and message queue. It stores cwd, model, permission, effort, and thinking settings; explicit forks additionally record their source session. See [`backend-sessions.md`](backend-sessions.md).
 
-**session index** — The file `sessions/index.json` (inside the repo, not a workspace). It is muselab's source of truth for per-session metadata that the CLI does not track: cwd, model, permission mode, effort, thinking toggle, pinned state, and auto-named flag. CLI JSONL owns the transcript; Claude and third-party providers may use different configuration roots. See [`backend-sessions.md`](backend-sessions.md).
+**session index** — The file `$MUSELAB_SESSIONS_DIR/index.json` (outside a workspace; repo-local by default). It is muselab's source of truth for per-session metadata that the CLI does not track: cwd, model, permission mode, effort, thinking toggle, pinned state, and auto-named flag. CLI JSONL owns the transcript; Claude and third-party providers may use different configuration roots. See [`backend-sessions.md`](backend-sessions.md).
 
-**sidecar** — The file `sessions/<sid>.sidecar.json` that stores per-message annotations layered on top of the CLI JSONL: cost (USD), model badge, timestamps, uploaded image thumbnails, and document references. Written after every turn; never stores the transcript itself. See [`backend-sessions.md — Sidecar files`](backend-sessions.md).
+**sidecar** — The file `$MUSELAB_SESSIONS_DIR/<sid>.sidecar.json` that stores per-message annotations layered on top of the CLI JSONL: cost (USD), model badge, timestamps, uploaded image thumbnails, and document references. Written after every turn; never stores the transcript itself. See [`backend-sessions.md — Sidecar files`](backend-sessions.md).
 
 **setting_sources** — The SDK parameter `["user", "project", "local"]` passed in `ClaudeAgentOptions` that tells the Claude Agent SDK which config scopes to load. `CLAUDE.md` and Claude configuration in the active workspace follow these scopes; muselab's bundled `skills/` are exposed through a local plugin.
 

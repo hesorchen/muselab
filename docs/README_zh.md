@@ -11,7 +11,7 @@
 
 ## 使用
 
-- [定制你的 CLAUDE.md](personalize-claude-md_zh.md) —— 让 Muse 了解你
+- [配置工作区 CLAUDE.md](personalize-claude-md_zh.md) —— 为项目写入可选的长期工作说明
 - [Skills](skills_zh.md) —— 开箱即用的 skill 清单，以及如何添加自己的
 - [手机端 PWA](mobile_zh.md) —— 加到主屏、推送通知、HTTPS
 - [终端](terminal_zh.md) —— 真实 PTY、终端列表、Profile 与移动操作

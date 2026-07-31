@@ -86,12 +86,21 @@ bash scripts/install-macos.sh    # macOS — user LaunchAgent
 bash scripts/install-linux.sh    # Linux / WSL2 — user systemd service
 ```
 
-Script steps: pre-flight checks → `uv sync` → write `.env` with a random token →
-7-question profile intake → register autostart → wait up to 30 seconds for the service to become available.
+Script steps: pre-flight checks → `uv sync` → select the primary workspace →
+write `.env` with a random token and a stable absolute session metadata path →
+register autostart → wait up to 30 seconds for the service to become available.
+On an existing `.env`, the installer adds the session path only when missing
+and never overwrites a custom value. It collects no personal profile, creates
+no predefined directories, and does not write `CLAUDE.md` automatically.
+Choose or configure a Provider in Settings after the first login.
 
 ## 2. Open it
 
 Local machine: `http://localhost:8765` → paste the token from `.env`.
+
+For durable project conventions, optionally run `bash scripts/intake.sh` to
+create a generic workspace `CLAUDE.md`. It creates no fixed directory
+structure. See [Configure workspace CLAUDE.md](personalize-claude-md.md).
 
 ### VPS
 
@@ -133,11 +142,16 @@ Per-OS detail (verify / restart / tail logs / expose to LAN / uninstall):
 docker run -d --name muselab \
   -p 127.0.0.1:8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-archive:/data \
+  -v $HOME/muselab-workspace:/data \
   -e MUSELAB_ROOT=/data \
+  -v $HOME/muselab-sessions:/app/sessions \
+  -e MUSELAB_SESSIONS_DIR=/app/sessions \
   -v $HOME/.claude:/home/muse/.claude \
   ghcr.io/hesorchen/muselab:latest
 ```
+
+The separate `/app/sessions` mount preserves chat indexes, annotations, and
+queues when the container is replaced.
 
 > **Bind address.** The example above pins the port to `127.0.0.1` so the
 > service is only reachable from the host. Plain `-p 8765:8765` binds
@@ -155,7 +169,7 @@ the OAuth credentials from `claude login`.
 > single-user Linux/macOS hosts the primary account is also uid 1000, so
 > bind-mounts work without adjustment. If the host UID differs (multi-user
 > host, custom macOS admin account, etc.), either run
-> `chmod -R go+rX ~/.claude` and `chown -R 1000:1000 ~/muselab-archive`
+> `chmod -R go+rX ~/.claude` and `chown -R 1000:1000 ~/muselab-workspace`
 > before starting the container, or pass `--user $(id -u):$(id -g)` and
 > accept that the in-container `~/.claude` may be read-only.
 
@@ -165,7 +179,7 @@ Pin a version: `ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`.
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
-cp .env.example .env && $EDITOR .env    # set MUSELAB_TOKEN, ARCHIVE_DIR
+cp .env.example .env && $EDITOR .env    # set MUSELAB_TOKEN; ARCHIVE_DIR is the host workspace (legacy name)
 claude login                              # host-side; container reuses OAuth
 docker compose up -d
 ```

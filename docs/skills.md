@@ -19,10 +19,11 @@ automatically.
 
 ## Bundled skills
 
-Muselab ships 12 skills out of the box. The first eight are muselab-native
-(MIT); the last four are community-contributed and included with
-attribution — see `THIRD_PARTY_LICENSES.md` for upstream URLs and license
-details.
+Muselab ships 12 supported skills out of the box: eight muselab-native
+(MIT) and four community-contributed. A deprecated native compatibility
+alias remains discoverable for one transition cycle, so the repository
+contains 13 skill directories in total. See `THIRD_PARTY_LICENSES.md` for
+upstream URLs and license details.
 
 | Skill | What it does | Origin | External deps |
 |---|---|---|---|
@@ -33,7 +34,8 @@ details.
 | `citation-formatter` | Converts DOIs, arXiv IDs, PubMed IDs, and raw text into APA 7 / IEEE / GB/T 7714 / BibTeX; fetches authoritative metadata when possible | muselab-native | `WebFetch` or `mcp__fetch__fetch` (optional) |
 | `task-decomposer` | Turns a vague goal into an ordered task list with size estimates, a Definition of Done, critical-path steps, and flagged unknowns | muselab-native | none |
 | `summary-distiller` | Picks the right summary shape (TL;DR, key points, structured, action items) based on source type; preserves numbers, names, and dates verbatim | muselab-native | none |
-| `archive-curator` | Scans and organizes the personal archive, proposes changes before mutation, and fills meaningful `CLAUDE.md` gaps conversationally | muselab-native | none |
+| `workspace-curator` | Organises the active workspace with a scan-first, proposal-first workflow and explicit confirmation before material changes | muselab-native | none |
+| `archive-curator` | Deprecated compatibility alias for `workspace-curator`, with the same proposal and safety boundaries | muselab-native | none |
 | `pptx` | Generates PowerPoint files by writing and running inline Python with `python-pptx` via the Bash tool | community | `python-pptx` (`pip install python-pptx`) |
 | `csv-analyzer` | Loads a CSV with `pandas`, profiles column types, generates conditional charts (PNG), outputs a complete analysis in one response | community | `pandas`; `matplotlib`/`seaborn` optional |
 | `translate` | Three-stage internal pipeline (literal → issue identification → polished reinterpretation); outputs final Chinese text only, preserving technical terms | community | none |
@@ -58,7 +60,7 @@ scopes:
 | Scope | Resolves to |
 |---|---|
 | `user` | `~/.claude/` — user-global config shared with Claude Code CLI |
-| `project` | the archive `cwd` (see below) |
+| `project` | the active workspace `cwd` (see below) |
 | `local` | `.claude/` inside `cwd` |
 
 **`cwd` is the active workspace:**

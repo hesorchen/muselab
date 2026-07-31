@@ -27,6 +27,7 @@ in sessions/{sid}.json — double-write with CLI's JSONL caused compact_boundary
 to be invisible in the UI after native /compact ran.
 """
 import json
+import os
 import re
 import sys
 import threading
@@ -73,8 +74,14 @@ def title_from_message(text: str, limit: int = 24) -> str:
     return first_line
 
 
-SESS_DIR = Path(__file__).resolve().parent.parent / "sessions"
-SESS_DIR.mkdir(exist_ok=True)
+_DEFAULT_SESS_DIR = Path(__file__).resolve().parent.parent / "sessions"
+_configured_sess_dir = os.environ.get("MUSELAB_SESSIONS_DIR", "").strip()
+SESS_DIR = (
+    Path(_configured_sess_dir).expanduser().resolve()
+    if _configured_sess_dir
+    else _DEFAULT_SESS_DIR
+)
+SESS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX = SESS_DIR / "index.json"
 
 

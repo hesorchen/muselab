@@ -15,29 +15,16 @@
 
 <table align="center">
 <tr>
-<td align="center"><a href="promo/media/screenshot-desktop.png"><img src="promo/media/screenshot-desktop.png" width="470" alt="Complete desktop workspace"></a></td>
-<td align="center"><a href="promo/media/screenshot-desktop-terminal.png"><img src="promo/media/screenshot-desktop-terminal.png" width="470" alt="Real Unix PTY terminal on desktop"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="210" alt="Mobile light-theme preview"></a></td>
+<td align="center"><a href="promo/media/screenshot-mobile.png"><img src="promo/media/screenshot-mobile.png" width="210" alt="Mobile dark-theme preview"></a></td>
 </tr>
 <tr>
-<td align="center">Desktop · files, preview, and chat</td>
-<td align="center">Desktop · real Unix PTY terminal</td>
+<td align="center">Mobile · light theme</td>
+<td align="center">Mobile · dark theme</td>
 </tr>
 </table>
 
-<table align="center">
-<tr>
-<td align="center"><a href="promo/media/screenshot-mobile-files.jpeg"><img src="promo/media/screenshot-mobile-files.jpeg" width="210" alt="Mobile file browser"></a></td>
-<td align="center"><a href="promo/media/screenshot-mobile-preview.png"><img src="promo/media/screenshot-mobile-preview.png" width="210" alt="Mobile native preview"></a></td>
-<td align="center"><a href="promo/media/screenshot-mobile-chat.png"><img src="promo/media/screenshot-mobile-chat.png" width="210" alt="Mobile Agent chat"></a></td>
-</tr>
-<tr>
-<td align="center">Mobile · files</td>
-<td align="center">Mobile · native preview</td>
-<td align="center">Mobile · Agent chat</td>
-</tr>
-</table>
-
-<p align="center"><sub>Click any image to view the original.</sub></p>
+<p align="center"><sub>Public demo data; click either image to view the original.</sub></p>
 
 ## Core features
 
@@ -82,13 +69,11 @@ Something wrong? Run `bash scripts/doctor.sh` for layered diagnostics and concre
 
 ## Session practice
 
-> "This is my checkup report from this year. Compare it with last year's report and turn the metric changes into a one-page HTML trend report."
+> "Inspect the latest changes in this project, find why the tests became slower, fix the cause, run verification, and write the result to `docs/performance-note.md`."
 
-Muse finds both PDFs in `health/`, reads the files, extracts the metrics, and writes a single-file HTML report with charts — rendered directly in the preview pane. Then you say:
+Muse reads the code and Git diff in the active working directory, runs targeted tests in a real terminal, edits the relevant files, and verifies the result. The generated note opens directly in the preview pane. When you switch to another working directory, the file tree, terminals, new sessions, and context switch with it.
 
-> "Now check the insurance policies in `money/`. Do these metric changes reveal any coverage gaps?"
-
-Archives from two domains are analyzed in the same session, producing concrete guidance.
+Code, research collections, and knowledge bases can all be ordinary workspaces; no fixed directory structure is required.
 
 🌐 More scene demos on the [muselab promo page](https://hesorchen.github.io/muselab/promo/).
 
@@ -96,9 +81,9 @@ Archives from two domains are analyzed in the same session, producing concrete g
 
 | Solution | Limitation | How muselab works |
 |---|---|---|
-| ChatGPT / Claude.ai | Files are uploaded temporarily; memory is a black box | Archived files stay local, with a transparent memory mechanism |
-| Claude Code | Born in the terminal, built for code | The same Agent Harness, aimed at life files, usable on desktop and phone |
-| RAG document chat | Chunking + retrieval loses cross-document meaning; better suited for massive document sets | Stores source documents and reads complete files for lossless understanding |
+| ChatGPT / Claude.ai | Files are usually uploaded; workspace and execution context are not continuous | Local workspaces, generated files, and inspectable context remain available |
+| Claude Code | Terminal-first, ideal for direct local CLI work | The same Agent Harness with browser files, previews, real terminals, multiple workspaces, and mobile access |
+| RAG document chat | Chunking + retrieval fits large document sets but does not provide a complete execution environment | The Agent reads full files on demand and uses tools and terminals for multi-step work |
 
 Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How it compares](docs/comparison.md).
 
@@ -121,7 +106,7 @@ Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How
 **[📚 Full documentation index](docs/README.md)**
 
 - **Get started:** [Quick start](docs/quickstart.md) · [Linux install](docs/install-linux.md) · [macOS install](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
-- **Usage:** [Personalize CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Terminal](docs/terminal.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
+- **Usage:** [Configure workspace CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Terminal](docs/terminal.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
 - **Models:** [Providers](docs/providers.md) · [Codex Gateway](docs/codex-gateway.md) · [Add a provider](docs/add-provider.md) · [Model routing](docs/routing.md)
 - **Internals:** [Architecture](docs/architecture.md) · [Sessions](docs/backend-sessions.md) · [Files API](docs/backend-files.md) · [Security model](docs/backend-security.md) · [Frontend](docs/frontend.md) · [Infrastructure](docs/infrastructure.md)
 - **Reference:** [Configuration](docs/configuration.md) · [Data & backup](docs/data-and-backup.md) · [Troubleshooting](docs/troubleshooting.md) · [Glossary](docs/glossary.md)

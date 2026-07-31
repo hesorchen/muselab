@@ -27,6 +27,58 @@ note() { printf "    %s\n" "$*"; }
 
 FAIL=0
 WARN=0
+TOKEN=""
+WORKSPACE=""
+PORT="8765"
+
+# Read a simple dotenv assignment without sourcing the file. Sourcing .env
+# would execute shell syntax; doctor only needs scalar values and must remain a
+# read-only diagnostic for configuration content.
+env_value() {
+  local key="$1" line value
+  line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" .env 2>/dev/null | head -1)"
+  [[ -n "$line" ]] || return 0
+  value="${line#*=}"
+  # Trim only the edges so paths containing spaces stay intact.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if (( ${#value} >= 2 )) \
+      && [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif (( ${#value} >= 2 )) \
+      && [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+probe_writable_dir() {
+  local label="$1" path="$2" probe
+  if [[ -e "$path" && ! -d "$path" ]]; then
+    err "$label=$path exists but is not a directory"
+    FAIL=$((FAIL+1))
+    return
+  fi
+  if [[ ! -d "$path" ]]; then
+    if mkdir -p "$path" 2>/dev/null; then
+      ok "$label created: $path"
+    else
+      err "$label=$path cannot be created"
+      FAIL=$((FAIL+1))
+      return
+    fi
+  fi
+  probe="$(mktemp "$path/.muselab-doctor-write.XXXXXX" 2>/dev/null)"
+  if [[ -n "$probe" ]]; then
+    rm -f "$probe"
+    ok "$label writable: $path"
+  else
+    err "$label=$path is not writable"
+    FAIL=$((FAIL+1))
+  fi
+}
 
 bold "muselab doctor — $(date)"
 echo  "  Repo: $REPO"
@@ -60,30 +112,34 @@ echo
 bold "2. Configuration"
 if [[ -f .env ]]; then
   ok ".env present"
-  # Portable .env value extraction (BSD/macOS grep lacks -P/\K).
-  TOKEN=$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
-  ROOT=$(grep -E '^MUSELAB_ROOT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
-  PORT=$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+  TOKEN="$(env_value MUSELAB_TOKEN)"
+  WORKSPACE="$(env_value MUSELAB_ROOT)"
+  PORT="$(env_value MUSELAB_PORT)"
   PORT="${PORT:-8765}"
   if [[ -z "$TOKEN" ]]; then err "MUSELAB_TOKEN missing in .env"; FAIL=$((FAIL+1))
   elif (( ${#TOKEN} < 16 )); then err "MUSELAB_TOKEN too short (${#TOKEN} chars; need ≥16)"; FAIL=$((FAIL+1))
-  else ok "MUSELAB_TOKEN set (${TOKEN:0:4}…${TOKEN: -4}, ${#TOKEN} chars)"; fi
-  if [[ -z "$ROOT" ]]; then err "MUSELAB_ROOT missing in .env"; FAIL=$((FAIL+1))
-  elif [[ ! -d "$ROOT" ]]; then err "MUSELAB_ROOT=$ROOT but directory doesn't exist"; FAIL=$((FAIL+1))
+  else ok "MUSELAB_TOKEN set (${#TOKEN} chars; value not displayed)"; fi
+  if [[ -z "$WORKSPACE" ]]; then err "MUSELAB_ROOT missing in .env"; FAIL=$((FAIL+1))
+  elif [[ ! -d "$WORKSPACE" ]]; then err "MUSELAB_ROOT=$WORKSPACE but directory doesn't exist"; FAIL=$((FAIL+1))
   else
-    ok "MUSELAB_ROOT = $ROOT"
-    if [[ -f "$ROOT/CLAUDE.md" ]]; then
-      L=$(wc -l < "$ROOT/CLAUDE.md")
+    ok "MUSELAB_ROOT = $WORKSPACE"
+    probe_writable_dir "MUSELAB_ROOT" "$WORKSPACE"
+    if [[ -f "$WORKSPACE/CLAUDE.md" ]]; then
+      L=$(wc -l < "$WORKSPACE/CLAUDE.md")
       ok "  CLAUDE.md present ($L lines)"
     else
-      warn "  no CLAUDE.md at $ROOT — Muse will use defaults; run scripts/intake.sh to add"
-      WARN=$((WARN+1))
+      note "CLAUDE.md not present (optional; run scripts/intake.sh to add)"
     fi
-    for sub in health work money people notes archives; do
-      if [[ -d "$ROOT/$sub" ]]; then ok "  $sub/ present"
-      else note "  $sub/ missing (intake hasn't run, or you deleted it)"; fi
-    done
   fi
+
+  SESSIONS_DIR="$(env_value MUSELAB_SESSIONS_DIR)"
+  if [[ -z "$SESSIONS_DIR" ]]; then
+    SESSIONS_DIR="$REPO/sessions"
+    note "MUSELAB_SESSIONS_DIR unset; using default: $SESSIONS_DIR"
+  elif [[ "$SESSIONS_DIR" != /* ]]; then
+    SESSIONS_DIR="$REPO/$SESSIONS_DIR"
+  fi
+  probe_writable_dir "MUSELAB_SESSIONS_DIR" "$SESSIONS_DIR"
 else
   err ".env not found — run scripts/install-{linux,macos}.sh first"
   FAIL=$((FAIL+1))

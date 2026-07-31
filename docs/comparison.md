@@ -9,7 +9,7 @@ your use case, or whether one of the alternatives is a better match.
 
 |  | muselab | claudecodeui | LobeChat | AnythingLLM | Claude Code CLI |
 |---|---|---|---|---|---|
-| Primary purpose | Archive + AI chat | IDE for multi-CLI agents | Multi-model chat + plugin store | RAG over your docs | Terminal coding agent |
+| Primary purpose | Local workspaces + executable Agent | IDE for multi-CLI agents | Multi-model chat + plugin store | RAG over your docs | Terminal coding agent |
 | Self-hosted | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Browser access | ✅ | ✅ | ✅ | ✅ | ❌ |
 | HTML / PDF / image preview | ✅ | ⚠️ | ⚠️ | ⚠️ | ❌ |
@@ -38,9 +38,10 @@ Other names that often come up in the same search:
   chat with multi-user auth and an agents framework. Choose it for a shared,
   team-facing chat portal; muselab is deliberately single-user
   (see [Scope boundaries](#scope-boundaries)).
-- **Obsidian / Logseq AI plugins** — AI inside a note-taking app. They see
-  your vault's notes; muselab's agent works on the whole archive (any file
-  type) and can execute multi-step tasks against it, not just write text.
+- **Obsidian / Logseq AI plugins** — AI inside a note-taking app. They focus on
+  a notes vault; muselab's Agent works on registered local workspaces (any file
+  type) and can execute multi-step tasks with tools and terminals, not just
+  write text.
 
 ## vs. other Claude harnesses
 
@@ -48,17 +49,21 @@ Other names that often come up in the same search:
 |---|---|---|---|---|---|
 | Uses official **Claude Agent SDK** | ✅ direct | ✅ (canonical impl) | ✅ | ❌ wraps CLI process | ❌ protocol translator |
 | Web UI in browser | ✅ | ❌ TTY | ❌ desktop | ✅ | ❌ |
-| Personal-archive focus | ✅ | ❌ coding | ❌ general | ❌ coding | ❌ |
+| Files + previews + real terminal | ✅ integrated | ⚠️ terminal-first | ⚠️ no real terminal | ✅ | ❌ |
 | **Same agent loop on non-Claude models** | ✅ via vendor anthropic-compat | ❌ Anthropic only | ❌ Anthropic only | partial | ⚠ via translation, drops features |
 | Self-host friendly | ✅ | n/a (you already have it) | ❌ closed binary | ✅ | ✅ |
 | Open source | ✅ MIT | ❌ | ❌ | ✅ AGPL-3.0 | ✅ MIT |
 
-muselab is to your archive what Claude Code is to your codebase.
+muselab puts the Agent loop in a self-hosted local workspace that is accessible
+from a browser.
+
+Any authorized local directory can be a workspace. The installer collects no
+personal profile and creates no predefined directory structure.
 
 ## Scope boundaries
 
 - Single-user, single-token — two people sharing one instance share
-  everything; for team/family use, deploy one instance per person
+  everything; use separate instances or a multi-user product for team sharing
 - Not a full IDE — the built-in terminal is useful for commands and
   agent-assisted work in the active workspace, but muselab does not provide
   full code navigation, debugging, or an IDE extension ecosystem. Use

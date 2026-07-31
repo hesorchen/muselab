@@ -1,7 +1,7 @@
 [project]
 name = "muselab"
 version = "1.2.0"
-description = "Self-hosted web UI for the Claude Agent SDK — talk to your own files with Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo."
+description = "Self-hosted multi-model Agent workbench for local workspaces, files, terminals, and artifacts."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
@@ -15,7 +15,7 @@ keywords = [
     "self-hosted",
     "llm",
     "ai-assistant",
-    "personal-archive",
+    "agent-workspace",
     "deepseek",
     "pwa",
 ]
@@ -58,8 +58,8 @@ dependencies = [
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.49.0",
     # Live file-tree refresh for Agent / terminal / external-editor changes.
-    # One native watcher is shared per active workspace and released when the
-    # last browser disconnects.
+    # One on-demand watcher per subscribed workspace feeds the durable SQLite
+    # index; offline reconciliation runs when that workspace is reactivated.
     "watchfiles>=1.1.1",
     # xlsx preview — read-only, used by /api/files/xlsx. Pure-Python, no
     # native deps; safe to ship in the muselab Docker image.

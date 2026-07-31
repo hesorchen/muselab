@@ -145,6 +145,20 @@ async def _start_optional_services(scheduler, push, memory) -> None:
         sys.stderr.flush()
 
 
+async def _start_workspace_index(file_watch_manager) -> bool:
+    """Start the optional file index without taking chat/terminal down."""
+    try:
+        await file_watch_manager.start()
+    except Exception as exc:
+        sys.stderr.write(
+            "[muselab] workspace index start failed "
+            f"(continuing with chat/terminal): {exc}\n"
+        )
+        sys.stderr.flush()
+        return False
+    return True
+
+
 def _launch_background_tasks(coroutines) -> None:
     import asyncio
 
@@ -243,6 +257,7 @@ async def _lifespan(app: FastAPI):
     # hundreds of sessions.
     from .terminal import manager as _terminal_manager
     from .file_events import manager as _file_watch_manager
+    await _start_workspace_index(_file_watch_manager)
     await _terminal_manager.start()
     try:
         yield

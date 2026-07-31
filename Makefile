@@ -13,6 +13,7 @@ lint:
 	node --check frontend/i18n/index.js
 	node --check frontend/data/constants.js
 	node --check frontend/modules/file-capabilities.mjs
+	node --check frontend/modules/persistent-cache.mjs
 
 fmt:
 	@echo "no formatter configured yet; consider adding ruff later"

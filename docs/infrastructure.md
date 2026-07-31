@@ -14,14 +14,14 @@ All automation lives in `scripts/`. Each script is standalone bash and runs from
 |--------|---------|---------------|
 | `versions.env` | Single source of truth for pinned external tool versions. Both platform installers source it; the Dockerfile mirrors the Claude CLI pin. | — |
 | `quick-install.sh` | One-line bootstrap (`curl … \| bash`). Refuses root, detects OS, installs `uv` if missing, and hands off to the platform installer with interactive input preserved. | `MUSELAB_NONINTERACTIVE=1` |
-| `install-linux.sh` | Full Linux/WSL2 installer: prerequisites → dependencies → `.env` → systemd user unit → linger check. Includes the `CLAUDE.md` profile intake. | `MUSELAB_NONINTERACTIVE=1`, `MUSELAB_LOCALE=zh\|en`, `MUSELAB_SKIP_SERVICE=1`, `MUSELAB_NO_BROWSER=1` |
-| `install-macos.sh` | macOS equivalent that registers a launchd LaunchAgent. | same four flags |
+| `install-linux.sh` | Full Linux/WSL2 installer: prerequisites → dependencies → primary-workspace and `.env` setup → systemd user unit → linger check. It persists an absolute repo-local session metadata path, including when upgrading an existing `.env` that lacks the key. It does not create `CLAUDE.md` or a fixed directory structure. | `MUSELAB_NONINTERACTIVE=1`, `MUSELAB_SKIP_SERVICE=1`, `MUSELAB_NO_BROWSER=1` |
+| `install-macos.sh` | macOS equivalent that registers a launchd LaunchAgent. | same three flags |
 | `uninstall-linux.sh` | Stops and removes the systemd unit; leaves user data untouched. | — |
 | `uninstall-macos.sh` | Unloads and removes the LaunchAgent; leaves user data untouched. | — |
 | `upgrade.sh` | Upgrades the SDK and CLI, runs a smoke test, and prints rollback guidance on failure. It does not commit or restart the service. See [Upgrading](upgrade.md). | — |
-| `doctor.sh` | Checks prerequisites, configuration, dependencies, service status, HTTP authentication, and provider credentials. | — |
+| `doctor.sh` | Checks prerequisites, generic workspace/session-directory writability, optional `CLAUDE.md`, dependencies, service status, HTTP authentication, and provider credentials. It never reads session contents. | — |
 | `setup-https.sh` | Linux-only Caddy reverse-proxy setup with SSE-safe flushing, HSTS, and firewall rules. | — |
-| `intake.sh` | Re-runs the `CLAUDE.md` profile setup and backs up the existing file before overwriting. | — |
+| `intake.sh` | Optionally creates a generic workspace `CLAUDE.md` without creating other directories; backs up an existing file before replacement. | `MUSELAB_LOCALE=zh\|en` |
 | `lint.sh` | Runs repository consistency and privacy-leak checks. | `MUSELAB_LEAK_BLACKLIST` |
 
 ---
@@ -73,7 +73,7 @@ The `Dockerfile` uses two stages to keep the final image slim:
 | Compose setting | Default | Override |
 |-----------------|---------|----------|
 | Port bind | `127.0.0.1:8765:8765` | `MUSELAB_BIND`, `MUSELAB_PORT` |
-| Archive volume | `./data:/data` | `ARCHIVE_DIR` |
+| Host workspace volume | `./data:/data` | `ARCHIVE_DIR` (legacy compatibility name) |
 | Claude credentials | `~/.claude:/home/muse/.claude` | `CLAUDE_HOME` |
 | Sessions volume | `./sessions:/app/sessions` | — |
 | Memory limit | `4g` hard / `1g` reservation | — |
@@ -135,9 +135,9 @@ The shared `app_module` fixture:
 - redirects `MUSELAB_ENV_PATH` to a throwaway temp file so tests never touch the real `.env`
 - purges all provider API key env vars
 - deletes all `backend.*` entries from `sys.modules` to force a full re-import
-- isolates `sessions/` to a temp directory
+- isolates `MUSELAB_SESSIONS_DIR` to a temp directory
 
-The `temp_root` fixture creates a throwaway archive tree with a `notes/` subtree, a `.secret` file, and a `.env` file specifically for path-traversal security tests.
+The `temp_root` fixture creates a throwaway workspace tree with a `notes/` subtree, a `.secret` file, and a `.env` file specifically for path-traversal security tests.
 
 ### Notable test files
 
@@ -171,7 +171,7 @@ Triggers: push to `main`, version tags `v*.*.*`, PRs to `main`.
 | `e2e` | ubuntu-latest | no | Playwright/Chromium, 2 retries via `pytest-rerunfailures` |
 | `docker` | ubuntu-latest | yes (push jobs) | PRs: single-arch build, no push. main/tags: multi-arch build + push to `ghcr.io` |
 
-CI test env vars: `MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`, `MUSELAB_ROOT=${{ github.workspace }}/.ci-archive`.
+CI test env vars: `MUSELAB_TOKEN=ci-test-token-1234567890abcdef-min-32`, `MUSELAB_ROOT=${{ github.workspace }}/.ci-workspace`.
 
 ### install-test.yml
 

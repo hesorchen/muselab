@@ -114,7 +114,7 @@ class TerminalProfileWrite(BaseModel):
 
 
 class TerminalProfileRegistry:
-    """Small, process-local registry persisted under the primary archive root."""
+    """Small, process-local registry persisted under the primary workspace."""
 
     def __init__(self, root: Path) -> None:
         self.path = root / ".muselab" / "terminal_profiles.json"

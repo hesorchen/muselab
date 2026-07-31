@@ -29,12 +29,12 @@ edit `frontend/*.html|js|css`, hard-refresh the browser.
 ## What will likely be declined
 
 - Adding a build step (webpack / vite / etc.) — this would eliminate the "clone and run" property
-- Generic AI chat UI features that fall outside muselab's "personal archive
-  assistant" scope (e.g. plugin marketplace, document RAG over crawled content)
+- Generic AI chat UI features that do not strengthen muselab's local,
+  workspace-bound Agent workflow (e.g. a hosted account system or social feed)
 - Provider integrations that require an OpenAI-only protocol (muselab routes
   through the Claude Agent SDK, which expects Anthropic-compatible endpoints)
 - Anything that requires real personal data to test (all tests must work with
-  a throwaway archive directory)
+  a throwaway workspace directory)
 
 ## Pull request checklist
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -45,11 +46,20 @@ _PROJECT_MARKERS = (
 _BROWSER_LIMIT = 300
 
 
+def _stable_workspace_id(path: Path) -> str:
+    """Derive an ID for legacy registry rows that did not persist one."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"muselab-workspace:{path.resolve()}",
+    ))
+
+
 @dataclass(frozen=True)
 class WorkspaceEntry:
     path: str
     name: str
     primary: bool = False
+    id: str = ""
 
 
 class WorkspaceRegistry:
@@ -57,15 +67,34 @@ class WorkspaceRegistry:
         self.primary = Path(primary).expanduser().resolve()
         self._path = self.primary / ".muselab" / "workspaces.json"
         self._lock = threading.RLock()
-        self._workspaces = self._load()
+        self._workspaces, self._ids = self._load()
 
     def list(self) -> list[WorkspaceEntry]:
         with self._lock:
             return [
-                WorkspaceEntry(path=path, name=name,
-                               primary=path == str(self.primary))
+                WorkspaceEntry(
+                    path=path,
+                    name=name,
+                    primary=path == str(self.primary),
+                    id=self._ids[path],
+                )
                 for path, name in self._workspaces.items()
             ]
+
+    def id_for(self, value: str | Path | None = None) -> str:
+        path = str(self.resolve(value))
+        with self._lock:
+            return self._ids[path]
+
+    def entry_for(self, value: str | Path | None = None) -> WorkspaceEntry:
+        path = str(self.resolve(value))
+        with self._lock:
+            return WorkspaceEntry(
+                path=path,
+                name=self._workspaces[path],
+                primary=path == str(self.primary),
+                id=self._ids[path],
+            )
 
     def paths(self) -> tuple[Path, ...]:
         with self._lock:
@@ -102,11 +131,20 @@ class WorkspaceRegistry:
         if not clean_name:
             raise ValueError("workspace name cannot be empty")
         with self._lock:
+            path_value = str(path)
             updated = dict(self._workspaces)
-            updated[str(path)] = clean_name
-            self._save(updated)
+            updated[path_value] = clean_name
+            updated_ids = dict(self._ids)
+            updated_ids.setdefault(path_value, _stable_workspace_id(path))
+            self._save(updated, updated_ids)
             self._workspaces = updated
-        return WorkspaceEntry(str(path), clean_name, path == self.primary)
+            self._ids = updated_ids
+        return WorkspaceEntry(
+            path_value,
+            clean_name,
+            path == self.primary,
+            updated_ids[path_value],
+        )
 
     def remove(self, value: str | Path) -> None:
         path = Path(value).expanduser()
@@ -118,18 +156,24 @@ class WorkspaceRegistry:
         with self._lock:
             if str(path) not in self._workspaces:
                 raise ValueError("workspace is not registered")
+            path_value = str(path)
             updated = dict(self._workspaces)
-            del updated[str(path)]
-            self._save(updated)
+            del updated[path_value]
+            updated_ids = dict(self._ids)
+            del updated_ids[path_value]
+            self._save(updated, updated_ids)
             self._workspaces = updated
+            self._ids = updated_ids
 
     def reorder(self, paths: list[str]) -> None:
         with self._lock:
             if len(paths) != len(self._workspaces) or set(paths) != set(self._workspaces):
                 raise ValueError("workspace order must contain every registered workspace exactly once")
             updated = {path: self._workspaces[path] for path in paths}
-            self._save(updated)
+            updated_ids = {path: self._ids[path] for path in paths}
+            self._save(updated, updated_ids)
             self._workspaces = updated
+            self._ids = updated_ids
 
     def browse(self, value: str | Path | None = None) -> dict[str, Any]:
         path = self._browser_path(value)
@@ -271,17 +315,19 @@ class WorkspaceRegistry:
                 break
         return " · ".join(labels)
 
-    def _load(self) -> dict[str, str]:
+    def _load(self) -> tuple[dict[str, str], dict[str, str]]:
         primary_path = str(self.primary)
         fallback = {primary_path: self.primary.name or primary_path}
+        fallback_ids = {primary_path: _stable_workspace_id(self.primary)}
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return fallback
+            return fallback, fallback_ids
         entries = payload.get("workspaces") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
-            return fallback
+            return fallback, fallback_ids
         values: dict[str, str] = {}
+        ids: dict[str, str] = {}
         for item in entries:
             if not isinstance(item, dict):
                 continue
@@ -289,17 +335,30 @@ class WorkspaceRegistry:
                 path = self._validated(str(item.get("path") or ""))
             except ValueError:
                 continue
-            values[str(path)] = str(item.get("name") or path.name or path).strip()
+            path_value = str(path)
+            values[path_value] = str(
+                item.get("name") or path.name or path
+            ).strip()
+            raw_id = str(item.get("id") or "")
+            try:
+                ids[path_value] = (
+                    str(uuid.UUID(raw_id))
+                    if raw_id
+                    else _stable_workspace_id(path)
+                )
+            except ValueError:
+                ids[path_value] = _stable_workspace_id(path)
         if primary_path not in values:
             values = {**fallback, **values}
-        return values
+            ids = {**fallback_ids, **ids}
+        return values, ids
 
-    def _save(self, values: dict[str, str]) -> None:
+    def _save(self, values: dict[str, str], ids: dict[str, str]) -> None:
         atomic_write_text(
             self._path,
             json.dumps({
                 "workspaces": [
-                    {"path": path, "name": name}
+                    {"id": ids[path], "path": path, "name": name}
                     for path, name in values.items()
                 ]
             }, ensure_ascii=False, indent=2),
@@ -348,14 +407,16 @@ def browse_workspaces(path: str = Query("")) -> dict[str, Any]:
 
 
 @router.post("", dependencies=[Depends(require_token)])
-def register_workspace(body: WorkspaceRequest) -> dict[str, Any]:
+async def register_workspace(body: WorkspaceRequest) -> dict[str, Any]:
     try:
         entry = registry.register(body.path, body.name or None)
         # Session discovery is cached.  A newly registered directory may
         # already contain Claude JSONL history, so invalidate before the next
         # list pull instead of making the user wait for the stale TTL.
         from . import sessions
+        from .file_events import manager as file_watch_manager
         sessions.invalidate_sessions_cache()
+        await file_watch_manager.ensure_workspace(Path(entry.path))
         return asdict(entry)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -371,11 +432,14 @@ def reorder_workspaces(body: WorkspaceOrderRequest) -> dict[str, Any]:
 
 
 @router.delete("", dependencies=[Depends(require_token)])
-def remove_workspace(path: str = Query(...)) -> dict[str, bool]:
+async def remove_workspace(path: str = Query(...)) -> dict[str, bool]:
     try:
+        entry = registry.entry_for(path)
         registry.remove(path)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     from . import sessions
+    from .file_events import manager as file_watch_manager
     sessions.invalidate_sessions_cache()
+    await file_watch_manager.remove_workspace(entry.id)
     return {"ok": True}

@@ -53,8 +53,9 @@ configured network access.
 
 These are SKILL.md instruction files (plain text, no compiled code)
 shipped with muselab to give Muse out-of-the-box capabilities.
-The first eight are muselab-native; the remaining four are community-authored
-and included here with attribution.
+Eight supported skills are muselab-native; four are community-authored and
+included here with attribution. `archive-curator` is a deprecated native
+compatibility alias for `workspace-curator`.
 
 | Skill | Author / Repo | License | Upstream |
 |---|---|---|---|
@@ -65,6 +66,7 @@ and included here with attribution.
 | `summary-distiller` | muselab contributors | MIT | this repo |
 | `task-decomposer` | muselab contributors | MIT | this repo |
 | `web-search` | muselab contributors | MIT | this repo |
+| `workspace-curator` | muselab contributors | MIT | this repo |
 | `archive-curator` | muselab contributors | MIT | this repo |
 | `pptx` | tfriedel / claude-office-skills | not specified† | <https://github.com/tfriedel/claude-office-skills> |
 | `csv-analyzer` | coffeefuelbump | not specified† | <https://github.com/coffeefuelbump/csv-data-summarizer-claude-skill> |

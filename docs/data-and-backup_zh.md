@@ -41,7 +41,7 @@ Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CL
 | 路径 | 内容 |
 |---|---|
 | `<repo>/.env` | token、provider key 和部署配置，包含秘密 |
-| `<repo>/sessions/` | 会话索引、sidecar、队列、活动回合哨兵和派生索引 |
+| `$MUSELAB_SESSIONS_DIR/` | 会话索引、sidecar、队列、活动回合哨兵和派生索引；默认 `<repo>/sessions/` |
 | `<repo>/mcp.json` | MCP server 配置，可能包含凭据 |
 | `<repo>/provider_overrides.json` | 内置 provider 修改和自定义 provider |
 
@@ -81,7 +81,7 @@ Registry。完整迁移需要同时考虑工作目录、仓库状态、Claude CL
 1. 在新机器安装同版本或更新版本的 muselab。
 2. 停止服务。
 3. 恢复主工作目录、需要的额外工作目录、仓库状态、`~/.claude/`，以及使用第三方 Provider 时的隔离 transcript。
-4. 检查 `.env` 中的 `MUSELAB_ROOT`，并在工作目录选择器里更新失效的绝对路径。
+4. 检查 `.env` 中的 `MUSELAB_ROOT` 与 `MUSELAB_SESSIONS_DIR`，并在工作目录选择器里更新失效的工作区路径。
 5. 检查文件所有者和权限，特别是 `.env`、Claude 凭据、VAPID key 与终端 Profile。
 6. 启动服务，依次验证工作目录、历史会话、附件、定时任务、终端 Profile、生图历史和 Push。
 7. 运行 `bash scripts/doctor.sh` 做基础自检。

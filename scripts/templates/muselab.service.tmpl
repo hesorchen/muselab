@@ -1,5 +1,5 @@
 [Unit]
-Description=muselab — your archive + Muse, the AI inside
+Description=muselab — self-hosted Agent workspace
 Documentation=https://github.com/hesorchen/muselab
 After=network-online.target
 Wants=network-online.target
@@ -26,7 +26,7 @@ TimeoutStopSec=15
 # Hardening: forbid the service (or any subprocess: MCP servers, skills, the
 # SDK-spawned claude CLI) from gaining new privileges via setuid/setgid/caps.
 # Zero-cost — muselab never needs to escalate. (ProtectHome is intentionally
-# omitted: the service must read/write your archive ROOT under $HOME.)
+# omitted: the service must read/write workspace roots under $HOME.)
 NoNewPrivileges=true
 # Resource limits — generous but bounded
 LimitNOFILE=8192

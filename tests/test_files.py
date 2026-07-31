@@ -51,6 +51,68 @@ def test_list_internal_directory_symlink_preserves_logical_paths(
     ]
 
 
+def test_symlink_cannot_bypass_internal_state_protection(
+    client,
+    auth,
+    temp_root,
+):
+    internal = temp_root / ".muselab"
+    internal.mkdir(exist_ok=True)
+    (internal / "private-state.txt").write_text(
+        "secret",
+        encoding="utf-8",
+    )
+    (temp_root / "state-link").symlink_to(
+        internal,
+        target_is_directory=True,
+    )
+
+    response = client.get(
+        "/api/files/read?path=state-link/private-state.txt",
+        headers=auth,
+    )
+    assert response.status_code == 403
+
+
+def test_symlinked_internal_directory_target_is_protected(
+    client,
+    auth,
+    temp_root,
+    tmp_path,
+):
+    internal_target = temp_root / "relocated-internal-state"
+    internal_target.mkdir()
+    (internal_target / "private-state.txt").write_text(
+        "secret",
+        encoding="utf-8",
+    )
+    other = tmp_path / "other-workspace"
+    other.mkdir()
+    (other / ".muselab").symlink_to(
+        internal_target,
+        target_is_directory=True,
+    )
+    (other / "state-link").symlink_to(
+        internal_target,
+        target_is_directory=True,
+    )
+    assert client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(other)},
+    ).status_code == 200
+
+    response = client.get(
+        "/api/files/read",
+        headers=auth,
+        params={
+            "path": "state-link/private-state.txt",
+            "workspace": str(other),
+        },
+    )
+    assert response.status_code == 403
+
+
 def test_read_markdown(client, auth):
     r = client.get("/api/files/read?path=README.md", headers=auth)
     assert r.status_code == 200

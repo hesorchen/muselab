@@ -57,7 +57,7 @@ log show --predicate 'process == "muselab"' --last 5m
 
 **iOS 无法注册 PWA 或开启通知。** iOS 要求安全上下文（HTTPS）。裸 `http://192.168.x.x:端口` 不行。用 Tailscale 的 `*.ts.net` 地址（自动 HTTPS）或跑 `scripts/setup-https.sh`。*先*把应用加到主屏，再开通知。完整步骤：[手机端 PWA](mobile_zh.md)。
 
-**所有设备的推送同时失效。** `<archive>/.muselab/vapid.json` 的 VAPID 密钥对读不出来了。muselab 不会静默重建（那会作废所有订阅）。从备份恢复它，或主动删掉以生成新密钥对 —— 之后每台设备会重新订阅。
+**所有设备的推送同时失效。** `<主工作区>/.muselab/vapid.json` 的 VAPID 密钥对读不出来了。muselab 不会静默重建（那会作废所有订阅）。从备份恢复它，或主动删掉以生成新密钥对 —— 之后每台设备会重新订阅。
 
 ## 会话流、队列与 Footer
 

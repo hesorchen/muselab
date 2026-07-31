@@ -10,7 +10,8 @@ plugin 暴露，并对所有 provider 默认启用 `skills="all"`；模型会按
 
 ## 预置的 12 个 skill
 
-前 8 个为 muselab 自带，后 4 个为社区作者贡献（许可与出处见
+下表列出 12 个当前 skill；另保留一个旧名称兼容入口。前 8 个为 muselab
+自带，后 4 个为社区作者贡献（许可与出处见
 [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)）。
 
 | Skill | 触发时机 | 用途 |
@@ -26,7 +27,10 @@ plugin 暴露，并对所有 provider 默认启用 `skills="all"`；模型会按
 | **csv-analyzer** | 分析 CSV 数据 | 统计摘要、列分布、异常值 |
 | **translate** | 中英互译 | 保留格式的段落翻译 |
 | **meeting-notes** | 整理会议纪要 | 决议 / 行动项 / 待办抽取 |
-| **archive-curator** | 整理 archive 或补全 CLAUDE.md | 先扫描与提案，确认后再安全执行 |
+| **workspace-curator** | 整理当前工作区 | 先扫描与提案，确认后再安全执行 |
+
+`archive-curator` 暂时作为 `workspace-curator` 的 deprecated 兼容名称保留；
+它不再采集个人资料、补全 `CLAUDE.md` 或创建预设目录。
 
 ## 添加你自己的 skill
 

@@ -63,6 +63,7 @@ def backend_url(tmp_path_factory):
         **os.environ,
         "MUSELAB_TOKEN": TEST_TOKEN,
         "MUSELAB_ROOT": str(root),
+        "MUSELAB_SESSIONS_DIR": str(root / "sessions"),
         "MUSELAB_PORT": str(port),
         "MUSELAB_ENV_PATH": str(root / "e2e.env"),
         "MUSELAB_MODEL": "deepseek-v4-pro",
@@ -103,7 +104,12 @@ def backend_url(tmp_path_factory):
     )
     base = f"http://127.0.0.1:{port}"
     # Wait for server readiness; fail fast if the process died.
-    deadline = time.time() + 15
+    # Importing FastAPI/Pydantic can exceed 15 seconds on a memory-constrained
+    # or concurrently loaded runner before Uvicorn can emit its first log.
+    startup_timeout = float(
+        os.environ.get("MUSELAB_E2E_STARTUP_TIMEOUT", "45")
+    )
+    deadline = time.time() + startup_timeout
     import urllib.request
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -120,7 +126,9 @@ def backend_url(tmp_path_factory):
         proc.kill()
         proc.wait(timeout=5)
         log_file.close()
-        raise RuntimeError("backend never became ready")
+        raise RuntimeError(
+            f"backend never became ready within {startup_timeout:g}s"
+        )
 
     yield base
     proc.terminate()

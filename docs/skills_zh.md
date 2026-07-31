@@ -10,7 +10,10 @@ Skills 是 SKILL.md 指令包，由 Claude Agent SDK 在启动时加载并提供
 
 ## 内置 Skills
 
-Muselab 开箱即附 12 个 skill。前八个是 muselab 原生 skill（MIT 许可）；后四个来自社区贡献并注明了出处——上游 URL 和许可证详情见 `THIRD_PARTY_LICENSES.md`。
+Muselab 开箱即附 12 个正式支持的 skill：8 个 muselab 原生 skill（MIT
+许可）和 4 个社区贡献 skill。另有 1 个弃用的原生兼容别名，在一个过渡周期
+内仍可发现，因此仓库中共有 13 个 skill 目录。上游 URL 和许可证详情见
+`THIRD_PARTY_LICENSES.md`。
 
 | Skill | 功能 | 来源 | 外部依赖 |
 |---|---|---|---|
@@ -21,7 +24,8 @@ Muselab 开箱即附 12 个 skill。前八个是 muselab 原生 skill（MIT 许�
 | `citation-formatter` | 将 DOI、arXiv ID、PubMed ID 和原始文本转换为 APA 7 / IEEE / GB/T 7714 / BibTeX 格式；尽可能获取权威元数据 | muselab 原生 | `WebFetch` 或 `mcp__fetch__fetch`（可选）|
 | `task-decomposer` | 将模糊目标拆解为有序任务列表，附带规模估算、完成标准、关键路径步骤和已标记的未知项 | muselab 原生 | 无 |
 | `summary-distiller` | 根据来源类型选择合适的摘要形式（TL;DR、要点、结构化、行动项）；逐字保留数字、人名和日期 | muselab 原生 | 无 |
-| `archive-curator` | 扫描并整理个人 archive，文件变更前先提案确认，并以对话方式补全有意义的 `CLAUDE.md` 空白 | muselab 原生 | 无 |
+| `workspace-curator` | 以先扫描、先提案的方式整理当前工作区，执行实质性变更前须明确确认 | muselab 原生 | 无 |
+| `archive-curator` | `workspace-curator` 的弃用兼容别名；沿用相同的提案确认与安全边界 | muselab 原生 | 无 |
 | `pptx` | 通过 Bash 工具编写并运行内联 Python（`python-pptx`）生成 PowerPoint 文件 | 社区 | `python-pptx`（`pip install python-pptx`）|
 | `csv-analyzer` | 用 `pandas` 加载 CSV，分析列类型，生成条件图表（PNG），在单次响应中输出完整分析 | 社区 | `pandas`；`matplotlib` / `seaborn` 可选 |
 | `translate` | 三阶段内部流水线（直译 → 问题识别 → 润色再诠释）；仅输出最终中文文本，保留技术术语 | 社区 | 无 |
@@ -44,7 +48,7 @@ setting_sources=["user", "project", "local"]
 | 作用域 | 解析路径 |
 |---|---|
 | `user` | `~/.claude/`——与 Claude Code CLI 共享的用户全局配置 |
-| `project` | 归档根目录 `cwd`（见下文）|
+| `project` | 当前活动工作区 `cwd`（见下文）|
 | `local` | `cwd` 内的 `.claude/` |
 
 **`cwd` 即当前活动工作区：**

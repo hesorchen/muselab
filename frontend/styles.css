@@ -835,7 +835,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      KEPT on mobile (marker `.files-keep-mobile`): theme toggle (phone users
      switch theme often, Settings is too many taps away) and upload (touch
      has no drag-drop, and per-node context-menu upload is dir-only — the
-     header button is the only way to push a file to the archive root from a
+     header button is the only way to push a file to the workspace root from a
      phone). The file-search bar lives below the header and stays visible. */
   .pane.files .pane-head .icon-btn:not(.files-keep-mobile) { display: none; }
 
@@ -1714,7 +1714,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 .root-action:disabled { opacity: 0.55; cursor: wait; }
 .root-action svg.spinning { animation: spin 0.8s linear infinite; }
 /* Drop target highlight — drag a tree node / OS file onto the root bar to
-   move / upload it to the archive root. Mirrors `li.drag-over` (accent fill
+   move / upload it to the workspace root. Mirrors `li.drag-over` (accent fill
    + inset ring) so the affordance reads the same as dropping onto a node. */
 .filelist-sticky-root.drag-over {
   background: var(--c-accent);
@@ -3843,7 +3843,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 
 /* Cost-dashboard skeleton — mirrors the chips + 4 KPI cards + bar chart +
    per-model rows layout so the slow first load (the cold cost-dashboard scan
-   reads every session JSONL and can take several seconds on a large archive)
+   reads every session JSONL and can take several seconds in a large workspace)
    shows structure instead of a blank pane. Reuses skeleton-shimmer. */
 .cost-skeleton { display: flex; flex-direction: column; gap: 16px; padding: 4px 0; }
 .cost-skeleton .sk-chip,
@@ -5632,151 +5632,9 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   text-align: left;
 }
 .onboard-card.warn  { border-left-color: var(--c-warn); background: rgba(245, 158, 11, 0.05); }
-.onboard-card.calm  { border-left-color: var(--c-accent-soft); }
-
-/* Welcome card — one-time orientation card. Wider than the state cards
-   because it carries the value-prop + a 3-step ordered list. Has a close
-   "×" in the top-right; the close call writes localStorage so this never
-   shows again on this device. */
-.onboard-card.welcome {
-  position: relative;
-  max-width: 560px;
-  background: linear-gradient(180deg, var(--c-bg-1) 0%, var(--c-bg-0) 100%);
-  border-left-color: var(--c-accent);
-}
-.onboard-card.welcome code {
-  font-family: var(--font-mono, monospace);
-  font-size: 0.85em;
-  padding: 1px 5px;
-  border-radius: var(--r-sm);
-  background: var(--c-bg-0);
-  border: 1px solid var(--c-border);
-  color: var(--c-accent);
-}
-.welcome-dismiss {
-  position: absolute; top: 6px; right: 8px;
-  width: 24px; height: 24px;
-  border: none; background: transparent;
-  color: var(--c-fg-3); cursor: pointer;
-  font-size: 18px; line-height: 1;
-  border-radius: var(--r-sm);
-  display: inline-flex; align-items: center; justify-content: center;
-  transition: color var(--t-fast), background var(--t-fast);
-}
-.welcome-dismiss:hover { color: var(--c-fg-0); background: var(--c-bg-0); }
-.welcome-steps {
-  list-style: none;
-  counter-reset: welcome-step;
-  padding: 0; margin: 4px 0 0;
-  display: flex; flex-direction: column; gap: var(--sp-2);
-}
-.welcome-steps li {
-  counter-increment: welcome-step;
-  padding: 8px 12px 8px 36px;
-  background: var(--c-bg-0);
-  border-radius: var(--r-md);
-  font-size: var(--fs-sm);
-  color: var(--c-fg-1);
-  line-height: 1.5;
-  position: relative;
-}
-.welcome-steps li::before {
-  content: counter(welcome-step);
-  position: absolute; left: 10px; top: 50%;
-  transform: translateY(-50%);
-  width: 20px; height: 20px;
-  border-radius: 50%;
-  background: var(--c-accent);
-  color: white;
-  font-size: var(--fs-xs); font-weight: var(--fw-semibold);
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.welcome-steps code {
-  font-family: var(--font-mono, monospace);
-  font-size: 0.85em;
-  padding: 1px 5px;
-  border-radius: 3px;
-  background: var(--c-bg-1);
-  color: var(--c-accent);
-}
 .onboard-card-title { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--c-fg-0); margin-bottom: 6px; }
-/* Title + shuffle button on one row when the inspire-prompts card is
-   showing. Without flex they stack and the shuffle hangs awkwardly. */
-.onboard-card-head {
-  display: flex; align-items: center; gap: var(--sp-2);
-  margin-bottom: 6px;
-}
-.onboard-card-head .onboard-card-title { margin-bottom: 0; flex: 1; }
-.onboard-shuffle {
-  background: transparent;
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-sm);
-  color: var(--c-fg-3);
-  cursor: pointer;
-  width: 32px; height: 32px;
-  display: inline-flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  transition: color var(--t-fast), border-color var(--t-fast),
-              background var(--t-fast), transform .12s;
-}
-.onboard-shuffle svg { width: 18px; height: 18px; }
-.onboard-shuffle:hover {
-  color: var(--c-accent);
-  border-color: var(--c-accent);
-  background: var(--c-accent-soft);
-}
-.onboard-shuffle:active { transform: rotate(30deg) scale(0.94); }
 .onboard-card-body  { font-size: var(--fs-sm); color: var(--c-fg-2); line-height: 1.55; margin-bottom: var(--sp-3); }
 .onboard-card button.btn-primary { font-size: var(--fs-sm); padding: 6px 14px; }
-
-.onboard-subdirs { display: flex; flex-direction: column; gap: 6px; }
-.onboard-subdir {
-  display: flex; align-items: baseline; gap: 10px;
-  padding: 6px 10px; border-radius: var(--r-md);
-  background: var(--c-bg-0);
-  font-size: var(--fs-xs);
-}
-.onboard-subdir-name { color: var(--c-accent); font-weight: var(--fw-semibold); min-width: 70px; }
-.onboard-subdir-hint { color: var(--c-fg-2); }
-
-.onboard-suggestions { display: flex; flex-direction: column; gap: 6px; }
-.onboard-suggestion {
-  text-align: left;
-  padding: 8px 12px;
-  background: var(--c-bg-0);
-  border: 1px solid var(--c-border-strong);
-  border-radius: var(--r-md);
-  cursor: pointer; font: inherit;
-  color: var(--c-fg-0); font-size: var(--fs-sm);
-  transition: background var(--t-fast), border-color var(--t-fast);
-}
-.onboard-suggestion:hover {
-  background: var(--c-accent-soft);
-  border-color: var(--c-accent);
-}
-.onboard-skills { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--c-border-strong); }
-.onboard-skills-label {
-  font-size: var(--fs-xs); color: var(--c-fg-3); margin-bottom: 6px;
-  display: flex; align-items: baseline; justify-content: space-between;
-  gap: var(--sp-2);
-}
-.onboard-skills-seeall {
-  background: none; border: none; padding: 0;
-  color: var(--c-accent); cursor: pointer;
-  font-size: var(--fs-xs);
-}
-.onboard-skills-seeall:hover { text-decoration: underline; }
-.onboard-skills-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.skill-chip {
-  display: inline-flex; align-items: center; gap: var(--sp-1);
-  padding: 4px 10px; border-radius: var(--r-full);
-  background: rgba(245, 158, 11, 0.10); color: var(--c-warn);
-  border: 1px solid rgba(245, 158, 11, 0.3);
-  cursor: pointer; font: inherit; font-size: var(--fs-xs);
-  transition: filter var(--t-fast);
-}
-.skill-chip:hover { filter: brightness(1.05); }
-.skill-chip-icon { font-size: 0.9em; }
 
 /* ===== Emoji-to-SVG icon wrappers (added 2026-05-22) ============================
    Each of these wrapper classes used to contain a single emoji char (🧩 / 🔌 /
@@ -5786,7 +5644,6 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    the visual footprint of the prior emoji exactly. currentColor + Lucide
    stroke conventions inherit from the wrapper's color (theme variables).
    ============================================================================ */
-.skill-chip-icon svg,
 .tool-prefix-icon svg,
 .queued-icon svg,
 .compact-pending-icon svg,
@@ -6664,7 +6521,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .mention-item .name-row .name { flex: 0 1 auto; min-width: 0; }
 /* Open-tab badge — small pill that distinguishes "currently open in a
-   preview tab" from generic archive search hits. Color matches the
+   preview tab" from generic workspace search hits. Color matches the
    accent so it reads as "active / live" rather than incidental. */
 .mention-open-badge {
   flex-shrink: 0;
@@ -6682,7 +6539,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   color: var(--c-on-accent, #fff);
 }
 /* Visually nudge open items: subtle left accent border so even when the
-   list mixes open + archive results, you can spot the open ones at a
+   list mixes open + workspace results, you can spot the open ones at a
    glance without reading the badge. */
 .mention-item.is-open {
   box-shadow: inset 3px 0 0 var(--c-accent-soft);
@@ -7813,7 +7670,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
    Command palette (Cmd/Ctrl+K) — VS Code / Linear style. Opened via the
    magnifier icon-btn in the chat-pane header or via the global keyboard
    shortcut. Modal is centered with fuzzy-search jump across actions,
-   sessions, and (whole-archive, server-side) files.
+   sessions, and (whole-workspace, server-side) files.
    ========================================================================== */
 
 /* Modal backdrop + container */
@@ -9257,164 +9114,6 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
 }
 
 /* ============================================================
-   Muse opener — UI-only "Muse said" bubble at chat empty state.
-   ============================================================ */
-.muse-opener {
-  display: flex;
-  gap: 10px;
-  margin: 14px 0 18px;
-  max-width: 620px;
-  align-self: center;
-  width: 100%;
-}
-.muse-opener > .muse-mascot.sm {
-  flex: 0 0 28px;
-  margin-top: var(--sp-1);
-}
-.muse-opener-bubble {
-  flex: 1;
-  background: var(--c-bg-2);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-xl);
-  border-top-left-radius: 4px;
-  padding: 12px 16px;
-}
-.muse-opener-text {
-  font-size: var(--fs-md);
-  line-height: 1.55;
-  color: var(--c-fg-0);
-}
-.muse-opener-action {
-  margin-top: 10px;
-  padding: 6px 12px;
-  font-size: var(--fs-sm);
-  background: var(--c-btn-primary-bg);
-  color: var(--c-on-accent);
-  border: none;
-  border-radius: var(--r-md);
-  cursor: pointer;
-  transition: opacity var(--t-base);
-}
-.muse-opener-action:hover { opacity: 0.85; }
-
-/* ============================================================
-   Nine Muses 3×3 grid — conversation entry matrix.
-   ============================================================ */
-.muse-grid-wrap {
-  max-width: 760px;
-  width: 100%;
-  align-self: center;
-  margin: 8px 0 16px;
-}
-.muse-grid-divider {
-  text-align: center;
-  font-size: var(--fs-sm);
-  color: var(--c-fg-3);
-  margin-bottom: 14px;
-  position: relative;
-}
-.muse-grid-divider::before,
-.muse-grid-divider::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  width: 25%;
-  height: 1px;
-  background: var(--c-border);
-}
-.muse-grid-divider::before { left: 8%; }
-.muse-grid-divider::after  { right: 8%; }
-.muse-grid-divider span {
-  display: inline-block;
-  padding: 0 14px;
-  background: var(--c-bg-1);
-  position: relative;
-  z-index: 1;
-}
-.muse-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-}
-/* Token sanity pass: previously referenced --bg / --border / --accent /
-   --fg / --bg-soft / --fg-soft, none of which are defined anywhere in
-   this stylesheet — they were Tailwind / shadcn naming carried in by
-   reflex. Every cell fell through to the hardcoded fallback (#fff /
-   #e5e7eb / #3b82f6 …), which is fine on light theme by coincidence but
-   completely wrong on dark and eyecare. Replaced with the real muselab
-   token namespace --c-*. */
-.muse-cell {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--sp-1);
-  text-align: left;
-  padding: 14px 14px 12px;
-  background: var(--c-bg-2);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-lg);
-  cursor: pointer;
-  transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
-  font-family: inherit;
-  min-height: 120px;
-}
-.muse-cell:hover {
-  border-color: var(--c-accent);
-  background: var(--c-bg-3);
-  transform: translateY(-1px);
-}
-.muse-cell:active { transform: translateY(0); }
-.muse-cell.active {
-  border-color: var(--c-accent);
-  background: var(--c-accent-soft);
-}
-.muse-cell-icon {
-  width: 22px;
-  height: 22px;
-  margin-bottom: var(--sp-1);
-  color: var(--c-accent);
-  flex-shrink: 0;
-}
-.muse-cell-icon svg { width: 100%; height: 100%; }
-.muse-cell-name {
-  font-size: var(--fs-base);
-  font-weight: var(--fw-semibold);
-  color: var(--c-fg-0);
-}
-.muse-cell-domain {
-  font-size: var(--fs-sm);
-  color: var(--c-fg-3);
-  margin-bottom: var(--sp-1);
-}
-.muse-cell-invite {
-  font-size: var(--fs-sm);
-  line-height: 1.5;
-  color: var(--c-fg-3);
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-/* Mobile: collapse 3×3 to a single column scrollable list. */
-@media (max-width: 720px) {
-  .muse-grid {
-    grid-template-columns: 1fr;
-    gap: var(--sp-2);
-  }
-  .muse-cell {
-    min-height: auto;
-    flex-direction: row;
-    align-items: center;
-    gap: 10px;
-  }
-  .muse-cell-icon { margin-bottom: 0; }
-  .muse-cell-name { flex-shrink: 0; }
-  .muse-cell-domain { display: none; }
-  .muse-cell-invite { -webkit-line-clamp: 2; }
-}
-
-/* ============================================================
    Lazy-loaded history — "Load earlier messages" button at top
    of chat scroll. Sticky-ish, low-key, doesn't compete with the
    current conversation but discoverable when needed.
@@ -9946,23 +9645,6 @@ html[data-theme="eyecare"] .task-log-line.task-updated .task-log-icon { backgrou
   color: var(--c-accent);
 }
 .load-earlier-truncated-note { color: var(--c-fg-3); }
-
-/* ---- Muse opener bubble ---- */
-.muse-opener-bubble {
-  background: var(--c-bg-1);
-  border-color: var(--c-border);
-}
-.muse-opener-text { color: var(--c-fg-1); }
-.muse-opener-action { background: var(--c-btn-primary-bg); }
-.muse-opener-action:hover { background: var(--c-btn-primary-hover); }
-
-/* ---- Nine-muses grid ---- */
-.muse-grid-divider { color: var(--c-fg-3); }
-.muse-grid-divider::before, .muse-grid-divider::after { background: var(--c-border); }
-.muse-grid-divider span { background: var(--c-bg-0); }
-/* (muse-cell visual properties moved to the canonical .muse-cell rule
-   higher up in this file — the token-namespace fix made this duplicate
-   block redundant. Kept here only as a historical note.) */
 
 /* ---- Claude Auth card ---- */
 .claude-auth-card {

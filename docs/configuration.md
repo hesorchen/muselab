@@ -21,12 +21,18 @@ Restart after editing `.env` manually. Provider keys, default model, and default
 | `MUSELAB_PORT` | Listen port | `8765` |
 | `MUSELAB_URL` | Optional public HTTPS origin for remote clients | Local origin |
 | `MUSELAB_ENV_PATH` | `.env` file read and written by the Settings API; useful for tests or special deployments | `<repo>/.env` |
+| `MUSELAB_SESSIONS_DIR` | Durable session metadata directory | `<repo>/sessions` |
 | `MUSELAB_MODEL` | Default model for new sessions; the built-in Claude default is effective when unset | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_MODEL` | Settings-managed default, synchronized with `MUSELAB_MODEL` | `claude-sonnet-4-6` |
 | `MUSELAB_DEFAULT_PERMISSION` | Default SDK permission mode | `bypassPermissions` |
 | `MUSELAB_MEMORY_DIR` | Optional long-term-memory Registry/config directory | `$MUSELAB_ROOT/.muselab/memory` |
 
-`MUSELAB_ROOT` must exist. System-level roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, and `/boot` are rejected. A user's own home directory or a directory beneath it is allowed.
+`MUSELAB_ROOT` must exist. System-level roots such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, and `/boot` are rejected. A user's own home directory or a directory beneath it is allowed. Older documentation called this the archive root; the environment-variable name remains compatible, while the product concept is now the primary workspace.
+
+`MUSELAB_SESSIONS_DIR` stores muselab's session index, sidecars, queues, and
+restart-recovery sentinels, not the CLI transcript itself. Native installers
+write the checkout's absolute `<repo>/sessions` path into `.env`; an unset
+value retains the repo-local default for compatibility.
 
 ## Multiple workspaces
 
@@ -122,7 +128,7 @@ These variables are consumed by `docker-compose.yml`, not by backend business lo
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ARCHIVE_DIR` | Host directory mounted at container `/data` | `./data` |
+| `ARCHIVE_DIR` | Host workspace mounted at container `/data`; the name is retained only for Docker Compose compatibility | `./data` |
 | `CLAUDE_HOME` | Host Claude CLI configuration directory | `${HOME}/.claude` |
 | `MUSELAB_BIND` | Host interface for the published port | `127.0.0.1` |
 
@@ -131,7 +137,7 @@ These variables are consumed by `docker-compose.yml`, not by backend business lo
 | Variable | Purpose | Default |
 |---|---|---|
 | `MUSELAB_NONINTERACTIVE` | Use install defaults without prompts | `0` |
-| `MUSELAB_LOCALE` | Installer and initial-template language | Detected from `LANG` |
+| `MUSELAB_LOCALE` | Language used by optional `scripts/intake.sh` workspace templates | Detected from `LANG` |
 | `MUSELAB_SKIP_SERVICE` | Install files and dependencies without registering or starting systemd/launchd | `0` |
 | `MUSELAB_NO_BROWSER` | Do not open a browser after installation | `0` |
 

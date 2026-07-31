@@ -98,6 +98,46 @@ def test_i18n_zh_en_key_parity():
     )
 
 
+def test_frontend_positions_muselab_as_a_workspace_agent_workbench():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    constants = (FRONTEND / "data" / "constants.js").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    combined = "\n".join((app, constants, i18n, html, css))
+
+    assert '"empty.preview_tagline": "MuseLab · 本地 Agent 工作台"' in i18n
+    assert '"empty.preview_tagline": "MuseLab · Local Agent Workbench"' in i18n
+    assert '"onboard.no_provider_title":' in i18n
+    assert 'class="muse-mascot' in html
+    assert app.count("greek:") == 9
+
+    for dead_symbol in (
+        "MUSELAB_INSPIRE_PROMPTS",
+        "onboardingSubdirs",
+        "SKILL_TRIGGERS",
+        "skillSuggestions",
+        "onboardingPrompts",
+        "shuffleInspirePrompts",
+        "useSuggestedPrompt",
+        "claudeMdChipTitle",
+        "openClaudeMdHelp",
+        "museOpener",
+        "pickMascotAndAsk",
+        "startOrganize",
+    ):
+        assert dead_symbol not in combined
+    for stale_copy in ("未配档案", "真正懂你", "health/foo.md", "archive root"):
+        assert stale_copy not in combined.lower()
+
+    # Compatibility/security/file-type semantics are intentionally not part of
+    # the positioning cleanup.
+    assert "archive_root" in app
+    assert '"archive_project"' in app
+    assert "noarchive" in html
+    assert 'data-ext="archive"' in css
+
+
 def test_memory_center_and_chat_recall_trace_are_wired():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     index = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -445,7 +485,8 @@ def test_session_poll_and_revision_reconciliation_are_resilient():
     end = app.index("\n    _sessionsEqual", start)
     reconcile = app[start:end]
 
-    assert "if (this._sessionListPullPromise) return this._sessionListPullPromise" in app
+    assert "const sharedResult = await this._sessionListPullPromise" in app
+    assert "await this._pullSessionListOnce(false, requestedIds.join(\",\"))" in app
     assert "async _pullSessionListOnce(" in app
     assert "signal: controller.signal" in app
     assert "if (r.status === 304)" in app
@@ -620,7 +661,8 @@ def test_conversation_fork_is_explicit_and_keeps_edit_and_model_switch_separate(
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     assert '@click="menuFork(tabCtxMenu && tabCtxMenu.id)"' in html
-    assert '@click.stop="forkConversation(tid, m.uuid)"' in html
+    assert '@click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"' in html
+    assert "turnForkMessageId(paneMsgs, i)" in app
     assert 'class="fork-origin-banner"' in html
     assert 'x-text="currentForkSource().name"' in html
 
@@ -743,6 +785,49 @@ def test_activity_center_uses_two_compact_numberless_status_dots():
     assert "background:var(--c-success)" in unread
 
 
+def test_task_rows_force_targeted_session_lookup_and_activate_the_linked_workspace():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    deep_start = app.index("async _openSessionFromDeeplink(id, workspace = \"\")")
+    deep_end = app.index("\n    // Close a tab.", deep_start)
+    deep = app[deep_start:deep_end]
+    assert "this.sessionWorkspaces.some(w => w.path === workspace)" in deep
+    assert "await this._changeWorkspaceSurface(workspace)" in deep
+    # A normal in-flight list poll may swallow extraIds; the shared list helper
+    # must deterministically follow it with an id-bearing request.
+    assert "await this._pullSessionList(false, id)" in deep
+    assert "if (!this.sessions.find(s => s.id === id)) return false" in deep
+    assert "await this.activateTab(id)" in deep
+    assert "if (this.currentId !== id) return false" in deep
+    assert 'this.setMobileTab("chat")' in deep
+
+    activity_start = app.index("async openActivityEvent(item)")
+    activity_end = app.index("\n    async ackAllActivity", activity_start)
+    activity = app[activity_start:activity_end]
+    assert "item.session_id || item.thread_id" in activity
+    assert "item.workspace || item.cwd || \"\"" in activity
+    assert "await this._openSessionFromDeeplink(" in activity
+    assert "if (!opened)" in activity
+    assert '@click="openActivityEvent(item)"' in html
+
+    pull_start = app.index("async _pullSessionList(conditional = false, extraIds = \"\")")
+    pull_end = app.index("\n    async _pullSessionListOnce", pull_start)
+    pull = app[pull_start:pull_end]
+    assert "const sharedResult = await this._sessionListPullPromise" in pull
+    assert "requestedIds.every(id => this.sessions.some(s => s.id === id))" in pull
+    assert "await this._pullSessionListOnce(false, requestedIds.join(\",\"))" in pull
+
+    # Scheduler run-history rows have the same out-of-window failure mode and
+    # therefore must not bypass the guarded helper with a bare openTab().
+    assert '@click="openSchedRunSession(run)"' in html
+    sched_start = app.index("async openSchedRunSession(run)")
+    sched_end = app.index("\n    fmtSchedTime", sched_start)
+    sched = app[sched_start:sched_end]
+    assert "await this._openSessionFromDeeplink(" in sched
+    assert "run.workspace || run.cwd || \"\"" in sched
+
+
 def test_bounded_stream_resync_waits_for_canonical_history_without_retry_loop():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     handler_start = app.index('es.addEventListener("resync"')
@@ -779,7 +864,10 @@ def test_stream_done_errors_share_failed_message_state_and_actions():
 
     assert "markUserFailed(_detail, d.kind, d.cta, d.retryable)" in done
     assert "if (d.is_error)" in done
-    assert "_drainPendingQueue(streamSid)" in done
+    assert "_drainPendingQueue(streamSid, completedTurnId)" in done
+    assert "d.turn_id || streamState.activeTurnId || expectedTurnId" in done
+    assert "turnId === completedTurnId" in app
+    assert "this._attachToServerTurn(" in app
     assert "markUserFailed(serverError, errKind, errCta, errRetryable)" in error
 
 
@@ -886,12 +974,11 @@ def test_background_task_gap_stops_footer_without_blocking_composer():
     assert "if (streamState.es === es) streamState.es = null" in app
     assert "d.background && d.attachable === false" in app
     assert "continuation: !!d.continuation" in app
-    # An assistant tail with a uuid still earns a footer even without a `ts`
-    # (that's the fork affordance). The `!streaming` guard came with the
-    # separator restyle: the footer no longer hosts the streaming dots, so
-    # during a live turn this clause would otherwise render an empty rule.
-    assert "(m.role === 'assistant' && m.uuid && !(pane && pane.streaming))" in html
-    assert 'x-show="m.role === \'assistant\' && m.uuid' in html
+    # A canonical boundary anywhere in a tool-ending turn still earns the
+    # tail-mounted footer and fork affordance. The `!streaming` guard came with
+    # the separator restyle: the footer no longer hosts streaming dots.
+    assert "(turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming))" in html
+    assert 'x-show="turnForkMessageId(paneMsgs, i)' in html
     assert 'Object.prototype.hasOwnProperty.call(s, "turn_active")' in app
     assert "return !!s.turn_active" in app
     assert "return !!(s && s.background_active)" in app
@@ -1036,6 +1123,89 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "expectedText" in app
     assert "const stillOwned = () => this.tabState[sid] === ownerState" in app
     assert "if (!isContinuation)" in send
+    assert "all = this._preserveCanonicalMessageIdentity(st, all)" in load
+    assert "delete canonicalFields._k" in app
+    assert "matched._k = mountedKey" in app
+    canonical_start = app.index("_scheduleCanonicalStreamReload(sid, st")
+    canonical_end = app.index("\n    _retireStaleSessionStream", canonical_start)
+    canonical_reload = app[canonical_start:canonical_end]
+    assert "this.loadSession(sid, { quiet: true })" in canonical_reload
+    assert "quiet: sid === this.currentId" not in canonical_reload
+
+
+def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    append_start = app.index("_appendLiveMessage(st, m)")
+    append_end = app.index("\n    _mountedMessageCap", append_start)
+    append = app[append_start:append_end]
+    # Every live role can become the visual turn tail. Predeclaring these keys
+    # makes done-time assignments reactive on tool/status rows too.
+    assert 'hasOwnProperty.call(m, "uuid")' in append
+    assert 'hasOwnProperty.call(m, "forkUuid")' in append
+    assert 'hasOwnProperty.call(m, "ts")' in append
+    assert 'hasOwnProperty.call(m, "elapsed")' in append
+
+    mark_start = app.index("const _markDone = (")
+    mark_end = app.index("\n      const markUserFailed", mark_start)
+    mark = app[mark_start:mark_end]
+    assert "if (tailCandidate && tailCandidate !== stampedAssistant)" in mark
+    assert "_stamp(tailCandidate)" in mark
+    assert "if (!m.ts) m.ts = _now" in mark
+    assert "if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed" in mark
+    assert "const completedAtMs = Number(meta.completedAtMs)" in mark
+    assert "const durationMs = Number(meta.durationMs)" in mark
+    assert "tailCandidate.forkUuid = assistantUuid" in mark
+    # `done.assistant_uuid` is only an early fork boundary. No live message
+    # may adopt it as canonical identity before the quiet history reload.
+    assert ".uuid = assistantUuid" not in mark
+
+    done_start = app.index('es.addEventListener("done"')
+    done_end = app.index('es.addEventListener("error"', done_start)
+    done = app[done_start:done_end]
+    assert "const completedFinalText = ownsCurBubble()" in done
+    assert "} else if (!d.cancelled) {" in done
+    assert "this._reconcileCompletedTurn(" in done
+    assert "streamSid, streamState, completedFinalText" in done
+    assert "assistantUuid: d.assistant_uuid" in done
+    assert "completedAtMs: d.completed_at_ms" in done
+    assert "durationMs: d.duration_ms" in done
+
+    reconcile_start = app.index("_reconcileCompletedTurn(sid, ownerState")
+    reconcile_end = app.index(
+        "\n    _reconcileCompletedContinuation", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
+    assert "!!(await activeResponse.json()).active" in reconcile
+    assert '"/api/chat/sessions/" + sid + "?tail=80"' in reconcile
+    assert "m && m.role !== \"user\" && m.uuid" in reconcile
+    assert "m.role === \"assistant\" && m.uuid" in reconcile
+    assert "const loaded = await this.loadSession(sid, { quiet: true })" in reconcile
+    assert "attempt < 30" in reconcile
+    assert "Math.min(2000, 250 + attempt * 100)" in reconcile
+
+    continuity_start = app.index("_messageContinuitySignatures(m)")
+    continuity_end = app.index(
+        "\n    _preserveCanonicalMessageIdentity", continuity_start)
+    continuity = app[continuity_start:continuity_end]
+    assert "forkUuid" not in continuity
+    fork_start = app.index("turnForkMessageId(paneMsgs, i)")
+    fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
+    fork = app[fork_start:fork_end]
+    assert "if (message.forkUuid) return message.forkUuid" in fork
+
+    preserve_start = app.index("_preserveCanonicalMessageIdentity(st, incoming)")
+    preserve_end = app.index("\n    _assignLiveKey", preserve_start)
+    preserve = app[preserve_start:preserve_end]
+    assert 'mountedKey.includes(":live:")' in preserve
+    assert "if (liveFields.ts) matched.ts = liveFields.ts" in preserve
+    assert "if (liveFields.elapsed) matched.elapsed = liveFields.elapsed" in preserve
+    assert "const canonicalTail = result[result.length - 1]" in preserve
+    assert "canonicalTail.elapsed = liveFooter.elapsed" in preserve
+
+    assert "(turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming))" in html
+    assert '@click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"' in html
 
 
 def test_background_settlement_pauses_footer_until_reaction_starts():
@@ -1061,7 +1231,7 @@ def test_terminal_event_immediately_settles_tab_activity_snapshot():
     done = app[done_start:app.index("const markUserFailed =", done_start)]
     assert "if (authoritativeTerminal)" in done
     assert "this._setSessionActivityExpectation(" in done
-    assert "_markDone(!!d.cancelled, backgroundPending, true);" in app
+    assert "_markDone(!!d.cancelled, backgroundPending, true, {" in app
 
 
 def test_scheduler_uses_activity_completion_instead_of_fixed_history_polling():
@@ -1483,11 +1653,103 @@ def test_file_tree_live_events_are_workspace_scoped_and_mobile_batched():
     assert 'es.addEventListener("changes"' in app
     assert 'es.addEventListener("resync"' in app
     assert "this._workspaceIsCurrent(ownerWorkspace)" in app
+    assert "params.set(\"cursor\", String(cursor))" in app
+    assert "_queueWorkspaceEventPayload(payload, workspace)" in app
+    assert "WORKSPACE_EVENT_BATCH_MOBILE_MS: 250" in app
+    assert "_flushWorkspaceEventBatch(ownerWorkspace)" in app
+    assert "this._applyFileTreeDelta(fresh)" in app
     assert "this._refreshParentInTree(path, ownerWorkspace)" in app
     assert "const delay = this._isMobileLayout() ? 650 : 250" in app
     assert "if (!this._fileTreeIsVisible())" in app
     assert "this._stopFileEvents(true)" in app
-    assert 'if (t === "files") this._flushFileTreeDirty()' in app
+    assert 'if (t === "files") this._flushFileTreeDirty()' not in app
+
+
+def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    cache = (FRONTEND / "modules" / "persistent-cache.mjs").read_text(
+        encoding="utf-8")
+    makefile = (FRONTEND.parent / "Makefile").read_text(encoding="utf-8")
+
+    change_start = app.index("async _changeWorkspaceSurface(path)")
+    change_end = app.index("\n    async switchWorkspace(path)", change_start)
+    change = app[change_start:change_end]
+    assert "this.loadRoot({ runtimeSnapshot: !!runtime })" in change
+    assert "coldTreeOk = await treeReady" in change
+    assert "Promise.allSettled" not in change
+    assert "await terminalRefresh" not in change
+    assert "this.fetchTerminals({ restore: true })" in change
+    assert "{ preview: !!tab.preview, reveal: false }" in change
+    assert "void treeReady.then(startFileEvents)" in change
+    assert "this._fileTreeDirty = treeOk !== true" in change
+    assert "this._scheduleWorkspaceSyncRetry(path)" in change
+    assert "\n      await refresh;" not in change
+
+    capture_start = app.index("_captureWorkspaceSurface(path")
+    capture = app[capture_start:change_start]
+    assert "visible: this.visible || []" in capture
+    assert "childCache: this.childCache || {}" in capture
+    assert "visible: (this.visible || []).map" not in capture
+
+    sync_start = app.index("async _syncWorkspaceTree(")
+    sync_end = app.index("\n    _enqueueWorkspaceSync(", sync_start)
+    sync = app[sync_start:sync_end]
+    assert '`/api/files/delta?${query}`' in sync
+    assert '`/api/files/bootstrap${query ? `?${query}` : ""}`' in sync
+    assert 'params.set("show_hidden", "true")' in sync
+    assert "const hasCursor = hydrated && cursor != null" in sync
+    assert "void task.then(release, release)" in app
+    assert "task.finally(" not in app
+
+    delta_start = app.index("_applyFileTreeDelta(changes)")
+    delta_end = app.index("\n    async _syncWorkspaceTree(", delta_start)
+    delta = app[delta_start:delta_end]
+    assert delta.index('part => part.startsWith(".")') < delta.index(
+        "const nodes = new Map()")
+    assert "const nodes = new Map()" in delta
+    assert "const finalNodes = new Map()" in delta
+    assert "const affectedParents = new Set()" in delta
+    assert "!knownParents.has(parent)" in delta
+    assert "findIndex(" not in delta
+    assert ".splice(" not in delta
+    assert "(this.visible || []).map(node => ({ ...node }))" not in delta
+    assert "if (visibleChanged)" in delta
+    assert "const nextExpanded = new Set(" in delta
+    assert "this._pendingExpanded = Array.from(nextExpanded)" in delta
+
+    persist_start = app.index("_scheduleWorkspaceTreePersist(")
+    persist_end = app.index("\n    _materializeFileSnapshot(", persist_start)
+    persist = app[persist_start:persist_end]
+    assert "WORKSPACE_TREE_PERSIST_DEBOUNCE_MS: 1500" in app
+    assert "window.requestIdleCallback" in persist
+    assert 'if (this.previewSurface === "terminal") return' in persist
+    assert "Clone only after the trailing debounce" in persist
+    assert 'const neededParents = new Set(["", ...expanded])' in persist
+    assert "Object.entries(source.childCache || {}).map" not in persist
+
+    assert 'const DB_NAME = "muselab-persistent-cache-v1"' in cache
+    assert 'const WORKSPACES = "workspaces"' in cache
+    assert "getWorkspaceSnapshot(owner)" in cache
+    assert "putWorkspaceSnapshot(owner, snapshot)" in cache
+    assert "session-tail" not in cache
+    assert "db.onversionchange = () => {" in cache
+    assert "databasePromise = undefined" in cache
+    assert "db.close()" in cache
+    assert "persistent-cache.mjs" in makefile
+
+    boot_start = app.index("async _bootApp()")
+    boot_end = app.index("\n    // Start the always-on", boot_start)
+    boot = app[boot_start:boot_end]
+    assert "Promise.resolve(this.loadRoot()).catch(() => false)" in boot
+    assert "this._startLiveConnections({ fileEvents: false })" in boot
+    assert "await rootReady" not in boot
+
+    load_start = app.index("loadRoot({ runtimeSnapshot = false")
+    load_end = app.index("\n    reloadTree()", load_start)
+    load = app[load_start:load_end]
+    assert "this._enqueueWorkspaceSync(" in load
+    assert "_loadRootNow({" in app
+    assert "treeSeq === this._treeLoadSeq" in load
 
 
 def test_chat_code_blocks_have_copy_button_with_clipboard_fallback():

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content,viewport-fit=cover" />
-<!-- noindex defense: muselab is a personal archive. If a user accidentally
+<!-- noindex defense: muselab exposes a local workspace. If a user accidentally
      exposes their instance (Cloudflare tunnel, port-forward, misconfigured
      reverse proxy), search engines should not slurp it up. Belt + suspenders
      with /robots.txt served from main.py. -->
@@ -439,12 +439,12 @@
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
              :class="{ 'drag-over': dragOverRoot }"
-             :title="fileWorkspacePath() || contextInfo.archive_root || ''"
+             :title="fileWorkspacePath() || contextInfo.workspace_root || contextInfo.archive_root || ''"
              @dragover.prevent="onTreeRootDragOver($event)"
              @dragleave="dragOverRoot = false"
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
-          <span class="path" x-text="fileWorkspacePath() || contextInfo.archive_root || '—'"></span>
+          <span class="path" x-text="fileWorkspacePath() || contextInfo.workspace_root || contextInfo.archive_root || '—'"></span>
           <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
                "+" and ctx menu use — both already handle path:'' (root), so
                these are pure entry points, no new write paths. @click.stop
@@ -1320,16 +1320,6 @@
           <span x-text="t('pane.chat')"></span>
         </span>
         <span class="spacer"></span>
-        <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
-             by default, so the "present" state is implicit). When missing,
-             clicking opens a help dialog with how-to-fix instructions. -->
-        <span class="ctx-chip warn"
-              x-show="contextInfo._fetched && !contextInfo.claude_md_exists"
-              :title="claudeMdChipTitle()"
-              @click="openClaudeMdHelp()">
-          <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
-          <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
-        </span>
         <!-- Global task center — moved here from the files header to sit
              immediately left of the Skills entry (2026-07-21). -->
         <button class="activity-center-btn" type="button" @click="openActivityCenter()"
@@ -1368,9 +1358,6 @@
           <svg><use href="#i-plug"/></svg>
         </button>
 
-        <!-- Profile setup is available from the empty-chat CTA or by trying
-             archive-curator in the Skills drawer. There is intentionally no
-             persistent "Organize archive" header button. -->
         <!-- Manual hard-refresh escape hatch. When the chat pane gets
              stuck (SSE wedged, Alpine state out of sync after a flaky
              reconnect, etc.), users have no way out except closing the
@@ -2717,7 +2704,7 @@
                      && (
                        m.ts
                        || m.elapsed
-                       || (m.role === 'assistant' && m.uuid && !(pane && pane.streaming))
+                       || (turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming))
                      )">
                 <span x-show="m.ts"
                       class="msg-ts" :title="m.model || ''"
@@ -2756,9 +2743,9 @@
                 </details>
                 <button class="turn-fork-btn"
                         type="button"
-                        x-show="m.role === 'assistant' && m.uuid && !(pane && pane.streaming)"
+                        x-show="turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming)"
                         :disabled="forkingSessionId === tid || isTabStreaming(tid)"
-                        @click.stop="forkConversation(tid, m.uuid)"
+                        @click.stop="forkConversation(tid, turnForkMessageId(paneMsgs, i))"
                         :title="lang==='zh' ? '从这里 Fork' : 'Fork from here'"
                         :aria-label="lang==='zh' ? '从这里 Fork' : 'Fork from here'">
                   <svg><use href="#i-fork"/></svg>
@@ -4579,7 +4566,7 @@
             <div class="settings-hint" x-text="t('set.cost.codex_quota_empty')"></div>
           </template>
           <!-- Skeleton while the (uncached / cold) dashboard scan runs — the
-               first load on a large archive reads every session JSONL and can
+               first load in a large workspace reads every session JSONL and can
                take several seconds. Showing the layout's shape beats a blank
                pane with only the button reading "Loading…". -->
           <template x-if="cost.loading && !cost.data">
@@ -4724,8 +4711,8 @@
           <div class="settings-hint warn"
                x-show="settings.draftDefaults.permission === 'bypassPermissions'"
                x-text="lang==='zh'
-                 ? '⚠ bypass 模式下 Muse 可以读 / 改 / 删 archive 内任意文件，不会弹窗确认。仅在你充分信任当前对话内容时使用。'
-                 : '⚠ In bypass mode Muse can read / edit / delete any file under your archive without confirmation. Only use it when you fully trust what you ask.'"></div>
+                 ? '⚠ bypass 模式下 Muse 可以读 / 改 / 删当前工作区内任意文件，不会弹窗确认。仅在你充分信任当前对话内容时使用。'
+                 : '⚠ In bypass mode Muse can read / edit / delete any file in the current workspace without confirmation. Only use it when you fully trust what you ask.'"></div>
         </div>
 
         <!-- Notifications — single switch (2026-05-28, collapsed from 4
@@ -4999,7 +4986,7 @@
             </tr>
             <tr>
               <td><span class="kbd">@</span></td>
-              <td x-text="lang==='zh' ? '在输入框引用 archive 文件或目录（自动补全）' : 'Mention archive file or folder in input (autocomplete)'"></td>
+              <td x-text="lang==='zh' ? '在输入框引用工作区文件或目录（自动补全）' : 'Mention a workspace file or folder in input (autocomplete)'"></td>
             </tr>
             <tr>
               <td><span class="kbd">/</span></td>
@@ -5591,8 +5578,8 @@
                       x-model="scheduler.draft.prompt"
                       rows="3"
                       :placeholder="lang==='zh'
-                        ? '例：总结过去 24 小时 archive 的改动，列出值得关注的三件事'
-                        : 'e.g. Summarize what changed in my archive in the last 24h and flag the 3 worth my attention'"></textarea>
+                        ? '例：总结当前工作区过去 24 小时的改动，列出值得关注的三件事'
+                        : 'e.g. Summarize changes in the current workspace over the last 24h and flag the 3 worth my attention'"></textarea>
           </div>
 
           <!-- Session mode — added 2026-05-28. Reuses the .sched-freq-btn
@@ -5742,7 +5729,7 @@
                           :key="run.ts + ':' + (run.session_id || '')">
                   <div class="sched-task-run sched-row-clickable"
                        :class="{ err: !run.ok }"
-                       @click="run.session_id && openTab(run.session_id)"
+                       @click="openSchedRunSession(run)"
                        :title="run.session_id
                          ? (lang==='zh' ? '点击打开此次运行的 session' : 'Open this run session')
                          : ''">

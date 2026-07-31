@@ -286,11 +286,8 @@ def is_chinese_locale() -> bool:
     """Best-effort host-locale check — True when LANG / LC_ALL / LC_MESSAGES
     indicates a Chinese system.
 
-    Used to choose between bilingual template assets at runtime
-    (`default-CLAUDE.md` vs `default-CLAUDE.en.md`, archive-skeleton READMEs,
-    session labels). Mirrors the env-var probe in
-    `scripts/install-*.{sh,ps1}` and `scripts/intake.{sh,ps1}` so install-time
-    + runtime decisions agree.
+    Used for locale-aware runtime labels. Mirrors the env-var probe in the
+    install and intake scripts so install-time + runtime decisions agree.
 
     Conservative: only returns True when one of the locale env vars contains
     "zh" (zh / zh_CN / zh_TW / zh_HK). Everything else falls through to

@@ -39,6 +39,7 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 # to the client.
 # ============================================================
 TRASH_DIR_NAME = ".muselab-dustbin"
+INTERNAL_DIR_NAME = ".muselab"
 
 # Serializes every "check destination then rename into place" sequence
 # (upload finalize / rename / trash-restore). Each of those does an
@@ -376,6 +377,19 @@ def _inside_registered_workspace(target: Path) -> bool:
     return False
 
 
+def _inside_internal_state(target: Path) -> bool:
+    for workspace in workspace_registry.paths():
+        try:
+            internal_root = (
+                workspace.resolve() / INTERNAL_DIR_NAME
+            ).resolve()
+            if _inside(target, internal_root):
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
 def safe_resolve(
     rel: str,
     allow_sensitive: bool = False,
@@ -393,6 +407,11 @@ def safe_resolve(
       - `.env`, `id_rsa`, `*.pem` etc. (SENSITIVE_SUFFIX / SENSITIVE_NAMES)."""
     root = _root_or_default(root)
     logical = _logical_relative_path(rel)
+    if INTERNAL_DIR_NAME in logical.parts:
+        raise HTTPException(
+            status_code=403,
+            detail="muselab internal state is not accessible",
+        )
     # NUL byte in a path raises ValueError from (root / rel) and FastAPI
     # converts that to a 500 with a traceback that leaks internal module
     # paths. Reject early as 400. Same for any string that Python's path
@@ -408,6 +427,13 @@ def safe_resolve(
     root_real = root.resolve()
     if not _inside(target, root_real) and not _inside_registered_workspace(target):
         raise HTTPException(status_code=400, detail="path escapes root")
+    # Logical-path checks alone are insufficient: a workspace symlink can point
+    # at `.muselab`. Protect the resolved target across every registered root.
+    if _inside_internal_state(target):
+        raise HTTPException(
+            status_code=403,
+            detail="muselab internal state is not accessible",
+        )
     # Block by name regardless of whether the file already exists, so the API
     # can neither read nor write `.env` / private-key shaped paths.
     if not allow_sensitive and not target.is_dir() and _is_sensitive(target):
@@ -460,7 +486,10 @@ def list_dir(
         with os.scandir(target) as scan:
             candidates = []
             for child in scan:
-                if is_root_listing and child.name == TRASH_DIR_NAME:
+                if is_root_listing and child.name in {
+                    TRASH_DIR_NAME,
+                    INTERNAL_DIR_NAME,
+                }:
                     continue
                 if not show_hidden and child.name.startswith("."):
                     continue
@@ -1124,7 +1153,7 @@ def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
 # Default 100 MB cap per uploaded file. Override via MUSELAB_MAX_UPLOAD_MB.
 MAX_UPLOAD_BYTES = env_int("MUSELAB_MAX_UPLOAD_MB", 100, min_value=1) * 1024 * 1024
 # Filename extensions that are likely to be hostile or pointless to host in
-# a personal archive. Block at upload (cleaner than after-the-fact cleanup).
+# a local workspace. Block at upload (cleaner than after-the-fact cleanup).
 UPLOAD_BLOCKED_SUFFIX = {
     ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".cmd",
     ".ps1",  # PowerShell scripts — block by default; allow via .env override later
@@ -1477,6 +1506,7 @@ def copy_bak(req: CopyBakReq, root: Path = Depends(_workspace_root)) -> dict:
 
 SEARCH_IGNORE = {".git", "node_modules", "__pycache__", ".venv", "venv",
                  ".cache", ".pytest_cache", ".mypy_cache", "dist", "build",
+                 INTERNAL_DIR_NAME,
                  # Trash always excluded from search/grep regardless of
                  # show_hidden — otherwise a search for "foo" surfaces every
                  # version of foo.md the user has ever deleted, which the
@@ -1515,7 +1545,7 @@ MAX_GREP_TIME_SEC = 8            # soft time budget
 _DIR_CACHE: dict[str, tuple[float, list[tuple[str, bool]]]] = {}
 _DIR_CACHE_LOCK = threading.Lock()
 # Bound the cache so a pathological archive (millions of dirs) can't
-# OOM the process. Typical personal archives have 50-500 dirs total,
+# OOM the process. Typical local workspaces have 50-500 dirs total,
 # so this rarely matters. On overflow we drop the oldest insertion.
 _DIR_CACHE_MAX = 5000
 

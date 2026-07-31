@@ -16,9 +16,11 @@ def test_register_list_and_remove_workspace(client, auth, temp_root, tmp_path):
     created = client.post(
         "/api/chat/workspaces", headers=auth, json={"path": str(other)})
     assert created.status_code == 200
-    assert created.json() == {
-        "path": str(other.resolve()), "name": "other", "primary": False,
-    }
+    created_payload = created.json()
+    assert created_payload["path"] == str(other.resolve())
+    assert created_payload["name"] == "other"
+    assert created_payload["primary"] is False
+    assert created_payload["id"]
 
     rows = client.get("/api/chat/workspaces", headers=auth).json()["workspaces"]
     assert rows[0]["path"] == str(temp_root.resolve())
@@ -57,6 +59,36 @@ def test_removed_workspace_sessions_keep_their_attachments(
 
     assert kept.exists()
     assert not orphan.exists()
+
+
+def test_legacy_registry_rows_receive_stable_workspace_ids(
+    app_module,
+    temp_root,
+    tmp_path,
+):
+    import json
+
+    from backend.workspaces import WorkspaceRegistry
+
+    other = _make_workspace(tmp_path)
+    registry_dir = temp_root / ".muselab"
+    registry_dir.mkdir()
+    (registry_dir / "workspaces.json").write_text(
+        json.dumps({
+            "workspaces": [
+                {"path": str(temp_root), "name": "primary"},
+                {"path": str(other), "name": "other"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    first = WorkspaceRegistry(temp_root)
+    second = WorkspaceRegistry(temp_root)
+    assert [row.id for row in first.list()] == [
+        row.id for row in second.list()
+    ]
+    assert all(row.id for row in first.list())
 
 
 def test_reorder_workspaces_persists_complete_order(client, auth, temp_root, tmp_path):

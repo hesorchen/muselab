@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # muselab — macOS uninstaller. Removes LaunchAgents and the status bar client.
-# Leaves the repo .env, sessions/, archive, and log directory untouched.
+# Leaves the repo .env, sessions/, workspace files, and log directory untouched.
 set -euo pipefail
 
 PLIST="$HOME/Library/LaunchAgents/com.muselab.plist"

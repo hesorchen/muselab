@@ -80,11 +80,18 @@ bash scripts/install-macos.sh    # macOS — 用户级 LaunchAgent
 bash scripts/install-linux.sh    # Linux / WSL2 — 用户级 systemd
 ```
 
-脚本执行流程：预检查 → `uv sync` → 生成 `.env`（含随机 token）→ 7 个问题写入 CLAUDE.md → 注册自启动 → 等待服务就绪（最多 30 秒）。
+脚本执行流程：预检查 → `uv sync` → 选择主工作区 → 生成 `.env`（含随机 token
+与稳定的绝对会话元数据路径）→ 注册自启动 → 等待服务就绪（最多 30 秒）。已有
+`.env` 仅在缺少会话目录配置时补写，不覆盖自定义值。安装器不采集个人资料、
+不创建预设目录，也不会自动写入 `CLAUDE.md`；Provider 在首次登录后的 Settings
+中选择或配置。
 
 ## 2. 访问
 
 本机：`http://localhost:8765` → 粘贴 `.env` 里的 token。
+
+需要长期项目约定时，可选运行 `bash scripts/intake.sh` 生成通用工作区
+`CLAUDE.md`；它不会创建固定目录。详见[配置工作区 CLAUDE.md](personalize-claude-md_zh.md)。
 
 ### VPS 部署
 
@@ -124,17 +131,21 @@ bash scripts/doctor.sh        # Linux / macOS / WSL2
 docker run -d --name muselab \
   -p 127.0.0.1:8765:8765 \
   -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-archive:/data \
+  -v $HOME/muselab-workspace:/data \
   -e MUSELAB_ROOT=/data \
+  -v $HOME/muselab-sessions:/app/sessions \
+  -e MUSELAB_SESSIONS_DIR=/app/sessions \
   -v $HOME/.claude:/home/muse/.claude \
   ghcr.io/hesorchen/muselab:latest
 ```
+
+单独挂载 `/app/sessions`，可以在替换容器时保留会话索引、注解和队列。
 
 > **绑定地址说明：** 上面示例显式绑定 `127.0.0.1`，服务只在本机可达。直接写 `-p 8765:8765` 会绑到 `0.0.0.0`（所有网卡）——在公网 VPS 上等于把服务挂到互联网上，只靠 token 一道防线。若需 LAN 内访问（如手机连本机），改成 `-p 0.0.0.0:8765:8765`，并务必在前面加防火墙或反向代理。仓库自带的 `docker-compose.yml` 默认绑 `127.0.0.1`，要放开在 `.env` 设 `MUSELAB_BIND=0.0.0.0`。
 
 容器以非 root 用户 `muse`（uid 1000）运行，主目录为 `/home/muse/.claude`。将宿主机的 `~/.claude` 挂载至该路径，即可复用 `claude login` 获取的 OAuth 凭据。
 
-> **宿主机 UID 说明：** 容器内 muse 用户为 uid 1000，大多数单用户 Linux / macOS 主机的账号也是 uid 1000，挂载可直接生效。若宿主机 UID 不同（多用户环境、自定义 macOS 管理员账号等），需在启动容器前执行 `chmod -R go+rX ~/.claude` 及 `chown -R 1000:1000 ~/muselab-archive`；或传入 `--user $(id -u):$(id -g)`，但需接受容器内 `~/.claude` 可能为只读。
+> **宿主机 UID 说明：** 容器内 muse 用户为 uid 1000，大多数单用户 Linux / macOS 主机的账号也是 uid 1000，挂载可直接生效。若宿主机 UID 不同（多用户环境、自定义 macOS 管理员账号等），需在启动容器前执行 `chmod -R go+rX ~/.claude` 及 `chown -R 1000:1000 ~/muselab-workspace`；或传入 `--user $(id -u):$(id -g)`，但需接受容器内 `~/.claude` 可能为只读。
 
 指定版本：`ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`。
 
@@ -142,7 +153,7 @@ docker run -d --name muselab \
 
 ```bash
 git clone https://github.com/hesorchen/muselab && cd muselab
-cp .env.example .env && $EDITOR .env    # 填 MUSELAB_TOKEN、ARCHIVE_DIR
+cp .env.example .env && $EDITOR .env    # 填 MUSELAB_TOKEN、ARCHIVE_DIR（宿主机工作区，兼容变量名）
 claude login                              # 宿主机执行，容器复用 OAuth
 docker compose up -d
 ```
