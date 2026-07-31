@@ -5454,20 +5454,135 @@ function portal() {
         if (st[tailKey] === run) st[tailKey] = null;
       }
     },
+    _normalizePermissionMode(value, fallback = "") {
+      const mode = String(value || "");
+      return [
+        "bypassPermissions", "acceptEdits", "default",
+        "dontAsk", "auto", "plan",
+      ].includes(mode) ? mode : fallback;
+    },
+    _sessionPermissionMode(sid) {
+      if (!sid) {
+        return this._normalizePermissionMode(this.defaultPermission, "default");
+      }
+      const st = this.tabState && this.tabState[sid];
+      if (st && st._permissionExpected) {
+        return this._normalizePermissionMode(st._permissionExpected.value, "default");
+      }
+      const meta = (this.sessions || []).find(s => s.id === sid);
+      return this._normalizePermissionMode(
+        (meta && meta.permission) || (st && st.permission)
+          || this.defaultPermission,
+        "default",
+      );
+    },
+    permissionControlDisabled(sid = this.currentId) {
+      if (!sid || this.workspaceSwitching) return true;
+      const st = this.tabState && this.tabState[sid];
+      return !!((st && (st._permissionChangePending || st.compacting))
+        || this.isTabStreaming(sid));
+    },
+    permissionControlTitle(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (st && st._permissionChangePending) return this.t("perm.switching");
+      if (sid && (this.isTabStreaming(sid) || (st && st.compacting))) {
+        return this.t("perm.switch_wait_stream");
+      }
+      return this.t("set.label.default_permission");
+    },
+    _applySessionPermissionMode(
+      sid,
+      rawMode,
+      { previousPermission = "", authoritative = false } = {},
+    ) {
+      const mode = this._normalizePermissionMode(rawMode);
+      if (!sid || !mode) return "";
+      const st = this._ensureTabState(sid);
+      const current = (this.sessions || []).find(s => s.id === sid);
+      const priorMode = this._normalizePermissionMode(
+        previousPermission || (current && current.permission) || st.permission,
+        "default",
+      );
+      const existingReturn = (current && current.plan_return_permission) || "";
+      const planReturnPermission = mode === "plan"
+        ? this._normalizePermissionMode(
+            (priorMode !== "plan" && priorMode) || existingReturn,
+            "",
+          )
+        : "";
+
+      this.sessions = (this.sessions || []).map(session =>
+        session.id === sid
+          ? {
+              ...session,
+              permission: mode,
+              plan_return_permission: planReturnPermission,
+            }
+          : session);
+      if (this._optimisticMetas && this._optimisticMetas[sid]) {
+        this._optimisticMetas[sid] = {
+          ...this._optimisticMetas[sid],
+          permission: mode,
+          plan_return_permission: planReturnPermission,
+        };
+      }
+      st.permission = mode;
+      st._permissionChangePending = false;
+      if (authoritative) {
+        // The SSE event is newer than both the current UI value and any
+        // in-flight PATCH. Keep it pinned until the next session-list response
+        // echoes the server-persisted mode.
+        const seq = ++st._permissionPatchSeq;
+        st._permissionExpected = {
+          seq,
+          value: mode,
+          fallback: mode,
+          planReturnPermission,
+          source: "permission_mode_changed",
+        };
+      }
+      if (this.currentId === sid) this.permission = mode;
+      this._scheduleSavePrefs();
+      return mode;
+    },
     async onPermissionChange() {
       if (!this.currentId) return false;
       const sid = this.currentId;
       const st = this._ensureTabState(sid);
+      const stable = this._sessionPermissionMode(sid);
+      if (this.permissionControlDisabled(sid)) {
+        this.permission = stable;
+        if (this.isTabStreaming(sid) || st.compacting) {
+          this.toast(this.t("perm.switch_wait_stream"), "warn", 2500);
+        }
+        return false;
+      }
       const seq = ++st._permissionPatchSeq;
-      const value = this.permission || "default";
+      const value = this._normalizePermissionMode(this.permission, "default");
       const session = this.sessions.find(s => s.id === sid);
-      const previous = (session && session.permission) || "default";
+      const previous = this._normalizePermissionMode(
+        st.permission || (session && session.permission),
+        "default",
+      );
+      const previousPlanReturn = (session && session.plan_return_permission) || "";
       const priorExpected = st._permissionExpected;
       const expected = {
         seq, value,
         fallback: priorExpected ? priorExpected.fallback : previous,
+        fallbackPlanReturn: priorExpected
+          && priorExpected.fallbackPlanReturn !== undefined
+          ? priorExpected.fallbackPlanReturn
+          : previousPlanReturn,
+        planReturnPermission: value === "plan"
+          ? this._normalizePermissionMode(
+              (previous !== "plan" && previous) || previousPlanReturn,
+              "",
+            )
+          : "",
       };
       st._permissionExpected = expected;
+      st.permission = value;
+      st._permissionChangePending = true;
       try {
         const r = await this._serializeTabSettingPatch(
           st, "_permissionPatchTail", async () => {
@@ -5483,9 +5598,14 @@ function portal() {
         if (!r.ok) throw new Error(await r.text());
         if (this.tabState[sid] !== st) return false;
         const current = this.sessions.find(s => s.id === sid);
-        if (current) current.permission = value;
+        if (current) {
+          current.permission = value;
+          current.plan_return_permission = expected.planReturnPermission;
+        }
+        st.permission = value;
         if (st._permissionExpected) {
           st._permissionExpected.fallback = value;
+          st._permissionExpected.fallbackPlanReturn = expected.planReturnPermission;
           if (st._permissionExpected.seq === seq && st._permissionExpected.echoed) {
             st._permissionExpected = null;
           }
@@ -5499,10 +5619,18 @@ function portal() {
         const fallback = expected.fallback;
         if (st._permissionExpected === expected) st._permissionExpected = null;
         const current = this.sessions.find(s => s.id === sid);
-        if (current) current.permission = fallback;
+        if (current) {
+          current.permission = fallback;
+          current.plan_return_permission = expected.fallbackPlanReturn || "";
+        }
+        st.permission = fallback;
         if (this.currentId === sid) this.permission = fallback;
         this.toast(this.lang === "zh" ? "权限切换失败" : "Permission switch failed", "error");
         return false;
+      } finally {
+        if (this.tabState[sid] === st && st._permissionPatchSeq === seq) {
+          st._permissionChangePending = false;
+        }
       }
     },
     async onEffortChange() {
@@ -5707,6 +5835,11 @@ function portal() {
         _reconnectTimer: null,
         _canonicalResyncTimer: null,
         _canonicalResyncPending: false,
+        // Per-session permission mirror. The active tab copies this primitive
+        // into root `permission`; background tabs never read another tab's
+        // selector value.
+        permission: "",
+        _permissionChangePending: false,
         _permissionPatchSeq: 0,
         _effortPatchSeq: 0,
         _thinkingPatchSeq: 0,
@@ -5818,6 +5951,10 @@ function portal() {
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
+      if (st.permission === undefined) st.permission = "";
+      if (st._permissionChangePending === undefined) {
+        st._permissionChangePending = false;
+      }
       if (st._sessionActivityExpected === undefined) {
         st._sessionActivityExpected = null;
       }
@@ -6013,6 +6150,15 @@ function portal() {
         .concat((item.pendingImages || []).filter(im => im.id && !im.error).map(im => im.id))
         .concat((item.pendingDocs || []).filter(d => d.id && !d.error).map(d => d.id));
       const image_ids = ids.join(",");
+      const permission = this._normalizePermissionMode(item.permission, "");
+      const session = (this.sessions || []).find(row => row.id === sid);
+      const planReturnPermission = permission === "plan"
+        ? this._normalizePermissionMode(
+            item.plan_return_permission
+              || (session && session.plan_return_permission),
+            "",
+          )
+        : "";
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
           method: "POST",
@@ -6021,7 +6167,8 @@ function portal() {
           // drain replays the turn under this mode (fixes queued messages
           // bypassing tool approval the UI said was required).
           body: JSON.stringify({ text: item.text || "", image_ids,
-                                 permission: item.permission || "" }),
+                                 permission,
+                                 plan_return_permission: planReturnPermission }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -6578,6 +6725,15 @@ function portal() {
     // before ownership changes.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
+      const meta = (this.sessions || []).find(s => s.id === id);
+      const mode = this._normalizePermissionMode(
+        st._permissionExpected
+          ? st._permissionExpected.value
+          : ((meta && meta.permission) || st.permission || this.defaultPermission),
+        "default",
+      );
+      st.permission = mode;
+      this.permission = mode;
       this._activateComposerState(id);
       this.messages = st.messages;
       this.sessionUsage = st.sessionUsage;
@@ -6871,6 +7027,7 @@ function portal() {
       const st = meta && this.tabState && this.tabState[meta.id];
       if (!st) return meta;
       let out = meta;
+      const permissionExpected = st._permissionExpected;
       const fields = [
         ["_permissionExpected", "_permissionPatchTail", "permission",
           value => value || "default"],
@@ -6891,6 +7048,14 @@ function portal() {
         }
         if (out === meta) out = { ...meta };
         out[field] = expected.value;
+      }
+      // A mode transition and its plan return target are one atomic session
+      // setting. When a stale list response is held behind an expected
+      // permission value, hold its companion field too.
+      if (permissionExpected && st._permissionExpected
+          && permissionExpected.planReturnPermission !== undefined) {
+        if (out === meta) out = { ...meta };
+        out.plan_return_permission = permissionExpected.planReturnPermission;
       }
       return out;
     },
@@ -6949,6 +7114,30 @@ function portal() {
       next = next
         .map(meta => this._retainExpectedSessionSettings(meta))
         .map(meta => this._retainExpectedSessionActivity(meta));
+      // Keep every warm tab's primitive mirror aligned even when the rendered
+      // session list is shallow-equal and takes the fast return below.
+      for (const meta of next) {
+        const st = this.tabState && this.tabState[meta.id];
+        if (!st) continue;
+        st.permission = this._normalizePermissionMode(
+          st._permissionExpected
+            ? st._permissionExpected.value
+            : (meta.permission || st.permission || this.defaultPermission),
+          "default",
+        );
+      }
+      const activeMeta = next.find(meta => meta.id === this.currentId);
+      if (activeMeta) {
+        const activeState = this._ensureTabState(this.currentId);
+        this.permission = this._normalizePermissionMode(
+          activeState._permissionExpected
+            ? activeState._permissionExpected.value
+            : (activeMeta.permission || activeState.permission
+              || this.defaultPermission),
+          "default",
+        );
+        activeState.permission = this.permission;
+      }
       // Keep the OPEN conversation's messages live too — not just the session
       // LIST. Runs BEFORE the equality early-return so it fires every pull even
       // when the picker itself doesn't need a re-render (e.g. a turn still
@@ -7269,6 +7458,9 @@ function portal() {
         if (!!x.background_active !== !!y.background_active) return false;
         if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
+        if ((x.permission || "") !== (y.permission || "")) return false;
+        if ((x.plan_return_permission || "")
+            !== (y.plan_return_permission || "")) return false;
         if ((x.effort || "") !== (y.effort || "")) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
         if ((x.cwd || "") !== (y.cwd || "")) return false;
@@ -8059,6 +8251,7 @@ function portal() {
         name: prefix + stamp,
         model: seedModel,
         permission: this.defaultPermission || "bypassPermissions",
+        plan_return_permission: options.plan_return_permission || "",
         created_at: ts,
         updated_at: ts,
         message_count: 0,
@@ -8083,6 +8276,7 @@ function portal() {
       const st = this._ensureTabState(id);
       st.messages.length = 0;
       st._loaded = true;
+      st.permission = meta.permission;
       this._activateTabState(id);
       if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
       if (this._isMobileLayout()) this.setMobileTab("chat");
@@ -8764,7 +8958,10 @@ function portal() {
           // a wrapper left visible around a body that no longer renders is the
           // 30-40px blank-gap bug this whole method exists to prevent.
           if (this.conciseHidesToolUse(m)) return false;
-          // TodoWrite / Task|Agent / ExitPlanMode always render their own card.
+          // TodoWrite / Task|Agent / ExitPlanMode render their own card. Once
+          // ExitPlanMode's actionable permission card arrives, suppress the
+          // earlier passive duplicate.
+          if (m.name === "ExitPlanMode" && m._approvalSuperseded) return false;
           if (m.name === "TodoWrite" || m.name === "Task" || m.name === "Agent"
               || m.name === "ExitPlanMode") return true;
           // Task* (TaskList / TaskGet / TaskOutput) family uses one-line
@@ -10443,7 +10640,7 @@ function portal() {
       this._activateTabState(this.currentId);
       this.ackCurrentActivity();
       this.savePrefs();
-      // Sync the model + effort dropdowns to THIS session's persisted
+      // Sync the model + permission + effort dropdowns to THIS session's persisted
       // values on every tab switch. Without this, the dropdowns are
       // tied to root state (this.model / this.effort) which carries
       // over from whatever the user last picked on the previous tab.
@@ -10459,6 +10656,15 @@ function portal() {
           this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: cur.id };
         }
         if (cur.model) this.model = cur.model;
+        const curState = this._ensureTabState(cur.id);
+        const curPermission = this._normalizePermissionMode(
+          curState._permissionExpected
+            ? curState._permissionExpected.value
+            : (cur.permission || curState.permission || this.defaultPermission),
+          "default",
+        );
+        curState.permission = curPermission;
+        this.permission = curPermission;
         // effort: explicit assignment even when empty — switching from
         // a high-effort tab to one with no override should clear the
         // dropdown, not inherit the old value.
@@ -10988,6 +11194,25 @@ function portal() {
         if (loadedUpdated) st._seenUpdated = loadedUpdated;
         // (The session outline is sourced from the backend via
         // refreshOutlineFromBackend (GET …/outline), not built here.)
+        const permissionExpected = st._permissionExpected;
+        st.permission = this._normalizePermissionMode(
+          permissionExpected
+            ? permissionExpected.value
+            : (s.permission || st.permission || this.defaultPermission),
+          "default",
+        );
+        const loadedMeta = (this.sessions || []).find(row => row.id === sid);
+        if (loadedMeta) {
+          loadedMeta.permission = st.permission;
+          if (permissionExpected
+              && permissionExpected.planReturnPermission !== undefined) {
+            loadedMeta.plan_return_permission =
+              permissionExpected.planReturnPermission;
+          } else if (Object.prototype.hasOwnProperty.call(
+            s, "plan_return_permission")) {
+            loadedMeta.plan_return_permission = s.plan_return_permission || "";
+          }
+        }
         if (sid === this.currentId) {
           this.messages = st.messages;
           // Background-completion: if there's an in-flight turn on this
@@ -10999,14 +11224,9 @@ function portal() {
           // surface the state. The user can wait + reload to see more.
           this._checkActiveTurn(sid);
           if (s.model) this.model = s.model;
-          this.permission = st._permissionExpected
-            ? st._permissionExpected.value
-            // 2026-07-21: legacy/blank sessions had no stored permission and fell
-            // through to a hard-coded "default". That value then leaked out via
-            // savePrefs() into the NEXT newly-created chat's starting mode,
-            // overriding the user's configured global default ("新建会话还是
-            // default"). Honor the server-authoritative defaultPermission first.
-            : (s.permission || this.defaultPermission || "default");
+          // Per-tab state owns the primitive; root permission is only the
+          // currently visible selector mirror.
+          this.permission = st.permission;
           // effort defaults to "" (adaptive); always assign so switching from
           // a high-effort tab to a fresh one doesn't leave the old value visible.
           this.effort = s.effort || "";
@@ -21057,6 +21277,15 @@ function portal() {
       if (!sendSid) return false;
       if (sendSid === this.currentId) this._captureComposerState(sendSid);
       const sendState = this._ensureTabState(sendSid);
+      // Do not start a new turn between the optimistic selector change and
+      // its persisted session update. Otherwise Plan Mode could launch with a
+      // stale/missing return capability. Reconnects and queued snapshots own
+      // their existing runtime contract and are intentionally exempt.
+      if (sendState._permissionChangePending
+          && !opts.reconnect && !opts.resumedItem) {
+        this.toast(this.t("perm.switching"), "warn", 2000);
+        return false;
+      }
       const sendDraft = sendState.draft;
       // Snapshot the pinned session's draft before any await. Every later read,
       // clear, upload wait and enqueue remains owned by this exact state object.
@@ -21093,6 +21322,9 @@ function portal() {
         ? this.model : ((sendMeta && sendMeta.model) || this.model);
       const sendPermission = sendSid === this.currentId
         ? this.permission : ((sendMeta && sendMeta.permission) || "default");
+      const sendPlanReturnPermission = sendPermission === "plan"
+        ? ((sendMeta && sendMeta.plan_return_permission) || "")
+        : "";
       // Reconnect mode: skip user-input validation + user-msg push.
       // Used by _reconnectActiveTurn() when loadSession discovers an
       // in-flight background turn on the current session — we just want
@@ -21252,6 +21484,7 @@ function portal() {
           pendingImages: composerImages,
           pendingDocs: composerDocs,
           permission: sendPermission,
+          plan_return_permission: sendPlanReturnPermission,
         });
         if (!ok) return false;
         clearSubmittedComposer();
@@ -21617,7 +21850,9 @@ function portal() {
       };
       ["text", "thinking", "tool_use", "tool_result", "task_started",
        "task_progress", "task_notification", "rate_limit",
-       "ask_user_question", "permission_request", "ping",
+       "ask_user_question", "permission_request", "permission_request_resolved",
+       "permission_mode_changed",
+       "permission_mode_change_failed", "ping",
        "done", "error", "cancelled", "resync"].forEach(
         t => es.addEventListener(t, _bumpSse));
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
@@ -21932,6 +22167,9 @@ function portal() {
         // just forgot to copy it across).
         const msg = { role: "tool_use", name: d.name, id: d.id,
                        summary: d.summary, input: d.input,
+                       // ExitPlanMode's later permission_request replaces this
+                       // passive plan card with the actionable approval card.
+                       _approvalSuperseded: false,
                        // Pre-declare the reactive key so a later
                        // task_started/notification event (applyTaskStatus)
                        // reliably triggers Alpine re-render. Adding a
@@ -22114,17 +22352,155 @@ function portal() {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
         closeAsst();
+        const exitPlan = d.kind === "exit_plan"
+          || d.kind === "exit_plan_mode"
+          || d.tool === "ExitPlanMode";
+        let planTool = null;
+        if (exitPlan) {
+          const toolUseId = d.tool_use_id || d.toolUseId || "";
+          const messages = this._allPaneMessages(streamState);
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const candidate = messages[i];
+            if (!candidate || candidate.role !== "tool_use"
+                || candidate.name !== "ExitPlanMode") continue;
+            if (toolUseId && candidate.id !== toolUseId) continue;
+            planTool = candidate;
+            break;
+          }
+          if (planTool) planTool._approvalSuperseded = true;
+        }
         this._appendLiveMessage(streamState, {
           role: "permission_request",
           id: d.id,
           tool: d.tool,
           summary: d.summary,
+          sessionId: streamSid,
+          kind: d.kind || (exitPlan ? "exit_plan" : "tool"),
+          suggestions: Array.isArray(d.suggestions) ? d.suggestions : [],
+          return_mode: d.return_mode || "",
+          title: d.title || "",
+          display_name: d.display_name || "",
+          description: d.description || "",
+          input: d.input || {},
+          tool_use_id: d.tool_use_id || d.toolUseId
+            || (planTool && planTool.id) || "",
+          plan: d.plan
+            || (d.input && (d.input.plan || d.input.plan_content))
+            || (planTool && (planTool.plan
+              || (planTool.input && planTool.input.plan)))
+            || "",
           resolved: false,
           decision: null,
+          mode: null,
+          submitting: false,
+          awaitingTransition: false,
+          _decisionAcknowledged: false,
+          failure_message: "",
         });
 
         _scrollIfActive();
       });
+      es.addEventListener("permission_request_resolved", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        if (!d.id) return;
+        const messages = this._allPaneMessages(streamState);
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg.role !== "permission_request" || msg.id !== d.id) continue;
+          const exitPlan = this.isExitPlanPermission(msg)
+            || d.kind === "exit_plan";
+          // Mark the SSE as authoritative so a losing same-card POST from
+          // another browser tab cannot roll this decision back in its catch.
+          msg._decisionAcknowledged = true;
+          msg.submitting = false;
+          msg.failure_message = "";
+          msg.decision = d.decision || null;
+          msg.mode = this._normalizePermissionMode(d.mode, "") || null;
+          if (exitPlan && d.decision === "allow") {
+            // The decision only releases the SDK callback. Persisting the new
+            // permission and rebuilding the runtime is a separate commit.
+            msg.resolved = false;
+            msg.awaitingTransition = true;
+          } else {
+            // Generic approvals and "keep planning" are complete at decision.
+            msg.resolved = true;
+            msg.awaitingTransition = false;
+          }
+          break;
+        }
+      });
+      es.addEventListener("permission_mode_changed", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        const mode = this._applySessionPermissionMode(streamSid, d.permission, {
+          previousPermission: d.previous_permission || "",
+          authoritative: true,
+        });
+        if (!mode) return;
+
+        // Resolve the newest matching plan approval in the origin session. The
+        // transport's streamSid — never currentId — owns both the card and mode.
+        if (d.source === "exit_plan") {
+          const messages = this._allPaneMessages(streamState);
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (!this.isExitPlanPermission(msg)) continue;
+            if (!msg.awaitingTransition) continue;
+            if (d.tool_use_id && msg.tool_use_id
+                && d.tool_use_id !== msg.tool_use_id) continue;
+            msg.submitting = false;
+            msg.awaitingTransition = false;
+            msg.failure_message = "";
+            msg._decisionAcknowledged = true;
+            msg.resolved = true;
+            msg.decision = "allow";
+            msg.mode = mode;
+            break;
+          }
+        }
+      });
+      es.addEventListener("permission_mode_change_failed", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        this._applySessionPermissionMode(streamSid, d.permission || "plan", {
+          previousPermission: "plan",
+          authoritative: true,
+        });
+        // External hooks can fail without a MuseLab approval card, but the
+        // reported permission is still authoritative for this session.
+        if (d.source !== "exit_plan") return;
+        const messages = this._allPaneMessages(streamState);
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (!this.isExitPlanPermission(msg)) continue;
+          if (!msg.awaitingTransition) continue;
+          if (d.tool_use_id && msg.tool_use_id
+              && d.tool_use_id !== msg.tool_use_id) continue;
+          msg.submitting = false;
+          msg.awaitingTransition = false;
+          msg._decisionAcknowledged = true;
+          msg.resolved = true;
+          msg.decision = "failed";
+          msg.failure_message = d.message || "";
+          break;
+        }
+      });
+      const _finalizePendingPermissionRequests = (message = "") => {
+        const messages = this._allPaneMessages(streamState);
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (!msg || msg.role !== "permission_request" || msg.resolved) continue;
+          const exitPlan = this.isExitPlanPermission(msg);
+          const transitionFailed = exitPlan && msg.awaitingTransition;
+          msg.submitting = false;
+          msg.awaitingTransition = false;
+          msg._decisionAcknowledged = true;
+          msg.resolved = true;
+          msg.decision = transitionFailed ? "failed" : "expired";
+          msg.failure_message = transitionFailed ? message : "";
+        }
+      };
       const _stopTimer = (keepBackgroundElapsed = false) => {
         if (!keepBackgroundElapsed && streamState._streamTimer) {
           clearInterval(streamState._streamTimer);
@@ -22156,6 +22532,10 @@ function portal() {
         authoritativeTerminal = false,
         completionMeta = null,
       ) => {
+        // A terminal stream cannot service permission buttons anymore. Expire
+        // untouched cards, and fail an accepted ExitPlan transition if its
+        // permission-mode commit never arrived.
+        _finalizePendingPermissionRequests();
         streamState.streaming = false;
         streamState._continuationAwaitingReaction = false;
         streamState.es = null;
@@ -22914,28 +23294,81 @@ function portal() {
       }
     },
     // ====== permission_request helpers ======
-    async decidePermission(msg, decision) {
-      if (msg.resolved) return;
-      msg.resolved = true;
+    isExitPlanPermission(msg) {
+      return !!(msg && msg.role === "permission_request"
+        && (msg.kind === "exit_plan"
+          || msg.kind === "exit_plan_mode"
+          || msg.tool === "ExitPlanMode"));
+    },
+    planModeSuggestions(msg) {
+      const seen = new Set();
+      const suggestions = [];
+      for (const suggestion of ((msg && msg.suggestions) || [])) {
+        const mode = this._normalizePermissionMode(
+          suggestion && suggestion.mode,
+          "",
+        );
+        if (!mode || seen.has(mode)) continue;
+        seen.add(mode);
+        suggestions.push({ ...suggestion, mode });
+      }
+      return suggestions;
+    },
+    planPermissionMarkdown(msg) {
+      const input = (msg && msg.input) || {};
+      return (msg && msg.plan) || input.plan || input.plan_content || "";
+    },
+    permissionModeLabel(mode) {
+      const key = "perm.mode." + String(mode || "");
+      const label = this.t(key);
+      return label === key ? String(mode || "") : label;
+    },
+    planSuggestionLabel(mode) {
+      const key = "plan.approve." + String(mode || "");
+      const label = this.t(key);
+      return label === key
+        ? this.t("plan.approve_mode", { mode: this.permissionModeLabel(mode) })
+        : label;
+    },
+    async decidePermission(msg, decision, mode = null) {
+      if (msg.resolved || msg.submitting || msg.awaitingTransition) return;
+      const sid = msg.sessionId || this.currentId;
+      if (!sid) return;
+      mode = this._normalizePermissionMode(mode, "") || null;
+      const waitsForTransition = this.isExitPlanPermission(msg)
+        && decision === "allow";
+      msg.submitting = true;
+      msg.awaitingTransition = waitsForTransition;
+      msg.failure_message = "";
       msg.decision = decision;
+      msg.mode = mode;
       try {
         const r = await fetch(
-          `/api/chat/permission/${encodeURIComponent(this.currentId)}/${encodeURIComponent(msg.id)}`,
+          `/api/chat/permission/${encodeURIComponent(sid)}/${encodeURIComponent(msg.id)}`,
           {
             method: "POST",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ decision }),
+            body: JSON.stringify({ decision, mode }),
           },
         );
         if (!r.ok) {
-          msg.resolved = false;
-          msg.decision = null;
-          this.toast(this.t("perm.submit_failed"), "error", 3000);
+          throw new Error(await r.text());
         }
+        // ExitPlanMode is a two-phase transaction: POST only wakes the SDK
+        // callback. The later permission_mode_changed SSE is the commit.
+        if (!waitsForTransition) msg.resolved = true;
       } catch (e) {
+        // Another subscriber may have won the same pending request while this
+        // fetch was in flight. Its resolution event is authoritative; the
+        // losing POST commonly returns 404/409 and must not reopen the card.
+        if (msg._decisionAcknowledged) return;
         msg.resolved = false;
+        msg.awaitingTransition = false;
         msg.decision = null;
+        msg.mode = null;
         this.toast(this.t("perm.submit_failed"), "error", 3000);
+      } finally {
+        msg.submitting = false;
       }
     },
 

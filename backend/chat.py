@@ -391,6 +391,12 @@ _clients: dict[_ClientKey, ClaudeSDKClient] = {}
 # enabled dynamically), so a mismatch rebuilds the runtime instead of trying
 # to mutate it in place.
 _client_permission: dict[_ClientKey, str] = {}
+# A client launched in Plan Mode has one more capability bit: whether it may
+# return to bypassPermissions after ExitPlanMode. The CLI only permits that
+# transition when the process was started with
+# --allow-dangerously-skip-permissions, so two otherwise-identical `plan`
+# runtimes with different return modes must never share a pooled client.
+_client_plan_return: dict[_ClientKey, str] = {}
 
 
 # Cap on token deltas queued for a single attached subscriber. Deltas are the
@@ -1712,8 +1718,170 @@ def _creation_lock_for(key: _ClientKey) -> asyncio.Lock:
     return _creation_locks.setdefault(key, asyncio.Lock())
 
 
+def _normalize_plan_return_permission(
+    permission: str,
+    plan_return_permission: str | None,
+) -> str:
+    """Return the fail-closed Plan Mode return target for a runtime request."""
+    if permission != "plan":
+        return ""
+    target = (plan_return_permission or "").strip()
+    if target in _VALID_PERMISSION_MODES and target != "plan":
+        return target
+    return "default"
+
+
+def _build_plan_exit_hooks(
+    session_id: str,
+    plan_return_permission: str = "default",
+) -> tuple[Any, Any]:
+    """Build the success/failure hooks that commit an ExitPlanMode transition.
+
+    `can_use_tool` only records the user's selected SDK suggestion. The durable
+    session mode changes here, after the CLI confirms ExitPlanMode itself
+    completed. This keeps a failed/cancelled tool call from leaving MuseLab's
+    metadata ahead of the real runtime.
+    """
+
+    def _stop_ambiguous_transition(reason: str) -> dict[str, Any]:
+        # A failed/stale ExitPlanMode may already have changed the live CLI's
+        # permission. Do not let that ambiguous process continue the same turn
+        # and potentially write while durable metadata still says Plan.
+        return {
+            "continue_": False,
+            "stopReason": reason,
+        }
+
+    async def _post_tool_use(input_data, tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tid = str(data.get("tool_use_id") or tool_use_id or "")
+        transition = perm.consume_plan_transition(session_id, tid)
+        target = getattr(transition, "mode", None)
+        externally_resolved = not bool(target)
+        if externally_resolved:
+            # User/project hooks loaded through setting_sources may approve
+            # ExitPlanMode before can_use_tool runs. PostToolUse still fires,
+            # so use the SDK-reported current mode when it is concrete.
+            candidate = data.get("permission_mode")
+            target = (
+                candidate
+                if isinstance(candidate, str)
+                and candidate in _VALID_PERMISSION_MODES
+                and candidate != "plan"
+                else None
+            )
+
+        # ExitPlanMode can mutate the live CLI even when MuseLab's callback was
+        # bypassed by an external PermissionRequest/PreToolUse hook. Always
+        # discard this runtime before metadata I/O or target inference.
+        _pending_runtime_rebuilds.add(session_id)
+        if not target:
+            await perm.emit_session_event(
+                session_id,
+                "permission_mode_change_failed",
+                {
+                    "permission": (
+                        (sess.get_session(session_id) or {}).get("permission")
+                        or "plan"
+                    ),
+                    "source": "external_hook",
+                    "tool_use_id": tid,
+                    "message": "ExitPlanMode did not report a non-Plan mode.",
+                },
+            )
+            return _stop_ambiguous_transition(
+                "ExitPlanMode completed without a verifiable target mode.")
+        try:
+            previous = "plan"
+            if not sess.commit_plan_exit(
+                session_id,
+                target,
+                expected_plan_return=plan_return_permission,
+            ):
+                current = sess.get_session(session_id) or {}
+                await perm.emit_session_event(
+                    session_id,
+                    "permission_mode_change_failed",
+                    {
+                        "permission": current.get("permission") or "plan",
+                        "requested_permission": target,
+                        "source": (
+                            "external_hook"
+                            if externally_resolved else "exit_plan"
+                        ),
+                        "tool_use_id": tid,
+                        "message": (
+                            "Plan mode changed in another client; "
+                            "the stale approval was not applied."
+                        ),
+                    },
+                )
+                return _stop_ambiguous_transition(
+                    "A newer permission change superseded this plan approval.")
+        except Exception as exc:
+            sys.stderr.write(
+                f"[plan-mode] persist failed sid={session_id[:8]} "
+                f"target={target}: {type(exc).__name__}: {exc}\n")
+            await perm.emit_session_event(
+                session_id,
+                "permission_mode_change_failed",
+                {
+                    "permission": "plan",
+                    "requested_permission": target,
+                    "source": (
+                        "external_hook" if externally_resolved else "exit_plan"
+                    ),
+                    "tool_use_id": tid,
+                    "message": "Could not persist the Plan mode transition.",
+                },
+            )
+            return _stop_ambiguous_transition(
+                "MuseLab could not persist the Plan mode transition.")
+
+        # The current process may continue this turn under the SDK's new mode,
+        # but the next turn must use a freshly-launched client whose permission
+        # contract matches persisted state (especially for bypass capability).
+        await perm.emit_session_event(
+            session_id,
+            "permission_mode_changed",
+            {
+                "permission": target,
+                "previous_permission": previous,
+                "source": (
+                    "external_hook" if externally_resolved else "exit_plan"
+                ),
+                "tool_use_id": tid,
+            },
+        )
+        return {}
+
+    async def _post_tool_use_failure(input_data, tool_use_id, _context):
+        data = input_data if isinstance(input_data, dict) else {}
+        tid = str(data.get("tool_use_id") or tool_use_id or "")
+        transition = perm.discard_plan_transition(session_id, tid)
+        # External hooks can apply a mode before a later ExitPlanMode failure,
+        # too. Its live state is ambiguous even without a staged transition.
+        _pending_runtime_rebuilds.add(session_id)
+        current = sess.get_session(session_id) or {}
+        await perm.emit_session_event(
+            session_id,
+            "permission_mode_change_failed",
+            {
+                "permission": current.get("permission") or "plan",
+                "source": "exit_plan" if transition else "external_hook",
+                "tool_use_id": tid,
+                "message": str(data.get("error") or ""),
+            },
+        )
+        return _stop_ambiguous_transition(
+            "ExitPlanMode failed; the runtime will be rebuilt safely.")
+
+    return _post_tool_use, _post_tool_use_failure
+
+
 async def _build_and_connect_client(
     session_id: str, model: str, permission: str, effort: str,
+    plan_return_permission: str = "",
 ) -> ClaudeSDKClient:
     """The slow path: build ClaudeAgentOptions, instantiate ClaudeSDKClient,
     call .connect() with retry. NEVER holds _lock — multi-second CLI
@@ -1721,6 +1889,8 @@ async def _build_and_connect_client(
     for serialising concurrent misses on the same key via _creation_lock_for().
     """
     sess_data = sess.get_session(session_id) or {}
+    plan_return_permission = _normalize_plan_return_permission(
+        permission, plan_return_permission)
     workspace_root = sess.session_workspace(session_id)
     # New CLI rule: session_id + resume/continue conflict unless fork_session
     # is set. So we use resume alone — it both loads existing state AND
@@ -1760,6 +1930,8 @@ async def _build_and_connect_client(
         sys.stderr.write(f"[cli-stderr sid={session_id[:8]}] {line}\n")
         sys.stderr.flush()
 
+    post_exit_hook, post_exit_failure_hook = _build_plan_exit_hooks(
+        session_id, plan_return_permission)
     opts_kwargs = dict(
         cwd=str(workspace_root),
         model=endpoints.normalize_model_id(model),
@@ -1832,8 +2004,23 @@ async def _build_and_connect_client(
                 hooks=[mem0.build_recall_hook(session_id)],
                 timeout=mem0.RECALL_HOOK_TIMEOUT,
             )],
+            "PostToolUse": [HookMatcher(
+                matcher="ExitPlanMode",
+                hooks=[post_exit_hook],
+            )],
+            "PostToolUseFailure": [HookMatcher(
+                matcher="ExitPlanMode",
+                hooks=[post_exit_failure_hook],
+            )],
         },
     )
+    if permission == "plan" and plan_return_permission == "bypassPermissions":
+        # The CLI refuses a later setMode(bypassPermissions) unless this
+        # capability was granted at process launch. This flag permits the
+        # transition without starting the client itself in bypass mode.
+        opts_kwargs["extra_args"] = {
+            "allow-dangerously-skip-permissions": None,
+        }
     # Let the SDK expose every discovered Skill for every provider, including
     # Anthropic-compatible third-party gateways:
     # users expect an explicitly named local skill (e.g. galatea) to be usable
@@ -1986,7 +2173,12 @@ async def _build_and_connect_client(
     # plus CanUseToolShadowedWarning noise. Interactive questions use the
     # dedicated muselab MCP tool in every mode.
     if permission != "bypassPermissions":
-        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(session_id)
+        opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
+            session_id,
+            plan_return_permission=(
+                plan_return_permission if permission == "plan" else None
+            ),
+        )
     # Third-party Anthropic-compatible endpoints may emit a `thinking` block
     # without the signature key that the SDK parser requires.  Use the narrow
     # compatibility client only for vendor routes; native Claude stays on the
@@ -2207,7 +2399,8 @@ def _has_enabled_external_mcp() -> bool:
 
 
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
-                     effort: str = "") -> ClaudeSDKClient:
+                     effort: str = "",
+                     plan_return_permission: str = "") -> ClaudeSDKClient:
     """Create or fetch a ClaudeSDKClient for a (session, model, effort) triple.
     Switching model OR effort in the UI yields a fresh client; resume=session_id
     loads the same on-disk conversation history into the new client.
@@ -2227,6 +2420,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         await disconnect_client(session_id)
 
     key = (session_id, model, effort)
+    plan_return_permission = _normalize_plan_return_permission(
+        permission, plan_return_permission)
 
     # Fast path: cache hit. Lock just long enough to read + touch LRU.
     async with _lock:
@@ -2236,6 +2431,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 _client_lru.remove(key)
             _client_lru.append(key)
         cached_perm = _client_permission.get(key) if cached is not None else None
+        cached_plan_return = (
+            _client_plan_return.get(key, "") if cached is not None else "")
 
     if cached is not None:
         # Permission is part of the runtime's launch contract even though it
@@ -2243,10 +2440,13 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         # default mode may reject a later switch to bypassPermissions. Never
         # return a stale client after a failed control request: replace the
         # session runtime deterministically.
-        if cached_perm != permission:
+        if (cached_perm != permission
+                or (permission == "plan"
+                    and cached_plan_return != plan_return_permission)):
             await disconnect_client(session_id)
             return await get_client(
-                session_id, model, permission, effort=effort)
+                session_id, model, permission, effort=effort,
+                plan_return_permission=plan_return_permission)
         return cached
 
     # Cache miss: build a new client OUTSIDE _lock. Per-key creation
@@ -2263,18 +2463,27 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 _client_lru.append(key)
             cached_perm = (
                 _client_permission.get(key) if cached is not None else None)
+            cached_plan_return = (
+                _client_plan_return.get(key, "") if cached is not None else "")
 
         # Two callers can race on the same storage key while requesting
         # different launch modes. The creation lock coalesces them, but the
         # waiter must still reject the runtime built with the other mode.
         if cached is not None:
-            if cached_perm == permission:
+            if (cached_perm == permission
+                    and (permission != "plan"
+                         or cached_plan_return == plan_return_permission)):
                 return cached
             await disconnect_client(session_id)
 
         # Slow path — no awaits hold _lock.
-        client = await _build_and_connect_client(
-            session_id, model, permission, effort)
+        if permission == "plan":
+            client = await _build_and_connect_client(
+                session_id, model, permission, effort,
+                plan_return_permission=plan_return_permission)
+        else:
+            client = await _build_and_connect_client(
+                session_id, model, permission, effort)
 
         # Wedge gate: freeze the tool-set before anyone can run a turn on this
         # client. Runs under the per-key creation lock (blocks only same-key
@@ -2298,6 +2507,10 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         async with _lock:
             _clients[key] = client
             _client_permission[key] = permission
+            if permission == "plan":
+                _client_plan_return[key] = plan_return_permission
+            else:
+                _client_plan_return.pop(key, None)
             # Start the sole reader for this client BEFORE anyone can consume
             # it. Turns and the background-task watcher both attach to this
             # pump instead of opening their own iterator over the same stream.
@@ -2326,6 +2539,7 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                 old_key = _client_lru.pop(candidate_idx)
                 old_client = _clients.pop(old_key, None)
                 _client_permission.pop(old_key, None)
+                _client_plan_return.pop(old_key, None)
                 # Drop the per-key creation lock too — otherwise evicted
                 # keys leak Lock objects in _creation_locks forever
                 # (disconnect_client clears it, but LRU eviction didn't).
@@ -2511,6 +2725,7 @@ async def _evict_failed_session_stream(stream: _SessionStream) -> None:
         if _clients.get(key) is client:
             _clients.pop(key, None)
             _client_permission.pop(key, None)
+            _client_plan_return.pop(key, None)
             if key in _client_lru:
                 _client_lru.remove(key)
         if _session_streams.get(key) is stream:
@@ -2571,6 +2786,7 @@ async def disconnect_client(session_id: str) -> None:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
+            _client_plan_return.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -2616,6 +2832,7 @@ async def shutdown_runtime() -> None:
         clients = list({id(client): client for client in _clients.values()}.values())
         _clients.clear()
         _client_permission.clear()
+        _client_plan_return.clear()
         _creation_locks.clear()
         _client_lru.clear()
         _pending_runtime_rebuilds.clear()
@@ -4605,6 +4822,9 @@ class QueueEnqueueReq(BaseModel):
     # the headless drain replays the turn under the same mode instead of
     # falling back to the server default (see _maybe_drain_queue).
     permission: str = ""
+    # Plan Mode additionally snapshots the mode ExitPlanMode should return to.
+    # Legacy/malformed values are normalized to fail-closed `default`.
+    plan_return_permission: str | None = None
 
 
 class QueuePauseReq(BaseModel):
@@ -4653,8 +4873,25 @@ def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
     # headless failure when the drain replays the item later.
     if (req.permission or "").strip():
         _validate_permission(req.permission)
-    res = sess.enqueue_message(sid, text, req.image_ids or "",
-                               permission=req.permission or "")
+    plan_return_permission = req.plan_return_permission
+    if req.permission == "plan" and plan_return_permission is None:
+        # Cached clients predating this field still preserve the current
+        # session's complete Plan contract. If they enqueue Plan while the
+        # session is non-Plan, capture that current mode just like a direct
+        # send entering Plan Mode would.
+        current = sess.get_session(sid) or {}
+        plan_return_permission = (
+            current.get("plan_return_permission")
+            if current.get("permission") == "plan"
+            else current.get("permission")
+        )
+    res = sess.enqueue_message(
+        sid,
+        text,
+        req.image_ids or "",
+        permission=req.permission or "",
+        plan_return_permission=plan_return_permission,
+    )
     if not res.get("ok"):
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
@@ -4803,7 +5040,16 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
         ok = True
     if req.permission is not None:
         permission = _validate_permission(req.permission)
-        ok = sess.update_permission(sid, permission) or ok
+        current_meta = sess.get_session(sid) or {}
+        current_permission = (current_meta.get("permission") or "").strip()
+        changed = current_permission != permission
+        updated = sess.update_permission(sid, permission)
+        ok = updated or ok
+        if updated and changed:
+            # Permission is a launch contract. A busy session defers the
+            # replacement to its turn boundary; an idle one is evicted now so
+            # the next send cannot reuse a process with stale capabilities.
+            await _rebuild_session_runtime(sid)
     if req.effort is not None:
         # Validate against SDK literal set; empty string is a deliberate
         # "clear override" signal so the user can revert to adaptive.
@@ -5976,12 +6222,18 @@ async def _native_compact_session_locked(sid: str) -> dict:
     model = (meta.get("model") or "").strip() or MODEL
     effort = (meta.get("effort") or "").strip()
     # /compact is a CLI control command, not an agent tool call. Preserve the
-    # current runtime permission instead of escalating to bypassPermissions;
-    # a cold compact uses fail-closed default. This avoids a launch-sensitive
-    # permission transition for an operation that does not need one.
+    # warm runtime contract, or use the durable session contract on a cold
+    # start. In particular, Plan's return capability is part of that contract.
     prior_perm = _client_permission.get((sid, model, effort))
-    client = await get_client(
-        sid, model, prior_perm or "default", effort=effort)
+    permission = prior_perm or (meta.get("permission") or "default")
+    client_kwargs: dict[str, Any] = {"effort": effort}
+    if permission == "plan":
+        client_kwargs["plan_return_permission"] = (
+            _client_plan_return.get((sid, model, effort))
+            or meta.get("plan_return_permission")
+            or "default"
+        )
+    client = await get_client(sid, model, permission, **client_kwargs)
     before_total = 0
     post_compact_usage: dict | None = None
     try:
@@ -6152,6 +6404,7 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         name=new_name,
         model=src_meta.get("model") or MODEL,
         permission=src_meta.get("permission") or "",
+        plan_return_permission=src_meta.get("plan_return_permission"),
         auto_named=False,
         message_count=forked_count,
         turn_count=forked_turns,
@@ -6671,6 +6924,7 @@ async def reset(session_id: str | None = None) -> dict:
         for k in keys:
             c = _clients.pop(k, None)
             _client_permission.pop(k, None)
+            _client_plan_return.pop(k, None)
             _creation_locks.pop(k, None)
             if k in _client_lru:
                 _client_lru.remove(k)
@@ -8893,6 +9147,7 @@ async def _start_turn(
     *,
     model: str = "",
     permission: str = "bypassPermissions",
+    plan_return_permission: str = "",
     image_ids: str = "",
     persist_permission: bool = True,
 ) -> "TurnBroadcast":
@@ -9012,6 +9267,15 @@ async def _start_turn(
     # snapshot without rolling the session's newer selection back afterward.
     if persist_permission:
         sess.update_permission(session_id, permission)
+        # update_permission captures the previous non-plan mode atomically when
+        # entering Plan Mode. Re-read so this very first plan turn launches with
+        # the correct ExitPlanMode return capability.
+        s = sess.get_session(session_id) or s
+        plan_return_to_use = _normalize_plan_return_permission(
+            permission, s.get("plan_return_permission"))
+    else:
+        plan_return_to_use = _normalize_plan_return_permission(
+            permission, plan_return_permission)
 
     # Effort is per-session; read from metadata (settable via PATCH). Empty
     # string = SDK adaptive default, which is what the existing behavior was.
@@ -9034,10 +9298,13 @@ async def _start_turn(
         # The active-turn reservation above is visible before we wait here, so
         # those paths can fail cleanly instead of mutating this runtime.
         async with _session_runtime_lock_for(session_id):
+            client_kwargs: dict[str, Any] = {"effort": effort_to_use}
+            if permission == "plan":
+                client_kwargs["plan_return_permission"] = plan_return_to_use
             startup_task = asyncio.create_task(
                 get_client(
                     session_id, model_to_use, permission,
-                    effort=effort_to_use))
+                    **client_kwargs))
             broadcast.startup_task = startup_task
             try:
                 client = await asyncio.wait_for(startup_task, timeout=60.0)
@@ -9652,9 +9919,43 @@ async def _start_turn(
             try:
                 while True:
                     evt = await src_q.get()
-                    await merge_q.put(("side", evt))
+                    try:
+                        await merge_q.put(("side", evt))
+                    finally:
+                        src_q.task_done()
             except asyncio.CancelledError:
                 pass
+
+        async def _prepare_side_event(payload):
+            if isinstance(payload, dict) and payload.get("event") in {
+                "ask_user_question", "permission_request"
+            }:
+                try:
+                    from .activity import activity as _activity
+                    await asyncio.to_thread(
+                        _activity.set_state, session_id,
+                        "waiting_approval", detail="Waiting for user input")
+                except Exception as e:
+                    sys.stderr.write(
+                        f"[activity] waiting state failed sid={session_id}: {e}\n")
+            return payload
+
+        async def _flush_side_channels():
+            """Move hook/approval events ahead of the terminal SSE boundary.
+
+            ExitPlanMode hooks enqueue their mode event before the SDK emits
+            ResultMessage, but the independent side pump may not have run yet.
+            Queue.join() provides a real hand-off barrier; a scheduler race can
+            no longer let `done` overtake permission resolution.
+            """
+            await asyncio.gather(side_q.join(), perm_q.join())
+            while True:
+                try:
+                    queued_kind, queued_payload = merge_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if queued_kind == "side":
+                    yield await _prepare_side_event(queued_payload)
 
         # ====== message-type-specific handlers ======
         # Three nested async generators, one per SDK message type. They share
@@ -10458,21 +10759,12 @@ async def _start_turn(
             while True:
                 kind, payload = await merge_q.get()
                 if kind == "side":
-                    if isinstance(payload, dict) and payload.get("event") in {
-                        "ask_user_question", "permission_request"
-                    }:
-                        try:
-                            from .activity import activity as _activity
-                            await asyncio.to_thread(
-                                _activity.set_state, session_id,
-                                "waiting_approval", detail="Waiting for user input")
-                        except Exception as e:
-                            sys.stderr.write(
-                                f"[activity] waiting state failed sid={session_id}: {e}\n")
                     # Already shaped as {"event": "...", "data": "..."} — pass through.
-                    yield payload
+                    yield await _prepare_side_event(payload)
                     continue
                 if kind == "error":
+                    async for side_event in _flush_side_channels():
+                        yield side_event
                     # If the user interrupted this turn and the force-stop
                     # watchdog tore the CLI down, receive_response() raises a
                     # transport error that lands here. That's an expected
@@ -10485,6 +10777,8 @@ async def _start_turn(
                         yield _error_event(payload)
                     break
                 if kind == "done":
+                    async for side_event in _flush_side_channels():
+                        yield side_event
                     break
                 # kind == "claude" — dispatch by SDK message type to the
                 # per-type helper async generators defined above. Each
@@ -10553,7 +10847,10 @@ async def _start_turn(
             perm_task.cancel()
             claude_task.cancel()
             unregister_session_queue(session_id)
-            perm.unregister_session_queue(session_id)
+            if perm.unregister_session_queue(session_id):
+                # Approval returned updatedPermissions but no terminal tool hook
+                # arrived. The CLI's live mode is ambiguous; never reuse it.
+                _pending_runtime_rebuilds.add(session_id)
 
     # Background-completion + reconnect-streaming design:
     #
@@ -10805,6 +11102,7 @@ async def _maybe_drain_queue(session_id: str) -> None:
             session_id,
             item.get("text", ""),
             permission=perm,
+            plan_return_permission=item.get("plan_return_permission", ""),
             image_ids=item.get("image_ids", ""),
             persist_permission=False,
         )
@@ -11003,6 +11301,8 @@ async def submit_answer_api(session_id: str, question_id: str, req: AnswerReq) -
 class PermissionDecisionReq(BaseModel):
     decision: str           # "allow" | "deny" | "always"
     message: str | None = None
+    # ExitPlanMode only: one of the SDK-provided setMode suggestions.
+    mode: str | None = None
 
 
 @router.post("/permission/{session_id}/{request_id}",
@@ -11011,7 +11311,9 @@ async def submit_permission_decision_api(
     session_id: str, request_id: str, req: PermissionDecisionReq
 ) -> dict:
     """Frontend POSTs Allow / Deny / Always-allow click here."""
-    if not perm.submit_decision(session_id, request_id, req.decision, req.message):
+    if not perm.submit_decision(
+        session_id, request_id, req.decision, req.message, mode=req.mode,
+    ):
         raise HTTPException(404, "no pending permission request with that id "
                                   "(may have timed out or been answered already)")
     return {"ok": True}

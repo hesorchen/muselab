@@ -45,6 +45,7 @@ def chat_mod(app_module):
     from backend import chat as chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
+    chat_mod._client_plan_return.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
     chat_mod._session_streams.clear()
@@ -54,6 +55,7 @@ def chat_mod(app_module):
     yield chat_mod
     chat_mod._clients.clear()
     chat_mod._client_permission.clear()
+    chat_mod._client_plan_return.clear()
     chat_mod._creation_locks.clear()
     chat_mod._client_lru.clear()
     chat_mod._session_streams.clear()
@@ -64,7 +66,9 @@ def chat_mod(app_module):
 
 def _patch_builder(monkeypatch, chat_mod):
     """Replace the slow CLI-spawning path with a fake-client factory."""
-    async def fake_build(session_id, model, permission, effort):
+    async def fake_build(
+        session_id, model, permission, effort, plan_return_permission="",
+    ):
         return _FakeSDKClient(session_id, model, effort)
 
     def fake_ensure(key, client):
@@ -155,6 +159,41 @@ def test_permission_switch_rebuilds_runtime(chat_mod, monkeypatch):
         assert c3 is not c2
         assert c2.disconnected is True
         assert chat_mod._client_permission[key] == "bypassPermissions"
+
+    asyncio.run(run())
+
+
+def test_plan_return_capability_participates_in_runtime_contract(
+    chat_mod, monkeypatch,
+):
+    _patch_builder(monkeypatch, chat_mod)
+
+    async def run():
+        key = ("sid-plan", "claude-sonnet-4-6", "")
+        first = await chat_mod.get_client(
+            "sid-plan",
+            "claude-sonnet-4-6",
+            "plan",
+            plan_return_permission="default",
+        )
+        reused = await chat_mod.get_client(
+            "sid-plan",
+            "claude-sonnet-4-6",
+            "plan",
+            plan_return_permission="default",
+        )
+        assert reused is first
+
+        elevated = await chat_mod.get_client(
+            "sid-plan",
+            "claude-sonnet-4-6",
+            "plan",
+            plan_return_permission="bypassPermissions",
+        )
+        assert elevated is not first
+        assert first.disconnected is True
+        assert chat_mod._client_permission[key] == "plan"
+        assert chat_mod._client_plan_return[key] == "bypassPermissions"
 
     asyncio.run(run())
 

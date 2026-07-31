@@ -125,6 +125,26 @@ def test_same_provider_model_switch_rebuilds_client(chat_mod, client):
     assert chat_mod.sess.get_session(sid)["model"] == "claude-haiku-4-5"
 
 
+def test_permission_patch_enters_plan_and_rebuilds_client(chat_mod, client):
+    sid = _make_compact_session(client)
+    key = (sid, "claude-sonnet-4-6", "")
+    fake = _seed(chat_mod, key)
+
+    before = chat_mod.sess.get_session(sid)
+    response = client.patch(
+        f"/api/chat/sessions/{sid}",
+        headers={"X-Auth-Token": TEST_TOKEN},
+        json={"permission": "plan"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert fake.disconnected is True
+    assert key not in chat_mod._clients
+    current = chat_mod.sess.get_session(sid)
+    assert current["permission"] == "plan"
+    assert current["plan_return_permission"] == before["permission"]
+
+
 @pytest.mark.asyncio
 async def test_runtime_rebuild_defers_while_turn_is_reserved(chat_mod):
     sid = "sid-deferred-rebuild"
@@ -593,11 +613,12 @@ def test_fork_inherits_session_settings_and_records_lineage(
         json={
             "name": "source chat",
             "model": "claude-sonnet-4-6",
-            "permission": "plan",
+            "permission": "bypassPermissions",
         },
     )
     assert source.status_code == 200, source.text
     sid = source.json()["id"]
+    chat_mod.sess.update_permission(sid, "plan")
     chat_mod.sess.update_effort(sid, "high")
     chat_mod.sess.update_thinking(sid, False)
     chat_mod.sess.bump_session(sid, message_count=12, turn_count=3)
@@ -620,6 +641,7 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["session_id"] == new_sid
     assert body["name"] == "source chat · 分支"
     assert body["permission"] == "plan"
+    assert body["plan_return_permission"] == "bypassPermissions"
     assert body["effort"] == "high"
     assert body["thinking"] is False
     # A point-in-time fork starts with unknown presentation counts. The

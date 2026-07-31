@@ -10,7 +10,8 @@ SDK is invoked with ``resume=<sid>``. That file holds:
   - tool sidechains for subagents
 
 muselab keeps a small sidecar of metadata the CLI doesn't track:
-  - session-level: name, model, permission, auto_named flag,
+  - session-level: name, model, permission, plan_return_permission,
+    auto_named flag,
     created_at/updated_at
   - per-message annotations keyed by message UUID:
       cost (per-turn USD), model (badge), images (uploaded base64),
@@ -35,7 +36,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 # SDK-native session enumeration. CLI's JSONL is the truth for transcript +
 # last-modified + custom_title; muselab index.json is the truth for
@@ -44,6 +45,7 @@ from typing import Any
 # the session immediately after create_session).
 from claude_agent_sdk import list_sessions as sdk_list_sessions
 from claude_agent_sdk import get_session_info as sdk_get_session_info
+from claude_agent_sdk.types import PermissionMode
 from .settings import ROOT, atomic_write_text
 from .workspaces import registry as workspace_registry
 
@@ -84,6 +86,44 @@ SESS_DIR = (
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX = SESS_DIR / "index.json"
 
+# A Plan-mode process still needs a concrete permission mode to return to after
+# ExitPlanMode.  Keep that launch contract beside the visible session
+# permission because the Claude JSONL transcript does not persist MuseLab's
+# per-session selection.  Derive the allowlist from the installed SDK so new
+# non-Plan modes (for example "auto") do not require a second hand-maintained
+# list here.
+_VALID_PLAN_RETURN_PERMISSIONS = (
+    frozenset(get_args(PermissionMode)) - {"plan"}
+)
+_PLAN_RETURN_PERMISSION_FALLBACK = "default"
+
+
+def _normalize_plan_return_permission(permission: Any, value: Any) -> str:
+    """Return the safe Plan-exit mode for a persisted session or queue item.
+
+    The field is meaningful only while ``permission == "plan"``.  Legacy rows
+    have no field at all, and hand-edited/older data may contain an invalid
+    value (including ``"plan"`` itself); all of those fail closed to
+    ``"default"`` instead of inheriting a global/browser/runtime bypass mode.
+    """
+    current = permission.strip() if isinstance(permission, str) else ""
+    if current != "plan":
+        return ""
+    candidate = value.strip() if isinstance(value, str) else ""
+    if candidate in _VALID_PLAN_RETURN_PERMISSIONS:
+        return candidate
+    return _PLAN_RETURN_PERMISSION_FALLBACK
+
+
+def _normalize_session_permission_fields(row: dict) -> dict:
+    """Return a copy with the Plan return-mode invariant made explicit."""
+    normalized = dict(row)
+    normalized["plan_return_permission"] = _normalize_plan_return_permission(
+        normalized.get("permission"),
+        normalized.get("plan_return_permission"),
+    )
+    return normalized
+
 
 def _sidecar_path(sid: str) -> Path:
     return SESS_DIR / f"{sid}.sidecar.json"
@@ -108,7 +148,15 @@ def _load_index() -> list[dict]:
 
 
 def _save_index(items: list[dict]) -> None:
-    atomic_write_text(INDEX, json.dumps(items, ensure_ascii=False, indent=2))
+    # Canonicalize legacy permission metadata on the next ordinary mutation.
+    # Reads normalize in memory only, so merely opening an old session never
+    # rewrites index.json.
+    canonical = [
+        _normalize_session_permission_fields(item)
+        if isinstance(item, dict) else item
+        for item in items
+    ]
+    atomic_write_text(INDEX, json.dumps(canonical, ensure_ascii=False, indent=2))
     # Index was just rewritten — invalidate any cached list_sessions() output
     # so the next caller sees the rename / delete / bump immediately rather
     # than waiting for the TTL to expire.
@@ -325,6 +373,10 @@ def _merge_sdk_with_index(
         "name": name,
         "model": m.get("model", ""),
         "permission": m.get("permission", ""),
+        "plan_return_permission": _normalize_plan_return_permission(
+            m.get("permission"),
+            m.get("plan_return_permission"),
+        ),
         # Auto-named flag stays True only if neither SDK custom_title nor
         # an explicit muselab rename has happened yet.
         "auto_named": (m.get("auto_named", True)
@@ -389,6 +441,7 @@ def toggle_pin(sid: str) -> bool:
         now = time.time()
         idx.append({
             "id": sid, "name": "", "model": "",
+            "permission": "", "plan_return_permission": "",
             "created_at": now, "updated_at": now,
             "message_count": 0, "auto_named": True, "pinned": True,
         })
@@ -412,6 +465,7 @@ def set_pin(sid: str, val: bool) -> bool:
         now = time.time()
         idx.append({
             "id": sid, "name": "", "model": "",
+            "permission": "", "plan_return_permission": "",
             "created_at": now, "updated_at": now,
             "message_count": 0, "auto_named": True, "pinned": bool(val),
         })
@@ -495,6 +549,7 @@ def _build_sessions_list() -> list[dict]:
             if s.get("cwd") and not workspace_registry.contains(s.get("cwd")):
                 continue
             row = dict(s)
+            row = _normalize_session_permission_fields(row)
             # Legacy muselab releases persisted per-session system prompts.
             # Keep the inert key on disk for non-destructive compatibility,
             # but never expose or execute it.
@@ -514,14 +569,17 @@ def create_session(
     model: str = "",
     cwd: str | Path | None = None,
     permission: str = "",
+    plan_return_permission: str | None = None,
 ) -> dict:
     return register_session(str(uuid.uuid4()), name=name, model=model,
                             permission=permission,
+                            plan_return_permission=plan_return_permission,
                             auto_named=True, cwd=cwd)
 
 
 def register_session(sid: str, *, name: str = "", model: str = "",
                      permission: str = "",
+                     plan_return_permission: str | None = None,
                      auto_named: bool = True,
                      message_count: int = 0,
                      turn_count: int | None = None,
@@ -541,6 +599,10 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "name": name or _default_session_name(),
         "model": model,
         "permission": permission,
+        "plan_return_permission": _normalize_plan_return_permission(
+            permission,
+            plan_return_permission,
+        ),
         "created_at": now,
         "updated_at": now,
         "message_count": message_count,
@@ -566,7 +628,7 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         # ids would break list dedupe and x-for :key bindings on the frontend.
         existing = next((s for s in idx if s.get("id") == sid), None)
         if existing is not None:
-            public_existing = dict(existing)
+            public_existing = _normalize_session_permission_fields(existing)
             public_existing.pop("system_prompt", None)
             return public_existing
         idx.append(meta)
@@ -613,7 +675,9 @@ def get_session_meta(sid: str) -> dict | None:
     if info is not None:
         meta = _merge_sdk_with_index(info, m or {}, workspace)
     elif m is not None:
-        meta = {**m, "cwd": str(m.get("cwd") or ROOT)}
+        meta = _normalize_session_permission_fields(
+            {**m, "cwd": str(m.get("cwd") or ROOT)}
+        )
         # Read-only compatibility for indexes written by older releases.
         meta.pop("system_prompt", None)
     else:
@@ -786,15 +850,84 @@ def update_model(sid: str, model: str) -> None:
                 return
 
 
-def update_permission(sid: str, permission: str) -> bool:
-    """Persist the permission selected for subsequent turns in this session."""
+def update_permission(
+    sid: str,
+    permission: str,
+    *,
+    plan_return_permission: str | None = None,
+) -> bool:
+    """Atomically persist the visible mode and Plan's eventual return mode.
+
+    Entering Plan captures the previous non-Plan mode unless the caller
+    supplies an explicit return mode.  Re-applying Plan preserves the existing
+    return mode.  Leaving Plan clears the now-inert field.
+    """
     with _INDEX_LOCK:
         idx = _load_index()
         for s in idx:
             if s["id"] == sid:
+                previous = (
+                    s.get("permission", "").strip()
+                    if isinstance(s.get("permission"), str)
+                    else ""
+                )
+                if permission == "plan":
+                    if plan_return_permission is not None:
+                        candidate = plan_return_permission
+                    elif previous == "plan":
+                        candidate = s.get("plan_return_permission")
+                    else:
+                        candidate = previous
+                    s["plan_return_permission"] = (
+                        _normalize_plan_return_permission("plan", candidate)
+                    )
+                else:
+                    s["plan_return_permission"] = ""
                 s["permission"] = permission
                 _save_index(idx)
                 return True
+        return False
+
+
+def commit_plan_exit(
+    sid: str,
+    permission: str,
+    *,
+    expected_plan_return: str | None = None,
+) -> bool:
+    """Compare-and-set a completed ExitPlanMode transition.
+
+    Approval can overlap a PATCH from another browser/device. Only the SDK
+    runtime that is still durably in Plan Mode, with the same return contract
+    it was launched under, may commit its chosen exit mode. If a newer user
+    action already changed/re-entered Plan Mode, leave that choice untouched
+    and let the caller discard the now-stale runtime.
+    """
+    if permission == "plan" or permission not in _VALID_PLAN_RETURN_PERMISSIONS:
+        return False
+    with _INDEX_LOCK:
+        idx = _load_index()
+        for s in idx:
+            if s["id"] != sid:
+                continue
+            current = (
+                s.get("permission", "").strip()
+                if isinstance(s.get("permission"), str)
+                else ""
+            )
+            if current != "plan":
+                return False
+            if expected_plan_return is not None:
+                current_return = _normalize_plan_return_permission(
+                    "plan", s.get("plan_return_permission"))
+                expected_return = _normalize_plan_return_permission(
+                    "plan", expected_plan_return)
+                if current_return != expected_return:
+                    return False
+            s["permission"] = permission
+            s["plan_return_permission"] = ""
+            _save_index(idx)
+            return True
         return False
 
 
@@ -1073,6 +1206,7 @@ def set_message_count(sid: str, message_count: int,
         now = time.time()
         stub = {
             "id": sid, "name": "", "model": "",
+            "permission": "", "plan_return_permission": "",
             "created_at": now, "updated_at": now,
             "message_count": message_count, "auto_named": True,
         }
@@ -1091,7 +1225,8 @@ def set_message_count(sid: str, message_count: int,
 # window between a queue mutation and an annotation write. A dedicated file +
 # lock keeps the two independent.
 #
-# Shape: {"items": [{"id","text","image_ids","enqueued_at"}], "paused": bool}
+# Shape: {"items": [{"id","text","image_ids","permission",
+#                    "plan_return_permission","enqueued_at"}], "paused": bool}
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
 #   - paused: set True when a queued turn errors / hits ask_user_question /
 #     is user-cancelled; auto-drain stops until the user resumes
@@ -1119,15 +1254,31 @@ def _load_queue(sid: str) -> dict:
         d.setdefault("paused", False)
         if not isinstance(d["items"], list):
             d["items"] = []
+        else:
+            # Compatibility is read-only here: legacy Plan items immediately
+            # behave as default-on-exit, while GET does not rewrite the file.
+            d["items"] = [
+                _normalize_session_permission_fields(item)
+                if isinstance(item, dict) else item
+                for item in d["items"]
+            ]
         return d
     except Exception:
         return {"items": [], "paused": False}
 
 
 def _save_queue(sid: str, data: dict) -> None:
+    canonical = dict(data)
+    items = canonical.get("items")
+    if isinstance(items, list):
+        canonical["items"] = [
+            _normalize_session_permission_fields(item)
+            if isinstance(item, dict) else item
+            for item in items
+        ]
     # An empty, un-paused queue leaves no file behind (avoids littering
     # sessions/ with thousands of empty queue.json files over time).
-    if not data.get("items") and not data.get("paused"):
+    if not canonical.get("items") and not canonical.get("paused"):
         p = _queue_path(sid)
         if p.exists():
             try:
@@ -1135,7 +1286,10 @@ def _save_queue(sid: str, data: dict) -> None:
             except OSError:
                 pass
         return
-    atomic_write_text(_queue_path(sid), json.dumps(data, ensure_ascii=False))
+    atomic_write_text(
+        _queue_path(sid),
+        json.dumps(canonical, ensure_ascii=False),
+    )
 
 
 def get_queue(sid: str) -> dict:
@@ -1145,15 +1299,15 @@ def get_queue(sid: str) -> dict:
 
 
 def enqueue_message(sid: str, text: str, image_ids: str = "",
-                    permission: str = "") -> dict:
+                    permission: str = "",
+                    plan_return_permission: str | None = None) -> dict:
     """Append a message to the session's queue. Returns
     {'ok': bool, 'item'?: dict, 'queue': dict, 'error'?: str}. Rejects past
     _QUEUE_MAX (mirrors frontend cap).
 
-    `permission` snapshots the sender's permission mode at enqueue time so
-    the headless drain starts the turn under the SAME mode the user had
-    selected — without it, drained turns silently fell back to the server
-    default (bypassPermissions), skipping tool approval the user expected."""
+    `permission` and `plan_return_permission` snapshot the sender's complete
+    launch contract at enqueue time so the headless drain neither falls back
+    to a server default nor reads a newer session selection."""
     with _QUEUE_LOCK:
         data = _load_queue(sid)
         if len(data["items"]) >= _QUEUE_MAX:
@@ -1163,6 +1317,10 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
             "text": text or "",
             "image_ids": image_ids or "",
             "permission": permission or "",
+            "plan_return_permission": _normalize_plan_return_permission(
+                permission,
+                plan_return_permission,
+            ),
             "enqueued_at": int(time.time() * 1000),
         }
         data["items"].append(item)
@@ -1189,7 +1347,10 @@ def requeue_head(sid: str, item: dict) -> dict:
     the _QUEUE_MAX cap (it's restoring an item that was already accepted)."""
     with _QUEUE_LOCK:
         data = _load_queue(sid)
-        data["items"].insert(0, item)
+        data["items"].insert(
+            0,
+            _normalize_session_permission_fields(item),
+        )
         _save_queue(sid, data)
         return data
 

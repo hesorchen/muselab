@@ -65,6 +65,59 @@ def test_non_bypass_runtime_installs_permission_resolver(
     assert callable(captured["can_use_tool"])
 
 
+def test_plan_runtime_can_return_to_bypass_and_installs_exit_hooks(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-plan-bypass",
+        "deepseek-v4-pro",
+        "plan",
+        "",
+        plan_return_permission="bypassPermissions",
+    ))
+
+    assert captured["permission_mode"] == "plan"
+    assert captured["extra_args"] == {
+        "allow-dangerously-skip-permissions": None,
+    }
+    assert callable(captured["can_use_tool"])
+    for hook_name in ("PostToolUse", "PostToolUseFailure"):
+        matchers = captured["hooks"][hook_name]
+        assert len(matchers) == 1
+        assert matchers[0].matcher == "ExitPlanMode"
+        assert len(matchers[0].hooks) == 1
+        assert callable(matchers[0].hooks[0])
+
+
+def test_plan_runtime_with_default_return_does_not_gain_bypass_capability(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-plan-default",
+        "deepseek-v4-pro",
+        "plan",
+        "",
+        plan_return_permission="default",
+    ))
+
+    assert captured["permission_mode"] == "plan"
+    assert "extra_args" not in captured
+
+
 def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_path):
     from backend import chat as chat_mod
     from backend import endpoints
