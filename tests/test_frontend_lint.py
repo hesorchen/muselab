@@ -979,6 +979,9 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
+    activity_state = app[app.index("activity: {"):app.index("_activityEtags:")]
+    assert 'view: "timeline"' in activity_state
+
     review = app.index('{ key: "review"')
     running = app.index('{ key: "running"', review)
     failed = app.index('{ key: "failed"', running)
@@ -1008,6 +1011,12 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'this.activity.view === "timeline"' in app
     assert 'key === "timeline") return true' in app
     assert "setActivityView('timeline')" in html
+    assert "const pinRank = Number(!!b.pinned) - Number(!!a.pinned)" in app
+    assert "async toggleActivityPin(item)" in app
+    assert 'method: "PATCH", json: { pinned: target }' in app
+    assert '@click.stop="toggleActivityPin(item)"' in html
+    assert 'x-show="activity.view === \'timeline\'"' in html
+    assert ".activity-pin.active" in css
 
     # The left marker is unread/action state, not a permanent failure marker.
     assert "activityIsUnreadResult(item) ? ' is-unread'" in html

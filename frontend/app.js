@@ -520,9 +520,9 @@ function portal() {
     },
     activity: {
       show: false, loading: false, events: [],
-      // Status groups remain the default operational view. The alternate
-      // timeline shows every state by its latest transition time.
-      view: "status",
+      // The global center opens on the cross-status timeline by default.
+      // An explicit user choice is still restored from localStorage.
+      view: "timeline",
       viewLoaded: false,
       summary: {
         running: 0, unread: 0, attention: 0,
@@ -545,6 +545,7 @@ function portal() {
     _activityLiveSeq: 0,
     _activityLiveTimer: null,
     _activityLiveVisibilityBound: false,
+    _activityPinPending: {},
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -25035,6 +25036,8 @@ function portal() {
         .filter(item => this.activityMatchesGroup(item, group.key))
         .sort((a, b) => {
           if (group.key === "timeline") {
+            const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
+            if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
           if (group.key === "running") {
@@ -25070,8 +25073,8 @@ function portal() {
         return [{
           key: "timeline",
           label: this.lang === "zh"
-            ? "全部会话（按时间倒序）"
-            : "All sessions (newest first)",
+            ? "全部任务（置顶优先 · 时间倒序）"
+            : "All tasks (pinned, then newest)",
         }];
       }
       const groups = this.activityGroups();
@@ -25114,6 +25117,46 @@ function portal() {
       const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    },
+    async toggleActivityPin(item) {
+      if (!item?.id || this.activity.view !== "timeline") return false;
+      const eventId = String(item.id);
+      if (this._activityPinPending[eventId]) return false;
+      const previous = !!item.pinned;
+      const target = !previous;
+      this._activityPinPending = {
+        ...this._activityPinPending,
+        [eventId]: true,
+      };
+
+      // Reorder immediately, and retire any snapshot that started before this
+      // mutation so it cannot briefly restore the old pin state.
+      const current = this.activity.events.find(row => row.id === eventId);
+      if (current) current.pinned = target;
+      this.activity.events = [...this.activity.events];
+      this._activityAppliedSeq = ++this._activityRequestSeq;
+      try {
+        const { ok, data, error } = await this.api(
+          `/api/activity/${encodeURIComponent(eventId)}`,
+          { method: "PATCH", json: { pinned: target } },
+        );
+        if (!ok || !data?.item) throw new Error(error || "activity pin failed");
+        // The PATCH response has the same envelope as an SSE update, so this
+        // also works when the live channel is unavailable. A duplicate SSE
+        // revision is ignored by _applyActivityUpdate.
+        this._applyActivityUpdate(data);
+        return true;
+      } catch (_) {
+        const latest = this.activity.events.find(row => row.id === eventId);
+        if (latest && !!latest.pinned === target) latest.pinned = previous;
+        this.activity.events = [...this.activity.events];
+        this.toast(this.lang === "zh" ? "置顶操作失败" : "Could not update pin", "error");
+        return false;
+      } finally {
+        const pending = { ...this._activityPinPending };
+        delete pending[eventId];
+        this._activityPinPending = pending;
+      }
     },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
