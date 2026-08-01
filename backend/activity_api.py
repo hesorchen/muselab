@@ -5,6 +5,7 @@ import json
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .activity import activity
@@ -13,6 +14,10 @@ from .capability_tickets import tickets
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
 _EVENT_TICKET_TTL_S = 45
+
+
+class ActivityPatchRequest(BaseModel):
+    pinned: bool
 
 
 def _json(request: Request, response: Response, payload: dict):
@@ -96,6 +101,14 @@ async def activity_events() -> EventSourceResponse:
 @router.post("/ack-all", dependencies=[Depends(require_token)])
 def ack_all():
     return {"ok": True, "changed": activity.ack(), "summary": activity.summary()}
+
+
+@router.patch("/{event_id}", dependencies=[Depends(require_token)])
+def patch_activity(event_id: str, req: ActivityPatchRequest):
+    update = activity.set_pin(event_id, req.pinned)
+    if update is None:
+        raise HTTPException(status_code=404, detail="activity not found")
+    return {"ok": True, **update}
 
 
 @router.post("/{event_id}/ack", dependencies=[Depends(require_token)])

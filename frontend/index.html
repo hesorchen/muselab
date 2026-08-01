@@ -5517,17 +5517,35 @@
           <section class="activity-group" x-show="activityEvents(group).length">
             <h3 x-text="group.label"></h3>
             <template x-for="item in activityEvents(group)" :key="item.id">
-              <button class="activity-row" @click="openActivityEvent(item)"
-                      :class="item.state
-                        + (activityIsUnreadResult(item) ? ' is-unread' : '')
-                        + (activityRequiresAction(item) ? ' requires-action' : '')">
-                <span class="activity-state-dot"></span>
-                <span class="activity-row-main">
-                  <strong x-text="item.task_summary || item.session_name"></strong>
-                  <small><span x-text="item.workspace_name"></span><span x-show="item.session_name"> · <span x-text="item.session_name"></span></span><span x-show="item.status_detail"> · <span x-text="item.status_detail"></span></span></small>
-                </span>
-                <span class="activity-row-side"><span x-text="activityStateLabel(item.state)"></span><small x-text="activityTime(item)"></small></span>
-              </button>
+              <div class="activity-row-wrap"
+                   :class="{ pinned: activity.view === 'timeline' && item.pinned }">
+                <button class="activity-row" type="button"
+                        @click="openActivityEvent(item)"
+                        :class="item.state
+                          + (activityIsUnreadResult(item) ? ' is-unread' : '')
+                          + (activityRequiresAction(item) ? ' requires-action' : '')">
+                  <span class="activity-state-dot"></span>
+                  <span class="activity-row-main">
+                    <strong x-text="item.task_summary || item.session_name"></strong>
+                    <small><span x-text="item.workspace_name"></span><span x-show="item.session_name"> · <span x-text="item.session_name"></span></span><span x-show="item.status_detail"> · <span x-text="item.status_detail"></span></span></small>
+                  </span>
+                  <span class="activity-row-side"><span x-text="activityStateLabel(item.state)"></span><small x-text="activityTime(item)"></small></span>
+                </button>
+                <button class="activity-pin" type="button"
+                        x-show="activity.view === 'timeline'"
+                        :class="{ active: item.pinned, pending: _activityPinPending[item.id] }"
+                        :disabled="!!_activityPinPending[item.id]"
+                        :aria-pressed="!!item.pinned"
+                        :aria-label="item.pinned ? (lang==='zh' ? '取消置顶' : 'Unpin') : (lang==='zh' ? '置顶任务' : 'Pin task')"
+                        :title="item.pinned ? (lang==='zh' ? '取消置顶' : 'Unpin') : (lang==='zh' ? '置顶任务' : 'Pin task')"
+                        @click.stop="toggleActivityPin(item)">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="17" x2="12" y2="22"/>
+                    <path d="M5 17h14l-1.5-5H6.5L5 17z"/>
+                    <path d="M9 12V5h6v7"/>
+                  </svg>
+                </button>
+              </div>
             </template>
             <button class="activity-group-more" type="button"
                     x-show="activityHiddenCount(group) > 0"

@@ -138,6 +138,38 @@ def test_list_sorts_by_latest_transition_not_storage_position(tmp_path, monkeypa
     assert rows[0]["updated_at"] == 6
 
 
+def test_pin_persists_without_rewriting_activity_time(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    ticks = iter([1, 2, 3, 4, 5])
+    monkeypatch.setattr("backend.activity.time.time", lambda: next(ticks))
+    old = service.start("s1", summary="older task")
+    service.finish("s1", "completed")
+    service.start("s2", summary="newer task")
+    service.finish("s2", "completed")
+
+    revision = service.revision
+    update = service.set_pin(old["id"], True)
+    assert update is not None
+    pinned = update["item"]
+    assert pinned["pinned"] is True
+    assert pinned["updated_at"] == 2
+    assert update["revision"] == service.revision == revision + 1
+    assert update["generation"] == service.generation
+    # The backend remains a chronological ledger. Pin priority belongs only
+    # to the task center's timeline presentation.
+    assert [row["session_id"] for row in service.list()] == ["s2", "s1"]
+
+    restarted = ActivityService(tmp_path)
+    restored = next(row for row in restarted.list() if row["session_id"] == "s1")
+    assert restored["pinned"] is True
+    resumed = restarted.start("s1", summary="same task, next turn")
+    assert resumed["pinned"] is True
+    unpinned = restarted.set_pin(old["id"], False)
+    assert unpinned is not None
+    assert unpinned["item"]["pinned"] is False
+    assert restarted.set_pin("missing", True) is None
+
+
 def test_restart_marks_running_as_failed(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     service.start("s1", summary="long task")
@@ -190,3 +222,42 @@ def test_activity_event_ticket_requires_authentication(client, auth):
     response = client.post("/api/activity/events-ticket", headers=auth)
     assert response.status_code == 200
     assert response.json()["ticket"].startswith("activity.")
+
+
+def test_activity_pin_endpoint_is_authenticated_and_returns_live_envelope(
+    client,
+    auth,
+    tmp_path,
+    monkeypatch,
+):
+    from backend import activity_api
+
+    service = _service(tmp_path, monkeypatch)
+    started = service.start("s1", summary="pin from task center")
+    service.finish("s1", "completed")
+    monkeypatch.setattr(activity_api, "activity", service)
+
+    denied = client.patch(
+        f"/api/activity/{started['id']}",
+        json={"pinned": True},
+    )
+    assert denied.status_code == 401
+
+    missing = client.patch(
+        "/api/activity/missing",
+        headers=auth,
+        json={"pinned": True},
+    )
+    assert missing.status_code == 404
+
+    response = client.patch(
+        f"/api/activity/{started['id']}",
+        headers=auth,
+        json={"pinned": True},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["item"]["pinned"] is True
+    assert payload["revision"] == service.revision
+    assert payload["generation"] == service.generation

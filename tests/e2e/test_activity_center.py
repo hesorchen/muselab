@@ -30,6 +30,7 @@ def _login(page: Page, base: str, token: str) -> None:
 
 
 def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_token):
+    page.add_init_script("localStorage.removeItem('muselab_activity_view')")
     _login(page, backend_url, auth_token)
     page.wait_for_function(
         """() => {
@@ -42,6 +43,55 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
 
     page.locator(".activity-center-btn").click()
     expect(page.locator(".activity-modal")).to_be_visible()
+    expect(page.locator(".activity-view-switch button").nth(1)).to_have_class(
+        "active"
+    )
+
+    pin_requests: list[dict] = []
+
+    def patch_pin(route):
+        request = route.request.post_data_json
+        pin_requests.append(request)
+        pinned = bool(request["pinned"])
+        revision = 3 + len(pin_requests)
+        summary = {
+            "generation": "e2e-generation",
+            "revision": revision,
+            "running": 1,
+            "unread": 0,
+            "attention": 0,
+            "groups": {"review": 0, "running": 1, "failed": 1, "history": 1},
+            "group_unread": {"review": 0, "running": 0, "failed": 0, "history": 0},
+            "workspaces": [],
+        }
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "ok": True,
+                "generation": "e2e-generation",
+                "revision": revision,
+                "item": {
+                    "kind": "turn",
+                    "workspace": "/tmp/e2e",
+                    "workspace_name": "e2e",
+                    "session_name": "Activity test",
+                    "status_detail": "",
+                    "read": True,
+                    "id": "older",
+                    "session_id": "older-session",
+                    "task_summary": "Older completed task",
+                    "state": "completed",
+                    "started_at": 10,
+                    "finished_at": 100,
+                    "updated_at": 100,
+                    "pinned": pinned,
+                },
+                "summary": summary,
+            }),
+        )
+
+    page.route("**/api/activity/older", patch_pin)
 
     page.evaluate(
         """() => {
@@ -54,6 +104,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
             status_detail: '',
             read: true,
           };
+          app.activity.events = [];
+          app.activity.expanded = {};
           app._applyActivityUpdate({
             generation: 'e2e-generation',
             revision: 1,
@@ -138,13 +190,9 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
               updated_at: 90 - index,
             });
           }
-          app.setActivityView('timeline');
         }"""
     )
 
-    expect(page.locator(".activity-view-switch button").nth(1)).to_have_class(
-        "active"
-    )
     labels = page.locator(".activity-group .activity-row strong")
     expect(labels).to_have_count(10)
     assert labels.all_text_contents()[:3] == [
@@ -152,6 +200,32 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
         "Newer failed task",
         "Older completed task",
     ]
+
+    older = page.locator(".activity-row-wrap").filter(
+        has_text="Older completed task"
+    )
+    pin = older.locator(".activity-pin")
+    expect(pin).to_have_attribute("aria-pressed", "false")
+    pin.click()
+    expect(pin).to_be_enabled()
+    expect(pin).to_have_attribute("aria-pressed", "true")
+    assert labels.all_text_contents()[:3] == [
+        "Older completed task",
+        "Newest running task",
+        "Newer failed task",
+    ]
+    expect(page.locator(".activity-modal")).to_be_visible()
+
+    pin.click()
+    expect(pin).to_be_enabled()
+    expect(pin).to_have_attribute("aria-pressed", "false")
+    assert labels.all_text_contents()[:3] == [
+        "Newest running task",
+        "Newer failed task",
+        "Older completed task",
+    ]
+    assert pin_requests == [{"pinned": True}, {"pinned": False}]
+
     more = page.locator(".activity-group-more")
     expect(more).to_have_text("2 more")
     more.click()

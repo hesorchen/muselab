@@ -327,6 +327,26 @@ class ActivityService:
             "summary": summary,
         }
 
+    def set_pin(self, event_id: str, pinned: bool) -> dict[str, Any] | None:
+        """Persist a pin and return the exact ledger revision it belongs to."""
+        with self._lock:
+            item = next(
+                (row for row in self._events if row.get("id") == event_id),
+                None,
+            )
+            if item is None:
+                return None
+            target = bool(pinned)
+            if bool(item.get("pinned")) != target:
+                item["pinned"] = target
+                self._save()
+                self._publish_locked(item=item)
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "item": dict(item),
+            }
+
     def ack(self, event_id: str | None = None, *, sid: str | None = None) -> int:
         changed = 0
         acked_ids: list[str] = []
