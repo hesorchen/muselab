@@ -77,6 +77,115 @@ def test_directory_can_be_mentioned_from_search_and_tree_action(
     }
 
 
+def test_symlink_outside_workspace_error_is_actionable(
+        page: Page, backend_url, auth_token):
+    def reject_outside_link(route) -> None:
+        route.fulfill(
+            status=400,
+            content_type="application/json",
+            body='{"detail":"path escapes root"}',
+        )
+
+    page.route("**/api/files/list?path=outside-link*", reject_outside_link)
+    _login(page, backend_url, auth_token)
+    message = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          app.childCache = {};
+          const node = {
+            path: 'outside-link', name: 'outside-link', is_dir: true, depth: 0,
+          };
+          app.visible = [node];
+          app.expanded = new Set();
+          app.toasts = [];
+          await app.expand(node);
+          return app.toasts.at(-1)?.msg || '';
+        }"""
+    )
+    assert "不在当前工作区或已添加的工作区中" in message
+    assert "先把目标目录添加为工作区" in message
+    assert "{\"detail\"" not in message
+
+
+def test_chat_file_path_falls_back_to_unique_name_and_disambiguates(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const filename = 'f4_seq_features_16d_spec.md';
+          const requested = `docs/${filename}`;
+          const write = async (path, content) => {
+            const response = await fetch('/api/files/write', {
+              method: 'PUT',
+              headers: {...app.fileHdr(), 'Content-Type': 'application/json'},
+              body: JSON.stringify({path, content}),
+            });
+            if (!response.ok) throw new Error(await response.text());
+          };
+
+          app.toasts = [];
+          const chooserCalls = [];
+          const realChooseOne = app.chooseOne;
+          app.chooseOne = async options => {
+            chooserCalls.push(options.choices.map(choice => choice.value).sort());
+            return options.choices.find(choice => choice.value.startsWith('src/'))?.value;
+          };
+          try {
+            // The model supplied docs/<name>, while the only file lives under
+            // a differently named directory. Unique basename is safe to open.
+            await write(`test/${filename}`, 'UNIQUE_BASENAME_TARGET');
+            await app.openByPathToasted(requested);
+            const unique = {selected: app.selected, rawText: app.rawText};
+
+            // Once another same-name file exists, never guess: expose both
+            // complete paths and respect the explicit choice.
+            await write(`src/${filename}`, 'DISAMBIGUATED_TARGET');
+            await app.openByPathToasted(requested);
+            const ambiguous = {selected: app.selected, rawText: app.rawText};
+
+            // A full suffix match is stronger than basename-only candidates
+            // and should open directly without another chooser.
+            await write(`sandbox/docs/${filename}`, 'SUFFIX_TARGET');
+            await app.openByPathToasted(requested);
+            const suffix = {selected: app.selected, rawText: app.rawText};
+            return {
+              unique,
+              ambiguous,
+              suffix,
+              chooserCalls,
+              notFound: app.toasts.some(toast =>
+                String(toast.msg || '').includes('文件不存在')
+                || String(toast.msg || '').includes('Not found')),
+            };
+          } finally {
+            app.chooseOne = realChooseOne;
+          }
+        }"""
+    )
+
+    assert result == {
+        "unique": {
+            "selected": "test/f4_seq_features_16d_spec.md",
+            "rawText": "UNIQUE_BASENAME_TARGET",
+        },
+        "ambiguous": {
+            "selected": "src/f4_seq_features_16d_spec.md",
+            "rawText": "DISAMBIGUATED_TARGET",
+        },
+        "suffix": {
+            "selected": "sandbox/docs/f4_seq_features_16d_spec.md",
+            "rawText": "SUFFIX_TARGET",
+        },
+        "chooserCalls": [[
+            "src/f4_seq_features_16d_spec.md",
+            "test/f4_seq_features_16d_spec.md",
+        ]],
+        "notFound": False,
+    }
+
+
 def test_external_file_changes_refresh_tree_without_manual_reload(
         page: Page, backend_url, auth_token):
     """Direct API mutations stand in for Agent/terminal writes and deletes."""

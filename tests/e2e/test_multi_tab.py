@@ -147,6 +147,127 @@ def test_composer_drafts_are_isolated_between_tabs(page: Page, backend_url, auth
     expect(textarea).to_have_value("draft-b")
 
 
+def test_pending_send_text_survives_hard_refresh(
+        page: Page, backend_url, auth_token):
+    """The composer is visually cleared before the ticket resolves. A refresh
+    in that exact no-response window must recover the submitted text."""
+    _login(page, backend_url, auth_token)
+    marker = "refresh-safe-pending-send"
+    textarea = page.locator(".chat-input-textarea")
+    textarea.fill(marker)
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (url, init) => {
+            if (String(url).includes('/api/chat/stream/start')) {
+              return new Promise(() => {});
+            }
+            return originalFetch(url, init);
+          };
+          void app.send();
+        }"""
+    )
+    page.wait_for_function(
+        """([marker]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const store = JSON.parse(localStorage.getItem(
+            'muselab_chat_drafts_v1') || '{}');
+          return app.streaming && app.input === ''
+            && store.drafts?.[app.currentId]?.pending === marker;
+        }""",
+        arg=[marker],
+    )
+    page.reload(wait_until="domcontentloaded")
+    expect(page.locator(SEL_TABS)).to_be_visible(timeout=5000)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          return app && app.authed && app._sessionsInitialized && app.currentId;
+        }"""
+    )
+    restored = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            input: app.input,
+            currentId: app.currentId,
+            stateDraft: app.tabState[app.currentId]?.draft?.input,
+            store: JSON.parse(localStorage.getItem(
+              'muselab_chat_drafts_v1') || '{}'),
+          };
+        }"""
+    )
+    assert restored["input"] == marker, restored
+    expect(page.locator(".chat-input-textarea")).to_have_value(marker)
+
+
+def test_ticket_failure_restores_draft_and_idle_state(
+        page: Page, backend_url, auth_token):
+    attempts = 0
+
+    def reject_ticket(route) -> None:
+        nonlocal attempts
+        attempts += 1
+        route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"detail":"ticket unavailable"}',
+        )
+
+    page.route("**/api/chat/stream/start", reject_ticket)
+    _login(page, backend_url, auth_token)
+    marker = "ticket-failure-recovered"
+    page.locator(".chat-input-textarea").fill(marker)
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.pendingImages.push({
+            id: 'recover-image', mime: 'image/png', preview: 'data:image/png;base64,',
+            uploading: false, error: false,
+          });
+          app.pendingDocs.push({
+            id: 'recover-doc', name: 'recover.txt', kind: 'text',
+            uploading: false, error: false,
+          });
+        }"""
+    )
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const returned = await app.send();
+          const record = app._chatDraftRecord(app.currentId);
+          return {
+            returned,
+            input: app.input,
+            streaming: app.streaming,
+            pending: record.pending,
+            storedText: record.text,
+            imageIds: app.pendingImages.map(item => item.id),
+            docIds: app.pendingDocs.map(item => item.id),
+            bubbleCount: app.messages.filter(
+              m => m.role === 'user' && m.text === 'ticket-failure-recovered'
+            ).length,
+            hasToast: app.toasts.some(t => t.msg.includes('发送失败')
+              || t.msg.includes('Send failed')),
+          };
+        }"""
+    )
+    assert attempts == 2
+    assert result == {
+        "returned": False,
+        "input": marker,
+        "streaming": False,
+        "pending": "",
+        "storedText": marker,
+        "imageIds": ["recover-image"],
+        "docIds": ["recover-doc"],
+        "bubbleCount": 0,
+        "hasToast": True,
+    }
+    assert not page.locator("#jserr").is_visible()
+
+
 def test_upload_completion_stays_with_starting_tab(page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
     sid_a = page.evaluate(

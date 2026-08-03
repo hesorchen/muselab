@@ -1316,6 +1316,13 @@ function portal() {
         }
         localStorage.removeItem(oldK);
       }
+      // `pagehide` is bfcache-friendly (unlike an unconditional
+      // beforeunload handler) and still fires for browser refresh/PWA close.
+      // Flush the current composer synchronously so even a refresh immediately
+      // after the last keystroke keeps the draft.
+      window.addEventListener("pagehide", () => {
+        this._captureComposerState(this.currentId);
+      });
       this.initTheme();
       this.initLang();
       this.initMascot();
@@ -4402,20 +4409,28 @@ function portal() {
       this.openByPathToasted(p);
     },
 
-    // Fallback resolver for chat-link clicks whose path doesn't resolve
-    // workspace-relative. Searches the workspace by basename and returns every
-    // ROOT-relative path whose full path ends with the clicked path (same
-    // file, just a missing prefix). Caller decides: 0 → not-found toast,
+    // Fallback resolver for chat-link clicks whose path doesn't resolve from
+    // the workspace root. Prefer candidates whose full path ends with the
+    // clicked path (only a prefix is missing). If none do, fall back to every
+    // exact-basename match: models often preserve the filename but hallucinate
+    // or omit its parent directory. Caller decides: 0 → not-found toast,
     // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
-    async _findBySuffix(path, name, requestHeaders = this.fileHdr()) {
+    async _findChatFileCandidates(path, name, requestHeaders = this.fileHdr()) {
       try {
-        const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
+        const r = await fetch("/api/files/search?q=" + encodeURIComponent(name)
+          + "&exact=true&limit=200",
           { headers: requestHeaders });
         if (!r.ok) return [];
         const d = await r.json();
-        const suffix = "/" + path.replace(/^\/+/, "");
-        return (d.entries || []).filter(e =>
-          !e.is_dir && e.name === name && ("/" + e.path).endsWith(suffix));
+        const requested = String(path || "").replace(/\\/g, "/")
+          .replace(/^\.\//, "").replace(/^\/+/, "");
+        const suffix = "/" + requested;
+        const wantedName = String(name || "").toLowerCase();
+        const exactNameMatches = (d.entries || []).filter(e =>
+          !e.is_dir && String(e.name || "").toLowerCase() === wantedName);
+        const suffixMatches = exactNameMatches.filter(e =>
+          ("/" + String(e.path || "").replace(/\\/g, "/")).endsWith(suffix));
+        return suffixMatches.length ? suffixMatches : exactNameMatches;
       } catch (_) { return []; }
     },
 
@@ -4464,11 +4479,11 @@ function portal() {
         // Direct ROOT-relative lookup missed. The model commonly emits a path
         // relative to a subdirectory of the workspace root (e.g. "learning/x.html"
         // when the file actually lives at "claude_space/learning/x.html").
-        // Search the workspace by basename and accept a UNIQUE hit whose full
-        // path ends with the clicked path — same file, just a missing prefix.
-        // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
+        // Search by exact basename. Full-path suffix matches win; when the
+        // model got the directory wrong, a unique basename is still safe to
+        // open. Multiple candidates always go through explicit disambiguation.
         if (!hit) {
-          const matches = await this._findBySuffix(path, name, requestHeaders);
+          const matches = await this._findChatFileCandidates(path, name, requestHeaders);
           if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           let resolved = "";
           if (matches.length === 1) {
@@ -4755,6 +4770,125 @@ function portal() {
       }
     },
 
+    // Chat drafts are browser-local and session-scoped. Keep the text in a
+    // small standalone store instead of muselab_prefs so a hard refresh can
+    // recover what the user was typing without serialising File objects or
+    // short-lived upload handles. `pending` is a tiny outbox: while the
+    // stream ticket/SSE handshake is still in flight the composer is visually
+    // cleared, but the submitted text remains recoverable until onopen proves
+    // that the backend accepted the turn.
+    _chatDraftStoreKey: "muselab_chat_drafts_v1",
+    _chatDraftStore() {
+      const stored = this._getLSJson(this._chatDraftStoreKey, null);
+      if (!stored || stored.schema !== 1 || !stored.drafts
+          || typeof stored.drafts !== "object" || Array.isArray(stored.drafts)) {
+        return { schema: 1, drafts: {} };
+      }
+      return stored;
+    },
+    _chatDraftRecord(id) {
+      if (!id) return { text: "", pending: "", updatedAt: 0 };
+      const raw = this._chatDraftStore().drafts[id];
+      if (!raw || typeof raw !== "object") {
+        return { text: "", pending: "", updatedAt: 0 };
+      }
+      return {
+        text: typeof raw.text === "string" ? raw.text : "",
+        pending: typeof raw.pending === "string" ? raw.pending : "",
+        updatedAt: Number(raw.updatedAt) || 0,
+      };
+    },
+    _writeChatDraftRecord(id, record) {
+      if (!id) return false;
+      const store = this._chatDraftStore();
+      const drafts = { ...store.drafts };
+      const text = typeof record.text === "string" ? record.text : "";
+      const pending = typeof record.pending === "string" ? record.pending : "";
+      if (text || pending) {
+        drafts[id] = { text, pending, updatedAt: Date.now() };
+      } else {
+        delete drafts[id];
+      }
+      // A closed tab keeps its draft, but bound abandoned entries so stale
+      // session ids can never consume localStorage indefinitely.
+      const ids = Object.keys(drafts);
+      if (ids.length > 100) {
+        ids.sort((a, b) => (Number(drafts[b]?.updatedAt) || 0)
+          - (Number(drafts[a]?.updatedAt) || 0));
+        for (const staleId of ids.slice(100)) delete drafts[staleId];
+      }
+      return this._setLS(this._chatDraftStoreKey, JSON.stringify({
+        schema: 1, drafts,
+      }));
+    },
+    _mergeChatDraftText(first, second) {
+      first = typeof first === "string" ? first : "";
+      second = typeof second === "string" ? second : "";
+      if (!first || first === second) return second || first;
+      if (!second) return first;
+      return first + "\n\n" + second;
+    },
+    _cancelChatDraftTimer(id) {
+      if (!id || !this._chatDraftTimers || !this._chatDraftTimers[id]) return;
+      clearTimeout(this._chatDraftTimers[id]);
+      delete this._chatDraftTimers[id];
+    },
+    _persistChatDraft(id, text) {
+      if (!id) return false;
+      this._cancelChatDraftTimer(id);
+      const record = this._chatDraftRecord(id);
+      record.text = typeof text === "string" ? text : "";
+      return this._writeChatDraftRecord(id, record);
+    },
+    _schedulePersistChatDraft(id, text) {
+      if (!id) return;
+      if (!this._chatDraftTimers) this._chatDraftTimers = {};
+      clearTimeout(this._chatDraftTimers[id]);
+      const snapshot = typeof text === "string" ? text : "";
+      this._chatDraftTimers[id] = setTimeout(() => {
+        delete this._chatDraftTimers[id];
+        this._persistChatDraft(id, snapshot);
+      }, 120);
+    },
+    _stageChatRecoveryDraft(id, text) {
+      if (!id || typeof text !== "string" || !text) return;
+      this._cancelChatDraftTimer(id);
+      const record = this._chatDraftRecord(id);
+      record.pending = this._mergeChatDraftText(record.pending, text);
+      if (record.text === text) record.text = "";
+      this._writeChatDraftRecord(id, record);
+    },
+    _commitChatRecoveryDraft(id, text) {
+      if (!id || typeof text !== "string" || !text) return;
+      const record = this._chatDraftRecord(id);
+      if (record.pending === text) {
+        record.pending = "";
+        this._writeChatDraftRecord(id, record);
+      }
+    },
+    _consumePersistedChatDraft(id) {
+      const record = this._chatDraftRecord(id);
+      const recovered = this._mergeChatDraftText(record.pending, record.text);
+      if (record.pending) {
+        record.text = recovered;
+        record.pending = "";
+        this._writeChatDraftRecord(id, record);
+      }
+      return recovered;
+    },
+    _resolveChatRecoveryDraft(id, text) {
+      if (!id) return;
+      this._cancelChatDraftTimer(id);
+      this._writeChatDraftRecord(id, {
+        text: typeof text === "string" ? text : "", pending: "",
+      });
+    },
+    _deletePersistedChatDraft(id) {
+      if (!id) return;
+      this._cancelChatDraftTimer(id);
+      this._writeChatDraftRecord(id, { text: "", pending: "" });
+    },
+
     // Convenience: bilingual error toast for common "<verb> failed: <body>"
     // patterns. Call sites used to inline `this.toast("保存失败：" + …, "error")`
     // which gave English users a Chinese-only message. Pass the verb key
@@ -4878,6 +5012,7 @@ function portal() {
       // Best-effort: persist current state first in case savePrefs hasn't
       // run recently (e.g. user has been streaming for a while and prefs
       // didn't change). Cheap, idempotent.
+      try { this._captureComposerState(this.currentId); } catch (_) {}
       try { this.savePrefs(); } catch (_) {}
       this.toast(this.lang === "zh" ? "正在刷新…" : "Reloading…", "info", 1500);
       // Slight delay lets the toast render before the page tears down.
@@ -6180,10 +6315,14 @@ function portal() {
         // Newer half of the bounded bidirectional window. Chronological order is
         // always: _earlierMessages + messages + _laterMessages.
         _laterMessages: [],
-        // Composer state is intentionally memory-only. Closing/deleting the tab
-        // drops this object; savePrefs never serializes it, so refresh does too.
+        // Attachments/controllers stay memory-only; text is restored from the
+        // browser-local per-session draft store by _ensureTabState().
         draft: {
           input: "",
+          // False until _activateComposerState mirrors this slot into the
+          // root textarea. Prevents a second refresh during cold boot from
+          // copying the still-empty root input over a recovered draft.
+          _activated: false,
           pendingImages: [],
           pendingDocs: [],
           _historyIndex: -1,
@@ -6344,6 +6483,7 @@ function portal() {
       if (!this.tabState[id]) {
         this.tabState[id] = this._blankTabState();
         this.tabState[id]._sid = id;
+        this.tabState[id].draft.input = this._consumePersistedChatDraft(id);
         // The queue now lives server-side (sessions/{sid}.queue.json). We do
         // NOT pull it here — _ensureTabState is called synchronously all over
         // the place and shouldn't fire a fetch each time. The queue mirror is
@@ -7117,18 +7257,21 @@ function portal() {
       }
     },
 
-    _captureComposerState(id = this.currentId) {
+    _captureComposerState(id = this.currentId, { persist = true } = {}) {
       if (!id || id !== this.currentId) return;
       const st = this.tabState && this.tabState[id];
       if (!st || !st.draft) return;
+      if (st.draft._activated === false) return;
       st.draft.input = this.input || "";
       st.draft.pendingImages = this.pendingImages || [];
       st.draft.pendingDocs = this.pendingDocs || [];
       st.draft._sendWaitingForUpload = !!this._sendWaitingForUpload;
+      if (persist) this._persistChatDraft(id, st.draft.input);
     },
     _activateComposerState(id) {
       const st = this._ensureTabState(id);
       const draft = st.draft;
+      draft._activated = true;
       this.input = draft.input || "";
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
@@ -7314,6 +7457,15 @@ function portal() {
         this.connState = "reconnecting";
         return false;
       }
+      // An empty session can be recycled server-side while the browser is
+      // refreshing (especially after a send failed before its turn existed).
+      // Preserve the old landing tab's local text before choosing/creating a
+      // replacement id, then move it to that replacement below.
+      const previousId = this.currentId;
+      const previousState = previousId && this.tabState[previousId];
+      const previousDraft = previousState && previousState.draft
+        ? (previousState.draft.input || "")
+        : (previousId ? this._consumePersistedChatDraft(previousId) : "");
       const inWorkspace = this.workspaceSessions();
       const remembered = this.workspaceLastSession[this.currentWorkspacePath()];
       if (!inWorkspace.length) {
@@ -7339,6 +7491,14 @@ function portal() {
           ...this.workspaceLastSession,
           [this.currentWorkspacePath()]: this.currentId,
         };
+      }
+      if (previousId && previousId !== this.currentId && previousDraft) {
+        const landingState = this._ensureTabState(this.currentId);
+        landingState.draft.input = this._mergeChatDraftText(
+          previousDraft, landingState.draft.input || "",
+        );
+        this._persistChatDraft(this.currentId, landingState.draft.input);
+        this._deletePersistedChatDraft(previousId);
       }
       // [resident-panes] Seed the LRU with the landing tab only. Other restored
       // tabs lazy-mount on first switch (rebuild path), so a multi-tab restore
@@ -11172,6 +11332,7 @@ function portal() {
       const deletedIds = new Set((resp && resp.ids) || []);
       for (const sid of deletedIds) {
         this._disposeTabRuntime(sid);
+        this._deletePersistedChatDraft(sid);
       }
       this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
       await this.refreshSessions();
@@ -14147,6 +14308,7 @@ function portal() {
         return false;
       }
       this._disposeTabRuntime(sid);
+      this._deletePersistedChatDraft(sid);
       await this.refreshSessions();
       this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
       if (this.currentId === sid) {
@@ -15890,7 +16052,15 @@ function portal() {
             stale.staleWorkspace = true;
             throw stale;
           }
-          throw new Error(detail || `HTTP ${r.status}`);
+          let parsedDetail = detail;
+          try {
+            const parsed = JSON.parse(detail);
+            parsedDetail = parsed && (parsed.detail || parsed.error) || detail;
+          } catch (_) {}
+          const error = new Error(parsedDetail || `HTTP ${r.status}`);
+          error.status = r.status;
+          error.detail = parsedDetail;
+          throw error;
         }
         const d = await r.json();
         if (!isOwner()) {
@@ -16126,6 +16296,19 @@ function portal() {
         this.savePrefs();
       }
     },
+    _fileTreeOpenError(path, error) {
+      const detail = String((error && (error.detail || error.message)) || "").trim();
+      const displayPath = "/" + String(path || "").replace(/^\/+/, "");
+      if (detail === "path escapes root") {
+        return this.lang === "zh"
+          ? `无法打开 ${displayPath}：该目录的实际位置不在当前工作区或已添加的工作区中。若这是软链接，请先把目标目录添加为工作区。`
+          : `Could not open ${displayPath}: its resolved location is outside the current or registered workspaces. If this is a symlink, add its target directory as a workspace first.`;
+      }
+      if (this.lang === "zh") {
+        return `无法打开 ${displayPath}${detail ? "：" + detail : ""}`;
+      }
+      return `Could not open ${displayPath}${detail ? ": " + detail : ""}`;
+    },
     async expand(n, opts = {}) {
       // Idempotency guard (both sides of the await): two concurrent reveals
       // — e.g. a fire-and-forget revealInTree racing an awaited one after a
@@ -16149,8 +16332,7 @@ function portal() {
       } catch (e) {
         if (!opts.quiet && !e.staleWorkspace
             && isCurrent()) {
-          this.toast(this.lang === "zh"
-            ? `无法展开 /${n.path}` : `Could not open /${n.path}`, "error", 3000);
+          this.toast(this._fileTreeOpenError(n.path, e), "error", 6000);
         }
         return false;
       }
@@ -21464,6 +21646,7 @@ function portal() {
           // Drop the old session's tab + cached state, then open a fresh one
           // in its slot. newSession() handles tabState + openTabIds + switch.
           this._disposeTabRuntime(oldId);
+          this._deletePersistedChatDraft(oldId);
           this.openTabIds = this.openTabIds.filter(x => x !== oldId);
           await this.newSession();
           this.toast(this.t("slash.cleared"), "success", 1500);
@@ -21988,6 +22171,8 @@ function portal() {
       // A real edit forks away from the recalled entry. Programmatic history
       // navigation updates x-model directly and does not emit an input event.
       this._resetChatInputHistory();
+      this._captureComposerState(this.currentId, { persist: false });
+      this._schedulePersistChatDraft(this.currentId, this.input || "");
       const ta = ev.target;
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
@@ -22449,8 +22634,11 @@ function portal() {
       const composerDocs = sendDraft.pendingDocs.slice();
       const ownsSendDraft = () => this.tabState[sendSid] === sendState
         && sendState.draft === sendDraft;
-      const clearSubmittedComposer = () => {
+      const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) => {
         if (!ownsSendDraft()) return;
+        if (preserveForHandshake) {
+          this._stageChatRecoveryDraft(sendSid, composerText);
+        }
         if (sendDraft.input === composerText) sendDraft.input = "";
         this._resetChatInputHistory(sendDraft);
         const removeOwned = (items, sent) => {
@@ -22460,6 +22648,10 @@ function portal() {
         };
         removeOwned(sendDraft.pendingImages, new Set(composerImages));
         removeOwned(sendDraft.pendingDocs, new Set(composerDocs));
+        // Clearing the visible composer must not clear the durable backup
+        // until the SSE handshake succeeds. A newer draft typed during an
+        // await is persisted alongside that pending outgoing text.
+        this._persistChatDraft(sendSid, sendDraft.input);
         if (sendSid === this.currentId) {
           this._activateComposerState(sendSid);
           this.$nextTick(() => {
@@ -22548,6 +22740,7 @@ function portal() {
             sendDraft.input = "";
             this._resetChatInputHistory(sendDraft);
             if (this.currentId === sendSid) this.input = "";
+            this._persistChatDraft(sendSid, "");
           }
           this.$nextTick(() => { if (this.currentId === sendSid && this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
           await this._runSlash(m[1], m[2] || "");
@@ -22716,7 +22909,7 @@ function portal() {
       if (!isReconnect && !resumed) {
         // Remove only the captured payload; a newer draft typed during an await
         // stays in the still-global Phase 1 composer.
-        clearSubmittedComposer();
+        clearSubmittedComposer({ preserveForHandshake: true });
         this.$nextTick(() => {
           if (this.currentId !== sendSid) return;
           const ta = this.$refs.chatInput;
@@ -22871,18 +23064,73 @@ function portal() {
         });
         return tr;
       };
-      // Stop pressed while the ticket POST was still in flight: no backend turn
-      // was ever created, so the optimistic user bubble is a lie — it would sit
-      // in the transcript forever, unanswered and unrecoverable (a reload drops
-      // it because the server never persisted it). Roll the send back to the
-      // composer so the text stays editable and re-sendable.
-      const discardCancelledSend = () => {
+      // Restore a failed outgoing text without overwriting anything typed
+      // while the request was in flight. Attachments can be restored only
+      // before the ticket is consumed; their browser File/upload handles are
+      // deliberately not serialised across a page reload.
+      let submittedDraftRestored = false;
+      const restoreSubmittedComposer = (restoreAttachments = false) => {
+        if (isReconnect || resumed || submittedDraftRestored) return;
+        submittedDraftRestored = true;
+        if (ownsSendDraft()) {
+          sendDraft.input = this._mergeChatDraftText(
+            composerText, sendDraft.input || "",
+          );
+          if (restoreAttachments) {
+            const restoreOwned = (items, sent) => {
+              const missing = sent.filter(item => !items.includes(item));
+              if (missing.length) items.unshift(...missing);
+            };
+            restoreOwned(sendDraft.pendingImages, composerImages);
+            restoreOwned(sendDraft.pendingDocs, composerDocs);
+          }
+          this._resolveChatRecoveryDraft(sendSid, sendDraft.input);
+          if (sendSid === this.currentId) this._activateComposerState(sendSid);
+          return;
+        }
+        // The tab may have been closed during the failing request. Preserve
+        // the text in localStorage so reopening the session still recovers it.
+        const persisted = this._chatDraftRecord(sendSid);
+        this._resolveChatRecoveryDraft(sendSid, this._mergeChatDraftText(
+          composerText,
+          this._mergeChatDraftText(persisted.pending, persisted.text),
+        ));
+      };
+      // Stop/ticket failure before EventSource opens means no backend turn was
+      // created. Remove the optimistic bubble, restore the full local payload,
+      // and reset every stream flag/timer without relying on the later-scoped
+      // _markDone closure.
+      const rollbackUnstartedSend = () => {
         if (sentUserBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
           sentUserBubble = null;
         }
-        if (ownsSendDraft() && !sendDraft.input) sendDraft.input = composerText;
-        if (sendSid === this.currentId) this._activateComposerState(sendSid);
+        restoreSubmittedComposer(true);
+        if (streamState._streamTimer) clearInterval(streamState._streamTimer);
+        if (streamState._stallWatch) clearInterval(streamState._stallWatch);
+        streamState._streamTimer = null;
+        streamState._stallWatch = null;
+        streamState._streamStartedAt = 0;
+        streamState.streamElapsed = 0;
+        streamState.streaming = false;
+        streamState._continuationAwaitingReaction = false;
+        streamState.es = null;
+        streamState._streamStartController = null;
+        streamState._cancelBeforeStream = false;
+        streamState._stopping = false;
+        streamState._serverActiveObserved = false;
+        streamState.activeTurnId = "";
+        streamState.parentTurnId = "";
+        streamState.lastEventSeq = 0;
+        streamState.streamingModel = "";
+        if (streamSid === this.currentId) {
+          this.streaming = false;
+          this.es = null;
+          this._streamTimer = null;
+          this._streamStartedAt = 0;
+          this.streamElapsed = 0;
+          this.streamingModel = "";
+        }
       };
       try {
         let tr = await _mintTicket();
@@ -22910,17 +23158,17 @@ function portal() {
         if (streamState._cancelBeforeStream) {
           // stop() already performed the authoritative local cleanup. The
           // ticket was never consumed, so no backend turn/transcript exists.
-          discardCancelledSend();
+          rollbackUnstartedSend();
           return false;
         }
         // Could not mint a ticket (server error / network) — fail the send
         // visibly rather than leaking prompt+token into the URL.
-        this._markDone(streamSid);
+        rollbackUnstartedSend();
         this.toast(this.lang === "zh"
           ? "发送失败：无法建立流式连接，请重试"
           : "Send failed: could not start the stream — please retry",
           "error", 4000);
-        return;
+        return false;
       } finally {
         if (streamState._streamStartController === streamStartController) {
           streamState._streamStartController = null;
@@ -22929,7 +23177,7 @@ function portal() {
       if (streamState._cancelBeforeStream) {
         // Ticket minted but Stop landed first — same rollback. The ticket is
         // never consumed and expires on its own.
-        discardCancelledSend();
+        rollbackUnstartedSend();
         return false;
       }
       const es = new EventSource(url);
@@ -22944,6 +23192,9 @@ function portal() {
       es.onopen = () => {
         streamState._reconnectAttempts = 0;
         streamState._lastSseActivity = Date.now();
+        if (!isReconnect && !resumed) {
+          this._commitChatRecoveryDraft(sendSid, composerText);
+        }
       };
 
       // ── Silent-stall watchdog ──────────────────────────────────────────
@@ -23897,6 +24148,7 @@ function portal() {
           if (!isContinuation) {
             markUserFailed(_detail, d.kind, d.cta, d.retryable);
           }
+          restoreSubmittedComposer(false);
           if (ownsCurBubble()) curBubble.error = _detail;
         }
         // Pass the backend's `cancelled` flag through to _markDone so it
@@ -24061,6 +24313,7 @@ function portal() {
           if (!isContinuation) {
             markUserFailed(serverError, errKind, errCta, errRetryable);
           }
+          restoreSubmittedComposer(false);
           es.close(); _markDone(false, false, true); _stopTimer();
           // Pause auto-drain — same context likely fails the next message
           // too (quota / auth / cross-vendor signature). The failed user

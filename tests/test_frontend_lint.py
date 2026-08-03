@@ -524,6 +524,8 @@ def test_workspace_file_requests_reject_late_previous_owner_results():
     assert "opts.ownerWorkspace || this.fileWorkspacePath()" in children
     assert "this._workspaceIsCurrent(ownerWorkspace)" in children
     assert "stale.staleWorkspace = true" in children
+    assert "parsed.detail || parsed.error" in children
+    assert "error.detail = parsedDetail" in children
     assert "_uniqueFileNodes(nodes)" in app
     assert "ownerWorkspace = this.fileWorkspacePath()" in upload
     assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
@@ -974,6 +976,25 @@ def test_runtime_setting_expected_values_expire_and_accept_remote_truth():
     assert "at: Date.now()" in app[tier_start:tier_end]
 
 
+def test_chat_file_link_fallback_prefers_suffix_then_unique_basename():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    resolver_start = app.index("async _findChatFileCandidates(")
+    resolver_end = app.index("\n    // List-choice variant", resolver_start)
+    resolver = app[resolver_start:resolver_end]
+    open_start = app.index("async openByPathToasted(path)")
+    open_end = app.index("\n    // Open a background-task result", open_start)
+    open_path = app[open_start:open_end]
+
+    assert '"&exact=true&limit=200"' in resolver
+    assert "const exactNameMatches" in resolver
+    assert "const suffixMatches" in resolver
+    assert "suffixMatches.length ? suffixMatches : exactNameMatches" in resolver
+    assert "this._findChatFileCandidates(path, name, requestHeaders)" in open_path
+    assert "matches.length === 1" in open_path
+    assert "matches.length > 1" in open_path
+    assert "await this.chooseOne({" in open_path
+
+
 def test_activity_center_groups_by_attention_order_and_read_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1300,7 +1321,7 @@ def test_send_pins_owner_waits_before_enqueue_and_blocks_failed_attachments():
     assert "const sendDraft = sendState.draft" in send
     assert "const composerImages = sendDraft.pendingImages.slice()" in send
     assert "const composerDocs = sendDraft.pendingDocs.slice()" in send
-    assert "const clearSubmittedComposer = () =>" in send
+    assert "const clearSubmittedComposer = ({ preserveForHandshake = false } = {}) =>" in send
     assert "removeOwned(sendDraft.pendingImages" in send
     busy_branch = "await this._confirmSessionBusy(sendSid, sendState)"
     assert send.index("while (ownsSendDraft() && stillUploading())") < send.rindex(busy_branch)
@@ -1326,9 +1347,11 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert 'pendingImages: []' in blank
     assert 'pendingDocs: []' in blank
     assert '_sendWaitingForUpload: false' in blank
-    assert "_captureComposerState(id = this.currentId)" in app
+    assert '_activated: false' in blank
+    assert "_captureComposerState(id = this.currentId, { persist = true } = {})" in app
     assert "_activateComposerState(id)" in app
     assert "this._activateComposerState(id)" in app
+    assert "if (st.draft._activated === false) return" in app
     assert attach.index("const ownerSid = this.currentId") < attach.index(
         "await this._maybeCompressImage")
     assert "ownerDraft.pendingImages.push(raw)" in attach
@@ -1338,6 +1361,44 @@ def test_composer_draft_is_per_session_and_async_actions_pin_owner():
     assert "ownerState.draft.pendingImages.includes(entry)" in editor
     assert "ownerState.draft.pendingImages.push(entry)" in image_gen
     assert "this.tabState[ownerSid] !== ownerState" in image_gen
+
+
+def test_chat_draft_survives_refresh_and_failed_stream_start():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    send_start = app.index("async send(opts = {})")
+    send = app[send_start:app.index("\n    async stop()", send_start)]
+
+    assert '_chatDraftStoreKey: "muselab_chat_drafts_v1"' in app
+    assert "_consumePersistedChatDraft(id)" in app
+    assert "this.tabState[id].draft.input = this._consumePersistedChatDraft(id)" in app
+    assert 'window.addEventListener("pagehide"' in app
+    assert "this._schedulePersistChatDraft(this.currentId, this.input" in app
+    assert "this._stageChatRecoveryDraft(sendSid, composerText)" in send
+    assert "clearSubmittedComposer({ preserveForHandshake: true })" in send
+    assert "this._commitChatRecoveryDraft(sendSid, composerText)" in send
+    assert "const rollbackUnstartedSend = () =>" in send
+    assert "restoreSubmittedComposer(true)" in send
+    assert "restoreOwned(sendDraft.pendingImages, composerImages)" in send
+    assert "restoreOwned(sendDraft.pendingDocs, composerDocs)" in send
+    assert "this._markDone(streamSid)" not in send
+    assert send.count("restoreSubmittedComposer(false)") >= 2
+    assert "this._deletePersistedChatDraft(sid)" in app
+    assert "const previousDraft = previousState && previousState.draft" in app
+    assert "landingState.draft.input = this._mergeChatDraftText" in app
+
+
+def test_symlink_outside_workspace_has_actionable_tree_error():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_fileTreeOpenError(path, error)")
+    helper = app[start:app.index("\n    async expand(n, opts = {})", start)]
+    expand_start = app.index("async expand(n, opts = {})")
+    expand = app[expand_start:app.index("\n    collapse(n)", expand_start)]
+
+    assert 'detail === "path escapes root"' in helper
+    assert "不在当前工作区或已添加的工作区中" in helper
+    assert "先把目标目录添加为工作区" in helper
+    assert "outside the current or registered workspaces" in helper
+    assert "this._fileTreeOpenError(n.path, e)" in expand
 
 
 def test_queue_edit_does_not_borrow_active_composer_and_prompt_menu_is_removed():
@@ -1353,7 +1414,7 @@ def test_queue_edit_does_not_borrow_active_composer_and_prompt_menu_is_removed()
     assert "editSessionPrompt" not in app
 
 
-def test_tab_disposal_aborts_uploads_and_drops_memory_only_draft():
+def test_tab_disposal_aborts_memory_only_uploads_and_drops_runtime_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("_disposeTabRuntime(id)")
     dispose = app[start:app.index("async removeWorkspace", start)]

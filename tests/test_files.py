@@ -313,6 +313,28 @@ def test_search_by_filename(client, auth):
     assert "README.md" in names
 
 
+def test_search_by_exact_filename_skips_substring_siblings(
+    client,
+    auth,
+    temp_root,
+):
+    nested = temp_root / "test"
+    nested.mkdir()
+    (nested / "f4_seq_features_16d_spec.md").write_text("target\n")
+    (nested / "f4_seq_features_16d_spec.md.bak").write_text("backup\n")
+
+    response = client.get(
+        "/api/files/search",
+        headers=auth,
+        params={"q": "F4_SEQ_FEATURES_16D_SPEC.MD", "exact": "true"},
+    )
+
+    assert response.status_code == 200
+    assert [entry["path"] for entry in response.json()["entries"]] == [
+        "test/f4_seq_features_16d_spec.md",
+    ]
+
+
 def test_grep_content(client, auth):
     r = client.get("/api/files/grep?q=first paragraph", headers=auth)
     hits = r.json()["hits"]
