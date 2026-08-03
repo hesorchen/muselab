@@ -1719,13 +1719,16 @@ def search(
     q: str,
     limit: int = 100,
     show_hidden: bool = False,
+    exact: bool = False,
     root: Path = Depends(_workspace_root),
 ) -> dict:
-    """Filename / dirname substring search. Same `_cached_walk` win as
-    grep — bigger here in relative terms because search only reads
-    names (no file content), so the directory-listing IS the entire
-    cost. Repeat searches over a quiet archive drop from ~200 ms to
-    ~20 ms on a 3000-file tree."""
+    """Filename / dirname search, optionally matching the whole name.
+
+    Uses the same `_cached_walk` win as grep — bigger here in relative
+    terms because search only reads names (no file content), so the
+    directory-listing IS the entire cost. Repeat searches over a quiet
+    archive drop from ~200 ms to ~20 ms on a 3000-file tree.
+    """
     q_lower = q.strip().lower()
     if not q_lower:
         return {"entries": []}
@@ -1733,7 +1736,11 @@ def search(
     for dirpath, dirnames, filenames in _cached_walk(
             root, SEARCH_IGNORE, show_hidden):
         for name in dirnames + filenames:
-            if q_lower in name.lower():
+            name_lower = name.lower()
+            matches_query = (
+                name_lower == q_lower if exact else q_lower in name_lower
+            )
+            if matches_query:
                 full = Path(dirpath) / name
                 try:
                     stat = full.stat()
