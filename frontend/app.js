@@ -24302,7 +24302,13 @@ function portal() {
         // let the queue drain continue.
         if (serverError === "no active turn") {
           es.close(); _markDone(false, false, true); _stopTimer();
-          this.loadSession(streamSid).then(() => {
+          // This is a terminal reconciliation of content that is already on
+          // screen (especially a background continuation whose task-complete
+          // toast just fired), not a cold session open. A normal load flips
+          // messagesReady off and clears/rebuilds the array, producing an
+          // empty/skeleton flash before the same transcript returns. Quiet
+          // mode morphs canonical history into the mounted keyed messages.
+          this.loadSession(streamSid, { quiet: true }).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
           return;
@@ -24399,9 +24405,13 @@ function portal() {
             const d = await r.json();
             if (!d.active) {
               // Backend turn already finished while we were disconnected.
-              // Refresh session from disk to pick up the completed reply.
+              // Refresh session from disk to pick up the completed reply. The
+              // partial/live transcript is already visible, so keep this a
+              // quiet reconciliation rather than flashing a cold-load skeleton.
               _markDone(false, false, true); _stopTimer();
-              if (this.currentId === streamSid) this.loadSession(streamSid);
+              if (this.currentId === streamSid) {
+                this.loadSession(streamSid, { quiet: true });
+              }
               streamState._reconnectAttempts = 0;
               return;
             }

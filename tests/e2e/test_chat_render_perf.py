@@ -2426,6 +2426,224 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
     _assert_no_browser_errors(page, errors)
 
 
+def test_background_completion_no_active_fallback_never_blanks_visible_messages(
+    page: Page, backend_url, auth_token,
+):
+    """A settled continuation may race out of /active after its completion toast."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+
+    sid = "perf-background-completion-no-active"
+    final_text = "BACKGROUND_COMPLETION_REPLY stays mounted"
+    history_requests: list[str] = []
+    canonical_messages = [
+        {
+            "role": "user",
+            "text": "BACKGROUND_COMPLETION_USER",
+            "ts": 1_700_040_000,
+            "uuid": "background-completion-user",
+        },
+        {
+            "role": "assistant",
+            "text": final_text,
+            "ts": 1_700_040_001,
+            "uuid": "background-completion-assistant",
+        },
+        {
+            "role": "tool_use",
+            "name": "Task",
+            "id": "background-completion-tool",
+            "summary": "Background completion fixture",
+            "uuid": "background-completion-tool-uuid",
+            "task_status": {
+                "state": "completed",
+                "task_id": "background-completion-task",
+                "summary": "fixture complete",
+            },
+        },
+    ]
+
+    def delayed_history(route):
+        history_requests.append(route.request.url)
+        # Keep the canonical fetch in flight long enough to observe whether the
+        # already-rendered pane is hidden/cleared behind a cold-load skeleton.
+        time.sleep(0.35)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": sid,
+                "name": "Background completion no-active",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "thinking": True,
+                "messages": canonical_messages,
+                "offset": 0,
+                "total": len(canonical_messages),
+                "has_more": False,
+                "history_generation": "gen-background-completion",
+                "updated_at": 2,
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{sid}?*", delayed_history)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"background-completion-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._syncQueueFromServer = async () => {};
+        app._scheduleIdlePreload = () => {};
+        app.appReady = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.sessions = [{
+          id: sid, name: "Background completion no-active", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        st.messages.push(
+          {
+            role: "user", text: "BACKGROUND_COMPLETION_USER",
+            uuid: "background-completion-user", html: "",
+            _k: `${sid}:live:1`, _noAnim: true,
+          },
+          {
+            role: "assistant", text: arg.finalText,
+            html: `<p>${arg.finalText}</p>`,
+            _k: `${sid}:live:2`, _noAnim: true,
+          },
+          {
+            role: "tool_use", name: "Task", id: "background-completion-tool",
+            summary: "Background completion fixture",
+            task_status: {
+              state: "running", task_id: "background-completion-task",
+            },
+            _k: `${sid}:live:3`, _noAnim: true,
+          },
+        );
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app.mobileTab = "chat";
+        app._activateTabState(sid);
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app.atBottom = true;
+        return new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+        """,
+        {"sid": sid, "finalText": final_text},
+    )
+    expect(page.locator(".msg-pane:visible .msg.assistant")).to_contain_text(
+        final_text, timeout=5000,
+    )
+
+    _app_eval(
+        page,
+        """
+        return app.send({
+          reconnect: true, continuation: true, sessionId: arg,
+          turnId: "background-completion-turn", startedAt: Date.now() / 1000,
+        });
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """() => window.__emitSse("task_notification", {
+          status: "completed",
+          tool_use_id: "background-completion-tool",
+          task_id: "background-completion-task",
+          summary: "fixture complete",
+          background_tasks_pending: 0,
+          turn_id: "background-completion-turn",
+          event_seq: 1,
+        })"""
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          return app.toasts.some(toast => /后台任务已完成|Background task finished/
+            .test(toast.msg || toast.message || ""));
+        }""",
+        timeout=5000,
+    )
+
+    result = page.evaluate(
+        """async ({ sid, finalText }) => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app.tabState[sid];
+          const liveNode = document.querySelector(
+            `.msg[data-message-key="${CSS.escape(`${sid}:live:2`)}"]`);
+          const frames = [];
+          window.__emitSse("error", {
+            error: "no active turn",
+            turn_id: "background-completion-turn",
+            event_seq: 2,
+          });
+          const deadline = performance.now() + 3000;
+          while (!st.messages.some(m => m.uuid === "background-completion-assistant")
+                 && performance.now() < deadline) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const pane = Array.from(document.querySelectorAll(".msg-pane"))
+              .find(el => getComputedStyle(el).display !== "none");
+            const visibleMessages = pane ? Array.from(pane.querySelectorAll(".msg"))
+              .filter(el => getComputedStyle(el).display !== "none") : [];
+            frames.push({
+              ready: app.messagesReady,
+              loading: app.messagesLoading,
+              textVisible: !!pane && pane.textContent.includes(finalText),
+              visibleCount: visibleMessages.length,
+            });
+          }
+          await new Promise(resolve => app.$nextTick(() => requestAnimationFrame(resolve)));
+          const assistant = st.messages.find(
+            m => m.uuid === "background-completion-assistant");
+          const canonicalNode = assistant ? document.querySelector(
+            `.msg[data-message-key="${CSS.escape(assistant._k)}"]`) : null;
+          const finalPane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(el => getComputedStyle(el).display !== "none");
+          return {
+            frames,
+            sameNode: canonicalNode === liveNode,
+            key: assistant?._k || "",
+            finalVisible: !!finalPane && finalPane.textContent.includes(finalText),
+          };
+        }""",
+        {"sid": sid, "finalText": final_text},
+    )
+
+    assert history_requests, "no-active completion fallback did not reload history"
+    assert result["frames"], result
+    assert all(frame["ready"] and not frame["loading"] for frame in result["frames"]), result
+    assert all(frame["textVisible"] and frame["visibleCount"] > 0
+               for frame in result["frames"]), result
+    assert result["sameNode"] is True, result
+    assert result["key"] == f"{sid}:live:2"
+    assert result["finalVisible"] is True, result
+    _assert_no_browser_errors(page, errors)
+
+
 def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_url, auth_token):
     """Mobile files/preview/chat switching and rotation keep long chat usable."""
     errors = _capture_browser_errors(page)

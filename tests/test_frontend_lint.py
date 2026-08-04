@@ -1456,6 +1456,18 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     canonical_reload = app[canonical_start:canonical_end]
     assert "this.loadSession(sid, { quiet: true })" in canonical_reload
     assert "quiet: sid === this.currentId" not in canonical_reload
+    # A continuation can emit its task-complete toast and then race out of the
+    # grace-kept /active slot. Both terminal fallbacks reconcile an already-
+    # rendered pane and must never take the cold-load skeleton/clear path.
+    no_active_start = send.index('if (serverError === "no active turn")')
+    no_active_end = send.index("// ---- Transport-level", no_active_start)
+    assert "this.loadSession(streamSid, { quiet: true })" in send[
+        no_active_start:no_active_end]
+    transport_finished_start = send.index("if (!d.active)", no_active_end)
+    transport_finished_end = send.index(
+        "if (d.background && d.attachable === false)", transport_finished_start)
+    assert "this.loadSession(streamSid, { quiet: true })" in send[
+        transport_finished_start:transport_finished_end]
 
 
 def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
