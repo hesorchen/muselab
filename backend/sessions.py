@@ -1265,7 +1265,8 @@ def set_message_count(sid: str, message_count: int,
 # window between a queue mutation and an annotation write. A dedicated file +
 # lock keeps the two independent.
 #
-# Shape: {"items": [{"id","text","image_ids","permission",
+# Shape: {"items": [{"id","text","display_text","selection_quotes",
+#                    "image_ids","permission",
 #                    "plan_return_permission","enqueued_at"}], "paused": bool}
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
 #   - paused: set True when a queued turn errors / hits ask_user_question /
@@ -1340,6 +1341,8 @@ def get_queue(sid: str) -> dict:
 
 def enqueue_message(sid: str, text: str, image_ids: str = "",
                     permission: str = "",
+                    display_text: str = "",
+                    selection_quotes: list[dict] | None = None,
                     plan_return_permission: str | None = None) -> dict:
     """Append a message to the session's queue. Returns
     {'ok': bool, 'item'?: dict, 'queue': dict, 'error'?: str}. Rejects past
@@ -1355,6 +1358,8 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
         item = {
             "id": "q-" + uuid.uuid4().hex[:8],
             "text": text or "",
+            "display_text": display_text or "",
+            "selection_quotes": selection_quotes or [],
             "image_ids": image_ids or "",
             "permission": permission or "",
             "plan_return_permission": _normalize_plan_return_permission(

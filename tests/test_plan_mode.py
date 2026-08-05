@@ -237,6 +237,12 @@ def test_queue_endpoint_preserves_plan_return_capability(
 ):
     from backend import chat
 
+    # This case deliberately exercises the persisted item through one manual
+    # drain below. Enqueue now schedules an immediate background kick for idle
+    # sessions, so disable that production wakeup here or it can consume the
+    # item before the test installs its fake _start_turn.
+    monkeypatch.setattr(chat, "_schedule_queue_drain", lambda _sid: None)
+
     created = client.post(
         "/api/chat/sessions",
         headers=auth,

@@ -49,6 +49,49 @@ def test_memory_shortcut_opens_memory_settings_page(
     expect(page.locator(".memory-settings-section")).to_be_visible()
 
 
+def test_session_rename_updates_loaded_activity_row_immediately(
+    page: Page, backend_url, auth_token
+):
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const before = app.sessions.find(row => row.id === sid)?.name || '';
+          app.activity.events = [{
+            id: 'rename-target',
+            session_id: sid,
+            session_name: before,
+            task_summary: 'Keep task summary',
+            workspace: app.currentWorkspacePath(),
+            workspace_name: 'e2e',
+            state: 'completed',
+            read: true,
+            started_at: 1,
+            finished_at: 2,
+            updated_at: 2,
+          }];
+          app.renamingPickerSid = sid;
+          app.pickerRenameDraft = 'Renamed activity row';
+          await app.pickerCommitInlineRename();
+          return {
+            sessionName: app.sessions.find(row => row.id === sid)?.name,
+            activityName: app.activity.events[0]?.session_name,
+            taskSummary: app.activity.events[0]?.task_summary,
+            updatedAt: app.activity.events[0]?.updated_at,
+          };
+        }"""
+    )
+
+    assert result == {
+        "sessionName": "Renamed activity row",
+        "activityName": "Renamed activity row",
+        "taskSummary": "Keep task summary",
+        "updatedAt": 2,
+    }
+
+
 def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_token):
     page.add_init_script("localStorage.removeItem('muselab_activity_view')")
     _login(page, backend_url, auth_token)

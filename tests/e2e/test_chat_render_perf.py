@@ -261,6 +261,189 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
     )
 
 
+def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
+    page: Page, backend_url, auth_token,
+):
+    """User/assistant正文 share the preview selection helper safely."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "selection-chat-source"
+    _bootstrap_session_for_real_load(page, sid, "Selection source")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.messages = [
+          {
+            role: "user", text: "USER_SELECTION_MARKER user selected sentence",
+            uuid: "selection-user", _k: "selection-user", _noAnim: true,
+          },
+          {
+            role: "assistant",
+            text: "ASSISTANT_SELECTION_MARKER assistant selected sentence",
+            html: "<p>ASSISTANT_SELECTION_MARKER assistant selected sentence</p>",
+            uuid: "selection-assistant", _k: "selection-assistant", _noAnim: true,
+          },
+        ];
+        st.draft.input = "EXISTING_DRAFT";
+        st.draft.pendingImages = [{
+          id: "keep-image", uploading: false,
+          preview: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+        }];
+        st.draft.pendingDocs = [{ id: "keep-doc", uploading: false }];
+        app._activateTabState(arg);
+        app.mobileTab = "chat";
+        app.lang = "zh";
+        app.availableModels = [{ model: "e2e-model", label: "E2E" }];
+        return true;
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        """sid => document.querySelectorAll(
+          `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg`).length === 2""",
+        arg=sid,
+    )
+
+    def select_text(selector: str) -> None:
+        page.evaluate(
+            """selector => {
+              const node = document.querySelector(selector);
+              if (!node) throw new Error(`missing selection node: ${selector}`);
+              const range = document.createRange();
+              range.selectNodeContents(node);
+              const selection = window.getSelection();
+              selection.removeAllRanges();
+              selection.addRange(range);
+              document.dispatchEvent(new Event('selectionchange'));
+            }""",
+            selector,
+        )
+
+    select_text(
+        f'.msg-pane[data-tid="{sid}"] .msg.assistant .bubble p'
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.previewQuote.show && app.previewQuote.source === 'chat'
+            && app.previewQuote.role === 'assistant';
+        }"""
+    )
+    expect(page.locator(".preview-selection-actions")).to_be_visible()
+    page.locator(".preview-selection-actions button").first.click()
+    quoted = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        return {
+          input: st.draft.input,
+          quotes: st.draft.pendingQuotes.map(item => ({
+            text: item.text, role: item.role, messageId: item.messageId,
+          })),
+          images: st.draft.pendingImages.map(item => item.id),
+          docs: st.draft.pendingDocs.map(item => item.id),
+        };
+        """,
+    )
+    assert quoted["input"] == "EXISTING_DRAFT"
+    assert len(quoted["quotes"]) == 1
+    assert quoted["quotes"][0]["role"] == "assistant"
+    assert quoted["quotes"][0]["messageId"] == "selection-assistant"
+    assert "ASSISTANT_SELECTION_MARKER" in quoted["quotes"][0]["text"]
+    assert quoted["images"] == ["keep-image"]
+    assert quoted["docs"] == ["keep-doc"]
+
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(app.currentId);
+        st.draft.input = "ASK_DRAFT_MUST_SURVIVE";
+        st.draft.pendingQuotes.splice(0);
+        app._activateComposerState(app.currentId);
+        window.__selectionAskOriginalCreate = app._createPreviewSelectionAskSession;
+        app._createPreviewSelectionAskSession = async (snapshot, question) => {
+          const meta = {
+            id: "chat-side-question", name: "Chat side question",
+            model: app.model, permission: "default", active: false,
+            cwd: app.currentWorkspacePath(),
+          };
+          app.sessions = [meta, ...app.sessions.filter(s => s.id !== meta.id)];
+          const child = app._ensureTabState(meta.id);
+          child._loaded = true;
+          window.__selectionAskCreate = {snapshot, question};
+          return meta;
+        };
+        app.send = async opts => {
+          window.__selectionAskSend = opts;
+          const child = app._ensureTabState(opts.sessionId);
+          child.messages.splice(0, child.messages.length,
+            {role: "user", text: opts.detachedText},
+            {role: "assistant", text: "CHAT_SIDE_ANSWER"});
+          child.streaming = false;
+          return true;
+        };
+        """,
+    )
+    select_text(
+        f'.msg-pane[data-tid="{sid}"] .msg.user .user-msg-text'
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.previewQuote.show && app.previewQuote.source === 'chat'
+            && app.previewQuote.role === 'user';
+        }"""
+    )
+    page.locator(".preview-selection-actions button").nth(1).click()
+    ask = page.locator(".preview-selection-ask textarea")
+    expect(ask).to_be_focused()
+    ask.fill("这里的结论为什么成立？")
+    page.locator(".preview-selection-send").click()
+    page.wait_for_function("() => !!window.__selectionAskSend")
+    expect(page.locator(".preview-selection-answer-body")).to_contain_text(
+        "CHAT_SIDE_ANSWER"
+    )
+    sent = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(app.currentId);
+          return {
+            opts: window.__selectionAskSend,
+            create: window.__selectionAskCreate,
+            currentId: app.currentId,
+            draft: st.draft.input,
+            images: st.draft.pendingImages.map(item => item.id),
+            docs: st.draft.pendingDocs.map(item => item.id),
+            popover: app.previewQuote.show,
+            askSessionId: app.previewQuote.askSessionId,
+          };
+        }"""
+    )
+    assert sent["opts"]["sessionId"] == "chat-side-question"
+    assert sent["opts"]["permissionMode"] == "default"
+    assert "引用自我的消息：" in sent["opts"]["detachedText"]
+    assert "USER_SELECTION_MARKER" in sent["opts"]["detachedText"]
+    assert "这里的结论为什么成立？" in sent["opts"]["detachedText"]
+    assert sent["create"]["snapshot"]["sessionId"] == sid
+    assert sent["create"]["snapshot"]["messageId"] == "selection-user"
+    assert sent["currentId"] == sid
+    assert sent["draft"] == "ASK_DRAFT_MUST_SURVIVE"
+    assert sent["images"] == ["keep-image"]
+    assert sent["docs"] == ["keep-doc"]
+    assert sent["popover"] is True
+    assert sent["askSessionId"] == "chat-side-question"
+    _app_eval(
+        page,
+        """
+        app._createPreviewSelectionAskSession = window.__selectionAskOriginalCreate;
+        return true;
+        """,
+    )
+    _assert_no_browser_errors(page, errors)
+
+
 def test_effort_fast_capabilities_and_session_restore(
     page: Page, backend_url, auth_token,
 ):
@@ -2727,6 +2910,100 @@ def test_background_completion_no_active_fallback_never_blanks_visible_messages(
     assert result["sameNode"] is True, result
     assert result["key"] == f"{sid}:live:2"
     assert result["finalVisible"] is True, result
+    _assert_no_browser_errors(page, errors)
+
+
+def test_incomplete_background_continuation_keeps_user_queue_runnable(
+    page: Page, backend_url, auth_token,
+):
+    """A missed auto-reaction is not a failure of the queued user prompt."""
+    errors = _capture_browser_errors(page)
+    _install_fake_event_source(page)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"continuation-queue-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    sid = "continuation-queue-runnable"
+    _bootstrap_session_for_real_load(page, sid, "Continuation queue")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.messages = [{
+          role: "assistant", text: "BACKGROUND RESULT",
+          html: "<p>BACKGROUND RESULT</p>",
+          uuid: "continuation-queue-assistant",
+          _k: "continuation-queue-assistant", _noAnim: true,
+        }];
+        st.pendingQueue = [{
+          id: "queued-user-followup", text: "USER FOLLOWUP",
+          pendingImages: [], pendingDocs: [],
+        }];
+        st._queuePaused = false;
+        app._activateTabState(arg);
+        app.model = "e2e-model";
+        app._syncSessionListQuiet = () => {};
+        app._syncQueueFromServer = async () => {};
+        app._reconcileCompletedContinuation = () => {};
+        app.ackCurrentActivity = () => {};
+        app.highlightCode = async () => {};
+        app._ensureBgContPoller = () => {};
+        app._drainPendingQueue = (drainSid, turnId) => {
+          window.__continuationQueueDrain = { sid: drainSid, turnId };
+        };
+        return true;
+        """,
+        sid,
+    )
+
+    _app_eval(
+        page,
+        """
+        return app.send({
+          reconnect: true, continuation: true, sessionId: arg,
+          turnId: "continuation-queue-turn", startedAt: Date.now() / 1000,
+        });
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """() => window.__emitSse("done", {
+          is_error: true,
+          kind: "background_continuation_incomplete",
+          error: "background task completed but no final auto-reaction arrived",
+          continuation: true,
+          background_tasks_pending: 0,
+          turn_id: "continuation-queue-turn",
+          event_seq: 1,
+        })"""
+    )
+    page.wait_for_function("() => !!window.__continuationQueueDrain")
+    result = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        return {
+          paused: st._queuePaused,
+          pending: st.pendingQueue.map(item => item.text),
+          drain: window.__continuationQueueDrain,
+        };
+        """,
+        sid,
+    )
+    assert result == {
+        "paused": False,
+        "pending": ["USER FOLLOWUP"],
+        "drain": {"sid": sid, "turnId": "continuation-queue-turn"},
+    }
     _assert_no_browser_errors(page, errors)
 
 

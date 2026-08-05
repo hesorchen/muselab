@@ -1048,6 +1048,13 @@ _lock = asyncio.Lock()
 # interactive turn mutex only covers /stream turns; scheduler and /compact
 # also call query()/receive_response() and therefore share this lock.
 _session_runtime_locks: dict[str, asyncio.Lock] = {}
+# Queue drain has a separate per-session mutex. It cannot reuse the runtime
+# lock because _maybe_drain_queue() calls _start_turn(), which acquires that
+# lock while starting/reusing the SDK client. Serialising the higher-level
+# dequeue + launch transaction prevents concurrent completion/enqueue kicks
+# from popping adjacent FIFO items before either reserves _active_turns[sid].
+_queue_drain_locks: dict[str, asyncio.Lock] = {}
+_queue_drain_tasks: dict[str, asyncio.Task] = {}
 # Session settings can change after a turn reserves `_active_turns[sid]` but
 # before its detached query task starts. Disconnecting in that gap kills the
 # freshly selected client. Mark rebuilds and consume them at the next safe SDK
@@ -1057,6 +1064,10 @@ _pending_runtime_rebuilds: set[str] = set()
 
 def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
     return _session_runtime_locks.setdefault(session_id, asyncio.Lock())
+
+
+def _queue_drain_lock_for(session_id: str) -> asyncio.Lock:
+    return _queue_drain_locks.setdefault(session_id, asyncio.Lock())
 
 # ---------------------------------------------------------------------------
 # Cross-turn background tasks (SDK-native run_in_background)
@@ -1094,6 +1105,13 @@ _background_turn_started_at: dict[str, float] = {}
 # Originating user-turn identity retained across the watcher gap. Every
 # continuation gets its own turn_id and exposes this value as parent_turn_id.
 _background_origin_turn_id: dict[str, str] = {}
+# Activity Center completion deferred past the main ResultMessage while an SDK
+# background task still owns the logical turn.  The value is the status the
+# originating turn would have published at its terminal boundary.  The final
+# watcher generation consumes it only after the last task notification and its
+# auto-continuation have both settled, keeping the global running dot aligned
+# with the tab's ``background_active`` dot.
+_background_activity_finishes: dict[str, str] = {}
 # Monotonic per-session ownership token for detached continuation readers.
 # Cancelling a task is cooperative, so a replaced watcher can receive one more
 # message before CancelledError lands. Generation checks keep that stale reader
@@ -3232,8 +3250,11 @@ async def shutdown_runtime() -> None:
         _active_turns.clear()
         _sessions_with_inflight_tasks.clear()
         _bg_task_pinned_at.clear()
+        _background_activity_finishes.clear()
         _task_watchers.clear()
         _maintenance_tasks.clear()
+        _queue_drain_tasks.clear()
+        _queue_drain_locks.clear()
 
     async def _disconnect(client: ClaudeSDKClient) -> None:
         try:
@@ -5120,12 +5141,19 @@ def _clear_session_runtime_state(sid: str) -> None:
     runtime_lock = _session_runtime_locks.get(sid)
     if runtime_lock is not None and not runtime_lock.locked():
         _session_runtime_locks.pop(sid, None)
+    drain_task = _queue_drain_tasks.pop(sid, None)
+    if drain_task is not None and not drain_task.done():
+        drain_task.cancel()
+    drain_lock = _queue_drain_locks.get(sid)
+    if drain_lock is not None and not drain_lock.locked():
+        _queue_drain_locks.pop(sid, None)
     _continuation_generations[sid] = _continuation_generations.get(sid, 0) + 1
     watcher = _task_watchers.pop(sid, None)
     if watcher is not None and not watcher.done():
         watcher.cancel()
     _background_turn_started_at.pop(sid, None)
     _background_origin_turn_id.pop(sid, None)
+    _background_activity_finishes.pop(sid, None)
     task_ids = _sessions_with_inflight_tasks.pop(sid, set())
     for task_id in task_ids:
         _bg_task_descriptions.pop(task_id, None)
@@ -5251,11 +5279,19 @@ async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
 # Queued messages live in sessions/{sid}.queue.json (sess.*_queue helpers),
 # NOT in the browser. The drain trigger in _pump_gen_to_broadcast() pops the
 # head item and starts the next turn whenever a turn finishes — so the queue
-# advances with no browser attached. These endpoints are pure CRUD; the FE
-# uses them to enqueue / inspect / edit / pause the queue.
+# advances with no browser attached. Enqueue also schedules a drain kick: this
+# closes the completion race where the final one-shot drain observes an empty
+# queue just before a stale browser writes its follow-up. Other endpoints are
+# CRUD controls used to inspect / edit / pause the queue.
 # --------------------------------------------------------------------------
 class QueueEnqueueReq(BaseModel):
     text: str = ""
+    # Composer-only presentation fields for selected-text attachments. The
+    # SDK still receives `text` (which contains the readable quote context),
+    # while queued UI can keep the textarea body and removable quote chips
+    # distinct instead of showing an implementation prompt blob.
+    display_text: str = ""
+    selection_quotes: list[dict] | None = None
     image_ids: str = ""
     # Sender's permission mode at enqueue time. Persisted with the item so
     # the headless drain replays the turn under the same mode instead of
@@ -5272,6 +5308,35 @@ class QueuePauseReq(BaseModel):
 
 class QueueReorderReq(BaseModel):
     order: list[str]
+
+
+def _normalize_queue_selection_quotes(raw: list[dict] | None) -> list[dict]:
+    """Bound and shape browser-supplied quote-chip metadata.
+
+    This metadata is presentation-only; `_maybe_drain_queue` sends the already
+    composed `text` field. Keeping it plain and bounded prevents a malformed
+    client from turning the small queue sidecar into an unbounded data store.
+    """
+    normalized: list[dict] = []
+    for item in (raw or [])[:4]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "")[:6000].strip()
+        if not text:
+            continue
+        source = str(item.get("source") or "preview")
+        role = str(item.get("role") or "")
+        normalized.append({
+            "id": str(item.get("id") or "")[:80],
+            "source": source if source in {"preview", "chat"} else "preview",
+            "role": role if role in {"", "user", "assistant"} else "",
+            "sessionId": str(item.get("sessionId") or "")[:80],
+            "messageId": str(item.get("messageId") or "")[:80],
+            "path": str(item.get("path") or "")[:1024],
+            "text": text,
+            "truncated": bool(item.get("truncated")),
+        })
+    return normalized
 
 
 @router.get("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
@@ -5304,7 +5369,7 @@ def get_queue_api(sid: str) -> dict:
 
 
 @router.post("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
-def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
+async def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
     text = (req.text or "").strip()
     if not text and not (req.image_ids or "").strip():
         raise HTTPException(400, "empty message")
@@ -5324,16 +5389,31 @@ def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
             if current.get("permission") == "plan"
             else current.get("permission")
         )
+    selection_quotes = _normalize_queue_selection_quotes(
+        req.selection_quotes)
+    display_text = (
+        req.display_text
+        if selection_quotes
+        else (req.display_text or text)
+    )
     res = sess.enqueue_message(
         sid,
         text,
         req.image_ids or "",
         permission=req.permission or "",
+        display_text=display_text,
+        selection_quotes=selection_quotes,
         plan_return_permission=plan_return_permission,
     )
     if not res.get("ok"):
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
+    # Do not await SDK startup in the HTTP request: an idle/cold session can
+    # take tens of seconds to connect. The scheduled task is retained in the
+    # maintenance registry, coalesced per sid and serialised with every other
+    # drain source. If a turn/watcher still owns the session this is a cheap
+    # no-op; that owner's completion remains the next wakeup.
+    _schedule_queue_drain(sid)
     return res
 
 
@@ -5506,7 +5586,16 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
 
     ok = False
     if req.name is not None:
-        ok = sess.rename_session(sid, req.name) or ok
+        renamed = sess.rename_session(sid, req.name)
+        ok = renamed or ok
+        if renamed:
+            # The task ledger stores one denormalized display name per
+            # conversation.  Keep it in lockstep with the session index and
+            # publish the targeted row over the existing Activity SSE.  This
+            # intentionally preserves task timestamps/read state, so a rename
+            # cannot reorder the task center or make a result unread again.
+            from .activity import activity as _activity
+            await asyncio.to_thread(_activity.rename_session, sid, req.name)
         # Also propagate to CLI's JSONL so list_sessions() / manual claude
         # CLI runs see the new title. Silent no-op if JSONL doesn't exist yet.
         try:
@@ -9106,6 +9195,8 @@ async def _watch_inflight_tasks(
     leave an old continuation buffered for the next user turn to misattribute."""
     cont: TurnBroadcast | None = None
     cont_state: dict | None = None
+    activity_failed = False
+    watcher_cancelled = False
 
     def _owns_generation() -> bool:
         return (generation is None
@@ -9272,6 +9363,7 @@ async def _watch_inflight_tasks(
         transcript rendering/conversation counts by the SDK's `isMeta`
         semantics.
         """
+        nonlocal activity_failed
         if (pending or cont is None or cont_state is None
                 or last_settle_status == "stopped"
                 or cont_state["explicit_resume_requested"]):
@@ -9303,6 +9395,7 @@ async def _watch_inflight_tasks(
             await client.query(_meta_prompt())
             return True
         except Exception as e:
+            activity_failed = True
             cont_state["incomplete_error"] = (
                 "后台任务已经完成，但最终答复续接失败。请发送“继续”让 Muse "
                 f"完成上一轮。（{type(e).__name__}）"
@@ -9313,6 +9406,8 @@ async def _watch_inflight_tasks(
             return False
 
     def _mark_incomplete() -> None:
+        nonlocal activity_failed
+        activity_failed = True
         if cont_state is not None and not cont_state.get("incomplete_error"):
             cont_state["incomplete_error"] = (
                 "后台任务已经完成，但没有生成最终答复。请发送“继续”让 Muse "
@@ -9536,8 +9631,10 @@ async def _watch_inflight_tasks(
         # Shutdown or explicit watcher replacement. Keep pins so a replacement
         # watcher can continue ownership; ordinary new turns never cancel a
         # live watcher.
+        watcher_cancelled = True
         raise
     except asyncio.TimeoutError:
+        activity_failed = True
         sys.stderr.write(
             f"[chat] task watcher sid={session_id} reached its absolute "
             f"task deadline, {len(pending)} task(s) still pending; "
@@ -9546,6 +9643,7 @@ async def _watch_inflight_tasks(
         for task_id in pending:
             _bg_task_descriptions.pop(task_id, None)
     except Exception as e:
+        activity_failed = True
         sys.stderr.write(
             f"[chat] task watcher sid={session_id} err: "
             f"{type(e).__name__}: {e}; unpinning client\n")
@@ -9567,6 +9665,13 @@ async def _watch_inflight_tasks(
         sys.stderr.write(
             f"[chat] task watcher exit sid={session_id[:8]} "
             f"pending_left={sorted(pending)}\n")
+        # Close the logical turn before queue drain can start another turn and
+        # reuse this session's single Activity Center row.
+        if (not watcher_cancelled
+                and _owns_generation()
+                and not _sessions_with_inflight_tasks.get(session_id)):
+            await _finish_background_activity(
+                session_id, failed=activity_failed)
         # Only clear the registry slot if it still points at us (a fresh
         # watcher may have replaced it).
         if _task_watchers.get(session_id) is asyncio.current_task():
@@ -9730,6 +9835,45 @@ async def _finish_activity(
             f"[activity] startup finish failed sid={session_id}: {e}\n")
     finally:
         broadcast.activity_started = False
+
+
+def _defer_activity_finish(
+    session_id: str,
+    broadcast: TurnBroadcast,
+    status: str,
+) -> bool:
+    """Transfer Activity Center ownership from a turn to its task watcher.
+
+    ``ResultMessage`` closes only the visible main response when SDK-native
+    background tasks remain.  Finishing the ledger row there made the task
+    center go quiet while the session tab correctly stayed yellow.  Clearing
+    ``broadcast.activity_started`` prevents the outer turn cleanup from closing
+    the row; the owning watcher generation consumes the deferred status later.
+    """
+    if not broadcast.activity_started:
+        return False
+    _background_activity_finishes[session_id] = status
+    broadcast.activity_started = False
+    return True
+
+
+async def _finish_background_activity(
+    session_id: str,
+    *,
+    failed: bool = False,
+) -> None:
+    """Close a deferred activity row after the detached logical turn ends."""
+    status = _background_activity_finishes.pop(session_id, None)
+    if status is None:
+        return
+    if failed:
+        status = "failed"
+    try:
+        from .activity import activity as _activity
+        await asyncio.to_thread(_activity.finish, session_id, status)
+    except Exception as e:
+        sys.stderr.write(
+            f"[activity] background finish failed sid={session_id}: {e}\n")
 
 
 async def _start_turn(
@@ -10965,12 +11109,17 @@ async def _start_turn(
             }
             _activity_status = ("cancelled" if was_cancelled else
                                 "failed" if _is_error else "completed")
-            await _finish_activity(session_id, broadcast, _activity_status)
             _done_session_usage = dict(sess_u)
             _done_memory_recall = mem0.pop_recall_trace(session_id)
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
             )
+            if _done_background_tasks:
+                _defer_activity_finish(
+                    session_id, broadcast, _activity_status)
+            else:
+                await _finish_activity(
+                    session_id, broadcast, _activity_status)
             # Capture once at the SDK's authoritative terminal boundary. The
             # sidecar write happens after slower context/transcript work, but it
             # must persist the same completion instant the browser saw in done.
@@ -11674,57 +11823,95 @@ async def _maybe_drain_queue(session_id: str) -> None:
     On a lost race (_TurnBusy) or start failure (_TurnStartError), the popped
     item is restored to the queue head so nothing is dropped. A start failure
     additionally pauses the queue (mirrors the turn-errored policy)."""
-    if session_id in _active_turns and not _active_turns[session_id].done:
-        return
-    watcher = _task_watchers.get(session_id)
-    if (_sessions_with_inflight_tasks.get(session_id)
-            or (watcher is not None and not watcher.done())):
-        return
-    item = sess.dequeue_message(session_id)
-    if item is None:
-        return
-    # Replay under the permission mode snapshotted at enqueue time. Items
-    # from before the snapshot existed (or enqueued without one) fail CLOSED
-    # to "default" — requiring tool approval is the safe direction; the old
-    # behavior (falling through to bypassPermissions) let queued messages
-    # skip approval the user's UI said was required.
-    perm = (item.get("permission") or "").strip() or "default"
-    if perm not in _VALID_PERMISSION_MODES:
-        # Headless context — can't 400. An unknown persisted value (pre-
-        # validation enqueue, hand-edited queue file) fails CLOSED to
-        # "default" rather than crashing the drain or reaching the SDK.
-        perm = "default"
-    try:
-        await _start_turn(
-            session_id,
-            item.get("text", ""),
-            permission=perm,
-            plan_return_permission=item.get("plan_return_permission", ""),
-            image_ids=item.get("image_ids", ""),
-            persist_permission=False,
-        )
-    except _TurnBusy:
-        # A manual turn grabbed the slot between our check and the
-        # reservation. Restore the item; that turn's completion will drain.
-        sess.requeue_head(session_id, item)
-    except _TurnStartError:
-        # Client init / 504 — restore the item and pause so we don't spin on
-        # a broken backend headlessly. User resumes to retry.
-        sess.requeue_head(session_id, item)
+    async with _queue_drain_lock_for(session_id):
+        if session_id in _active_turns and not _active_turns[session_id].done:
+            return
+        watcher = _task_watchers.get(session_id)
+        if (_sessions_with_inflight_tasks.get(session_id)
+                or (watcher is not None and not watcher.done())):
+            return
+        item = sess.dequeue_message(session_id)
+        if item is None:
+            return
+        # Replay under the permission mode snapshotted at enqueue time. Items
+        # from before the snapshot existed (or enqueued without one) fail CLOSED
+        # to "default" — requiring tool approval is the safe direction; the old
+        # behavior (falling through to bypassPermissions) let queued messages
+        # skip approval the user's UI said was required.
+        perm = (item.get("permission") or "").strip() or "default"
+        if perm not in _VALID_PERMISSION_MODES:
+            # Headless context — can't 400. An unknown persisted value (pre-
+            # validation enqueue, hand-edited queue file) fails CLOSED to
+            # "default" rather than crashing the drain or reaching the SDK.
+            perm = "default"
         try:
-            sess.set_queue_paused(session_id, True)
-        except Exception:
-            pass
-        _notify_queue_paused_on_error(session_id)
-    except Exception as e:
-        # Unexpected — restore + pause defensively, never lose the message.
-        sess.requeue_head(session_id, item)
+            await _start_turn(
+                session_id,
+                item.get("text", ""),
+                permission=perm,
+                plan_return_permission=item.get("plan_return_permission", ""),
+                image_ids=item.get("image_ids", ""),
+                persist_permission=False,
+            )
+        except asyncio.CancelledError:
+            # A graceful service shutdown can cancel a scheduled kick after it
+            # dequeued but before SDK startup completed. Preserve the accepted
+            # message for the next process. Session deletion removes metadata
+            # before cancelling its task, so deliberately do not recreate a
+            # queue file for an owner that no longer exists.
+            if sess.get_session(session_id) is not None:
+                sess.requeue_head(session_id, item)
+            raise
+        except _TurnBusy:
+            # A manual turn grabbed the slot between our check and the
+            # reservation. Restore the item; that turn's completion will drain.
+            sess.requeue_head(session_id, item)
+        except _TurnStartError:
+            # Client init / 504 — restore the item and pause so we don't spin on
+            # a broken backend headlessly. User resumes to retry.
+            sess.requeue_head(session_id, item)
+            try:
+                sess.set_queue_paused(session_id, True)
+            except Exception:
+                pass
+            _notify_queue_paused_on_error(session_id)
+        except Exception as e:
+            # Unexpected — restore + pause defensively, never lose the message.
+            sess.requeue_head(session_id, item)
+            try:
+                sess.set_queue_paused(session_id, True)
+            except Exception:
+                pass
+            sys.stderr.write(
+                f"[chat] queue drain crashed sid={session_id}: {e}\n")
+            _notify_queue_paused_on_error(session_id)
+
+
+def _schedule_queue_drain(session_id: str) -> None:
+    """Kick one retained, coalesced drain task without delaying enqueue HTTP."""
+    existing = _queue_drain_tasks.get(session_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(_maybe_drain_queue(session_id))
+    _queue_drain_tasks[session_id] = task
+    _maintenance_tasks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _maintenance_tasks.discard(done)
+        if _queue_drain_tasks.get(session_id) is done:
+            _queue_drain_tasks.pop(session_id, None)
+        if done.cancelled():
+            return
         try:
-            sess.set_queue_paused(session_id, True)
-        except Exception:
-            pass
-        sys.stderr.write(f"[chat] queue drain crashed sid={session_id}: {e}\n")
-        _notify_queue_paused_on_error(session_id)
+            exc = done.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            sys.stderr.write(
+                f"[chat] scheduled queue drain failed sid={session_id}: "
+                f"{type(exc).__name__}: {exc}\n")
+
+    task.add_done_callback(_done)
 
 
 async def _subscribe_broadcast(

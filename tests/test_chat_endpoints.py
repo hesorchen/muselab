@@ -108,6 +108,35 @@ def test_reset_all_empty_pool(chat_mod, client):
     assert r.json() == {"ok": True, "reset": []}
 
 
+def test_session_rename_updates_activity_ledger(chat_mod, client, monkeypatch):
+    from backend import activity as activity_module
+
+    created = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "Before rename"},
+    )
+    assert created.status_code == 200, created.text
+    sid = created.json()["id"]
+    calls = []
+
+    def rename_activity(target_sid, name):
+        calls.append((target_sid, name))
+
+    monkeypatch.setattr(activity_module.activity, "rename_session", rename_activity)
+    monkeypatch.setattr(chat_mod, "sdk_rename_session", lambda *_args, **_kwargs: None)
+
+    response = client.patch(
+        f"/api/chat/sessions/{sid}",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "After rename"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert chat_mod.sess.get_session(sid)["name"] == "After rename"
+    assert calls == [(sid, "After rename")]
+
+
 def test_session_effort_and_fast_patch_persist_and_rebuild(
     chat_mod, client, monkeypatch,
 ):
