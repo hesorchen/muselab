@@ -379,6 +379,117 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
     asyncio.run(exercise())
 
 
+def test_activity_stays_running_until_background_continuation_finishes(
+        stream_env, client, monkeypatch):
+    """A main ResultMessage is not the logical end while a task is detached.
+
+    The tab derives its yellow dot from the task pin.  Activity Center must keep
+    the same session running until that pin settles and the CLI's continuation
+    reaches its own ResultMessage; otherwise opening the center shows no running
+    indicator for work that is visibly still active in the tab strip.
+    """
+    from backend import activity as activity_module
+
+    chat_mod = stream_env
+    sid = _make_session(client)
+
+    async def exercise():
+        watcher_attached = asyncio.Event()
+        release_watcher = asyncio.Event()
+        activity_transitions = []
+
+        started = TaskStartedMessage(
+            subtype="task_started", data={}, task_id="task_deferred",
+            description="sleep 20", uuid="task-start", session_id=sid,
+            tool_use_id="tu-bg", task_type="bash",
+        )
+        main_result = ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+        notification = TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="task_deferred",
+            status="completed", output_file="/tmp/task.out", summary="done",
+            uuid="task-finish", session_id=sid, tool_use_id="tu-bg",
+        )
+        reaction = AssistantMessage(
+            content=[TextBlock(text="后台任务已经完成。")],
+            model="claude-sonnet-4-6", usage={}, uuid="continuation-asst",
+        )
+        continuation_result = ResultMessage(
+            subtype="success", duration_ms=12, duration_api_ms=10,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={},
+        )
+
+        class _DeferredBackgroundClient(_FakeStreamClient):
+            async def receive_messages(self):
+                watcher_attached.set()
+                await release_watcher.wait()
+                for message in (notification, reaction, continuation_result):
+                    yield message
+
+        fake = _DeferredBackgroundClient([started, main_result])
+
+        async def fake_get_client(*_args, **_kwargs):
+            return fake
+
+        monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+        monkeypatch.setattr(
+            activity_module.activity,
+            "start",
+            lambda activity_sid, *, summary="": activity_transitions.append(
+                ("start", activity_sid, summary)),
+        )
+        monkeypatch.setattr(
+            activity_module.activity,
+            "finish",
+            lambda activity_sid, status: activity_transitions.append(
+                ("finish", activity_sid, status)),
+        )
+
+        broadcast = await chat_mod._start_turn(sid, "run a background task")
+        await asyncio.wait_for(watcher_attached.wait(), timeout=1)
+
+        assert any(
+            event.get("event") == "done"
+            for event in broadcast.replay_events()
+        )
+        assert activity_transitions == [
+            ("start", sid, "run a background task"),
+        ]
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {
+            "task_deferred",
+        }
+        assert chat_mod._background_activity_finishes[sid] == "completed"
+
+        await asyncio.wait_for(broadcast.task, timeout=1)
+        watcher = chat_mod._task_watchers[sid]
+        release_watcher.set()
+        await asyncio.wait_for(watcher, timeout=1)
+
+        assert activity_transitions == [
+            ("start", sid, "run a background task"),
+            ("finish", sid, "completed"),
+        ]
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+        assert sid not in chat_mod._background_activity_finishes
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._background_activity_finishes.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        recent = chat_mod._recent_turns.pop(sid, None)
+        if recent is not None:
+            recent.close()
+        chat_mod._delete_active_turn_sidecar(sid)
+
+
 def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
         stream_env, client, monkeypatch):
     """A pooled SDK queue may start with the preceding turn's delayed tail.

@@ -11,7 +11,7 @@ window.MUSELAB_STRINGS = {
     "pane.chat": "Muse",
     // sidebar / toggles
     "btn.hide_left": "隐藏文件区",  "btn.show_left": "显示文件区",
-    "btn.hide_right": "隐藏 Muse", "btn.show_right": "显示 Muse",
+    "btn.hide_preview": "隐藏预览区", "btn.show_preview": "显示预览区",
     "btn.show_hidden": "显示隐藏文件", "btn.hide_hidden": "不显示隐藏文件",
     "btn.refresh": "刷新",
     "btn.upload": "上传到当前目录",
@@ -404,7 +404,7 @@ window.MUSELAB_STRINGS = {
     "pane.preview": "Preview",
     "pane.chat": "Muse",
     "btn.hide_left": "Hide files",  "btn.show_left": "Show files",
-    "btn.hide_right": "Hide Muse",  "btn.show_right": "Show Muse",
+    "btn.hide_preview": "Hide preview", "btn.show_preview": "Show preview",
     "btn.show_hidden": "Show hidden files", "btn.hide_hidden": "Hide hidden files",
     "btn.refresh": "Refresh",
     "btn.upload": "Upload to current dir",

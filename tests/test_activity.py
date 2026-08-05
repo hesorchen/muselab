@@ -170,6 +170,47 @@ def test_pin_persists_without_rewriting_activity_time(tmp_path, monkeypatch):
     assert restarted.set_pin("missing", True) is None
 
 
+@pytest.mark.asyncio
+async def test_rename_persists_and_pushes_without_reordering_task(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    ticks = iter([1, 2, 3, 4])
+    monkeypatch.setattr("backend.activity.time.time", lambda: next(ticks))
+    first = service.start("s1", summary="older task")
+    service.finish("s1", "completed")
+    service.start("s2", summary="newer task")
+    service.finish("s2", "completed")
+    before = dict(next(row for row in service.list()
+                       if row["session_id"] == "s1"))
+
+    async with service.subscribe() as queue:
+        update = await asyncio.to_thread(
+            service.rename_session, "s1", "Renamed conversation",
+        )
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert update is not None
+    assert update["item"]["id"] == first["id"]
+    assert update["item"]["session_name"] == "Renamed conversation"
+    assert payload["item"]["session_name"] == "Renamed conversation"
+    assert payload["revision"] == update["revision"] == service.revision
+    after = next(row for row in service.list() if row["session_id"] == "s1")
+    for field in (
+        "updated_at", "started_at", "finished_at", "state", "read",
+        "task_summary", "turn_count",
+    ):
+        assert after[field] == before[field]
+    assert [row["session_id"] for row in service.list()] == ["s2", "s1"]
+
+    restarted = ActivityService(tmp_path)
+    restored = next(row for row in restarted.list()
+                    if row["session_id"] == "s1")
+    assert restored["session_name"] == "Renamed conversation"
+    assert service.rename_session("missing", "No row") is None
+
+
 def test_restart_marks_running_as_failed(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     service.start("s1", summary="long task")

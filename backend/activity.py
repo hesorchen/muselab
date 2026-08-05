@@ -327,6 +327,31 @@ class ActivityService:
             "summary": summary,
         }
 
+    def rename_session(self, sid: str, name: str) -> dict[str, Any] | None:
+        """Update only the mutable display name for a conversation row.
+
+        A rename is session metadata, not a task transition.  In particular it
+        must not touch ``updated_at``, read state, or the task summary: doing so
+        would move an old row to the front of the timeline or make a completed
+        result look new.  Publishing the otherwise unchanged row lets every
+        open Activity Center converge immediately through its existing SSE
+        connection.
+        """
+        with self._lock:
+            item = self._latest(sid)
+            if item is None:
+                return None
+            target = str(name)
+            if str(item.get("session_name") or "") != target:
+                item["session_name"] = target
+                self._save()
+                self._publish_locked(item=item)
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "item": dict(item),
+            }
+
     def set_pin(self, event_id: str, pinned: bool) -> dict[str, Any] | None:
         """Persist a pin and return the exact ledger revision it belongs to."""
         with self._lock:

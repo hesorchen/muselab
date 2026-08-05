@@ -595,6 +595,15 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   height: 100vh; height: 100dvh;
   width: 100vw; overflow: hidden;
 }
+/* Desktop information hierarchy: files | chat | preview. Keep a single copy
+   of each large Alpine subtree and use Grid's visual ordering, so changing the
+   layout never tears down the live conversation DOM or preview/editor state. */
+.layout > .pane.files { order: 1; }
+.layout > .files-resizer { order: 2; }
+.layout > .pane.chat { order: 3; }
+.layout > .preview-resizer { order: 4; }
+.layout > .pane.preview { order: 5; border-right: 0; }
+.layout > .mobile-tab-bar { order: 6; }
 .pane {
   display: flex; flex-direction: column;
   border-right: 1px solid var(--c-border);
@@ -680,10 +689,10 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
     transition: grid-template-rows var(--t-base);
   }
   /* Hide every pane by default; show only the one matching the active tab.
-     `!important` on the active pane is load-bearing: leftOpen/rightOpen are
+     `!important` on the active pane is load-bearing: leftOpen/previewOpen are
      persisted from DESKTOP use, where collapsing a side pane sets them false
      and adds `.pane-hidden` (display:none !important). On mobile the bottom
-     tab bar — NOT leftOpen/rightOpen — owns pane visibility, but without
+     tab bar — NOT leftOpen/previewOpen — owns pane visibility, but without
      !important here the persisted `.pane-hidden` wins and the Files/Chat tab
      renders a blank pane (no file tree, no search box). Re-assert. */
   .layout .pane { display: none; }
@@ -692,6 +701,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .layout[data-mobile-tab="chat"]    .pane.chat    { display: flex !important; grid-column: 1; }
   /* Drop the resizer bars (they belong to columns we no longer render) */
   .layout .resizer { display: none; }
+  .pane-side-toggle { display: none !important; }
   /* Hide the trash footer entirely on mobile. Its only live affordance on
      touch was click-to-open-trash (drag-to-delete is dead — HTML5 DnD never
      fires on touchscreens). Per product call, drop it: deletion already has
@@ -902,6 +912,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
     gap: var(--sp-2);
     width: 100%;
   }
+  .pane.preview .pane-head .pane-fileinfo-meta,
   .pane.preview .pane-head .pane-fileinfo-mtime { margin-left: auto; }
 
   /* Chat toolbar: keep attach + model + permission + effort + ctx-ring + send.
@@ -1601,20 +1612,21 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   min-width: 0; max-height: 100%; overflow: hidden; line-height: 1.25;
 }
 .pane-head .pane-fileinfo-path {
-  color: var(--c-fg-4); font-size: var(--fs-2xs); font-weight: var(--fw-normal);
+  color: var(--c-fg-4); font-size: var(--fs-xs); font-weight: var(--fw-normal);
   max-width: 100%;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  /* Left-truncate so the distinctive tail (…/dir/file.md) stays visible. */
-  direction: rtl; text-align: left; unicode-bidi: plaintext;
+  /* fileBreadcrumb() already keeps the useful tail to three directories. */
+  direction: ltr; text-align: left; unicode-bidi: plaintext;
 }
+.pane-head .pane-fileinfo-meta,
 .pane-head .pane-fileinfo-mtime {
-  color: var(--c-fg-4); font-size: var(--fs-2xs); opacity: 0.8;
+  color: var(--c-fg-4); font-size: var(--fs-xs); opacity: 0.82;
   flex-shrink: 0; font-variant-numeric: tabular-nums;
   /* Never wrap. "上次修改 2026-06-05 15:28" folding one glyph per line is what
      turned a 12px strip into a 50px tower and broke the header. */
   white-space: nowrap;
 }
-.pane-head .pane-fileinfo-mtime-label { opacity: 0.75; }
+.pane-head .pane-fileinfo-sep { padding: 0 3px; opacity: 0.65; }
 
 /* The files-header command-palette button is mobile-only (the mobile @media
    flips it to inline-flex). On desktop the palette lives in the chat header,
@@ -1648,6 +1660,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
   overflow: hidden;
+  container-type: inline-size;
   /* Position context for the absolutely-positioned PTR indicator —
      it floats above the list without taking layout space. */
   position: relative;
@@ -1680,15 +1693,13 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .filelist-sticky-root {
   display: flex; align-items: center; gap: 6px;
-  padding: 6px 12px;
-  font-family: var(--font-mono);
+  padding: 5px 10px;
   font-size: var(--fs-xs);
   color: var(--c-fg-2);
   background: var(--c-bg-1);
   /* Strong divider so the boundary between the (transient) open-files area
      and the (persistent) tree is unmistakable. */
-  border-bottom: 1px solid var(--c-border-strong);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+  border-bottom: 1px solid var(--c-border);
   flex-shrink: 0;
   user-select: none;
   cursor: default;
@@ -1846,9 +1857,9 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .filelist li {
   display: flex; align-items: center; gap: var(--sp-1);
-  /* VSCode-tight: was 26px → 22px. Saves vertical space, matches what
-     users expect from a file tree. */
-  padding: 2px 10px; min-height: 22px;
+  /* Compact without becoming fiddly: 28px keeps the hierarchy dense while
+     leaving icons, text and hover actions enough vertical breathing room. */
+  padding: 3px 10px; min-height: 28px;
   cursor: pointer;
   /* -webkit-/-moz- prefixes are REQUIRED: mobile WebKit (iOS Safari) ignores
      the unprefixed `user-select: none`, so without these the long-press on a
@@ -1899,13 +1910,19 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .filelist li:hover { background: var(--c-bg-2); }
 
-/* VSCode-style inline actions on directory rows. Pinned to the right
-   via margin-left:auto on the li-flex. Hidden by default, revealed on
-   row hover (desktop) or faded permanently on touch. */
+/* One stable trailing column owns either metadata or actions. Hover swaps the
+   two in-place, so buttons never squeeze the file name or sit beside a size. */
+.filelist li .tree-trailing {
+  position: relative; margin-left: auto;
+  flex: 0 0 64px; height: 22px; min-width: 0;
+  display: flex; align-items: center; justify-content: flex-end;
+}
+.filelist li.dir .tree-trailing { flex-basis: 44px; }
 .filelist li .tree-actions {
-  margin-left: auto;
+  position: absolute; inset: 0 0 0 auto;
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 2px;
   opacity: 0;
   transition: opacity var(--t-fast);
@@ -1914,6 +1931,7 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 /* File rows now also render the "⋯" more-menu (not just dirs), so reveal
    the action bar on hover for any row, not only directories. */
 .filelist li:hover .tree-actions { opacity: 1; }
+.filelist li:hover .size { opacity: 0; }
 .tree-action {
   background: transparent;
   border: 0;
@@ -1944,10 +1962,11 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   .filelist li .tree-actions { opacity: 0.55; }
   .filelist li .tree-actions:active,
   .filelist li.sel .tree-actions { opacity: 1; }
+  .filelist li .size { display: none !important; }
 }
 .filelist li.sel {
-  background: var(--c-accent-soft); color: var(--c-accent-fg);
-  box-shadow: inset 3px 0 0 var(--c-accent);   /* 左侧主色竖条标 active */
+  background: var(--c-accent-soft); color: var(--c-fg-0);
+  box-shadow: none;
 }
 .filelist li.sel .icon { color: var(--c-accent); }
 .filelist li.drag-over { background: var(--c-accent); color: white; box-shadow: inset 0 0 0 2px white; }
@@ -2024,7 +2043,19 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   flex: 1; font-size: var(--fs-base);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.filelist .size { color: var(--c-fg-3); font-size: var(--fs-xs); font-family: var(--font-mono); }
+.filelist .size {
+  width: 100%; overflow: hidden; text-overflow: ellipsis;
+  color: var(--c-fg-3); font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap;
+  transition: opacity var(--t-fast);
+}
+
+/* A narrow tree should protect the filename. Exact size remains available in
+   the preview metadata strip and tooltip without adding per-row stat calls. */
+@container (max-width: 250px) {
+  .filelist li.file .tree-trailing { flex-basis: 22px; }
+  .filelist li.file .size { display: none !important; }
+}
 
 /* Search results (双区块) */
 .search-results { overflow-y: auto; flex: 1; padding: var(--sp-2) 0; }
@@ -2361,6 +2392,306 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 .preview-find-item-snip { overflow: hidden; text-overflow: ellipsis; font-family: var(--font-mono); }
 .preview-find-item-snip mark,
 .preview-find-list mark { background: var(--c-accent-soft); color: var(--c-accent-fg); padding: 0 1px; border-radius: 2px; }
+
+/* Preview text-selection helper. Fixed positioning keeps it outside every
+   pane's overflow/scroll clipping and avoids touching the preview DOM itself. */
+.preview-selection-popover {
+  position: fixed;
+  z-index: 1450;
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  transform: translateX(-50%);
+  margin-top: 8px;
+  color: var(--c-fg-1);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+  filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.32));
+  animation: preview-selection-in 120ms ease-out;
+}
+.preview-selection-popover.place-above {
+  transform: translate(-50%, -100%);
+  margin-top: -8px;
+}
+.preview-selection-popover.is-dragged {
+  transform: none;
+  margin-top: 0;
+  will-change: left, top;
+}
+.preview-selection-popover.is-dragging {
+  filter: drop-shadow(0 14px 30px rgba(0, 0, 0, 0.38));
+}
+@keyframes preview-selection-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.preview-selection-actions {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 3px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-full);
+  background: var(--c-bg-2);
+}
+.preview-selection-actions button {
+  height: 30px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: var(--r-full);
+  background: transparent;
+  color: var(--c-fg-1);
+  font: inherit;
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+.preview-selection-actions button:hover,
+.preview-selection-actions button:focus-visible {
+  background: var(--c-accent-soft);
+  color: var(--c-accent-fg);
+  outline: none;
+}
+.preview-selection-actions button svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: currentColor;
+}
+.preview-selection-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--c-border-strong);
+}
+.preview-selection-popover.is-asking {
+  width: min(420px, calc(100vw - 24px));
+}
+.preview-selection-ask-shell {
+  width: 100%;
+  max-height: min(560px, calc(100vh - 28px));
+  overflow: hidden;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-lg);
+  background: var(--c-bg-2);
+}
+.preview-selection-ask {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px;
+  border: 0;
+  background: transparent;
+}
+.preview-selection-ask-head,
+.preview-selection-ask-foot,
+.preview-selection-source {
+  display: flex;
+  align-items: center;
+}
+.preview-selection-ask-head {
+  min-height: 24px;
+  gap: 8px;
+  margin-bottom: 7px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.preview-selection-popover.is-dragging .preview-selection-ask-head {
+  cursor: grabbing;
+}
+.preview-selection-source {
+  min-width: 0;
+  flex: 1;
+  gap: 6px;
+  color: var(--c-fg-2);
+}
+.preview-selection-source > svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+.preview-selection-source > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--fw-medium);
+  color: var(--c-fg-1);
+}
+.preview-selection-source small {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border-radius: var(--r-full);
+  background: var(--c-warn);
+  color: #17120a;
+  font-size: var(--fs-2xs);
+}
+.preview-selection-drag-grip {
+  width: 16px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-fg-4);
+  opacity: 0.72;
+  pointer-events: none;
+}
+.preview-selection-drag-grip svg {
+  width: 10px;
+  height: 16px;
+  fill: currentColor;
+}
+.preview-selection-ask-head:hover .preview-selection-drag-grip,
+.preview-selection-popover.is-dragging .preview-selection-drag-grip {
+  color: var(--c-fg-2);
+  opacity: 1;
+}
+.preview-selection-close {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--c-fg-3);
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.preview-selection-close:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.preview-selection-excerpt {
+  max-height: 54px;
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  overflow: hidden;
+  border-left: 2px solid var(--c-accent);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--c-bg-1);
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+}
+.preview-selection-ask textarea {
+  display: block;
+  width: 100%;
+  min-height: 62px;
+  max-height: 150px;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 8px 9px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  outline: none;
+  background: var(--c-bg-1);
+  color: var(--c-fg-0);
+  font: inherit;
+  line-height: 1.45;
+}
+.preview-selection-ask textarea::placeholder { color: var(--c-fg-3); }
+.preview-selection-ask textarea:focus {
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 2px var(--c-accent-soft);
+}
+.preview-selection-ask-foot {
+  min-height: 30px;
+  gap: 8px;
+  margin-top: 8px;
+}
+.preview-selection-ask-foot > span {
+  flex: 1;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.preview-selection-send {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--c-btn-primary-bg);
+  color: var(--c-on-accent);
+  cursor: pointer;
+}
+.preview-selection-send:hover:not(:disabled) { background: var(--c-btn-primary-hover); }
+.preview-selection-send:disabled { opacity: 0.42; cursor: default; }
+.preview-selection-send svg { width: 15px; height: 15px; }
+.preview-selection-send .spinner-sm { width: 13px; height: 13px; }
+.preview-selection-answer {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px;
+}
+.preview-selection-question {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  color: var(--c-fg-2);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+.preview-selection-answer-loading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 72px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.preview-selection-answer-body {
+  max-height: min(360px, calc(100vh - 210px));
+  overflow: auto;
+  padding: 2px 3px 6px;
+  color: var(--c-fg-1);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+}
+.preview-selection-answer-body > :first-child { margin-top: 0; }
+.preview-selection-answer-body > :last-child { margin-bottom: 0; }
+.preview-selection-error {
+  margin-top: 7px;
+  color: var(--c-danger);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+.preview-selection-open {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  color: var(--c-fg-1);
+  font: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.preview-selection-open:hover {
+  border-color: var(--c-accent);
+  color: var(--c-accent);
+}
+.preview-selection-open svg { width: 13px; height: 13px; }
+@media (pointer: coarse) {
+  .preview-selection-actions { min-height: 44px; }
+  .preview-selection-actions button { height: 38px; padding: 0 14px; }
+  .preview-selection-close,
+  .preview-selection-send { width: 36px; height: 36px; }
+  .preview-selection-open { min-height: 36px; }
+  .preview-selection-ask textarea { font-size: 16px; }
+}
 
 /* Injected highlight marks in the live preview content. */
 .preview-body mark.find-hit {
@@ -4723,6 +5054,58 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   display: flex; flex-wrap: wrap; gap: 6px;
   padding: 6px 4px;
 }
+.selection-quote-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: min(310px, 100%);
+  min-height: 48px;
+  box-sizing: border-box;
+  padding: 6px 30px 6px 9px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+}
+.selection-quote-icon {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-sm);
+  background: var(--c-accent-soft);
+  color: var(--c-accent);
+}
+.selection-quote-icon svg { width: 14px; height: 14px; }
+.selection-quote-body { min-width: 0; line-height: 1.25; }
+.selection-quote-source {
+  color: var(--c-fg-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+.selection-quote-text {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.selection-quote-x {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--c-fg-3);
+}
+.selection-quote-x:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.selection-quote-x svg { width: 11px; height: 11px; }
 .img-chip {
   position: relative;
   width: 64px; height: 64px;
@@ -5202,6 +5585,37 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   .img-editor-toolbar { padding: 8px 10px; gap: 12px; }
   .img-editor-foot { padding: 10px; }
 }
+.user-msg-quotes {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 7px;
+}
+.user-msg-quote {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.12);
+}
+.user-msg-quote > svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+.user-msg-quote > div { min-width: 0; }
+.user-msg-quote strong,
+.user-msg-quote span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-msg-quote strong { font-size: var(--fs-xs); font-weight: var(--fw-semibold); }
+.user-msg-quote span { margin-top: 1px; opacity: 0.78; font-size: var(--fs-xs); }
 .user-msg-imgs {
   display: flex; flex-wrap: wrap; gap: 6px;
   margin-bottom: 6px;
@@ -6490,6 +6904,30 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .queued-act:hover { background: rgba(255, 255, 255, 0.18); color: white; }
 .queued-act svg { width: 12px; height: 12px; }
+.queued-quote-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.queued-quote-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.1);
+  font-size: var(--fs-xs);
+}
+.queued-quote-chip svg { width: 12px; height: 12px; flex: 0 0 auto; }
+.queued-quote-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .queued-text {
   white-space: pre-wrap; word-break: break-word;
   font-size: var(--fs-sm);
@@ -8957,6 +9395,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
     padding-top: 6px;
     padding-bottom: 6px;
   }
+  .filelist li.file .tree-trailing { flex-basis: 36px; height: 36px; }
+  .filelist li.dir .tree-trailing { flex-basis: 74px; height: 36px; }
   .tree-action,
   .root-action {
     min-width: 36px;
