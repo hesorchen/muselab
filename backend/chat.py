@@ -2428,7 +2428,11 @@ async def _build_and_connect_client(
     # API can't form. Changing it invalidates the cached client (PATCH handler
     # calls disconnect_client) so the next turn rebuilds with this setting.
     thinking_pref = bool(sess_data.get("thinking", True))
-    supports_thinking = ((provider is None) or provider.supports_thinking) and thinking_pref
+    supports_thinking = (
+        endpoints.ducc_is_claude_model(model)
+        if is_ducc
+        else ((provider is None) or provider.supports_thinking)
+    ) and thinking_pref
     codex_effort_transport = (
         _is_codex_gateway_model(model) and effort != "auto"
     )
@@ -2462,7 +2466,9 @@ async def _build_and_connect_client(
     # half is `max`; the native Skill above supplies proactive delegation.
     # `auto` omits the SDK option. Gateway's post-translation header rule remains
     # final authority for every Codex wire-level effort.
-    if effort != "auto":
+    if effort != "auto" and (
+        not is_ducc or endpoints.ducc_is_claude_model(model)
+    ):
         sdk_effort = "max" if effort == "ultra" else effort
         if sdk_effort in _SDK_EFFORT_LEVELS:
             opts_kwargs["effort"] = sdk_effort

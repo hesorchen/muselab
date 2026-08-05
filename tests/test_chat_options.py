@@ -85,6 +85,37 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     }
 
 
+def test_non_claude_ducc_model_uses_catalog_name_without_claude_controls(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    wrapper = tmp_path / "muselab-ducc"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(
+        chat_mod, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
+    monkeypatch.setattr(chat_mod, "ducc_cli_wrapper", lambda: str(wrapper))
+    monkeypatch.setattr(
+        endpoints, "env_override",
+        lambda model: (_ for _ in ()).throw(
+            AssertionError("DUCC must not use endpoint env overrides")),
+    )
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    client = asyncio.run(chat_mod._build_and_connect_client(
+        "sid-ducc-gpt", "ducc:gpt-5-6-sol", "bypassPermissions", "high"))
+
+    assert captured["connected"] is True
+    assert client is not None
+    assert captured["cli_path"] == str(wrapper)
+    assert captured["model"] == "gpt-5.6-sol"
+    assert "env" not in captured
+    assert "effort" not in captured
+    assert captured["thinking"] == {"type": "disabled"}
+
+
 def test_non_bypass_runtime_installs_permission_resolver(
     app_module, monkeypatch, tmp_path,
 ):

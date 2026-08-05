@@ -1058,16 +1058,49 @@ ANTHROPIC_DEFAULT_MODELS: tuple[str, ...] = (
 
 # DUCC is a Claude Code-compatible CLI runtime, not an HTTP endpoint provider.
 # Prefix its picker values so a session can select the DUCC executable. DUCC's
-# model proxy expects its catalog display names (not Anthropic API ids); passing
+# model proxy expects its exact catalog names (not public API ids); passing
 # `claude-opus-4-8` through unchanged reaches OneAPI's default group and 503s.
+# Keep this ordered catalog aligned with the factory `ducc models` output.
 DUCC_PREFIX = "ducc:"
+DUCC_MODELS: tuple[tuple[str, str, str], ...] = (
+    ("auto-internal", "auto-内部", "Auto · 内部"),
+    ("deepseek-v4-flash-internal", "DeepSeek-V4-Flash-内部", "DeepSeek V4 Flash · 内部"),
+    ("glm-5-2-internal", "GLM-5.2-内部", "GLM 5.2 · 内部"),
+    ("kimi-k2-7-code-internal", "Kimi-K2.7-Code-内部", "Kimi K2.7 Code · 内部"),
+    ("auto", "auto", "Auto"),
+    ("glm-5", "GLM-5", "GLM 5"),
+    ("glm-5-1", "GLM-5.1", "GLM 5.1"),
+    ("glm-5-2", "GLM-5.2", "GLM 5.2"),
+    ("glm-5-turbo", "GLM-5-Turbo", "GLM 5 Turbo"),
+    ("grok-4-5", "grok-4.5", "Grok 4.5"),
+    ("gpt-5-5", "gpt-5.5", "GPT 5.5"),
+    ("gpt-5-6-luna", "gpt-5.6-luna", "GPT 5.6 Luna"),
+    ("gpt-5-6-terra", "gpt-5.6-terra", "GPT 5.6 Terra"),
+    ("gpt-5-6-sol", "gpt-5.6-sol", "GPT 5.6 Sol"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5", "Claude Haiku 4.5"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6", "Claude Sonnet 4.6"),
+    ("claude-sonnet-5", "Claude Sonnet 5", "Claude Sonnet 5"),
+    ("claude-opus-4-6", "Claude Opus 4.6", "Claude Opus 4.6"),
+    ("claude-opus-4-7", "Claude Opus 4.7", "Claude Opus 4.7"),
+    ("claude-opus-4-8", "Opus 4.8", "Claude Opus 4.8"),
+    ("claude-opus-5", "Opus 5", "Claude Opus 5"),
+    ("kimi-k2-6", "Kimi-K2.6", "Kimi K2.6"),
+    ("minimax-m3", "MiniMax-M3", "MiniMax M3"),
+    ("deepseek-v4-flash", "DeepSeek-V4-Flash", "DeepSeek V4 Flash"),
+    ("deepseek-v4-pro", "DeepSeek-V4-Pro", "DeepSeek V4 Pro"),
+)
 _DUCC_CLI_MODELS = {
-    "claude-sonnet-4-6": "Claude Sonnet 4.6",
-    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
-    "claude-opus-5": "Opus 5",
-    "claude-opus-4-8": "Opus 4.8",
-    "claude-opus-4-7": "Claude Opus 4.7",
+    model_id: cli_name for model_id, cli_name, _label in DUCC_MODELS
 }
+# Sessions created by the first DUCC integration used Anthropic's dated Haiku
+# id. Continue accepting it even though the picker now emits the stable id.
+_DUCC_CLI_MODELS["claude-haiku-4-5-20251001"] = "Claude Haiku 4.5"
+
+
+def ducc_is_claude_model(model: str) -> bool:
+    """Whether a DUCC picker id names a known Claude-family catalog entry."""
+    raw = model[len(DUCC_PREFIX):] if is_ducc_model(model) else model
+    return raw.startswith("claude-")
 
 
 def is_ducc_model(model: str) -> bool:
@@ -1366,14 +1399,17 @@ def available_groups() -> list[dict]:
     from .settings import locate_ducc_executable
     if locate_ducc_executable() and "ducc" not in disabled_models:
         ducc_items = [
-            {"label": label_for(m), "model": f"{DUCC_PREFIX}{m}"}
-            for m in anthropic_models()
-            if f"{DUCC_PREFIX}{m}" not in disabled_models
+            {"label": label, "model": f"{DUCC_PREFIX}{model_id}"}
+            for model_id, _cli_name, label in DUCC_MODELS
+            if f"{DUCC_PREFIX}{model_id}" not in disabled_models
         ]
         if ducc_items:
+            # DUCC exposes heterogeneous model families. Do not claim that every
+            # entry accepts Claude thinking/effort controls; chat.py enables the
+            # legacy DUCC thinking shape only for known Claude-family entries.
             groups.append({"group": "DUCC", "items": ducc_items,
-                           "supports_thinking": True,
-                           "supports_effort": True})
+                           "supports_thinking": False,
+                           "supports_effort": False})
     for p in catalog():
         if not p.models:
             continue
