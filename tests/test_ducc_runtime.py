@@ -22,6 +22,7 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
     )
     fake_ducc.chmod(0o755)
     wrapper = Path(__file__).resolve().parent.parent / "scripts" / "muselab-ducc"
+    assert "if [[ -v " not in wrapper.read_text(encoding="utf-8")
     env = dict(os.environ)
     env.update({
         "MUSELAB_DUCC_CLI": str(fake_ducc),

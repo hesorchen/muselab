@@ -27,7 +27,10 @@ safe_env=()
 
 append_if_set() {
     local name="$1"
-    if [[ -v "$name" ]]; then
+    # macOS still ships Bash 3.2, which has indirect expansion but not the
+    # newer `[[ -v name ]]` operator.  Keep the launcher portable across the
+    # same Linux/macOS matrix as MuseLab itself.
+    if [[ ${!name+x} ]]; then
         safe_env+=("$name=${!name}")
     fi
 }
@@ -51,12 +54,15 @@ done < <(compgen -e)
 for name in \
     HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
     http_proxy https_proxy all_proxy no_proxy; do
-    if [[ -v "$name" && "${!name}" != *"@"* ]]; then
-        safe_env+=("$name=${!name}")
+    if [[ ${!name+x} ]]; then
+        value="${!name}"
+        if [[ "$value" != *"@"* ]]; then
+            safe_env+=("$name=$value")
+        fi
     fi
 done
 
-if [[ ! -v PATH ]]; then
+if [[ -z ${PATH+x} ]]; then
     safe_env+=("PATH=/usr/local/bin:/usr/bin:/bin")
 fi
 
