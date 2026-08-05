@@ -144,6 +144,77 @@ def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
     return "\n".join(lines)
 
 
+# DUCC is an internet-capable local agent runtime.  Giving it the backend's
+# ambient environment would also give every tool it launches unrelated MuseLab,
+# provider, cloud, GitHub, database and SSH credentials.  Keep this allowlist
+# intentionally small and explicit.  The wrapper applies the same policy again
+# so direct/operator invocation cannot accidentally widen it.
+_DUCC_BASE_ENV_NAMES = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+    "LANG", "TZ",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    # Selection metadata used by managed DUCC installations.  Authentication
+    # material itself remains in DUCC's HOME-owned config and is not copied
+    # from arbitrary environment prefixes.
+    "DUCC_AUTH_SOURCE",
+)
+_DUCC_PROXY_ENV_NAMES = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+
+
+def _ducc_subprocess_env(executable: str) -> dict[str, str]:
+    """Build the complete, privacy-bounded environment for DUCC.
+
+    ClaudeAgentOptions.env is a subprocess environment replacement.  Starting
+    from an allowlist here prevents secrets unknown to MuseLab (for example a
+    future *_TOKEN variable) from reaching the wrapper at all.  Credentialed
+    proxy URLs are omitted as they commonly contain a reusable password.
+    """
+    safe = {
+        name: value
+        for name in _DUCC_BASE_ENV_NAMES
+        if (value := os.environ.get(name)) is not None
+    }
+    safe.update({
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith("LC_") and value
+    })
+    for name in _DUCC_PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        if value is not None and "@" not in value:
+            safe[name] = value
+    # This is a resolved executable path, not an auth value.  The wrapper
+    # captures it before rebuilding its own empty environment and never
+    # forwards MUSELAB_DUCC_CLI to the actual runtime.
+    safe["MUSELAB_DUCC_CLI"] = executable
+    return safe
+
+
+def _ducc_stderr_notice(line: str) -> str:
+    """Classify DUCC stderr without persisting its raw, potentially private text."""
+    low = (line or "").lower()
+    if any(word in low for word in (
+        "auth", "credential", "login", "token", "unauthorized", "forbidden",
+    )):
+        category = "authentication"
+    elif any(word in low for word in (
+        "network", "connect", "timeout", "proxy", "dns", "tls", "certificate",
+    )):
+        category = "network"
+    elif any(word in low for word in (
+        "config", "model", "argument", "option", "permission",
+    )):
+        category = "configuration"
+    else:
+        category = "runtime"
+    return f"{category} detail suppressed for privacy"
+
+
 def _build_ultra_skill_hook():
     """Activate Ultra's native Skill through transient SDK context."""
     async def ultra_skill_hook(_input_data, _tool_use_id, _context):
@@ -1007,14 +1078,10 @@ def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
 # task settlement + auto-continuation and released the reader.
 _sessions_with_inflight_tasks: dict[str, set[str]] = {}
 _task_watchers: dict[str, asyncio.Task] = {}
-# task_id -> epoch seconds when the task was first pinned. The watcher's
-# _TASK_WATCH_TIMEOUT is per-WATCHER, and every new user turn respawns the
-# watcher (_spawn_task_watcher) — which restarted that clock, so a task whose
-# terminal notification never arrives stayed pinned for as long as the user kept
-# chatting. The session then reports active:true forever (list_sessions_api
-# unions _sessions_with_inflight_tasks), which is what kept the reconnect /
-# flicker window open indefinitely (2026-08-04). This makes the deadline
-# absolute from the task's own launch instead.
+# task_id -> epoch seconds when the task was first pinned. Watcher generations
+# are replaceable, but their timeout is derived from this stable launch time so
+# a respawn cannot grant an orphaned task another full lease. The session-list
+# and /active paths also reap individual expired pins before publishing state.
 _bg_task_pinned_at: dict[str, float] = {}
 # Small post-response maintenance tasks, currently used to refresh compacted
 # transcript counts after the verified compact result has already reached the
@@ -1503,6 +1570,15 @@ def _model_control_capability(
     model: str, capability: dict | None = None,
 ) -> dict[str, Any]:
     """Return the frontend's exact per-model effort/Fast capability."""
+    if endpoints.is_ducc_model(model):
+        if endpoints.ducc_is_claude_model(model):
+            return {
+                "effort_levels": ["auto", *_SDK_EFFORT_LEVELS],
+                "service_tiers": [],
+                "supports_fast": False,
+            }
+        return {"effort_levels": [], "service_tiers": [],
+                "supports_fast": False}
     provider = endpoints.lookup(model or "")
     if provider is None and not endpoints.is_third_party(model):
         return {
@@ -2274,6 +2350,7 @@ async def _build_and_connect_client(
                 f"MuseLab DUCC launcher is missing or not executable: {wrapper}"
             )
         opts_kwargs["cli_path"] = str(wrapper)
+        opts_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
     if permission == "plan" and plan_return_permission == "bypassPermissions":
         # The CLI refuses a later setMode(bypassPermissions) unless this
         # capability was granted at process launch. This flag permits the
@@ -2371,8 +2448,11 @@ async def _build_and_connect_client(
                 )
         # Capture CLI stderr so auth / network errors surface in the service log.
         def _stderr_logger(line: str) -> None:
-            runtime = "DUCC" if is_ducc else "SDK-CLI"
-            sys.stderr.write(f"[{runtime}:{model}] {line}\n")
+            if is_ducc:
+                sys.stderr.write(
+                    f"[DUCC:{model}] {_ducc_stderr_notice(line)}\n")
+            else:
+                sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
             sys.stderr.flush()
         opts_kwargs["stderr"] = _stderr_logger
     # MCP servers: always register the in-process muselab server (for
@@ -3435,10 +3515,6 @@ def list_sessions_api(
         sid for sid, task_ids in _sessions_with_inflight_tasks.items()
         if task_ids
     }
-    background_active_sids.update(
-        sid for sid, watcher in _task_watchers.items()
-        if watcher is not None and not watcher.done()
-    )
     active_sids = turn_active_sids | background_active_sids
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
@@ -8810,12 +8886,10 @@ def _reap_stale_task_pins(session_id: str) -> list[str]:
     """Unpin tasks that have been in flight longer than _TASK_WATCH_TIMEOUT.
 
     A pin is the sole reason a session keeps reporting active:true. Nothing
-    else expires it: _settle_background_task needs a terminal notification,
-    and the watcher's own timeout only covers ONE watcher — a task that never
-    settles gets re-pinned into every subsequent watcher generation by
-    _merge_session_inflight, resetting the clock each time (observed
-    2026-08-04: a background pytest that produced no output left its session
-    permanently `active`, respawning a watcher after every user turn).
+    else expires it: _settle_background_task needs a terminal notification.
+    This explicit reap is the per-task half of the absolute deadline; the
+    watcher itself uses the newest pending pin as its generation-independent
+    outer deadline.
 
     Returns the reaped ids so the caller can log them.
     """
@@ -8824,12 +8898,30 @@ def _reap_stale_task_pins(session_id: str) -> list[str]:
         return []
     now = time.time()
     stale = [tid for tid in ids
-             if now - _bg_task_pinned_at.get(tid, now) > _TASK_WATCH_TIMEOUT]
+             if now - _bg_task_pinned_at.get(tid, now) >= _TASK_WATCH_TIMEOUT]
     if stale:
         _release_task_pins(session_id, stale)
         for tid in stale:
             _bg_task_descriptions.pop(tid, None)
     return stale
+
+
+def _task_watch_timeout_remaining(task_ids: Iterable[str]) -> float | None:
+    """Seconds until the newest pending task reaches its absolute deadline.
+
+    Watchers may be replaced across ordinary turns, but task launch timestamps
+    are stable.  Basing each generation on those timestamps prevents every
+    respawn from granting the same orphan another full 30-minute lease.  The
+    newest deadline is used so an older sibling cannot prematurely terminate a
+    genuinely fresh task; list and /active probes reap individual older pins.
+    """
+    ids = [task_id for task_id in task_ids if task_id]
+    if not ids:
+        return None
+    now = time.time()
+    newest_pin = max(_bg_task_pinned_at.setdefault(task_id, now)
+                     for task_id in ids)
+    return max(0.05, newest_pin + _TASK_WATCH_TIMEOUT - now)
 
 
 def _settle_background_task(session_id: str, task_id: str) -> bool:
@@ -9265,7 +9357,16 @@ async def _watch_inflight_tasks(
     # dispatch drains it.
     last_settle_status: str | None = None
     try:
-        async with asyncio.timeout(_TASK_WATCH_TIMEOUT):
+        async with asyncio.timeout(
+            _task_watch_timeout_remaining(pending)
+        ) as watch_deadline:
+            loop = asyncio.get_running_loop()
+
+            def _reschedule_watch_deadline() -> None:
+                remaining = _task_watch_timeout_remaining(pending)
+                watch_deadline.reschedule(
+                    None if remaining is None else loop.time() + remaining)
+
             while True:
                 # Once every task has settled and we're only waiting on the
                 # auto-continue, cap the read so a task that produces no
@@ -9314,6 +9415,7 @@ async def _watch_inflight_tasks(
                         f"sid={session_id[:8]} task={tid} "
                         f"status={last_settle_status} won={won_typed}\n")
                     pending.pop(tid, None)
+                    _reschedule_watch_deadline()
                     if won_typed:
                         if cont is None:
                             await _open_continuation()
@@ -9339,6 +9441,7 @@ async def _watch_inflight_tasks(
                             f"sid={session_id[:8]} task={tid} "
                             f"status={last_settle_status} won={won_updated}\n")
                         pending.pop(tid, None)
+                        _reschedule_watch_deadline()
                         if won_updated:
                             if cont is None:
                                 await _open_continuation()
@@ -9367,6 +9470,7 @@ async def _watch_inflight_tasks(
                         sys.stderr.write(
                             f"[chat] task watcher: typed start "
                             f"sid={session_id[:8]} task={tid}\n")
+                        _reschedule_watch_deadline()
                     if cont is not None:
                         cont.publish({"event": "task_started",
                                       "data": json.dumps({
@@ -9403,6 +9507,7 @@ async def _watch_inflight_tasks(
                     for n in notifs:
                         pending.pop(n.get("task_id") or "", None)
                         last_settle_status = n.get("status") or None
+                    _reschedule_watch_deadline()
                     if won and cont is None:
                         await _open_continuation()
                     for n in won:
@@ -9434,10 +9539,12 @@ async def _watch_inflight_tasks(
         raise
     except asyncio.TimeoutError:
         sys.stderr.write(
-            f"[chat] task watcher sid={session_id} timed out after "
-            f"{_TASK_WATCH_TIMEOUT}s, {len(pending)} task(s) still pending; "
+            f"[chat] task watcher sid={session_id} reached its absolute "
+            f"task deadline, {len(pending)} task(s) still pending; "
             f"unpinning client\n")
         _release_task_pins(session_id, pending)
+        for task_id in pending:
+            _bg_task_descriptions.pop(task_id, None)
     except Exception as e:
         sys.stderr.write(
             f"[chat] task watcher sid={session_id} err: "
@@ -11685,11 +11792,14 @@ def session_active_status(sid: str) -> dict:
                 and not getattr(recent, "continuation_consumed", False)):
             b = recent
         else:
-            watcher = _task_watchers.get(sid)
+            reaped = _reap_stale_task_pins(sid)
+            if reaped:
+                sys.stderr.write(
+                    f"[chat] reaped stale task pins sid={sid[:8]} "
+                    f"tasks={sorted(reaped)}\n")
             background_pending = len(
                 _sessions_with_inflight_tasks.get(sid, ()))
-            if (background_pending
-                    or (watcher is not None and not watcher.done())):
+            if background_pending:
                 # Busy but not attachable: the watcher is waiting for a task
                 # notification and there is no TurnBroadcast to replay yet.
                 # Frontends must keep the footer alive + queue new input, but
@@ -11831,12 +11941,20 @@ async def providers_list() -> dict:
             model = i["model"]
             capability = codex_capabilities.get(model)
             controls = _model_control_capability(model, capability)
+            is_ducc = endpoints.is_ducc_model(model)
+            ducc_claude = is_ducc and endpoints.ducc_is_claude_model(model)
             flat.append({
                 "group": g["group"],
                 "label": i["label"],
                 "model": model,
-                "supports_thinking": g.get("supports_thinking", True),
-                "supports_effort": g.get("supports_effort", False),
+                "supports_thinking": (
+                    ducc_claude if is_ducc
+                    else g.get("supports_thinking", True)
+                ),
+                "supports_effort": (
+                    ducc_claude if is_ducc
+                    else g.get("supports_effort", False)
+                ),
                 "effort_levels": controls["effort_levels"],
                 "service_tiers": controls["service_tiers"],
                 "supports_fast": controls["supports_fast"],

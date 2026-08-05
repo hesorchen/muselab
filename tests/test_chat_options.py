@@ -60,6 +60,13 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     wrapper.chmod(0o755)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-github-token")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "synthetic-cloud-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgres://synthetic-private-db")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/synthetic-private-agent.sock")
+    monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "synthetic-private-value")
+    monkeypatch.setenv("DUCC_AUTH_SOURCE", "managed-login")
+    monkeypatch.setenv("HTTPS_PROXY", "https://user:password@proxy.invalid")
     monkeypatch.setattr(
         chat_mod, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
     monkeypatch.setattr(chat_mod, "ducc_cli_wrapper", lambda: str(wrapper))
@@ -78,7 +85,16 @@ def test_ducc_model_uses_real_cli_runtime_without_native_auth(
     assert client is not None
     assert captured["cli_path"] == str(wrapper)
     assert captured["model"] == "Opus 4.8"
-    assert "env" not in captured
+    ducc_env = captured["env"]
+    assert ducc_env["MUSELAB_DUCC_CLI"] == "/opt/ducc/bin/ducc"
+    assert ducc_env["HOME"]
+    assert ducc_env["DUCC_AUTH_SOURCE"] == "managed-login"
+    assert "HTTPS_PROXY" not in ducc_env
+    for secret_name in (
+        "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "DATABASE_URL",
+        "SSH_AUTH_SOCK", "UNRELATED_PRIVATE_VALUE",
+    ):
+        assert secret_name not in ducc_env
     assert captured["effort"] == "high"
     assert captured["thinking"] == {
         "type": "enabled", "budget_tokens": 10000,
@@ -111,9 +127,23 @@ def test_non_claude_ducc_model_uses_catalog_name_without_claude_controls(
     assert client is not None
     assert captured["cli_path"] == str(wrapper)
     assert captured["model"] == "gpt-5.6-sol"
-    assert "env" not in captured
+    assert captured["env"]["MUSELAB_DUCC_CLI"] == "/opt/ducc/bin/ducc"
     assert "effort" not in captured
     assert captured["thinking"] == {"type": "disabled"}
+
+
+def test_ducc_stderr_is_categorized_without_persisting_raw_detail(app_module):
+    from backend import chat as chat_mod
+
+    private_line = (
+        "authentication failed token=synthetic-secret "
+        "prompt=synthetic-private-prompt"
+    )
+    notice = chat_mod._ducc_stderr_notice(private_line)
+
+    assert notice == "authentication detail suppressed for privacy"
+    assert "synthetic-secret" not in notice
+    assert "synthetic-private-prompt" not in notice
 
 
 def test_non_bypass_runtime_installs_permission_resolver(

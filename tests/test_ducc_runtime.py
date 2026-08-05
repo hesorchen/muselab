@@ -12,7 +12,10 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "names = [\n"
         "    'MUSELAB_TOKEN', 'ANTHROPIC_API_KEY',\n"
         "    'ANTHROPIC_CUSTOM_HEADERS', 'DEEPSEEK_API_KEY',\n"
-        "    'CLAUDE_CODE_ENTRYPOINT', 'DUCC_AUTH_SOURCE', 'HOME',\n"
+        "    'CLAUDE_CODE_ENTRYPOINT', 'GITHUB_TOKEN',\n"
+        "    'AWS_SECRET_ACCESS_KEY', 'DATABASE_URL', 'SSH_AUTH_SOCK',\n"
+        "    'UNRELATED_PRIVATE_VALUE', 'MUSELAB_DUCC_CLI',\n"
+        "    'HTTPS_PROXY', 'DUCC_AUTH_SOURCE', 'HOME',\n"
         "]\n"
         "print(json.dumps({name: name in os.environ for name in names}))\n",
         encoding="utf-8",
@@ -27,6 +30,12 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "ANTHROPIC_CUSTOM_HEADERS": "synthetic-static-header",
         "DEEPSEEK_API_KEY": "synthetic-provider-key",
         "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
+        "GITHUB_TOKEN": "synthetic-github-token",
+        "AWS_SECRET_ACCESS_KEY": "synthetic-cloud-secret",
+        "DATABASE_URL": "postgres://synthetic-private-db",
+        "SSH_AUTH_SOCK": "/tmp/synthetic-private-agent.sock",
+        "UNRELATED_PRIVATE_VALUE": "synthetic-private-value",
+        "HTTPS_PROXY": "https://user:password@proxy.invalid",
         "DUCC_AUTH_SOURCE": "synthetic-ducc-source",
     })
 
@@ -45,6 +54,13 @@ def test_ducc_wrapper_removes_muselab_provider_identity(tmp_path):
         "ANTHROPIC_CUSTOM_HEADERS": False,
         "DEEPSEEK_API_KEY": False,
         "CLAUDE_CODE_ENTRYPOINT": False,
+        "GITHUB_TOKEN": False,
+        "AWS_SECRET_ACCESS_KEY": False,
+        "DATABASE_URL": False,
+        "SSH_AUTH_SOCK": False,
+        "UNRELATED_PRIVATE_VALUE": False,
+        "MUSELAB_DUCC_CLI": False,
+        "HTTPS_PROXY": False,
         "DUCC_AUTH_SOURCE": True,
         "HOME": True,
     }

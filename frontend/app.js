@@ -5696,10 +5696,12 @@ function portal() {
       return null;
     },
     _isClaudeModel(model) {
-      return (model || "").startsWith("claude-");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return m.startsWith("claude-");
     },
     _isClaudeXHighModel(model) {
-      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(model || "");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(m);
     },
     _isCodexModel(model) {
       const m = model || "";
@@ -7109,7 +7111,7 @@ function portal() {
           }
         } catch (_e) {}
         if (contFound) return;   // continuation replay will flip the card
-        // FALLBACK reconciliation, every 4th tick (~32s): pull the history
+        // FALLBACK reconciliation, every 16th tick (~32s): pull the history
         // tail and stamp terminal task_status onto still-running cards. This
         // covers the cases the /active probe can't see — the watcher died
         // (server restart), the continuation's 60s TTL expired before a
@@ -7119,7 +7121,7 @@ function portal() {
         // 2026-06-11 when the typed-message path made the continuation
         // broadcast reliable.
         this._bgContTickN = (this._bgContTickN || 0) + 1;
-        if (this._bgContTickN % 4 !== 0) return;
+        if (this._bgContTickN % 16 !== 0) return;
         try {
           const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
                                   { headers: this.hdr() });
@@ -7185,7 +7187,14 @@ function portal() {
             { headers: this.hdr(), signal: controller.signal },
           );
           if (!stillOwned()) return;
-          if (!activeResponse.ok || !!(await activeResponse.json()).active) {
+          let activity = null;
+          try { activity = activeResponse.ok ? await activeResponse.json() : null; }
+          catch (_) { activity = null; }
+          // A detached background task has no live transcript writer.  It must
+          // not hold the just-finished foreground turn's canonical merge behind
+          // 30 repeated /active probes for the life of `sleep 20s`.  A real
+          // turn/continuation (active without background) still owns the pane.
+          if (!activity || (activity.active && !activity.background)) {
             retry();
             return;
           }
@@ -8125,10 +8134,18 @@ function portal() {
         const hasBaseline = baseline !== undefined && Number.isFinite(baselineN);
         const newer = hasBaseline && newU > baselineN;
         const priorTarget = Number(st._reconcileTargetUpdated) || 0;
-        // A genuinely newer revision is fresh work, not a stuck catch-up — give
-        // the bounded retry chain below a new budget.
-        if (newU > priorTarget) st._reconcileRetryN = 0;
-        st._reconcileTargetUpdated = Math.max(priorTarget, newU);
+        const backgroundOnly = !!cur.background_active && !cur.turn_active;
+        const messageCountChanged = !!previous
+          && Number(cur.message_count || 0) !== Number(previous.message_count || 0);
+        const turnCountChanged = !!previous
+          && Number(cur.turn_count || 0) !== Number(previous.turn_count || 0);
+        // JSONL mtime can advance on task lifecycle/progress records even when
+        // no visible conversation row changed.  During a detached background
+        // gap, only count changes are evidence that the pane needs a canonical
+        // refresh; status/name/time updates belong to their own UI surfaces.
+        const visibleNewer = newer && (
+          !backgroundOnly || messageCountChanged || turnCountChanged
+        );
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
         if (cur.active) st._serverActiveObserved = true;
@@ -8157,7 +8174,7 @@ function portal() {
           st._pendingExternalUpdate = true;
         }
         if (st.streaming || st.es) {
-          if (newer) st._pendingExternalUpdate = true;
+          if (visibleNewer) st._pendingExternalUpdate = true;
           continue;
         }
 
@@ -8170,8 +8187,18 @@ function portal() {
         // Refresh only on real evidence of new content; handle "server has a
         // live turn but this tab owns no transport" as a separate attach-only
         // path that costs one /active probe and no pane rewrite.
-        const needsRefresh = st._pendingExternalUpdate || newer;
-        const wantsAttach = !!cur.active && !st.streaming && !st.es;
+        const needsRefresh = st._pendingExternalUpdate || visibleNewer;
+        const hasTurnActivityFlag = Object.prototype.hasOwnProperty.call(
+          cur, "turn_active",
+        );
+        const wantsAttach = (
+          hasTurnActivityFlag ? !!cur.turn_active
+            : (!!cur.active && !cur.background_active)
+        ) && !st.streaming && !st.es;
+        if (needsRefresh && newU > priorTarget) st._reconcileRetryN = 0;
+        if (needsRefresh) {
+          st._reconcileTargetUpdated = Math.max(priorTarget, newU);
+        }
         if (st._reconcilePromise) {
           if (needsRefresh) st._pendingExternalUpdate = true;
           continue;

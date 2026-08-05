@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Claude Agent SDK overlays options.env onto the whole MuseLab backend
-# environment. Remove MuseLab/provider credentials before handing control to
-# DUCC; claude-go will install its own endpoint, auth and signed custom header.
+# Capture the executable before rebuilding a clean environment.  DUCC gets its
+# own HOME-owned login/config, but never MuseLab's ambient provider, cloud,
+# repository, database or SSH credentials.
 ducc_cli="${MUSELAB_DUCC_CLI:-}"
 if [[ -z "$ducc_cli" ]]; then
     for candidate in \
@@ -23,22 +23,41 @@ if [[ -z "$ducc_cli" || ! -x "$ducc_cli" ]]; then
     exit 127
 fi
 
-while IFS= read -r name; do
-    case "$name" in
-        MUSELAB_TOKEN|MUSELAB_PROVIDER_*|\
-        ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|\
-        ANTHROPIC_CUSTOM_HEADERS|ANTHROPIC_DEFAULT_*|\
-        CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|\
-        CLAUDE_AGENT_SDK_CLIENT_APP|CLAUDE_AGENT_SDK_VERSION|\
-        CLAUDE_CODE_ENTRYPOINT|\
-        DEEPSEEK_API_KEY|ZHIPUAI_API_KEY|MINIMAX_API_KEY|\
-        MOONSHOT_API_KEY|DASHSCOPE_API_KEY|XIAOMI_MIMO_API_KEY|\
-        QIANFAN_API_KEY|CODEX_GATEWAY_API_KEY|OPENAI_API_KEY|\
-        OPENAI_IMAGE_API_KEY)
-            unset "$name"
-            ;;
-    esac
-done < <(compgen -e)
-unset MUSELAB_DUCC_CLI
+safe_env=()
 
-exec "$ducc_cli" "$@"
+append_if_set() {
+    local name="$1"
+    if [[ -v "$name" ]]; then
+        safe_env+=("$name=${!name}")
+    fi
+}
+
+for name in \
+    PATH HOME USER LOGNAME SHELL TERM TMPDIR LANG TZ \
+    XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME \
+    SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS \
+    DUCC_AUTH_SOURCE; do
+    append_if_set "$name"
+done
+
+# Locale variables are configuration, not credentials, and can be named
+# beyond LC_ALL/LC_CTYPE.  Preserve only that closed prefix.
+while IFS= read -r name; do
+    [[ "$name" == LC_* ]] && append_if_set "$name"
+done < <(compgen -e)
+
+# Keep credential-free proxy compatibility.  A URL containing userinfo would
+# hand a reusable proxy password to every tool DUCC launches, so omit it.
+for name in \
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+    http_proxy https_proxy all_proxy no_proxy; do
+    if [[ -v "$name" && "${!name}" != *"@"* ]]; then
+        safe_env+=("$name=${!name}")
+    fi
+done
+
+if [[ ! -v PATH ]]; then
+    safe_env+=("PATH=/usr/local/bin:/usr/bin:/bin")
+fi
+
+exec env -i "${safe_env[@]}" "$ducc_cli" "$@"

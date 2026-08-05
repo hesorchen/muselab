@@ -2558,3 +2558,51 @@ def test_stale_task_pins_expire_after_the_watch_timeout(stream_env):
         for tid in ("task_fresh", "task_zombie"):
             chat_mod._bg_task_pinned_at.pop(tid, None)
             chat_mod._bg_task_descriptions.pop(tid, None)
+
+
+def test_watcher_timeout_keeps_absolute_task_deadline_across_respawns(
+    stream_env, monkeypatch,
+):
+    chat_mod = stream_env
+    now = 10_000.0
+    timeout = float(chat_mod._TASK_WATCH_TIMEOUT)
+    monkeypatch.setattr(chat_mod.time, "time", lambda: now)
+    try:
+        chat_mod._bg_task_pinned_at["task_old"] = now - timeout + 100
+        chat_mod._bg_task_pinned_at["task_new"] = now - timeout + 800
+
+        first = chat_mod._task_watch_timeout_remaining(
+            {"task_old", "task_new"})
+        assert first == 800
+
+        # A replacement watcher gets the remaining lease, not a fresh timeout.
+        now += 125
+        replacement = chat_mod._task_watch_timeout_remaining(
+            {"task_old", "task_new"})
+        assert replacement == 675
+    finally:
+        chat_mod._bg_task_pinned_at.pop("task_old", None)
+        chat_mod._bg_task_pinned_at.pop("task_new", None)
+
+
+def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
+    chat_mod = stream_env
+    sid = "sid-watcher-without-pin"
+
+    class LiveWatcher:
+        @staticmethod
+        def done():
+            return False
+
+    try:
+        chat_mod._task_watchers[sid] = LiveWatcher()
+        assert chat_mod.session_active_status(sid) == {"active": False}
+
+        chat_mod._pin_background_task(sid, "task_live")
+        active = chat_mod.session_active_status(sid)
+        assert active["active"] is True
+        assert active["background"] is True
+        assert active["background_tasks_pending"] == 1
+    finally:
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._release_task_pins(sid, {"task_live"})

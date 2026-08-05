@@ -792,6 +792,7 @@ def test_effort_and_fast_controls_follow_per_model_capabilities():
     assert "Array.isArray(meta.effort_levels)" in capabilities
     assert "meta.supports_fast === true" in capabilities
     assert "this._isClaudeModel(model)" in capabilities
+    assert app.count('replace(/^ducc:/i, "")') >= 2
     assert 'level !== "ultra"' in capabilities
     assert 'level !== "xhigh" || this._isClaudeXHighModel(model)' in capabilities
 
@@ -1532,7 +1533,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
         "\n    _reconcileCompletedContinuation", reconcile_start)
     reconcile = app[reconcile_start:reconcile_end]
     assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
-    assert "!!(await activeResponse.json()).active" in reconcile
+    assert "activity.active && !activity.background" in reconcile
     assert '"/api/chat/sessions/" + sid + "?tail=80"' in reconcile
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
@@ -2711,10 +2712,13 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     #    background task, so it cannot mean "there is new content".
     reconcile = js[js.index("    _reconcileOpenSession(next) {"):]
     reconcile = reconcile[:reconcile.index("\n    _sessionsEqual(")]
-    assert "const needsRefresh = st._pendingExternalUpdate || newer;" in reconcile
+    assert "const backgroundOnly = !!cur.background_active && !cur.turn_active;" in reconcile
+    assert "const needsRefresh = st._pendingExternalUpdate || visibleNewer;" in reconcile
+    assert "messageCountChanged || turnCountChanged" in reconcile
     assert "!!cur.active || st._pendingExternalUpdate" not in reconcile
     # Attaching to a server-side turn is a separate, pane-preserving path.
-    assert "const wantsAttach = !!cur.active && !st.streaming && !st.es;" in reconcile
+    assert "hasTurnActivityFlag ? !!cur.turn_active" in reconcile
+    assert "!!cur.active && !cur.background_active" in reconcile
     assert "if (wantsAttach && st._loaded) this._checkActiveTurn(sid);" in reconcile
     # 2. A HEALTHY transport is never retired on one stale `active:false` tick.
     assert "const transportDead = !st.es" in reconcile

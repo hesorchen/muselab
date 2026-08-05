@@ -2342,7 +2342,7 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
             "task_status": {"state": "running", "task_id": "task-gap-1"},
         },
     ]
-    _route_windowed_session(page, sid, messages)
+    requests = _route_windowed_session(page, sid, messages)
     page.route(
         f"**/api/chat/sessions/{sid}/active",
         lambda route: route.fulfill(
@@ -2383,7 +2383,9 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
         }];
         app.sessions = [{ id: arg, name: "Background gap",
           updated_at: Date.now() / 1000, model: "e2e-model",
-          permission: "bypassPermissions", thinking: true }];
+          permission: "bypassPermissions", thinking: true,
+          active: true, turn_active: false, background_active: true,
+          message_count: 3, turn_count: 1 }];
         app.openTabIds = [arg];
         app.tabState = {};
         app.currentId = arg;
@@ -2422,6 +2424,90 @@ def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(
     expect(page.locator(".chat-tab.active .chat-tab-stream-dot.is-background")).to_be_visible(
         timeout=5000,
     )
+
+    # The foreground turn may finish while its detached task keeps /active
+    # true.  Canonicalize that completed foreground turn once, but never hide
+    # or remount the already-visible assistant bubble while doing so.
+    reconciliation = page.evaluate(
+        """async sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          const node = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant`);
+          const key = st.messages.find(m => m.role === "assistant")?._k || "";
+          app._reconcileCompletedTurn(
+            sid, st, "BACKGROUND_GAP_ASSISTANT",
+          );
+          const frames = [];
+          for (let i = 0; i < 24; i += 1) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const pane = document.querySelector(
+              `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+            frames.push({
+              ready: app.messagesReady,
+              loading: app.messagesLoading,
+              visible: !!pane && pane.textContent.includes("BACKGROUND_GAP_ASSISTANT"),
+              count: pane ? pane.querySelectorAll(".msg").length : 0,
+            });
+          }
+          await new Promise(resolve => setTimeout(resolve, 120));
+          const current = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant`);
+          return {frames, sameNode: current === node, key,
+            currentKey: st.messages.find(m => m.role === "assistant")?._k || ""};
+        }""",
+        sid,
+    )
+    assert len(requests) >= 3, requests
+    assert reconciliation["sameNode"] is True, reconciliation
+    assert reconciliation["currentKey"] == reconciliation["key"]
+    assert all(
+        frame["ready"] and not frame["loading"]
+        and frame["visible"] and frame["count"] > 0
+        for frame in reconciliation["frames"]
+    ), reconciliation
+
+    # A task-progress/JSONL-mtime-only session-list update is metadata, not new
+    # chat content.  Repeated waiting ticks must not issue another ?tail=300 or
+    # replace any message node.
+    request_baseline = len(requests)
+    waiting = page.evaluate(
+        """async sid => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          st._seenUpdated = 1;
+          app.sessions[0] = {...app.sessions[0], updated_at: 1,
+            active: true, turn_active: false, background_active: true,
+            message_count: 3, turn_count: 1};
+          const node = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant`);
+          const frames = [];
+          for (let revision = 2; revision <= 8; revision += 1) {
+            app._applySessionList([{...app.sessions[0], updated_at: revision}]);
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const pane = document.querySelector(
+              `.msg-pane[data-tid="${CSS.escape(sid)}"]`);
+            frames.push({
+              ready: app.messagesReady,
+              loading: app.messagesLoading,
+              visible: !!pane && pane.textContent.includes("BACKGROUND_GAP_ASSISTANT"),
+              count: pane ? pane.querySelectorAll(".msg").length : 0,
+            });
+          }
+          const current = document.querySelector(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant`);
+          app._stopBgContPoller(sid);
+          return {frames, sameNode: current === node};
+        }""",
+        sid,
+    )
+    assert len(requests) == request_baseline, requests
+    assert waiting["sameNode"] is True, waiting
+    assert all(
+        frame["ready"] and not frame["loading"]
+        and frame["visible"] and frame["count"] > 0
+        for frame in waiting["frames"]
+    ), waiting
     assert tickets == [], "background-only state must not open an empty SSE"
     _assert_no_browser_errors(page, errors)
 
