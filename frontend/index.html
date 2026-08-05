@@ -1332,6 +1332,11 @@
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
         </button>
+        <button class="icon-btn" type="button" @click="openMemoryCenter()"
+                :title="lang==='zh' ? '记忆中心' : 'Memory Center'"
+                :aria-label="lang==='zh' ? '打开记忆中心' : 'Open Memory Center'">
+          <svg><use href="#i-brain"/></svg>
+        </button>
         <!-- 2026-07-25: removed the mobile-only terminal shortcut that used to
              sit here. The terminal is a preview-pane surface and the preview
              header already carries `.terminal-manager-btn`, so this was a
@@ -5514,8 +5519,11 @@
       <div class="modal-body activity-body">
         <div class="hint-row" x-show="activity.loading" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
         <template x-for="group in activityVisibleGroups()" :key="group.key">
-          <section class="activity-group" x-show="activityEvents(group).length">
-            <h3 x-text="group.label"></h3>
+          <section class="activity-group" x-show="activityEvents(group).length"
+                   :class="{ 'is-timeline': group.key === 'timeline' }">
+            <!-- The timeline toggle already communicates ordering. Repeating
+                 "all tasks · pinned first · newest" here adds visual noise. -->
+            <h3 x-show="group.key !== 'timeline'" x-text="group.label"></h3>
             <template x-for="item in activityEvents(group)" :key="item.id">
               <div class="activity-row-wrap"
                    :class="{ pinned: activity.view === 'timeline' && item.pinned }">
@@ -5526,10 +5534,28 @@
                           + (activityRequiresAction(item) ? ' requires-action' : '')">
                   <span class="activity-state-dot"></span>
                   <span class="activity-row-main">
-                    <strong x-text="item.task_summary || item.session_name"></strong>
-                    <small><span x-text="item.workspace_name"></span><span x-show="item.session_name"> · <span x-text="item.session_name"></span></span><span x-show="item.status_detail"> · <span x-text="item.status_detail"></span></span></small>
+                    <strong class="activity-session-name"
+                            x-text="item.session_name || item.task_summary"></strong>
+                    <small class="activity-task-line"
+                           x-show="activityTaskSummary(item) || activityTurnLabel(item) || activityWorkspaceLabel(item)">
+                      <span class="activity-task-summary"
+                            x-show="activityTaskSummary(item)"
+                            x-text="activityTaskSummary(item)"></span>
+                      <span class="activity-row-meta activity-turn-count"
+                            x-show="activityTurnLabel(item)"
+                            x-text="activityTurnLabel(item)"></span>
+                      <span class="activity-row-meta activity-workspace-label"
+                            x-show="activityWorkspaceLabel(item)"
+                            x-text="activityWorkspaceLabel(item)"></span>
+                    </small>
+                    <small class="activity-status-detail"
+                           x-show="activityStatusDetail(item)"
+                           x-text="activityStatusDetail(item)"></small>
                   </span>
-                  <span class="activity-row-side"><span x-text="activityStateLabel(item.state)"></span><small x-text="activityTime(item)"></small></span>
+                  <span class="activity-row-side">
+                    <span x-text="activityStateLabel(item.state)"></span>
+                    <small :title="activityTime(item)" x-text="activityRelativeTime(item)"></small>
+                  </span>
                 </button>
                 <button class="activity-pin" type="button"
                         x-show="activity.view === 'timeline'"

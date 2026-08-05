@@ -1070,6 +1070,24 @@ def test_activity_center_uses_two_compact_numberless_status_dots():
     assert "background:var(--c-success)" in unread
 
 
+def test_memory_center_shortcut_sits_immediately_after_activity_center():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    activity_start = html.index('class="activity-center-btn"')
+    activity_end = html.index("</button>", activity_start) + len("</button>")
+    memory_start = html.index('@click="openMemoryCenter()"', activity_end)
+    skills_start = html.index('@click="toggleSkillsDrawer()"', activity_end)
+
+    assert activity_end < memory_start < skills_start
+    shortcut = html[memory_start - 100:html.index("</button>", memory_start)]
+    assert 'href="#i-brain"' in shortcut
+    assert "打开记忆中心" in shortcut
+    assert 'async openSettings(activePage = "")' in app
+    assert 'activePage === "memory"' in app
+    assert 'async openMemoryCenter(tab = "")' in app
+    assert 'await this.openSettings("memory")' in app
+
+
 def test_task_rows_force_targeted_session_lookup_and_activate_the_linked_workspace():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")

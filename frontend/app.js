@@ -13356,7 +13356,7 @@ function portal() {
     },
 
     // ===== settings modal =====
-    async openSettings() {
+    async openSettings(activePage = "") {
       const r = await fetch("/api/settings", { headers: this.hdr() });
       if (!r.ok) {
         this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
@@ -13386,7 +13386,8 @@ function portal() {
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = this.isWideScreen ? "provider" : null;
+      this.settings.activePage = activePage === "memory"
+        ? "memory" : (this.isWideScreen ? "provider" : null);
       this.settings.show = true;
       // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
       // stays lazy because Codex quota refresh intentionally runs a CLI probe.
@@ -13394,6 +13395,11 @@ function portal() {
       this.refreshSkillList();
       this.loadClaudeAuthStatus();
       this.loadMemorySettings();
+    },
+
+    async openMemoryCenter(tab = "") {
+      if (tab) this.settings.memory.tab = tab;
+      await this.openSettings("memory");
     },
 
     _memoryConfigPayload() {
@@ -13441,12 +13447,7 @@ function portal() {
               : `${unseen.length} new Skill candidate(s) await review`,
             "info", 8000, {
               label: this.lang === "zh" ? "打开记忆中心" : "Open Memory Center",
-              onClick: async () => {
-                await this.openSettings();
-                this.settings.activePage = "memory";
-                this.settings.memory.tab = "skills";
-                await this.refreshMemoryCenter();
-              },
+              onClick: () => this.openMemoryCenter("skills"),
             });
           const merged = [...new Set([...seen, ...unseen])].slice(-100);
           this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
@@ -25605,10 +25606,50 @@ function portal() {
         paused: zh ? "已暂停" : "Paused", completed: zh ? "已完成" : "Completed",
         failed: zh ? "失败" : "Failed", cancelled: zh ? "已取消" : "Cancelled" })[state] || state;
     },
+    activityTaskSummary(item) {
+      const summary = String(item?.task_summary || "").trim();
+      const session = String(item?.session_name || "").trim();
+      return summary && summary !== session ? summary : "";
+    },
+    activityTurnLabel(item) {
+      const count = Math.max(0, Math.floor(Number(item?.turn_count) || 0));
+      if (count <= 1) return "";
+      return this.lang === "zh" ? `${count}轮` : `${count} turns`;
+    },
+    activityWorkspaceLabel(item) {
+      if ((this.activity.summary?.workspaces || []).length <= 1) return "";
+      return String(item?.workspace_name || "").trim();
+    },
+    activityStatusDetail(item) {
+      const detail = String(item?.status_detail || "").trim();
+      if (!detail || ["Task completed", "Task failed", "Task cancelled"].includes(detail)) {
+        return "";
+      }
+      return detail;
+    },
     activityTime(item) {
       const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    },
+    activityRelativeTime(item) {
+      const ts = this.activityEventTimestamp(item) * 1000;
+      if (!ts) return "";
+      const elapsed = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (elapsed < 45) return this.lang === "zh" ? "刚刚" : "Just now";
+      if (elapsed < 3600) {
+        const minutes = Math.max(1, Math.floor(elapsed / 60));
+        return this.lang === "zh" ? `${minutes}分钟前` : `${minutes}m ago`;
+      }
+      if (elapsed < 86400) {
+        const hours = Math.max(1, Math.floor(elapsed / 3600));
+        return this.lang === "zh" ? `${hours}小时前` : `${hours}h ago`;
+      }
+      if (elapsed < 7 * 86400) {
+        const days = Math.max(1, Math.floor(elapsed / 86400));
+        return this.lang === "zh" ? `${days}天前` : `${days}d ago`;
+      }
+      return this.activityTime(item);
     },
     async toggleActivityPin(item) {
       if (!item?.id || this.activity.view !== "timeline") return false;
