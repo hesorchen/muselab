@@ -792,6 +792,7 @@ def test_effort_and_fast_controls_follow_per_model_capabilities():
     assert "Array.isArray(meta.effort_levels)" in capabilities
     assert "meta.supports_fast === true" in capabilities
     assert "this._isClaudeModel(model)" in capabilities
+    assert app.count('replace(/^ducc:/i, "")') >= 2
     assert 'level !== "ultra"' in capabilities
     assert 'level !== "xhigh" || this._isClaudeXHighModel(model)' in capabilities
 
@@ -1068,6 +1069,24 @@ def test_activity_center_uses_two_compact_numberless_status_dots():
     assert "width:10px" in unread and "height:10px" in unread
     assert "min-width" not in unread and "padding" not in unread
     assert "background:var(--c-success)" in unread
+
+
+def test_memory_center_shortcut_sits_immediately_after_activity_center():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    activity_start = html.index('class="activity-center-btn"')
+    activity_end = html.index("</button>", activity_start) + len("</button>")
+    memory_start = html.index('@click="openMemoryCenter()"', activity_end)
+    skills_start = html.index('@click="toggleSkillsDrawer()"', activity_end)
+
+    assert activity_end < memory_start < skills_start
+    shortcut = html[memory_start - 100:html.index("</button>", memory_start)]
+    assert 'href="#i-brain"' in shortcut
+    assert "打开记忆中心" in shortcut
+    assert 'async openSettings(activePage = "")' in app
+    assert 'activePage === "memory"' in app
+    assert 'async openMemoryCenter(tab = "")' in app
+    assert 'await this.openSettings("memory")' in app
 
 
 def test_task_rows_force_targeted_session_lookup_and_activate_the_linked_workspace():
@@ -1456,6 +1475,18 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     canonical_reload = app[canonical_start:canonical_end]
     assert "this.loadSession(sid, { quiet: true })" in canonical_reload
     assert "quiet: sid === this.currentId" not in canonical_reload
+    # A continuation can emit its task-complete toast and then race out of the
+    # grace-kept /active slot. Both terminal fallbacks reconcile an already-
+    # rendered pane and must never take the cold-load skeleton/clear path.
+    no_active_start = send.index('if (serverError === "no active turn")')
+    no_active_end = send.index("// ---- Transport-level", no_active_start)
+    assert "this.loadSession(streamSid, { quiet: true })" in send[
+        no_active_start:no_active_end]
+    transport_finished_start = send.index("if (!d.active)", no_active_end)
+    transport_finished_end = send.index(
+        "if (d.background && d.attachable === false)", transport_finished_start)
+    assert "this.loadSession(streamSid, { quiet: true })" in send[
+        transport_finished_start:transport_finished_end]
 
 
 def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
@@ -1502,7 +1533,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
         "\n    _reconcileCompletedContinuation", reconcile_start)
     reconcile = app[reconcile_start:reconcile_end]
     assert '"/api/chat/sessions/" + sid + "/active"' in reconcile
-    assert "!!(await activeResponse.json()).active" in reconcile
+    assert "activity.active && !activity.background" in reconcile
     assert '"/api/chat/sessions/" + sid + "?tail=80"' in reconcile
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
@@ -2661,3 +2692,83 @@ def test_stop_aborts_stream_ticket_before_backend_turn_exists():
     assert "if (st._streamStartController && !st.es)" in stop
     assert "st._streamStartController.abort()" in stop
     assert "st.streaming = false" in stop
+
+
+def test_midturn_reconnect_storm_guards_are_in_place():
+    """Guard the 2026-08-04 mid-turn flicker fix.
+
+    Measured symptom: ~60 full SSE teardown+replay cycles in 20-30 s while a
+    turn was running (60 POST /stream/start, 63 ?tail=300 quiet reloads, 382
+    /active probes). No transport error was involved — the driver was a closed
+    loop: _reconcileOpenSession saw `active:true` in the session list, quiet-
+    reloaded the transcript, loadSession's tail probed /active, that reconnected
+    and replayed the whole turn, `done` refreshed the list, repeat. Each of the
+    asserts below removes one edge of that loop; losing any one re-opens it.
+    """
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    # 1. A live session-list row alone must not trigger a transcript re-read.
+    #    `cur.active` stays true for the whole life of a turn AND of any
+    #    background task, so it cannot mean "there is new content".
+    reconcile = js[js.index("    _reconcileOpenSession(next) {"):]
+    reconcile = reconcile[:reconcile.index("\n    _sessionsEqual(")]
+    assert "const backgroundOnly = !!cur.background_active && !cur.turn_active;" in reconcile
+    assert "const needsRefresh = st._pendingExternalUpdate || visibleNewer;" in reconcile
+    assert "messageCountChanged || turnCountChanged" in reconcile
+    assert "!!cur.active || st._pendingExternalUpdate" not in reconcile
+    # Attaching to a server-side turn is a separate, pane-preserving path.
+    assert "hasTurnActivityFlag ? !!cur.turn_active" in reconcile
+    assert "!!cur.active && !cur.background_active" in reconcile
+    assert "if (wantsAttach && st._loaded) this._checkActiveTurn(sid);" in reconcile
+    # 2. A HEALTHY transport is never retired on one stale `active:false` tick.
+    assert "const transportDead = !st.es" in reconcile
+    assert "if (transportDead) this._retireStaleSessionStream(sid, st);" in reconcile
+
+    # 3. Quiet reconciliation loads must not re-probe /active (that probe is
+    #    what turned every poll-driven reload into a full-turn replay).
+    load = js[js.index("    async loadSession(sid, opts = {}) {"):]
+    assert "const probeActive = opts.probeActive !== undefined" in load
+    assert "if (probeActive) this._checkActiveTurn(sid);" in load
+
+    # 4. Every reconnect source goes through one shared rate brake.
+    assert "_allowReconnect(sid, turnId) {" in js
+    gate = js[js.index("    _allowReconnect(sid, turnId) {"):]
+    gate = gate[:gate.index("\n    _reconcileOpenSession(")]
+    assert "if (last && now - last < MIN_GAP_MS) return false;" in gate
+    assert ">= BURST_MAX" in gate
+    # Refusal falls back to the flicker-free path: wait out the turn, then
+    # quiet-load canonical history.
+    assert "this._scheduleCanonicalStreamReload(sid, st);" in gate
+    check = js[js.index("    async _checkActiveTurn(sid) {"):]
+    check = check[:check.index("\n    // Hover-prefetch")]
+    assert "if (!this._allowReconnect(sid, d.turn_id)) return;" in check
+    recover = js[js.index("    async _recoverStalledStream(sid = this.currentId) {"):]
+    recover = recover[:recover.index("\n    _scheduleCanonicalStreamReload(")]
+    assert "if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;" in recover
+
+    # 5. The MAX_ATTEMPTS ceiling must stay reachable: a fresh turn is the only
+    #    place the counter resets. Every reconnect opens its EventSource
+    #    successfully, so resetting in es.onopen (or on retire) made the cap
+    #    unreachable and let the loop run forever.
+    assert js.count("_reconnectAttempts = 0") == 1
+    fresh = js[js.index("        streamState._sessionActivityExpected = null;"):]
+    fresh = fresh[:fresh.index("streamState.streaming = true;")]
+    assert "streamState._reconnectAttempts = 0;" in fresh
+    onopen = js[js.index("      es.onopen = () => {"):]
+    onopen = onopen[:onopen.index("      };")]
+    assert "_reconnectAttempts" not in onopen
+
+    # 6. Turn completion refreshes the list quietly instead of via
+    #    refreshSessions(), which also drives _recoverStalledStream — i.e. it
+    #    wired a second reconnect probe into the turn-completion path.
+    done = js[js.index("        streamState._seenUpdated = undefined;"):]
+    done = done[:done.index("        if (this.currentId === streamSid) {")]
+    assert "this._syncSessionListQuiet();" in done
+    assert "this.refreshSessions();" not in done
+
+    # 7. The catch-up retry is bounded. An unbounded 250 ms self-retry is a hot
+    #    loop whenever the transcript never reaches the list's target revision,
+    #    and every round costs a full ?tail= reload of the visible pane.
+    assert "st._reconcileRetryN = retries + 1;" in reconcile
+    assert "&& retries < 6" in reconcile
+    assert "Math.min(2000, 250 * (retries + 1))" in reconcile

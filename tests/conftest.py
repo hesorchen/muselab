@@ -101,6 +101,11 @@ def app_module(monkeypatch, temp_root, tmp_path):
 
     import backend.main as main_mod  # type: ignore[import]
 
+    # DUCC is installed on some developer machines but absent in CI. Keep the
+    # general suite host-independent; DUCC-specific tests opt back in explicitly.
+    from backend import settings as settings_mod
+    monkeypatch.setattr(settings_mod, "locate_ducc_executable", lambda: None)
+
     # Isolate Claude Auth status/disconnect tests from the developer's real
     # ~/.claude/.credentials.json. Individual tests that need a credentials file
     # monkeypatch this path explicitly.

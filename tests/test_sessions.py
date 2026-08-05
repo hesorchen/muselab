@@ -523,6 +523,32 @@ def test_providers_marks_codex_effort_capability(client, auth, monkeypatch):
     assert codex["supports_fast"] is True
 
 
+def test_providers_publish_ducc_controls_per_model_family(
+    client, auth, monkeypatch,
+):
+    from backend import chat as chat_mod
+    from backend import settings
+
+    monkeypatch.setattr(
+        settings, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
+    r = client.get("/api/chat/providers", headers=auth)
+
+    assert r.status_code == 200
+    models = r.json()["models"]
+    ducc_gpt = next(m for m in models if m["model"] == "ducc:gpt-5-6-sol")
+    ducc_claude = next(
+        m for m in models if m["model"] == "ducc:claude-opus-4-8")
+    assert ducc_gpt["supports_thinking"] is False
+    assert ducc_gpt["supports_effort"] is False
+    assert ducc_gpt["effort_levels"] == []
+    assert ducc_claude["supports_thinking"] is True
+    assert ducc_claude["supports_effort"] is True
+    assert ducc_claude["effort_levels"] == [
+        "auto", *chat_mod._SDK_EFFORT_LEVELS,
+    ]
+    assert ducc_claude["supports_fast"] is False
+
+
 def test_provider_capability_batch_probes_unreachable_gateway_once(
     app_module, monkeypatch,
 ):

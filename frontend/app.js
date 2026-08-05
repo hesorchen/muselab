@@ -4941,6 +4941,81 @@ function portal() {
       try { t.action && t.action.onClick && t.action.onClick(); }
       finally { this.dismissToast(t.id); }
     },
+    // ── Background-task settle feedback ────────────────────────────────────
+    // One agentic turn can settle dozens of Agent/Bash background tasks within
+    // a couple of seconds. Toasting each one unconditionally (the pre-2026-08-04
+    // behaviour) overflowed MAX_TOASTS instantly: the user saw a wall of
+    // identical "后台任务已完成" cards, the useful ones (failures) scrolled out
+    // of the stack, and every push+splice re-rendered the fixed overlay. Two
+    // guards here:
+    //   1. per-task_id dedup — a terminal state is reported at most once, so a
+    //      replayed continuation broadcast or a duplicate backend publisher
+    //      cannot re-toast the same task;
+    //   2. a short coalescing window — settles landing inside it collapse into
+    //      ONE toast that counts them by outcome.
+    // The task CARD is unaffected: applyTaskStatus still flips every card
+    // individually and immediately. This only governs the transient overlay.
+    _noteBackgroundTaskSettled(taskId, state, alreadyReported = false) {
+      const zh = this.lang === "zh";
+      // Terminal-state names as they arrive from the SSE payload; anything
+      // unrecognized is bucketed as a plain completion ("done").
+      const bucket = state === "failed" ? "failed"
+        : state === "stopped" ? "stopped" : "completed";
+      if (taskId) {
+        this._bgToastSeen = this._bgToastSeen || new Map();
+        if (this._bgToastSeen.has(taskId)) return;
+        this._bgToastSeen.set(taskId, bucket);
+        // Bound the dedup ledger. Terminal states never revert, so evicting
+        // the oldest entries can only re-admit a task that settled hundreds of
+        // tasks ago — long past any replay window.
+        if (this._bgToastSeen.size > 500) {
+          const drop = this._bgToastSeen.size - 500;
+          let i = 0;
+          for (const k of this._bgToastSeen.keys()) {
+            if (i++ >= drop) break;
+            this._bgToastSeen.delete(k);
+          }
+        }
+      } else if (alreadyReported) {
+        // No id to dedup on, but the server already published this exact
+        // transition through its other publisher — don't double-count it.
+        return;
+      }
+      this._bgToastBatch = this._bgToastBatch
+        || { completed: 0, failed: 0, stopped: 0 };
+      this._bgToastBatch[bucket] += 1;
+      if (this._bgToastTimer) return;
+      this._bgToastTimer = setTimeout(() => {
+        this._bgToastTimer = null;
+        const batch = this._bgToastBatch
+          || { completed: 0, failed: 0, stopped: 0 };
+        this._bgToastBatch = null;
+        const total = batch.completed + batch.failed + batch.stopped;
+        if (!total) return;
+        if (total === 1) {
+          const label = batch.failed ? (zh ? "后台任务失败" : "Background task failed")
+            : batch.stopped ? (zh ? "后台任务已停止" : "Background task stopped")
+              : (zh ? "后台任务已完成" : "Background task finished");
+          this.toast(label, batch.failed ? "error" : "info");
+          return;
+        }
+        const parts = [];
+        if (batch.completed) {
+          parts.push(zh ? `${batch.completed} 个已完成`
+            : `${batch.completed} finished`);
+        }
+        if (batch.failed) {
+          parts.push(zh ? `${batch.failed} 个失败` : `${batch.failed} failed`);
+        }
+        if (batch.stopped) {
+          parts.push(zh ? `${batch.stopped} 个已停止` : `${batch.stopped} stopped`);
+        }
+        const body = zh
+          ? `后台任务：${parts.join("、")}`
+          : `Background tasks: ${parts.join(", ")}`;
+        this.toast(body, batch.failed ? "error" : "info");
+      }, 700);
+    },
 
     // Enter pressed while a CJK IME is composing confirms the highlighted
     // candidate; it must not also submit the surrounding prompt or rename.
@@ -5621,10 +5696,12 @@ function portal() {
       return null;
     },
     _isClaudeModel(model) {
-      return (model || "").startsWith("claude-");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return m.startsWith("claude-");
     },
     _isClaudeXHighModel(model) {
-      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(model || "");
+      const m = String(model || "").replace(/^ducc:/i, "");
+      return /^claude-opus-4-(7|8)(?:$|[-.])/.test(m);
     },
     _isCodexModel(model) {
       const m = model || "";
@@ -7034,7 +7111,7 @@ function portal() {
           }
         } catch (_e) {}
         if (contFound) return;   // continuation replay will flip the card
-        // FALLBACK reconciliation, every 4th tick (~32s): pull the history
+        // FALLBACK reconciliation, every 16th tick (~32s): pull the history
         // tail and stamp terminal task_status onto still-running cards. This
         // covers the cases the /active probe can't see — the watcher died
         // (server restart), the continuation's 60s TTL expired before a
@@ -7044,7 +7121,7 @@ function portal() {
         // 2026-06-11 when the typed-message path made the continuation
         // broadcast reliable.
         this._bgContTickN = (this._bgContTickN || 0) + 1;
-        if (this._bgContTickN % 4 !== 0) return;
+        if (this._bgContTickN % 16 !== 0) return;
         try {
           const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
                                   { headers: this.hdr() });
@@ -7110,7 +7187,14 @@ function portal() {
             { headers: this.hdr(), signal: controller.signal },
           );
           if (!stillOwned()) return;
-          if (!activeResponse.ok || !!(await activeResponse.json()).active) {
+          let activity = null;
+          try { activity = activeResponse.ok ? await activeResponse.json() : null; }
+          catch (_) { activity = null; }
+          // A detached background task has no live transcript writer.  It must
+          // not hold the just-finished foreground turn's canonical merge behind
+          // 30 repeated /active probes for the life of `sleep 20s`.  A real
+          // turn/continuation (active without background) still owns the pane.
+          if (!activity || (activity.active && !activity.background)) {
             retry();
             return;
           }
@@ -7854,12 +7938,16 @@ function portal() {
             if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
               return false;
             }
+            // Same brake as _checkActiveTurn: this is a second, independent
+            // reconnect source, and it used to zero _reconnectAttempts right
+            // before sending — which is one of the reasons MAX_ATTEMPTS never
+            // bit. Ask the shared gate instead of resetting the counter.
+            if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;
             try { st.es.close(); } catch (_) {}
             if (st._stallWatch) clearInterval(st._stallWatch);
             st._stallWatch = null;
             st.es = null;
             st.streaming = false;
-            st._reconnectAttempts = 0;
             if (sid === this.currentId) {
               this.es = null;
               this.streaming = false;
@@ -7967,7 +8055,11 @@ function portal() {
       st.backgroundTaskCount = 0;
       st._continuationAwaitingReaction = false;
       st._draining = false;
-      st._reconnectAttempts = 0;
+      // NOTE — do NOT reset _reconnectAttempts here. Retiring a stream means
+      // "give up on this transport and reconcile from canonical history", not
+      // "the turn is new". Zeroing it let the retire→reconnect→retire cycle
+      // run without ever reaching MAX_ATTEMPTS (2026-08-04 flicker storm).
+      // The counter is cleared when a genuinely new turn is submitted.
       st._serverActiveObserved = false;
       st.streamElapsed = 0;
       st._streamStartedAt = 0;
@@ -7978,6 +8070,53 @@ function portal() {
         this.streamElapsed = 0;
         this._streamStartedAt = 0;
       }
+    },
+
+    // Central brake on transparent reconnects. A reconnect is never cheap:
+    // TurnBroadcast.subscribe() replays the ENTIRE turn (measured 2026-08-04:
+    // 403 events / ~900 KB mid-turn), and send({reconnect:true}) first wipes
+    // the in-flight bubbles (`splice(lastUserIdx + 1)`) before re-pushing them
+    // one by one. Any path that can fire faster than a turn lasts therefore
+    // shows up as a continuous flicker storm — 2026-08-04 measured ~60 full
+    // teardown+replay cycles in 20-30 s, driven by list-poll reconciliation
+    // rather than by a real transport failure.
+    //
+    // The brake distinguishes a LOOP from a flaky network by spacing, not by a
+    // hard lifetime cap: a loop re-fires within seconds, while sleep/wake or a
+    // dropped link re-fires minutes apart. So the budget is per-turn and
+    // recovers once reconnects stop coming in a burst. Callers that are refused
+    // must NOT reconnect anyway — they wait for the next probe (10 s list poll,
+    // 18 s stall watchdog), or fall back to _scheduleCanonicalStreamReload,
+    // which is flicker-free because it waits for the turn to end and then
+    // quiet-loads canonical history.
+    _allowReconnect(sid, turnId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st) return false;
+      const MIN_GAP_MS = 1500;         // never twice in one visual beat
+      const BURST_MAX = 6;             // close-together reconnects per turn
+      const BURST_WINDOW_MS = 60_000;  // quiet this long ⇒ not a loop, reset
+      const key = String(turnId || st.activeTurnId || "");
+      const now = Date.now();
+      let last = Number(st._reconnectGateAt) || 0;
+      // A different turn is different work, and the 60 s idle window means a
+      // reconnect that far apart cannot be a loop. Either way, start clean —
+      // otherwise the spacing rule would refuse a legitimate attach to the
+      // NEXT turn (e.g. the queue drain, which attaches ~350 ms after `done`).
+      if (st._reconnectGateTurn !== key || (last && now - last >= BURST_WINDOW_MS)) {
+        st._reconnectGateTurn = key;
+        st._reconnectGateCount = 0;
+        last = 0;
+      }
+      if (last && now - last < MIN_GAP_MS) return false;
+      if ((Number(st._reconnectGateCount) || 0) >= BURST_MAX) {
+        // Budget spent in a burst ⇒ treat it as a loop. Stop replaying; let the
+        // turn finish and reconcile from canonical history instead.
+        this._scheduleCanonicalStreamReload(sid, st);
+        return false;
+      }
+      st._reconnectGateAt = now;
+      st._reconnectGateCount = (Number(st._reconnectGateCount) || 0) + 1;
+      return true;
     },
 
     _reconcileOpenSession(next) {
@@ -7994,9 +8133,18 @@ function portal() {
         const baselineN = Number(baseline);
         const hasBaseline = baseline !== undefined && Number.isFinite(baselineN);
         const newer = hasBaseline && newU > baselineN;
-        st._reconcileTargetUpdated = Math.max(
-          Number(st._reconcileTargetUpdated) || 0,
-          newU,
+        const priorTarget = Number(st._reconcileTargetUpdated) || 0;
+        const backgroundOnly = !!cur.background_active && !cur.turn_active;
+        const messageCountChanged = !!previous
+          && Number(cur.message_count || 0) !== Number(previous.message_count || 0);
+        const turnCountChanged = !!previous
+          && Number(cur.turn_count || 0) !== Number(previous.turn_count || 0);
+        // JSONL mtime can advance on task lifecycle/progress records even when
+        // no visible conversation row changed.  During a detached background
+        // gap, only count changes are evidence that the pane needs a canonical
+        // refresh; status/name/time updates belong to their own UI surfaces.
+        const visibleNewer = newer && (
+          !backgroundOnly || messageCountChanged || turnCountChanged
         );
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
@@ -8006,26 +8154,62 @@ function portal() {
           || !!(previous && previous.active)
           || (newer && streamAgeMs >= 5000)
         );
+        // A live SSE is the strongest evidence available that the turn is still
+        // running: it is a direct pipe to the turn itself, while the session
+        // list is a 10 s snapshot that can lag a turn start (or race a turn
+        // boundary). Retiring a HEALTHY transport on one such tick used to
+        // hand the pane to the reconnect path, which then replayed the whole
+        // turn and re-armed itself — the outer half of the 2026-08-04 flicker
+        // storm. Only retire when the transport itself agrees it is dead:
+        // closed readyState, or no inbound event (incl. the 15 s server ping)
+        // for longer than two ping intervals. A healthy stream just records
+        // the discrepancy and keeps the pane; its own `done` reconciles.
         if ((st.streaming || st.es) && serverSettled) {
-          this._retireStaleSessionStream(sid, st);
+          const sseSilentMs = Date.now() - (Number(st._lastSseActivity)
+            || Number(st._streamStartedAt) || Date.now());
+          const transportDead = !st.es
+            || Number(st.es.readyState) === 2
+            || sseSilentMs >= 32_000;
+          if (transportDead) this._retireStaleSessionStream(sid, st);
           st._pendingExternalUpdate = true;
         }
         if (st.streaming || st.es) {
-          if (newer) st._pendingExternalUpdate = true;
+          if (visibleNewer) st._pendingExternalUpdate = true;
           continue;
         }
 
-        const needsRefresh = !!cur.active || st._pendingExternalUpdate || newer;
+        // `cur.active` alone is NOT a reason to re-read the transcript. The
+        // session list reports active for the whole life of an in-flight turn
+        // *and* of any background task (`_sessions_with_inflight_tasks`), so
+        // treating it as "needs refresh" re-ran a full ?tail=300 quiet reload
+        // on every tick of that window — and loadSession's tail then probed
+        // /active and reconnected, closing the 2026-08-04 flicker loop.
+        // Refresh only on real evidence of new content; handle "server has a
+        // live turn but this tab owns no transport" as a separate attach-only
+        // path that costs one /active probe and no pane rewrite.
+        const needsRefresh = st._pendingExternalUpdate || visibleNewer;
+        const hasTurnActivityFlag = Object.prototype.hasOwnProperty.call(
+          cur, "turn_active",
+        );
+        const wantsAttach = (
+          hasTurnActivityFlag ? !!cur.turn_active
+            : (!!cur.active && !cur.background_active)
+        ) && !st.streaming && !st.es;
+        if (needsRefresh && newU > priorTarget) st._reconcileRetryN = 0;
+        if (needsRefresh) {
+          st._reconcileTargetUpdated = Math.max(priorTarget, newU);
+        }
         if (st._reconcilePromise) {
           if (needsRefresh) st._pendingExternalUpdate = true;
           continue;
         }
         if (!needsRefresh) {
           if (!hasBaseline && st._loaded && newU) st._seenUpdated = newU;
+          if (wantsAttach && st._loaded) this._checkActiveTurn(sid);
           continue;
         }
 
-        const attach = !!cur.active;
+        const attach = wantsAttach;
         st._pendingExternalUpdate = false;
         let succeeded = false;
         const task = (async () => {
@@ -8055,13 +8239,22 @@ function portal() {
             const stillBehind = target > 0 && (!hasSeen || target > seen);
             if (stillBehind) st._pendingExternalUpdate = true;
             else if (succeeded) st._pendingExternalUpdate = false;
+            // Bounded catch-up retry. The transcript can legitimately lag the
+            // list target by one round (a list response observed U2 while the
+            // transcript request already in flight still carried U1), so retry
+            // — but back off and stop. An unbounded 250 ms retry is a hot loop
+            // whenever the gap does NOT close, and each round costs a full
+            // ?tail= reload of the visible pane (2026-08-04 flicker storm).
+            const retries = Number(st._reconcileRetryN) || 0;
+            if (!stillBehind) st._reconcileRetryN = 0;
             if (succeeded && stillBehind && !st.streaming && !st.es
-                && !st._reconcileRetryTimer) {
+                && !st._reconcileRetryTimer && retries < 6) {
+              st._reconcileRetryN = retries + 1;
               st._reconcileRetryTimer = setTimeout(() => {
                 st._reconcileRetryTimer = null;
                 const latest = (this.sessions || []).find(s => s && s.id === sid);
                 if (latest) this._reconcileOpenSession([latest]);
-              }, 250);
+              }, Math.min(2000, 250 * (retries + 1)));
             }
           }
         })();
@@ -11696,6 +11889,10 @@ function portal() {
         }
         if (d.active && !st.streaming && !st.es) {
           st._serverActiveObserved = true;
+          // Rate-limited: a reconnect replays the whole turn over a wiped
+          // pane, and this probe runs from ~8 different pollers. Without the
+          // gate they compound into a visible reconnect storm (2026-08-04).
+          if (!this._allowReconnect(sid, d.turn_id)) return;
           // Reconnect any time the backend says there's an active turn.
           // get_session_api returns SDK-only messages (no broadcast
           // overlay), so loadSession's view is just the user msg — the
@@ -11823,6 +12020,16 @@ function portal() {
       // messages never blanks the conversation or jumps the scroll. Cold opens
       // and tab switches keep the normal skeleton + chunked-reveal path.
       const quiet = !!opts.quiet;
+      // probeActive:false → do NOT run _checkActiveTurn after the load.
+      // _checkActiveTurn reconnects whenever the backend reports a live turn,
+      // and a reconnect replays the entire turn over a wiped pane. Cold opens
+      // and tab switches genuinely need that probe (it's how a page reload
+      // re-attaches to a running turn), but the quiet reconciliation callers
+      // do NOT: each of them already probed /active itself and decided what to
+      // do, so probing again here just turned every poll-driven quiet reload
+      // into a reconnect — the inner half of the 2026-08-04 flicker loop.
+      const probeActive = opts.probeActive !== undefined
+        ? !!opts.probeActive : !quiet;
       const st = this._ensureTabState(sid);
       const runtimeSettingsGenerationAtLoad = st._runtimeSettingsGeneration;
       // A live stream owns st.messages and every SSE closure points directly at
@@ -11873,10 +12080,26 @@ function portal() {
         // pages in from the server via _fetchOlderWindow on "Load earlier".
         const _coldEarly = !this.appReady;
         const _mobileEarly = this._isMobileLayout();
-        const _initialLoadEarly = _mobileEarly
+        const _baseInitialLoad = _mobileEarly
           ? (_coldEarly ? 8 : 15)
           : (_coldEarly ? 30 : 60);
-        const FETCH_TAIL = _initialLoadEarly * 5;
+        // QUIET refresh must not shrink the pane. A quiet load is a merge into
+        // an ALREADY-PAINTED pane, and a long agentic turn can leave up to
+        // _mountedMessageCap() (300 desktop) bubbles mounted — far more than
+        // the cold-open window above. Loading the narrow window in that state
+        // spliced several hundred bubbles down to ~60 and pushed the rest into
+        // _earlierMessages: a violent height collapse + mass DOM teardown,
+        // which is the post-turn half of the "会话区刷新闪烁" report
+        // (2026-08-04). Widen the window (and the fetched tail) to at least
+        // what is currently mounted so a quiet merge is a true in-place morph.
+        // Cold opens and non-quiet loads keep the narrow, freeze-avoiding
+        // window — nothing is painted yet there, so there is nothing to
+        // preserve.
+        const _mountedNow = (quiet && Array.isArray(st.messages))
+          ? st.messages.length : 0;
+        const _quietFloor = Math.min(this._mountedMessageCap(), _mountedNow);
+        const _initialLoadEarly = Math.max(_baseInitialLoad, _quietFloor);
+        const FETCH_TAIL = Math.max(_baseInitialLoad * 5, _quietFloor);
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const controller = new AbortController();
         const timeout = setTimeout(
@@ -12017,9 +12240,12 @@ function portal() {
         // the original one-shot path — zero behaviour change for short sessions.
         let _deferHead = null;
         if (sid === this.currentId && quiet) {
-          // Quiet refresh: render the whole visible window synchronously (small —
-          // it's a refresh, not a cold open) so the in-place swap below morphs in
-          // fully-rendered bubbles with no deferred-head dance.
+          // Quiet refresh: render the whole visible window synchronously so the
+          // in-place swap below morphs in fully-rendered bubbles with no
+          // deferred-head dance. Not as costly as it looks even with the
+          // mounted-width floor above: _preserveCanonicalMessageIdentity has
+          // already reused the live objects, which keep their existing `html`,
+          // so renderMarkdown only does real work for genuinely new rows.
           visible.forEach(renderMarkdown);
         } else if (sid === this.currentId) {
           if (visible.length > INITIAL_LOAD) {
@@ -12149,7 +12375,7 @@ function portal() {
           // know the reply isn't done yet. A proper "reconnect SSE for
           // live streaming" UI is a larger refactor; for now we just
           // surface the state. The user can wait + reload to see more.
-          this._checkActiveTurn(sid);
+          if (probeActive) this._checkActiveTurn(sid);
           if (resolvedModel) this.model = resolvedModel;
           // Per-tab state owns the primitive; root permission is only the
           // currently visible selector mirror.
@@ -13157,7 +13383,7 @@ function portal() {
     },
 
     // ===== settings modal =====
-    async openSettings() {
+    async openSettings(activePage = "") {
       const r = await fetch("/api/settings", { headers: this.hdr() });
       if (!r.ok) {
         this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
@@ -13187,7 +13413,8 @@ function portal() {
       // (provider — the most-used section) and render only that pane.
       // Mobile: stay at the top-level menu (activePage=null) and let the
       // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = this.isWideScreen ? "provider" : null;
+      this.settings.activePage = activePage === "memory"
+        ? "memory" : (this.isWideScreen ? "provider" : null);
       this.settings.show = true;
       // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
       // stays lazy because Codex quota refresh intentionally runs a CLI probe.
@@ -13195,6 +13422,11 @@ function portal() {
       this.refreshSkillList();
       this.loadClaudeAuthStatus();
       this.loadMemorySettings();
+    },
+
+    async openMemoryCenter(tab = "") {
+      if (tab) this.settings.memory.tab = tab;
+      await this.openSettings("memory");
     },
 
     _memoryConfigPayload() {
@@ -13242,12 +13474,7 @@ function portal() {
               : `${unseen.length} new Skill candidate(s) await review`,
             "info", 8000, {
               label: this.lang === "zh" ? "打开记忆中心" : "Open Memory Center",
-              onClick: async () => {
-                await this.openSettings();
-                this.settings.activePage = "memory";
-                this.settings.memory.tab = "skills";
-                await this.refreshMemoryCenter();
-              },
+              onClick: () => this.openMemoryCenter("skills"),
             });
           const merged = [...new Set([...seen, ...unseen])].slice(-100);
           this._setLS("muselab_memory_artifacts_seen", JSON.stringify(merged));
@@ -22947,6 +23174,14 @@ function portal() {
         streamState._serverActiveObserved = false;
         // A real new local turn supersedes any just-finished list expectation.
         streamState._sessionActivityExpected = null;
+        // Fresh turn ⇒ fresh reconnect budget. This is the ONLY place the
+        // transport-retry counter is cleared; see es.onopen /
+        // _retireStaleSessionStream for why resetting it elsewhere made the
+        // MAX_ATTEMPTS ceiling unreachable.
+        streamState._reconnectAttempts = 0;
+        streamState._reconnectGateTurn = "";
+        streamState._reconnectGateCount = 0;
+        streamState._reconnectGateAt = 0;
       }
       streamState.streaming = true;
       streamState._continuationAwaitingReaction = false;
@@ -23183,14 +23418,18 @@ function portal() {
       const es = new EventSource(url);
       streamState.es = es;
       if (streamSid === this.currentId) this.es = es;
-      // Reset auto-reconnect counter on each successful SSE open. NOTE
-      // — we deliberately do NOT (re)start the elapsed-time counter
-      // here. Timer + _streamStartedAt are set above at submit time so
-      // (a) the footer shows "0.0s" immediately instead of waiting
-      // through the SSE handshake, and (b) mid-stream reconnects don't
-      // visibly reset the displayed elapsed back to zero.
+      // NOTE — a successful open deliberately does NOT reset
+      // _reconnectAttempts. Every reconnect DOES open successfully (the
+      // backend replays the turn happily), so resetting here made the
+      // MAX_ATTEMPTS ceiling unreachable and let a reconnect loop run
+      // forever (2026-08-04 flicker storm). The budget is per-turn: it is
+      // cleared where a genuinely new turn is submitted (`!isReconnect` in
+      // send()), not on every transport open. We also deliberately
+      // do NOT (re)start the elapsed-time counter here: timer +
+      // _streamStartedAt are set above at submit time so (a) the footer shows
+      // "0.0s" immediately instead of waiting through the SSE handshake, and
+      // (b) mid-stream reconnects don't visibly reset the displayed elapsed.
       es.onopen = () => {
-        streamState._reconnectAttempts = 0;
         streamState._lastSseActivity = Date.now();
         if (!isReconnect && !resumed) {
           this._commitChatRecoveryDraft(sendSid, composerText);
@@ -23308,6 +23547,26 @@ function portal() {
         // never evict (and visually jump) while the user has scrolled up to
         // read history. Evicted bubbles land in the "Load earlier" stash.
         if (this.atBottom) this.scrollToBottom(false);
+      };
+      // Coalesced variant for event bursts. A turn that settles N background
+      // tasks at once delivers N task_notification events back-to-back; calling
+      // _scrollIfActive per event ran N × (_capLiveMessages splice → Alpine DOM
+      // teardown → scrollHeight reflow → scrollTop slam), which is exactly the
+      // "会话区刷新闪烁" the user reported (2026-08-04). Collapse the whole burst
+      // into one pass on the next frame — the card patches themselves are
+      // already applied synchronously, so nothing visible is delayed beyond a
+      // single frame.
+      let _scrollCoalesceHandle = null;
+      const _scrollIfActiveSoon = () => {
+        if (_scrollCoalesceHandle !== null) return;
+        const run = () => {
+          _scrollCoalesceHandle = null;
+          if (!ownsStreamState()) return;
+          _scrollIfActive();
+        };
+        _scrollCoalesceHandle = (typeof requestAnimationFrame === "function")
+          ? requestAnimationFrame(run)
+          : setTimeout(run, 16);
       };
       const ownsStreamState = () => this.tabState[streamSid] === streamState;
       const ownsCurBubble = () => ownsStreamState() && !!curBubble
@@ -23679,18 +23938,14 @@ function portal() {
         //     scrolled far off-screen;
         //   - green unread dot when the launching session isn't the tab
         //     being viewed (same affordance as a turn finishing elsewhere).
-        const zh = this.lang === "zh";
-        const label = st === "failed"
-          ? (zh ? "后台任务失败" : "Background task failed")
-          : st === "stopped"
-            ? (zh ? "后台任务已停止" : "Background task stopped")
-            : (zh ? "后台任务已完成" : "Background task finished");
-        this.toast(label, st === "failed" ? "error" : "info");
+        // Deduped per task_id and coalesced across a burst — see
+        // _noteBackgroundTaskSettled.
+        this._noteBackgroundTaskSettled(d.task_id, st, !!d.already_reported);
         if (streamSid !== this.currentId) {
           const ts = this.tabState[streamSid];
           if (ts && !ts.streaming) ts.unread = true;
         }
-        _scrollIfActive();
+        _scrollIfActiveSoon();
       });
       es.addEventListener("rate_limit", ev => {
         let d;
@@ -24196,7 +24451,12 @@ function portal() {
         // reload on top of it.
         streamState._seenUpdated = undefined;
         if (streamSid === this.currentId) this._openSeenUpdated = undefined;
-        this.refreshSessions();
+        // Quiet ETag pull, NOT refreshSessions(): the latter also runs
+        // _recoverStalledStream, a second reconnect source. It early-returns
+        // here (streaming already false), but wiring a reconnect probe into
+        // the turn-completion path is how the 2026-08-04 storm kept re-arming
+        // itself. The list refresh is all this needs.
+        this._syncSessionListQuiet();
         if (this.currentId === streamSid) {
           // highlightCode resolves AFTER syntax highlight + artifact render
           // (mermaid / HTML preview iframes), which can grow the tail block's
@@ -24302,7 +24562,13 @@ function portal() {
         // let the queue drain continue.
         if (serverError === "no active turn") {
           es.close(); _markDone(false, false, true); _stopTimer();
-          this.loadSession(streamSid).then(() => {
+          // This is a terminal reconciliation of content that is already on
+          // screen (especially a background continuation whose task-complete
+          // toast just fired), not a cold session open. A normal load flips
+          // messagesReady off and clears/rebuilds the array, producing an
+          // empty/skeleton flash before the same transcript returns. Quiet
+          // mode morphs canonical history into the mounted keyed messages.
+          this.loadSession(streamSid, { quiet: true }).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
           return;
@@ -24387,7 +24653,6 @@ function portal() {
           // root-level streamElapsed which is now another tab's display.
           if (this.currentId !== streamSid) {
             _stopTimer();
-            streamState._reconnectAttempts = 0;
             return;
           }
           // streamState.streaming is still true from initial send(); use
@@ -24399,10 +24664,13 @@ function portal() {
             const d = await r.json();
             if (!d.active) {
               // Backend turn already finished while we were disconnected.
-              // Refresh session from disk to pick up the completed reply.
+              // Refresh session from disk to pick up the completed reply. The
+              // partial/live transcript is already visible, so keep this a
+              // quiet reconciliation rather than flashing a cold-load skeleton.
               _markDone(false, false, true); _stopTimer();
-              if (this.currentId === streamSid) this.loadSession(streamSid);
-              streamState._reconnectAttempts = 0;
+              if (this.currentId === streamSid) {
+                this.loadSession(streamSid, { quiet: true });
+              }
               return;
             }
             if (d.background && d.attachable === false) {
@@ -24413,7 +24681,6 @@ function portal() {
               _markDone(false, true, true);
               _stopTimer();
               this._ensureBgContPoller(streamSid);
-              streamState._reconnectAttempts = 0;
               return;
             }
             // Re-subscribe via the existing reconnect plumbing.
@@ -25366,10 +25633,50 @@ function portal() {
         paused: zh ? "已暂停" : "Paused", completed: zh ? "已完成" : "Completed",
         failed: zh ? "失败" : "Failed", cancelled: zh ? "已取消" : "Cancelled" })[state] || state;
     },
+    activityTaskSummary(item) {
+      const summary = String(item?.task_summary || "").trim();
+      const session = String(item?.session_name || "").trim();
+      return summary && summary !== session ? summary : "";
+    },
+    activityTurnLabel(item) {
+      const count = Math.max(0, Math.floor(Number(item?.turn_count) || 0));
+      if (count <= 1) return "";
+      return this.lang === "zh" ? `${count}轮` : `${count} turns`;
+    },
+    activityWorkspaceLabel(item) {
+      if ((this.activity.summary?.workspaces || []).length <= 1) return "";
+      return String(item?.workspace_name || "").trim();
+    },
+    activityStatusDetail(item) {
+      const detail = String(item?.status_detail || "").trim();
+      if (!detail || ["Task completed", "Task failed", "Task cancelled"].includes(detail)) {
+        return "";
+      }
+      return detail;
+    },
     activityTime(item) {
       const ts = this.activityEventTimestamp(item) * 1000;
       return ts ? new Date(ts).toLocaleString(this.lang === "zh" ? "zh-CN" : "en-US",
         { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    },
+    activityRelativeTime(item) {
+      const ts = this.activityEventTimestamp(item) * 1000;
+      if (!ts) return "";
+      const elapsed = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (elapsed < 45) return this.lang === "zh" ? "刚刚" : "Just now";
+      if (elapsed < 3600) {
+        const minutes = Math.max(1, Math.floor(elapsed / 60));
+        return this.lang === "zh" ? `${minutes}分钟前` : `${minutes}m ago`;
+      }
+      if (elapsed < 86400) {
+        const hours = Math.max(1, Math.floor(elapsed / 3600));
+        return this.lang === "zh" ? `${hours}小时前` : `${hours}h ago`;
+      }
+      if (elapsed < 7 * 86400) {
+        const days = Math.max(1, Math.floor(elapsed / 86400));
+        return this.lang === "zh" ? `${days}天前` : `${days}d ago`;
+      }
+      return this.activityTime(item);
     },
     async toggleActivityPin(item) {
       if (!item?.id || this.activity.view !== "timeline") return false;

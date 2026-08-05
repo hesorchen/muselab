@@ -29,6 +29,26 @@ def _login(page: Page, base: str, token: str) -> None:
     )
 
 
+def test_memory_shortcut_opens_memory_settings_page(
+    page: Page, backend_url, auth_token
+):
+    _login(page, backend_url, auth_token)
+
+    shortcut = page.locator(".activity-center-btn + .icon-btn")
+    expect(shortcut).to_have_count(1)
+    expect(shortcut.locator('use[href="#i-brain"]')).to_have_count(1)
+    shortcut.click()
+
+    expect(page.locator(".settings-modal")).to_be_visible()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.settings.show && app.settings.activePage === 'memory';
+        }"""
+    )
+    expect(page.locator(".memory-settings-section")).to_be_visible()
+
+
 def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_token):
     page.add_init_script("localStorage.removeItem('muselab_activity_view')")
     _login(page, backend_url, auth_token)
@@ -193,9 +213,14 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
         }"""
     )
 
-    labels = page.locator(".activity-group .activity-row strong")
-    expect(labels).to_have_count(10)
-    assert labels.all_text_contents()[:3] == [
+    session_labels = page.locator(".activity-group .activity-session-name")
+    task_labels = page.locator(".activity-group .activity-task-summary")
+    expect(session_labels).to_have_count(10)
+    expect(task_labels).to_have_count(10)
+    assert session_labels.all_text_contents()[:3] == [
+        "Activity test", "Activity test", "Activity test",
+    ]
+    assert task_labels.all_text_contents()[:3] == [
         "Newest running task",
         "Newer failed task",
         "Older completed task",
@@ -209,7 +234,7 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     pin.click()
     expect(pin).to_be_enabled()
     expect(pin).to_have_attribute("aria-pressed", "true")
-    assert labels.all_text_contents()[:3] == [
+    assert task_labels.all_text_contents()[:3] == [
         "Older completed task",
         "Newest running task",
         "Newer failed task",
@@ -219,7 +244,7 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     pin.click()
     expect(pin).to_be_enabled()
     expect(pin).to_have_attribute("aria-pressed", "false")
-    assert labels.all_text_contents()[:3] == [
+    assert task_labels.all_text_contents()[:3] == [
         "Newest running task",
         "Newer failed task",
         "Older completed task",
@@ -229,7 +254,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     more = page.locator(".activity-group-more")
     expect(more).to_have_text("2 more")
     more.click()
-    expect(labels).to_have_count(12)
+    expect(session_labels).to_have_count(12)
+    expect(task_labels).to_have_count(12)
 
 
 def test_terminal_event_wins_over_stale_tab_activity_snapshot(

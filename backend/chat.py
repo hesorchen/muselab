@@ -44,9 +44,11 @@ from .settings import (
     ROOT,
     MODEL,
     atomic_write_text,
+    ducc_cli_wrapper,
     env_float,
     env_int,
     is_chinese_locale,
+    locate_ducc_executable,
 )
 from . import sessions as sess
 from . import endpoints
@@ -140,6 +142,77 @@ def _muselab_gateway_headers(effort: str, service_tier: str) -> str:
     if service_tier == "fast":
         lines.append("X-MuseLab-Service-Tier: fast")
     return "\n".join(lines)
+
+
+# DUCC is an internet-capable local agent runtime.  Giving it the backend's
+# ambient environment would also give every tool it launches unrelated MuseLab,
+# provider, cloud, GitHub, database and SSH credentials.  Keep this allowlist
+# intentionally small and explicit.  The wrapper applies the same policy again
+# so direct/operator invocation cannot accidentally widen it.
+_DUCC_BASE_ENV_NAMES = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+    "LANG", "TZ",
+    "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    # Selection metadata used by managed DUCC installations.  Authentication
+    # material itself remains in DUCC's HOME-owned config and is not copied
+    # from arbitrary environment prefixes.
+    "DUCC_AUTH_SOURCE",
+)
+_DUCC_PROXY_ENV_NAMES = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+
+
+def _ducc_subprocess_env(executable: str) -> dict[str, str]:
+    """Build the complete, privacy-bounded environment for DUCC.
+
+    ClaudeAgentOptions.env is a subprocess environment replacement.  Starting
+    from an allowlist here prevents secrets unknown to MuseLab (for example a
+    future *_TOKEN variable) from reaching the wrapper at all.  Credentialed
+    proxy URLs are omitted as they commonly contain a reusable password.
+    """
+    safe = {
+        name: value
+        for name in _DUCC_BASE_ENV_NAMES
+        if (value := os.environ.get(name)) is not None
+    }
+    safe.update({
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith("LC_") and value
+    })
+    for name in _DUCC_PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        if value is not None and "@" not in value:
+            safe[name] = value
+    # This is a resolved executable path, not an auth value.  The wrapper
+    # captures it before rebuilding its own empty environment and never
+    # forwards MUSELAB_DUCC_CLI to the actual runtime.
+    safe["MUSELAB_DUCC_CLI"] = executable
+    return safe
+
+
+def _ducc_stderr_notice(line: str) -> str:
+    """Classify DUCC stderr without persisting its raw, potentially private text."""
+    low = (line or "").lower()
+    if any(word in low for word in (
+        "auth", "credential", "login", "token", "unauthorized", "forbidden",
+    )):
+        category = "authentication"
+    elif any(word in low for word in (
+        "network", "connect", "timeout", "proxy", "dns", "tls", "certificate",
+    )):
+        category = "network"
+    elif any(word in low for word in (
+        "config", "model", "argument", "option", "permission",
+    )):
+        category = "configuration"
+    else:
+        category = "runtime"
+    return f"{category} detail suppressed for privacy"
 
 
 def _build_ultra_skill_hook():
@@ -1005,6 +1078,11 @@ def _session_runtime_lock_for(session_id: str) -> asyncio.Lock:
 # task settlement + auto-continuation and released the reader.
 _sessions_with_inflight_tasks: dict[str, set[str]] = {}
 _task_watchers: dict[str, asyncio.Task] = {}
+# task_id -> epoch seconds when the task was first pinned. Watcher generations
+# are replaceable, but their timeout is derived from this stable launch time so
+# a respawn cannot grant an orphaned task another full lease. The session-list
+# and /active paths also reap individual expired pins before publishing state.
+_bg_task_pinned_at: dict[str, float] = {}
 # Small post-response maintenance tasks, currently used to refresh compacted
 # transcript counts after the verified compact result has already reached the
 # browser. Strong references prevent accidental mid-run garbage collection.
@@ -1492,6 +1570,15 @@ def _model_control_capability(
     model: str, capability: dict | None = None,
 ) -> dict[str, Any]:
     """Return the frontend's exact per-model effort/Fast capability."""
+    if endpoints.is_ducc_model(model):
+        if endpoints.ducc_is_claude_model(model):
+            return {
+                "effort_levels": ["auto", *_SDK_EFFORT_LEVELS],
+                "service_tiers": [],
+                "supports_fast": False,
+            }
+        return {"effort_levels": [], "service_tiers": [],
+                "supports_fast": False}
     provider = endpoints.lookup(model or "")
     if provider is None and not endpoints.is_third_party(model):
         return {
@@ -2114,6 +2201,7 @@ async def _build_and_connect_client(
         raise ValueError(f"invalid service tier: {service_tier}")
     plan_return_permission = _normalize_plan_return_permission(
         permission, plan_return_permission)
+    is_ducc = endpoints.is_ducc_model(model)
     workspace_root = sess.session_workspace(session_id)
     # New CLI rule: session_id + resume/continue conflict unless fork_session
     # is set. So we use resume alone — it both loads existing state AND
@@ -2164,7 +2252,8 @@ async def _build_and_connect_client(
         user_prompt_hooks.append(_build_ultra_skill_hook())
     opts_kwargs = dict(
         cwd=str(workspace_root),
-        model=endpoints.normalize_model_id(model),
+        model=(endpoints.ducc_cli_model(model) if is_ducc
+               else endpoints.normalize_model_id(model)),
         permission_mode=permission,
         max_buffer_size=max_buf,
         stderr=_cli_stderr,
@@ -2244,6 +2333,24 @@ async def _build_and_connect_client(
             )],
         },
     )
+    if is_ducc:
+        # Keep the SDK's mature stream-json/control/MCP/session machinery, but
+        # swap the executable to MuseLab's sanitising wrapper. The wrapper then
+        # execs the real DUCC launcher, so claude-go — not MuseLab's static env —
+        # owns authentication, endpoint selection and comate_custom_header.
+        ducc_executable = locate_ducc_executable()
+        wrapper = Path(ducc_cli_wrapper())
+        if ducc_executable is None:
+            raise ClaudeSDKError(
+                "DUCC runtime is unavailable: install/login to DUCC or set "
+                "MUSELAB_DUCC_CLI to its executable path."
+            )
+        if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+            raise ClaudeSDKError(
+                f"MuseLab DUCC launcher is missing or not executable: {wrapper}"
+            )
+        opts_kwargs["cli_path"] = str(wrapper)
+        opts_kwargs["env"] = _ducc_subprocess_env(ducc_executable)
     if permission == "plan" and plan_return_permission == "bypassPermissions":
         # The CLI refuses a later setMode(bypassPermissions) unless this
         # capability was granted at process launch. This flag permits the
@@ -2267,7 +2374,9 @@ async def _build_and_connect_client(
     # This way the SDK's full agent loop (tools, MCP, skills, CLAUDE.md)
     # works uniformly across providers — no router process needed.
     # Claude models still go direct so Pro OAuth keeps working.
-    env_ovr = endpoints.env_override(model)
+    # DUCC is a CLI runtime, not an Anthropic-compatible endpoint override.
+    # Never inject MuseLab's provider URL/key/static custom header into it.
+    env_ovr = None if is_ducc else endpoints.env_override(model)
     if env_ovr is not None:
         env_ovr = dict(env_ovr)
         # Isolated vendor config prevents OAuth fallback, but starts with no
@@ -2325,25 +2434,25 @@ async def _build_and_connect_client(
                 env_ovr["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(effective_limit)
         opts_kwargs["env"] = env_ovr
     else:
-        # No env_override == this is Claude (or unknown model). CLI needs
-        # ONE of: ~/.claude/.credentials.json (Pro OAuth), ANTHROPIC_API_KEY
-        # in env, or ANTHROPIC_AUTH_TOKEN. If none of those are present, CLI
-        # exits 1 with "Not logged in" BEFORE producing any stderr — leaving
-        # only a useless ProcessError. Pre-check and raise a clean message
-        # so the UI can surface "请先配置 Anthropic API key 或运行 claude login"
-        # instead of a generic stream-failure.
-        cred_file = Path.home() / ".claude" / ".credentials.json"
-        if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
-                and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-            raise ClaudeSDKError(
-                f"Claude model '{model}' requires auth: either run "
-                f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
-                f"Settings. CLI would exit 1 silently otherwise."
-            )
-        # Capture CLI stderr so vendor 401 / network errors surface
-        # in /tmp/muselab-restart.log instead of vanishing silently.
+        # DUCC owns auth through claude-go and does not use native Claude's
+        # credentials file/API-key precheck. For the ordinary Claude route keep
+        # the existing early, user-readable auth failure.
+        if not is_ducc:
+            cred_file = Path.home() / ".claude" / ".credentials.json"
+            if not cred_file.exists() and not os.environ.get("ANTHROPIC_API_KEY") \
+                    and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                raise ClaudeSDKError(
+                    f"Claude model '{model}' requires auth: either run "
+                    f"`claude login` (Pro/Max) or set ANTHROPIC_API_KEY in "
+                    f"Settings. CLI would exit 1 silently otherwise."
+                )
+        # Capture CLI stderr so auth / network errors surface in the service log.
         def _stderr_logger(line: str) -> None:
-            sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
+            if is_ducc:
+                sys.stderr.write(
+                    f"[DUCC:{model}] {_ducc_stderr_notice(line)}\n")
+            else:
+                sys.stderr.write(f"[SDK-CLI:{model}] {line}\n")
             sys.stderr.flush()
         opts_kwargs["stderr"] = _stderr_logger
     # MCP servers: always register the in-process muselab server (for
@@ -2399,7 +2508,11 @@ async def _build_and_connect_client(
     # API can't form. Changing it invalidates the cached client (PATCH handler
     # calls disconnect_client) so the next turn rebuilds with this setting.
     thinking_pref = bool(sess_data.get("thinking", True))
-    supports_thinking = ((provider is None) or provider.supports_thinking) and thinking_pref
+    supports_thinking = (
+        endpoints.ducc_is_claude_model(model)
+        if is_ducc
+        else ((provider is None) or provider.supports_thinking)
+    ) and thinking_pref
     codex_effort_transport = (
         _is_codex_gateway_model(model) and effort != "auto"
     )
@@ -2414,11 +2527,18 @@ async def _build_and_connect_client(
         # Fixed at 10000 — no UI knob (2026-05-28). Power users can still
         # override via the env var if they really need to.
         budget = env_int("MUSELAB_THINKING_BUDGET", 10000, min_value=0)
-        # display="summarized" is REQUIRED for Opus 4.7+: those models default
-        # to display="omitted" (signature-only, no plaintext), so without this
-        # the SDK never emits thinking_delta and the FE thinking block is empty.
-        opts_kwargs["thinking"] = ThinkingConfigEnabled(
-            type="enabled", budget_tokens=budget, display="summarized")
+        if is_ducc:
+            # The current factory DUCC CLI predates --thinking-display. Keep
+            # thinking enabled, but omit that newer presentation-only option.
+            opts_kwargs["thinking"] = ThinkingConfigEnabled(
+                type="enabled", budget_tokens=budget)
+        else:
+            # display="summarized" is REQUIRED for Opus 4.7+: those models
+            # default to display="omitted" (signature-only, no plaintext), so
+            # without this the SDK never emits thinking_delta and the FE block
+            # is empty.
+            opts_kwargs["thinking"] = ThinkingConfigEnabled(
+                type="enabled", budget_tokens=budget, display="summarized")
     else:
         opts_kwargs["thinking"] = ThinkingConfigDisabled(type="disabled")
     # SDK-native effort is still used where possible. Ultra is not in SDK
@@ -2426,7 +2546,9 @@ async def _build_and_connect_client(
     # half is `max`; the native Skill above supplies proactive delegation.
     # `auto` omits the SDK option. Gateway's post-translation header rule remains
     # final authority for every Codex wire-level effort.
-    if effort != "auto":
+    if effort != "auto" and (
+        not is_ducc or endpoints.ducc_is_claude_model(model)
+    ):
         sdk_effort = "max" if effort == "ultra" else effort
         if sdk_effort in _SDK_EFFORT_LEVELS:
             opts_kwargs["effort"] = sdk_effort
@@ -3109,6 +3231,7 @@ async def shutdown_runtime() -> None:
         _pending_runtime_rebuilds.clear()
         _active_turns.clear()
         _sessions_with_inflight_tasks.clear()
+        _bg_task_pinned_at.clear()
         _task_watchers.clear()
         _maintenance_tasks.clear()
 
@@ -3376,14 +3499,22 @@ def list_sessions_api(
         sid for sid, bc in _active_turns.items()
         if bc is not None and not bc.done
     }
+    # Expire pins older than the watch timeout before deriving the flag. A pin is
+    # the ONLY reason a session reports background_active, and it is cleared only
+    # by a terminal notification — a task that never delivers one used to keep
+    # the session `active` forever, which in turn kept the browser's reconnect /
+    # reconcile machinery awake (2026-08-04 flicker). Reaping here (rather than
+    # only at turn end) means the deadline holds for an idle session too.
+    for sid in list(_sessions_with_inflight_tasks):
+        reaped = _reap_stale_task_pins(sid)
+        if reaped:
+            sys.stderr.write(
+                f"[chat] reaped stale task pins sid={sid[:8]} "
+                f"tasks={sorted(reaped)}\n")
     background_active_sids = {
         sid for sid, task_ids in _sessions_with_inflight_tasks.items()
         if task_ids
     }
-    background_active_sids.update(
-        sid for sid, watcher in _task_watchers.items()
-        if watcher is not None and not watcher.done()
-    )
     active_sids = turn_active_sids | background_active_sids
     # Copy each dict (never mutate the shared list_sessions() cache) + add the
     # live `active` flag. Only the returned subset is processed now, not all N.
@@ -4998,6 +5129,7 @@ def _clear_session_runtime_state(sid: str) -> None:
     task_ids = _sessions_with_inflight_tasks.pop(sid, set())
     for task_id in task_ids:
         _bg_task_descriptions.pop(task_id, None)
+        _bg_task_pinned_at.pop(task_id, None)
     recent = _recent_turns.pop(sid, None)
     if recent is not None:
         recent.close()
@@ -8732,8 +8864,64 @@ def _release_task_pins(session_id: str, task_ids) -> None:
         return
     for tid in list(task_ids):
         ids.discard(tid)
+        _bg_task_pinned_at.pop(tid, None)
     if not ids:
         _sessions_with_inflight_tasks.pop(session_id, None)
+
+
+def _pin_background_task(session_id: str, task_id: str) -> None:
+    """Register a launched background task as in flight for the session.
+
+    Single entry point so the launch instant is always recorded alongside the
+    pin — _reap_stale_task_pins needs it to expire a task whose terminal
+    notification never arrives.
+    """
+    if not task_id:
+        return
+    _sessions_with_inflight_tasks.setdefault(session_id, set()).add(task_id)
+    _bg_task_pinned_at.setdefault(task_id, time.time())
+
+
+def _reap_stale_task_pins(session_id: str) -> list[str]:
+    """Unpin tasks that have been in flight longer than _TASK_WATCH_TIMEOUT.
+
+    A pin is the sole reason a session keeps reporting active:true. Nothing
+    else expires it: _settle_background_task needs a terminal notification.
+    This explicit reap is the per-task half of the absolute deadline; the
+    watcher itself uses the newest pending pin as its generation-independent
+    outer deadline.
+
+    Returns the reaped ids so the caller can log them.
+    """
+    ids = _sessions_with_inflight_tasks.get(session_id)
+    if not ids:
+        return []
+    now = time.time()
+    stale = [tid for tid in ids
+             if now - _bg_task_pinned_at.get(tid, now) >= _TASK_WATCH_TIMEOUT]
+    if stale:
+        _release_task_pins(session_id, stale)
+        for tid in stale:
+            _bg_task_descriptions.pop(tid, None)
+    return stale
+
+
+def _task_watch_timeout_remaining(task_ids: Iterable[str]) -> float | None:
+    """Seconds until the newest pending task reaches its absolute deadline.
+
+    Watchers may be replaced across ordinary turns, but task launch timestamps
+    are stable.  Basing each generation on those timestamps prevents every
+    respawn from granting the same orphan another full 30-minute lease.  The
+    newest deadline is used so an older sibling cannot prematurely terminate a
+    genuinely fresh task; list and /active probes reap individual older pins.
+    """
+    ids = [task_id for task_id in task_ids if task_id]
+    if not ids:
+        return None
+    now = time.time()
+    newest_pin = max(_bg_task_pinned_at.setdefault(task_id, now)
+                     for task_id in ids)
+    return max(0.05, newest_pin + _TASK_WATCH_TIMEOUT - now)
 
 
 def _settle_background_task(session_id: str, task_id: str) -> bool:
@@ -8763,6 +8951,7 @@ def _settle_background_task(session_id: str, task_id: str) -> bool:
             if not ids:
                 _sessions_with_inflight_tasks.pop(session_id, None)
         _bg_task_descriptions.pop(task_id, None)
+        _bg_task_pinned_at.pop(task_id, None)
     return settled
 
 
@@ -8924,8 +9113,8 @@ async def _watch_inflight_tasks(
 
     async def _open_continuation() -> None:
         """Register a fresh continuation broadcast in _active_turns[sid] under
-        the lock. If a live turn somehow holds the slot, leave cont None and
-        let that turn's in-turn dispatch surface the notification instead."""
+        the lock. If a live turn somehow holds the slot, leave cont None —
+        _emit_settlement then publishes into THAT turn's broadcast instead."""
         nonlocal cont, cont_state
         if not _owns_generation():
             return
@@ -8939,7 +9128,7 @@ async def _watch_inflight_tasks(
                 return
             existing = _active_turns.get(session_id)
             if existing is not None and not existing.done:
-                return   # a live turn raced in — defer to it
+                return   # a live turn raced in — _emit_settlement handles it
             _active_turns[session_id] = b
         cont = b
         cont_state = {
@@ -8954,6 +9143,39 @@ async def _watch_inflight_tasks(
             "explicit_resume_requested": False,
             "incomplete_error": None,
         }
+
+    def _emit_settlement(event: dict) -> bool:
+        """Deliver a terminal task event, continuation or not.
+
+        The pump routes to `self._turn or self._background`, and a turn detaches
+        its queue at ResultMessage while `_active_turns[sid]` is only popped
+        later in _pump_gen_to_broadcast's finally. A task settling inside that
+        window is therefore handed to THIS watcher (in-turn dispatch never sees
+        it, so it cannot report it) while _open_continuation still refuses to
+        take the occupied slot. Publishing only `if cont is not None` dropped
+        the event outright: dedup was won here, delivery happened nowhere, and
+        the user saw no completion at all (2026-08-04).
+
+        The live turn's broadcast is a perfectly good carrier — the browser is
+        already subscribed to it, and `task_notification` is position-
+        independent (the FE keys it to the launching card by task_id /
+        tool_use_id). So fall back to it, and only report a drop when there is
+        genuinely nobody to publish to.
+        """
+        if cont is not None:
+            cont.publish(event)
+            return True
+        live = _active_turns.get(session_id)
+        if live is not None and not live.done:
+            live.publish(event)
+            sys.stderr.write(
+                f"[chat] task watcher: settlement published into the live "
+                f"turn sid={session_id[:8]} turn={live.turn_id[:8]}\n")
+            return True
+        sys.stderr.write(
+            f"[chat] task watcher: settlement had no carrier "
+            f"sid={session_id[:8]} event={event.get('event')}\n")
+        return False
 
     async def _close_continuation(
         cancelled: bool = False,
@@ -9135,7 +9357,16 @@ async def _watch_inflight_tasks(
     # dispatch drains it.
     last_settle_status: str | None = None
     try:
-        async with asyncio.timeout(_TASK_WATCH_TIMEOUT):
+        async with asyncio.timeout(
+            _task_watch_timeout_remaining(pending)
+        ) as watch_deadline:
+            loop = asyncio.get_running_loop()
+
+            def _reschedule_watch_deadline() -> None:
+                remaining = _task_watch_timeout_remaining(pending)
+                watch_deadline.reschedule(
+                    None if remaining is None else loop.time() + remaining)
+
             while True:
                 # Once every task has settled and we're only waiting on the
                 # auto-continue, cap the read so a task that produces no
@@ -9184,20 +9415,20 @@ async def _watch_inflight_tasks(
                         f"sid={session_id[:8]} task={tid} "
                         f"status={last_settle_status} won={won_typed}\n")
                     pending.pop(tid, None)
+                    _reschedule_watch_deadline()
                     if won_typed:
                         if cont is None:
                             await _open_continuation()
-                        if cont is not None:
-                            cont.publish({"event": "task_notification",
+                        _emit_settlement({"event": "task_notification",
                                           "data": json.dumps({
-                                "task_id": tid,
-                                "tool_use_id": getattr(msg, "tool_use_id", None),
-                                "status": getattr(msg, "status", None),
-                                "summary": getattr(msg, "summary", None),
-                                "output_file": getattr(msg, "output_file", None),
-                                "usage": dict(getattr(msg, "usage", None) or {}),
-                                "background_tasks_pending": len(pending),
-                            })})
+                            "task_id": tid,
+                            "tool_use_id": getattr(msg, "tool_use_id", None),
+                            "status": getattr(msg, "status", None),
+                            "summary": getattr(msg, "summary", None),
+                            "output_file": getattr(msg, "output_file", None),
+                            "usage": dict(getattr(msg, "usage", None) or {}),
+                            "background_tasks_pending": len(pending),
+                        })})
                 elif isinstance(msg, TaskUpdatedMessage):
                     terminal = _terminal_task_update(msg)
                     if terminal is not None:
@@ -9210,15 +9441,15 @@ async def _watch_inflight_tasks(
                             f"sid={session_id[:8]} task={tid} "
                             f"status={last_settle_status} won={won_updated}\n")
                         pending.pop(tid, None)
+                        _reschedule_watch_deadline()
                         if won_updated:
                             if cont is None:
                                 await _open_continuation()
-                            if cont is not None:
-                                terminal["background_tasks_pending"] = len(pending)
-                                cont.publish({
-                                    "event": "task_notification",
-                                    "data": json.dumps(terminal),
-                                })
+                            terminal["background_tasks_pending"] = len(pending)
+                            _emit_settlement({
+                                "event": "task_notification",
+                                "data": json.dumps(terminal),
+                            })
                 elif isinstance(msg, TaskStartedMessage):
                     # A task launched DURING the auto-continue reaction (the
                     # model can run tools in that turn, including Bash
@@ -9233,13 +9464,13 @@ async def _watch_inflight_tasks(
                     desc = getattr(msg, "description", None)
                     if tid:
                         pending[tid] = desc
-                        _sessions_with_inflight_tasks.setdefault(
-                            session_id, set()).add(tid)
+                        _pin_background_task(session_id, tid)
                         if desc:
                             _bg_task_descriptions[tid] = desc
                         sys.stderr.write(
                             f"[chat] task watcher: typed start "
                             f"sid={session_id[:8]} task={tid}\n")
+                        _reschedule_watch_deadline()
                     if cont is not None:
                         cont.publish({"event": "task_started",
                                       "data": json.dumps({
@@ -9276,19 +9507,19 @@ async def _watch_inflight_tasks(
                     for n in notifs:
                         pending.pop(n.get("task_id") or "", None)
                         last_settle_status = n.get("status") or None
+                    _reschedule_watch_deadline()
                     if won and cont is None:
                         await _open_continuation()
                     for n in won:
-                        if cont is not None:
-                            cont.publish({"event": "task_notification",
+                        _emit_settlement({"event": "task_notification",
                                           "data": json.dumps({
-                                "task_id": n.get("task_id") or "",
-                                "tool_use_id": n.get("tool_use_id") or None,
-                                "status": n.get("status") or None,
-                                "summary": n.get("summary") or None,
-                                "output_file": n.get("output_file") or None,
-                                "background_tasks_pending": len(pending),
-                            })})
+                            "task_id": n.get("task_id") or "",
+                            "tool_use_id": n.get("tool_use_id") or None,
+                            "status": n.get("status") or None,
+                            "summary": n.get("summary") or None,
+                            "output_file": n.get("output_file") or None,
+                            "background_tasks_pending": len(pending),
+                        })})
                 elif isinstance(msg, ResultMessage):
                     # End of the CLI's auto-continue reaction — close the
                     # continuation. If tasks remain in flight, keep reading for
@@ -9308,10 +9539,12 @@ async def _watch_inflight_tasks(
         raise
     except asyncio.TimeoutError:
         sys.stderr.write(
-            f"[chat] task watcher sid={session_id} timed out after "
-            f"{_TASK_WATCH_TIMEOUT}s, {len(pending)} task(s) still pending; "
+            f"[chat] task watcher sid={session_id} reached its absolute "
+            f"task deadline, {len(pending)} task(s) still pending; "
             f"unpinning client\n")
         _release_task_pins(session_id, pending)
+        for task_id in pending:
+            _bg_task_descriptions.pop(task_id, None)
     except Exception as e:
         sys.stderr.write(
             f"[chat] task watcher sid={session_id} err: "
@@ -9368,19 +9601,34 @@ async def _watch_inflight_tasks(
 def _merge_session_inflight(
     session_id: str, turn_inflight: dict[str, dict],
 ) -> dict[str, dict]:
-    """Union THIS turn's launches with EVERY unsettled task pinned for the
-    session, so watcher replacement never orphans an already-pinned task.
+    """Every task still pinned for the session, enriched with this turn's launch
+    metadata — the pin set is the SOLE authority on what is still in flight.
 
-    Descriptions for prior-turn tasks come from the cross-turn cache. Already
-    settled tasks aren't in the pin set, so this never resurrects a finished one.
+    It used to start from ``dict(turn_inflight)`` and union the pin set on top,
+    which silently resurrected settled tasks: only the in-turn dispatch pops
+    ``inflight_tasks``, so a task the cross-turn WATCHER settled stayed in the
+    turn's local dict. At turn end that stale id was handed to a fresh watcher
+    (observed 2026-08-04: ``generation=3 pending=['b97zswye9', …]`` for a task
+    whose terminal notification had already been consumed) and re-pinned by
+    _spawn_task_watcher's caller, so the session reported active:true while
+    waiting for a notification that can never arrive a second time.
+
+    Descriptions for prior-turn tasks come from the cross-turn cache. Pins older
+    than the watch timeout are reaped here rather than carried forward forever.
     """
-    merged = dict(turn_inflight)
+    reaped = _reap_stale_task_pins(session_id)
+    if reaped:
+        sys.stderr.write(
+            f"[chat] reaped stale task pins sid={session_id[:8]} "
+            f"tasks={sorted(reaped)}\n")
+    merged: dict[str, dict] = {}
     for tid in _sessions_with_inflight_tasks.get(session_id, ()):
-        if tid not in merged:
-            merged[tid] = {
-                "tool_use_id": None,
-                "description": _bg_task_descriptions.get(tid),
-            }
+        info = turn_inflight.get(tid) or {}
+        merged[tid] = {
+            "tool_use_id": info.get("tool_use_id"),
+            "description": info.get("description")
+            or _bg_task_descriptions.get(tid),
+        }
     return merged
 
 
@@ -10521,8 +10769,7 @@ async def _start_turn(
                                     "tool_use_id": tu_id,
                                     "description": desc,
                                 }
-                                _sessions_with_inflight_tasks.setdefault(
-                                    session_id, set()).add(tid)
+                                _pin_background_task(session_id, tid)
                                 if desc:
                                     _bg_task_descriptions[tid] = desc
                                 # Stamp the launching card ⏳ running live, the
@@ -10573,8 +10820,7 @@ async def _start_turn(
                     # notification settles (in-turn here, or the cross-turn
                     # watcher). Mid-turn this is redundant with _active_turns'
                     # eviction exemption, but it's what survives past turn end.
-                    _sessions_with_inflight_tasks.setdefault(
-                        session_id, set()).add(tid)
+                    _pin_background_task(session_id, tid)
                     if info["description"]:
                         _bg_task_descriptions[tid] = info["description"]
                 yield {"event": "task_started", "data": json.dumps({
@@ -10602,6 +10848,21 @@ async def _start_turn(
                 status = getattr(msg, "status", None)
                 summary = getattr(msg, "summary", None)
                 output_file = getattr(msg, "output_file", None)
+                # In-turn settle (the rare case where a background task finishes
+                # before this turn's ResultMessage): unpin + dedup against the
+                # TaskUpdated path. This MUST run BEFORE the yield below.
+                # 2026-08-04: it used to run after, so this branch had no gate
+                # at all while the TaskUpdatedMessage branch did — every task
+                # whose terminal transition arrived as BOTH a TaskUpdated patch
+                # and a typed notification emitted task_notification TWICE
+                # (measured: 1750 of 6193 in-turn settles, i.e. ~28%), which the
+                # frontend rendered as two "后台任务已完成" toasts per task.
+                # `settled` False means the TaskUpdated patch already reported
+                # this exact transition; the event still goes out (its typed
+                # payload can carry a summary/output_file the patch lacked, and
+                # the card merge is idempotent) but is flagged so the client
+                # treats it as a card patch rather than a fresh notification.
+                settled = _on_task_settled(session_id, tid, status=status)
                 yield {"event": "task_notification", "data": json.dumps({
                     "task_id": tid,
                     "tool_use_id": getattr(msg, "tool_use_id", None),
@@ -10609,22 +10870,10 @@ async def _start_turn(
                     "summary": summary,
                     "output_file": output_file,
                     "usage": dict(getattr(msg, "usage", None) or {}),
-                    "background_tasks_pending": max(
-                        0,
-                        len(_sessions_with_inflight_tasks.get(
-                            session_id, ())) - (1 if tid else 0),
-                    ),
+                    "background_tasks_pending": len(
+                        _sessions_with_inflight_tasks.get(session_id, ())),
+                    "already_reported": not settled,
                 })}
-                # In-turn settle (the rare case where a background task finishes
-                # before this turn's ResultMessage). The card already flipped via
-                # the task_notification event above — here we just unpin +
-                # notify. _on_task_settled dedups via
-                # _sessions_with_inflight_tasks so the in-turn and cross-turn
-                # paths never double-unpin the same task_id, and its push is
-                # presence-gated: a user watching this live stream never gets
-                # buzzed, a user away from every screen does (e.g. a queued
-                # turn running headless).
-                _on_task_settled(session_id, tid, status=status)
             elif isinstance(msg, TaskUpdatedMessage):
                 terminal = _terminal_task_update(msg)
                 if terminal is None:
@@ -11543,11 +11792,14 @@ def session_active_status(sid: str) -> dict:
                 and not getattr(recent, "continuation_consumed", False)):
             b = recent
         else:
-            watcher = _task_watchers.get(sid)
+            reaped = _reap_stale_task_pins(sid)
+            if reaped:
+                sys.stderr.write(
+                    f"[chat] reaped stale task pins sid={sid[:8]} "
+                    f"tasks={sorted(reaped)}\n")
             background_pending = len(
                 _sessions_with_inflight_tasks.get(sid, ()))
-            if (background_pending
-                    or (watcher is not None and not watcher.done())):
+            if background_pending:
                 # Busy but not attachable: the watcher is waiting for a task
                 # notification and there is no TurnBroadcast to replay yet.
                 # Frontends must keep the footer alive + queue new input, but
@@ -11689,12 +11941,20 @@ async def providers_list() -> dict:
             model = i["model"]
             capability = codex_capabilities.get(model)
             controls = _model_control_capability(model, capability)
+            is_ducc = endpoints.is_ducc_model(model)
+            ducc_claude = is_ducc and endpoints.ducc_is_claude_model(model)
             flat.append({
                 "group": g["group"],
                 "label": i["label"],
                 "model": model,
-                "supports_thinking": g.get("supports_thinking", True),
-                "supports_effort": g.get("supports_effort", False),
+                "supports_thinking": (
+                    ducc_claude if is_ducc
+                    else g.get("supports_thinking", True)
+                ),
+                "supports_effort": (
+                    ducc_claude if is_ducc
+                    else g.get("supports_effort", False)
+                ),
                 "effort_levels": controls["effort_levels"],
                 "service_tiers": controls["service_tiers"],
                 "supports_fast": controls["supports_fast"],

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Capture the executable before rebuilding a clean environment.  DUCC gets its
+# own HOME-owned login/config, but never MuseLab's ambient provider, cloud,
+# repository, database or SSH credentials.
+ducc_cli="${MUSELAB_DUCC_CLI:-}"
+if [[ -z "$ducc_cli" ]]; then
+    for candidate in \
+        "$HOME/.comate/baidu-cc/bin/ducc" \
+        "$HOME/.baidu-cc/baidu-cc/bin/ducc"; do
+        if [[ -x "$candidate" ]]; then
+            ducc_cli="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "$ducc_cli" ]] && command -v ducc >/dev/null 2>&1; then
+    ducc_cli="$(command -v ducc)"
+fi
+if [[ -z "$ducc_cli" || ! -x "$ducc_cli" ]]; then
+    printf '%s\n' 'MuseLab DUCC runtime: executable not found' >&2
+    exit 127
+fi
+
+safe_env=()
+
+append_if_set() {
+    local name="$1"
+    # macOS still ships Bash 3.2, which has indirect expansion but not the
+    # newer `[[ -v name ]]` operator.  Keep the launcher portable across the
+    # same Linux/macOS matrix as MuseLab itself.
+    if [[ ${!name+x} ]]; then
+        safe_env+=("$name=${!name}")
+    fi
+}
+
+for name in \
+    PATH HOME USER LOGNAME SHELL TERM TMPDIR LANG TZ \
+    XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME \
+    SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS \
+    DUCC_AUTH_SOURCE; do
+    append_if_set "$name"
+done
+
+# Locale variables are configuration, not credentials, and can be named
+# beyond LC_ALL/LC_CTYPE.  Preserve only that closed prefix.
+while IFS= read -r name; do
+    [[ "$name" == LC_* ]] && append_if_set "$name"
+done < <(compgen -e)
+
+# Keep credential-free proxy compatibility.  A URL containing userinfo would
+# hand a reusable proxy password to every tool DUCC launches, so omit it.
+for name in \
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+    http_proxy https_proxy all_proxy no_proxy; do
+    if [[ ${!name+x} ]]; then
+        value="${!name}"
+        if [[ "$value" != *"@"* ]]; then
+            safe_env+=("$name=$value")
+        fi
+    fi
+done
+
+if [[ -z ${PATH+x} ]]; then
+    safe_env+=("PATH=/usr/local/bin:/usr/bin:/bin")
+fi
+
+exec env -i "${safe_env[@]}" "$ducc_cli" "$@"
