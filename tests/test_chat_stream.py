@@ -861,13 +861,17 @@ def test_settle_background_task_dedups(stream_env):
 def test_merge_session_inflight_recovers_orphaned_task(stream_env):
     """Watcher replacement must retain every session-level task even when this
     turn's local inflight_tasks doesn't contain it. _merge_session_inflight
-    unions the turn-local launches with the session-level pin set."""
+    derives the set from the session-level pin set and enriches it with any
+    turn-local launch metadata."""
     chat_mod = stream_env
     sid = "sid-orphan"
     try:
         # Prior-turn task still pinned at session level + description cached,
-        # but NOT in this turn's local inflight dict.
-        chat_mod._sessions_with_inflight_tasks[sid] = {"task_prior"}
+        # but NOT in this turn's local inflight dict. `task_now` is a launch
+        # from THIS turn — every launch path pins (_pin_background_task), so a
+        # live turn-local task is always in the pin set too.
+        chat_mod._pin_background_task(sid, "task_prior")
+        chat_mod._pin_background_task(sid, "task_now")
         chat_mod._bg_task_descriptions["task_prior"] = "deep research"
         turn_local = {"task_now": {"tool_use_id": "tu_now",
                                    "description": "this turn"}}
@@ -877,18 +881,21 @@ def test_merge_session_inflight_recovers_orphaned_task(stream_env):
         # Both the just-launched task and the orphaned prior task are covered.
         assert set(merged) == {"task_now", "task_prior"}
         assert merged["task_now"]["description"] == "this turn"
+        assert merged["task_now"]["tool_use_id"] == "tu_now"
         assert merged["task_prior"]["description"] == "deep research"
         # Turn-local entry is not mutated (defensive copy).
         assert "task_prior" not in turn_local
 
-        # A session with no pins → just the turn-local set, unchanged.
-        assert chat_mod._merge_session_inflight("sid-none", turn_local) == \
-            turn_local
+        # A session with no pins → nothing in flight, whatever the turn-local
+        # dict still holds (see the no-resurrect test).
+        assert chat_mod._merge_session_inflight("sid-none", turn_local) == {}
         # Empty everything → empty (no spurious watcher spawn).
         assert chat_mod._merge_session_inflight("sid-none", {}) == {}
     finally:
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
         chat_mod._bg_task_descriptions.pop("task_prior", None)
+        for tid in ("task_prior", "task_now"):
+            chat_mod._bg_task_pinned_at.pop(tid, None)
 
 
 def test_watcher_opens_continuation_turn_and_unpins(stream_env):
@@ -2424,3 +2431,130 @@ def test_preflight_compact_trusts_the_token_count_over_the_verdict(
     # The prompt survived the scare — it was sent after the compact, not dropped.
     assert fake.queried[0] == "/compact"
     assert len(fake.queried) == 2
+
+
+def test_watcher_publishes_settlement_into_live_turn_when_slot_is_busy(stream_env):
+    """A background task settling in the turn-teardown window must still be
+    reported.
+
+    The pump routes to `self._turn or self._background`; a turn detaches its
+    queue at ResultMessage while `_active_turns[sid]` is only popped later, in
+    _pump_gen_to_broadcast's finally. A task settling inside that window is
+    therefore handed to the WATCHER (the in-turn dispatch is already gone, so it
+    can never report it) while _open_continuation still refuses to take the
+    occupied slot. The old code published only `if cont is not None`, so dedup
+    was won here and delivery happened nowhere: no toast, no card flip
+    (2026-08-04, task b97zswye9). The live turn's broadcast is the carrier.
+    """
+    import asyncio
+
+    chat_mod = stream_env
+    sid = "sid-busy-slot"
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task_race"}
+    # A live (not done) turn occupying the slot — exactly the teardown window.
+    live = chat_mod.TurnBroadcast(session_id=sid, model="m")
+    chat_mod._active_turns[sid] = live
+
+    notif = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="task_race",
+        status="completed", output_file="/tmp/race.md", summary="ok",
+        uuid="u-race", session_id=sid, tool_use_id="tu-race")
+    fake_client = _FakeWatchClient([notif])
+
+    async def run():
+        await chat_mod._watch_inflight_tasks(
+            sid, fake_client, {"task_race": "sleep 20"})
+
+    try:
+        asyncio.run(run())
+        # No continuation was opened (the slot was busy) — so the event must
+        # have landed on the live turn instead of being dropped.
+        assert chat_mod._active_turns.get(sid) is live
+        kinds = [e.get("event") for e in live.events]
+        assert "task_notification" in kinds, f"settlement dropped: {kinds}"
+        payload = json.loads(next(
+            e for e in live.events
+            if e.get("event") == "task_notification")["data"])
+        assert payload["task_id"] == "task_race"
+        assert payload["tool_use_id"] == "tu-race"
+        assert payload["status"] == "completed"
+        assert payload["output_file"] == "/tmp/race.md"
+        # Settlement still unpinned the task.
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._recent_turns.pop(sid, None)
+
+
+def test_merge_session_inflight_does_not_resurrect_watcher_settled_task(stream_env):
+    """Only the in-turn dispatch pops the turn-local `inflight_tasks`, so a task
+    the WATCHER settled stays in that dict. Merging it back in re-pinned a
+    finished task into a fresh watcher generation, and the session then reported
+    active:true while waiting for a notification that can never arrive twice
+    (2026-08-04: `generation=3 pending=['b97zswye9', ...]`). The pin set is the
+    sole authority."""
+    chat_mod = stream_env
+    sid = "sid-no-resurrect"
+    try:
+        # Watcher already settled task_gone → not in the pin set. task_live is.
+        chat_mod._sessions_with_inflight_tasks[sid] = {"task_live"}
+        turn_local = {
+            "task_gone": {"tool_use_id": "tu_gone", "description": "settled"},
+            "task_live": {"tool_use_id": "tu_live", "description": "running"},
+        }
+
+        merged = chat_mod._merge_session_inflight(sid, turn_local)
+
+        assert set(merged) == {"task_live"}, \
+            "a watcher-settled task was resurrected into the next watcher"
+        # Turn-local metadata still enriches the surviving pin.
+        assert merged["task_live"]["tool_use_id"] == "tu_live"
+        assert merged["task_live"]["description"] == "running"
+        # No pins at all → no spurious watcher spawn.
+        assert chat_mod._merge_session_inflight("sid-none", turn_local) == {}
+        assert chat_mod._merge_session_inflight("sid-none", {}) == {}
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+
+def test_stale_task_pins_expire_after_the_watch_timeout(stream_env):
+    """A pin is the ONLY thing making a session report background_active, and
+    _settle_background_task needs a terminal notification to clear it. A task
+    that never delivers one (a background job that produced no output) used to
+    pin its session forever — respawning a watcher after every user turn and
+    keeping the browser's reconnect machinery awake. The deadline is absolute
+    from the task's own launch, not per-watcher."""
+    import time as _time
+
+    chat_mod = stream_env
+    sid = "sid-stale-pin"
+    try:
+        chat_mod._pin_background_task(sid, "task_fresh")
+        chat_mod._pin_background_task(sid, "task_zombie")
+        chat_mod._bg_task_descriptions["task_zombie"] = "pytest that died"
+        # Backdate one pin past the watch timeout.
+        chat_mod._bg_task_pinned_at["task_zombie"] = (
+            _time.time() - chat_mod._TASK_WATCH_TIMEOUT - 1)
+
+        reaped = chat_mod._reap_stale_task_pins(sid)
+
+        assert reaped == ["task_zombie"]
+        assert chat_mod._sessions_with_inflight_tasks[sid] == {"task_fresh"}
+        # Reaping consumes the bookkeeping so nothing leaks.
+        assert "task_zombie" not in chat_mod._bg_task_pinned_at
+        assert "task_zombie" not in chat_mod._bg_task_descriptions
+        # A fresh pin is never reaped, and the call is idempotent.
+        assert chat_mod._reap_stale_task_pins(sid) == []
+
+        # Last pin expiring drops the session entirely → background_active False.
+        chat_mod._bg_task_pinned_at["task_fresh"] = (
+            _time.time() - chat_mod._TASK_WATCH_TIMEOUT - 1)
+        assert chat_mod._reap_stale_task_pins(sid) == ["task_fresh"]
+        assert sid not in chat_mod._sessions_with_inflight_tasks
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+        for tid in ("task_fresh", "task_zombie"):
+            chat_mod._bg_task_pinned_at.pop(tid, None)
+            chat_mod._bg_task_descriptions.pop(tid, None)

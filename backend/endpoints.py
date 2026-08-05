@@ -1056,6 +1056,29 @@ ANTHROPIC_DEFAULT_MODELS: tuple[str, ...] = (
     "claude-opus-4-7",
 )
 
+# DUCC is a Claude Code-compatible CLI runtime, not an HTTP endpoint provider.
+# Prefix its picker values so a session can select the DUCC executable. DUCC's
+# model proxy expects its catalog display names (not Anthropic API ids); passing
+# `claude-opus-4-8` through unchanged reaches OneAPI's default group and 503s.
+DUCC_PREFIX = "ducc:"
+_DUCC_CLI_MODELS = {
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
+    "claude-opus-5": "Opus 5",
+    "claude-opus-4-8": "Opus 4.8",
+    "claude-opus-4-7": "Claude Opus 4.7",
+}
+
+
+def is_ducc_model(model: str) -> bool:
+    return bool(model) and model.lower().startswith(DUCC_PREFIX)
+
+
+def ducc_cli_model(model: str) -> str:
+    """Translate a prefixed picker value to DUCC's model-catalog name."""
+    raw = model[len(DUCC_PREFIX):] if is_ducc_model(model) else model
+    return _DUCC_CLI_MODELS.get(raw, raw)
+
 
 def _overrides_get(key: str, default=None):
     """Read a SINGLE key from the override store without deep-copying the whole
@@ -1206,6 +1229,8 @@ def normalize_model_id(model: str) -> str:
     user-created providers using a colon-tag prefix work the same way. The
     legacy literals are kept as a fallback in case lookup() can't resolve the
     provider (e.g. it was deleted)."""
+    if is_ducc_model(model):
+        return model[len(DUCC_PREFIX):]
     p = lookup(model)
     if p and p.prefix.endswith(":") and model.startswith(p.prefix):
         return model[len(p.prefix):]
@@ -1332,6 +1357,21 @@ def available_groups() -> list[dict]:
             # Anthropic's own endpoint always handles the standard thinking
             # config (it IS the standard) → supports_thinking True.
             groups.append({"group": "Claude", "items": claude_items,
+                           "supports_thinking": True,
+                           "supports_effort": True})
+    # DUCC supplies its own authentication, proxy and dynamically signed
+    # comate_custom_header. It therefore remains available even when native
+    # Anthropic OAuth/API-key auth is absent. The internal prefix selects the
+    # runtime and is stripped before --model reaches DUCC.
+    from .settings import locate_ducc_executable
+    if locate_ducc_executable() and "ducc" not in disabled_models:
+        ducc_items = [
+            {"label": label_for(m), "model": f"{DUCC_PREFIX}{m}"}
+            for m in anthropic_models()
+            if f"{DUCC_PREFIX}{m}" not in disabled_models
+        ]
+        if ducc_items:
+            groups.append({"group": "DUCC", "items": ducc_items,
                            "supports_thinking": True,
                            "supports_effort": True})
     for p in catalog():

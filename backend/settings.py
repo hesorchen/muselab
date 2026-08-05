@@ -92,6 +92,41 @@ def locate_executable(name: str) -> str | None:
     return None
 
 
+def locate_ducc_executable() -> str | None:
+    """Resolve the real DUCC wrapper without depending on an interactive shell.
+
+    ``ducc`` commonly lives below the Comate extension rather than on the
+    service's PATH.  ``MUSELAB_DUCC_CLI`` is an operator override; the remaining
+    paths cover the two layouts used by current and standalone installations.
+    Only executable regular files are accepted.
+    """
+    candidates: list[Path] = []
+    configured = os.environ.get("MUSELAB_DUCC_CLI", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    found = locate_executable("ducc")
+    if found:
+        candidates.append(Path(found))
+    home = Path.home()
+    candidates.extend([
+        home / ".comate" / "baidu-cc" / "bin" / "ducc",
+        home / ".baidu-cc" / "baidu-cc" / "bin" / "ducc",
+    ])
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return str(resolved)
+        except OSError:
+            continue
+    return None
+
+
+def ducc_cli_wrapper() -> str:
+    """Return MuseLab's environment-sanitising DUCC launcher."""
+    return str(Path(__file__).resolve().parent.parent / "scripts" / "muselab-ducc")
+
+
 def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     """Write text atomically: tmpfile in same dir + os.replace().
 

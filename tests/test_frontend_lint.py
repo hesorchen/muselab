@@ -2673,3 +2673,80 @@ def test_stop_aborts_stream_ticket_before_backend_turn_exists():
     assert "if (st._streamStartController && !st.es)" in stop
     assert "st._streamStartController.abort()" in stop
     assert "st.streaming = false" in stop
+
+
+def test_midturn_reconnect_storm_guards_are_in_place():
+    """Guard the 2026-08-04 mid-turn flicker fix.
+
+    Measured symptom: ~60 full SSE teardown+replay cycles in 20-30 s while a
+    turn was running (60 POST /stream/start, 63 ?tail=300 quiet reloads, 382
+    /active probes). No transport error was involved — the driver was a closed
+    loop: _reconcileOpenSession saw `active:true` in the session list, quiet-
+    reloaded the transcript, loadSession's tail probed /active, that reconnected
+    and replayed the whole turn, `done` refreshed the list, repeat. Each of the
+    asserts below removes one edge of that loop; losing any one re-opens it.
+    """
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    # 1. A live session-list row alone must not trigger a transcript re-read.
+    #    `cur.active` stays true for the whole life of a turn AND of any
+    #    background task, so it cannot mean "there is new content".
+    reconcile = js[js.index("    _reconcileOpenSession(next) {"):]
+    reconcile = reconcile[:reconcile.index("\n    _sessionsEqual(")]
+    assert "const needsRefresh = st._pendingExternalUpdate || newer;" in reconcile
+    assert "!!cur.active || st._pendingExternalUpdate" not in reconcile
+    # Attaching to a server-side turn is a separate, pane-preserving path.
+    assert "const wantsAttach = !!cur.active && !st.streaming && !st.es;" in reconcile
+    assert "if (wantsAttach && st._loaded) this._checkActiveTurn(sid);" in reconcile
+    # 2. A HEALTHY transport is never retired on one stale `active:false` tick.
+    assert "const transportDead = !st.es" in reconcile
+    assert "if (transportDead) this._retireStaleSessionStream(sid, st);" in reconcile
+
+    # 3. Quiet reconciliation loads must not re-probe /active (that probe is
+    #    what turned every poll-driven reload into a full-turn replay).
+    load = js[js.index("    async loadSession(sid, opts = {}) {"):]
+    assert "const probeActive = opts.probeActive !== undefined" in load
+    assert "if (probeActive) this._checkActiveTurn(sid);" in load
+
+    # 4. Every reconnect source goes through one shared rate brake.
+    assert "_allowReconnect(sid, turnId) {" in js
+    gate = js[js.index("    _allowReconnect(sid, turnId) {"):]
+    gate = gate[:gate.index("\n    _reconcileOpenSession(")]
+    assert "if (last && now - last < MIN_GAP_MS) return false;" in gate
+    assert ">= BURST_MAX" in gate
+    # Refusal falls back to the flicker-free path: wait out the turn, then
+    # quiet-load canonical history.
+    assert "this._scheduleCanonicalStreamReload(sid, st);" in gate
+    check = js[js.index("    async _checkActiveTurn(sid) {"):]
+    check = check[:check.index("\n    // Hover-prefetch")]
+    assert "if (!this._allowReconnect(sid, d.turn_id)) return;" in check
+    recover = js[js.index("    async _recoverStalledStream(sid = this.currentId) {"):]
+    recover = recover[:recover.index("\n    _scheduleCanonicalStreamReload(")]
+    assert "if (!this._allowReconnect(sid, d.turn_id || st.activeTurnId)) return false;" in recover
+
+    # 5. The MAX_ATTEMPTS ceiling must stay reachable: a fresh turn is the only
+    #    place the counter resets. Every reconnect opens its EventSource
+    #    successfully, so resetting in es.onopen (or on retire) made the cap
+    #    unreachable and let the loop run forever.
+    assert js.count("_reconnectAttempts = 0") == 1
+    fresh = js[js.index("        streamState._sessionActivityExpected = null;"):]
+    fresh = fresh[:fresh.index("streamState.streaming = true;")]
+    assert "streamState._reconnectAttempts = 0;" in fresh
+    onopen = js[js.index("      es.onopen = () => {"):]
+    onopen = onopen[:onopen.index("      };")]
+    assert "_reconnectAttempts" not in onopen
+
+    # 6. Turn completion refreshes the list quietly instead of via
+    #    refreshSessions(), which also drives _recoverStalledStream — i.e. it
+    #    wired a second reconnect probe into the turn-completion path.
+    done = js[js.index("        streamState._seenUpdated = undefined;"):]
+    done = done[:done.index("        if (this.currentId === streamSid) {")]
+    assert "this._syncSessionListQuiet();" in done
+    assert "this.refreshSessions();" not in done
+
+    # 7. The catch-up retry is bounded. An unbounded 250 ms self-retry is a hot
+    #    loop whenever the transcript never reaches the list's target revision,
+    #    and every round costs a full ?tail= reload of the visible pane.
+    assert "st._reconcileRetryN = retries + 1;" in reconcile
+    assert "&& retries < 6" in reconcile
+    assert "Math.min(2000, 250 * (retries + 1))" in reconcile

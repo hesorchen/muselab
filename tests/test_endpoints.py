@@ -47,6 +47,39 @@ def test_lookup_unknown_model(monkeypatch):
     assert ep.lookup("claude-sonnet-4-6") is None  # claude not in catalog
 
 
+def test_ducc_model_prefix_selects_runtime_and_catalog_model(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {})
+
+    assert ep.is_ducc_model("ducc:claude-opus-4-8")
+    assert not ep.is_ducc_model("claude-opus-4-8")
+    assert ep.normalize_model_id("ducc:claude-opus-4-8") == "claude-opus-4-8"
+    assert ep.ducc_cli_model("ducc:claude-opus-4-8") == "Opus 4.8"
+    assert ep.ducc_cli_model("ducc:unknown-model") == "unknown-model"
+    assert ep.lookup("ducc:claude-opus-4-8") is None
+
+
+def test_ducc_group_does_not_require_native_anthropic_auth(monkeypatch):
+    ep = _reload_endpoints(monkeypatch, {
+        "ANTHROPIC_API_KEY": None,
+        "ANTHROPIC_AUTH_TOKEN": None,
+        "MUSELAB_DISABLED_PROVIDERS": None,
+    })
+    from backend import settings
+    monkeypatch.setattr(settings, "locate_ducc_executable", lambda: "/tmp/ducc")
+    monkeypatch.setattr(ep.Path, "home", lambda: Path("/nonexistent-home"))
+
+    groups = ep.available_groups()
+    ducc = next(group for group in groups if group["group"] == "DUCC")
+
+    assert ducc["supports_thinking"] is True
+    assert ducc["supports_effort"] is True
+    assert {item["model"] for item in ducc["items"]} >= {
+        "ducc:claude-opus-4-8",
+        "ducc:claude-sonnet-4-6",
+    }
+    assert all(item["model"].startswith("ducc:") for item in ducc["items"])
+
+
 def test_env_override_missing_key(monkeypatch):
     ep = _reload_endpoints(monkeypatch, {"DEEPSEEK_API_KEY": None})
     assert ep.env_override("deepseek-v4-pro") is None

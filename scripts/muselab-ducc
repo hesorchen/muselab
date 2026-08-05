@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Claude Agent SDK overlays options.env onto the whole MuseLab backend
+# environment. Remove MuseLab/provider credentials before handing control to
+# DUCC; claude-go will install its own endpoint, auth and signed custom header.
+ducc_cli="${MUSELAB_DUCC_CLI:-}"
+if [[ -z "$ducc_cli" ]]; then
+    for candidate in \
+        "$HOME/.comate/baidu-cc/bin/ducc" \
+        "$HOME/.baidu-cc/baidu-cc/bin/ducc"; do
+        if [[ -x "$candidate" ]]; then
+            ducc_cli="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "$ducc_cli" ]] && command -v ducc >/dev/null 2>&1; then
+    ducc_cli="$(command -v ducc)"
+fi
+if [[ -z "$ducc_cli" || ! -x "$ducc_cli" ]]; then
+    printf '%s\n' 'MuseLab DUCC runtime: executable not found' >&2
+    exit 127
+fi
+
+while IFS= read -r name; do
+    case "$name" in
+        MUSELAB_TOKEN|MUSELAB_PROVIDER_*|\
+        ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|\
+        ANTHROPIC_CUSTOM_HEADERS|ANTHROPIC_DEFAULT_*|\
+        CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_OAUTH_TOKEN|CLAUDE_CONFIG_DIR|\
+        CLAUDE_AGENT_SDK_CLIENT_APP|CLAUDE_AGENT_SDK_VERSION|\
+        CLAUDE_CODE_ENTRYPOINT|\
+        DEEPSEEK_API_KEY|ZHIPUAI_API_KEY|MINIMAX_API_KEY|\
+        MOONSHOT_API_KEY|DASHSCOPE_API_KEY|XIAOMI_MIMO_API_KEY|\
+        QIANFAN_API_KEY|CODEX_GATEWAY_API_KEY|OPENAI_API_KEY|\
+        OPENAI_IMAGE_API_KEY)
+            unset "$name"
+            ;;
+    esac
+done < <(compgen -e)
+unset MUSELAB_DUCC_CLI
+
+exec "$ducc_cli" "$@"

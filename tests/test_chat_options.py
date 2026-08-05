@@ -49,6 +49,42 @@ def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_pa
         assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "deepseek-v4-pro"
 
 
+def test_ducc_model_uses_real_cli_runtime_without_native_auth(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    wrapper = tmp_path / "muselab-ducc"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        chat_mod, "locate_ducc_executable", lambda: "/opt/ducc/bin/ducc")
+    monkeypatch.setattr(chat_mod, "ducc_cli_wrapper", lambda: str(wrapper))
+    monkeypatch.setattr(
+        endpoints, "env_override",
+        lambda model: (_ for _ in ()).throw(
+            AssertionError("DUCC must not use endpoint env overrides")),
+    )
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    client = asyncio.run(chat_mod._build_and_connect_client(
+        "sid-ducc-runtime", "ducc:claude-opus-4-8",
+        "bypassPermissions", "high"))
+
+    assert captured["connected"] is True
+    assert client is not None
+    assert captured["cli_path"] == str(wrapper)
+    assert captured["model"] == "Opus 4.8"
+    assert "env" not in captured
+    assert captured["effort"] == "high"
+    assert captured["thinking"] == {
+        "type": "enabled", "budget_tokens": 10000,
+    }
+
+
 def test_non_bypass_runtime_installs_permission_resolver(
     app_module, monkeypatch, tmp_path,
 ):
