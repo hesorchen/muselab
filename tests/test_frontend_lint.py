@@ -350,19 +350,25 @@ def test_enter_submission_waits_for_ime_composition():
     helper_start = app.index("_claimNonImeEnter(ev)")
     helper_end = app.index("\n    },", helper_start)
     helper = app[helper_start:helper_end]
-    ime_start = app.index("_isImeComposingEvent(ev)")
+    ime_start = app.index("    _isImeComposingEvent(ev) {")
     ime_end = app.index("\n    },", ime_start)
     ime = app[ime_start:ime_end]
     assert "ev.isComposing" in ime
     assert "ev.keyCode === 229" in ime
     assert "ev.which === 229" in ime
     assert 'ev.key === "Process"' in ime
+    assert "target._museImeComposing" in ime
+    assert "target._museImeEndedAt" in ime
+    assert "eventAt - endedAt <= 80" in ime
     assert helper.index("return false") < helper.index("ev.preventDefault()")
 
     assert '@keydown.enter="confirmModalOnEnter($event)"' in html
     assert '@keydown.enter="commitRenameTabOnEnter($event)"' in html
     assert '@keydown.enter="pickerCommitInlineRenameOnEnter($event)"' in html
     assert '@keydown.enter="onEnter($event)"' in html
+    assert '@compositionstart="onImeCompositionStart($event)"' in html
+    assert '@compositionend="onImeCompositionEnd($event)"' in html
+    assert '@blur="onChatInputBlur($event)"' in html
     assert '@keydown.enter.prevent="commitRenameTab()"' not in html
     assert '@keydown.enter.prevent="pickerCommitInlineRename()"' not in html
     assert '@keydown.enter.prevent.stop="onEnter($event)"' not in html
@@ -1421,7 +1427,12 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "if (!waitForTerminalEvent || !st.streaming)" in stop
     cancelled_start = app.index('es.addEventListener("cancelled"')
     cancelled_end = app.index("\n      });", cancelled_start)
-    assert "_markDone(true, false, true)" in app[cancelled_start:cancelled_end]
+    cancelled = app[cancelled_start:cancelled_end]
+    assert "_markDone(true, false, true)" in cancelled
+    assert "d.snapshot_ready" in cancelled
+    assert "streamState._seenUpdated = undefined" in cancelled
+    assert "quiet: true" in cancelled
+    assert "probeActive: false" in cancelled
     mark_done_start = app.index("const _markDone = (")
     mark_done_end = app.index("\n      };", mark_done_start)
     assert "streamState._stopping = false" in app[

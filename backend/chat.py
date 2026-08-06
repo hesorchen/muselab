@@ -821,6 +821,17 @@ class TurnBroadcast:
         self.user_text: str = ""
         self.user_images: list[dict] = []
         self.user_docs: list[dict] = []
+        # Display-only recovery boundary for an explicitly interrupted turn.
+        # The Claude CLI may abort before it flushes this turn to JSONL, while
+        # the browser has already rendered text/thinking/tool cards.  Capture
+        # the transcript coordinate immediately before query() so a durable
+        # MuseLab snapshot can later be inserted at the same visual position
+        # without writing partial assistant output back into model context.
+        self.transcript_boundary: dict[str, Any] = {}
+        self.canonical_terminal_published = False
+        self.cancelled_snapshot_persisted = False
+        self.cancelled_snapshot_suppressed = False
+        self.cancelled_snapshot_lock = threading.Lock()
         # True for a HEADLESS CONTINUATION turn: the cross-turn task watcher
         # opens one of these (no user prompt) when an SDK background task
         # finishes after its originating turn ended. It carries the task's
@@ -4711,6 +4722,58 @@ def _session_message_uuids(sid: str, model: str) -> frozenset[str]:
         return frozenset()
 
 
+def _turn_transcript_boundary(
+    sid: str,
+    model: str,
+) -> tuple[frozenset[str], dict[str, Any]]:
+    """Return the SDK replay boundary plus a display-history anchor.
+
+    The UUID set continues to protect the pooled SDK receive queue from
+    replaying a previous response.  The compact coordinate is retained on the
+    ``TurnBroadcast`` only for the lifetime of this turn and, if the user
+    interrupts before a canonical ResultMessage, is copied into the private
+    cancelled-turn display snapshot.
+    """
+    existing = _session_message_uuids(sid, model)
+    boundary: dict[str, Any] = {
+        "record_count": 0,
+        "source_dev": 0,
+        "source_inode": 0,
+        "normal_uuid": "",
+        "normal_total": 0,
+        "full_uuid": "",
+        "full_total": 0,
+    }
+    try:
+        indexed = _ensure_transcript_index(sid)
+        if indexed is None:
+            return existing, boundary
+        _, index = indexed
+        records = index.get("records") or []
+        source = index.get("source") or {}
+        boundary.update({
+            "record_count": len(records),
+            "source_dev": int(source.get("dev") or 0),
+            "source_inode": int(source.get("inode") or 0),
+        })
+        for order in ("normal", "full"):
+            record_ids = (index.get("orders") or {}).get(order) or []
+            prefix = (index.get("bubble_prefix") or {}).get(order) or [0]
+            if record_ids:
+                rec = records[record_ids[-1]]
+                boundary[f"{order}_uuid"] = str(rec.get("uuid") or "")
+            boundary[f"{order}_total"] = int(prefix[-1] if prefix else 0)
+    except Exception as exc:
+        # Recovery metadata is best-effort.  Failing to establish an anchor
+        # must never stop the actual model request; an unanchored snapshot is
+        # still safely appended to the display history if cancellation occurs.
+        sys.stderr.write(
+            f"[chat-stream] transcript boundary skipped sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+    return existing, boundary
+
+
 class _TurnResponseBoundary:
     """Classify pooled-SDK messages relative to one ``query()`` call."""
 
@@ -4793,21 +4856,20 @@ def get_session_api(
     outline / export / jump-to-pre-compact back-compat — those need the whole
     list. Windowing is ignored when `full` is set.
 
-    Mid-turn fallback: SDK CLI only writes the JSONL on turn completion,
-    so a reload while a reply is streaming would otherwise return an
-    empty list. When an active TurnBroadcast exists for `sid`, we
-    reconstruct the in-flight messages from its event buffer (user
-    prompt + every SSE event yielded so far) so the user sees the
-    partial reply instead of a blank session."""
+    Explicit-interrupt recovery: if the CLI was force-stopped before it could
+    flush this turn to JSONL, merge MuseLab's private display snapshot at its
+    original transcript anchor. The snapshot is presentation-only and is
+    never passed back into model context."""
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
+    snapshots, snapshot_generation = _load_cancelled_turn_snapshots(sid)
     # Any bounded request uses the byte-offset index, including bounded
     # ``full``-order paging after an outline jump.  Keeping normal/full as an
     # explicit response coordinate prevents a full-order offset from later
     # being sent to the default normal-order endpoint.
-    uses_index = bool(around_uuid or tail > 0 or offset >= 0)
+    uses_index = bool(around_uuid or tail > 0 or offset >= 0 or snapshots)
     generation = ""
     has_later = False
     pre_total = 0
@@ -4816,13 +4878,25 @@ def get_session_api(
     if uses_index:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
-            messages: list[dict] = []
-            total = 0
-            win_offset = 0
-            window = []
+            generation = _combined_history_generation(
+                "", snapshot_generation)
+            if history_generation and history_generation != generation:
+                raise HTTPException(409, detail={
+                    "error": "history_generation_mismatch",
+                    "history_generation": generation,
+                })
+            if around_uuid:
+                raise HTTPException(404, "message uuid not found")
+            window, total, win_offset, has_later = _interrupted_history_window(
+                None, None, snapshots, {}, history_order,
+                tail=tail, offset=offset, limit=limit)
+            messages = window
         else:
             transcript_path, index = indexed
-            generation = str(index.get("history_generation") or "")
+            generation = _combined_history_generation(
+                str(index.get("history_generation") or ""),
+                snapshot_generation,
+            )
             # Bubbles stranded before the visible chain's root (post-/compact,
             # or a fork). Reported in FULL-order units in every response so the
             # client can offer "Load earlier" even when the normal-order window
@@ -4871,35 +4945,58 @@ def get_session_api(
             else:
                 order = "full" if full else "normal"
                 history_order = order
-                total = index["bubble_prefix"][order][-1]
-                if offset >= 0:
-                    start = max(0, min(offset, total))
-                    end = total if limit <= 0 else min(total, start + limit)
+                if snapshots:
+                    window, total, win_offset, has_later = (
+                        _interrupted_history_window(
+                            transcript_path,
+                            index,
+                            snapshots,
+                            annotations,
+                            order,
+                            tail=tail,
+                            offset=offset,
+                            limit=limit,
+                        )
+                    )
                 else:
-                    start = max(0, total - tail)
-                    end = total
-                record_ids, inner_start, _ = (
-                    transcript_idx.record_indices_for_bubble_window(
-                        index, order, start, end))
-                shaped = _indexed_ui_records(
-                    transcript_path, index, record_ids, annotations)
-                window = shaped[inner_start:inner_start + (end - start)]
-                win_offset = start
-                has_later = end < total
+                    total = index["bubble_prefix"][order][-1]
+                    if offset >= 0:
+                        start = max(0, min(offset, total))
+                        end = total if limit <= 0 else min(total, start + limit)
+                    else:
+                        start = max(0, total - tail)
+                        end = total
+                    record_ids, inner_start, _ = (
+                        transcript_idx.record_indices_for_bubble_window(
+                            index, order, start, end))
+                    shaped = _indexed_ui_records(
+                        transcript_path, index, record_ids, annotations)
+                    window = shaped[inner_start:inner_start + (end - start)]
+                    win_offset = start
+                    has_later = end < total
             messages = window
 
             # The index already has the exact normal-order bubble total, so
             # window requests can self-heal message_count without shaping the
             # entire transcript.
-            normal_total = index["bubble_prefix"]["normal"][-1]
+            if snapshots:
+                normal_total, turns = _interrupted_history_stats(
+                    index, snapshots, "normal")
+            else:
+                normal_total = index["bubble_prefix"]["normal"][-1]
+                records = index["records"]
+                turns = sum(
+                    1 for rec_i in index["orders"]["normal"]
+                    if records[rec_i].get("real_user_prompt")
+                )
             if not full and meta.get("message_count", 0) != normal_total:
                 try:
-                    records = index["records"]
-                    turns = sum(
-                        1 for rec_i in index["orders"]["normal"]
-                        if records[rec_i].get("real_user_prompt")
-                    )
                     sess.set_message_count(sid, normal_total, turn_count=turns)
+                    meta = {
+                        **meta,
+                        "message_count": normal_total,
+                        "turn_count": turns,
+                    }
                 except Exception:
                     pass
     else:
@@ -4972,10 +5069,15 @@ def get_session_outline_api(sid: str) -> dict:
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
+    _, snapshot_generation = _load_cancelled_turn_snapshots(sid)
     try:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
-            return {"outline": [], "history_generation": ""}
+            return {
+                "outline": [],
+                "history_generation": _combined_history_generation(
+                    "", snapshot_generation),
+            }
         _, index = indexed
         records = index["records"]
         items = [
@@ -4988,24 +5090,25 @@ def get_session_outline_api(sid: str) -> dict:
         ]
         return {
             "outline": items,
-            "history_generation": index.get("history_generation") or "",
+            "history_generation": _combined_history_generation(
+                index.get("history_generation") or "", snapshot_generation),
         }
     except Exception:
-        return {"outline": [], "history_generation": ""}
+        return {
+            "outline": [],
+            "history_generation": _combined_history_generation(
+                "", snapshot_generation),
+        }
 
 
 def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
-    """Reconstruct a UI-shaped message list from an in-flight broadcast.
-    Lossy by design: this is shown only mid-turn while SDK JSONL is
-    empty. Once the turn finishes the regular SDK→UI path takes over
-    and we drop this view.
+    """Reconstruct the browser-visible portion of one broadcast.
 
-    Events fold like the streaming-handler's openAsst/closeAsst dance:
-    consecutive 'text' deltas form one assistant bubble; thinking
-    deltas accumulate into one thinking message; tool_use / tool_result
-    push their own messages. Non-render events (done / error / etc.)
-    are ignored here — the UI's `done` handler only matters in live
-    streaming, not in a reload-rebuild."""
+    This is the display record used when an explicit interrupt prevents the
+    CLI from committing a canonical JSONL turn.  It deliberately contains no
+    hidden protocol payloads and is never fed back to the model: only the same
+    bounded text/thinking/tool fields already sent to the browser are kept.
+    """
     out: list[dict] = []
     if bc.user_text or bc.user_images or bc.user_docs:
         out.append({
@@ -5016,6 +5119,23 @@ def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
         })
     cur_text_msg: dict | None = None
     cur_thinking_msg: dict | None = None
+
+    def close_segment() -> None:
+        nonlocal cur_text_msg, cur_thinking_msg
+        cur_text_msg = None
+        cur_thinking_msg = None
+
+    def apply_task_status(tool_use_id: str, task_id: str, **patch: Any) -> None:
+        for message in reversed(out):
+            if message.get("role") != "tool_use":
+                continue
+            status = message.get("task_status") or {}
+            if (tool_use_id and message.get("id") == tool_use_id) or (
+                task_id and status.get("task_id") == task_id
+            ):
+                message["task_status"] = {**status, "task_id": task_id, **patch}
+                return
+
     for ev in bc.replay_events():
         kind = ev.get("event") or ""
         data_str = ev.get("data") or "{}"
@@ -5041,30 +5161,487 @@ def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
             else:
                 cur_thinking_msg["text"] += chunk
         elif kind == "tool_use":
-            cur_text_msg = None
-            cur_thinking_msg = None
-            out.append({
+            close_segment()
+            message = {
                 "role": "tool_use",
                 "name": data.get("name"),
+                "id": data.get("id"),
                 "summary": data.get("summary"),
-                "input": data.get("input"),
+                "input": data.get("input") or {},
+                "task_status": None,
+                "_approvalSuperseded": False,
                 **({"todos": data["todos"]} if "todos" in data else {}),
                 **({"task": data["task"]} if "task" in data else {}),
                 **({"plan": data["plan"]} if "plan" in data else {}),
-            })
+            }
+            out.append(message)
         elif kind == "tool_result":
-            cur_text_msg = None
-            cur_thinking_msg = None
+            close_segment()
             out.append({
                 "role": "tool_result",
+                "id": data.get("id"),
+                "tool_name": data.get("tool_name") or "",
                 "preview": data.get("preview"),
+                "text": data.get("text") or "",
                 "truncated": data.get("truncated"),
+                "text_truncated": data.get("text_truncated"),
                 "is_error": data.get("is_error"),
+                "bash": data.get("bash"),
             })
-        # ask_user_question / permission_request not reconstructed here —
-        # they're interactive blocks whose answer state lives in the
-        # ask/perm queues, not in the broadcast buffer.
+        elif kind == "task_started":
+            apply_task_status(
+                str(data.get("tool_use_id") or ""),
+                str(data.get("task_id") or ""),
+                state="running",
+                description=data.get("description") or "",
+            )
+        elif kind == "task_progress":
+            apply_task_status(
+                str(data.get("tool_use_id") or ""),
+                str(data.get("task_id") or ""),
+                state="running",
+                usage=data.get("usage") or {},
+                last_tool_name=data.get("last_tool_name") or "",
+            )
+        elif kind == "task_notification":
+            raw_state = str(data.get("status") or "")
+            state = raw_state if raw_state in {
+                "completed", "failed", "stopped"
+            } else "done"
+            apply_task_status(
+                str(data.get("tool_use_id") or ""),
+                str(data.get("task_id") or ""),
+                state=state,
+                summary=data.get("summary") or "",
+                output_file=data.get("output_file") or "",
+            )
+        elif kind == "ask_user_question":
+            close_segment()
+            questions = data.get("questions") or []
+            out.append({
+                "role": "ask_user_question",
+                "id": data.get("id"),
+                "questions": questions,
+                "pendingAnswers": {
+                    str(question.get("question") or ""): (
+                        [] if question.get("multiSelect") else None
+                    )
+                    for question in questions
+                    if isinstance(question, dict)
+                },
+                # The stream is terminal: never resurrect an actionable card
+                # whose backend Future was cancelled with the turn.
+                "submitted": True,
+                "askOtherOpen": False,
+                "askOtherText": "",
+            })
+        elif kind == "permission_request":
+            close_segment()
+            out.append({
+                "role": "permission_request",
+                "id": data.get("id"),
+                "tool": data.get("tool"),
+                "summary": data.get("summary"),
+                "kind": data.get("kind") or "tool",
+                "suggestions": data.get("suggestions") or [],
+                "return_mode": data.get("return_mode") or "",
+                "title": data.get("title") or "",
+                "display_name": data.get("display_name") or "",
+                "description": data.get("description") or "",
+                "input": data.get("input") or {},
+                "tool_use_id": data.get("tool_use_id") or data.get("toolUseId") or "",
+                "plan": data.get("plan") or "",
+                "resolved": True,
+                "decision": "expired",
+                "mode": None,
+                "submitting": False,
+                "awaitingTransition": False,
+                "_decisionAcknowledged": True,
+                "failure_message": "",
+            })
     return out
+
+
+_CANCELLED_TURN_SNAPSHOT_SCHEMA = 1
+
+
+def _canonical_uuid_component(value: str) -> str | None:
+    """Return a filesystem-safe canonical UUID or ``None``."""
+    try:
+        parsed = uuid.UUID(str(value or ""))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    canonical = str(parsed)
+    return canonical if canonical == str(value or "").lower() else None
+
+
+def _cancelled_turn_session_dir(sid: str) -> Path | None:
+    safe_sid = _canonical_uuid_component(sid)
+    if safe_sid is None:
+        return None
+    return sess.SESS_DIR / "cancelled_turns" / safe_sid
+
+
+def _cancelled_turn_snapshot_path(sid: str, turn_id: str) -> Path | None:
+    directory = _cancelled_turn_session_dir(sid)
+    safe_turn = _canonical_uuid_component(turn_id)
+    if directory is None or safe_turn is None:
+        return None
+    return directory / f"{safe_turn}.json"
+
+
+def _delete_cancelled_turn_snapshots(sid: str) -> None:
+    directory = _cancelled_turn_session_dir(sid)
+    if directory is None or not directory.exists():
+        return
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _load_cancelled_turn_snapshots(sid: str) -> tuple[list[dict], str]:
+    """Load private display-only interrupted-turn snapshots.
+
+    The generation hashes filenames and stat data only; private message text is
+    never copied into an ETag, log line, or other externally observable cache
+    key.
+    """
+    directory = _cancelled_turn_session_dir(sid)
+    if directory is None or not directory.exists():
+        return [], ""
+    snapshots: list[dict] = []
+    digest = hashlib.blake2b(digest_size=12)
+    for path in sorted(directory.glob("*.json")):
+        try:
+            stat = path.stat()
+            digest.update(path.name.encode("ascii", errors="ignore"))
+            digest.update(f":{stat.st_mtime_ns}:{stat.st_size};".encode("ascii"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("snapshot root must be an object")
+            if data.get("schema") != _CANCELLED_TURN_SNAPSHOT_SCHEMA:
+                raise ValueError("unsupported snapshot schema")
+            if data.get("sid") != sid or not isinstance(data.get("messages"), list):
+                raise ValueError("snapshot ownership mismatch")
+            snapshots.append(data)
+        except Exception as exc:
+            # Never log payloads: a cancelled turn can contain private source,
+            # prompts, or tool output. Filename + exception class is enough for
+            # an operator to find a corrupt local artifact.
+            sys.stderr.write(
+                f"[chat] cancelled snapshot skipped file={path.name} "
+                f"exc={type(exc).__name__}\n")
+    snapshots.sort(key=lambda item: (
+        int(item.get("started_at_ms") or 0), str(item.get("turn_id") or "")))
+    return snapshots, digest.hexdigest() if snapshots else ""
+
+
+def _combined_history_generation(base: str, snapshot_generation: str) -> str:
+    if not snapshot_generation:
+        return base
+    return f"{base or 'none'}~cancelled-{snapshot_generation}"
+
+
+def _persist_cancelled_turn_snapshot(bc: "TurnBroadcast") -> bool:
+    """Serialize the pump/watchdog race and persist one stable snapshot."""
+    with bc.cancelled_snapshot_lock:
+        return _persist_cancelled_turn_snapshot_locked(bc)
+
+
+def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
+    """Atomically persist the browser-visible part of a non-canonical turn."""
+    if bc.cancelled_snapshot_persisted:
+        return True
+    if (bc.cancelled_snapshot_suppressed
+            or bc.canonical_terminal_published
+            or not bc.cancelled):
+        return False
+    path = _cancelled_turn_snapshot_path(bc.session_id, bc.turn_id)
+    if path is None:
+        return False
+    messages = _broadcast_to_ui_messages(bc)
+    if not messages:
+        return False
+
+    now_ms = int(time.time() * 1000)
+    elapsed_s = max(0.0, now_ms / 1000.0 - float(bc.started_at or 0))
+    for index, message in enumerate(messages):
+        message["_key"] = f"cancelled:{bc.turn_id}:{index}"
+        message["_interrupted"] = True
+        message["_interrupted_turn_id"] = bc.turn_id
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            message.setdefault("ts", now_ms)
+            if elapsed_s >= 1:
+                message.setdefault("elapsed", round(elapsed_s, 1))
+            break
+
+    boundary = dict(bc.transcript_boundary or {})
+    hidden_uuids: list[str] = []
+    try:
+        indexed = _ensure_transcript_index(bc.session_id)
+        if indexed is not None:
+            _, index = indexed
+            source = index.get("source") or {}
+            same_source = (
+                int(source.get("dev") or 0) == int(boundary.get("source_dev") or 0)
+                and int(source.get("inode") or 0)
+                    == int(boundary.get("source_inode") or 0)
+            )
+            start = int(boundary.get("record_count") or 0)
+            records = index.get("records") or []
+            if same_source and 0 <= start <= len(records):
+                hidden_uuids = list(dict.fromkeys(
+                    str(record.get("uuid") or "")
+                    for record in records[start:]
+                    if record.get("uuid")
+                ))
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] cancelled snapshot boundary scan skipped "
+            f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
+
+    payload = {
+        "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
+        "sid": bc.session_id,
+        "turn_id": bc.turn_id,
+        "model": bc.model,
+        "started_at_ms": int(float(bc.started_at or 0) * 1000),
+        "interrupted_at_ms": now_ms,
+        "anchors": {
+            "normal": {
+                "uuid": boundary.get("normal_uuid") or "",
+                "total": int(boundary.get("normal_total") or 0),
+            },
+            "full": {
+                "uuid": boundary.get("full_uuid") or "",
+                "total": int(boundary.get("full_total") or 0),
+            },
+        },
+        "hidden_uuids": hidden_uuids,
+        "messages": messages,
+    }
+    try:
+        # Keep the atomic writer's temporary file and the final snapshot in a
+        # session-private directory. Interrupted prompts and tool output must
+        # not be readable by another local account during the rename-sized
+        # window before the final file chmod below.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            path.parent.chmod(0o700)
+        atomic_write_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        with suppress(OSError):
+            path.chmod(0o600)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] cancelled snapshot write failed sid={bc.session_id[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        return False
+
+    # The durable display record is already committed. Metadata is a
+    # self-healing cache (the history endpoint recomputes it), so a failure to
+    # bump the list row must not tell the browser that snapshot persistence
+    # failed and leave the just-rendered pane exposed to an older reload.
+    bc.cancelled_snapshot_persisted = True
+    try:
+        snapshots, _ = _load_cancelled_turn_snapshots(bc.session_id)
+        indexed = _ensure_transcript_index(bc.session_id)
+        index = indexed[1] if indexed is not None else None
+        total, turns = _interrupted_history_stats(index, snapshots, "normal")
+        sess.bump_session(
+            bc.session_id,
+            message_count=total,
+            turn_count=turns,
+            auto_rename_from=bc.user_text,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] cancelled snapshot metadata sync failed "
+            f"sid={bc.session_id[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+    return True
+
+
+def _interrupted_history_segments(
+    index: dict | None,
+    snapshots: list[dict],
+    order: str,
+) -> tuple[list[dict], int]:
+    """Build a virtual bubble stream of canonical records + snapshots."""
+    records = (index or {}).get("records") or []
+    orders = (index or {}).get("orders") or {}
+    record_ids = list(orders.get(order) or [])
+    positions: dict[str, int] = {}
+    for position, record_id in enumerate(record_ids):
+        uid = str(records[record_id].get("uuid") or "")
+        if uid:
+            positions[uid] = position
+    full_uuids = {
+        str(records[record_id].get("uuid") or "")
+        for record_id in orders.get("full") or []
+    }
+    prefix = ((index or {}).get("bubble_prefix") or {}).get(order) or [0]
+
+    placed: dict[int, list[dict]] = {}
+    included: list[dict] = []
+    for snapshot in snapshots:
+        anchors = snapshot.get("anchors") or {}
+        anchor = anchors.get(order) or {}
+        anchor_uuid = str(anchor.get("uuid") or "")
+        if anchor_uuid and anchor_uuid in positions:
+            position = positions[anchor_uuid]
+        elif order == "normal" and anchor_uuid and anchor_uuid in full_uuids:
+            # The interrupted turn sits before the current compact/fork root.
+            # Keep it in full-history mode but do not punch it back into the
+            # normal post-compact view.
+            continue
+        else:
+            target = max(0, int(anchor.get("total") or 0))
+            position = -1
+            for pos in range(len(record_ids)):
+                reached = int(prefix[pos + 1] if pos + 1 < len(prefix) else 0)
+                if reached > target:
+                    break
+                position = pos
+        placed.setdefault(position, []).append(snapshot)
+        included.append(snapshot)
+
+    for group in placed.values():
+        group.sort(key=lambda item: (
+            int(item.get("started_at_ms") or 0), str(item.get("turn_id") or "")))
+
+    hidden = {
+        str(uid)
+        for snapshot in included
+        for uid in (snapshot.get("hidden_uuids") or [])
+        if uid
+    }
+    segments: list[dict] = []
+
+    def append_snapshots(position: int) -> None:
+        for snapshot in placed.get(position, []):
+            messages = snapshot.get("messages") or []
+            if messages:
+                segments.append({
+                    "kind": "snapshot",
+                    "snapshot": snapshot,
+                    "count": len(messages),
+                })
+
+    append_snapshots(-1)
+    for position, record_id in enumerate(record_ids):
+        record = records[record_id]
+        if str(record.get("uuid") or "") not in hidden:
+            count = max(0, int(record.get("bubble_count") or 0))
+            if count:
+                segments.append({
+                    "kind": "record",
+                    "record_id": record_id,
+                    "count": count,
+                })
+        append_snapshots(position)
+    snapshot_turns = sum(
+        1
+        for snapshot in included
+        if any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in (snapshot.get("messages") or [])
+        )
+    )
+    return segments, snapshot_turns
+
+
+def _interrupted_history_stats(
+    index: dict | None,
+    snapshots: list[dict],
+    order: str,
+) -> tuple[int, int]:
+    segments, snapshot_turns = _interrupted_history_segments(
+        index, snapshots, order)
+    total = sum(int(segment.get("count") or 0) for segment in segments)
+    records = (index or {}).get("records") or []
+    canonical_turns = sum(
+        1
+        for segment in segments
+        if segment.get("kind") == "record"
+        and records[segment["record_id"]].get("real_user_prompt")
+    )
+    return total, canonical_turns + snapshot_turns
+
+
+def _interrupted_history_window(
+    transcript_path: Path | None,
+    index: dict | None,
+    snapshots: list[dict],
+    annotations: dict[str, dict],
+    order: str,
+    *,
+    tail: int = 0,
+    offset: int = -1,
+    limit: int = 0,
+) -> tuple[list[dict], int, int, bool]:
+    """Read one window from the virtual display history.
+
+    Only canonical records that intersect the requested display window are
+    read from JSONL.  A session with a cancelled snapshot therefore retains
+    the existing long-history/windowing protections instead of falling back to
+    a full transcript parse on every open.
+    """
+    segments, _ = _interrupted_history_segments(index, snapshots, order)
+    total = sum(int(segment.get("count") or 0) for segment in segments)
+    if offset >= 0:
+        start = max(0, min(offset, total))
+        end = total if limit <= 0 else min(total, start + limit)
+    elif tail > 0:
+        start = max(0, total - tail)
+        end = total
+    else:
+        start, end = 0, total
+
+    pieces: list[tuple[str, Any, int, int]] = []
+    selected_record_ids: list[int] = []
+    cursor = 0
+    for segment in segments:
+        count = int(segment.get("count") or 0)
+        seg_start, seg_end = cursor, cursor + count
+        cursor = seg_end
+        overlap_start = max(start, seg_start)
+        overlap_end = min(end, seg_end)
+        if overlap_start >= overlap_end:
+            continue
+        local_start = overlap_start - seg_start
+        local_end = overlap_end - seg_start
+        if segment["kind"] == "record":
+            record_id = int(segment["record_id"])
+            selected_record_ids.append(record_id)
+            pieces.append(("record", record_id, local_start, local_end))
+        else:
+            pieces.append((
+                "snapshot", segment["snapshot"], local_start, local_end))
+
+    shaped_by_record: dict[int, list[dict]] = {}
+    if transcript_path is not None and index is not None and selected_record_ids:
+        shaped = _indexed_ui_records(
+            transcript_path, index, selected_record_ids, annotations)
+        shaped_cursor = 0
+        records = index.get("records") or []
+        for record_id in selected_record_ids:
+            count = max(0, int(records[record_id].get("bubble_count") or 0))
+            shaped_by_record[record_id] = shaped[
+                shaped_cursor:shaped_cursor + count]
+            shaped_cursor += count
+
+    window: list[dict] = []
+    for kind, source, local_start, local_end in pieces:
+        if kind == "record":
+            messages = shaped_by_record.get(int(source), [])
+        else:
+            messages = source.get("messages") or []
+        window.extend(messages[local_start:local_end])
+    return window, total, start, end < total
 
 
 @router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
@@ -5077,13 +5654,21 @@ def export_session_markdown(sid: str) -> Response:
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
-    try:
-        sdk_msgs = _get_session_msgs(sid, model)
-    except Exception:
-        sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
-    compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    snapshots, _ = _load_cancelled_turn_snapshots(sid)
+    if snapshots:
+        indexed = _ensure_transcript_index(sid)
+        transcript_path = indexed[0] if indexed is not None else None
+        index = indexed[1] if indexed is not None else None
+        messages, _, _, _ = _interrupted_history_window(
+            transcript_path, index, snapshots, annotations, "normal")
+    else:
+        try:
+            sdk_msgs = _get_session_msgs(sid, model)
+        except Exception:
+            sdk_msgs = []
+        compact_uuids = _compact_summary_uuids(sid)
+        messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
     # Bind any unbound pending image/doc attachments (those persisted
     # before the stream completed could write a uuid annotation) to the
     # user messages that have inline image refs but no thumb/url yet.
@@ -5163,6 +5748,14 @@ def _clear_session_runtime_state(sid: str) -> None:
         recent.close()
     broadcast = _active_turns.pop(sid, None)
     if broadcast is not None:
+        # Explicit session deletion owns the terminal state. Prevent the
+        # cancelled pump's finally block from recreating a private display
+        # snapshot after purge_session_storage has removed every artifact.
+        broadcast.cancelled_snapshot_suppressed = True
+        # Join any already-running to_thread writer before the caller removes
+        # the snapshot directory. A later writer observes the suppression bit.
+        with broadcast.cancelled_snapshot_lock:
+            pass
         task = getattr(broadcast, "task", None)
         if task is not None and not task.done():
             task.cancel()
@@ -5212,6 +5805,7 @@ def purge_session_storage(sid: str) -> bool:
     _interrupted_at_startup.pop(sid, None)
     _clear_session_runtime_state(sid)
     _delete_active_turn_sidecar(sid)
+    _delete_cancelled_turn_snapshots(sid)
     return removed
 
 
@@ -7468,7 +8062,12 @@ async def _force_stop_after_grace(
             if _active_turns.get(session_id) is bc:
                 _active_turns.pop(session_id, None)
         if not bc.done:
-            bc.publish({"event": "cancelled", "data": "{}"})
+            snapshot_ready = await asyncio.to_thread(
+                _persist_cancelled_turn_snapshot, bc)
+            bc.publish({
+                "event": "cancelled",
+                "data": json.dumps({"snapshot_ready": snapshot_ready}),
+            })
             bc.finish()
         _delete_active_turn_sidecar(session_id)
     except Exception as e:
@@ -9793,7 +10392,12 @@ async def _finish_cancelled_startup(
 ) -> TurnBroadcast:
     """Finish a turn cancelled before its SDK client/query was ready."""
     if not broadcast.done:
-        broadcast.publish({"event": "cancelled", "data": "{}"})
+        snapshot_ready = await asyncio.to_thread(
+            _persist_cancelled_turn_snapshot, broadcast)
+        broadcast.publish({
+            "event": "cancelled",
+            "data": json.dumps({"snapshot_ready": snapshot_ready}),
+        })
         broadcast.finish()
     async with _lock:
         if _active_turns.get(session_id) is broadcast:
@@ -9961,6 +10565,11 @@ async def _start_turn(
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
+    # The Stop button can race cold CLI/MCP startup before attachment parsing
+    # and the final model resolution below. Retain the already-submitted text
+    # as soon as this broadcast owns the session so startup cancellation can
+    # persist the same user bubble the browser is displaying.
+    broadcast.user_text = prompt
     # Clear a completed watcher defensively. A live watcher must never be
     # cancelled here: it still owns the stream and its continuation belongs to
     # the previous turn.
@@ -10555,8 +11164,9 @@ async def _start_turn(
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
                 # cheap; to_thread keeps a long-session parse off the event loop.
-                existing_uuids = await asyncio.to_thread(
-                    _session_message_uuids, session_id, model_to_use)
+                existing_uuids, transcript_boundary = await asyncio.to_thread(
+                    _turn_transcript_boundary, session_id, model_to_use)
+                broadcast.transcript_boundary = transcript_boundary
                 boundary = _TurnResponseBoundary(existing_uuids)
                 # mem0 recall is supplied by the UserPromptSubmit hook configured
                 # on this client. The canonical query remains exactly `prompt` so
@@ -11674,6 +12284,26 @@ async def _start_turn(
                                 turn_errored = True
                         except (ValueError, TypeError):
                             pass
+                        # ResultMessage is the canonical transcript boundary.
+                        # Even a graceful done(cancelled=true) must not get a
+                        # duplicate display snapshot layered over JSONL.
+                        broadcast.canonical_terminal_published = True
+                    if (isinstance(ev, dict)
+                            and ev.get("event") == "cancelled"
+                            and broadcast.cancelled):
+                        snapshot_ready = await asyncio.to_thread(
+                            _persist_cancelled_turn_snapshot, broadcast)
+                        try:
+                            cancelled_data = json.loads(ev.get("data") or "{}")
+                        except (TypeError, ValueError):
+                            cancelled_data = {}
+                        if not isinstance(cancelled_data, dict):
+                            cancelled_data = {}
+                        cancelled_data["snapshot_ready"] = snapshot_ready
+                        ev = {
+                            **ev,
+                            "data": json.dumps(cancelled_data),
+                        }
                     broadcast.publish(ev)
                     if isinstance(ev, dict) and ev.get("event") == "done":
                         terminal_published = True
@@ -11718,6 +12348,11 @@ async def _start_turn(
                         "".join(assistant_acc),
                         turn_error_text or "turn stream failed",
                         broadcast.turn_id)
+            if (broadcast.cancelled
+                    and not broadcast.canonical_terminal_published
+                    and not broadcast.cancelled_snapshot_persisted):
+                await asyncio.to_thread(
+                    _persist_cancelled_turn_snapshot, broadcast)
             _activity_status = ("cancelled" if broadcast.cancelled else
                                 "failed" if turn_errored else "completed")
             await _finish_activity(

@@ -305,6 +305,86 @@ def test_window_endpoint_matches_full_oracle_and_adds_stable_keys(
     assert len({m["_key"] for m in body["messages"]}) == len(body["messages"])
 
 
+def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(
+    client, auth, app_module, tmp_path,
+):
+    """Partial JSONL rows are replaced by one durable display-only snapshot."""
+    from backend import chat as chat_mod
+
+    entries = [
+        _entry("u0", "user", "before"),
+        _entry("a0", "assistant", "before answer", "u0"),
+        # The CLI managed to append part of the interrupted turn before its
+        # process was force-stopped. These UUIDs must be hidden, not duplicated.
+        _entry("u-cancel", "user", "cancel prompt", "a0"),
+        _entry("a-cancel", "assistant", "canonical partial", "u-cancel"),
+        # A later successful turn remains after the interrupted display layer.
+        _entry("u-after", "user", "after prompt", "a-cancel"),
+        _entry("a-after", "assistant", "after answer", "u-after"),
+    ]
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    turn_id = "00000000-0000-4000-8000-000000000099"
+    path = chat_mod._cancelled_turn_snapshot_path(sid, turn_id)
+    assert path is not None
+    chat_mod.atomic_write_text(path, json.dumps({
+        "schema": chat_mod._CANCELLED_TURN_SNAPSHOT_SCHEMA,
+        "sid": sid,
+        "turn_id": turn_id,
+        "started_at_ms": 1_700_000_000_000,
+        "interrupted_at_ms": 1_700_000_001_000,
+        "anchors": {
+            "normal": {"uuid": "a0", "total": 2},
+            "full": {"uuid": "a0", "total": 2},
+        },
+        "hidden_uuids": ["u-cancel", "a-cancel"],
+        "messages": [
+            {
+                "role": "user", "text": "cancel prompt",
+                "_key": f"cancelled:{turn_id}:0", "_interrupted": True,
+            },
+            {
+                "role": "assistant", "text": "live partial survives",
+                "_key": f"cancelled:{turn_id}:1", "_interrupted": True,
+            },
+        ],
+    }, ensure_ascii=False))
+
+    response = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 20})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [(item["role"], item.get("text")) for item in body["messages"]] == [
+        ("user", "before"),
+        ("assistant", "before answer"),
+        ("user", "cancel prompt"),
+        ("assistant", "live partial survives"),
+        ("user", "after prompt"),
+        ("assistant", "after answer"),
+    ]
+    assert body["total"] == 6
+    assert body["message_count"] == 6
+    assert body["turn_count"] == 3
+    assert "canonical partial" not in response.text
+    assert "~cancelled-" in body["history_generation"]
+
+    page = client.get(
+        f"/api/chat/sessions/{sid}",
+        headers=auth,
+        params={
+            "offset": 1,
+            "limit": 4,
+            "history_generation": body["history_generation"],
+        },
+    )
+    assert page.status_code == 200, page.text
+    assert [(item["role"], item.get("text")) for item in page.json()["messages"]] == [
+        ("assistant", "before answer"),
+        ("user", "cancel prompt"),
+        ("assistant", "live partial survives"),
+        ("user", "after prompt"),
+    ]
+
+
 def test_endpoint_reports_pre_total_and_zeroes_it_in_full_order(
     client, auth, app_module, tmp_path,
 ):

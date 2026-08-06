@@ -5,6 +5,7 @@ with fake clients, so the route logic (4-tuple key handling, disconnect
 fan-out, response shape) runs for real without spawning a CLI.
 """
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -378,7 +379,7 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     """Stop must work before get_client() has produced a cached client."""
     from backend import activity as activity_module
 
-    sid = "sid-cold-start"
+    sid = "00000000-0000-4000-8000-000000000042"
     startup_entered = asyncio.Event()
     activity_transitions = []
 
@@ -397,6 +398,7 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
         lambda _sid: {"model": "glm-5.2-internal", "effort": ""},
     )
     monkeypatch.setattr(chat_mod.sess, "update_permission", lambda *_a: True)
+    monkeypatch.setattr(chat_mod.sess, "bump_session", lambda *_a, **_kw: True)
     monkeypatch.setattr(
         activity_module.activity,
         "start",
@@ -424,6 +426,10 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     assert broadcast.cancelled is True
     assert broadcast.done is True
     assert [event["event"] for event in broadcast.replay_events()] == ["cancelled"]
+    cancelled_payload = json.loads(next(broadcast.replay_events())["data"])
+    assert cancelled_payload["snapshot_ready"] is True
+    snapshots, _ = chat_mod._load_cancelled_turn_snapshots(sid)
+    assert [message["text"] for message in snapshots[0]["messages"]] == ["stop me"]
     assert sid not in chat_mod._active_turns
     assert sid not in chat_mod._clients
     assert activity_transitions == [
@@ -433,6 +439,7 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     recent = chat_mod._recent_turns.pop(sid, None)
     if recent is not None:
         recent.close()
+    chat_mod._delete_cancelled_turn_snapshots(sid)
 
 
 def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
@@ -526,6 +533,90 @@ async def test_force_stop_noop_when_turn_drained_naturally(chat_mod):
     # _active_turns no longer holds it (the pump's finally popped it).
     await chat_mod._force_stop_after_grace(sid, bc, grace=0.01)
     assert c.disconnected is False
+
+
+def test_cancelled_turn_snapshot_survives_reload_export_and_delete(
+    chat_mod, client, auth,
+):
+    """A force-stopped turn is display history even when no CLI JSONL exists."""
+    created = client.post(
+        "/api/chat/sessions",
+        headers=auth,
+        json={"name": "cancel snapshot", "model": "claude-sonnet-4-6"},
+    )
+    assert created.status_code == 200, created.text
+    sid = created.json()["id"]
+    bc = chat_mod.TurnBroadcast(sid, model="claude-sonnet-4-6")
+    bc.user_text = "keep this interrupted prompt"
+    bc.cancelled = True
+    bc.publish({
+        "event": "text",
+        "data": '{"text":"partial assistant text"}',
+    })
+    bc.publish({
+        "event": "thinking",
+        "data": '{"text":"partial reasoning"}',
+    })
+    bc.publish({
+        "event": "tool_use",
+        "data": (
+            '{"name":"Read","id":"toolu_cancelled",'
+            '"summary":"notes.md","input":{"file_path":"notes.md"}}'
+        ),
+    })
+    bc.publish({
+        "event": "tool_result",
+        "data": (
+            '{"id":"toolu_cancelled","tool_name":"Read",'
+            '"preview":"line one","text":"line one\\nline two",'
+            '"truncated":false,"text_truncated":false,"is_error":false}'
+        ),
+    })
+
+    try:
+        assert chat_mod._persist_cancelled_turn_snapshot(bc) is True
+        path = chat_mod._cancelled_turn_snapshot_path(sid, bc.turn_id)
+        assert path is not None and path.exists()
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        assert path.stat().st_mode & 0o777 == 0o600
+
+        first = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+        assert first.status_code == 200, first.text
+        body = first.json()
+        messages = body["messages"]
+        assert [message["role"] for message in messages] == [
+            "user", "assistant", "thinking", "tool_use", "tool_result",
+        ]
+        assert messages[0]["text"] == "keep this interrupted prompt"
+        assert messages[1]["text"] == "partial assistant text"
+        assert messages[3]["id"] == "toolu_cancelled"
+        assert messages[4]["text"] == "line one\nline two"
+        assert all(message["_interrupted"] is True for message in messages)
+        assert len({message["_key"] for message in messages}) == len(messages)
+        assert "~cancelled-" in body["history_generation"]
+        assert body["message_count"] == len(messages)
+        assert body["turn_count"] == 1
+
+        # Disk, not _active_turns/_recent_turns, is the recovery source.
+        chat_mod._active_turns.pop(sid, None)
+        chat_mod._recent_turns.pop(sid, None)
+        second = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+        assert second.status_code == 200, second.text
+        assert second.json()["messages"] == messages
+
+        exported = client.get(
+            f"/api/chat/sessions/{sid}/export?token={TEST_TOKEN}")
+        assert exported.status_code == 200, exported.text
+        assert "keep this interrupted prompt" in exported.text
+        assert "partial assistant text" in exported.text
+
+        deleted = client.delete(f"/api/chat/sessions/{sid}", headers=auth)
+        assert deleted.status_code == 200, deleted.text
+        assert not path.exists()
+    finally:
+        bc.close()
 
 
 # ====== probe_provider ======

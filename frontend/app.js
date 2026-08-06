@@ -1164,6 +1164,11 @@ function portal() {
           && focused && focused.closest && focused.closest(".terminal-host")) {
         return;
       }
+      // Composition candidate navigation/confirmation belongs wholly to the
+      // IME. Some WebViews report the commit Enter as an ordinary keydown
+      // immediately after compositionend; the per-element lifecycle guard
+      // below keeps global shortcuts from treating it as a real command.
+      if (this._isImeComposingEvent(ev)) return;
       // ---- Command palette ----
       // Cmd/Ctrl+K from anywhere opens it. While open, palette owns
       // ↑/↓/Enter; everything else falls through to the input.
@@ -1651,7 +1656,8 @@ function portal() {
     // shrinks the layout with no keyboard present → a big blank band appears
     // at the bottom of the chat. Zeroing the inset here keeps the two CSS
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
-    onChatInputBlur() {
+    onChatInputBlur(ev) {
+      this._resetImeCompositionState(ev);
       document.body.classList.remove("kb-open");
       document.documentElement.style.setProperty("--kb-inset", "0px");
       this._scheduleMobileRootReset();
@@ -5068,9 +5074,40 @@ function portal() {
     // candidate; it must not also submit the surrounding prompt or rename.
     // `isComposing` is the standard signal, while keyCode/which 229 and
     // key="Process" cover older Safari/WebView and Windows IME variants.
+    //
+    // Chromium WebViews and Safari can emit compositionend just BEFORE the
+    // very same candidate-confirming Enter, with isComposing=false and
+    // keyCode=13. Track the textarea lifecycle directly and treat an Enter in
+    // that short event window as part of the commit. DOM-local fields avoid
+    // reactive writes while the native IME buffer is live.
+    onImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      target._museImeComposing = true;
+      target._museImeEndedAt = 0;
+    },
+    onImeCompositionEnd(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      target._museImeComposing = false;
+      target._museImeEndedAt = Number(ev.timeStamp) || 0;
+    },
+    _resetImeCompositionState(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      target._museImeComposing = false;
+      target._museImeEndedAt = 0;
+    },
     _isImeComposingEvent(ev) {
-      return !!(ev && (ev.isComposing || ev.keyCode === 229 || ev.which === 229
-        || ev.key === "Process"));
+      if (!ev) return false;
+      const target = ev.target || ev.currentTarget;
+      const endedAt = Number(target && target._museImeEndedAt) || 0;
+      const eventAt = Number(ev.timeStamp) || 0;
+      const commitEnter = ev.key === "Enter" && endedAt > 0
+        && eventAt >= endedAt && eventAt - endedAt <= 80;
+      return !!(ev.isComposing || ev.keyCode === 229 || ev.which === 229
+        || ev.key === "Process" || (target && target._museImeComposing)
+        || commitEnter);
     },
     _claimNonImeEnter(ev) {
       if (!ev || this._isImeComposingEvent(ev)) return false;
@@ -25583,10 +25620,33 @@ function portal() {
           }
         }, delay);
       });
-      es.addEventListener("cancelled", () => {
+      es.addEventListener("cancelled", ev => {
         flushRender();
+        let d = {};
+        try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
         es.close(); _markDone(true, false, true); _stopTimer();
+        // A force-stopped CLI may never commit this turn to canonical JSONL.
+        // The backend writes the already-rendered SSE record to a private,
+        // display-only snapshot BEFORE emitting snapshot_ready. Reconcile that
+        // snapshot quietly now so a list poll / tab switch / page reload sees
+        // the same content and Alpine can retain matching live objects + keys.
+        // If persistence failed, keep the live pane and clear its old revision
+        // baseline so stop()'s delayed list refresh cannot replace it with an
+        // older transcript immediately after the user clicks Stop.
+        streamState._seenUpdated = undefined;
+        if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+        if (d && d.snapshot_ready) {
+          this.loadSession(streamSid, {
+            quiet: true,
+            probeActive: false,
+          }).then(loaded => {
+            if (loaded && this.tabState[streamSid] === streamState) {
+              streamState._loaded = true;
+              streamState._pendingExternalUpdate = false;
+            }
+          });
+        }
         // User explicitly stopped — pause the queue too. Auto-draining
         // here would be surprising (they cancelled for a reason, almost
         // never "just this one but please send the rest"). The paused
