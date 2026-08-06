@@ -32,6 +32,15 @@ def _login(page: Page, base: str, token: str) -> None:
 
 
 def _select_rendered_preview_text(page: Page) -> str:
+    # Alpine can publish ``previewMode`` one render tick before the Markdown
+    # body is mounted.  Wait for the actual selectable surface so callers do
+    # not race an otherwise healthy preview on slower CI runners.
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll(
+          '.pane.preview .markdown, .pane.preview pre.text, '
+          + '.pane.preview .xlsx-preview'
+        )).some(el => el.getClientRects().length && el.textContent.trim())"""
+    )
     return page.evaluate(
         """() => {
           const roots = Array.from(document.querySelectorAll(
