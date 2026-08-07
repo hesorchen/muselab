@@ -644,6 +644,10 @@ def test_reload_footer_recovers_hidden_continuation_start_and_four_fields(
                timestamp="2026-08-07T10:37:29Z"),
     ]
     sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    # Session creation intentionally leaves an unreachable requested model
+    # unlocked on credential-free installations.  This footer scenario needs
+    # a deterministic session model regardless of developer login / CI auth.
+    chat_mod.sess.update_model(sid, "claude-sonnet-4-6")
 
     response = client.get(
         f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})

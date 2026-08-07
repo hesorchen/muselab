@@ -3883,6 +3883,12 @@ function portal() {
       // stamp turn_status.  A canonical historical footer already has ts, so
       // never relabel such a prior turn just because a newer stream is active.
       if (pane && pane.streaming && m && !m.ts) return "running";
+      // Compatibility for cached/front-end-injected records created before
+      // turn_status became part of the footer contract.  Their terminal `ts`
+      // is already durable proof that the turn closed; keep the footer and
+      // point-fork action available until the next canonical reload enriches
+      // the record with an explicit status.
+      if (m && m.ts) return "completed";
       return "";
     },
     turnStatusLabel(status) {

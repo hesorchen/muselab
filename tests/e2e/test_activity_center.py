@@ -88,6 +88,10 @@ def test_cached_activity_refresh_does_not_shift_rows_or_modal(
     expect(page.locator(".activity-refreshing")).to_be_visible()
     row = page.locator(".activity-row").filter(has_text="Stable activity row")
     expect(row).to_be_visible()
+    # Measure only the loading/refresh transition.  The modal has its own
+    # short open scale transition; CI can reach this assertion while that
+    # unrelated animation is still changing geometry by ~1-2px.
+    page.wait_for_timeout(250)
 
     before = page.evaluate(
         """async () => {

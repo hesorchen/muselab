@@ -2290,9 +2290,8 @@ async def _build_and_connect_client(
     user_prompt_hooks = (
         [] if side_question_runtime else [mem0.build_recall_hook(session_id)]
     )
-    if (not side_question_runtime and effort == "ultra"
-            and _is_codex_gateway_model(model)
-            and not skills_off):
+    if (effort == "ultra" and _is_codex_gateway_model(model)
+            and not side_question_runtime and not skills_off):
         user_prompt_hooks.append(_build_ultra_skill_hook())
     opts_kwargs = dict(
         cwd=str(workspace_root),
