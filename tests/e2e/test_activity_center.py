@@ -49,6 +49,89 @@ def test_memory_shortcut_opens_memory_settings_page(
     expect(page.locator(".memory-settings-section")).to_be_visible()
 
 
+def test_cached_activity_refresh_does_not_shift_rows_or_modal(
+    page: Page, backend_url, auth_token,
+):
+    """The loading indicator must be out of flow when cached rows exist."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.events = [{
+            id: 'stable-refresh-row', kind: 'turn',
+            session_id: 'stable-refresh-session',
+            session_name: 'Stable activity row',
+            task_summary: 'Must not jump when loading disappears',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'running', read: true,
+            started_at: 100, finished_at: 0, updated_at: 100,
+          }];
+          app.activity.summary = {
+            running: 1, unread: 0, attention: 0,
+            groups: {review: 0, running: 1, failed: 0, history: 0},
+            group_unread: {review: 0, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          app.fetchActivity = () => new Promise(resolve => {
+            window.__finishStableActivityRefresh = resolve;
+          });
+          void app.openActivityCenter();
+        }"""
+    )
+    expect(page.locator(".activity-modal")).to_be_visible()
+    expect(page.locator(".activity-refreshing")).to_be_visible()
+    row = page.locator(".activity-row").filter(has_text="Stable activity row")
+    expect(row).to_be_visible()
+    # Measure only the loading/refresh transition.  The modal has its own
+    # short open scale transition; CI can reach this assertion while that
+    # unrelated animation is still changing geometry by ~1-2px.
+    page.wait_for_timeout(250)
+
+    before = page.evaluate(
+        """async () => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const row = Array.from(document.querySelectorAll('.activity-row'))
+            .find(node => node.textContent.includes('Stable activity row'));
+          return {
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyHeight: body.getBoundingClientRect().height,
+            rowTop: row.getBoundingClientRect().top,
+          };
+        }"""
+    )
+    page.evaluate("() => window.__finishStableActivityRefresh(true)")
+    page.wait_for_function(
+        "() => !document.querySelector('#app')._x_dataStack[0].activity.loading"
+    )
+    after = page.evaluate(
+        """async () => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const row = Array.from(document.querySelectorAll('.activity-row'))
+            .find(node => node.textContent.includes('Stable activity row'));
+          return {
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyHeight: body.getBoundingClientRect().height,
+            rowTop: row.getBoundingClientRect().top,
+          };
+        }"""
+    )
+
+    for key in ("modalHeight", "bodyHeight", "rowTop"):
+        assert abs(after[key] - before[key]) < 1, (before, after)
+
+
 def test_session_rename_updates_loaded_activity_row_immediately(
     page: Page, backend_url, auth_token
 ):

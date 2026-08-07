@@ -162,6 +162,37 @@ def test_non_bypass_runtime_installs_permission_resolver(
     assert callable(captured["can_use_tool"])
 
 
+def test_side_question_runtime_exposes_only_public_web_tools(
+    app_module, monkeypatch, tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints, sessions as sess
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.delenv("MUSELAB_DISABLE_SKILLS", raising=False)
+    monkeypatch.setattr(endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    side = sess.create_session(
+        "side question",
+        model="deepseek-v4-pro",
+        permission="default",
+        activity_hidden=True,
+        runtime_profile="side_question",
+    )
+    captured = _capture_build_options(chat_mod, monkeypatch)
+
+    asyncio.run(chat_mod._build_and_connect_client(
+        side["id"], "deepseek-v4-pro", "default", ""))
+
+    assert captured["tools"] == ["WebSearch", "WebFetch"]
+    assert captured["allowed_tools"] == ["WebSearch", "WebFetch"]
+    assert captured["setting_sources"] == []
+    assert captured["plugins"] == []
+    assert captured["mcp_servers"] == {}
+    assert "skills" not in captured
+    assert "can_use_tool" not in captured
+    assert "UserPromptSubmit" not in captured["hooks"]
+
+
 def test_plan_runtime_can_return_to_bypass_and_installs_exit_hooks(
     app_module, monkeypatch, tmp_path,
 ):

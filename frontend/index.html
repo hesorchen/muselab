@@ -991,7 +991,7 @@
              x-show="previewSurface==='file' && (previewDragHover || osFileDragging)"
              x-transition.opacity
              @dragover.prevent
-             @drop.prevent="onPreviewDrop($event); previewDragHover = false; osFileDragging = false; _dragCounter = 0">
+             @drop.prevent="onPreviewDrop($event)">
           <div class="preview-drop-inner">
             <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
@@ -2806,24 +2806,38 @@
                    the bottom, and keeping both would pulse two sets of dots
                    ~20px apart. -->
               <div class="turn-footer"
-                   x-show="m.role !== 'user'
+                   x-show="(m.role !== 'user' || m.turn_status || m._interrupted || m._failed)
                      && (i === paneMsgs.length - 1 || (paneMsgs[i + 1] && paneMsgs[i + 1].role === 'user'))
+                     && turnFooterStatus(m, pane)
                      && (
-                       m.ts
-                       || m.elapsed
+                       turnFooterTime(m, pane)
+                       || turnFooterElapsed(m, pane) !== null
+                       || turnFooterModel(m, pane, tid)
+                       || turnFooterStatus(m, pane)
+                       || m._interrupted
                        || (turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming))
                      )">
-                <span x-show="m.ts"
-                      class="msg-ts" :title="m.model || ''"
-                      x-text="fmtTurnTime(m.ts)"></span>
+                <span class="turn-status"
+                      x-show="turnFooterStatus(m, pane)"
+                      :class="turnFooterStatus(m, pane)"
+                      x-text="turnStatusLabel(turnFooterStatus(m, pane))"></span>
+                <!-- Old transcripts may predate completion annotations.  Their
+                     last record still carries mts, which is a close and stable
+                     fallback instead of rendering a separator with no time. -->
+                <span x-show="turnFooterTime(m, pane)"
+                      class="msg-ts"
+                      x-text="fmtTurnTime(turnFooterTime(m, pane))"></span>
                 <!-- Total elapsed kept after done so the user can
                      reference back how long the turn took (esp. useful
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts"
+                <span x-show="turnFooterElapsed(m, pane) !== null && turnFooterTime(m, pane)"
                       class="msg-elapsed"
-                      x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
+                      x-text="'· ' + fmtStreamElapsed(turnFooterElapsed(m, pane))"></span>
+                <span x-show="turnFooterModel(m, pane, tid)" class="turn-model"
+                      :title="turnFooterModel(m, pane, tid)"
+                      x-text="'· ' + modelLabel(turnFooterModel(m, pane, tid))"></span>
                 <details class="memory-recall-trace"
                          x-show="m.memoryRecall && m.memoryRecall.count">
                   <summary x-text="lang==='zh'
@@ -2986,11 +3000,13 @@
                     <span style="flex:1"></span>
                     <button class="queued-act icon-btn sm"
                             @click="editPendingQueueItem(currentId, qi)"
+                            :disabled="queueActionBusy(currentId, 'edit:' + q.id)"
                             :title="lang==='zh' ? '编辑' : 'Edit'">
                       <svg><use href="#i-edit"/></svg>
                     </button>
                     <button class="queued-act icon-btn sm"
                             @click="removePendingQueueItem(currentId, qi)"
+                            :disabled="queueActionBusy(currentId, 'remove:' + q.id)"
                             :title="lang==='zh' ? '移除' : 'Remove'">
                       <svg><use href="#i-x"/></svg>
                     </button>
@@ -3073,9 +3089,11 @@
                           + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
             <button class="queue-paused-btn primary"
                     @click="resumeQueueDrain(currentId)"
+                    :disabled="queueActionBusy(currentId, 'resume')"
                     x-text="lang==='zh' ? '继续执行' : 'Resume'"></button>
             <button class="queue-paused-btn"
                     @click="discardQueue(currentId)"
+                    :disabled="queueActionBusy(currentId, 'discard')"
                     x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
           </div>
 
@@ -3361,10 +3379,12 @@
                     @keydown.meta.x="onCutLine($event)"
                     @keydown.up="onChatArrowUp($event)"
                     @keydown.down="onChatArrowDown($event)"
+                    @compositionstart="onImeCompositionStart($event)"
+                    @compositionend="onImeCompositionEnd($event)"
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
                     @focus="onChatInputFocus($event)"
-                    @blur="onChatInputBlur()"
+                    @blur="onChatInputBlur($event)"
                     @click="onChatInputClick($event)"
                     :placeholder="t('chat.placeholder')"></textarea>
           </form>
@@ -3549,10 +3569,14 @@
                  shows while streaming. Same shape + size + fill — they
                  read as a sibling pair (blue send / red stop). -->
             <button @click="send()"
-                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingQuotes.length && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._stopping || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingQuotes.length && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
-                    :aria-label="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')"
-                    :title="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')">
+                    :aria-label="tabState[currentId]?._stopping
+                      ? (lang==='zh' ? '正在中断' : 'Stopping')
+                      : (_isBusy(currentId) ? t('queue.button_hint') : t('btn.send'))"
+                    :title="tabState[currentId]?._stopping
+                      ? (lang==='zh' ? '等待上一条任务完成中断' : 'Waiting for the previous turn to stop')
+                      : (_isBusy(currentId) ? t('queue.button_hint') : t('btn.send'))">
               <span class="icon"><svg><use href="#i-send"/></svg></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
@@ -3693,20 +3717,50 @@
                     @click="dismissPreviewQuote(true)"
                     :title="lang === 'zh' ? '关闭' : 'Close'">×</button>
           </div>
-          <div class="preview-selection-question" x-text="previewQuote.question"></div>
-          <div class="preview-selection-answer-loading"
-               x-show="previewSelectionAskRunning() && !previewSelectionAskText()">
-            <span class="spinner-sm"></span>
-            <span x-text="lang === 'zh' ? '正在回答…' : 'Answering…'"></span>
+          <div class="preview-selection-conversation"
+               @scroll.passive="onPreviewSelectionAskScroll($event)"
+               x-effect="previewSelectionAskText(); $nextTick(() => scrollPreviewSelectionAskConversation())">
+            <template x-for="(message, index) in previewSelectionAskConversation()"
+                      :key="message._key || message.id || message.uuid || index">
+              <div class="preview-selection-turn"
+                   :class="message.role === 'user' ? 'is-user' : 'is-assistant'">
+                <template x-if="message.role === 'user'">
+                  <div class="preview-selection-question"
+                       x-text="previewSelectionAskUserText(message)"></div>
+                </template>
+                <template x-if="message.role === 'assistant'">
+                  <div class="preview-selection-answer-body markdown"
+                       x-html="previewSelectionAskMessageHtml(message)"></div>
+                </template>
+              </div>
+            </template>
+            <div class="preview-selection-answer-loading"
+                 x-show="previewSelectionAskRunning()">
+              <span class="spinner-sm"></span>
+              <span x-text="previewSelectionAskSearching()
+                ? (lang === 'zh' ? '正在检索网页…' : 'Searching the web…')
+                : (lang === 'zh' ? '正在回答…' : 'Answering…')"></span>
+            </div>
           </div>
-          <div class="preview-selection-answer-body markdown"
-               x-show="previewSelectionAskText()"
-               x-html="previewSelectionAskHtml()"></div>
           <div class="preview-selection-error"
                x-show="previewQuote.askError || previewSelectionAskFailed()"
                x-text="previewQuote.askError || (lang === 'zh' ? '侧问没有完成，可打开会话重试' : 'The side question did not finish; open the chat to retry')"></div>
+          <form class="preview-selection-followup"
+                @submit.prevent="sendPreviewSelectionFollowup()">
+            <textarea x-model="previewQuote.followup"
+                      rows="2"
+                      autocomplete="off"
+                      :placeholder="lang === 'zh' ? '继续追问…' : 'Ask a follow-up…'"
+                      @keydown.enter="onPreviewQuoteFollowupEnter($event)"
+                      @keydown.escape.stop.prevent="dismissPreviewQuote(true)"></textarea>
+            <button type="submit" class="preview-selection-followup-send"
+                    :disabled="!previewQuote.followup.trim() || previewSelectionAskRunning() || workspaceSwitching"
+                    :title="lang === 'zh' ? '发送追问' : 'Send follow-up'">
+              <svg aria-hidden="true"><use href="#i-send"/></svg>
+            </button>
+          </form>
           <div class="preview-selection-ask-foot">
-            <span x-text="lang === 'zh' ? '不写入当前会话' : 'Kept out of the current chat'"></span>
+            <span x-text="lang === 'zh' ? '独立多轮 · 可网页搜索' : 'Independent thread · Web search enabled'"></span>
             <button type="button" class="preview-selection-open"
                     @click="openPreviewSelectionAskSession()"
                     :title="lang === 'zh' ? '打开完整分支会话' : 'Open the full branch chat'">
@@ -3717,6 +3771,27 @@
         </div>
       </div>
     </template>
+  </div>
+
+  <!-- One predictable OS-file drop surface for the whole application.
+       Pointer events stay on the content underneath so a directory row can
+       be the only explicit nested destination; every other location routes
+       to the current workspace root. -->
+  <div class="global-file-drop-overlay"
+       x-show="authed && osFileDragging"
+       x-transition.opacity
+       x-cloak
+       :class="{ 'into-directory': osFileDropOnDirectory }"
+       role="status" aria-live="polite">
+    <div class="global-file-drop-card">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+      </svg>
+      <strong x-text="osFileDropOnDirectory
+        ? (lang === 'zh' ? '上传到 /' + osFileDropDir : 'Upload to /' + osFileDropDir)
+        : (lang === 'zh' ? '上传到工作区根目录' : 'Upload to workspace root')"></strong>
+      <span x-text="lang === 'zh' ? '松开鼠标以上传' : 'Release to upload'"></span>
+    </div>
   </div>
 
   <!-- ============ Message outline modal ============
@@ -5666,6 +5741,13 @@
                   :class="{ active: activity.view === 'timeline' }"
                   x-text="lang==='zh' ? '时间倒序' : 'By time'"></button>
         </div>
+        <!-- Fixed-size slot: refresh visibility changes without moving the
+             view switch or close button. -->
+        <span class="activity-refreshing" :class="{ active: activity.loading }"
+              :title="lang==='zh' ? '正在刷新' : 'Refreshing'"
+              :aria-hidden="!activity.loading">
+          <span class="spinner-sm"></span>
+        </span>
         <button class="modal-close" @click="activity.show=false" aria-label="Close">×</button>
       </div>
       <!-- One chip per attention group, in the same order as the sections below:
@@ -5695,8 +5777,15 @@
                 x-text="lang==='zh' ? '清除筛选' : 'Clear filter'"></button>
         <button class="btn-ghost sm" x-show="activity.summary.unread" @click="ackAllActivity()" x-text="lang==='zh' ? '全部标为已读' : 'Mark all read'"></button>
       </div>
-      <div class="modal-body activity-body">
-        <div class="hint-row" x-show="activity.loading" x-text="lang==='zh' ? '加载中…' : 'Loading…'"></div>
+      <div class="modal-body activity-body" :aria-busy="activity.loading">
+        <!-- Loading is an overlay, not a list row.  A normal-flow hint used to
+             disappear above the mounted rows when fetchActivity settled,
+             shifting the entire ledger (and modal height) in one frame. -->
+        <div class="activity-loading-overlay" x-show="activity.loading && !activity.events.length"
+             role="status" aria-live="polite">
+          <span class="spinner-sm"></span>
+          <span x-text="lang==='zh' ? '正在加载任务…' : 'Loading tasks…'"></span>
+        </div>
         <template x-for="group in activityVisibleGroups()" :key="group.key">
           <section class="activity-group" x-show="activityEvents(group).length"
                    :class="{ 'is-timeline': group.key === 'timeline' }">

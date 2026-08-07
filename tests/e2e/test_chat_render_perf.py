@@ -261,6 +261,184 @@ def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
     )
 
 
+def test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends(
+    page: Page, backend_url, auth_token,
+):
+    """WebView compositionend→plain Enter must commit, not submit, Chinese."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "ime-composition-chat"
+    _bootstrap_session_for_real_load(page, sid, "IME composition")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.draft.input = "";
+        app._activateTabState(arg);
+        window.__imeSendCalls = 0;
+        app.send = () => { window.__imeSendCalls += 1; return true; };
+        return true;
+        """,
+        sid,
+    )
+    textarea = page.locator(".chat-input-textarea")
+    expect(textarea).to_be_visible(timeout=5000)
+    textarea.focus()
+
+    result = page.evaluate(
+        """async () => {
+          const textarea = document.querySelector(".chat-input-textarea");
+          textarea.dispatchEvent(new CompositionEvent("compositionstart", {
+            bubbles: true, data: "ni",
+          }));
+          textarea.value = "你";
+          textarea.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            inputType: "insertCompositionText",
+            data: "你",
+            isComposing: true,
+          }));
+          textarea.dispatchEvent(new CompositionEvent("compositionend", {
+            bubbles: true, data: "你",
+          }));
+          // Chromium WebView/Safari ordering: the final model input lands,
+          // then the candidate-confirming Enter is reported as a plain key.
+          textarea.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            inputType: "insertText",
+            data: "你",
+            isComposing: false,
+          }));
+          const commitEnter = new KeyboardEvent("keydown", {
+            key: "Enter", code: "Enter", bubbles: true, cancelable: true,
+          });
+          textarea.dispatchEvent(commitEnter);
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const committed = {
+            sendCalls: window.__imeSendCalls,
+            input: app.input,
+            value: textarea.value,
+            prevented: commitEnter.defaultPrevented,
+          };
+
+          await new Promise(resolve => setTimeout(resolve, 100));
+          const sendEnter = new KeyboardEvent("keydown", {
+            key: "Enter", code: "Enter", bubbles: true, cancelable: true,
+          });
+          textarea.dispatchEvent(sendEnter);
+          return {
+            committed,
+            sendCalls: window.__imeSendCalls,
+            sendPrevented: sendEnter.defaultPrevented,
+            composing: !!textarea._museImeComposing,
+          };
+        }"""
+    )
+
+    assert result["committed"] == {
+        "sendCalls": 0,
+        "input": "你",
+        "value": "你",
+        "prevented": False,
+    }
+    assert result["sendCalls"] == 1
+    assert result["sendPrevented"] is True
+    assert result["composing"] is False
+    _assert_no_browser_errors(page, errors)
+
+
+def test_native_ime_buffer_survives_reactive_composer_reconciliation(
+    page: Page, backend_url, auth_token,
+):
+    """Alpine model writes must not replace Chromium's native marked text."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "ime-native-reconciliation"
+    _bootstrap_session_for_real_load(page, sid, "Native IME reconciliation")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.draft.input = "";
+        app._activateTabState(arg);
+        return true;
+        """,
+        sid,
+    )
+    textarea = page.locator(".chat-input-textarea")
+    expect(textarea).to_be_visible(timeout=5000)
+    textarea.click()
+    page.wait_for_function(
+        "() => document.activeElement === document.querySelector('.chat-input-textarea')"
+    )
+
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Input.imeSetComposition", {
+        "text": "ni",
+        "selectionStart": 2,
+        "selectionEnd": 2,
+        "replacementStart": 0,
+        "replacementEnd": 0,
+    })
+    composing = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          composing: !!ta._museImeComposing,
+          guarded: typeof ta._museImeOriginalForceModelUpdate === 'function' };
+        """,
+    )
+    assert composing == {
+        "value": "ni", "input": "ni", "composing": True, "guarded": True,
+    }
+
+    # This is the rare real-world race: a tab/draft reconciliation writes the
+    # root x-model while native marked text is still active. Before the guard,
+    # Alpine immediately assigned textarea.value and Chromium emitted no
+    # compositionend, leaving the OS IME attached to stale editor state.
+    protected = _app_eval(
+        page,
+        """
+        app.input = 'reconciled draft';
+        return new Promise(resolve => queueMicrotask(() => {
+          const ta = document.querySelector('.chat-input-textarea');
+          resolve({ value: ta.value, input: app.input,
+            composing: !!ta._museImeComposing });
+        }));
+        """,
+    )
+    assert protected == {
+        "value": "ni", "input": "reconciled draft", "composing": True,
+    }
+
+    cdp.send("Input.imeSetComposition", {
+        "text": "你",
+        "selectionStart": 1,
+        "selectionEnd": 1,
+        "replacementStart": 0,
+        "replacementEnd": 2,
+    })
+    cdp.send("Input.insertText", {"text": "你"})
+    committed = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          composing: !!ta._museImeComposing,
+          guarded: !!ta._museImeOriginalForceModelUpdate };
+        """,
+    )
+    assert committed == {
+        "value": "你", "input": "你", "composing": False, "guarded": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
 def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
     page: Page, backend_url, auth_token,
 ):
@@ -2049,6 +2227,244 @@ def test_desktop_done_reconcile_preserves_live_message_dom_identity(
     _assert_no_browser_errors(page, errors)
 
 
+def test_desktop_cancelled_snapshot_reconcile_never_blanks_or_replaces_live_nodes(
+    page: Page, backend_url, auth_token,
+):
+    """A forced interrupt quietly adopts its durable display snapshot."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _install_fake_event_source(page)
+    sid = "perf-cancelled-snapshot-identity"
+    prompt = "CANCELLED_SNAPSHOT_USER_PROMPT"
+    first_text = "CANCELLED_SNAPSHOT_FIRST_REPLY " + ("kept before tool " * 20)
+    thinking = "CANCELLED_SNAPSHOT_THINKING"
+    tool_result = "CANCELLED_SNAPSHOT_TOOL_RESULT\nsecond line"
+    final_text = "CANCELLED_SNAPSHOT_FINAL_SEGMENT " + ("still visible " * 20)
+    cancelled_at_ms = int(time.time() * 1000)
+    snapshot_messages: list[dict] = []
+    requests = _route_windowed_session(page, sid, snapshot_messages)
+    page.route(
+        "**/api/chat/stream/start",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ticket":"cancelled-snapshot-ticket"}',
+        ),
+    )
+    _login(page, backend_url, auth_token)
+    _app_eval(
+        page,
+        """
+        const sid = arg.sid;
+        app.refreshSessions = async () => {};
+        app._fetchTabUsage = async () => {};
+        app._checkActiveTurn = () => {};
+        app._scheduleIdlePreload = () => {};
+        app._ensureSessionRegistered = async () => true;
+        app._confirmSessionBusy = async () => false;
+        app.appReady = true;
+        app.availableModels = [{
+          model: "e2e-model", label: "E2E model", group: "e2e",
+          supports_thinking: true,
+        }];
+        app.model = "e2e-model";
+        app.defaultModel = "e2e-model";
+        app.sessions = [{
+          id: sid, name: "Cancelled snapshot", updated_at: 1,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        }];
+        app.openTabIds = [sid];
+        app.tabState = {};
+        app.tabState[sid] = app._blankTabState();
+        const st = app._ensureTabState(sid);
+        st._loaded = true;
+        st._seenUpdated = 1;
+        app.currentId = sid;
+        app._residentTabIds = [sid];
+        app._activateTabState(sid);
+        app.messagesReady = true;
+        app.messagesLoading = false;
+        app.mobileTab = "chat";
+        app.input = arg.prompt;
+        app.atBottom = true;
+        return true;
+        """,
+        {"sid": sid, "prompt": prompt},
+    )
+
+    _app_eval(page, "app.send(); return true;")
+    page.wait_for_function(
+        "() => window.__fakeChatStreams && window.__fakeChatStreams().length === 1"
+    )
+    page.evaluate(
+        """payload => {
+          window.__emitSse("text", {
+            text: payload.first, turn_id: "cancelled-snapshot-turn", event_seq: 1,
+          });
+          window.__emitSse("thinking", {
+            text: payload.thinking, turn_id: "cancelled-snapshot-turn", event_seq: 2,
+          });
+          window.__emitSse("tool_use", {
+            id: "toolu_cancelled_snapshot", name: "Read",
+            summary: "cancelled snapshot fixture",
+            input: {file_path: "fixture.txt"},
+            turn_id: "cancelled-snapshot-turn", event_seq: 3,
+          });
+          window.__emitSse("tool_result", {
+            id: "toolu_cancelled_snapshot", tool_name: "Read",
+            preview: payload.toolResult, text: payload.toolResult,
+            truncated: false, text_truncated: false, is_error: false,
+            turn_id: "cancelled-snapshot-turn", event_seq: 4,
+          });
+          window.__emitSse("text", {
+            text: payload.final, turn_id: "cancelled-snapshot-turn", event_seq: 5,
+          });
+        }""",
+        {
+            "first": first_text,
+            "thinking": thinking,
+            "toolResult": tool_result,
+            "final": final_text,
+        },
+    )
+    page.wait_for_function(
+        """expected => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const pane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(el => getComputedStyle(el).display !== "none");
+          return app.streaming && app.messages.length === 6
+            && pane?.textContent.includes(expected.first)
+            && pane?.textContent.includes(expected.final);
+        }""",
+        arg={"first": first_text, "final": final_text},
+        timeout=10000,
+    )
+    before = page.evaluate(
+        """() => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const pane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(el => getComputedStyle(el).display !== "none");
+          const nodes = Array.from(pane.querySelectorAll(".msg"));
+          window.__cancelledSnapshotNodes = nodes;
+          window.__cancelledSnapshotKeys = app.messages.map(m => m._k);
+          window.__cancelledSnapshotMinCount = nodes.length;
+          window.__cancelledSnapshotObserver = new MutationObserver(() => {
+            const visible = Array.from(document.querySelectorAll(".msg-pane"))
+              .find(el => getComputedStyle(el).display !== "none");
+            const count = visible ? visible.querySelectorAll(".msg").length : 0;
+            window.__cancelledSnapshotMinCount = Math.min(
+              window.__cancelledSnapshotMinCount, count);
+          });
+          window.__cancelledSnapshotObserver.observe(
+            document.querySelector("#app"), {childList: true, subtree: true});
+          return {count: nodes.length, keys: window.__cancelledSnapshotKeys};
+        }"""
+    )
+    assert before["count"] == 6
+    assert all(":live:" in key for key in before["keys"])
+
+    snapshot_messages.extend([
+        {
+            "role": "user", "text": prompt,
+            "_key": "cancelled:cancelled-snapshot-turn:0", "_interrupted": True,
+        },
+        {
+            "role": "assistant", "text": first_text, "model": "e2e-model",
+            "_key": "cancelled:cancelled-snapshot-turn:1", "_interrupted": True,
+        },
+        {
+            "role": "thinking", "text": thinking,
+            "_key": "cancelled:cancelled-snapshot-turn:2", "_interrupted": True,
+        },
+        {
+            "role": "tool_use", "id": "toolu_cancelled_snapshot", "name": "Read",
+            "summary": "cancelled snapshot fixture", "input": {"file_path": "fixture.txt"},
+            "_key": "cancelled:cancelled-snapshot-turn:3", "_interrupted": True,
+        },
+        {
+            "role": "tool_result", "id": "toolu_cancelled_snapshot", "tool_name": "Read",
+            "preview": tool_result, "text": tool_result, "is_error": False,
+            "_key": "cancelled:cancelled-snapshot-turn:4", "_interrupted": True,
+        },
+        {
+            "role": "assistant", "text": final_text, "model": "e2e-model",
+            "ts": cancelled_at_ms, "elapsed": 5.0,
+            "turn_status": "cancelled",
+            "_key": "cancelled:cancelled-snapshot-turn:5", "_interrupted": True,
+        },
+    ])
+    page.evaluate(
+        """() => window.__emitSse("cancelled", {
+          snapshot_ready: true,
+          turn_id: "cancelled-snapshot-turn",
+          event_seq: 6,
+        })"""
+    )
+    page.wait_for_function(
+        """expected => {
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const st = app._ensureTabState(expected.sid);
+          return !app.streaming && !st.streaming && st._loaded
+            && st.messages.length === expected.count
+            && st.messages.every(message => message._interrupted === true);
+        }""",
+        arg={"sid": sid, "count": len(snapshot_messages)},
+        timeout=10000,
+    )
+    result = page.evaluate(
+        """async ({ first, final }) => {
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          window.__cancelledSnapshotObserver.disconnect();
+          const app = document.querySelector("#app")._x_dataStack[0];
+          const pane = Array.from(document.querySelectorAll(".msg-pane"))
+            .find(el => getComputedStyle(el).display !== "none");
+          const nodes = Array.from(pane.querySelectorAll(".msg"));
+          const tail = app.messages[app.messages.length - 1];
+          const footer = nodes[nodes.length - 1]?.querySelector('.turn-footer');
+          return {
+            minCount: window.__cancelledSnapshotMinCount,
+            count: nodes.length,
+            sameNodes: nodes.every(
+              (node, index) => node === window.__cancelledSnapshotNodes[index]),
+            keys: app.messages.map(message => message._k),
+            ready: app.messagesReady,
+            loading: app.messagesLoading,
+            firstVisible: pane.textContent.includes(first),
+            finalVisible: pane.textContent.includes(final),
+            tailStatus: tail.turn_status,
+            tailModel: tail.model,
+            tailTs: tail.ts,
+            tailElapsed: tail.elapsed,
+            footerVisible: !!footer?.getClientRects().length,
+            footerText: footer?.textContent.replace(/\\s+/g, ' ').trim() || '',
+          };
+        }""",
+        {"first": first_text, "final": final_text},
+    )
+
+    assert requests, "cancelled reconciliation did not request the display snapshot"
+    assert result["minCount"] == before["count"], result
+    assert result["count"] == before["count"]
+    assert result["sameNodes"] is True, result
+    assert result["keys"] == before["keys"]
+    assert result["ready"] is True and result["loading"] is False
+    assert result["firstVisible"] is True and result["finalVisible"] is True
+    assert result["tailStatus"] == "cancelled"
+    assert result["tailModel"] == "e2e-model"
+    # The live terminal timestamp is deliberately preserved during a quiet
+    # same-DOM reconcile; a cold reload reads the durable value asserted by
+    # the backend snapshot test. Both must remain populated here.
+    assert result["tailTs"] > 0
+    assert result["tailElapsed"] >= 1
+    assert result["footerVisible"] is True
+    assert ("E2E model" in result["footerText"]
+            or "e2e-model" in result["footerText"])
+    assert ("已中断" in result["footerText"]
+            or "Interrupted" in result["footerText"])
+    _assert_no_browser_errors(page, errors)
+
+
 def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     page: Page, backend_url, auth_token,
 ):
@@ -2244,6 +2660,11 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
               completed_at_ms: arg.completedAtMs,
               duration_ms: arg.durationMs,
               total_cost_usd: 0.001,
+              model: 'e2e-model',
+              memory_recall: {
+                id: 'tool-tail-memory-trace', count: 1,
+                latency_ms: 8, status: 'ok', items: [],
+              },
               session_usage: {
                 context_used_pct: 5,
                 context_used: 500,
@@ -2272,6 +2693,9 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
             && tail?.role === 'tool_result'
             && tail.ts === arg.completedAtMs
             && tail.elapsed === arg.durationMs / 1000
+            && tail.model === 'e2e-model'
+            && tail.turn_status === 'completed'
+            && tail.memoryRecall?.id === 'tool-tail-memory-trace'
             && tail.forkUuid === arg.assistantUuid
             && tailNode?.classList.contains('tool_result')
             && footer?.getClientRects().length
@@ -2296,8 +2720,14 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     expected_time = _app_eval(
         page, "return app.fmtTurnTime(arg);", completed_at_ms
     )
+    expected_status = _app_eval(
+        page, "return app.lang === 'zh' ? '已完成' : 'Completed';"
+    )
     expect(footer.locator(".msg-ts")).to_have_text(expected_time)
     expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
+    expect(footer.locator(".turn-model")).to_have_text("· E2E model")
+    expect(footer.locator(".turn-status")).to_have_text(expected_status)
+    expect(footer.locator(".memory-recall-trace")).to_be_visible()
     expect(footer.locator(".turn-fork-btn")).to_be_visible()
 
     state = _app_eval(
@@ -2315,6 +2745,9 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
             app.messages, app.messages.length - 1),
           ts: tail.ts,
           elapsed: tail.elapsed,
+          model: tail.model,
+          turnStatus: tail.turn_status,
+          memoryRecallId: tail.memoryRecall?.id || '',
           liveKey: tail._k,
           streaming: app.streaming,
         };
@@ -2330,6 +2763,9 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
         "forkBoundary": assistant_uuid,
         "ts": completed_at_ms,
         "elapsed": duration_ms / 1000,
+        "model": "e2e-model",
+        "turnStatus": "completed",
+        "memoryRecallId": "tool-tail-memory-trace",
         "streaming": False,
     }
     assert ":live:" in live_key
@@ -2490,6 +2926,139 @@ def test_canonical_reload_stays_quiet_when_background_tab_becomes_current(
     assert all(frame["visibleCount"] > 0 for frame in result["frames"]), result
     assert result["finalVisible"] is True, result
     _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_turn_footer_keeps_complete_metadata_inside_chat(
+    page: Page, backend_url, auth_token,
+):
+    """Status/time/duration/model/fork all fit at the 320px floor."""
+    page.set_viewport_size({"width": 320, "height": 700})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          st.messages.splice(0, st.messages.length, ...app._historyEnvelopes(sid, [{
+            role: 'assistant', text: 'MOBILE_FOOTER_COMPLETE',
+            html: '<p>MOBILE_FOOTER_COMPLETE</p>',
+            uuid: 'mobile-footer-assistant',
+            forkUuid: 'mobile-footer-assistant',
+            ts: Date.now(), elapsed: 3725,
+            model: 'codex:a-very-long-model-name-for-footer',
+            turn_status: 'completed',
+          }]));
+          st._loaded = true;
+          st.messagesReady = true;
+          st.streaming = false;
+          app._activateTabState(sid);
+          app.messagesReady = true;
+          app.mobileTab = 'chat';
+        }"""
+    )
+    footer = page.locator(".msg-pane:visible .turn-footer")
+    expect(footer).to_be_visible()
+    expect(footer.locator(".turn-status")).to_be_visible()
+    expect(footer.locator(".msg-ts")).to_be_visible()
+    expect(footer.locator(".msg-elapsed")).to_be_visible()
+    expect(footer.locator(".turn-model")).to_be_visible()
+    expect(footer.locator(".turn-fork-btn")).to_be_visible()
+
+    geometry = footer.evaluate(
+        """node => {
+          const body = node.closest('.chat-body').getBoundingClientRect();
+          const rect = node.getBoundingClientRect();
+          const visible = Array.from(node.children)
+            .filter(child => child.getClientRects().length)
+            .map(child => {
+              const r = child.getBoundingClientRect();
+              return {left: r.left, right: r.right};
+            });
+          return {
+            bodyLeft: body.left, bodyRight: body.right,
+            left: rect.left, right: rect.right,
+            clientWidth: node.clientWidth, scrollWidth: node.scrollWidth,
+            visible,
+          };
+        }"""
+    )
+    assert geometry["left"] >= geometry["bodyLeft"] - 1, geometry
+    assert geometry["right"] <= geometry["bodyRight"] + 1, geometry
+    assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
+    assert all(
+        child["left"] >= geometry["bodyLeft"] - 1
+        and child["right"] <= geometry["bodyRight"] + 1
+        for child in geometry["visible"]
+    ), geometry
+
+
+def test_failed_queue_edit_never_duplicates_and_stopping_turn_rejects_send(
+    page: Page, backend_url, auth_token,
+):
+    """Exercise both queue failure guards through Alpine's live state."""
+    _login(page, backend_url, auth_token)
+    sid = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId"
+    )
+    mutations: list[str] = []
+
+    def fail_queue_mutation(route):
+        mutations.append(route.request.method)
+        route.fulfill(
+            status=503,
+            content_type="application/json",
+            body='{"detail":"temporary queue failure"}',
+        )
+
+    page.route(
+        f"**/api/chat/sessions/{sid}/queue/q-edit-failure",
+        fail_queue_mutation,
+    )
+    result = page.evaluate(
+        """async sid => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(sid);
+          app._syncQueueFromServer = async () => {};
+          st.pendingQueue = [{
+            id: 'q-edit-failure', text: 'SERVER ORIGINAL',
+            displayText: 'SERVER ORIGINAL', pendingQuotes: [],
+            images: [], docs: [],
+          }];
+          st.draft.input = '';
+          app._activateComposerState(sid);
+          await app.editPendingQueueItem(sid, 0);
+          const afterEdit = {
+            queueLength: st.pendingQueue.length,
+            queueText: st.pendingQueue[0]?.text || '',
+            draft: st.draft.input,
+            busy: Object.keys(st._queueMutating || {}),
+          };
+
+          st._stopping = true;
+          st.streaming = true;
+          st.draft.input = 'SEND DURING STOP';
+          app._activateComposerState(sid);
+          const sendResult = await app.send();
+          return {
+            afterEdit,
+            sendResult,
+            stoppingDraft: st.draft.input,
+            pendingAfterStop: st.pendingQueue.length,
+          };
+        }""",
+        sid,
+    )
+
+    assert mutations == ["DELETE"]
+    assert result["afterEdit"] == {
+        "queueLength": 1,
+        "queueText": "SERVER ORIGINAL",
+        "draft": "",
+        "busy": [],
+    }
+    assert result["sendResult"] is False
+    assert result["stoppingDraft"] == "SEND DURING STOP"
+    assert result["pendingAfterStop"] == 1
 
 
 def test_background_task_gap_leaves_composer_usable_without_empty_reconnect(

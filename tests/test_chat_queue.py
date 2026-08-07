@@ -130,13 +130,26 @@ def test_set_queue_paused_toggles(app_module):
     assert sess.set_queue_paused(sid, False)["paused"] is False
 
 
-def test_pause_empty_queue_persists_flag(app_module):
-    """Pausing an empty queue still records paused=True (the file is written
-    because paused is truthy even with no items)."""
+def test_pause_empty_queue_is_a_noop(app_module):
+    """A pause cannot outlive (or predate) the work it protects."""
     sess = _sess(app_module)
     sid = "s-pause-empty"
-    sess.set_queue_paused(sid, True)
-    assert sess.get_queue(sid)["paused"] is True
+    assert sess.set_queue_paused(sid, True)["paused"] is False
+    assert sess.get_queue(sid) == {"items": [], "paused": False}
+    assert not sess._queue_path(sid).exists()
+
+
+def test_legacy_empty_paused_queue_is_normalized_before_next_enqueue(app_module):
+    """Upgrade an already-stranded queue instead of only preventing new ones."""
+    sess = _sess(app_module)
+    sid = "s-legacy-empty-paused"
+    sess._queue_path(sid).write_text(
+        '{"items": [], "paused": true}', encoding="utf-8",
+    )
+
+    assert sess.get_queue(sid) == {"items": [], "paused": False}
+    sess.enqueue_message(sid, "fresh after upgrade")
+    assert sess.dequeue_message(sid)["text"] == "fresh after upgrade"
 
 
 def test_remove_queue_item(app_module):

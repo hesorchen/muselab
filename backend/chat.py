@@ -16,7 +16,7 @@ import urllib.parse
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, get_args
+from typing import Any, Iterable, Literal, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
 from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
@@ -796,6 +796,14 @@ class TurnBroadcast:
         # queue rather than charging into the next item — the user stopped on
         # purpose, almost never "just this one, send the rest."
         self.cancelled = False
+        # Exact persisted assistant boundary observed from AssistantMessage.
+        # Keep it on the broadcast as well as in event_gen's local accumulator:
+        # a forced interrupt can prevent ResultMessage from arriving, but the
+        # CLI may still flush that AssistantMessage to JSONL several seconds
+        # later.  The cancellation cleanup can then annotate the precise UUID
+        # instead of racing a "latest transcript row" scan.
+        self.last_assistant_uuid = ""
+        self.cancelled_at_ms = 0
         self.started_at = time.time()
         # Immutable identity for this exact assistant turn. Session id alone
         # cannot distinguish the classic ABA race where turn A finishes and
@@ -821,6 +829,17 @@ class TurnBroadcast:
         self.user_text: str = ""
         self.user_images: list[dict] = []
         self.user_docs: list[dict] = []
+        # Display-only recovery boundary for an explicitly interrupted turn.
+        # The Claude CLI may abort before it flushes this turn to JSONL, while
+        # the browser has already rendered text/thinking/tool cards.  Capture
+        # the transcript coordinate immediately before query() so a durable
+        # MuseLab snapshot can later be inserted at the same visual position
+        # without writing partial assistant output back into model context.
+        self.transcript_boundary: dict[str, Any] = {}
+        self.canonical_terminal_published = False
+        self.cancelled_snapshot_persisted = False
+        self.cancelled_snapshot_suppressed = False
+        self.cancelled_snapshot_lock = threading.Lock()
         # True for a HEADLESS CONTINUATION turn: the cross-turn task watcher
         # opens one of these (no user prompt) when an SDK background task
         # finishes after its originating turn ended. It carries the task's
@@ -851,6 +870,7 @@ class TurnBroadcast:
         # session, before cold client/MCP startup. Startup failure/cancellation
         # uses this bit to close only rows that were actually created.
         self.activity_started = False
+        self.activity_hidden = False
 
     def publish(self, event: dict) -> None:
         """Route one SSE event to the record channel, the live channel, or both.
@@ -2211,6 +2231,9 @@ async def _build_and_connect_client(
     for serialising concurrent misses on the same key via _creation_lock_for().
     """
     sess_data = sess.get_session(session_id) or {}
+    side_question_runtime = (
+        sess_data.get("runtime_profile") == "side_question"
+    )
     effort = _normalize_effort(effort)
     service_tier = (service_tier or "").strip()
     if effort not in _VALID_EFFORT:
@@ -2264,9 +2287,11 @@ async def _build_and_connect_client(
     skills_off = os.environ.get("MUSELAB_DISABLE_SKILLS", "").lower() in (
         "1", "true", "yes",
     )
-    user_prompt_hooks = [mem0.build_recall_hook(session_id)]
+    user_prompt_hooks = (
+        [] if side_question_runtime else [mem0.build_recall_hook(session_id)]
+    )
     if (effort == "ultra" and _is_codex_gateway_model(model)
-            and not skills_off):
+            and not side_question_runtime and not skills_off):
         user_prompt_hooks.append(_build_ultra_skill_hook())
     opts_kwargs = dict(
         cwd=str(workspace_root),
@@ -2351,6 +2376,19 @@ async def _build_and_connect_client(
             )],
         },
     )
+    if side_question_runtime:
+        # Side questions are deliberately narrower than ordinary workspace
+        # agents.  `tools` removes every built-in except public web lookup;
+        # the explicit allow rules make those two tools usable from the compact
+        # floating window without an approval card it cannot render.  Remove
+        # workspace/user instruction sources, plugins and recall hooks as well:
+        # a web query must not gain unrelated private context behind the user's
+        # back.  The selected excerpt + forked transcript remain available.
+        opts_kwargs["tools"] = ["WebSearch", "WebFetch"]
+        opts_kwargs["allowed_tools"] = ["WebSearch", "WebFetch"]
+        opts_kwargs["setting_sources"] = []
+        opts_kwargs["plugins"] = []
+        opts_kwargs["hooks"].pop("UserPromptSubmit", None)
     if is_ducc:
         # Keep the SDK's mature stream-json/control/MCP/session machinery, but
         # swap the executable to MuseLab's sanitising wrapper. The wrapper then
@@ -2381,7 +2419,7 @@ async def _build_and_connect_client(
     # users expect an explicitly named local skill (e.g. galatea) to be usable
     # regardless of the selected model. Operators who hit vendor payload limits
     # can still opt out globally via MUSELAB_DISABLE_SKILLS=1.
-    if not skills_off:
+    if not skills_off and not side_question_runtime:
         opts_kwargs["skills"] = "all"
     # Optional model params from env (UI-editable via /api/settings).
     mt = env_int("MUSELAB_MAX_TURNS", 0, min_value=0)
@@ -2481,35 +2519,39 @@ async def _build_and_connect_client(
     #     user already added via `claude mcp add` "just works" without
     #     re-entering — muselab is positioned as a Claude Code replacement.
     # See backend/api_settings.py _load_mcp_merged for the merge rules.
-    mcp_dict: dict = {"muselab": build_server_for_session(session_id)}
-    try:
-        from .api_settings import _load_mcp_merged
-        for name, spec in _load_mcp_merged().items():
-            if not isinstance(spec, dict):
-                continue
-            # Skip disabled servers (UI toggle OR override stub).
-            if spec.get("disabled"):
-                continue
-            # Strip muselab-local metadata keys before handing to SDK —
-            # `_source` / `_overridden_by_muselab` / `disabled` are
-            # display/control fields, not part of the MCP spec.
-            clean = {k: v for k, v in spec.items()
-                     if not k.startswith("_") and k != "disabled"}
-            # Defensive: external sources may have entries without
-            # `command` (e.g. broken Claude Code config). Skip rather
-            # than hand the SDK an unconnectable spec.
-            if "command" not in clean and "url" not in clean:
-                continue
-            mcp_dict[name] = clean
-    except Exception as e:
-        # Don't silently drop EVERY MCP server because one source had a
-        # parse error — log + carry on with the built-in. _load_mcp_merged
-        # already swallows per-file errors and stderr's them; this catch
-        # is for unexpected programmer errors only.
-        sys.stderr.write(
-            f"[chat] mcp merge failed for sid={session_id[:8]}: "
-            f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
-        sys.stderr.flush()
+    mcp_dict: dict = (
+        {} if side_question_runtime
+        else {"muselab": build_server_for_session(session_id)}
+    )
+    if not side_question_runtime:
+        try:
+            from .api_settings import _load_mcp_merged
+            for name, spec in _load_mcp_merged().items():
+                if not isinstance(spec, dict):
+                    continue
+                # Skip disabled servers (UI toggle OR override stub).
+                if spec.get("disabled"):
+                    continue
+                # Strip muselab-local metadata keys before handing to SDK —
+                # `_source` / `_overridden_by_muselab` / `disabled` are
+                # display/control fields, not part of the MCP spec.
+                clean = {k: v for k, v in spec.items()
+                         if not k.startswith("_") and k != "disabled"}
+                # Defensive: external sources may have entries without
+                # `command` (e.g. broken Claude Code config). Skip rather
+                # than hand the SDK an unconnectable spec.
+                if "command" not in clean and "url" not in clean:
+                    continue
+                mcp_dict[name] = clean
+        except Exception as e:
+            # Don't silently drop EVERY MCP server because one source had a
+            # parse error — log + carry on with the built-in. _load_mcp_merged
+            # already swallows per-file errors and stderr's them; this catch
+            # is for unexpected programmer errors only.
+            sys.stderr.write(
+                f"[chat] mcp merge failed for sid={session_id[:8]}: "
+                f"{type(e).__name__}: {e}; only muselab built-in MCP active\n")
+            sys.stderr.flush()
     opts_kwargs["mcp_servers"] = mcp_dict
     # Enable extended thinking for models whose provider endpoint handles
     # the standard Anthropic thinking config. Some vendors (e.g. Qianfan)
@@ -2575,7 +2617,7 @@ async def _build_and_connect_client(
     # callback, so wiring it there only creates a false AskUserQuestion promise
     # plus CanUseToolShadowedWarning noise. Interactive questions use the
     # dedicated muselab MCP tool in every mode.
-    if permission != "bypassPermissions":
+    if permission != "bypassPermissions" and not side_question_runtime:
         opts_kwargs["can_use_tool"] = perm.build_callback_for_session(
             session_id,
             plan_return_permission=(
@@ -3303,6 +3345,13 @@ class CreateReq(BaseModel):
     # has open in a tab and is about to type in. Empty + closed + unpinned +
     # auto-named is the only thing eligible for cleanup.
     open_ids: list[str] | None = None
+    # Lightweight side-question branches remain normal resumable sessions but
+    # intentionally do not become rows in the global task/activity ledger.
+    activity_hidden: bool = False
+    # A side question is conversational, not a general workspace agent.  Its
+    # runtime exposes only public web lookup tools even when the branch is
+    # later opened as a full chat.
+    runtime_profile: Literal["", "side_question"] = ""
 
 
 _last_orphan_gc_at = 0.0
@@ -3771,6 +3820,8 @@ def create_session_api(req: CreateReq) -> dict:
                 permission=resolved_permission,
                 auto_named=True,
                 cwd=req.cwd or None,
+                activity_hidden=req.activity_hidden,
+                runtime_profile=req.runtime_profile,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -3781,6 +3832,8 @@ def create_session_api(req: CreateReq) -> dict:
                 model=resolved_model,
                 permission=resolved_permission,
                 cwd=req.cwd or None,
+                activity_hidden=req.activity_hidden,
+                runtime_profile=req.runtime_profile,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -4330,6 +4383,17 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         elapsed = ann.get("elapsed_s")
         if elapsed is not None and "elapsed" not in entry:
             entry["elapsed"] = elapsed
+        # Completion annotations belong to the persisted assistant UUID, but
+        # one SDK message can explode into thinking/tool/result bubbles and the
+        # footer mounts on whichever bubble is visually last.  Fan model and
+        # terminal state across that UUID just like ts/elapsed, otherwise a
+        # tool-ending turn reloads as two separator lines with no model/state.
+        model_name = ann.get("model")
+        if model_name and "model" not in entry:
+            entry["model"] = model_name
+        turn_status = ann.get("turn_status")
+        if turn_status and "turn_status" not in entry:
+            entry["turn_status"] = turn_status
         # User-msg image annotations (thumb + url for the lightbox)
         # live in the sidecar — the inline `image_refs` extracted from
         # the SDK content blocks only carry `mime`. Layer the sidecar's
@@ -4396,6 +4460,71 @@ def _ensure_transcript_index(sid: str) -> tuple[Path, dict] | None:
         sid, path, _transcript_index_path(sid), _describe_transcript_record)
 
 
+def _indexed_turn_context(
+    transcript_path: Path,
+    index: dict,
+    record_indices: list[int],
+) -> dict[str, tuple[str, int | None]]:
+    """Map selected record UUIDs to their logical turn origin and start time.
+
+    A visible assistant run may span several JSONL records (tool results), and
+    a background-task continuation starts at a zero-bubble task-notification
+    record.  A bounded tail read normally does not read that hidden ancestor,
+    so deriving footer duration from visible bubbles alone either loses the
+    value or accidentally borrows metadata from the launch turn.  The index
+    already stores parent links plus prompt/notification descriptors; walk
+    those cheap records and seek only the few unique origin lines for time.
+    """
+    records = index.get("records") or []
+    if not records or not record_indices:
+        return {}
+    by_uuid: dict[str, int] = {}
+    for record_i, record in enumerate(records):
+        uid = str(record.get("uuid") or "")
+        if uid:
+            by_uuid[uid] = record_i
+
+    origin_by_uuid: dict[str, str] = {}
+    origin_indices: set[int] = set()
+    for selected_i in record_indices:
+        if selected_i < 0 or selected_i >= len(records):
+            continue
+        selected = records[selected_i]
+        selected_uuid = str(selected.get("uuid") or "")
+        current_i = selected_i
+        origin_i = selected_i
+        seen: set[str] = set()
+        while 0 <= current_i < len(records):
+            current = records[current_i]
+            current_uuid = str(current.get("uuid") or "")
+            if current_uuid in seen:
+                break
+            if current_uuid:
+                seen.add(current_uuid)
+            origin_i = current_i
+            if (current.get("real_user_prompt")
+                    or current.get("task_notifications")):
+                break
+            parent = str(current.get("parent") or "")
+            parent_i = by_uuid.get(parent) if parent else None
+            if parent_i is None:
+                break
+            current_i = parent_i
+        origin_uuid = str(records[origin_i].get("uuid") or selected_uuid)
+        if selected_uuid:
+            origin_by_uuid[selected_uuid] = origin_uuid
+        origin_indices.add(origin_i)
+
+    origin_times: dict[str, int | None] = {}
+    for entry in transcript_idx.read_records(
+            transcript_path, index, sorted(origin_indices)):
+        origin_times[str(entry.get("uuid") or "")] = _transcript_ts_ms(entry)
+    return {
+        uid: (origin_uuid, origin_times.get(origin_uuid))
+        for uid, origin_uuid in origin_by_uuid.items()
+    }
+
+
 def _indexed_ui_records(
     transcript_path: Path,
     index: dict,
@@ -4404,6 +4533,8 @@ def _indexed_ui_records(
 ) -> list[dict]:
     """Seek/read and shape only selected records from a transcript index."""
     entries = transcript_idx.read_records(transcript_path, index, record_indices)
+    turn_context = _indexed_turn_context(
+        transcript_path, index, record_indices)
     raw = [
         _RawMsg(str(e.get("uuid") or ""), str(e.get("type") or ""),
                 e.get("message") or {}, _transcript_ts_ms(e))
@@ -4423,6 +4554,13 @@ def _indexed_ui_records(
         ordinal = ordinals.get(uid, 0)
         ordinals[uid] = ordinal + 1
         bubble["_key"] = f"{uid}:{ordinal}"
+        context = turn_context.get(uid)
+        if context is not None:
+            origin_uuid, started_at_ms = context
+            if origin_uuid:
+                bubble["_turn_origin_uuid"] = origin_uuid
+            if started_at_ms is not None:
+                bubble["turn_started_at"] = started_at_ms
         tool_id = str(bubble.get("id") or "")
         if bubble.get("role") == "tool_result" and tool_id:
             tool_name = tool_names.get(tool_id) or ""
@@ -4435,6 +4573,113 @@ def _indexed_ui_records(
         elif bubble.get("role") == "tool_use" and tool_id in task_status:
             bubble["task_status"] = task_status[tool_id]
     return bubbles
+
+
+def _complete_turn_footer_metadata(
+    messages: list[dict],
+    session_model: str,
+    *,
+    has_later: bool,
+    active_turn: "TurnBroadcast | None" = None,
+) -> None:
+    """Put one complete footer contract on every real visual turn tail.
+
+    The frontend footer lives on the last muse-side bubble before a visible
+    user bubble.  Persisted completion annotations, however, belong to the
+    exact assistant UUID that produced ResultMessage and may sit earlier than
+    a trailing tool_result.  Background continuations add another wrinkle:
+    they have no visible user separator at all.  Restrict donors to the tail's
+    indexed turn origin, then fill status/time/duration/model without leaking
+    metadata across those hidden boundaries.
+    """
+    if not messages:
+        return
+    active_uuid = ""
+    if active_turn is not None and not active_turn.done:
+        active_uuid = str(active_turn.last_assistant_uuid or "")
+
+    i = 0
+    while i < len(messages):
+        if messages[i].get("role") == "user":
+            i += 1
+            continue
+        group_start = i
+        while i < len(messages) and messages[i].get("role") != "user":
+            i += 1
+        group = messages[group_start:i]
+        tail = group[-1]
+        origin_uuid = str(tail.get("_turn_origin_uuid") or "")
+        scope = ([item for item in group
+                  if str(item.get("_turn_origin_uuid") or "") == origin_uuid]
+                 if origin_uuid else group)
+        if not scope:
+            scope = [tail]
+
+        def last_value(field: str) -> Any:
+            for item in reversed(scope):
+                if field not in item:
+                    continue
+                value = item.get(field)
+                if value is not None and value != "":
+                    return value
+            return None
+
+        status = str(last_value("turn_status") or "")
+        active_scope = bool(active_uuid and any(
+            str(item.get("uuid") or "") == active_uuid for item in scope))
+        closed_by_user = i < len(messages)
+        complete_window_tail = i == len(messages) and not has_later
+        if not status:
+            if active_scope:
+                status = "running"
+            elif closed_by_user or complete_window_tail:
+                status = "completed"
+
+        # A page ending in the middle of a turn is not a real footer boundary.
+        # Leave it without status; the frontend hides incomplete separators.
+        if not status:
+            continue
+
+        terminal_ms = last_value("ts")
+        if terminal_ms is None:
+            terminal_ms = last_value("mts")
+        try:
+            terminal_ms = int(terminal_ms) if terminal_ms is not None else None
+        except (TypeError, ValueError, OverflowError):
+            terminal_ms = None
+
+        started_ms = last_value("turn_started_at")
+        try:
+            started_ms = int(started_ms) if started_ms is not None else None
+        except (TypeError, ValueError, OverflowError):
+            started_ms = None
+
+        elapsed = last_value("elapsed")
+        try:
+            elapsed = float(elapsed) if elapsed is not None else None
+        except (TypeError, ValueError, OverflowError):
+            elapsed = None
+        if elapsed is None and started_ms is not None:
+            end_ms = (int(time.time() * 1000)
+                      if status == "running" else terminal_ms)
+            if end_ms is not None:
+                elapsed = round(max(0.0, (end_ms - started_ms) / 1000), 1)
+
+        footer_model = str(last_value("model") or "")
+        if not footer_model and active_scope and active_turn is not None:
+            footer_model = str(active_turn.model or "")
+        if not footer_model:
+            footer_model = str(session_model or "")
+
+        tail["turn_status"] = status
+        if status != "running" and terminal_ms is not None:
+            tail["ts"] = terminal_ms
+        if started_ms is not None:
+            tail["turn_started_at"] = started_ms
+        if elapsed is not None:
+            tail["elapsed"] = elapsed
+        if footer_model:
+            tail["model"] = footer_model
 
 
 def _bind_pending_attachments(sid: str, messages: list[dict]) -> None:
@@ -4711,6 +4956,58 @@ def _session_message_uuids(sid: str, model: str) -> frozenset[str]:
         return frozenset()
 
 
+def _turn_transcript_boundary(
+    sid: str,
+    model: str,
+) -> tuple[frozenset[str], dict[str, Any]]:
+    """Return the SDK replay boundary plus a display-history anchor.
+
+    The UUID set continues to protect the pooled SDK receive queue from
+    replaying a previous response.  The compact coordinate is retained on the
+    ``TurnBroadcast`` only for the lifetime of this turn and, if the user
+    interrupts before a canonical ResultMessage, is copied into the private
+    cancelled-turn display snapshot.
+    """
+    existing = _session_message_uuids(sid, model)
+    boundary: dict[str, Any] = {
+        "record_count": 0,
+        "source_dev": 0,
+        "source_inode": 0,
+        "normal_uuid": "",
+        "normal_total": 0,
+        "full_uuid": "",
+        "full_total": 0,
+    }
+    try:
+        indexed = _ensure_transcript_index(sid)
+        if indexed is None:
+            return existing, boundary
+        _, index = indexed
+        records = index.get("records") or []
+        source = index.get("source") or {}
+        boundary.update({
+            "record_count": len(records),
+            "source_dev": int(source.get("dev") or 0),
+            "source_inode": int(source.get("inode") or 0),
+        })
+        for order in ("normal", "full"):
+            record_ids = (index.get("orders") or {}).get(order) or []
+            prefix = (index.get("bubble_prefix") or {}).get(order) or [0]
+            if record_ids:
+                rec = records[record_ids[-1]]
+                boundary[f"{order}_uuid"] = str(rec.get("uuid") or "")
+            boundary[f"{order}_total"] = int(prefix[-1] if prefix else 0)
+    except Exception as exc:
+        # Recovery metadata is best-effort.  Failing to establish an anchor
+        # must never stop the actual model request; an unanchored snapshot is
+        # still safely appended to the display history if cancellation occurs.
+        sys.stderr.write(
+            f"[chat-stream] transcript boundary skipped sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+    return existing, boundary
+
+
 class _TurnResponseBoundary:
     """Classify pooled-SDK messages relative to one ``query()`` call."""
 
@@ -4793,21 +5090,20 @@ def get_session_api(
     outline / export / jump-to-pre-compact back-compat — those need the whole
     list. Windowing is ignored when `full` is set.
 
-    Mid-turn fallback: SDK CLI only writes the JSONL on turn completion,
-    so a reload while a reply is streaming would otherwise return an
-    empty list. When an active TurnBroadcast exists for `sid`, we
-    reconstruct the in-flight messages from its event buffer (user
-    prompt + every SSE event yielded so far) so the user sees the
-    partial reply instead of a blank session."""
+    Explicit-interrupt recovery: if the CLI was force-stopped before it could
+    flush this turn to JSONL, merge MuseLab's private display snapshot at its
+    original transcript anchor. The snapshot is presentation-only and is
+    never passed back into model context."""
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
+    snapshots, snapshot_generation = _load_cancelled_turn_snapshots(sid)
     # Any bounded request uses the byte-offset index, including bounded
     # ``full``-order paging after an outline jump.  Keeping normal/full as an
     # explicit response coordinate prevents a full-order offset from later
     # being sent to the default normal-order endpoint.
-    uses_index = bool(around_uuid or tail > 0 or offset >= 0)
+    uses_index = bool(around_uuid or tail > 0 or offset >= 0 or snapshots)
     generation = ""
     has_later = False
     pre_total = 0
@@ -4816,13 +5112,25 @@ def get_session_api(
     if uses_index:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
-            messages: list[dict] = []
-            total = 0
-            win_offset = 0
-            window = []
+            generation = _combined_history_generation(
+                "", snapshot_generation)
+            if history_generation and history_generation != generation:
+                raise HTTPException(409, detail={
+                    "error": "history_generation_mismatch",
+                    "history_generation": generation,
+                })
+            if around_uuid:
+                raise HTTPException(404, "message uuid not found")
+            window, total, win_offset, has_later = _interrupted_history_window(
+                None, None, snapshots, {}, history_order,
+                tail=tail, offset=offset, limit=limit)
+            messages = window
         else:
             transcript_path, index = indexed
-            generation = str(index.get("history_generation") or "")
+            generation = _combined_history_generation(
+                str(index.get("history_generation") or ""),
+                snapshot_generation,
+            )
             # Bubbles stranded before the visible chain's root (post-/compact,
             # or a fork). Reported in FULL-order units in every response so the
             # client can offer "Load earlier" even when the normal-order window
@@ -4871,35 +5179,58 @@ def get_session_api(
             else:
                 order = "full" if full else "normal"
                 history_order = order
-                total = index["bubble_prefix"][order][-1]
-                if offset >= 0:
-                    start = max(0, min(offset, total))
-                    end = total if limit <= 0 else min(total, start + limit)
+                if snapshots:
+                    window, total, win_offset, has_later = (
+                        _interrupted_history_window(
+                            transcript_path,
+                            index,
+                            snapshots,
+                            annotations,
+                            order,
+                            tail=tail,
+                            offset=offset,
+                            limit=limit,
+                        )
+                    )
                 else:
-                    start = max(0, total - tail)
-                    end = total
-                record_ids, inner_start, _ = (
-                    transcript_idx.record_indices_for_bubble_window(
-                        index, order, start, end))
-                shaped = _indexed_ui_records(
-                    transcript_path, index, record_ids, annotations)
-                window = shaped[inner_start:inner_start + (end - start)]
-                win_offset = start
-                has_later = end < total
+                    total = index["bubble_prefix"][order][-1]
+                    if offset >= 0:
+                        start = max(0, min(offset, total))
+                        end = total if limit <= 0 else min(total, start + limit)
+                    else:
+                        start = max(0, total - tail)
+                        end = total
+                    record_ids, inner_start, _ = (
+                        transcript_idx.record_indices_for_bubble_window(
+                            index, order, start, end))
+                    shaped = _indexed_ui_records(
+                        transcript_path, index, record_ids, annotations)
+                    window = shaped[inner_start:inner_start + (end - start)]
+                    win_offset = start
+                    has_later = end < total
             messages = window
 
             # The index already has the exact normal-order bubble total, so
             # window requests can self-heal message_count without shaping the
             # entire transcript.
-            normal_total = index["bubble_prefix"]["normal"][-1]
+            if snapshots:
+                normal_total, turns = _interrupted_history_stats(
+                    index, snapshots, "normal")
+            else:
+                normal_total = index["bubble_prefix"]["normal"][-1]
+                records = index["records"]
+                turns = sum(
+                    1 for rec_i in index["orders"]["normal"]
+                    if records[rec_i].get("real_user_prompt")
+                )
             if not full and meta.get("message_count", 0) != normal_total:
                 try:
-                    records = index["records"]
-                    turns = sum(
-                        1 for rec_i in index["orders"]["normal"]
-                        if records[rec_i].get("real_user_prompt")
-                    )
                     sess.set_message_count(sid, normal_total, turn_count=turns)
+                    meta = {
+                        **meta,
+                        "message_count": normal_total,
+                        "turn_count": turns,
+                    }
                 except Exception:
                     pass
     else:
@@ -4926,6 +5257,16 @@ def get_session_api(
                 sess.set_message_count(sid, total, turn_count=turns)
             except Exception:
                 pass
+
+    active_turn = _active_turns.get(sid)
+    if active_turn is not None and active_turn.done:
+        active_turn = None
+    _complete_turn_footer_metadata(
+        window,
+        model,
+        has_later=has_later,
+        active_turn=active_turn,
+    )
 
     return {
         **meta,
@@ -4972,10 +5313,15 @@ def get_session_outline_api(sid: str) -> dict:
     meta = sess.get_session_meta(sid)
     if meta is None:
         raise HTTPException(404, "session not found")
+    _, snapshot_generation = _load_cancelled_turn_snapshots(sid)
     try:
         indexed = _ensure_transcript_index(sid)
         if indexed is None:
-            return {"outline": [], "history_generation": ""}
+            return {
+                "outline": [],
+                "history_generation": _combined_history_generation(
+                    "", snapshot_generation),
+            }
         _, index = indexed
         records = index["records"]
         items = [
@@ -4988,24 +5334,25 @@ def get_session_outline_api(sid: str) -> dict:
         ]
         return {
             "outline": items,
-            "history_generation": index.get("history_generation") or "",
+            "history_generation": _combined_history_generation(
+                index.get("history_generation") or "", snapshot_generation),
         }
     except Exception:
-        return {"outline": [], "history_generation": ""}
+        return {
+            "outline": [],
+            "history_generation": _combined_history_generation(
+                "", snapshot_generation),
+        }
 
 
 def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
-    """Reconstruct a UI-shaped message list from an in-flight broadcast.
-    Lossy by design: this is shown only mid-turn while SDK JSONL is
-    empty. Once the turn finishes the regular SDK→UI path takes over
-    and we drop this view.
+    """Reconstruct the browser-visible portion of one broadcast.
 
-    Events fold like the streaming-handler's openAsst/closeAsst dance:
-    consecutive 'text' deltas form one assistant bubble; thinking
-    deltas accumulate into one thinking message; tool_use / tool_result
-    push their own messages. Non-render events (done / error / etc.)
-    are ignored here — the UI's `done` handler only matters in live
-    streaming, not in a reload-rebuild."""
+    This is the display record used when an explicit interrupt prevents the
+    CLI from committing a canonical JSONL turn.  It deliberately contains no
+    hidden protocol payloads and is never fed back to the model: only the same
+    bounded text/thinking/tool fields already sent to the browser are kept.
+    """
     out: list[dict] = []
     if bc.user_text or bc.user_images or bc.user_docs:
         out.append({
@@ -5016,6 +5363,23 @@ def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
         })
     cur_text_msg: dict | None = None
     cur_thinking_msg: dict | None = None
+
+    def close_segment() -> None:
+        nonlocal cur_text_msg, cur_thinking_msg
+        cur_text_msg = None
+        cur_thinking_msg = None
+
+    def apply_task_status(tool_use_id: str, task_id: str, **patch: Any) -> None:
+        for message in reversed(out):
+            if message.get("role") != "tool_use":
+                continue
+            status = message.get("task_status") or {}
+            if (tool_use_id and message.get("id") == tool_use_id) or (
+                task_id and status.get("task_id") == task_id
+            ):
+                message["task_status"] = {**status, "task_id": task_id, **patch}
+                return
+
     for ev in bc.replay_events():
         kind = ev.get("event") or ""
         data_str = ev.get("data") or "{}"
@@ -5041,30 +5405,733 @@ def _broadcast_to_ui_messages(bc: "TurnBroadcast") -> list[dict]:
             else:
                 cur_thinking_msg["text"] += chunk
         elif kind == "tool_use":
-            cur_text_msg = None
-            cur_thinking_msg = None
-            out.append({
+            close_segment()
+            message = {
                 "role": "tool_use",
                 "name": data.get("name"),
+                "id": data.get("id"),
                 "summary": data.get("summary"),
-                "input": data.get("input"),
+                "input": data.get("input") or {},
+                "task_status": None,
+                "_approvalSuperseded": False,
                 **({"todos": data["todos"]} if "todos" in data else {}),
                 **({"task": data["task"]} if "task" in data else {}),
                 **({"plan": data["plan"]} if "plan" in data else {}),
-            })
+            }
+            out.append(message)
         elif kind == "tool_result":
-            cur_text_msg = None
-            cur_thinking_msg = None
+            close_segment()
             out.append({
                 "role": "tool_result",
+                "id": data.get("id"),
+                "tool_name": data.get("tool_name") or "",
                 "preview": data.get("preview"),
+                "text": data.get("text") or "",
                 "truncated": data.get("truncated"),
+                "text_truncated": data.get("text_truncated"),
                 "is_error": data.get("is_error"),
+                "bash": data.get("bash"),
             })
-        # ask_user_question / permission_request not reconstructed here —
-        # they're interactive blocks whose answer state lives in the
-        # ask/perm queues, not in the broadcast buffer.
+        elif kind == "task_started":
+            apply_task_status(
+                str(data.get("tool_use_id") or ""),
+                str(data.get("task_id") or ""),
+                state="running",
+                description=data.get("description") or "",
+            )
+        elif kind == "task_progress":
+            apply_task_status(
+                str(data.get("tool_use_id") or ""),
+                str(data.get("task_id") or ""),
+                state="running",
+                usage=data.get("usage") or {},
+                last_tool_name=data.get("last_tool_name") or "",
+            )
+        elif kind == "task_notification":
+            raw_state = str(data.get("status") or "")
+            state = raw_state if raw_state in {
+                "completed", "failed", "stopped"
+            } else "done"
+            apply_task_status(
+                str(data.get("tool_use_id") or ""),
+                str(data.get("task_id") or ""),
+                state=state,
+                summary=data.get("summary") or "",
+                output_file=data.get("output_file") or "",
+            )
+        elif kind == "ask_user_question":
+            close_segment()
+            questions = data.get("questions") or []
+            out.append({
+                "role": "ask_user_question",
+                "id": data.get("id"),
+                "questions": questions,
+                "pendingAnswers": {
+                    str(question.get("question") or ""): (
+                        [] if question.get("multiSelect") else None
+                    )
+                    for question in questions
+                    if isinstance(question, dict)
+                },
+                # The stream is terminal: never resurrect an actionable card
+                # whose backend Future was cancelled with the turn.
+                "submitted": True,
+                "askOtherOpen": False,
+                "askOtherText": "",
+            })
+        elif kind == "permission_request":
+            close_segment()
+            out.append({
+                "role": "permission_request",
+                "id": data.get("id"),
+                "tool": data.get("tool"),
+                "summary": data.get("summary"),
+                "kind": data.get("kind") or "tool",
+                "suggestions": data.get("suggestions") or [],
+                "return_mode": data.get("return_mode") or "",
+                "title": data.get("title") or "",
+                "display_name": data.get("display_name") or "",
+                "description": data.get("description") or "",
+                "input": data.get("input") or {},
+                "tool_use_id": data.get("tool_use_id") or data.get("toolUseId") or "",
+                "plan": data.get("plan") or "",
+                "resolved": True,
+                "decision": "expired",
+                "mode": None,
+                "submitting": False,
+                "awaitingTransition": False,
+                "_decisionAcknowledged": True,
+                "failure_message": "",
+            })
     return out
+
+
+_CANCELLED_TURN_SNAPSHOT_SCHEMA = 1
+
+
+def _canonical_uuid_component(value: str) -> str | None:
+    """Return a filesystem-safe canonical UUID or ``None``."""
+    try:
+        parsed = uuid.UUID(str(value or ""))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    canonical = str(parsed)
+    return canonical if canonical == str(value or "").lower() else None
+
+
+def _cancelled_turn_session_dir(sid: str) -> Path | None:
+    safe_sid = _canonical_uuid_component(sid)
+    if safe_sid is None:
+        return None
+    return sess.SESS_DIR / "cancelled_turns" / safe_sid
+
+
+def _cancelled_turn_snapshot_path(sid: str, turn_id: str) -> Path | None:
+    directory = _cancelled_turn_session_dir(sid)
+    safe_turn = _canonical_uuid_component(turn_id)
+    if directory is None or safe_turn is None:
+        return None
+    return directory / f"{safe_turn}.json"
+
+
+def _delete_cancelled_turn_snapshots(sid: str) -> None:
+    directory = _cancelled_turn_session_dir(sid)
+    if directory is None or not directory.exists():
+        return
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _cancelled_snapshot_canonical_span(
+    transcript_path: Path,
+    index: dict,
+    snapshot: dict,
+) -> tuple[list[str], str]:
+    """Resolve a late JSONL flush back to its interrupted turn.
+
+    A force-stopped CLI can acknowledge the terminal boundary before its
+    AssistantMessage UUID is observable, then append that canonical record
+    several seconds later.  The snapshot's pre-query record coordinate plus
+    the original user-record timestamp identifies that turn without inspecting
+    or logging private message text.  Return all UUIDs in the logical turn and
+    the last assistant UUID that can own its durable footer.
+    """
+    boundary = snapshot.get("transcript_boundary") or {}
+    records = index.get("records") or []
+    try:
+        start = int(boundary.get("record_count"))
+    except (TypeError, ValueError):
+        return [], ""
+    if start < 0 or start >= len(records):
+        return [], ""
+
+    source = index.get("source") or {}
+    for field, current_field in (
+        ("source_dev", "dev"), ("source_inode", "inode"),
+    ):
+        try:
+            expected = int(boundary.get(field) or 0)
+            current = int(source.get(current_field) or 0)
+        except (TypeError, ValueError):
+            return [], ""
+        if expected and current and expected != current:
+            return [], ""
+
+    real_user_ids = [
+        record_i for record_i in range(start, len(records))
+        if records[record_i].get("real_user_prompt")
+    ]
+    if not real_user_ids:
+        return [], ""
+    entries = transcript_idx.read_records(
+        transcript_path, index, real_user_ids)
+    entry_by_uuid = {
+        str(entry.get("uuid") or ""): entry for entry in entries
+    }
+    started_ms = int(snapshot.get("started_at_ms") or 0)
+    interrupted_ms = int(snapshot.get("interrupted_at_ms") or 0)
+    canonical_terminal = bool(snapshot.get("canonical_terminal_published"))
+    origin_i: int | None = None
+    for candidate_position, record_i in enumerate(real_user_ids):
+        record_uuid = str(records[record_i].get("uuid") or "")
+        ts_ms = _transcript_ts_ms(entry_by_uuid.get(record_uuid) or {})
+        if ts_ms is None:
+            # A canonical ResultMessage means this query definitely reached
+            # the transcript even on legacy rows without timestamps.  The
+            # first real prompt after the pre-query boundary is therefore it.
+            if canonical_terminal and candidate_position == 0:
+                origin_i = record_i
+            break
+        if started_ms and ts_ms < started_ms - 5_000:
+            continue
+        if interrupted_ms and ts_ms <= interrupted_ms + 250:
+            origin_i = record_i
+            break
+        # A post-interrupt prompt belongs to a resend/new turn.  Never borrow
+        # its assistant merely because the user repeated the exact same text.
+        if interrupted_ms and ts_ms > interrupted_ms + 250:
+            break
+
+    if origin_i is None:
+        return [], ""
+    origin_uuid = str(records[origin_i].get("uuid") or "")
+    by_uuid = {
+        str(record.get("uuid") or ""): record_i
+        for record_i, record in enumerate(records)
+        if record.get("uuid")
+    }
+    origin_cache: dict[int, str] = {}
+
+    def logical_origin(record_i: int) -> str:
+        cached = origin_cache.get(record_i)
+        if cached is not None:
+            return cached
+        current_i = record_i
+        seen: set[str] = set()
+        result = ""
+        while 0 <= current_i < len(records):
+            current = records[current_i]
+            current_uuid = str(current.get("uuid") or "")
+            if current_uuid in seen:
+                break
+            if current_uuid:
+                seen.add(current_uuid)
+            # A task notification starts a separate headless continuation;
+            # cancelling the launch turn must not relabel that later reaction.
+            if current.get("task_notifications"):
+                break
+            if current.get("real_user_prompt"):
+                result = current_uuid
+                break
+            parent = str(current.get("parent") or "")
+            parent_i = by_uuid.get(parent) if parent else None
+            if parent_i is None:
+                break
+            current_i = parent_i
+        origin_cache[record_i] = result
+        return result
+
+    span: list[str] = []
+    tail_assistant_uuid = ""
+    for record_i in range(origin_i, len(records)):
+        if logical_origin(record_i) != origin_uuid:
+            continue
+        record = records[record_i]
+        record_uuid = str(record.get("uuid") or "")
+        if record_uuid:
+            span.append(record_uuid)
+        if (record.get("type") == "assistant"
+                and int(record.get("bubble_count") or 0) > 0):
+            tail_assistant_uuid = record_uuid
+    return span, tail_assistant_uuid
+
+
+def _heal_cancelled_snapshot_from_canonical(
+    sid: str,
+    path: Path,
+    snapshot: dict,
+    transcript_path: Path,
+    index: dict,
+) -> bool:
+    """Promote a late canonical assistant to the snapshot's cancelled truth.
+
+    Until an assistant exists, dynamically hide any duplicate canonical user
+    rows and keep rendering the private snapshot.  Once the assistant arrives,
+    annotate its exact UUID and retire only this validated snapshot file.
+    """
+    span, assistant_uuid = _cancelled_snapshot_canonical_span(
+        transcript_path, index, snapshot)
+    if span:
+        snapshot["hidden_uuids"] = list(dict.fromkeys([
+            *(snapshot.get("hidden_uuids") or []), *span,
+        ]))
+    if not assistant_uuid:
+        return False
+    started_ms = int(snapshot.get("started_at_ms") or 0)
+    interrupted_ms = int(snapshot.get("interrupted_at_ms") or 0)
+    elapsed_s = round(max(0, interrupted_ms - started_ms) / 1000, 1)
+    try:
+        sess.set_message_annotation(
+            sid,
+            assistant_uuid,
+            model=str(snapshot.get("model") or ""),
+            ts=interrupted_ms or None,
+            turn_status="cancelled",
+            elapsed_s=elapsed_s,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] late cancelled footer heal failed sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        return False
+    # Exact path comes from the already-validated canonical sid/turn snapshot
+    # directory.  Failure to unlink is harmless: subsequent reads resolve and
+    # exclude it again, while the sidecar remains authoritative.
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
+    return True
+
+
+def _load_cancelled_turn_snapshots(sid: str) -> tuple[list[dict], str]:
+    """Load private display-only interrupted-turn snapshots.
+
+    The generation hashes filenames and stat data only; private message text is
+    never copied into an ETag, log line, or other externally observable cache
+    key.
+    """
+    directory = _cancelled_turn_session_dir(sid)
+    if directory is None or not directory.exists():
+        return [], ""
+    loaded: list[tuple[Path, dict]] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("snapshot root must be an object")
+            if data.get("schema") != _CANCELLED_TURN_SNAPSHOT_SCHEMA:
+                raise ValueError("unsupported snapshot schema")
+            if data.get("sid") != sid or not isinstance(data.get("messages"), list):
+                raise ValueError("snapshot ownership mismatch")
+            loaded.append((path, data))
+        except Exception as exc:
+            # Never log payloads: a cancelled turn can contain private source,
+            # prompts, or tool output. Filename + exception class is enough for
+            # an operator to find a corrupt local artifact.
+            sys.stderr.write(
+                f"[chat] cancelled snapshot skipped file={path.name} "
+                f"exc={type(exc).__name__}\n")
+    indexed: tuple[Path, dict] | None = None
+    if any((data.get("transcript_boundary") or {}).get("record_count") is not None
+           for _, data in loaded):
+        try:
+            indexed = _ensure_transcript_index(sid)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] cancelled snapshot heal skipped sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n")
+
+    snapshots: list[dict] = []
+    kept_paths: list[Path] = []
+    for path, data in loaded:
+        healed = False
+        if indexed is not None and data.get("transcript_boundary"):
+            try:
+                healed = _heal_cancelled_snapshot_from_canonical(
+                    sid, path, data, indexed[0], indexed[1])
+            except Exception as exc:
+                # Recovery must fail closed to the already-valid private
+                # snapshot; a malformed/temporarily changing transcript must
+                # never turn session history into a 500 response.
+                sys.stderr.write(
+                    f"[chat] cancelled snapshot heal deferred sid={sid[:8]} "
+                    f"exc={type(exc).__name__}\n")
+        if not healed:
+            snapshots.append(data)
+            kept_paths.append(path)
+    snapshots.sort(key=lambda item: (
+        int(item.get("started_at_ms") or 0), str(item.get("turn_id") or "")))
+    digest = hashlib.blake2b(digest_size=12)
+    for path in kept_paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        digest.update(path.name.encode("ascii", errors="ignore"))
+        digest.update(f":{stat.st_mtime_ns}:{stat.st_size};".encode("ascii"))
+    return snapshots, digest.hexdigest() if snapshots else ""
+
+
+def _combined_history_generation(base: str, snapshot_generation: str) -> str:
+    if not snapshot_generation:
+        return base
+    return f"{base or 'none'}~cancelled-{snapshot_generation}"
+
+
+def _persist_cancelled_turn_snapshot(bc: "TurnBroadcast") -> bool:
+    """Serialize the pump/watchdog race and persist one stable snapshot."""
+    with bc.cancelled_snapshot_lock:
+        return _persist_cancelled_turn_snapshot_locked(bc)
+
+
+def _cancelled_footer_values(bc: "TurnBroadcast") -> tuple[int, float]:
+    """Return one stable terminal timestamp/duration for an interrupted turn."""
+    now_ms = int(getattr(bc, "cancelled_at_ms", 0) or 0)
+    if now_ms <= 0:
+        now_ms = int(time.time() * 1000)
+        bc.cancelled_at_ms = now_ms
+    elapsed_s = max(0.0, now_ms / 1000.0 - float(bc.started_at or 0))
+    return now_ms, round(elapsed_s, 1)
+
+
+def _persist_cancelled_footer_annotation_locked(
+    bc: "TurnBroadcast", now_ms: int, elapsed_s: float,
+) -> bool:
+    """Persist footer truth even when an interrupted turn reached JSONL late.
+
+    ResultMessage normally owns this annotation.  A forced CLI teardown can
+    still emit and persist an AssistantMessage without ever producing that
+    terminal ResultMessage, which used to leave a refresh with only the raw
+    text.  AssistantMessage already gave us its exact UUID; writing a private
+    sidecar annotation is safe even if the JSONL line itself flushes shortly
+    afterwards.
+    """
+    assistant_uuid = str(getattr(bc, "last_assistant_uuid", "") or "")
+    if not assistant_uuid:
+        return False
+    try:
+        sess.set_message_annotation(
+            bc.session_id,
+            assistant_uuid,
+            model=bc.model,
+            ts=now_ms,
+            turn_status="cancelled",
+            elapsed_s=elapsed_s,
+        )
+        return True
+    except Exception as exc:
+        # No prompt/reply text in logs: UUID ownership + exception class is
+        # enough to diagnose a local sidecar failure without leaking content.
+        sys.stderr.write(
+            f"[chat] cancelled footer annotation failed "
+            f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        return False
+
+
+def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
+    """Atomically persist the browser-visible part of a non-canonical turn."""
+    if bc.cancelled_snapshot_persisted:
+        return True
+    if bc.cancelled_snapshot_suppressed or not bc.cancelled:
+        return False
+    now_ms, elapsed_s = _cancelled_footer_values(bc)
+    annotation_ready = _persist_cancelled_footer_annotation_locked(
+        bc, now_ms, elapsed_s)
+    # ResultMessage made the canonical transcript authoritative.  Do not layer
+    # a duplicate display snapshot over it; the exact UUID annotation above is
+    # the only missing persistence step in this narrow done/interrupt race.
+    if bc.canonical_terminal_published and annotation_ready:
+        return annotation_ready
+    path = _cancelled_turn_snapshot_path(bc.session_id, bc.turn_id)
+    if path is None:
+        return False
+    messages = _broadcast_to_ui_messages(bc)
+    if not messages:
+        return False
+
+    for index, message in enumerate(messages):
+        message["_key"] = f"cancelled:{bc.turn_id}:{index}"
+        message["_interrupted"] = True
+        message["_interrupted_turn_id"] = bc.turn_id
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            message.setdefault("ts", now_ms)
+            if elapsed_s >= 1:
+                message.setdefault("elapsed", elapsed_s)
+            message.setdefault("model", bc.model)
+            message.setdefault("turn_status", "cancelled")
+            break
+
+    boundary = dict(bc.transcript_boundary or {})
+
+    payload = {
+        "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
+        "sid": bc.session_id,
+        "turn_id": bc.turn_id,
+        "model": bc.model,
+        "started_at_ms": int(float(bc.started_at or 0) * 1000),
+        "interrupted_at_ms": now_ms,
+        "canonical_terminal_published": bool(
+            bc.canonical_terminal_published),
+        "transcript_boundary": {
+            "record_count": int(boundary.get("record_count") or 0),
+            "source_dev": int(boundary.get("source_dev") or 0),
+            "source_inode": int(boundary.get("source_inode") or 0),
+        },
+        "anchors": {
+            "normal": {
+                "uuid": boundary.get("normal_uuid") or "",
+                "total": int(boundary.get("normal_total") or 0),
+            },
+            "full": {
+                "uuid": boundary.get("full_uuid") or "",
+                "total": int(boundary.get("full_total") or 0),
+            },
+        },
+        "hidden_uuids": [],
+        "messages": messages,
+    }
+    try:
+        # Keep the atomic writer's temporary file and the final snapshot in a
+        # session-private directory. Interrupted prompts and tool output must
+        # not be readable by another local account during the rename-sized
+        # window before the final file chmod below.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with suppress(OSError):
+            path.parent.chmod(0o700)
+        atomic_write_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        with suppress(OSError):
+            path.chmod(0o600)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] cancelled snapshot write failed sid={bc.session_id[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        return False
+
+    # The durable display record is already committed. Metadata is a
+    # self-healing cache (the history endpoint recomputes it), so a failure to
+    # bump the list row must not tell the browser that snapshot persistence
+    # failed and leave the just-rendered pane exposed to an older reload.
+    bc.cancelled_snapshot_persisted = True
+    try:
+        snapshots, _ = _load_cancelled_turn_snapshots(bc.session_id)
+        indexed = _ensure_transcript_index(bc.session_id)
+        index = indexed[1] if indexed is not None else None
+        total, turns = _interrupted_history_stats(index, snapshots, "normal")
+        sess.bump_session(
+            bc.session_id,
+            message_count=total,
+            turn_count=turns,
+            auto_rename_from=bc.user_text,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            f"[chat] cancelled snapshot metadata sync failed "
+            f"sid={bc.session_id[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+    return True
+
+
+def _interrupted_history_segments(
+    index: dict | None,
+    snapshots: list[dict],
+    order: str,
+) -> tuple[list[dict], int]:
+    """Build a virtual bubble stream of canonical records + snapshots."""
+    records = (index or {}).get("records") or []
+    orders = (index or {}).get("orders") or {}
+    record_ids = list(orders.get(order) or [])
+    positions: dict[str, int] = {}
+    for position, record_id in enumerate(record_ids):
+        uid = str(records[record_id].get("uuid") or "")
+        if uid:
+            positions[uid] = position
+    full_uuids = {
+        str(records[record_id].get("uuid") or "")
+        for record_id in orders.get("full") or []
+    }
+    prefix = ((index or {}).get("bubble_prefix") or {}).get(order) or [0]
+
+    placed: dict[int, list[dict]] = {}
+    included: list[dict] = []
+    for snapshot in snapshots:
+        anchors = snapshot.get("anchors") or {}
+        anchor = anchors.get(order) or {}
+        anchor_uuid = str(anchor.get("uuid") or "")
+        if anchor_uuid and anchor_uuid in positions:
+            position = positions[anchor_uuid]
+        elif order == "normal" and anchor_uuid and anchor_uuid in full_uuids:
+            # The interrupted turn sits before the current compact/fork root.
+            # Keep it in full-history mode but do not punch it back into the
+            # normal post-compact view.
+            continue
+        else:
+            target = max(0, int(anchor.get("total") or 0))
+            position = -1
+            for pos in range(len(record_ids)):
+                reached = int(prefix[pos + 1] if pos + 1 < len(prefix) else 0)
+                if reached > target:
+                    break
+                position = pos
+        placed.setdefault(position, []).append(snapshot)
+        included.append(snapshot)
+
+    for group in placed.values():
+        group.sort(key=lambda item: (
+            int(item.get("started_at_ms") or 0), str(item.get("turn_id") or "")))
+
+    hidden = {
+        str(uid)
+        for snapshot in included
+        for uid in (snapshot.get("hidden_uuids") or [])
+        if uid
+    }
+    segments: list[dict] = []
+
+    def append_snapshots(position: int) -> None:
+        for snapshot in placed.get(position, []):
+            messages = snapshot.get("messages") or []
+            if messages:
+                segments.append({
+                    "kind": "snapshot",
+                    "snapshot": snapshot,
+                    "count": len(messages),
+                })
+
+    append_snapshots(-1)
+    for position, record_id in enumerate(record_ids):
+        record = records[record_id]
+        if str(record.get("uuid") or "") not in hidden:
+            count = max(0, int(record.get("bubble_count") or 0))
+            if count:
+                segments.append({
+                    "kind": "record",
+                    "record_id": record_id,
+                    "count": count,
+                })
+        append_snapshots(position)
+    snapshot_turns = sum(
+        1
+        for snapshot in included
+        if any(
+            isinstance(message, dict) and message.get("role") == "user"
+            for message in (snapshot.get("messages") or [])
+        )
+    )
+    return segments, snapshot_turns
+
+
+def _interrupted_history_stats(
+    index: dict | None,
+    snapshots: list[dict],
+    order: str,
+) -> tuple[int, int]:
+    segments, snapshot_turns = _interrupted_history_segments(
+        index, snapshots, order)
+    total = sum(int(segment.get("count") or 0) for segment in segments)
+    records = (index or {}).get("records") or []
+    canonical_turns = sum(
+        1
+        for segment in segments
+        if segment.get("kind") == "record"
+        and records[segment["record_id"]].get("real_user_prompt")
+    )
+    return total, canonical_turns + snapshot_turns
+
+
+def _interrupted_history_window(
+    transcript_path: Path | None,
+    index: dict | None,
+    snapshots: list[dict],
+    annotations: dict[str, dict],
+    order: str,
+    *,
+    tail: int = 0,
+    offset: int = -1,
+    limit: int = 0,
+) -> tuple[list[dict], int, int, bool]:
+    """Read one window from the virtual display history.
+
+    Only canonical records that intersect the requested display window are
+    read from JSONL.  A session with a cancelled snapshot therefore retains
+    the existing long-history/windowing protections instead of falling back to
+    a full transcript parse on every open.
+    """
+    segments, _ = _interrupted_history_segments(index, snapshots, order)
+    total = sum(int(segment.get("count") or 0) for segment in segments)
+    if offset >= 0:
+        start = max(0, min(offset, total))
+        end = total if limit <= 0 else min(total, start + limit)
+    elif tail > 0:
+        start = max(0, total - tail)
+        end = total
+    else:
+        start, end = 0, total
+
+    pieces: list[tuple[str, Any, int, int]] = []
+    selected_record_ids: list[int] = []
+    cursor = 0
+    for segment in segments:
+        count = int(segment.get("count") or 0)
+        seg_start, seg_end = cursor, cursor + count
+        cursor = seg_end
+        overlap_start = max(start, seg_start)
+        overlap_end = min(end, seg_end)
+        if overlap_start >= overlap_end:
+            continue
+        local_start = overlap_start - seg_start
+        local_end = overlap_end - seg_start
+        if segment["kind"] == "record":
+            record_id = int(segment["record_id"])
+            selected_record_ids.append(record_id)
+            pieces.append(("record", record_id, local_start, local_end))
+        else:
+            pieces.append((
+                "snapshot", segment["snapshot"], local_start, local_end))
+
+    shaped_by_record: dict[int, list[dict]] = {}
+    if transcript_path is not None and index is not None and selected_record_ids:
+        shaped = _indexed_ui_records(
+            transcript_path, index, selected_record_ids, annotations)
+        shaped_cursor = 0
+        records = index.get("records") or []
+        for record_id in selected_record_ids:
+            count = max(0, int(records[record_id].get("bubble_count") or 0))
+            shaped_by_record[record_id] = shaped[
+                shaped_cursor:shaped_cursor + count]
+            shaped_cursor += count
+
+    window: list[dict] = []
+    for kind, source, local_start, local_end in pieces:
+        if kind == "record":
+            messages = shaped_by_record.get(int(source), [])
+        else:
+            started_at_ms = int(source.get("started_at_ms") or 0)
+            turn_id = str(source.get("turn_id") or "")
+            messages = [dict(message)
+                        for message in (source.get("messages") or [])]
+            for message in messages:
+                if turn_id:
+                    message.setdefault(
+                        "_turn_origin_uuid", f"cancelled:{turn_id}")
+                if started_at_ms > 0:
+                    message.setdefault("turn_started_at", started_at_ms)
+        window.extend(messages[local_start:local_end])
+    return window, total, start, end < total
 
 
 @router.get("/sessions/{sid}/export", dependencies=[Depends(require_token_query)])
@@ -5077,13 +6144,21 @@ def export_session_markdown(sid: str) -> Response:
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
-    try:
-        sdk_msgs = _get_session_msgs(sid, model)
-    except Exception:
-        sdk_msgs = []
     annotations = sess.get_message_annotations(sid)
-    compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    snapshots, _ = _load_cancelled_turn_snapshots(sid)
+    if snapshots:
+        indexed = _ensure_transcript_index(sid)
+        transcript_path = indexed[0] if indexed is not None else None
+        index = indexed[1] if indexed is not None else None
+        messages, _, _, _ = _interrupted_history_window(
+            transcript_path, index, snapshots, annotations, "normal")
+    else:
+        try:
+            sdk_msgs = _get_session_msgs(sid, model)
+        except Exception:
+            sdk_msgs = []
+        compact_uuids = _compact_summary_uuids(sid)
+        messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
     # Bind any unbound pending image/doc attachments (those persisted
     # before the stream completed could write a uuid annotation) to the
     # user messages that have inline image refs but no thumb/url yet.
@@ -5163,6 +6238,14 @@ def _clear_session_runtime_state(sid: str) -> None:
         recent.close()
     broadcast = _active_turns.pop(sid, None)
     if broadcast is not None:
+        # Explicit session deletion owns the terminal state. Prevent the
+        # cancelled pump's finally block from recreating a private display
+        # snapshot after purge_session_storage has removed every artifact.
+        broadcast.cancelled_snapshot_suppressed = True
+        # Join any already-running to_thread writer before the caller removes
+        # the snapshot directory. A later writer observes the suppression bit.
+        with broadcast.cancelled_snapshot_lock:
+            pass
         task = getattr(broadcast, "task", None)
         if task is not None and not task.done():
             task.cancel()
@@ -5212,6 +6295,7 @@ def purge_session_storage(sid: str) -> bool:
     _interrupted_at_startup.pop(sid, None)
     _clear_session_runtime_state(sid)
     _delete_active_turn_sidecar(sid)
+    _delete_cancelled_turn_snapshots(sid)
     return removed
 
 
@@ -6900,6 +7984,8 @@ class ForkReq(BaseModel):
     # Omit / null = no truncation, copy the full transcript.
     up_to_message_id: str | None = None
     title: str | None = None
+    activity_hidden: bool = False
+    runtime_profile: Literal["", "side_question"] = ""
 
 
 @router.post("/sessions/{sid}/fork", dependencies=[Depends(require_token)])
@@ -6977,6 +8063,8 @@ def fork_session_api(sid: str, req: ForkReq) -> dict:
         forked_from=sid,
         forked_from_name=source_name,
         forked_from_message_id=req.up_to_message_id or "",
+        activity_hidden=req.activity_hidden,
+        runtime_profile=req.runtime_profile,
         cwd=src_meta.get("cwd") or str(ROOT),
     )
     return {
@@ -7336,6 +8424,8 @@ async def interrupt(session_id: str) -> dict:
     bc = _active_turns.get(session_id)
     if bc is not None and not bc.done:
         bc.cancelled = True
+        if not bc.cancelled_at_ms:
+            bc.cancelled_at_ms = int(time.time() * 1000)
         # Arm the hard-stop deadline from the CLICK, not after waiting for the
         # SDK control request. The old ordering added its possible 60s timeout
         # in front of the 2.5s grace period.
@@ -7468,7 +8558,12 @@ async def _force_stop_after_grace(
             if _active_turns.get(session_id) is bc:
                 _active_turns.pop(session_id, None)
         if not bc.done:
-            bc.publish({"event": "cancelled", "data": "{}"})
+            snapshot_ready = await asyncio.to_thread(
+                _persist_cancelled_turn_snapshot, bc)
+            bc.publish({
+                "event": "cancelled",
+                "data": json.dumps({"snapshot_ready": snapshot_ready}),
+            })
             bc.finish()
         _delete_active_turn_sidecar(session_id)
     except Exception as e:
@@ -9197,6 +10292,11 @@ async def _watch_inflight_tasks(
     cont_state: dict | None = None
     activity_failed = False
     watcher_cancelled = False
+    # The continuation is a real assistant turn for display/accounting even
+    # though it has no user bubble.  Keep the session's public model id on its
+    # broadcast so live and persisted footers do not reload with a blank model.
+    continuation_model = str(
+        (sess.get_session_meta(session_id) or {}).get("model") or "")
 
     def _owns_generation() -> bool:
         return (generation is None
@@ -9209,7 +10309,7 @@ async def _watch_inflight_tasks(
         nonlocal cont, cont_state
         if not _owns_generation():
             return
-        b = TurnBroadcast(session_id=session_id, model="")
+        b = TurnBroadcast(session_id=session_id, model=continuation_model)
         b.started_at = _background_turn_started_at.get(
             session_id, b.started_at)
         b.parent_turn_id = _background_origin_turn_id.get(session_id, "")
@@ -9284,12 +10384,23 @@ async def _watch_inflight_tasks(
             return
         incomplete_error = (state or {}).get("incomplete_error")
         completed_at_ms = int(time.time() * 1000)
+        assistant_uuid = str((state or {}).get("assistant_uuid") or "")
+        cont_elapsed = (
+            round(duration_ms / 1000, 1)
+            if duration_ms
+            else round(max(0.0, time.time() - b.started_at), 1)
+        )
+        terminal_status = (
+            "cancelled" if cancelled else
+            "failed" if incomplete_error else
+            "completed"
+        )
         done_payload = {
             "cancelled": cancelled,
             "model": b.model,
             "continuation": True,
             "duration_ms": duration_ms,
-            "assistant_uuid": (state or {}).get("assistant_uuid") or "",
+            "assistant_uuid": assistant_uuid,
             "completed_at_ms": completed_at_ms,
             "background_tasks_pending": len(pending),
         }
@@ -9306,53 +10417,35 @@ async def _watch_inflight_tasks(
         # long JSONL cannot leave the continuation footer pulsing after the
         # SDK has already emitted its ResultMessage.
         b.publish({"event": "done", "data": json.dumps(done_payload)})
+        # AssistantMessage already supplied the exact persisted UUID.  Annotate
+        # that boundary directly in the same event-loop turn as done; rescanning
+        # "the latest assistant" raced both delayed JSONL flushes and the next
+        # user turn, which is why continuation footers disappeared on refresh.
+        if assistant_uuid:
+            try:
+                # Keep this synchronous inside the current event-loop turn:
+                # publish() only queues the frame, so subscribers cannot act
+                # on done (or refresh) until this tiny local sidecar write is
+                # durable.  Offloading here reintroduced the very race this
+                # exact-UUID path is meant to close.
+                sess.set_message_annotation(
+                    session_id,
+                    assistant_uuid,
+                    model=b.model,
+                    ts=completed_at_ms,
+                    turn_status=terminal_status,
+                    elapsed_s=cont_elapsed if cont_elapsed >= 1 else None,
+                )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[chat] continuation footer annotation failed "
+                    f"sid={session_id[:8]}: {type(e).__name__}\n")
+                sys.stderr.flush()
         b.finish()
         async with _lock:
             if _active_turns.get(session_id) is b:
                 _active_turns.pop(session_id, None)
         _remember_recent_turn(session_id, b)
-        # Persist the completion time the way a normal turn does (see the
-        # set_message_annotation call in _handle_result_message). The uuid MUST
-        # come from the transcript tail because annotations are keyed by the
-        # persisted uuid. This is presentation bookkeeping, so run it after
-        # the watcher has released its stream slot; a slow transcript scan or
-        # sidecar write must not delay footer completion or queue draining.
-        async def _annotate_completion() -> None:
-            try:
-                asst_uuid, _ = await asyncio.to_thread(
-                    _recent_turn_uuids, session_id, False)
-                if asst_uuid:
-                    existing = await asyncio.to_thread(
-                        sess.get_message_annotations, session_id)
-                    # Never overwrite. A continuation that ended without a
-                    # reply of its own resolves to the previous turn's
-                    # assistant message, which already has that timestamp.
-                    if "ts" not in (existing.get(asst_uuid) or {}):
-                        cont_elapsed = (
-                            round(duration_ms / 1000, 1)
-                            if duration_ms
-                            else round(
-                                max(0.0, time.time() - b.started_at), 1)
-                        )
-                        await asyncio.to_thread(
-                            sess.set_message_annotation,
-                            session_id, asst_uuid,
-                            model=b.model,
-                            ts=completed_at_ms,
-                            elapsed_s=(
-                                cont_elapsed if cont_elapsed >= 1 else None),
-                        )
-            except Exception as e:
-                # A missing footer timestamp must never affect the continuation.
-                sys.stderr.write(
-                    f"[chat] continuation ts annotation failed "
-                    f"sid={session_id[:8]}: {type(e).__name__}: {e}\n")
-                sys.stderr.flush()
-
-        annotation_task = asyncio.create_task(_annotate_completion())
-        _maintenance_tasks.add(annotation_task)
-        annotation_task.add_done_callback(_maintenance_tasks.discard)
-
     async def _request_explicit_resume(reason: str) -> bool:
         """Ask the existing SDK session to finish the originating request.
 
@@ -9482,6 +10575,27 @@ async def _watch_inflight_tasks(
                         _mark_incomplete()
                     break
                 if msg is _STREAM_EOF:
+                    if pending:
+                        # A definitive stream EOF means the owning CLI is gone:
+                        # no terminal TaskNotification can ever arrive for the
+                        # still-pinned subprocesses.  Keeping those pins made
+                        # /active and Activity Center report a ghost running
+                        # task after an interrupted turn had already vanished
+                        # from the chat pane.  Watcher replacement/shutdown
+                        # arrives as CancelledError instead and deliberately
+                        # retains ownership, so releasing only on EOF is safe.
+                        deferred_status = _background_activity_finishes.get(
+                            session_id)
+                        activity_failed = deferred_status != "cancelled"
+                        sys.stderr.write(
+                            f"[chat] task watcher: stream ended with "
+                            f"{len(pending)} pending task(s) "
+                            f"sid={session_id[:8]}; releasing dead pins\n")
+                        _release_task_pins(session_id, pending)
+                        for task_id in pending:
+                            _bg_task_descriptions.pop(task_id, None)
+                        pending.clear()
+                        break
                     if await _request_explicit_resume("message stream ended"):
                         _reopen_stream()
                         continue
@@ -9793,7 +10907,12 @@ async def _finish_cancelled_startup(
 ) -> TurnBroadcast:
     """Finish a turn cancelled before its SDK client/query was ready."""
     if not broadcast.done:
-        broadcast.publish({"event": "cancelled", "data": "{}"})
+        snapshot_ready = await asyncio.to_thread(
+            _persist_cancelled_turn_snapshot, broadcast)
+        broadcast.publish({
+            "event": "cancelled",
+            "data": json.dumps({"snapshot_ready": snapshot_ready}),
+        })
         broadcast.finish()
     async with _lock:
         if _active_turns.get(session_id) is broadcast:
@@ -9810,6 +10929,8 @@ async def _start_activity_early(
     prompt: str,
 ) -> None:
     """Expose a reserved turn while its SDK client is still starting."""
+    if broadcast.activity_hidden:
+        return
     try:
         from .activity import activity as _activity
         await asyncio.to_thread(
@@ -9961,6 +11082,11 @@ async def _start_turn(
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
+    # The Stop button can race cold CLI/MCP startup before attachment parsing
+    # and the final model resolution below. Retain the already-submitted text
+    # as soon as this broadcast owns the session so startup cancellation can
+    # persist the same user bubble the browser is displaying.
+    broadcast.user_text = prompt
     # Clear a completed watcher defensively. A live watcher must never be
     # cancelled here: it still owns the stream and its continuation belongs to
     # the previous turn.
@@ -9985,6 +11111,7 @@ async def _start_turn(
     # prevents the "I tried to switch but it didn't take" class of bugs and
     # avoids cross-vendor thinking-signature corruption.
     s = sess.get_session(session_id) or {}
+    broadcast.activity_hidden = bool(s.get("activity_hidden", False))
     locked = (s.get("model") or "").strip()
     if locked:
         healed = _heal_unreachable_locked_model(session_id, locked, model)
@@ -10555,8 +11682,9 @@ async def _start_turn(
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
                 # cheap; to_thread keeps a long-session parse off the event loop.
-                existing_uuids = await asyncio.to_thread(
-                    _session_message_uuids, session_id, model_to_use)
+                existing_uuids, transcript_boundary = await asyncio.to_thread(
+                    _turn_transcript_boundary, session_id, model_to_use)
+                broadcast.transcript_boundary = transcript_boundary
                 boundary = _TurnResponseBoundary(existing_uuids)
                 # mem0 recall is supplied by the UserPromptSubmit hook configured
                 # on this client. The canonical query remains exactly `prompt` so
@@ -10669,7 +11797,7 @@ async def _start_turn(
         async def _prepare_side_event(payload):
             if isinstance(payload, dict) and payload.get("event") in {
                 "ask_user_question", "permission_request"
-            }:
+            } and not broadcast.activity_hidden:
                 try:
                     from .activity import activity as _activity
                     await asyncio.to_thread(
@@ -10743,6 +11871,7 @@ async def _start_turn(
             assistant_uuid = getattr(msg, "uuid", None)
             if assistant_uuid:
                 last_assistant_uuid = str(assistant_uuid)
+                broadcast.last_assistant_uuid = last_assistant_uuid
             a_usage = getattr(msg, "usage", None) or {}
             if a_usage:
                 in_t = int(a_usage.get("input_tokens", 0) or 0)
@@ -11121,11 +12250,36 @@ async def _start_turn(
                 await _finish_activity(
                     session_id, broadcast, _activity_status)
             # Capture once at the SDK's authoritative terminal boundary. The
-            # sidecar write happens after slower context/transcript work, but it
-            # must persist the same completion instant the browser saw in done.
+            # exact assistant UUID is already known from AssistantMessage, so
+            # persist the footer BEFORE yielding done.  A hard refresh or a new
+            # turn can otherwise arrive while the slower context/transcript
+            # bookkeeping below is still running and observe a bare assistant
+            # record with no status/model/duration.
             _completed_at_ms = int(time.time() * 1000)
+            _msg_duration_ms = getattr(msg, "duration_ms", None)
+            _elapsed_s = (round(_msg_duration_ms / 1000, 1)
+                          if _msg_duration_ms else None)
+            _footer_annotation_uuid = ""
+            if last_assistant_uuid:
+                try:
+                    await asyncio.to_thread(
+                        sess.set_message_annotation,
+                        session_id,
+                        last_assistant_uuid,
+                        cost=f"${cost:.4f}",
+                        model=model_to_use,
+                        ts=_completed_at_ms,
+                        turn_status=_activity_status,
+                        elapsed_s=_elapsed_s,
+                    )
+                    _footer_annotation_uuid = last_assistant_uuid
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[chat] terminal footer annotation failed "
+                        f"sid={session_id[:8]} exc={type(exc).__name__}\n")
+                    sys.stderr.flush()
             yield {"event": "done", "data": json.dumps({
-                "duration_ms": getattr(msg, "duration_ms", None),
+                "duration_ms": _msg_duration_ms,
                 "assistant_uuid": last_assistant_uuid,
                 "completed_at_ms": _completed_at_ms,
                 "total_cost_usd": cost,
@@ -11261,8 +12415,12 @@ async def _start_turn(
             # fallback branch, which previously left it unbound on the fast path
             # → UnboundLocalError at every turn's end.
             all_msgs: list | None = None
-            new_asst_uuid, new_user_uuid = await asyncio.to_thread(
+            scanned_asst_uuid, new_user_uuid = await asyncio.to_thread(
                 _recent_turn_uuids, session_id, bool(persisted_imgs))
+            # AssistantMessage is the exact boundary for this turn.  A scan of
+            # the mutable transcript tail can already see a continuation or a
+            # fast next turn, so it is fallback-only.
+            new_asst_uuid = last_assistant_uuid or scanned_asst_uuid
             if not (new_asst_uuid and new_user_uuid):
                 try:
                     all_msgs = await asyncio.to_thread(
@@ -11291,7 +12449,7 @@ async def _start_turn(
                             new_user_uuid = sm.uuid
                     if new_asst_uuid and new_user_uuid:
                         break
-            if new_asst_uuid:
+            if new_asst_uuid and new_asst_uuid != _footer_annotation_uuid:
                 # ts (ms epoch) stamps the turn's completion time. The
                 # frontend's turn-footer (.turn-footer in index.html)
                 # reads it via fmtHM() → "HH:MM" under the last muse
@@ -11304,13 +12462,11 @@ async def _start_turn(
                 # "13:42 · 2m50s" footer (FE-side stamping only survives
                 # within the live session). None when SDK didn't fill
                 # duration_ms.
-                _msg_duration_ms = getattr(msg, "duration_ms", None)
-                _elapsed_s = (round(_msg_duration_ms / 1000, 1)
-                              if _msg_duration_ms else None)
                 sess.set_message_annotation(
                     session_id, new_asst_uuid,
                     cost=f"${cost:.4f}", model=model_to_use,
                     ts=_completed_at_ms,
+                    turn_status=_activity_status,
                     elapsed_s=_elapsed_s)
             if new_user_uuid and (persisted_imgs or persisted_docs):
                 sess.set_message_annotation(
@@ -11674,6 +12830,26 @@ async def _start_turn(
                                 turn_errored = True
                         except (ValueError, TypeError):
                             pass
+                        # ResultMessage is the canonical transcript boundary.
+                        # Even a graceful done(cancelled=true) must not get a
+                        # duplicate display snapshot layered over JSONL.
+                        broadcast.canonical_terminal_published = True
+                    if (isinstance(ev, dict)
+                            and ev.get("event") == "cancelled"
+                            and broadcast.cancelled):
+                        snapshot_ready = await asyncio.to_thread(
+                            _persist_cancelled_turn_snapshot, broadcast)
+                        try:
+                            cancelled_data = json.loads(ev.get("data") or "{}")
+                        except (TypeError, ValueError):
+                            cancelled_data = {}
+                        if not isinstance(cancelled_data, dict):
+                            cancelled_data = {}
+                        cancelled_data["snapshot_ready"] = snapshot_ready
+                        ev = {
+                            **ev,
+                            "data": json.dumps(cancelled_data),
+                        }
                     broadcast.publish(ev)
                     if isinstance(ev, dict) and ev.get("event") == "done":
                         terminal_published = True
@@ -11718,6 +12894,11 @@ async def _start_turn(
                         "".join(assistant_acc),
                         turn_error_text or "turn stream failed",
                         broadcast.turn_id)
+            if (broadcast.cancelled
+                    and not broadcast.canonical_terminal_published
+                    and not broadcast.cancelled_snapshot_persisted):
+                await asyncio.to_thread(
+                    _persist_cancelled_turn_snapshot, broadcast)
             _activity_status = ("cancelled" if broadcast.cancelled else
                                 "failed" if turn_errored else "completed")
             await _finish_activity(
@@ -11756,7 +12937,11 @@ async def _start_turn(
                 elif broadcast.cancelled:
                     # User explicitly stopped this turn — pause the queue so
                     # the remaining items don't auto-fire. They resume manually.
-                    sess.set_queue_paused(session_id, True)
+                    # Keep the empty-queue invariant atomic.  A late terminal
+                    # cleanup used to create ``{items: [], paused: true}``;
+                    # the next message then entered a queue that could never
+                    # drain, which looked like an intermittent send failure.
+                    sess.pause_queue_if_nonempty(session_id)
                 else:
                     await _maybe_drain_queue(session_id)
             except Exception as e:
