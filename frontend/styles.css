@@ -585,7 +585,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
    ========================================================================== */
 .layout {
   display: grid;
-  grid-template-columns: 280px 1fr 440px;
+  grid-template-columns: 340px 1fr 440px;
   /* dvh = dynamic viewport height — matches the actually-visible area on
      mobile Safari (where the address bar collapses/expands), preventing the
      chat input from getting hidden behind browser chrome. Falls back to vh
@@ -2578,7 +2578,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   font-size: var(--fs-xs);
   line-height: 1.45;
 }
-.preview-selection-ask textarea {
+.preview-selection-ask textarea,
+.preview-selection-followup textarea {
   display: block;
   width: 100%;
   min-height: 62px;
@@ -2594,8 +2595,10 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   font: inherit;
   line-height: 1.45;
 }
-.preview-selection-ask textarea::placeholder { color: var(--c-fg-3); }
-.preview-selection-ask textarea:focus {
+.preview-selection-ask textarea::placeholder,
+.preview-selection-followup textarea::placeholder { color: var(--c-fg-3); }
+.preview-selection-ask textarea:focus,
+.preview-selection-followup textarea:focus {
   border-color: var(--c-accent);
   box-shadow: 0 0 0 2px var(--c-accent-soft);
 }
@@ -2609,7 +2612,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   color: var(--c-fg-3);
   font-size: var(--fs-xs);
 }
-.preview-selection-send {
+.preview-selection-send,
+.preview-selection-followup-send {
   width: 30px;
   height: 30px;
   padding: 0;
@@ -2622,40 +2626,69 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   color: var(--c-on-accent);
   cursor: pointer;
 }
-.preview-selection-send:hover:not(:disabled) { background: var(--c-btn-primary-hover); }
-.preview-selection-send:disabled { opacity: 0.42; cursor: default; }
-.preview-selection-send svg { width: 15px; height: 15px; }
+.preview-selection-send:hover:not(:disabled),
+.preview-selection-followup-send:hover:not(:disabled) { background: var(--c-btn-primary-hover); }
+.preview-selection-send:disabled,
+.preview-selection-followup-send:disabled { opacity: 0.42; cursor: default; }
+.preview-selection-send svg,
+.preview-selection-followup-send svg { width: 15px; height: 15px; }
 .preview-selection-send .spinner-sm { width: 13px; height: 13px; }
 .preview-selection-answer {
   width: 100%;
   box-sizing: border-box;
   padding: 10px;
+  display: flex;
+  flex-direction: column;
+  max-height: min(560px, calc(100vh - 28px));
+  min-height: 0;
+}
+.preview-selection-conversation {
+  min-height: 72px;
+  max-height: min(350px, calc(100vh - 230px));
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 2px 3px 7px;
+  overscroll-behavior: contain;
+}
+.preview-selection-turn {
+  display: flex;
+  width: 100%;
+}
+.preview-selection-turn.is-user { justify-content: flex-end; }
+.preview-selection-turn.is-assistant { justify-content: flex-start; }
+.preview-selection-turn.is-user .preview-selection-question {
+  width: fit-content;
+  max-width: 88%;
 }
 .preview-selection-question {
-  margin: 0 0 8px;
+  margin: 0;
   padding: 7px 9px;
   border-radius: var(--r-md);
-  background: var(--c-bg-1);
-  color: var(--c-fg-2);
-  font-size: var(--fs-xs);
+  background: var(--c-accent-soft);
+  color: var(--c-fg-1);
+  font-size: var(--fs-sm);
   line-height: 1.45;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .preview-selection-answer-loading {
   display: flex;
   align-items: center;
   gap: 7px;
-  min-height: 72px;
+  min-height: 32px;
   color: var(--c-fg-3);
   font-size: var(--fs-xs);
 }
 .preview-selection-answer-body {
-  max-height: min(360px, calc(100vh - 210px));
-  overflow: auto;
-  padding: 2px 3px 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 3px;
   color: var(--c-fg-1);
   font-size: var(--fs-sm);
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 .preview-selection-answer-body > :first-child { margin-top: 0; }
 .preview-selection-answer-body > :last-child { margin-bottom: 0; }
@@ -2664,6 +2697,25 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   color: var(--c-danger);
   font-size: var(--fs-xs);
   line-height: 1.4;
+}
+.preview-selection-followup {
+  display: flex;
+  align-items: flex-end;
+  gap: 7px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--c-border);
+}
+.preview-selection-followup textarea {
+  flex: 1;
+  min-width: 0;
+  min-height: 38px;
+  max-height: 96px;
+  resize: vertical;
+  padding: 7px 8px;
+}
+.preview-selection-followup .preview-selection-followup-send {
+  flex: 0 0 auto;
 }
 .preview-selection-open {
   min-height: 30px;
@@ -2688,9 +2740,11 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   .preview-selection-actions { min-height: 44px; }
   .preview-selection-actions button { height: 38px; padding: 0 14px; }
   .preview-selection-close,
-  .preview-selection-send { width: 36px; height: 36px; }
+  .preview-selection-send,
+  .preview-selection-followup-send { width: 36px; height: 36px; }
   .preview-selection-open { min-height: 36px; }
-  .preview-selection-ask textarea { font-size: 16px; }
+  .preview-selection-ask textarea,
+  .preview-selection-followup textarea { font-size: 16px; }
 }
 
 /* Injected highlight marks in the live preview content. */
@@ -2724,6 +2778,65 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   font-size: var(--fs-md); font-weight: var(--fw-semibold);
   display: flex; flex-direction: column; align-items: center; gap: 10px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.global-file-drop-overlay {
+  position: fixed;
+  inset: 10px;
+  z-index: 1180;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--c-accent);
+  border-radius: var(--r-xl);
+  background: color-mix(in srgb, var(--c-accent-soft) 72%, transparent);
+  box-shadow: inset 0 0 0 1px var(--c-accent-soft);
+  backdrop-filter: blur(1.5px);
+}
+.global-file-drop-overlay.into-directory {
+  border-color: var(--c-success);
+  background: color-mix(in srgb, var(--c-success) 10%, transparent);
+}
+.global-file-drop-card {
+  min-width: min(360px, calc(100vw - 48px));
+  max-width: calc(100vw - 48px);
+  padding: 22px 28px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-lg);
+  background: var(--c-bg-1);
+  color: var(--c-fg-0);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  text-align: center;
+}
+.global-file-drop-card svg {
+  width: 34px;
+  height: 34px;
+  margin-bottom: 3px;
+  fill: none;
+  stroke: var(--c-accent);
+  stroke-width: 1.7;
+}
+.global-file-drop-overlay.into-directory .global-file-drop-card svg {
+  stroke: var(--c-success);
+}
+.global-file-drop-card strong {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-md);
+}
+.global-file-drop-card span {
+  color: var(--c-fg-2);
+  font-size: var(--fs-sm);
+}
+@media (max-width: 700px) {
+  .global-file-drop-overlay { inset: 6px; }
+  .global-file-drop-card { padding: 18px 20px; }
 }
 .editor {
   width: 100%; height: 100%; padding: var(--sp-5);
@@ -3567,7 +3680,41 @@ pre.text {
 .activity-chip.is-empty { opacity:0.42; }
 .activity-chip.is-empty:hover { opacity:0.85; }
 @media (prefers-reduced-motion:reduce) { .activity-chip .activity-chip-dot { animation:none; } }
-.activity-body { max-height:min(70vh,680px); overflow:auto; padding:10px 14px 18px; }
+.activity-body { position:relative; max-height:min(70vh,680px); overflow:auto; padding:10px 14px 18px; }
+/* Keep the desktop ledger geometry stable across cold load → rows.  The
+   loading/refresh indicators are absolutely positioned, so neither their
+   appearance nor disappearance can push a mounted row or resize the modal. */
+@media (min-width:721px) {
+  .activity-body { min-height:min(46vh,420px); }
+}
+.activity-loading-overlay {
+  position:absolute;
+  inset:0;
+  z-index:2;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  color:var(--c-fg-3);
+  font-size:var(--fs-sm);
+  background:var(--c-bg-1);
+}
+.activity-refreshing {
+  width:20px;
+  height:20px;
+  flex:0 0 20px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  pointer-events:none;
+  color:var(--c-accent);
+  visibility:hidden;
+  opacity:0;
+  transition:opacity var(--t-fast);
+}
+.activity-refreshing.active { visibility:visible; opacity:1; }
+.activity-refreshing .spinner-sm,
+.activity-loading-overlay .spinner-sm { flex:0 0 auto; }
 .activity-group h3 { margin:10px 4px 6px; color:var(--c-fg-3); font-size:var(--fs-xs); font-weight:var(--fw-medium); }
 .activity-group-more { display:block; width:100%; margin:2px 0 0; padding:6px 8px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); font:inherit; font-size:var(--fs-xs); text-align:left; cursor:pointer; }
 .activity-group-more:hover { background:var(--c-bg-2); color:var(--c-fg-1); }
@@ -4257,6 +4404,28 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
   height: 1px;
   background: var(--c-border);
 }
+.turn-status,
+.turn-model {
+  flex:0 0 auto;
+  color:var(--c-fg-3);
+  font-size:var(--fs-xs);
+  white-space:nowrap;
+}
+.turn-status {
+  min-width: 48px;
+  text-align: right;
+}
+.turn-status.running { color:var(--c-accent-fg); }
+.turn-status.completed { color:var(--c-success); }
+.turn-status.failed { color:var(--c-danger); }
+.turn-status.cancelled { color:var(--c-warn); }
+.turn-model {
+  flex:0 1 auto;
+  min-width:0;
+  max-width:120px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
 .turn-fork-btn {
   width: 22px;
   height: 22px;
@@ -4296,8 +4465,10 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
      width on every breakpoint. Just tighten the vertical rhythm. */
   .turn-footer {
     margin: 4px 0 2px;
+    gap: 5px;
     min-height: 14px;
   }
+  .turn-model { max-width:90px; }
   .turn-fork-btn {
     width: 30px;
     height: 30px;
@@ -6508,6 +6679,8 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
   flex-shrink: 0;
+  min-width: 46px;
+  text-align: center;
 }
 /* "· 2m50s" total-elapsed pill stamped next to .msg-ts after the turn
    finishes. Same mono / muted treatment as .msg-ts so they read as one
@@ -6518,6 +6691,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
   flex-shrink: 0;
+  min-width: 52px;
 }
 
 .jump-bottom {

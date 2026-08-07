@@ -231,7 +231,7 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert 'class="selection-quote-chip"' in html
     assert '@click="removePendingQuote(i)"' in html
     assert "将展开为独立侧问" in html
-    assert "不写入当前会话" in html
+    assert "独立多轮 · 可网页搜索" in html
     assert '@click="openPreviewSelectionAskSession()"' in html
     assert 'x-ref="previewSelectionPopover"' in html
     assert '@pointerdown="startPreviewQuoteDrag($event)"' in html
@@ -281,6 +281,48 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert 'permissionMode: "default"' in ask
     assert "this.dismissPreviewQuote(true)" not in ask
     assert "newSession" not in ask
+
+
+def test_side_question_stays_floating_and_is_hidden_from_activity_center():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    sessions = (BACKEND / "sessions.py").read_text(encoding="utf-8")
+
+    transient_start = app.index("\n    dismissTransientPreviewQuote(") + 1
+    transient_end = app.index("\n    dismissPreviewQuote(", transient_start)
+    transient = app[transient_start:transient_end]
+    assert 'this.previewQuote.mode === "ask"' in transient
+    assert "return false" in transient
+
+    selection_start = app.index("_initPreviewSelection()")
+    selection_end = app.index("\n    _previewQuoteElement()", selection_start)
+    selection = app[selection_start:selection_end]
+    assert "if (!inPopover) this.dismissTransientPreviewQuote(false)" in selection
+    assert "if (!inPopover && this.previewQuote.show) this.dismissPreviewQuote" not in selection
+    for owner_change in (
+        'this.$watch("currentId"',
+        'this.$watch("selected"',
+        "onPreviewViewportScroll()",
+        "async openFile(n, opts = {})",
+    ):
+        start = app.index(owner_change)
+        assert "dismissTransientPreviewQuote" in app[start:start + 700]
+
+    create_start = app.index("async _createPreviewSelectionAskSession(")
+    create_end = app.index("\n    previewSelectionAskMessages()", create_start)
+    create = app[create_start:create_end]
+    assert create.count("activity_hidden: true") >= 3
+    assert create.count('runtime_profile: "side_question"') >= 3
+    assert "sendPreviewSelectionFollowup()" in app
+    assert "previewSelectionAskConversation()" in app
+    assert "WebSearch or WebFetch" in app
+    assert "preview-selection-followup" in html
+    assert "activity_hidden: bool = False" in chat
+    assert "broadcast.activity_hidden = bool" in chat
+    assert "if broadcast.activity_hidden:" in chat
+    assert "and not broadcast.activity_hidden" in chat
+    assert '"activity_hidden": bool(m.get("activity_hidden", False))' in sessions
 
 
 def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
@@ -361,6 +403,10 @@ def test_enter_submission_waits_for_ime_composition():
     assert "target._museImeEndedAt" in ime
     assert "eventAt - endedAt <= 80" in ime
     assert helper.index("return false") < helper.index("ev.preventDefault()")
+    assert "_museImeOriginalForceModelUpdate" in app
+    assert "target._x_forceModelUpdate = value =>" in app
+    assert "this._finishImeComposition(target)" in app
+    assert "if (this.input !== target.value) this.input = target.value" in app
 
     assert '@keydown.enter="confirmModalOnEnter($event)"' in html
     assert '@keydown.enter="commitRenameTabOnEnter($event)"' in html
@@ -461,10 +507,48 @@ def test_desktop_layout_is_files_chat_preview_with_one_canonical_chat_dom():
     assert "rightWidth: 440" not in app
     assert "leftOpen: this.leftOpen, previewOpen: this.previewOpen" in app
     assert "leftWidth: this.leftWidth, previewWidth: this.previewWidth" in app
-    assert 'schema: 8' in app
+    assert 'leftWidth: 340' in app
+    assert 'schema: 9' in app
+    assert 'Math.abs(p.leftWidth - 280) <= 1' in app
     assert 'else if (typeof p.rightWidth === "number")' in app
     assert 'if (next === "preview") this.previewOpen = true;' in app
     assert "btn.hide_preview" in i18n and "btn.show_preview" in i18n
+
+
+def test_external_file_drop_is_global_root_by_default_and_directory_explicit():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    listener_start = app.index("// Document-level OS-file-drag detection")
+    listener_end = app.index("// HTML preview bridge", listener_start)
+    listeners = app[listener_start:listener_end]
+    assert 'document.addEventListener("drop", (e) =>' in listeners
+    assert "this._externalFileDropTarget(e.target)" in listeners
+    assert "this._uploadFilesToDir(dropTarget.dir, files)" in listeners
+    assert "e.stopPropagation()" in listeners
+    assert "}, true);" in listeners
+
+    target_start = app.index("_externalFileDropTarget(target)")
+    target_end = app.index("\n    async upload(ev)", target_start)
+    target = app[target_start:target_end]
+    assert '.closest(".filelist li.dir[data-path]")' in target
+    assert 'dir: row ? String(row.dataset.path || "") : ""' in target
+
+    attach_start = app.index("async onAttachDrop(ev)")
+    attach_end = app.index("\n    async onImagePaste", attach_start)
+    attach = app[attach_start:attach_end]
+    assert 'this._uploadFilesToDir("", files)' in attach
+    assert "_attachFile" not in attach
+
+    drop_start = app.index("async onDrop(ev, n)")
+    drop_end = app.index("\n    // Parallel-upload", drop_start)
+    tree_drop = app[drop_start:drop_end]
+    assert 'this._uploadFilesToDir(n.is_dir ? n.path : "", files)' in tree_drop
+    assert 'class="global-file-drop-overlay"' in html
+    assert "上传到工作区根目录" in html
+    assert ".global-file-drop-overlay" in css
+    assert "pointer-events: none" in css
 
     nav = html[html.index('<nav class="mobile-tab-bar"'):
                html.index("</nav>", html.index('<nav class="mobile-tab-bar"'))]
@@ -1412,7 +1496,9 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
 
     assert 'x-show="isTabStreaming(currentId)"' in html
     assert "chat-toolbar-stop" in html
-    assert ':title="_isBusy(currentId) ? t(\'queue.button_hint\')' in html
+    assert "tabState[currentId]?._stopping" in html
+    assert "等待上一条任务完成中断" in html
+    assert "_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')" in html
     assert "撤回队尾" not in html
     assert "removePendingQueueItem" not in stop
     assert "if (st._stopping) return" in stop
@@ -1428,7 +1514,8 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     cancelled_start = app.index('es.addEventListener("cancelled"')
     cancelled_end = app.index("\n      });", cancelled_start)
     cancelled = app[cancelled_start:cancelled_end]
-    assert "_markDone(true, false, true)" in cancelled
+    assert "_markDone(true, false, true, {" in cancelled
+    assert 'turnStatus: "cancelled"' in cancelled
     assert "d.snapshot_ready" in cancelled
     assert "streamState._seenUpdated = undefined" in cancelled
     assert "quiet: true" in cancelled
@@ -2388,7 +2475,8 @@ def test_chat_send_and_stop_buttons_are_icon_only_but_accessible():
     buttons = html[toolbar_start:toolbar_end]
     assert 'x-text="t(\'btn.send\')"' not in buttons
     assert 'x-text="t(\'btn.stop\')"' not in buttons
-    assert ':aria-label="_isBusy(currentId) ? t(\'queue.button_hint\') : t(\'btn.send\')"' in buttons
+    assert "tabState[currentId]?._stopping" in buttons
+    assert "_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')" in buttons
     assert ':aria-label="t(\'btn.stop\')"' in buttons
     assert ".chat-toolbar-send { width: 44px; padding: 0; }" in css
     assert ".chat-toolbar-send > span:nth-child(2)" not in css
@@ -2634,6 +2722,65 @@ def test_turn_footer_is_a_separator_and_no_longer_hosts_streaming_dots():
     # full width.
     assert "padding: 4px 0 6px 40px;" not in css
     assert "padding: 2px 0 3px 34px;" not in css
+
+
+def test_turn_footer_falls_back_to_transcript_time_and_shows_model_and_state():
+    """Historic/tool-ending turns must not render as an empty separator."""
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    footer = html[html.index('<div class="turn-footer"'):]
+    footer = footer[:footer.index('<button class="turn-fork-btn"')]
+    assert "turnFooterTime(m, pane)" in footer
+    assert "turnFooterElapsed(m, pane)" in footer
+    assert "turnFooterStatus(m, pane)" in footer
+    assert 'class="turn-model"' in footer
+    assert 'class="turn-status"' in footer
+    assert "modelLabel(turnFooterModel(m, pane, tid))" in footer
+    assert 'entry["model"] = model_name' in chat
+    assert 'entry["turn_status"] = turn_status' in chat
+    assert "turn_status=_activity_status" in chat
+    assert "def _complete_turn_footer_metadata(" in chat
+    assert 'tail["turn_status"] = status' in chat
+
+    mark_start = app.index("const _markDone = (")
+    mark_end = app.index("\n      const markUserFailed", mark_start)
+    mark = app[mark_start:mark_end]
+    assert "if (!m.model && completedModel) m.model = completedModel" in mark
+    assert 'm.turn_status === "running"' in mark
+    assert "m.turn_status = turnStatus" in mark
+    assert "if (!m.memoryRecall && memoryRecall)" in mark
+    assert "if (!tailCandidate && lastUserCandidate && turnStatus)" in mark
+    assert "m.role !== 'user' || m.turn_status || m._interrupted || m._failed" in footer
+
+
+def test_queue_controls_validate_mutations_and_block_send_during_interrupt():
+    """A failed DELETE must not become an editable duplicate."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    chat = (BACKEND / "chat.py").read_text(encoding="utf-8")
+
+    helper_start = app.index("async _runQueueMutation(")
+    helper_end = app.index("\n    async _enqueueMessage", helper_start)
+    helper = app[helper_start:helper_end]
+    assert "if (!r.ok) throw" in helper
+    assert "queueActionBusy(sid, key)" in helper
+
+    edit_start = app.index("async editPendingQueueItem(")
+    edit_end = app.index("\n    async resumeQueueDrain", edit_start)
+    edit = app[edit_start:edit_end]
+    assert "if (!r) return;" in edit
+    assert edit.index("if (!r) return;") < edit.index("draft.input = displayText")
+
+    send_start = app.index("async send(opts = {})")
+    send_end = app.index("\n    // ====== ask_user_question", send_start)
+    send = app[send_start:send_end]
+    assert "if (sendState._stopping && !opts.reconnect && !opts.resumedItem)" in send
+    assert "tabState[currentId]?._stopping" in html
+    assert "queueActionBusy(currentId, 'edit:' + q.id)" in html
+    assert "queueActionBusy(currentId, 'remove:' + q.id)" in html
+    assert "sess.pause_queue_if_nonempty(session_id)" in chat
 
 
 def test_per_message_timestamps_are_plumbed_but_only_shown_on_expand():

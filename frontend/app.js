@@ -315,6 +315,10 @@ function portal() {
     // and the drop falls through to the browser, which opens the file
     // as a navigation away from muselab). See init() for the listeners.
     osFileDragging: false,
+    // The whole app is an OS-file drop surface.  Empty means workspace root;
+    // only a real directory row may set a nested destination.
+    osFileDropDir: "",
+    osFileDropOnDirectory: false,
     _dragCounter: 0,
     // Right-click context menu on a preview tab. { path, x, y } when open.
     previewTabCtxMenu: null,
@@ -393,9 +397,10 @@ function portal() {
     // contexts are sandboxed/browser-owned.
     previewQuote: {
       show: false, mode: "actions", source: "", role: "", sessionId: "",
-      messageId: "", text: "", path: "", question: "",
+      messageId: "", text: "", path: "", question: "", followup: "",
       x: 0, y: 0, above: false, truncated: false, sending: false,
       askSessionId: "", askSessionName: "", askPrompt: "", askError: "",
+      askAutoScroll: true,
       // Ask mode starts anchored to the selection. The first title-bar drag
       // converts x/y to viewport-relative top/left coordinates until close.
       dragged: false, dragging: false,
@@ -880,7 +885,7 @@ function portal() {
     // Desktop's secondary right rail is the preview. Chat is the primary,
     // always-mounted center pane and therefore has no open/closed flag.
     previewOpen: true,
-    leftWidth: 280,
+    leftWidth: 340,
     previewWidth: 440,
     showHidden: false,
     // ===== Trash =====
@@ -1382,7 +1387,7 @@ function portal() {
       this.$watch("currentId", (tid) => {
         if (this.previewQuote.show && this.previewQuote.sessionId
             && this.previewQuote.sessionId !== tid) {
-          this.dismissPreviewQuote(true);
+          this.dismissTransientPreviewQuote(true);
         }
         if (!tid) return;
         this.$nextTick(() => this._scrollTabIntoView(tid));
@@ -1444,16 +1449,21 @@ function portal() {
       };
       document.addEventListener("dragenter", (e) => {
         if (!_hasFileType(e.dataTransfer)) return;
+        e.preventDefault();
+        e.stopPropagation();
         this._dragCounter++;
-        if (this._dragCounter === 1) this.osFileDragging = true;
-      });
+        this._setOsFileDropTarget(e.target);
+      }, true);
       document.addEventListener("dragleave", (e) => {
         // Some browsers (Firefox) don't expose types on dragleave; we
         // decrement unconditionally because every leave matches an
         // earlier enter and the counter floor at 0 prevents drift.
+        if (this._dragCounter <= 0) return;
+        e.preventDefault();
+        e.stopPropagation();
         if (this._dragCounter > 0) this._dragCounter--;
-        if (this._dragCounter === 0) this.osFileDragging = false;
-      });
+        if (this._dragCounter === 0) this._resetOsFileDragState();
+      }, true);
       // Required for drop to fire: dragover MUST be preventDefault'd at
       // some level. The preview overlay does this when visible, but for
       // areas of the page that aren't drop targets we also need a
@@ -1463,14 +1473,22 @@ function portal() {
       document.addEventListener("dragover", (e) => {
         if (!_hasFileType(e.dataTransfer)) return;
         e.preventDefault();
-      });
+        e.stopPropagation();
+        this._setOsFileDropTarget(e.target);
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      }, true);
       document.addEventListener("drop", (e) => {
-        // If the drop wasn't handled by an explicit zone (preview /
-        // chat input), suppress browser default and reset state.
-        if (_hasFileType(e.dataTransfer)) e.preventDefault();
-        this._dragCounter = 0;
-        this.osFileDragging = false;
-      });
+        if (!_hasFileType(e.dataTransfer)) return;
+        // Capture before the composer/preview/tree handlers: an OS file is a
+        // workspace upload, never an implicit chat attachment.  Internal tab
+        // and tree drags carry custom MIME types and never enter this branch.
+        e.preventDefault();
+        e.stopPropagation();
+        const dropTarget = this._externalFileDropTarget(e.target);
+        const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+        this._resetOsFileDragState();
+        if (files.length) void this._uploadFilesToDir(dropTarget.dir, files);
+      }, true);
 
       // HTML preview bridge. Each live sandboxed frame reports image clicks,
       // readiness and internal scrolling through postMessage.
@@ -1576,7 +1594,7 @@ function portal() {
         console.groupEnd();
       });
       this.$watch("editing", v => {
-        this.dismissPreviewQuote(true);
+        this.dismissTransientPreviewQuote(true);
         v ? this.mountCM() : this.unmountCM();
       });
       // Removed: pane-open toast — the panel opening is self-evident.
@@ -1587,7 +1605,7 @@ function portal() {
       // boot restore). Fire once now too in case `selected` was restored
       // before this watcher attached.
       this.$watch("selected", (p) => {
-        this.dismissPreviewQuote(true);
+        this.dismissTransientPreviewQuote(true);
         this.loadSelectedMeta(p);
       });
       this.loadSelectedMeta(this.selected);
@@ -3074,7 +3092,8 @@ function portal() {
     },
     async onAttachDrop(ev) {
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
-      for (const f of files) await this._attachFile(f);
+      this._resetOsFileDragState();
+      await this._uploadFilesToDir("", files);
     },
     async onImagePaste(ev) {
       // Only handle pasted image data; let normal text paste through.
@@ -3826,8 +3845,11 @@ function portal() {
     // Compact, no decimals at minute granularity — second-precision past
     // ~30s adds visual noise without information value.
     fmtStreamElapsed(secs) {
-      if (!secs || secs < 1) return "";
-      const s = Math.floor(secs);
+      if (secs === null || secs === undefined || secs === "") return "";
+      const numeric = Number(secs);
+      if (!Number.isFinite(numeric) || numeric < 0) return "";
+      if (numeric < 1) return "<1s";
+      const s = Math.floor(numeric);
       if (s < 60) return `${s}s`;
       const m = Math.floor(s / 60);
       const rs = s % 60;
@@ -3851,6 +3873,48 @@ function portal() {
       const D = String(d.getDate()).padStart(2, "0");
       if (d.getFullYear() === now.getFullYear()) return `${M}-${D} ${hh}:${mm}`;
       return `${d.getFullYear()}-${M}-${D} ${hh}:${mm}`;
+    },
+    turnFooterStatus(m, pane) {
+      const stored = String((m && m.turn_status)
+        || (m && m._interrupted ? "cancelled" : "")
+        || (m && m._failed ? "failed" : ""));
+      if (stored) return stored;
+      // Fresh live bubbles are created before the terminal done payload can
+      // stamp turn_status.  A canonical historical footer already has ts, so
+      // never relabel such a prior turn just because a newer stream is active.
+      if (pane && pane.streaming && m && !m.ts) return "running";
+      return "";
+    },
+    turnStatusLabel(status) {
+      const value = String(status || "");
+      if (value === "running") return this.lang === "zh" ? "运行中" : "Running";
+      if (value === "completed") return this.lang === "zh" ? "已完成" : "Completed";
+      if (value === "failed") return this.lang === "zh" ? "失败" : "Failed";
+      return this.lang === "zh" ? "已中断" : "Interrupted";
+    },
+    turnFooterTime(m, pane) {
+      const status = this.turnFooterStatus(m, pane);
+      if (status === "running") {
+        return Number((m && m.turn_started_at)
+          || (pane && pane._streamStartedAt) || (m && m.mts) || 0);
+      }
+      return Number((m && (m.ts || m.mts || m.turn_started_at)) || 0);
+    },
+    turnFooterElapsed(m, pane) {
+      const value = this.turnFooterStatus(m, pane) === "running"
+        ? Math.max(
+            Number((m && m.elapsed) || 0),
+            Number((pane && pane.streamElapsed) || 0),
+          )
+        : Number(m && m.elapsed);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    },
+    turnFooterModel(m, pane, sid) {
+      const live = String((m && m.model)
+        || (pane && pane.streamingModel) || "");
+      if (live) return live;
+      const meta = (this.sessions || []).find(session => session.id === sid);
+      return String((meta && meta.model) || "");
     },
     // True when index i in messages[] is the tail of a turn — i.e. it
     // is muse-side AND the next message is either nonexistent or
@@ -5085,17 +5149,58 @@ function portal() {
       if (!target) return;
       target._museImeComposing = true;
       target._museImeEndedAt = 0;
+
+      // Alpine's x-model effect is allowed to write `textarea.value` whenever
+      // the root `input` value changes.  That is normally harmless, but a
+      // programmatic draft/session reconciliation that lands while Windows
+      // Pinyin / macOS marked text is active makes Chromium replace the
+      // native composition buffer without emitting compositionend.  The
+      // textarea then remains the IME's stale target: plain Latin input still
+      // works, while switching back to Chinese can stay broken until the page
+      // is restarted.
+      //
+      // Keep the DOM-owned marked text authoritative for this short window.
+      // Input events still update Alpine's model; only model -> DOM writes are
+      // deferred.  We restore Alpine's original hook and synchronize the
+      // committed DOM value in compositionend/blur below.
+      if (!target._museImeOriginalForceModelUpdate
+          && typeof target._x_forceModelUpdate === "function") {
+        const original = target._x_forceModelUpdate;
+        target._museImeOriginalForceModelUpdate = original;
+        target._x_forceModelUpdate = value => {
+          if (target._museImeComposing) {
+            target._museImeDeferredModelValue = value;
+            return;
+          }
+          original(value);
+        };
+      }
     },
     onImeCompositionEnd(ev) {
       const target = ev && (ev.target || ev.currentTarget);
       if (!target) return;
-      target._museImeComposing = false;
+      this._finishImeComposition(target);
       target._museImeEndedAt = Number(ev.timeStamp) || 0;
+    },
+    _finishImeComposition(target) {
+      if (!target) return;
+      target._museImeComposing = false;
+      const original = target._museImeOriginalForceModelUpdate;
+      if (typeof original === "function") {
+        target._x_forceModelUpdate = original;
+      }
+      delete target._museImeOriginalForceModelUpdate;
+      delete target._museImeDeferredModelValue;
+      // Safari/WebView may fire compositionend before its final non-composing
+      // input event.  Commit the DOM value now; the later input is idempotent.
+      // This also deliberately lets the user's marked text win over a stale
+      // programmatic draft write that was deferred above.
+      if (this.input !== target.value) this.input = target.value;
     },
     _resetImeCompositionState(ev) {
       const target = ev && (ev.target || ev.currentTarget);
       if (!target) return;
-      target._museImeComposing = false;
+      this._finishImeComposition(target);
       target._museImeEndedAt = 0;
     },
     _isImeComposingEvent(ev) {
@@ -5203,7 +5308,7 @@ function portal() {
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 8,          // v8 makes chat center + preview the right rail
+        schema: 9,          // v9 gives the desktop file manager useful room
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
@@ -5277,7 +5382,14 @@ function portal() {
           this.workspaceSurfaces = p.workspaceSurfaces;
         }
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
-        if (typeof p.leftWidth === "number") this.leftWidth = p.leftWidth;
+        if (typeof p.leftWidth === "number") {
+          // v8 shipped the file manager at 280px.  Migrating only that exact
+          // old default gives existing users the roomier desktop layout while
+          // preserving any width they deliberately resized themselves.
+          this.leftWidth = this._loadedPrefsSchema < 9
+            && Math.abs(p.leftWidth - 280) <= 1
+            ? 340 : p.leftWidth;
+        }
         // v7's rightOpen/rightWidth described the CHAT rail. In v8 chat is the
         // always-visible center pane and PREVIEW owns the right rail. Preserve
         // a useful old width, but never turn an old hidden-chat preference into
@@ -6594,6 +6706,11 @@ function portal() {
         // quota/auth error and confuse the user). Cleared by explicit
         // resume-queue or discard-queue actions on the failed user bubble.
         _queuePaused: false,
+        // Durable queue mutations are async.  Track them per action/item so a
+        // double-click cannot issue duplicate DELETE/resume requests, and so
+        // an edit is never copied back into the composer unless the server
+        // actually removed the queued original.
+        _queueMutating: {},
         // True only during _attachToServerTurn's poll window (between a turn's
         // done and the server starting the next queued turn) — suppresses the
         // idle "Queue waiting" banner so it doesn't flash mid-drain.
@@ -6687,6 +6804,9 @@ function portal() {
         st._sessionActivityExpected = null;
       }
       if (!Array.isArray(st.draft.pendingQuotes)) st.draft.pendingQuotes = [];
+      if (!st._queueMutating || typeof st._queueMutating !== "object") {
+        st._queueMutating = {};
+      }
       return st;
     },
 
@@ -6759,7 +6879,7 @@ function portal() {
       if ((previous === "preview" && next !== "preview")
           || (previous === "chat" && next !== "chat"
               && this.previewQuote.source === "chat")) {
-        this.dismissPreviewQuote(true);
+        this.dismissTransientPreviewQuote(true);
       }
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
@@ -6878,6 +6998,35 @@ function portal() {
     _currentQueueLen() {
       const st = this.tabState[this.currentId];
       return (st && st.pendingQueue) ? st.pendingQueue.length : 0;
+    },
+    queueActionBusy(sid, key) {
+      const st = sid && this.tabState[sid];
+      return !!(st && st._queueMutating && st._queueMutating[key]);
+    },
+    _setQueueActionBusy(st, key, busy) {
+      if (!st || !key) return;
+      const next = { ...(st._queueMutating || {}) };
+      if (busy) next[key] = true;
+      else delete next[key];
+      // Replace the object so Alpine sees keys introduced after mount.
+      st._queueMutating = next;
+    },
+    async _runQueueMutation(sid, st, key, url, options, failureZh, failureEn) {
+      if (!sid || !st || this.tabState[sid] !== st
+          || this.queueActionBusy(sid, key)) return null;
+      this._setQueueActionBusy(st, key, true);
+      try {
+        const r = await fetch(url, options);
+        if (!r.ok) throw new Error(`queue mutation failed: HTTP ${r.status}`);
+        return r;
+      } catch (_e) {
+        if (this.tabState[sid] === st) {
+          this.toast(this.lang === "zh" ? failureZh : failureEn, "error", 3500);
+        }
+        return null;
+      } finally {
+        if (this.tabState[sid] === st) this._setQueueActionBusy(st, key, false);
+      }
     },
     async _enqueueMessage(sid, item) {
       this._ensureTabState(sid);
@@ -7346,10 +7495,15 @@ function portal() {
       if (!st || !st.pendingQueue) return;
       const item = st.pendingQueue[idx];
       if (!item) return;
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const key = "remove:" + item.id;
+      const r = await this._runQueueMutation(
+        sid, st, key,
+        "/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
+        { method: "DELETE", headers: this.hdr() },
+        "移除排队消息失败，原消息仍保留",
+        "Could not remove the queued message; it is still queued",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
     },
     async editPendingQueueItem(sid, idx) {
@@ -7369,10 +7523,18 @@ function portal() {
       const quotes = (item.pendingQuotes || []).slice();
       const imgs = (item.images || []).slice();
       const docs = (item.docs || []).slice();
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const key = "edit:" + item.id;
+      const r = await this._runQueueMutation(
+        sid, st, key,
+        "/api/chat/sessions/" + sid + "/queue/" + encodeURIComponent(item.id),
+        { method: "DELETE", headers: this.hdr() },
+        "编辑排队消息失败，原消息仍保留",
+        "Could not edit the queued message; the original is still queued",
+      );
+      // Never create an editable duplicate when DELETE failed.  Previously the
+      // draft was restored unconditionally, so re-send could execute both the
+      // untouched queue item and its apparent replacement.
+      if (!r) return;
       await this._syncQueueFromServer(sid);
       if (this.tabState[sid] !== st) return;
       const draft = st.draft;
@@ -7404,21 +7566,34 @@ function portal() {
       // turn it starts. Also the manual "kick" for the post-restart case —
       // the server intentionally does NOT auto-resume draining on boot, so
       // dormant items wait here until the user hits Resume.
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue/pause", {
+      const st = this.tabState[sid];
+      if (!st) return;
+      const r = await this._runQueueMutation(
+        sid, st, "resume",
+        "/api/chat/sessions/" + sid + "/queue/pause",
+        {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
           body: JSON.stringify({ paused: false }),
-        });
-      } catch (_e) {}
+        },
+        "继续队列失败，请检查连接后重试",
+        "Could not resume the queue; check the connection and retry",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
       this._drainPendingQueue(sid);
     },
     async discardQueue(sid) {
-      try {
-        await fetch("/api/chat/sessions/" + sid + "/queue",
-                    { method: "DELETE", headers: this.hdr() });
-      } catch (_e) {}
+      const st = this.tabState[sid];
+      if (!st) return;
+      const r = await this._runQueueMutation(
+        sid, st, "discard",
+        "/api/chat/sessions/" + sid + "/queue",
+        { method: "DELETE", headers: this.hdr() },
+        "清空队列失败，消息仍保留",
+        "Could not discard the queue; messages are still queued",
+      );
+      if (!r) return;
       await this._syncQueueFromServer(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
@@ -11114,9 +11289,7 @@ function portal() {
     },
 
     async onPreviewDrop(ev) {
-      this.previewDragHover = false;
-      this.osFileDragging = false;
-      this._dragCounter = 0;
+      this._resetOsFileDragState();
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
       const ownerWorkspace = this.fileWorkspacePath();
@@ -12823,7 +12996,12 @@ function portal() {
       if (!existing.length || !(incoming && incoming.length)) return incoming || [];
       const existingTail = existing[existing.length - 1];
       const liveFooter = existingTail && existingTail.role !== "user"
-        ? { ts: existingTail.ts, elapsed: existingTail.elapsed }
+        ? {
+            ts: existingTail.ts,
+            elapsed: existingTail.elapsed,
+            model: existingTail.model,
+            turn_status: existingTail.turn_status,
+          }
         : null;
       const candidates = new Map();
       for (const message of existing) {
@@ -12858,6 +13036,8 @@ function portal() {
         const liveFields = mountedKey.includes(":live:") ? {
           ts: matched.ts,
           elapsed: matched.elapsed,
+          model: matched.model,
+          turn_status: matched.turn_status,
           memoryRecall: matched.memoryRecall,
         } : null;
         const canonicalFields = { ...canonical };
@@ -12866,6 +13046,10 @@ function portal() {
         if (liveFields) {
           if (liveFields.ts) matched.ts = liveFields.ts;
           if (liveFields.elapsed) matched.elapsed = liveFields.elapsed;
+          if (liveFields.model && !matched.model) matched.model = liveFields.model;
+          if (liveFields.turn_status && !matched.turn_status) {
+            matched.turn_status = liveFields.turn_status;
+          }
           if (liveFields.memoryRecall) matched.memoryRecall = liveFields.memoryRecall;
         }
         matched._k = mountedKey;
@@ -12881,6 +13065,12 @@ function portal() {
         if (!canonicalTail.ts && liveFooter.ts) canonicalTail.ts = liveFooter.ts;
         if (!canonicalTail.elapsed && liveFooter.elapsed) {
           canonicalTail.elapsed = liveFooter.elapsed;
+        }
+        if (!canonicalTail.model && liveFooter.model) {
+          canonicalTail.model = liveFooter.model;
+        }
+        if (!canonicalTail.turn_status && liveFooter.turn_status) {
+          canonicalTail.turn_status = liveFooter.turn_status;
         }
       }
       return result;
@@ -12915,6 +13105,13 @@ function portal() {
       if (!Object.prototype.hasOwnProperty.call(m, "forkUuid")) m.forkUuid = "";
       if (!Object.prototype.hasOwnProperty.call(m, "ts")) m.ts = null;
       if (!Object.prototype.hasOwnProperty.call(m, "elapsed")) m.elapsed = 0;
+      if (!Object.prototype.hasOwnProperty.call(m, "model")) m.model = "";
+      if (!Object.prototype.hasOwnProperty.call(m, "turn_status")) {
+        m.turn_status = "";
+      }
+      if (!Object.prototype.hasOwnProperty.call(m, "memoryRecall")) {
+        m.memoryRecall = null;
+      }
       this._assignLiveKey(st, m);
       const target = (st._laterMessages && st._laterMessages.length)
         ? st._laterMessages : st.messages;
@@ -17517,7 +17714,7 @@ function portal() {
       return saved;
     },
     onPreviewViewportScroll() {
-      if (this.previewQuote.show) this.dismissPreviewQuote(true);
+      this.dismissTransientPreviewQuote(true);
       clearTimeout(this._previewViewSaveTimer);
       const ownerPath = this.selected;
       const ownerLoadSeq = this._previewLoadSeq;
@@ -19005,7 +19202,7 @@ function portal() {
 
     async openFile(n, opts = {}) {
       if (!n || !n.path) return false;
-      this.dismissPreviewQuote(true);
+      this.dismissTransientPreviewQuote(true);
       if (this.previewSurface === "terminal") this._teardownTerminalView();
       this.previewSurface = "file";
       // Clicking / double-clicking the file that already owns the editor is a
@@ -20145,7 +20342,7 @@ function portal() {
       document.addEventListener("selectionchange", () => {
         // Focusing the inline question field collapses the document selection.
         // The selected source has already been snapshotted, so retain the ask
-        // panel until the user sends, cancels or changes preview ownership.
+        // panel until the user explicitly closes it or opens the full branch.
         if (this.previewQuote.show && this.previewQuote.mode === "ask") return;
         clearTimeout(this._previewSelectionTimer);
         this._previewSelectionTimer = setTimeout(() => {
@@ -20156,7 +20353,7 @@ function portal() {
       document.addEventListener("pointerdown", (ev) => {
         const inPopover = ev.target && ev.target.closest
           && ev.target.closest(".preview-selection-popover");
-        if (!inPopover && this.previewQuote.show) this.dismissPreviewQuote(false);
+        if (!inPopover) this.dismissTransientPreviewQuote(false);
       }, true);
       const onViewportResize = () => {
         // Mobile keyboards can resize the visual viewport while the question
@@ -20438,6 +20635,7 @@ function portal() {
         text: selectedText,
         path: source === "preview" ? this.selected : "",
         question: "",
+        followup: "",
         x: Math.min(viewportWidth - popoverHalf - 12,
           Math.max(popoverHalf + 12, rect.left + rect.width / 2)),
         y: above ? rect.top : rect.bottom,
@@ -20448,9 +20646,23 @@ function portal() {
         askSessionName: "",
         askPrompt: "",
         askError: "",
+        askAutoScroll: true,
         dragged: false,
         dragging: false,
       });
+    },
+
+    dismissTransientPreviewQuote(clearSelection = false) {
+      // The tiny selection-actions bubble is contextual and should disappear
+      // when its selection loses ownership. Once expanded into an independent
+      // question, however, it is a real floating window: page clicks, file or
+      // chat switches, scrolling and editor changes must not close it. Only
+      // its close button, Escape, or "open full chat" dismisses that state.
+      if (!this.previewQuote.show || this.previewQuote.mode === "ask") {
+        return false;
+      }
+      this.dismissPreviewQuote(clearSelection);
+      return true;
     },
 
     dismissPreviewQuote(clearSelection = false) {
@@ -20459,10 +20671,10 @@ function portal() {
       this._cancelPreviewQuoteDrag();
       Object.assign(this.previewQuote, {
         show: false, mode: "actions", source: "", role: "", sessionId: "",
-        messageId: "", text: "", path: "", question: "",
+        messageId: "", text: "", path: "", question: "", followup: "",
         x: 0, y: 0, above: false, truncated: false, sending: false,
         dragged: false, dragging: false, askSessionId: "",
-        askSessionName: "", askPrompt: "", askError: "",
+        askSessionName: "", askPrompt: "", askError: "", askAutoScroll: true,
       });
       if (clearSelection) {
         try {
@@ -20587,10 +20799,12 @@ function portal() {
       this.previewQuote.mode = "ask";
       this.previewQuote.dragged = false;
       this.previewQuote.question = "";
+      this.previewQuote.followup = "";
       this.previewQuote.askSessionId = "";
       this.previewQuote.askSessionName = "";
       this.previewQuote.askPrompt = "";
       this.previewQuote.askError = "";
+      this.previewQuote.askAutoScroll = true;
       this.$nextTick(() => {
         // x-ref inside an x-if template is not guaranteed to join Alpine's
         // root $refs collection on the same tick in every browser build.
@@ -20634,6 +20848,8 @@ function portal() {
               up_to_message_id: snapshot.source === "chat"
                 ? (snapshot.messageId || null) : null,
               title,
+              activity_hidden: true,
+              runtime_profile: "side_question",
             }),
           },
         );
@@ -20655,6 +20871,8 @@ function portal() {
             permission: "default",
             cwd: (source && source.cwd) || this.currentWorkspacePath(),
             open_ids: this.openTabIds || [],
+            activity_hidden: true,
+            runtime_profile: "side_question",
           }),
         });
         if (!response.ok) throw new Error(`selection session ${response.status}`);
@@ -20671,6 +20889,8 @@ function portal() {
         cwd: payload.cwd || (source && source.cwd) || this.currentWorkspacePath(),
         _selectionAsk: true,
         _selectionAskForked: forked,
+        activity_hidden: true,
+        runtime_profile: "side_question",
       };
       this.sessions = [meta, ...this.sessions.filter(s => s.id !== id)];
       this._sessionsEtag = "";
@@ -20698,7 +20918,31 @@ function portal() {
           break;
         }
       }
-      return messages.slice(userIndex + 1);
+      // Keep the branch-local user turns as well as assistant replies so the
+      // floating window can behave like a compact multi-turn conversation.
+      // Inherited fork history stays before the exact first side-question
+      // prompt and is therefore intentionally excluded.
+      return messages.slice(Math.max(0, userIndex));
+    },
+
+    previewSelectionAskConversation() {
+      return this.previewSelectionAskMessages().filter(message => (
+        message && message.text
+        && (message.role === "user" || message.role === "assistant")
+      ));
+    },
+
+    previewSelectionAskUserText(message) {
+      if (!message) return "";
+      if (message.text === this.previewQuote.askPrompt) {
+        return this.previewQuote.question || "";
+      }
+      return this.userVisibleText(message);
+    },
+
+    previewSelectionAskMessageHtml(message) {
+      const text = String((message && message.text) || "").trim();
+      return text ? this.mdRender(text) : "";
     },
 
     previewSelectionAskText() {
@@ -20709,9 +20953,44 @@ function portal() {
         .trim();
     },
 
-    previewSelectionAskHtml() {
-      const text = this.previewSelectionAskText();
+    previewSelectionAskHtml(message = null) {
+      const text = message ? String(message.text || "").trim()
+        : this.previewSelectionAskText();
       return text ? this.mdRender(text) : "";
+    },
+
+    previewSelectionAskSearching() {
+      if (!this.previewSelectionAskRunning()) return false;
+      const messages = this.previewSelectionAskMessages();
+      let lastUser = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i] && messages[i].role === "user") {
+          lastUser = i;
+          break;
+        }
+      }
+      return messages.slice(lastUser + 1).some(message => (
+        message && message.role === "tool_use"
+        && (message.name === "WebSearch" || message.name === "WebFetch")
+      ));
+    },
+
+    onPreviewSelectionAskScroll(ev) {
+      const el = ev && ev.currentTarget;
+      if (!el) return;
+      this.previewQuote.askAutoScroll = (
+        el.scrollHeight - el.scrollTop - el.clientHeight < 48
+      );
+    },
+
+    scrollPreviewSelectionAskConversation(force = false) {
+      if (!force && !this.previewQuote.askAutoScroll) return false;
+      const el = document.querySelector(
+        ".preview-selection-popover .preview-selection-conversation",
+      );
+      if (!el || !el.getClientRects().length) return false;
+      el.scrollTop = el.scrollHeight;
+      return true;
     },
 
     previewSelectionAskRunning() {
@@ -20745,6 +21024,63 @@ function portal() {
       return true;
     },
 
+    _previewSelectionAskPrompt(question, snapshot = null) {
+      const instruction = this.lang === "zh"
+        ? "这是一个独立侧问。请基于这个侧问分支已有的上下文回答。必要时可以使用 WebSearch 或 WebFetch 核实公开信息；不得调用其他工具或修改文件。搜索时不要把文件路径、凭证、私人信息或选中原文直接放入查询词或 URL，应先抽象成最少必要的公开关键词。"
+        : "This is an independent side question. Answer from the context already present in this side branch. You may use WebSearch or WebFetch when public information needs verification; do not use other tools or modify files. Never put file paths, credentials, private data, or the selected passage verbatim into a query or URL; reduce it to the minimum necessary public keywords first.";
+      const label = this.lang === "zh"
+        ? (snapshot ? "问题：" : "追问：")
+        : (snapshot ? "Question:" : "Follow-up:");
+      const parts = [];
+      if (snapshot) parts.push(this._previewQuoteBlock(snapshot));
+      parts.push(instruction, `${label}\n${question}`);
+      return parts.join("\n\n");
+    },
+
+    onPreviewQuoteFollowupEnter(ev) {
+      if (!ev || ev.isComposing || ev.keyCode === 229) return;
+      const isTouch = (window.matchMedia
+        && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
+      if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
+      ev.preventDefault();
+      this.sendPreviewSelectionFollowup();
+    },
+
+    async sendPreviewSelectionFollowup() {
+      const sid = this.previewQuote.askSessionId;
+      const question = String(this.previewQuote.followup || "").trim();
+      if (!sid || !question || this.previewSelectionAskRunning()
+          || this.workspaceSwitching) return false;
+      const prompt = this._previewSelectionAskPrompt(question);
+      this.previewQuote.sending = true;
+      this.previewQuote.askError = "";
+      this.previewQuote.askAutoScroll = true;
+      try {
+        const result = await this.send({
+          sessionId: sid,
+          detachedText: prompt,
+          detachedDisplayText: question,
+          permissionMode: "default",
+        });
+        if (result === false) {
+          this.previewQuote.askError = this.lang === "zh"
+            ? "追问发送失败，请重试"
+            : "Could not send the follow-up; please retry";
+          return false;
+        }
+        this.previewQuote.followup = "";
+        this.$nextTick(() => this.scrollPreviewSelectionAskConversation(true));
+        return true;
+      } catch (_) {
+        this.previewQuote.askError = this.lang === "zh"
+          ? "追问发送失败，请重试"
+          : "Could not send the follow-up; please retry";
+        return false;
+      } finally {
+        this.previewQuote.sending = false;
+      }
+    },
+
     async sendPreviewSelectionQuestion() {
       if (!this.previewQuote.show || this.previewQuote.mode !== "ask"
           || this.previewQuote.sending) return false;
@@ -20769,11 +21105,7 @@ function portal() {
         text: this.previewQuote.text,
         truncated: this.previewQuote.truncated,
       };
-      const prompt = this._previewQuoteBlock(snapshot)
-        + "\n\n" + (this.lang === "zh"
-          ? "这是一个独立侧问。请只基于已有上下文和上面的选中内容回答，不调用工具、不修改文件。\n问题："
-          : "This is an independent side question. Answer only from the existing context and selection; do not use tools or modify files.\nQuestion:")
-        + "\n" + question;
+      const prompt = this._previewSelectionAskPrompt(question, snapshot);
       this.previewQuote.sending = true;
       this.previewQuote.askError = "";
       try {
@@ -20784,6 +21116,7 @@ function portal() {
         const result = await this.send({
           sessionId: target.id,
           detachedText: prompt,
+          detachedDisplayText: question,
           permissionMode: "default",
         });
         if (result === false) {
@@ -21463,6 +21796,37 @@ function portal() {
     },
 
     // ===== upload / drag-drop / mkdir =====
+    _externalFileDropTarget(target) {
+      const el = target && target.nodeType === 1
+        ? target
+        : (target && target.parentElement);
+      const row = el && el.closest
+        ? el.closest(".filelist li.dir[data-path]")
+        : null;
+      return {
+        dir: row ? String(row.dataset.path || "") : "",
+        explicitDirectory: !!row,
+      };
+    },
+    _setOsFileDropTarget(target) {
+      const drop = this._externalFileDropTarget(target);
+      this.osFileDragging = true;
+      this.osFileDropDir = drop.dir;
+      this.osFileDropOnDirectory = drop.explicitDirectory;
+      this.dragOver = drop.explicitDirectory ? drop.dir : "";
+      this.dragOverRoot = !drop.explicitDirectory;
+      return drop;
+    },
+    _resetOsFileDragState() {
+      this._dragCounter = 0;
+      this.osFileDragging = false;
+      this.osFileDropDir = "";
+      this.osFileDropOnDirectory = false;
+      this.dragOver = "";
+      this.dragOverRoot = false;
+      this.previewDragHover = false;
+      this.dragHover = false;
+    },
     async upload(ev) {
       // Multi-file picker: upload all selected files in parallel to the
       // workspace root and refresh the tree ONCE, mirroring onPreviewDrop.
@@ -21657,6 +22021,17 @@ function portal() {
       this._lpStart = null;
     },
     onTreeNodeDragOver(ev, n) {
+      const types = Array.from(ev.dataTransfer?.types || []);
+      if (types.includes("Files")
+          && !types.includes(this._DRAG_MIME_INTERNAL)) {
+        // External files are deliberately stricter than tree moves: only a
+        // directory row is an explicit nested destination.  A file row is
+        // just another part of the window and therefore means workspace root.
+        this.dragOver = n.is_dir ? n.path : "";
+        this.dragOverRoot = !n.is_dir;
+        ev.dataTransfer.dropEffect = "copy";
+        return;
+      }
       // Target dir = the node itself when it's a folder, or its parent
       // directory when it's a file. Dropping onto a file lands the
       // item next to that file (matches Finder / VSCode behavior).
@@ -21703,10 +22078,11 @@ function portal() {
         return;
       }
 
-      // OS file upload — dropping onto a file uploads into that file's
-      // parent dir (same dir-resolution as internal moves).
+      // OS file upload — only a directory row is a nested target. Dropping on
+      // a file row follows the app-wide default and uploads to workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
-      await this._uploadFilesToDir(targetDir, files);
+      this._resetOsFileDragState();
+      await this._uploadFilesToDir(n.is_dir ? n.path : "", files);
     },
     // Parallel-upload a set of OS files into `targetDir` (empty string =
     // workspace root), then refresh the tree once and surface a single
@@ -21781,6 +22157,7 @@ function portal() {
       }
       // OS file upload → workspace root.
       const files = Array.from(ev.dataTransfer?.files || []);
+      this._resetOsFileDragState();
       await this._uploadFilesToDir("", files);
     },
     async moveTreeItem(srcPath, targetDir) {
@@ -23707,6 +24084,18 @@ function portal() {
       if (!sendSid) return false;
       if (sendSid === this.currentId) this._captureComposerState(sendSid);
       const sendState = this._ensureTabState(sendSid);
+      // Stop is an acknowledged control handshake, not an idle gap.  Sending
+      // while it is still settling used to enqueue a fresh message between the
+      // interrupt endpoint's atomic pause and the turn cleanup's second pause;
+      // that new item then appeared accepted but remained paused.  Keep the
+      // draft intact and make the short wait explicit instead.
+      if (sendState._stopping && !opts.reconnect && !opts.resumedItem) {
+        this.toast(this.lang === "zh"
+          ? "正在中断上一条任务，请稍候再发送"
+          : "The previous turn is still stopping; send again in a moment",
+        "warn", 2200);
+        return false;
+      }
       // Do not start a new turn between the optimistic selector change and
       // its persisted session update. Otherwise Plan Mode could launch with a
       // stale/missing return capability. Reconnects and queued snapshots own
@@ -23730,6 +24119,8 @@ function portal() {
       // lifecycle. This also makes ticket failure recovery a no-op for the
       // unrelated composer.
       const hasDetachedText = typeof opts.detachedText === "string";
+      const detachedDisplayText = typeof opts.detachedDisplayText === "string"
+        ? opts.detachedDisplayText : opts.detachedText;
       // Snapshot the pinned session's draft before any await. Every later read,
       // clear, upload wait and enqueue remains owned by this exact state object.
       const composerInput = hasDetachedText ? opts.detachedText : (sendDraft.input || "");
@@ -23980,7 +24371,7 @@ function portal() {
         this._capLiveMessages(sendState);
         sentUserBubble = this._appendLiveMessage(sendState, {
           role: "user", text,
-          displayText: hasDetachedText ? text : composerInput,
+          displayText: hasDetachedText ? detachedDisplayText : composerInput,
           selectionQuotes: composerQuotes.map(q => ({ ...q })),
           images: readyImages.map(im => ({
             preview: im.preview,
@@ -25147,6 +25538,11 @@ function portal() {
         const completedAtMs = Number(meta.completedAtMs) || 0;
         const durationMs = Number(meta.durationMs) || 0;
         const assistantUuid = String(meta.assistantUuid || "");
+        const completedModel = String(
+          meta.model || streamState.streamingModel || modelForBubble || "",
+        );
+        const turnStatus = String(meta.turnStatus || "");
+        const memoryRecall = meta.memoryRecall || null;
         const _now = completedAtMs > 0 ? completedAtMs : Date.now();
         const _elapsed = durationMs > 0
           ? durationMs / 1000
@@ -25155,14 +25551,23 @@ function portal() {
         const _stamp = (m) => {
           if (!m.ts) m.ts = _now;
           if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
+          if (!m.model && completedModel) m.model = completedModel;
+          if ((!m.turn_status || m.turn_status === "running") && turnStatus) {
+            m.turn_status = turnStatus;
+          }
+          if (!m.memoryRecall && memoryRecall) m.memoryRecall = memoryRecall;
         };
         // Tail-most muse-side message of THIS turn, used when the turn has no
         // assistant text bubble of its own to hang the footer on.
         let tailCandidate = null;
         let stampedAssistant = null;
+        let lastUserCandidate = null;
         for (let k = turnMessages.length - 1; k >= 0; k--) {
           const m = turnMessages[k];
-          if (m.role === "user") break;          // entered the previous turn
+          if (m.role === "user") {
+            lastUserCandidate = m;
+            break;                               // entered the previous turn
+          }
           if (tailCandidate === null) tailCandidate = m;
           // Skip tool blocks / standalone thinking; they're not the
           // "reply" the user reads time off.
@@ -25173,6 +25578,13 @@ function portal() {
           _stamp(m);                              // found the tail text bubble
           stampedAssistant = m;
           break;                                  // stop after the first one (most recent)
+        }
+        // An interrupt/error can land before the SDK emits any muse-side
+        // block.  Stamp that turn's user envelope so the terminal footer does
+        // not vanish with the pending bubble; the template explicitly allows
+        // a status-bearing user tail for this one exceptional shape.
+        if (!tailCandidate && lastUserCandidate && turnStatus) {
+          tailCandidate = lastUserCandidate;
         }
         // The footer is mounted on the actual turn-tail node. Stamp that node
         // regardless of whether an assistant bubble was found above; otherwise
@@ -25318,6 +25730,10 @@ function portal() {
           assistantUuid: d.assistant_uuid,
           completedAtMs: d.completed_at_ms,
           durationMs: d.duration_ms,
+          model: d.model,
+          turnStatus: d.cancelled
+            ? "cancelled" : (d.is_error ? "failed" : "completed"),
+          memoryRecall: d.memory_recall,
         });
         _stopTimer();
         if (isContinuation && !d.cancelled) {
@@ -25479,7 +25895,12 @@ function portal() {
             markUserFailed(serverError, errKind, errCta, errRetryable);
           }
           restoreSubmittedComposer(false);
-          es.close(); _markDone(false, false, true); _stopTimer();
+          es.close();
+          _markDone(false, false, true, {
+            model: modelForBubble,
+            turnStatus: "failed",
+          });
+          _stopTimer();
           // Pause auto-drain — same context likely fails the next message
           // too (quota / auth / cross-vendor signature). The failed user
           // bubble surfaces a "resume queue (N)" CTA so the user can
@@ -25625,7 +26046,12 @@ function portal() {
         let d = {};
         try { d = JSON.parse(ev.data || "{}"); } catch (_) { d = {}; }
         this.toast(this.lang === "zh" ? "已中断" : "Interrupted", "warn", 2000);
-        es.close(); _markDone(true, false, true); _stopTimer();
+        es.close();
+        _markDone(true, false, true, {
+          model: modelForBubble,
+          turnStatus: "cancelled",
+        });
+        _stopTimer();
         // A force-stopped CLI may never commit this turn to canonical JSONL.
         // The backend writes the already-rendered SSE record to a private,
         // display-only snapshot BEFORE emitting snapshot_ready. Reconcile that

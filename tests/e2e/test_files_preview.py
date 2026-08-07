@@ -119,6 +119,12 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
           };
           const prefs = JSON.parse(localStorage.getItem('muselab_prefs') || '{}');
           localStorage.setItem('muselab_prefs', JSON.stringify({
+            schema: 8, leftWidth: 280, previewWidth: 440,
+          }));
+          app.leftWidth = 280;
+          app.loadPrefs();
+          const fileWidthMigration = app.leftWidth;
+          localStorage.setItem('muselab_prefs', JSON.stringify({
             schema: 7, rightOpen: false, rightWidth: 512,
           }));
           app.previewOpen = true;
@@ -149,7 +155,7 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
           };
           app.toggleDesktopFull('chat');
           return {
-            before, hidden, restored, prefs, migration,
+            before, hidden, restored, prefs, migration, fileWidthMigration,
             previewFullscreen, chatFullscreen,
           };
         }"""
@@ -167,11 +173,12 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["restored"]["previewDisplay"] == "flex"
     assert result["restored"]["chat"]["right"] <= result["restored"]["preview"]["left"]
     assert result["restored"]["sameChatNode"] is True
-    assert result["prefs"]["schema"] == 8
+    assert result["prefs"]["schema"] == 9
     assert result["prefs"]["previewOpen"] is True
     assert result["prefs"]["previewWidth"] == 440
     assert "rightOpen" not in result["prefs"]
     assert "rightWidth" not in result["prefs"]
+    assert result["fileWidthMigration"] == 340
     assert result["migration"] == {"previewOpen": True, "previewWidth": 512}
     assert result["previewFullscreen"]["previewOpen"] is True
     assert result["previewFullscreen"]["preview"]["width"] == 1440
@@ -179,6 +186,147 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["chatFullscreen"]["chat"]["width"] == 1440
     assert result["chatFullscreen"]["previewDisplay"] == "none"
     assert result["chatFullscreen"]["sameChatNode"] is True
+
+
+def test_os_file_drop_uses_whole_window_root_except_explicit_directory(
+        page: Page, backend_url, auth_token):
+    """Composer/tree blank/file rows are root; only a dir row is nested."""
+    errors: list[str] = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const uploads = [];
+          const attachments = [];
+          const internalMoves = [];
+          app._uploadFilesToDir = async (dir, files) => {
+            uploads.push({dir, names: Array.from(files, file => file.name)});
+          };
+          app._attachFile = async file => attachments.push(file.name);
+          app.moveTreeItems = async (paths, dir) => {
+            internalMoves.push({paths: Array.from(paths), dir});
+          };
+
+          const list = document.querySelector('.filelist');
+          const dirRow = document.createElement('li');
+          dirRow.className = 'dir';
+          dirRow.dataset.path = 'drop-target-dir';
+          dirRow.innerHTML = '<span class="name">drop-target-dir</span>';
+          const dirNode = {is_dir: true, path: 'drop-target-dir'};
+          dirRow.addEventListener('dragover', event => {
+            event.preventDefault();
+            app.onTreeNodeDragOver(event, dirNode);
+          });
+          dirRow.addEventListener('drop', event => {
+            event.preventDefault();
+            void app.onDrop(event, dirNode);
+          });
+          list.appendChild(dirRow);
+          const fileRow = document.createElement('li');
+          fileRow.className = 'file';
+          fileRow.dataset.path = 'drop-target-dir/existing.txt';
+          fileRow.innerHTML = '<span class="name">existing.txt</span>';
+          list.appendChild(fileRow);
+
+          const overlay = document.querySelector('.global-file-drop-overlay');
+          const settle = () => new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const transfer = name => {
+            const dt = new DataTransfer();
+            dt.items.add(new File(['fixture'], name, {type: 'text/plain'}));
+            return dt;
+          };
+          const enter = async (target, name) => {
+            const dt = transfer(name);
+            target.dispatchEvent(new DragEvent('dragenter', {
+              bubbles: true, cancelable: true, dataTransfer: dt,
+            }));
+            target.dispatchEvent(new DragEvent('dragover', {
+              bubbles: true, cancelable: true, dataTransfer: dt,
+            }));
+            await settle();
+            return dt;
+          };
+          const drop = async (target, dt) => {
+            target.dispatchEvent(new DragEvent('drop', {
+              bubbles: true, cancelable: true, dataTransfer: dt,
+            }));
+            await settle();
+          };
+
+          const chat = document.querySelector('.chat-input-wrap');
+          let dt = await enter(chat, 'chat-root.txt');
+          const rootOverlay = {
+            visible: !!overlay.getClientRects().length,
+            directory: app.osFileDropOnDirectory,
+            text: overlay.textContent.replace(/\\s+/g, ' ').trim(),
+          };
+          await drop(chat, dt);
+
+          dt = await enter(list, 'tree-blank-root.txt');
+          await drop(list, dt);
+
+          dt = await enter(dirRow.querySelector('.name'), 'nested.txt');
+          const dirOverlay = {
+            visible: !!overlay.getClientRects().length,
+            directory: app.osFileDropOnDirectory,
+            dir: app.osFileDropDir,
+            text: overlay.textContent.replace(/\\s+/g, ' ').trim(),
+          };
+          await drop(dirRow.querySelector('.name'), dt);
+
+          dt = await enter(fileRow.querySelector('.name'), 'file-row-root.txt');
+          await drop(fileRow.querySelector('.name'), dt);
+
+          // The document capture route must ignore MuseLab's own tree drag.
+          const internal = new DataTransfer();
+          internal.setData(app._DRAG_MIME_INTERNAL, 'README.md');
+          internal.setData('text/plain', 'README.md');
+          app._dragSrcPath = 'README.md';
+          dirRow.querySelector('.name').dispatchEvent(new DragEvent('dragover', {
+            bubbles: true, cancelable: true, dataTransfer: internal,
+          }));
+          dirRow.querySelector('.name').dispatchEvent(new DragEvent('drop', {
+            bubbles: true, cancelable: true, dataTransfer: internal,
+          }));
+          await settle();
+          const internalOverlay = app.osFileDragging;
+          dirRow.remove();
+          fileRow.remove();
+          return {
+            uploads, attachments, internalMoves, internalOverlay,
+            rootOverlay, dirOverlay,
+            dragging: app.osFileDragging,
+            dropDir: app.osFileDropDir,
+          };
+        }"""
+    )
+
+    assert result["uploads"] == [
+        {"dir": "", "names": ["chat-root.txt"]},
+        {"dir": "", "names": ["tree-blank-root.txt"]},
+        {"dir": "drop-target-dir", "names": ["nested.txt"]},
+        {"dir": "", "names": ["file-row-root.txt"]},
+    ]
+    assert result["attachments"] == []
+    assert result["internalMoves"] == [
+        {"paths": ["README.md"], "dir": "drop-target-dir"},
+    ]
+    assert result["internalOverlay"] is False
+    assert result["rootOverlay"]["visible"] is True
+    assert result["rootOverlay"]["directory"] is False
+    assert ("工作区根目录" in result["rootOverlay"]["text"]
+            or "workspace root" in result["rootOverlay"]["text"])
+    assert result["dirOverlay"]["visible"] is True
+    assert result["dirOverlay"]["directory"] is True
+    assert result["dirOverlay"]["dir"] == "drop-target-dir"
+    assert "/drop-target-dir" in result["dirOverlay"]["text"]
+    assert result["dragging"] is False
+    assert result["dropDir"] == ""
+    assert errors == []
 
 
 def test_file_metadata_layout_is_compact_and_human_readable(
@@ -312,11 +460,15 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
             return meta;
           };
           app.send = async opts => {
-            window.__previewAskOptions = JSON.parse(JSON.stringify(opts));
+            window.__previewAskOptions = window.__previewAskOptions || [];
+            window.__previewAskOptions.push(JSON.parse(JSON.stringify(opts)));
             const st = app._ensureTabState(opts.sessionId);
-            st.messages.splice(0, st.messages.length,
-              {role: 'user', text: opts.detachedText},
-              {role: 'assistant', text: 'SIDE_ANSWER_MARKER'});
+            const turn = window.__previewAskOptions.length;
+            if (turn === 1) st.messages.splice(0, st.messages.length);
+            st.messages.push(
+              {role: 'user', text: opts.detachedText,
+               displayText: opts.detachedDisplayText},
+              {role: 'assistant', text: `SIDE_ANSWER_MARKER_${turn}`});
             st.streaming = false;
             return true;
           };
@@ -332,7 +484,16 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
     ask.locator('button[type="submit"]').click()
     expect(page.locator(".preview-selection-answer")).to_be_visible()
     expect(page.locator(".preview-selection-answer-body")).to_contain_text(
-        "SIDE_ANSWER_MARKER"
+        "SIDE_ANSWER_MARKER_1"
+    )
+    followup = page.locator(".preview-selection-followup textarea")
+    followup.fill("能再举一个例子吗？")
+    page.locator(".preview-selection-followup-send").click()
+    expect(page.locator(".preview-selection-conversation")).to_contain_text(
+        "SIDE_ANSWER_MARKER_2"
+    )
+    expect(page.locator(".preview-selection-conversation")).to_contain_text(
+        "能再举一个例子吗？"
     )
 
     asked = page.evaluate(
@@ -358,11 +519,17 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
           };
         }"""
     )
-    assert asked["opts"]["sessionId"] == "preview-side-question"
-    assert asked["opts"]["permissionMode"] == "default"
-    assert "引用自 `README.md`" in asked["opts"]["detachedText"]
-    assert selected_for_ask in asked["opts"]["detachedText"]
-    assert "这段内容的核心是什么？" in asked["opts"]["detachedText"]
+    assert len(asked["opts"]) == 2
+    first, followup_opts = asked["opts"]
+    assert first["sessionId"] == followup_opts["sessionId"] == "preview-side-question"
+    assert first["permissionMode"] == followup_opts["permissionMode"] == "default"
+    assert "引用自 `README.md`" in first["detachedText"]
+    assert selected_for_ask in first["detachedText"]
+    assert "这段内容的核心是什么？" in first["detachedText"]
+    assert first["detachedDisplayText"] == "这段内容的核心是什么？"
+    assert "追问：" in followup_opts["detachedText"]
+    assert "能再举一个例子吗？" in followup_opts["detachedText"]
+    assert followup_opts["detachedDisplayText"] == "能再举一个例子吗？"
     assert asked["create"]["snapshot"]["sessionId"] == before["session"]
     assert asked["create"]["question"] == "这段内容的核心是什么？"
     assert asked["input"] == asked["draft"] == "KEEP EXISTING DRAFT"
@@ -429,6 +596,8 @@ def test_selection_side_session_forks_without_opening_or_switching_tab(
     assert fork_bodies == [{
         "up_to_message_id": "assistant-boundary",
         "title": fork_bodies[0]["title"],
+        "activity_hidden": True,
+        "runtime_profile": "side_question",
     }]
     assert "独立侧问" in fork_bodies[0]["title"]
     assert result["id"] == child
@@ -437,6 +606,70 @@ def test_selection_side_session_forks_without_opening_or_switching_tab(
     assert child not in result["openTabs"]
     assert result["stateLoaded"] is True
     assert result["statePermission"] == "default"
+
+
+def test_side_question_window_stays_floating_until_explicit_close(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1200, "height": 800})
+    _login(page, backend_url, auth_token)
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'README.md' && app.previewMode === 'md';
+        }"""
+    )
+    _select_rendered_preview_text(page)
+    page.locator(".preview-selection-actions button").nth(1).click()
+    popover = page.locator(".preview-selection-popover")
+    textarea = page.locator(".preview-selection-ask:visible textarea")
+    expect(textarea).to_be_visible()
+    textarea.fill("FLOATING_QUESTION_DRAFT")
+
+    # An ordinary click elsewhere used to close the window in capture phase.
+    page.locator(".filelist").click(position={"x": 6, "y": 6})
+    expect(popover).to_be_visible()
+    expect(textarea).to_have_value("FLOATING_QUESTION_DRAFT")
+
+    # File selection, chat-tab ownership and preview scrolling are all page
+    # navigation, not an implicit close command for an independent question.
+    state = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const source = app.currentId;
+          const other = '22222222-3333-4444-8555-666666666666';
+          app.sessions = [...app.sessions, {
+            id: other, name: 'Other chat', model: app.model,
+            permission: 'default', cwd: app.currentWorkspacePath(),
+          }];
+          app.openTabIds = [...app.openTabIds, other];
+          app._ensureTabState(other)._loaded = true;
+          app.selected = 'notes/a.md';
+          app.currentId = other;
+          app.onPreviewViewportScroll();
+          await new Promise(resolve => app.$nextTick(resolve));
+          const switched = {
+            show: app.previewQuote.show,
+            mode: app.previewQuote.mode,
+            question: app.previewQuote.question,
+          };
+          app.currentId = source;
+          app.openTabIds = app.openTabIds.filter(id => id !== other);
+          app.sessions = app.sessions.filter(row => row.id !== other);
+          delete app.tabState[other];
+          await new Promise(resolve => app.$nextTick(resolve));
+          return switched;
+        }"""
+    )
+    assert state == {
+        "show": True,
+        "mode": "ask",
+        "question": "FLOATING_QUESTION_DRAFT",
+    }
+    expect(popover).to_be_visible()
+
+    page.locator(".preview-selection-ask:visible .preview-selection-close").click()
+    expect(popover).to_be_hidden()
 
 
 def test_selection_side_question_window_drags_by_header_and_stays_in_view(

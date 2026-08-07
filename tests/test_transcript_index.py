@@ -385,6 +385,134 @@ def test_window_endpoint_interleaves_cancelled_snapshot_at_original_anchor(
     ]
 
 
+def test_late_canonical_flush_keeps_interrupted_footer_after_refresh(
+    client, auth, app_module, tmp_path,
+):
+    """A delayed AssistantMessage must inherit the earlier interrupt truth.
+
+    This reproduces the live race: Stop renders an interrupted footer while
+    the CLI is being torn down, the browser refreshes, and only then does the
+    canonical assistant row reach JSONL.  It must not be inferred completed
+    merely because a later user turn now follows it.
+    """
+    from backend import chat as chat_mod
+
+    initial = [
+        _entry("u0", "user", "before",
+               timestamp="2024-01-01T00:00:00.000Z"),
+        _entry("a0", "assistant", "before answer", "u0",
+               timestamp="2024-01-01T00:00:00.500Z"),
+    ]
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, initial)
+    _, boundary = chat_mod._turn_transcript_boundary(
+        sid, "claude-sonnet-4-6")
+    bc = chat_mod.TurnBroadcast(
+        session_id=sid, model="codex:gpt-5.6-sol")
+    bc.user_text = "repeatable prompt"
+    bc.started_at = 1_704_067_201.0
+    bc.cancelled_at_ms = 1_704_067_202_500
+    bc.cancelled = True
+    bc.canonical_terminal_published = True
+    bc.transcript_boundary = boundary
+    bc.publish({
+        "event": "text",
+        "data": json.dumps({"text": "live partial"}),
+    })
+
+    try:
+        # No AssistantMessage UUID exists yet.  The canonical-terminal flag
+        # must no longer suppress the temporary interrupted snapshot.
+        assert chat_mod._persist_cancelled_turn_snapshot(bc) is True
+        snapshot_path = chat_mod._cancelled_turn_snapshot_path(sid, bc.turn_id)
+        assert snapshot_path is not None and snapshot_path.exists()
+
+        _append(
+            transcript,
+            _entry("u-cancel", "user", "repeatable prompt", "a0",
+                   timestamp="2024-01-01T00:00:01.200Z"),
+            _entry("a-cancel", "assistant", "late canonical partial", "u-cancel",
+                   timestamp="2024-01-01T00:00:05.000Z"),
+            _entry("u-after", "user", "repeatable prompt", "a-cancel",
+                   timestamp="2024-01-01T00:00:06.000Z"),
+            _entry("a-after", "assistant", "later success", "u-after",
+                   timestamp="2024-01-01T00:00:07.000Z"),
+        )
+
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 20})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert [(item["uuid"], item["role"]) for item in body["messages"]] == [
+            ("u0", "user"), ("a0", "assistant"),
+            ("u-cancel", "user"), ("a-cancel", "assistant"),
+            ("u-after", "user"), ("a-after", "assistant"),
+        ]
+        cancelled = next(
+            item for item in body["messages"] if item["uuid"] == "a-cancel")
+        assert cancelled["turn_status"] == "cancelled"
+        assert cancelled["ts"] == bc.cancelled_at_ms
+        assert cancelled["elapsed"] == 1.5
+        assert cancelled["model"] == "codex:gpt-5.6-sol"
+        assert not snapshot_path.exists()
+        assert chat_mod.sess.get_message_annotations(sid)["a-cancel"][
+            "turn_status"] == "cancelled"
+    finally:
+        bc.close()
+
+
+def test_interrupted_snapshot_never_steals_post_interrupt_resend(
+    client, auth, app_module, tmp_path,
+):
+    """A result-less stop must not mark a fast same-text resend cancelled."""
+    from backend import chat as chat_mod
+
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, [
+            _entry("u0", "user", "before",
+                   timestamp="2024-01-01T00:00:00.000Z"),
+            _entry("a0", "assistant", "before answer", "u0",
+                   timestamp="2024-01-01T00:00:00.500Z"),
+        ])
+    _, boundary = chat_mod._turn_transcript_boundary(
+        sid, "claude-sonnet-4-6")
+    bc = chat_mod.TurnBroadcast(
+        session_id=sid, model="codex:gpt-5.6-sol")
+    bc.user_text = "same prompt"
+    bc.started_at = 1_704_067_201.0
+    bc.cancelled_at_ms = 1_704_067_202_000
+    bc.cancelled = True
+    bc.transcript_boundary = boundary
+    bc.publish({
+        "event": "text", "data": json.dumps({"text": "stopped partial"}),
+    })
+
+    try:
+        assert chat_mod._persist_cancelled_turn_snapshot(bc) is True
+        snapshot_path = chat_mod._cancelled_turn_snapshot_path(sid, bc.turn_id)
+        assert snapshot_path is not None and snapshot_path.exists()
+        # The interrupted query wrote no canonical user row.  A new turn with
+        # identical text starts after the click and must remain completed.
+        _append(
+            transcript,
+            _entry("u-resend", "user", "same prompt", "a0",
+                   timestamp="2024-01-01T00:00:03.000Z"),
+            _entry("a-resend", "assistant", "successful resend", "u-resend",
+                   timestamp="2024-01-01T00:00:04.000Z"),
+        )
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 20})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        resend = next(
+            item for item in body["messages"] if item.get("uuid") == "a-resend")
+        assert resend["turn_status"] == "completed"
+        assert snapshot_path.exists()
+        assert "a-resend" not in chat_mod.sess.get_message_annotations(sid)
+    finally:
+        bc.close()
+
+
 def test_endpoint_reports_pre_total_and_zeroes_it_in_full_order(
     client, auth, app_module, tmp_path,
 ):
@@ -481,6 +609,123 @@ def test_cross_window_tool_context_task_status_generation_and_around(
     )
     assert stale.status_code == 409
     assert stale.json()["detail"]["error"] == "history_generation_mismatch"
+
+
+def test_reload_footer_recovers_hidden_continuation_start_and_four_fields(
+    client, auth, app_module, tmp_path,
+):
+    """A zero-bubble task notification is the continuation's turn boundary."""
+    from backend import chat as chat_mod
+
+    notification = (
+        "<task-notification><tool-use-id>toolu_bg</tool-use-id>"
+        "<task-id>bg1</task-id><status>completed</status>"
+        "<summary>done</summary></task-notification>"
+    )
+    entries = [
+        _entry("u1", "user", "launch", timestamp="2026-08-07T10:35:20Z"),
+        _entry("a1", "assistant", [{
+            "type": "tool_use", "id": "toolu_bg", "name": "Bash",
+            "input": {"command": "sleep 20", "run_in_background": True},
+        }], "u1", timestamp="2026-08-07T10:35:22Z"),
+        _entry("tr1", "user", [{
+            "type": "tool_result", "tool_use_id": "toolu_bg",
+            "content": "started",
+        }], "a1", timestamp="2026-08-07T10:35:23Z"),
+        # This record renders no user bubble and therefore is outside a normal
+        # bubble-window read, but it is the true start of the auto-continuation.
+        _entry("notify1", "user", notification, "tr1",
+               timestamp="2026-08-07T10:35:34Z"),
+        _entry("a2", "assistant", "background task finished", "notify1",
+               timestamp="2026-08-07T10:35:40Z"),
+        _entry("u2", "user", "next", "a2",
+               timestamp="2026-08-07T10:37:26Z"),
+        _entry("a3", "assistant", "next answer", "u2",
+               timestamp="2026-08-07T10:37:29Z"),
+    ]
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+
+    response = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+    assert response.status_code == 200, response.text
+    messages = response.json()["messages"]
+    continuation_tail = next(item for item in messages if item["uuid"] == "a2")
+
+    assert continuation_tail["turn_status"] == "completed"
+    assert continuation_tail["ts"] == 1_786_098_940_000
+    assert continuation_tail["elapsed"] == 6.0
+    assert continuation_tail["model"] == "claude-sonnet-4-6"
+    assert continuation_tail["turn_started_at"] == 1_786_098_934_000
+    assert continuation_tail["_turn_origin_uuid"] == "notify1"
+
+
+def test_reload_footer_moves_cancel_annotation_to_actual_tool_result_tail(
+    client, auth, app_module, tmp_path,
+):
+    """The footer mounts after tool_result, not on the annotated assistant."""
+    from backend import chat as chat_mod
+
+    entries = [
+        _entry("u1", "user", "run", timestamp="2026-08-07T11:34:00Z"),
+        _entry("a1", "assistant", [{
+            "type": "tool_use", "id": "toolu_stop", "name": "Bash",
+            "input": {"command": "sleep 30"},
+        }], "u1", timestamp="2026-08-07T11:34:01Z"),
+        _entry("tr1", "user", [{
+            "type": "tool_result", "tool_use_id": "toolu_stop",
+            "content": "stopped",
+        }], "a1", timestamp="2026-08-07T11:34:06Z"),
+        _entry("u2", "user", "after", "tr1",
+               timestamp="2026-08-07T11:35:00Z"),
+    ]
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    chat_mod.sess.set_message_annotation(
+        sid, "a1",
+        model="codex:gpt-5.6-sol",
+        ts=1_786_102_446_000,
+        turn_status="cancelled",
+        elapsed_s=6.0,
+    )
+
+    response = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+    assert response.status_code == 200, response.text
+    tail = next(item for item in response.json()["messages"]
+                if item["uuid"] == "tr1")
+
+    assert tail["turn_status"] == "cancelled"
+    assert tail["ts"] == 1_786_102_446_000
+    assert tail["elapsed"] == 6.0
+    assert tail["model"] == "codex:gpt-5.6-sol"
+
+
+def test_reload_footer_exposes_four_fields_for_active_canonical_tail(
+    client, auth, app_module, tmp_path,
+):
+    from backend import chat as chat_mod
+
+    entries = [
+        _entry("u1", "user", "run", timestamp="2026-08-07T11:34:00Z"),
+        _entry("a1", "assistant", "partial", "u1",
+               timestamp="2026-08-07T11:34:02Z"),
+    ]
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    active = chat_mod.TurnBroadcast(sid, model="codex:gpt-5.6-sol")
+    active.last_assistant_uuid = "a1"
+    chat_mod._active_turns[sid] = active
+    try:
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 50})
+        assert response.status_code == 200, response.text
+        tail = response.json()["messages"][-1]
+
+        assert tail["turn_status"] == "running"
+        assert tail["turn_started_at"] == 1_786_102_440_000
+        assert tail["elapsed"] >= 0
+        assert tail["model"] == "codex:gpt-5.6-sol"
+    finally:
+        chat_mod._active_turns.pop(sid, None)
+        active.close()
 
 
 def test_around_uuid_limit_is_in_bubbles_and_keeps_target(

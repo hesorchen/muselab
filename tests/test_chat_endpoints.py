@@ -813,6 +813,7 @@ def test_fork_inherits_session_settings_and_records_lineage(
     )
     assert source.status_code == 200, source.text
     sid = source.json()["id"]
+    assert source.json()["activity_hidden"] is False
     chat_mod.sess.update_permission(sid, "plan")
     chat_mod.sess.update_effort(sid, "high")
     chat_mod.sess.update_service_tier(sid, "fast")
@@ -828,7 +829,12 @@ def test_fork_inherits_session_settings_and_records_lineage(
     response = client.post(
         f"/api/chat/sessions/{sid}/fork",
         headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
-        json={"up_to_message_id": boundary, "title": "source chat · 分支"},
+        json={
+            "up_to_message_id": boundary,
+            "title": "source chat · 分支",
+            "activity_hidden": True,
+            "runtime_profile": "side_question",
+        },
     )
 
     assert response.status_code == 200, response.text
@@ -849,6 +855,8 @@ def test_fork_inherits_session_settings_and_records_lineage(
     assert body["forked_from"] == sid
     assert body["forked_from_name"] == "source chat"
     assert body["forked_from_message_id"] == boundary
+    assert body["activity_hidden"] is True
+    assert body["runtime_profile"] == "side_question"
     assert body["cwd"] == source.json()["cwd"]
 
 
