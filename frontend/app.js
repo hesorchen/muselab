@@ -405,6 +405,16 @@ function portal() {
       // converts x/y to viewport-relative top/left coordinates until close.
       dragged: false, dragging: false,
     },
+    // Per-turn memory recall details are rendered in a root-level fixed
+    // popover. Keeping the card outside .chat-body is load-bearing: every pane
+    // intentionally clips overflow, so no descendant z-index can escape the
+    // transcript/composer/preview boundaries.
+    memoryRecallPopover: {
+      show: false, recall: null, style: "",
+    },
+    _memoryRecallAnchor: null,
+    _memoryRecallOwner: null,
+    _memoryRecallPositionFrame: 0,
     _previewSelectionBound: false,
     _previewSelectionTimer: null,
     _previewQuoteDrag: null,
@@ -547,9 +557,9 @@ function portal() {
     },
     activity: {
       show: false, loading: false, events: [],
-      // The global center opens on the cross-status timeline by default.
-      // An explicit user choice is still restored from localStorage.
-      view: "timeline",
+      // Custom groups are the primary organization surface. An explicit user
+      // choice is still restored from localStorage.
+      view: "groups",
       viewLoaded: false,
       summary: {
         running: 0, unread: 0, attention: 0,
@@ -561,6 +571,13 @@ function portal() {
       expanded: {},
       // Selected group keys. Empty array = no filter = show every group.
       filter: [],
+      customGroups: [],
+      groupEditor: {
+        open: false, id: "", name: "", color: "blue", saving: false,
+      },
+      moveMenu: { show: false, eventId: "", style: "" },
+      dragEventId: "",
+      dragOverGroupId: null,
     },
     _activityEtags: {},
     _activityFetchPromises: {},
@@ -573,6 +590,7 @@ function portal() {
     _activityLiveTimer: null,
     _activityLiveVisibilityBound: false,
     _activityPinPending: {},
+    _activityGroupPending: {},
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -1279,6 +1297,8 @@ function portal() {
         }
       }
       if (ev.key === "Escape") {
+        if (this.memoryRecallPopover.show) { this.closeMemoryRecallPopover(); return; }
+        if (this.activity.moveMenu.show) { this.closeActivityMoveMenu(); return; }
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
         if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
@@ -1339,6 +1359,10 @@ function portal() {
       this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
+      window.addEventListener("resize", () => {
+        this._queueMemoryRecallPosition();
+        if (this.activity.moveMenu.show) this.closeActivityMoveMenu();
+      });
       // (Cross-tab queue sync via localStorage `storage` events was removed
       // when the queue moved server-side: there's one authoritative copy now,
       // and each tab refreshes its mirror via _syncQueueFromServer on load /
@@ -1385,6 +1409,8 @@ function portal() {
       // picker, slash /resume, etc. without requiring each entry point
       // to remember to call _scrollTabIntoView.
       this.$watch("currentId", (tid) => {
+        this.closeMemoryRecallPopover();
+        this.closeActivityMoveMenu();
         if (this.previewQuote.show && this.previewQuote.sessionId
             && this.previewQuote.sessionId !== tid) {
           this.dismissTransientPreviewQuote(true);
@@ -13768,6 +13794,94 @@ function portal() {
       }
     },
 
+    toggleMemoryRecallPopover(ev, message) {
+      if (this.memoryRecallPopover.show && this._memoryRecallOwner === message) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const recall = message?.memoryRecall;
+      const anchor = ev?.currentTarget;
+      if (!recall || !anchor) return;
+      if (this.previewQuote.show && this.previewQuote.mode !== "ask") {
+        this.dismissPreviewQuote(true);
+      }
+      this._memoryRecallOwner = message;
+      this._memoryRecallAnchor = anchor;
+      this.memoryRecallPopover = {
+        show: true,
+        recall,
+        style: "position:fixed;left:12px;top:12px;visibility:hidden;",
+      };
+      this.$nextTick(() => this._positionMemoryRecallPopover());
+    },
+
+    _queueMemoryRecallPosition() {
+      if (!this.memoryRecallPopover.show || this._memoryRecallPositionFrame) return;
+      this._memoryRecallPositionFrame = requestAnimationFrame(() => {
+        this._memoryRecallPositionFrame = 0;
+        this._positionMemoryRecallPopover();
+      });
+    },
+
+    _positionMemoryRecallPopover() {
+      if (!this.memoryRecallPopover.show) return;
+      const anchor = this._memoryRecallAnchor;
+      const popover = document.querySelector(".memory-recall-global");
+      if (!anchor?.isConnected || !popover) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const pad = 12;
+      const gap = 8;
+      const anchorRect = anchor.getBoundingClientRect();
+      if (anchorRect.bottom < 0 || anchorRect.top > viewportHeight) {
+        this.closeMemoryRecallPopover();
+        return;
+      }
+      const width = Math.max(1, Math.min(420, viewportWidth - pad * 2));
+      const maxHeight = Math.max(1, Math.min(420, viewportHeight - pad * 2));
+      // Measure at the final width.  Measuring the unconstrained portal first
+      // makes long memory text look like one short line; after width is
+      // applied it wraps taller and can fall below the viewport even though
+      // the initial geometry appeared to fit.
+      popover.style.width = `${Math.round(width)}px`;
+      popover.style.maxHeight = `${Math.round(maxHeight)}px`;
+      popover.style.left = `${pad}px`;
+      popover.style.top = `${pad}px`;
+      const measuredHeight = Math.min(
+        maxHeight,
+        Math.max(1, popover.getBoundingClientRect().height || popover.scrollHeight),
+      );
+      const centered = anchorRect.left + anchorRect.width / 2 - width / 2;
+      const left = Math.max(pad, Math.min(centered, viewportWidth - width - pad));
+      const roomAbove = anchorRect.top - pad - gap;
+      const roomBelow = viewportHeight - anchorRect.bottom - pad - gap;
+      const openAbove = roomAbove >= measuredHeight || roomAbove > roomBelow;
+      const top = openAbove
+        ? Math.max(pad, anchorRect.top - gap - measuredHeight)
+        : Math.min(viewportHeight - pad - measuredHeight, anchorRect.bottom + gap);
+      this.memoryRecallPopover.style = [
+        "position:fixed",
+        `left:${Math.round(left)}px`,
+        `top:${Math.round(Math.max(pad, top))}px`,
+        `width:${Math.round(width)}px`,
+        `max-height:${Math.round(maxHeight)}px`,
+        "visibility:visible",
+      ].join(";");
+    },
+
+    closeMemoryRecallPopover() {
+      if (this._memoryRecallPositionFrame) {
+        cancelAnimationFrame(this._memoryRecallPositionFrame);
+        this._memoryRecallPositionFrame = 0;
+      }
+      this.memoryRecallPopover = { show: false, recall: null, style: "" };
+      this._memoryRecallAnchor = null;
+      this._memoryRecallOwner = null;
+    },
+
     // ===== settings modal =====
     async openSettings(activePage = "") {
       const r = await fetch("/api/settings", { headers: this.hdr() });
@@ -23884,6 +23998,7 @@ function portal() {
       }
     },
     onChatScroll() {
+      this._queueMemoryRecallPosition();
       const el = this.$refs.chatBody;
       if (!el) return;
       const st = this.currentId && this.tabState && this.tabState[this.currentId];
@@ -26914,6 +27029,9 @@ function portal() {
             this.activity.events = data.events;
             this._syncScheduledActivitySnapshot(data.events);
           }
+          if (!opts.summaryOnly && Array.isArray(data.custom_groups)) {
+            this.activity.customGroups = data.custom_groups;
+          }
           this._syncAppBadge();
           return true;
         } catch (_) { return false; }
@@ -26923,11 +27041,12 @@ function portal() {
       finally { if (this._activityFetchPromises[key] === promise) delete this._activityFetchPromises[key]; }
     },
     async openActivityCenter() {
+      this.closeMemoryRecallPopover();
       if (!this.activity.viewLoaded) {
         this.activity.viewLoaded = true;
         try {
           const saved = localStorage.getItem("muselab_activity_view");
-          if (saved === "status" || saved === "timeline") {
+          if (["status", "groups", "timeline"].includes(saved)) {
             this.activity.view = saved;
           } else if (saved === "finished") {
             // Migrate the short-lived terminal-only view to the corrected
@@ -26941,8 +27060,17 @@ function portal() {
       await this.fetchActivity();
       this.activity.loading = false;
     },
+    closeActivityCenter() {
+      this.activity.show = false;
+      this.closeActivityMoveMenu();
+      this.cancelActivityGroupEditor();
+      this.onActivityDragEnd();
+    },
     setActivityView(view) {
-      if (view !== "status" && view !== "timeline") return;
+      if (!["status", "groups", "timeline"].includes(view)) return;
+      this.closeActivityMoveMenu();
+      this.cancelActivityGroupEditor();
+      this.onActivityDragEnd();
       this.activity.view = view;
       try { localStorage.setItem("muselab_activity_view", view); } catch (_) {}
     },
@@ -26959,9 +27087,34 @@ function portal() {
     },
     ACTIVITY_GROUP_CAP: 5,
     ACTIVITY_TIMELINE_CAP: 15,
+    ACTIVITY_GROUP_COLORS: [
+      "blue", "violet", "cyan", "green", "amber", "rose", "gray",
+    ],
+    activityCustomGroupSections() {
+      const sections = (this.activity.customGroups || []).map(group => ({
+        key: `custom:${group.id}`,
+        label: group.name,
+        custom: true,
+        groupId: group.id,
+        color: group.color || "blue",
+      }));
+      sections.push({
+        key: "custom:__ungrouped__",
+        label: this.lang === "zh" ? "未分组" : "Ungrouped",
+        custom: true,
+        groupId: "",
+        color: "gray",
+        builtin: true,
+      });
+      return sections;
+    },
     activityMatchesGroup(item, key) {
       if (!item) return false;
       if (key === "timeline") return true;
+      if (key === "custom:__ungrouped__") return !String(item.group_id || "");
+      if (key.startsWith("custom:")) {
+        return String(item.group_id || "") === key.slice("custom:".length);
+      }
       if (key === "review") return item.state === "completed" && !item.read;
       if (key === "running") return ["running", "waiting_approval", "paused"].includes(item.state);
       if (key === "failed") return item.state === "failed";
@@ -26975,12 +27128,25 @@ function portal() {
     },
     activityAllEvents(group) {
       const activeRank = { waiting_approval: 0, paused: 1, running: 2 };
+      const attentionRank = item => {
+        if (this.activityRequiresAction(item)) return 0;
+        if (this.activityIsUnreadResult(item)) return 1;
+        if (["running", "waiting_approval", "paused"].includes(item.state)) return 2;
+        return 3;
+      };
       return (this.activity.events || [])
         .filter(item => this.activityMatchesGroup(item, group.key))
         .sort((a, b) => {
           if (group.key === "timeline") {
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
+          if (group.custom) {
+            const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
+            if (pinRank) return pinRank;
+            const rank = attentionRank(a) - attentionRank(b);
+            if (rank) return rank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
           if (group.key === "running") {
@@ -27007,6 +27173,7 @@ function portal() {
       this.activity.expanded[key] = !this.activity.expanded[key];
     },
     activityGroupCount(group) {
+      if (group?.custom) return this.activityAllEvents(group).length;
       const count = this.activity.summary?.groups?.[group.key];
       return Number.isFinite(Number(count))
         ? Number(count) : this.activityAllEvents(group).length;
@@ -27019,6 +27186,9 @@ function portal() {
             ? "全部任务（置顶优先 · 时间倒序）"
             : "All tasks (pinned, then newest)",
         }];
+      }
+      if (this.activity.view === "groups") {
+        return this.activityCustomGroupSections();
       }
       const groups = this.activityGroups();
       const on = this.activity.filter || [];
@@ -27045,6 +27215,11 @@ function portal() {
       return !!item && ["waiting_approval", "paused"].includes(item.state);
     },
     activityGroupUnread(group) {
+      if (group?.custom) {
+        return this.activityAllEvents(group)
+          .filter(item => this.activityIsUnreadResult(item)
+            || this.activityRequiresAction(item)).length;
+      }
       const count = this.activity.summary?.group_unread?.[group.key];
       if (Number.isFinite(Number(count))) return Number(count);
       return this.activityAllEvents(group)
@@ -27141,6 +27316,224 @@ function portal() {
         this._activityPinPending = pending;
       }
     },
+    openActivityGroupEditor(group = null) {
+      const palette = this.ACTIVITY_GROUP_COLORS;
+      const fallback = palette[(this.activity.customGroups || []).length % palette.length];
+      this.closeActivityMoveMenu();
+      this.activity.groupEditor = {
+        open: true,
+        id: group?.groupId || group?.id || "",
+        name: group?.label || group?.name || "",
+        color: group?.color || fallback,
+        saving: false,
+      };
+      this.$nextTick(() => {
+        const input = document.querySelector(".activity-group-editor input");
+        if (input) input.focus();
+      });
+    },
+    cancelActivityGroupEditor() {
+      this.activity.groupEditor = {
+        open: false, id: "", name: "", color: "blue", saving: false,
+      };
+    },
+    async saveActivityGroup() {
+      const draft = this.activity.groupEditor;
+      const name = String(draft.name || "").trim();
+      if (!name || draft.saving) return;
+      draft.saving = true;
+      const editing = !!draft.id;
+      try {
+        const { ok, data, error } = await this.api(
+          editing
+            ? `/api/activity/groups/${encodeURIComponent(draft.id)}`
+            : "/api/activity/groups",
+          {
+            method: editing ? "PATCH" : "POST",
+            json: { name, color: draft.color || "blue" },
+          },
+        );
+        if (!ok || !Array.isArray(data?.custom_groups)) {
+          throw new Error(error || "activity group save failed");
+        }
+        this.activity.customGroups = data.custom_groups;
+        this._activityRevision = Math.max(
+          this._activityRevision, Number(data.revision) || 0,
+        );
+        this.cancelActivityGroupEditor();
+      } catch (error) {
+        draft.saving = false;
+        this.toast(
+          this.lang === "zh"
+            ? `保存分组失败：${String(error?.message || error)}`
+            : `Could not save group: ${String(error?.message || error)}`,
+          "error",
+        );
+      }
+    },
+    async deleteActivityGroup(group) {
+      if (!group?.groupId) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "删除分组？" : "Delete group?",
+        body: this.lang === "zh"
+          ? `“${group.label}”中的会话会移回“未分组”，会话本身不会删除。`
+          : `Sessions in “${group.label}” will move to Ungrouped. No session will be deleted.`,
+        okText: this.lang === "zh" ? "删除分组" : "Delete group",
+        danger: true,
+      });
+      if (!ok) return;
+      const groupId = group.groupId;
+      const { ok: deleted, data, error } = await this.api(
+        `/api/activity/groups/${encodeURIComponent(groupId)}`,
+        { method: "DELETE" },
+      );
+      if (!deleted) {
+        this.toast(
+          this.lang === "zh" ? "删除分组失败" : (error || "Could not delete group"),
+          "error",
+        );
+        return;
+      }
+      this.activity.customGroups = data?.custom_groups || [];
+      for (const item of this.activity.events) {
+        if (String(item.group_id || "") === groupId) delete item.group_id;
+      }
+      this.activity.events = [...this.activity.events];
+      this.activity.expanded = {};
+      this._activityRevision = Math.max(
+        this._activityRevision, Number(data?.revision) || 0,
+      );
+    },
+    async moveActivityGroup(group, delta) {
+      if (!group?.groupId || !delta) return;
+      const previous = [...(this.activity.customGroups || [])];
+      const at = previous.findIndex(row => row.id === group.groupId);
+      const target = at + delta;
+      if (at < 0 || target < 0 || target >= previous.length) return;
+      const next = [...previous];
+      const [moved] = next.splice(at, 1);
+      next.splice(target, 0, moved);
+      this.activity.customGroups = next;
+      const { ok, data } = await this.api("/api/activity/groups/order", {
+        method: "PUT",
+        json: { ids: next.map(row => row.id) },
+      });
+      if (!ok) {
+        this.activity.customGroups = previous;
+        this.toast(this.lang === "zh" ? "分组排序失败" : "Could not reorder groups", "error");
+        return;
+      }
+      if (Array.isArray(data?.custom_groups)) {
+        this.activity.customGroups = data.custom_groups;
+      }
+      this._activityRevision = Math.max(
+        this._activityRevision, Number(data?.revision) || 0,
+      );
+    },
+    activityGroupCanMove(group, delta) {
+      if (!group?.groupId) return false;
+      const at = (this.activity.customGroups || [])
+        .findIndex(row => row.id === group.groupId);
+      return at >= 0 && at + delta >= 0
+        && at + delta < (this.activity.customGroups || []).length;
+    },
+    openActivityMoveMenu(ev, item) {
+      if (!item?.id) return;
+      const rect = ev?.currentTarget?.getBoundingClientRect();
+      if (!rect) return;
+      const width = Math.min(230, window.innerWidth - 16);
+      const estimatedHeight = Math.min(
+        360, 48 + ((this.activity.customGroups || []).length + 1) * 34,
+      );
+      const left = Math.max(
+        8, Math.min(rect.right - width, window.innerWidth - width - 8),
+      );
+      const top = rect.bottom + 6 + estimatedHeight <= window.innerHeight - 8
+        ? rect.bottom + 6
+        : Math.max(8, rect.top - estimatedHeight - 6);
+      this.activity.moveMenu = {
+        show: true,
+        eventId: String(item.id),
+        style: `position:fixed;left:${Math.round(left)}px;top:${Math.round(top)}px;width:${Math.round(width)}px;`,
+      };
+    },
+    closeActivityMoveMenu() {
+      this.activity.moveMenu = { show: false, eventId: "", style: "" };
+    },
+    activityMoveMenuItem() {
+      const eventId = this.activity.moveMenu.eventId;
+      return this.activity.events.find(row => String(row.id) === eventId) || null;
+    },
+    async assignActivityGroup(item, groupId = "") {
+      if (!item?.id) return false;
+      const eventId = String(item.id);
+      if (this._activityGroupPending[eventId]) return false;
+      const target = String(groupId || "");
+      const previous = String(item.group_id || "");
+      this.closeActivityMoveMenu();
+      if (target === previous) return true;
+      this._activityGroupPending = {
+        ...this._activityGroupPending,
+        [eventId]: true,
+      };
+      if (target) item.group_id = target;
+      else delete item.group_id;
+      this.activity.events = [...this.activity.events];
+      this._activityAppliedSeq = ++this._activityRequestSeq;
+      try {
+        const { ok, data, error } = await this.api(
+          `/api/activity/${encodeURIComponent(eventId)}/group`,
+          { method: "PUT", json: { group_id: target } },
+        );
+        if (!ok || !data?.item) throw new Error(error || "group assignment failed");
+        const at = this.activity.events.findIndex(row => row.id === eventId);
+        if (at >= 0) this.activity.events.splice(at, 1, data.item);
+        this.activity.events = [...this.activity.events];
+        if (Array.isArray(data.custom_groups)) {
+          this.activity.customGroups = data.custom_groups;
+        }
+        this._activityRevision = Math.max(
+          this._activityRevision, Number(data.revision) || 0,
+        );
+        return true;
+      } catch (_) {
+        const latest = this.activity.events.find(row => row.id === eventId);
+        if (latest) {
+          if (previous) latest.group_id = previous;
+          else delete latest.group_id;
+        }
+        this.activity.events = [...this.activity.events];
+        this.toast(this.lang === "zh" ? "移动会话失败" : "Could not move session", "error");
+        return false;
+      } finally {
+        const pending = { ...this._activityGroupPending };
+        delete pending[eventId];
+        this._activityGroupPending = pending;
+      }
+    },
+    onActivityDragStart(ev, item) {
+      if (this.activity.view !== "groups" || !item?.id) return;
+      this.activity.dragEventId = String(item.id);
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", String(item.id));
+      }
+    },
+    onActivityDragEnd() {
+      this.activity.dragEventId = "";
+      this.activity.dragOverGroupId = null;
+    },
+    onActivityGroupDragOver(group) {
+      if (!this.activity.dragEventId) return;
+      this.activity.dragOverGroupId = group.groupId || "";
+    },
+    async onActivityGroupDrop(group) {
+      const eventId = this.activity.dragEventId;
+      this.onActivityDragEnd();
+      if (!eventId) return;
+      const item = this.activity.events.find(row => String(row.id) === eventId);
+      if (item) await this.assignActivityGroup(item, group.groupId || "");
+    },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
       if (this._activityLiveSource) {
@@ -27194,6 +27587,9 @@ function portal() {
       if (generation && generation !== this._activityGeneration) {
         this._activityGeneration = generation;
         this._activityRevision = 0;
+      }
+      if (Array.isArray(payload?.custom_groups)) {
+        this.activity.customGroups = payload.custom_groups;
       }
       const revision = Number(payload?.revision) || 0;
       if (revision && revision <= this._activityRevision) return;
@@ -27331,7 +27727,7 @@ function portal() {
     },
     async openActivityEvent(item) {
       if (!item) return;
-      this.activity.show = false;
+      this.closeActivityCenter();
       const ack = this.ackActivityEvent(item);
       const sid = item.session_id || item.thread_id;
       const opened = sid

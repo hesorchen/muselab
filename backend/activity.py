@@ -16,6 +16,11 @@ from .settings import ROOT, atomic_write_text
 from . import sessions
 
 _MAX_EVENTS = 500
+_MAX_CUSTOM_GROUPS = 40
+_MAX_GROUP_NAME = 48
+_GROUP_COLORS = frozenset({
+    "blue", "violet", "cyan", "green", "amber", "rose", "gray",
+})
 _TERMINAL = {"completed", "failed", "cancelled"}
 _ACTIVE = {"running", "waiting_approval", "paused"}
 
@@ -79,14 +84,17 @@ class ActivityService:
 
     def __init__(self, root: Path = ROOT):
         self.path = root / ".muselab" / "activity.json"
+        self.groups_path = root / ".muselab" / "activity-groups.json"
         self._lock = threading.RLock()
         self._generation = uuid.uuid4().hex
         self._revision = 0
         self._subscribers: dict[
             asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop
         ] = {}
+        self._custom_groups, self._group_assignments = self._load_group_state()
         self._events = self._load()
         changed = self._collapse_sessions()
+        changed = self._reconcile_event_groups() or changed
         for item in self._events:
             if item.get("state") in _ACTIVE:
                 now = time.time()
@@ -96,6 +104,98 @@ class ActivityService:
                 changed = True
         if changed:
             self._save()
+
+    @staticmethod
+    def _group_name(value: Any) -> str:
+        name = " ".join(str(value or "").split())
+        if not name:
+            raise ValueError("group name is required")
+        if len(name) > _MAX_GROUP_NAME:
+            raise ValueError(f"group name exceeds {_MAX_GROUP_NAME} characters")
+        return name
+
+    @staticmethod
+    def _group_color(value: Any) -> str:
+        color = str(value or "blue").strip().lower()
+        if color not in _GROUP_COLORS:
+            raise ValueError("invalid group color")
+        return color
+
+    def _load_group_state(self) -> tuple[list[dict[str, str]], dict[str, str]]:
+        try:
+            raw = json.loads(self.groups_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return [], {}
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot parse activity groups: {self.groups_path}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError("activity group state must be an object")
+
+        source_groups = raw.get("groups", [])
+        source_assignments = raw.get("assignments", {})
+        if (not isinstance(source_groups, list)
+                or not isinstance(source_assignments, dict)):
+            raise RuntimeError("invalid activity group state")
+
+        groups: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in source_groups[:_MAX_CUSTOM_GROUPS]:
+            if not isinstance(row, dict):
+                continue
+            group_id = str(row.get("id") or "").strip()
+            if not group_id or group_id in seen:
+                continue
+            try:
+                name = self._group_name(row.get("name"))
+                color = self._group_color(row.get("color"))
+            except ValueError:
+                continue
+            seen.add(group_id)
+            groups.append({"id": group_id, "name": name, "color": color})
+
+        assignments = {
+            str(sid): str(group_id)
+            for sid, group_id in source_assignments.items()
+            if str(sid) and str(group_id) in seen
+        }
+        return groups, assignments
+
+    def _save_group_state(self) -> None:
+        self.groups_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(self.groups_path, json.dumps({
+            "version": 1,
+            "groups": self._custom_groups,
+            "assignments": self._group_assignments,
+        }, ensure_ascii=False, indent=2))
+
+    def _group_payload_locked(self) -> list[dict[str, str]]:
+        return [dict(group) for group in self._custom_groups]
+
+    def _apply_assignment_locked(self, item: dict[str, Any]) -> bool:
+        sid = str(item.get("session_id") or item.get("thread_id") or "")
+        assigned = self._group_assignments.get(sid, "")
+        current = str(item.get("group_id") or "")
+        if assigned == current:
+            return False
+        if assigned:
+            item["group_id"] = assigned
+        else:
+            item.pop("group_id", None)
+        return True
+
+    def _reconcile_event_groups(self) -> bool:
+        valid = {group["id"] for group in self._custom_groups}
+        self._group_assignments = {
+            sid: group_id
+            for sid, group_id in self._group_assignments.items()
+            if group_id in valid
+        }
+        changed = False
+        for item in self._events:
+            changed = self._apply_assignment_locked(item) or changed
+        return changed
 
     def _load(self) -> list[dict[str, Any]]:
         try:
@@ -134,6 +234,7 @@ class ActivityService:
         *,
         item: dict[str, Any] | None = None,
         acked_ids: list[str] | None = None,
+        resync: bool = False,
     ) -> None:
         """Fan out a compact transition to SSE subscribers.
 
@@ -149,7 +250,10 @@ class ActivityService:
             "generation": self._generation,
             "revision": self._revision,
             "summary": summary,
+            "custom_groups": self._group_payload_locked(),
         }
+        if resync:
+            payload["resync"] = True
         if item is not None:
             payload["item"] = dict(item)
         if acked_ids:
@@ -242,6 +346,7 @@ class ActivityService:
                 updated_at=now, needs_attention=False, read=True,
                 turn_count=int(item.get("turn_count") or 0) + 1,
             )
+            self._apply_assignment_locked(item)
             if source_id:
                 item["source_id"] = source_id[:200]
             else:
@@ -316,6 +421,7 @@ class ActivityService:
         """Return rows and counters from the same locked ledger snapshot."""
         with self._lock:
             events = [dict(x) for x in self._events]
+            custom_groups = self._group_payload_locked()
             generation = self._generation
             revision = self._revision
         ordered = sorted(events, key=_activity_at, reverse=True)
@@ -325,7 +431,155 @@ class ActivityService:
         return {
             "events": ordered[:min(max(limit, 1), _MAX_EVENTS)],
             "summary": summary,
+            "custom_groups": custom_groups,
         }
+
+    def list_groups(self) -> list[dict[str, str]]:
+        with self._lock:
+            return self._group_payload_locked()
+
+    def create_group(self, name: str, color: str = "blue") -> dict[str, Any]:
+        clean_name = self._group_name(name)
+        clean_color = self._group_color(color)
+        with self._lock:
+            if len(self._custom_groups) >= _MAX_CUSTOM_GROUPS:
+                raise ValueError("too many custom groups")
+            if any(group["name"].casefold() == clean_name.casefold()
+                   for group in self._custom_groups):
+                raise ValueError("group name already exists")
+            group = {
+                "id": uuid.uuid4().hex,
+                "name": clean_name,
+                "color": clean_color,
+            }
+            self._custom_groups.append(group)
+            self._save_group_state()
+            self._publish_locked()
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "group": dict(group),
+                "custom_groups": self._group_payload_locked(),
+            }
+
+    def update_group(
+        self,
+        group_id: str,
+        *,
+        name: str | None = None,
+        color: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            group = next((row for row in self._custom_groups
+                          if row["id"] == group_id), None)
+            if group is None:
+                return None
+            clean_name = (
+                group["name"] if name is None else self._group_name(name)
+            )
+            clean_color = (
+                group["color"] if color is None else self._group_color(color)
+            )
+            if any(row["id"] != group_id
+                   and row["name"].casefold() == clean_name.casefold()
+                   for row in self._custom_groups):
+                raise ValueError("group name already exists")
+            changed = group["name"] != clean_name or group["color"] != clean_color
+            group.update(name=clean_name, color=clean_color)
+            if changed:
+                self._save_group_state()
+                self._publish_locked()
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "group": dict(group),
+                "custom_groups": self._group_payload_locked(),
+            }
+
+    def reorder_groups(self, group_ids: list[str]) -> dict[str, Any]:
+        with self._lock:
+            current = [group["id"] for group in self._custom_groups]
+            if len(group_ids) != len(current) or set(group_ids) != set(current):
+                raise ValueError("group order must contain every group exactly once")
+            lookup = {group["id"]: group for group in self._custom_groups}
+            if group_ids != current:
+                self._custom_groups = [lookup[group_id] for group_id in group_ids]
+                self._save_group_state()
+                self._publish_locked()
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "custom_groups": self._group_payload_locked(),
+            }
+
+    def delete_group(self, group_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            if not any(group["id"] == group_id for group in self._custom_groups):
+                return None
+            self._custom_groups = [
+                group for group in self._custom_groups if group["id"] != group_id
+            ]
+            cleared_sessions = {
+                sid for sid, assigned in self._group_assignments.items()
+                if assigned == group_id
+            }
+            self._group_assignments = {
+                sid: assigned
+                for sid, assigned in self._group_assignments.items()
+                if assigned != group_id
+            }
+            changed_events = 0
+            for item in self._events:
+                if str(item.get("group_id") or "") == group_id:
+                    item.pop("group_id", None)
+                    changed_events += 1
+            self._save_group_state()
+            if changed_events:
+                self._save()
+            self._publish_locked(resync=True)
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "cleared_sessions": len(cleared_sessions),
+                "custom_groups": self._group_payload_locked(),
+            }
+
+    def set_group(self, event_id: str, group_id: str) -> dict[str, Any] | None:
+        target = str(group_id or "").strip()
+        with self._lock:
+            if target and not any(group["id"] == target
+                                  for group in self._custom_groups):
+                raise ValueError("activity group not found")
+            item = next((row for row in self._events
+                         if row.get("id") == event_id), None)
+            if item is None:
+                return None
+            sid = str(item.get("session_id") or item.get("thread_id") or "")
+            current = str(item.get("group_id") or "")
+            if target == current:
+                return {
+                    "generation": self._generation,
+                    "revision": self._revision,
+                    "item": dict(item),
+                    "custom_groups": self._group_payload_locked(),
+                }
+            if target:
+                if sid:
+                    self._group_assignments[sid] = target
+                item["group_id"] = target
+            else:
+                if sid:
+                    self._group_assignments.pop(sid, None)
+                item.pop("group_id", None)
+            self._save_group_state()
+            self._save()
+            self._publish_locked(item=item)
+            return {
+                "generation": self._generation,
+                "revision": self._revision,
+                "item": dict(item),
+                "custom_groups": self._group_payload_locked(),
+            }
 
     def rename_session(self, sid: str, name: str) -> dict[str, Any] | None:
         """Update only the mutable display name for a conversation row.

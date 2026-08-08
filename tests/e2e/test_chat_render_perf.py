@@ -2848,7 +2848,10 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
               model: 'e2e-model',
               memory_recall: {
                 id: 'tool-tail-memory-trace', count: 1,
-                latency_ms: 8, status: 'ok', items: [],
+                latency_ms: 8, status: 'ok', items: [{
+                  id: 'tool-tail-memory-item', kind: 'preference',
+                  content: 'A deliberately long memory detail '.repeat(36),
+                }],
               },
               session_usage: {
                 context_used_pct: 5,
@@ -2912,8 +2915,38 @@ def test_tool_result_tail_done_metadata_renders_footer_before_canonical_reload(
     expect(footer.locator(".msg-elapsed")).to_have_text("· 2m05s")
     expect(footer.locator(".turn-model")).to_have_text("· E2E model")
     expect(footer.locator(".turn-status")).to_have_text(expected_status)
-    expect(footer.locator(".memory-recall-trace")).to_be_visible()
+    recall_trigger = footer.locator(".memory-recall-trace")
+    expect(recall_trigger).to_be_visible()
     expect(footer.locator(".turn-fork-btn")).to_be_visible()
+
+    recall_trigger.click()
+    recall = page.locator(".memory-recall-global")
+    expect(recall).to_be_visible()
+    recall_geometry = recall.evaluate(
+        """node => {
+          const rect = node.getBoundingClientRect();
+          return {
+            position: getComputedStyle(node).position,
+            zIndex: Number(getComputedStyle(node).zIndex),
+            insideChatScroller: !!node.closest('.chat-body'),
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+          };
+        }"""
+    )
+    assert recall_geometry["position"] == "fixed"
+    assert recall_geometry["zIndex"] >= 800
+    assert recall_geometry["insideChatScroller"] is False
+    assert recall_geometry["left"] >= 0
+    assert recall_geometry["top"] >= 0
+    assert recall_geometry["right"] <= recall_geometry["viewportWidth"]
+    assert recall_geometry["bottom"] <= recall_geometry["viewportHeight"]
+    page.keyboard.press("Escape")
+    expect(recall).to_be_hidden()
 
     state = _app_eval(
         page,

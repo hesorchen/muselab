@@ -170,6 +170,74 @@ def test_pin_persists_without_rewriting_activity_time(tmp_path, monkeypatch):
     assert restarted.set_pin("missing", True) is None
 
 
+def test_custom_groups_persist_reorder_and_assignment_without_rewriting_task(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    ticks = iter([1, 2, 3, 4])
+    monkeypatch.setattr("backend.activity.time.time", lambda: next(ticks))
+    first = service.start("s1", summary="older task")
+    service.finish("s1", "completed")
+    service.start("s2", summary="newer task")
+    service.finish("s2", "completed")
+    before = dict(next(row for row in service.list()
+                       if row["session_id"] == "s1"))
+
+    research = service.create_group("Research", "violet")["group"]
+    delivery = service.create_group("Delivery", "green")["group"]
+    assigned = service.set_group(first["id"], research["id"])
+    assert assigned is not None
+    assert assigned["item"]["group_id"] == research["id"]
+    after = next(row for row in service.list() if row["session_id"] == "s1")
+    for field in (
+        "updated_at", "started_at", "finished_at", "state", "read",
+        "task_summary", "turn_count",
+    ):
+        assert after[field] == before[field]
+    assert [row["session_id"] for row in service.list()] == ["s2", "s1"]
+
+    ordered = service.reorder_groups([delivery["id"], research["id"]])
+    assert [row["id"] for row in ordered["custom_groups"]] == [
+        delivery["id"], research["id"],
+    ]
+    restarted = ActivityService(tmp_path)
+    assert [row["id"] for row in restarted.list_groups()] == [
+        delivery["id"], research["id"],
+    ]
+    restored = next(row for row in restarted.list()
+                    if row["session_id"] == "s1")
+    assert restored["group_id"] == research["id"]
+
+    cleared = restarted.delete_group(research["id"])
+    assert cleared is not None
+    assert cleared["cleared_sessions"] == 1
+    assert "group_id" not in next(
+        row for row in restarted.list() if row["session_id"] == "s1"
+    )
+    state = json.loads(restarted.groups_path.read_text(encoding="utf-8"))
+    assert state["assignments"] == {}
+
+
+@pytest.mark.asyncio
+async def test_group_delete_pushes_resync_for_all_affected_rows(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    item = service.start("s1", summary="grouped task")
+    group = service.create_group("Temporary", "amber")["group"]
+    service.set_group(item["id"], group["id"])
+
+    async with service.subscribe() as queue:
+        deleted = await asyncio.to_thread(service.delete_group, group["id"])
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert deleted is not None
+    assert payload["resync"] is True
+    assert payload["custom_groups"] == []
+
+
 @pytest.mark.asyncio
 async def test_rename_persists_and_pushes_without_reordering_task(
     tmp_path,
@@ -302,3 +370,66 @@ def test_activity_pin_endpoint_is_authenticated_and_returns_live_envelope(
     assert payload["item"]["pinned"] is True
     assert payload["revision"] == service.revision
     assert payload["generation"] == service.generation
+
+
+def test_activity_group_endpoints_manage_and_assign_custom_groups(
+    client,
+    auth,
+    tmp_path,
+    monkeypatch,
+):
+    from backend import activity_api
+
+    service = _service(tmp_path, monkeypatch)
+    started = service.start("s1", summary="group from task center")
+    service.finish("s1", "completed")
+    monkeypatch.setattr(activity_api, "activity", service)
+
+    denied = client.post(
+        "/api/activity/groups",
+        json={"name": "Research", "color": "violet"},
+    )
+    assert denied.status_code == 401
+
+    created = client.post(
+        "/api/activity/groups",
+        headers=auth,
+        json={"name": "Research", "color": "violet"},
+    )
+    assert created.status_code == 200
+    group = created.json()["group"]
+    assert group["name"] == "Research"
+
+    duplicate = client.post(
+        "/api/activity/groups",
+        headers=auth,
+        json={"name": "research", "color": "blue"},
+    )
+    assert duplicate.status_code == 400
+
+    assigned = client.put(
+        f"/api/activity/{started['id']}/group",
+        headers=auth,
+        json={"group_id": group["id"]},
+    )
+    assert assigned.status_code == 200
+    assert assigned.json()["item"]["group_id"] == group["id"]
+
+    renamed = client.patch(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+        json={"name": "Deep research", "color": "cyan"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["group"]["color"] == "cyan"
+
+    listed = client.get("/api/activity/groups", headers=auth)
+    assert listed.status_code == 200
+    assert listed.json()["custom_groups"][0]["name"] == "Deep research"
+
+    deleted = client.delete(
+        f"/api/activity/groups/{group['id']}",
+        headers=auth,
+    )
+    assert deleted.status_code == 200
+    assert "group_id" not in service.list()[0]

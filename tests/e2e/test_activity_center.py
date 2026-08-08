@@ -233,6 +233,116 @@ def test_desktop_timeline_defaults_to_fifteen_rows_in_larger_modal(
     assert mobile_geometry["bodyMaxHeight"] == "none"
 
 
+def test_custom_groups_show_empty_sections_and_move_sessions(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'groups';
+          app.activity.loading = false;
+          app.activity.expanded = {};
+          app.activity.customGroups = [
+            {id: 'research', name: 'Research', color: 'violet'},
+            {id: 'delivery', name: 'Delivery', color: 'green'},
+          ];
+          app.activity.events = [{
+            id: 'grouped-row', session_id: 'grouped-session',
+            session_name: 'Research session', task_summary: 'Grouped task',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'completed', read: false, group_id: 'research',
+            started_at: 10, finished_at: 20, updated_at: 20,
+          }, {
+            id: 'ungrouped-row', session_id: 'ungrouped-session',
+            session_name: 'Ungrouped session', task_summary: 'Move this task',
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'running', read: true,
+            started_at: 30, finished_at: 0, updated_at: 30,
+          }];
+          app.activity.summary = {
+            running: 1, unread: 1, attention: 0,
+            groups: {review: 1, running: 1, failed: 0, history: 0},
+            group_unread: {review: 1, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          window.__activityGroupCalls = [];
+          app.api = async (path, options = {}) => {
+            window.__activityGroupCalls.push({path, options});
+            if (path === '/api/activity/groups' && options.method === 'POST') {
+              const group = {
+                id: 'writing', name: options.json.name,
+                color: options.json.color,
+              };
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                custom_groups: [...app.activity.customGroups, group],
+              }};
+            }
+            if (path.endsWith('/group') && options.method === 'PUT') {
+              const id = decodeURIComponent(path.split('/').at(-2));
+              const item = app.activity.events.find(row => row.id === id);
+              const updated = {...item};
+              if (options.json.group_id) updated.group_id = options.json.group_id;
+              else delete updated.group_id;
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                item: updated,
+                custom_groups: [...app.activity.customGroups],
+              }};
+            }
+            return {ok: false, data: null, error: 'unexpected test request'};
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    groups = page.locator(".activity-group.is-custom")
+    expect(groups).to_have_count(3)
+    assert page.locator(
+        ".activity-custom-group-head > strong"
+    ).all_text_contents() == ["Research", "Delivery", "未分组"]
+    delivery = groups.filter(has_text="Delivery")
+    expect(delivery.locator(".activity-custom-group-empty")).to_be_visible()
+
+    ungrouped_row = page.locator(".activity-row-wrap").filter(
+        has_text="Ungrouped session"
+    )
+    ungrouped_row.hover()
+    ungrouped_row.locator(".activity-row-group").click()
+    menu = page.locator(".activity-move-menu")
+    expect(menu).to_be_visible()
+    expect(menu.locator("button")).to_have_count(3)
+    menu.locator("button").filter(has_text="Research").click()
+
+    research = groups.filter(has_text="Research")
+    expect(research.locator(".activity-row-wrap")).to_have_count(2)
+    expect(groups.filter(has_text="未分组").locator(
+        ".activity-custom-group-empty"
+    )).to_be_visible()
+
+    page.locator(".activity-groups-toolbar .btn-ghost").click()
+    editor = page.locator(".activity-group-editor")
+    expect(editor).to_be_visible()
+    editor.locator("input").fill("Writing")
+    editor.locator(".activity-group-swatch.is-rose").click()
+    editor.locator('button[type="submit"]').click()
+    expect(page.locator(".activity-custom-group-head > strong")).to_contain_text(
+        ["Research", "Delivery", "Writing", "未分组"]
+    )
+
+    calls = page.evaluate("() => window.__activityGroupCalls")
+    assert any(call["path"].endswith("/ungrouped-row/group") for call in calls)
+    assert any(call["path"] == "/api/activity/groups" for call in calls)
+
+
 def test_session_rename_updates_loaded_activity_row_immediately(
     page: Page, backend_url, auth_token
 ):
@@ -292,7 +402,11 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
 
     page.locator(".activity-center-btn").click()
     expect(page.locator(".activity-modal")).to_be_visible()
-    expect(page.locator(".activity-view-switch button").nth(1)).to_have_class(
+    expect(page.locator(".activity-view-switch button").nth(0)).to_have_class(
+        "active"
+    )
+    page.locator(".activity-view-switch button").nth(2).click()
+    expect(page.locator(".activity-view-switch button").nth(2)).to_have_class(
         "active"
     )
 

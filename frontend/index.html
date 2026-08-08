@@ -2838,30 +2838,13 @@
                 <span x-show="turnFooterModel(m, pane, tid)" class="turn-model"
                       :title="turnFooterModel(m, pane, tid)"
                       x-text="'· ' + modelLabel(turnFooterModel(m, pane, tid))"></span>
-                <details class="memory-recall-trace"
-                         x-show="m.memoryRecall && m.memoryRecall.count">
-                  <summary x-text="lang==='zh'
-                    ? `· 使用了 ${m.memoryRecall?.count || 0} 条记忆`
-                    : `· Used ${m.memoryRecall?.count || 0} memories`"></summary>
-                  <div class="memory-recall-popover">
-                    <div class="memory-recall-meta"
-                         x-text="`${m.memoryRecall?.latency_ms || 0} ms · ${m.memoryRecall?.status || ''}`"></div>
-                    <template x-for="item in (m.memoryRecall?.items || [])" :key="item.id">
-                      <div class="memory-recall-item">
-                        <span x-text="item.kind"></span>
-                        <p x-text="item.content"></p>
-                        <div class="memory-recall-feedback">
-                          <button @click.stop="memoryFeedback(item, true, m.memoryRecall?.id)"
-                                  :class="{ active: item._feedback === 'up' }"
-                                  :title="lang==='zh' ? '这条记忆有用' : 'Helpful'">↑</button>
-                          <button @click.stop="memoryFeedback(item, false, m.memoryRecall?.id)"
-                                  :class="{ active: item._feedback === 'down' }"
-                                  :title="lang==='zh' ? '这条记忆无用' : 'Not helpful'">↓</button>
-                        </div>
-                      </div>
-                    </template>
-                  </div>
-                </details>
+                <button type="button" class="memory-recall-trace"
+                        x-show="m.memoryRecall && m.memoryRecall.count"
+                        :aria-expanded="memoryRecallPopover.show && _memoryRecallOwner === m"
+                        @click.stop="toggleMemoryRecallPopover($event, m)"
+                        x-text="lang==='zh'
+                          ? `· 使用了 ${m.memoryRecall?.count || 0} 条记忆`
+                          : `· Used ${m.memoryRecall?.count || 0} memories`"></button>
                 <button class="turn-fork-btn"
                         type="button"
                         x-show="turnForkMessageId(paneMsgs, i) && !(pane && pane.streaming)"
@@ -5730,12 +5713,53 @@
     </div>
   </div>
 
-  <div class="modal-backdrop" x-show="activity.show" @click.self="activity.show=false" x-cloak>
-    <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="activity.show=false">
+  <!-- Root-level portal for per-turn memory details.  This cannot live inside
+       .turn-footer: chat panes deliberately clip overflow, so a descendant
+       popover will be cut off regardless of z-index. -->
+  <div class="memory-recall-global"
+       x-show="memoryRecallPopover.show"
+       :style="memoryRecallPopover.style"
+       @click.stop
+       @click.outside="closeMemoryRecallPopover()"
+       role="dialog"
+       :aria-label="lang==='zh' ? '本轮使用的记忆' : 'Memories used in this turn'"
+       x-cloak>
+    <div class="memory-recall-head">
+      <strong x-text="lang==='zh'
+        ? `本轮使用了 ${memoryRecallPopover.recall?.count || 0} 条记忆`
+        : `Used ${memoryRecallPopover.recall?.count || 0} memories`"></strong>
+      <button type="button" @click="closeMemoryRecallPopover()"
+              :aria-label="lang==='zh' ? '关闭记忆详情' : 'Close memory details'">×</button>
+    </div>
+    <div class="memory-recall-meta"
+         x-text="`${memoryRecallPopover.recall?.latency_ms || 0} ms · ${memoryRecallPopover.recall?.status || ''}`"></div>
+    <template x-for="item in (memoryRecallPopover.recall?.items || [])" :key="item.id">
+      <div class="memory-recall-item">
+        <span x-text="item.kind"></span>
+        <p x-text="item.content"></p>
+        <div class="memory-recall-feedback">
+          <button type="button"
+                  @click="memoryFeedback(item, true, memoryRecallPopover.recall?.id)"
+                  :class="{ active: item._feedback === 'up' }"
+                  :title="lang==='zh' ? '这条记忆有用' : 'Helpful'">↑</button>
+          <button type="button"
+                  @click="memoryFeedback(item, false, memoryRecallPopover.recall?.id)"
+                  :class="{ active: item._feedback === 'down' }"
+                  :title="lang==='zh' ? '这条记忆无用' : 'Not helpful'">↓</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <div class="modal-backdrop" x-show="activity.show" @click.self="closeActivityCenter()" x-cloak>
+    <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="closeActivityCenter()">
       <div class="modal-head">
         <span class="modal-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
         <div class="activity-view-switch" role="group"
              :aria-label="lang==='zh' ? '任务视图' : 'Task view'">
+          <button type="button" @click="setActivityView('groups')"
+                  :class="{ active: activity.view === 'groups' }"
+                  x-text="lang==='zh' ? '按分组' : 'By group'"></button>
           <button type="button" @click="setActivityView('status')"
                   :class="{ active: activity.view === 'status' }"
                   x-text="lang==='zh' ? '按状态' : 'By status'"></button>
@@ -5750,7 +5774,7 @@
               :aria-hidden="!activity.loading">
           <span class="spinner-sm"></span>
         </span>
-        <button class="modal-close" @click="activity.show=false" aria-label="Close">×</button>
+        <button class="modal-close" @click="closeActivityCenter()" aria-label="Close">×</button>
       </div>
       <!-- One chip per attention group, in the same order as the sections below:
            completed results to review, live work, failures, then viewed history. -->
@@ -5779,6 +5803,47 @@
                 x-text="lang==='zh' ? '清除筛选' : 'Clear filter'"></button>
         <button class="btn-ghost sm" x-show="activity.summary.unread" @click="ackAllActivity()" x-text="lang==='zh' ? '全部标为已读' : 'Mark all read'"></button>
       </div>
+      <div class="activity-groups-toolbar" x-show="activity.view === 'groups'">
+        <div>
+          <strong x-text="lang==='zh' ? '自定义分组' : 'Custom groups'"></strong>
+          <small x-text="lang==='zh'
+            ? '拖动会话，或使用每行右侧的分组按钮移动'
+            : 'Drag a session, or use the group button on each row'"></small>
+        </div>
+        <button type="button" class="btn-ghost sm"
+                :disabled="activity.customGroups.length >= 40"
+                @click="openActivityGroupEditor()">
+          <svg><use href="#i-plus"/></svg>
+          <span x-text="lang==='zh' ? '新建分组' : 'New group'"></span>
+        </button>
+      </div>
+      <form class="activity-group-editor"
+            x-show="activity.view === 'groups' && activity.groupEditor.open"
+            @submit.prevent="saveActivityGroup()" x-cloak>
+        <input type="text" maxlength="48" autocomplete="off"
+               x-model="activity.groupEditor.name"
+               :placeholder="lang==='zh' ? '分组名称' : 'Group name'"
+               :aria-label="lang==='zh' ? '分组名称' : 'Group name'" />
+        <div class="activity-group-colors"
+             :aria-label="lang==='zh' ? '分组颜色' : 'Group color'">
+          <template x-for="color in ACTIVITY_GROUP_COLORS" :key="color">
+            <button type="button" class="activity-group-swatch"
+                    :class="['is-' + color, { active: activity.groupEditor.color === color }]"
+                    :aria-pressed="activity.groupEditor.color === color"
+                    :aria-label="(lang==='zh' ? '选择颜色：' : 'Choose color: ') + color"
+                    @click="activity.groupEditor.color = color"></button>
+          </template>
+        </div>
+        <div class="activity-group-editor-actions">
+          <button type="button" class="btn-ghost sm" @click="cancelActivityGroupEditor()"
+                  x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
+          <button type="submit" class="btn-primary sm"
+                  :disabled="activity.groupEditor.saving || !activity.groupEditor.name.trim()"
+                  x-text="activity.groupEditor.saving
+                    ? (lang==='zh' ? '保存中…' : 'Saving…')
+                    : (lang==='zh' ? '保存' : 'Save')"></button>
+        </div>
+      </form>
       <div class="modal-body activity-body" :aria-busy="activity.loading">
         <!-- Loading is an overlay, not a list row.  A normal-flow hint used to
              disappear above the mounted rows when fetchActivity settled,
@@ -5789,14 +5854,58 @@
           <span x-text="lang==='zh' ? '正在加载任务…' : 'Loading tasks…'"></span>
         </div>
         <template x-for="group in activityVisibleGroups()" :key="group.key">
-          <section class="activity-group" x-show="activityEvents(group).length"
-                   :class="{ 'is-timeline': group.key === 'timeline' }">
+          <section class="activity-group"
+                   x-show="group.custom || activityEvents(group).length"
+                   :class="{
+                     'is-timeline': group.key === 'timeline',
+                     'is-custom': group.custom,
+                     'is-drag-over': group.custom
+                       && activity.dragOverGroupId === (group.groupId || '')
+                   }"
+                   @dragover.prevent="group.custom && onActivityGroupDragOver(group)"
+                   @drop.prevent="group.custom && onActivityGroupDrop(group)">
             <!-- The timeline toggle already communicates ordering. Repeating
                  "all tasks · pinned first · newest" here adds visual noise. -->
-            <h3 x-show="group.key !== 'timeline'" x-text="group.label"></h3>
+            <h3 x-show="!group.custom && group.key !== 'timeline'" x-text="group.label"></h3>
+            <div class="activity-custom-group-head" x-show="group.custom">
+              <span class="activity-custom-group-dot"
+                    :class="'is-' + (group.color || 'gray')"></span>
+              <strong x-text="group.label"></strong>
+              <span class="activity-custom-group-count"
+                    x-text="activityGroupCount(group)"></span>
+              <span class="activity-custom-group-attention"
+                    x-show="activityGroupUnread(group)"
+                    :title="lang==='zh' ? '需要关注' : 'Needs attention'"
+                    x-text="activityGroupUnread(group)"></span>
+              <div class="activity-custom-group-actions" x-show="!group.builtin">
+                <button type="button" :disabled="!activityGroupCanMove(group, -1)"
+                        @click="moveActivityGroup(group, -1)"
+                        :title="lang==='zh' ? '上移分组' : 'Move group up'">↑</button>
+                <button type="button" :disabled="!activityGroupCanMove(group, 1)"
+                        @click="moveActivityGroup(group, 1)"
+                        :title="lang==='zh' ? '下移分组' : 'Move group down'">↓</button>
+                <button type="button" @click="openActivityGroupEditor(group)"
+                        :title="lang==='zh' ? '编辑分组' : 'Edit group'">
+                  <svg><use href="#i-edit"/></svg>
+                </button>
+                <button type="button" class="danger" @click="deleteActivityGroup(group)"
+                        :title="lang==='zh' ? '删除分组' : 'Delete group'">
+                  <svg><use href="#i-trash"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="activity-custom-group-empty"
+                 x-show="group.custom && !activityAllEvents(group).length"
+                 x-text="lang==='zh' ? '拖动会话到这里' : 'Drag sessions here'"></div>
             <template x-for="item in activityEvents(group)" :key="item.id">
               <div class="activity-row-wrap"
-                   :class="{ pinned: activity.view === 'timeline' && item.pinned }">
+                   :class="{
+                     pinned: activity.view === 'timeline' && item.pinned,
+                     dragging: activity.dragEventId === String(item.id)
+                   }"
+                   :draggable="activity.view === 'groups'"
+                   @dragstart="onActivityDragStart($event, item)"
+                   @dragend="onActivityDragEnd()">
                 <button class="activity-row" type="button"
                         @click="openActivityEvent(item)"
                         :class="item.state
@@ -5841,6 +5950,15 @@
                     <path d="M9 12V5h6v7"/>
                   </svg>
                 </button>
+                <button class="activity-row-group" type="button"
+                        x-show="activity.view === 'groups'"
+                        :class="{ pending: _activityGroupPending[item.id] }"
+                        :disabled="!!_activityGroupPending[item.id]"
+                        @click.stop="openActivityMoveMenu($event, item)"
+                        :title="lang==='zh' ? '移动到分组' : 'Move to group'"
+                        :aria-label="lang==='zh' ? '移动到分组' : 'Move to group'">
+                  <svg><use href="#i-folder"/></svg>
+                </button>
               </div>
             </template>
             <button class="activity-group-more" type="button"
@@ -5863,6 +5981,31 @@
              x-text="lang==='zh' ? '该状态下暂无任务' : 'No tasks in this state'"></div>
       </div>
     </div>
+  </div>
+
+  <!-- Portalled above the activity modal so it never gets clipped by the
+       modal body's scroll container. -->
+  <div class="activity-move-menu"
+       x-show="activity.moveMenu.show"
+       :style="activity.moveMenu.style"
+       @click.stop
+       @click.outside="closeActivityMoveMenu()"
+       role="menu"
+       x-cloak>
+    <div class="activity-move-menu-title"
+         x-text="lang==='zh' ? '移动到分组' : 'Move to group'"></div>
+    <template x-for="group in activityCustomGroupSections()" :key="group.key">
+      <button type="button" role="menuitem"
+              :class="{ active: String(activityMoveMenuItem()?.group_id || '') === String(group.groupId || '') }"
+              @click="assignActivityGroup(activityMoveMenuItem(), group.groupId || '')">
+        <span class="activity-custom-group-dot"
+              :class="'is-' + (group.color || 'gray')"></span>
+        <span x-text="group.label"></span>
+        <svg x-show="String(activityMoveMenuItem()?.group_id || '') === String(group.groupId || '')">
+          <use href="#i-check"/>
+        </svg>
+      </button>
+    </template>
   </div>
 
   <!-- Scheduled-tasks drawer — modal listing tasks + create form +
