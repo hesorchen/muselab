@@ -3363,7 +3363,8 @@
                type=password input，iOS 就会把它当成账户字段。display:contents
                让这个 form 不参与布局，只提供 DOM 语义。 -->
           <form autocomplete="off" onsubmit="return false" style="display:contents">
-          <textarea x-model="input" x-ref="chatInput"
+          <textarea x-ref="chatInput"
+                    x-effect="_syncChatInputDom(input, { target: $el })"
                     rows="1"
                     :disabled="!availableModels.length || workspaceSwitching"
                     class="chat-input-textarea"
@@ -3381,6 +3382,7 @@
                     @keydown.down="onChatArrowDown($event)"
                     @compositionstart="onImeCompositionStart($event)"
                     @compositionend="onImeCompositionEnd($event)"
+                    @beforeinput="onChatBeforeInput($event)"
                     @input="onChatInput($event); autoGrow($event.target)"
                     @paste="onImagePaste($event)"
                     @focus="onChatInputFocus($event)"

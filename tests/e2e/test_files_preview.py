@@ -392,7 +392,7 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
           app.lang = 'zh';
-          app.input = 'alphaomega';
+          app._setChatInput('alphaomega');
           await new Promise(resolve => app.$nextTick(resolve));
           app._captureComposerState(app.currentId);
           const ta = app.$refs.chatInput;
@@ -440,7 +440,9 @@ def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
     page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          app.input = 'KEEP EXISTING DRAFT';
+          // Programmatic composer changes use the native-editor bridge so the
+          // focused textarea and the reactive draft advance together.
+          app._setChatInput('KEEP EXISTING DRAFT');
           app.pendingImages = [{id: 'keep-image'}];
           app.pendingDocs = [{id: 'keep-doc'}];
           app.pendingQuotes.splice(0);
