@@ -1281,7 +1281,12 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     activity_state = app[app.index("activity: {"):app.index("_activityEtags:")]
-    assert 'view: "timeline"' in activity_state
+    assert 'view: "groups"' in activity_state
+
+    group_button = html.index("setActivityView('groups')")
+    status_button = html.index("setActivityView('status')")
+    timeline_button = html.index("setActivityView('timeline')")
+    assert group_button < status_button < timeline_button
 
     review = app.index('{ key: "review"')
     running = app.index('{ key: "running"', review)
@@ -1312,6 +1317,19 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'this.activity.view === "timeline"' in app
     assert 'key === "timeline") return true' in app
     assert "setActivityView('timeline')" in html
+    assert "setActivityView('groups')" in html
+    assert 'activity.view === "groups"' in app
+    assert "activityCustomGroupSections()" in app
+    assert 'key: "custom:__ungrouped__"' in app
+    assert '"/api/activity/groups"' in app
+    assert '"/api/activity/groups/order"' in app
+    assert '}/group`' in app
+    assert 'class="activity-groups-toolbar"' in html
+    assert 'class="activity-group-editor"' in html
+    assert 'class="activity-row-group"' in html
+    assert '@dragstart="onActivityDragStart($event, item)"' in html
+    assert ".activity-group.is-custom.is-drag-over" in css
+    assert ".activity-move-menu" in css
     assert "const pinRank = Number(!!b.pinned) - Number(!!a.pinned)" in app
     assert "async toggleActivityPin(item)" in app
     assert 'method: "PATCH", json: { pinned: target }' in app
@@ -1327,6 +1345,26 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "activityIsUnreadResult(item) ? ' is-unread'" in html
     assert ".activity-row.failed.is-unread .activity-state-dot" in css
     assert ".activity-row.failed .activity-state-dot,.activity-row.waiting_approval" not in css
+
+
+def test_memory_recall_details_use_a_root_fixed_portal():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    trigger = html.index('class="memory-recall-trace"')
+    portal = html.index('class="memory-recall-global"')
+    activity = html.index('class="modal activity-modal"')
+    assert trigger < portal < activity
+    assert 'class="memory-recall-popover"' not in html
+    assert "document.querySelector(\".memory-recall-global\")" in app
+    assert '"position:fixed"' in app
+    assert "_queueMemoryRecallPosition()" in app
+    assert ".memory-recall-global {" in css
+    portal_css = css[css.index(".memory-recall-global {"):]
+    portal_css = portal_css[:portal_css.index("}")]
+    assert "position: fixed" in portal_css
+    assert "z-index: 880" in portal_css
 
 
 def test_activity_center_uses_two_compact_numberless_status_dots():
