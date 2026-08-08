@@ -403,8 +403,11 @@ def test_enter_submission_waits_for_ime_composition():
     assert "target._museImeEndedAt" in ime
     assert "eventAt - endedAt <= 80" in ime
     assert helper.index("return false") < helper.index("ev.preventDefault()")
-    assert "_museImeOriginalForceModelUpdate" in app
-    assert "target._x_forceModelUpdate = value =>" in app
+    assert "_museImeOriginalForceModelUpdate" not in app
+    assert "target._x_forceModelUpdate = value =>" not in app
+    assert "_syncChatInputDom(value = this.input, options = {})" in app
+    assert "target._museImeComposing" in app
+    assert "ev.inputType === \"insertCompositionText\"" in app
     assert "this._finishImeComposition(target)" in app
     assert "if (this.input !== target.value) this.input = target.value" in app
 
@@ -414,7 +417,11 @@ def test_enter_submission_waits_for_ime_composition():
     assert '@keydown.enter="onEnter($event)"' in html
     assert '@compositionstart="onImeCompositionStart($event)"' in html
     assert '@compositionend="onImeCompositionEnd($event)"' in html
+    assert '@beforeinput="onChatBeforeInput($event)"' in html
     assert '@blur="onChatInputBlur($event)"' in html
+    assert 'x-effect="_syncChatInputDom(input, { target: $el })"' in html
+    assert 'x-model="input"' not in html
+    assert 'x-model.unintrusive="input"' not in html
     assert '@keydown.enter.prevent="commitRenameTab()"' not in html
     assert '@keydown.enter.prevent="pickerCommitInlineRename()"' not in html
     assert '@keydown.enter.prevent.stop="onEnter($event)"' not in html

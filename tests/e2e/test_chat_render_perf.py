@@ -390,11 +390,14 @@ def test_native_ime_buffer_survives_reactive_composer_reconciliation(
         const ta = document.querySelector('.chat-input-textarea');
         return { value: ta.value, input: app.input,
           composing: !!ta._museImeComposing,
-          guarded: typeof ta._museImeOriginalForceModelUpdate === 'function' };
+          privateHookWrapped:
+            Object.prototype.hasOwnProperty.call(
+              ta, '_museImeOriginalForceModelUpdate') };
         """,
     )
     assert composing == {
-        "value": "ni", "input": "ni", "composing": True, "guarded": True,
+        "value": "ni", "input": "ni", "composing": True,
+        "privateHookWrapped": False,
     }
 
     # This is the rare real-world race: a tab/draft reconciliation writes the
@@ -430,11 +433,193 @@ def test_native_ime_buffer_survives_reactive_composer_reconciliation(
         const ta = document.querySelector('.chat-input-textarea');
         return { value: ta.value, input: app.input,
           composing: !!ta._museImeComposing,
-          guarded: !!ta._museImeOriginalForceModelUpdate };
+          privateHookWrapped:
+            Object.prototype.hasOwnProperty.call(
+              ta, '_museImeOriginalForceModelUpdate') };
         """,
     )
     assert committed == {
-        "value": "你", "input": "你", "composing": False, "guarded": False,
+        "value": "你", "input": "你", "composing": False,
+        "privateHookWrapped": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_native_ime_stays_attached_across_reconciliation_and_tab_switch(
+    page: Page, backend_url, auth_token,
+):
+    """Repeated background refreshes and owner changes keep one healthy IME."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    first_sid = "ime-owner-first"
+    second_sid = "ime-owner-second"
+    _bootstrap_session_for_real_load(page, first_sid, "IME owner first")
+    _app_eval(
+        page,
+        """
+        const first = app._ensureTabState(arg.first);
+        first._loaded = true;
+        first.draft.input = "";
+        const second = app._ensureTabState(arg.second);
+        second._loaded = true;
+        second.draft.input = "";
+        app.sessions.push({
+          id: arg.second, name: "IME owner second", updated_at: Date.now() / 1000,
+          model: "e2e-model", permission: "bypassPermissions", thinking: true,
+        });
+        app.openTabIds.push(arg.second);
+        app._activateTabState(arg.first);
+        const ta = document.querySelector('.chat-input-textarea');
+        window.__imeStableNode = ta;
+        window.__imeStableModelHook = ta._x_forceModelUpdate;
+        return true;
+        """,
+        {"first": first_sid, "second": second_sid},
+    )
+    textarea = page.locator(".chat-input-textarea")
+    textarea.click()
+    page.wait_for_function(
+        "() => document.activeElement === document.querySelector('.chat-input-textarea')"
+    )
+    cdp = page.context.new_cdp_session(page)
+
+    for index, (phonetic, committed_text) in enumerate(
+        [("ni", "你"), ("hao", "好"), ("zhong", "中")]
+    ):
+        _app_eval(page, "app._setChatInput(''); return true;")
+        cdp.send("Input.imeSetComposition", {
+            "text": phonetic,
+            "selectionStart": len(phonetic),
+            "selectionEnd": len(phonetic),
+            "replacementStart": 0,
+            "replacementEnd": 0,
+        })
+        # A canonical/background reconciliation may mutate the root model, but
+        # must not write over Chromium's marked text while the control is focused.
+        protected = _app_eval(
+            page,
+            """
+            app.input = arg.model;
+            return new Promise(resolve => queueMicrotask(() => {
+              const ta = document.querySelector('.chat-input-textarea');
+              resolve({ value: ta.value, composing: !!ta._museImeComposing });
+            }));
+            """,
+            {"model": f"background-refresh-{index}"},
+        )
+        assert protected == {"value": phonetic, "composing": True}
+        cdp.send("Input.imeSetComposition", {
+            "text": committed_text,
+            "selectionStart": len(committed_text),
+            "selectionEnd": len(committed_text),
+            "replacementStart": 0,
+            "replacementEnd": len(phonetic),
+        })
+        cdp.send("Input.insertText", {"text": committed_text})
+        committed = _app_eval(
+            page,
+            """
+            const ta = document.querySelector('.chat-input-textarea');
+            return {
+              value: ta.value, input: app.input,
+              composing: !!ta._museImeComposing,
+              sameNode: ta === window.__imeStableNode,
+              sameModelHook: ta._x_forceModelUpdate === window.__imeStableModelHook,
+            };
+            """,
+        )
+        assert committed == {
+            "value": committed_text,
+            "input": committed_text,
+            "composing": False,
+            "sameNode": True,
+            "sameModelHook": True,
+        }
+
+    blur_commit = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        app.input = 'stale-background-model';
+        return new Promise(resolve => queueMicrotask(() => {
+          const visible = ta.value;
+          ta.blur();
+          resolve({
+            visible,
+            input: app.input,
+            draft: app._ensureTabState(arg).draft.input,
+          });
+        }));
+        """,
+        first_sid,
+    )
+    assert blur_commit == {"visible": "中", "input": "中", "draft": "中"}
+    textarea.click()
+
+    # Change session ownership while marked text is live. The phonetic buffer
+    # belongs to the old draft; the shared DOM then receives the new draft and
+    # must accept another native composition without rebuilding the whole app.
+    _app_eval(page, "app._setChatInput(''); return true;")
+    cdp.send("Input.imeSetComposition", {
+        "text": "wen",
+        "selectionStart": 3,
+        "selectionEnd": 3,
+        "replacementStart": 0,
+        "replacementEnd": 0,
+    })
+    switched = _app_eval(
+        page,
+        """
+        app._captureComposerState(arg.first);
+        app.currentId = arg.second;
+        app._activateTabState(arg.second);
+        const ta = document.querySelector('.chat-input-textarea');
+        return {
+          value: ta.value,
+          firstDraft: app._ensureTabState(arg.first).draft.input,
+          secondDraft: app._ensureTabState(arg.second).draft.input,
+          composing: !!ta._museImeComposing,
+          sameNode: ta === window.__imeStableNode,
+        };
+        """,
+        {"first": first_sid, "second": second_sid},
+    )
+    assert switched == {
+        "value": "",
+        "firstDraft": "wen",
+        "secondDraft": "",
+        "composing": False,
+        "sameNode": True,
+    }
+
+    textarea.click()
+    cdp.send("Input.imeSetComposition", {
+        "text": "wen",
+        "selectionStart": 3,
+        "selectionEnd": 3,
+        "replacementStart": 0,
+        "replacementEnd": 0,
+    })
+    cdp.send("Input.imeSetComposition", {
+        "text": "文",
+        "selectionStart": 1,
+        "selectionEnd": 1,
+        "replacementStart": 0,
+        "replacementEnd": 3,
+    })
+    cdp.send("Input.insertText", {"text": "文"})
+    recovered = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          composing: !!ta._museImeComposing,
+          sameNode: ta === window.__imeStableNode };
+        """,
+    )
+    assert recovered == {
+        "value": "文", "input": "文", "composing": False, "sameNode": True,
     }
     _assert_no_browser_errors(page, errors)
 

@@ -1676,6 +1676,19 @@ function portal() {
     // inputs (.kb-open class + --kb-inset) in lockstep, exactly like update().
     onChatInputBlur(ev) {
       this._resetImeCompositionState(ev);
+      const target = ev && (ev.target || ev.currentTarget);
+      const settledOwner = target && target._museImeSettledOwnerSid;
+      // The composer bridge intentionally ignores model writes while focused.
+      // When focus leaves (for example, the user clicks Send), commit exactly
+      // what is visibly in the native control before the click handler reads
+      // the draft. A composition settled for a different tab is excluded.
+      if (target && (!settledOwner || settledOwner === this.currentId)) {
+        if (this.input !== target.value) this.input = target.value;
+        const state = this.currentId && this.tabState && this.tabState[this.currentId];
+        if (state && state.draft) state.draft.input = target.value;
+        if (this.currentId) this._persistChatDraft(this.currentId, target.value);
+      }
+      if (target) delete target._museImeSettledOwnerSid;
       document.body.classList.remove("kb-open");
       document.documentElement.style.setProperty("--kb-inset", "0px");
       this._scheduleMobileRootReset();
@@ -5145,41 +5158,36 @@ function portal() {
     // `isComposing` is the standard signal, while keyCode/which 229 and
     // key="Process" cover older Safari/WebView and Windows IME variants.
     //
-    // Chromium WebViews and Safari can emit compositionend just BEFORE the
-    // very same candidate-confirming Enter, with isComposing=false and
-    // keyCode=13. Track the textarea lifecycle directly and treat an Enter in
-    // that short event window as part of the commit. DOM-local fields avoid
-    // reactive writes while the native IME buffer is live.
-    onImeCompositionStart(ev) {
-      const target = ev && (ev.target || ev.currentTarget);
+    // The chat textarea deliberately has no x-model. While it owns focus,
+    // native DOM text is authoritative and reactive model effects do not
+    // write `textarea.value`. This is essential for Windows Pinyin and
+    // macOS marked text. Reassigning value during an active composition can
+    // detach Chromium from the OS IME; afterwards Latin keys still work but a
+    // newly selected Chinese IME produces no text until the page is rebuilt.
+    // Programmatic composer edits go through _setChatInput(), which also
+    // refuses DOM writes for the short marked-text window.
+    _markImeComposition(target) {
       if (!target) return;
       target._museImeComposing = true;
       target._museImeEndedAt = 0;
-
-      // Alpine's x-model effect is allowed to write `textarea.value` whenever
-      // the root `input` value changes.  That is normally harmless, but a
-      // programmatic draft/session reconciliation that lands while Windows
-      // Pinyin / macOS marked text is active makes Chromium replace the
-      // native composition buffer without emitting compositionend.  The
-      // textarea then remains the IME's stale target: plain Latin input still
-      // works, while switching back to Chinese can stay broken until the page
-      // is restarted.
-      //
-      // Keep the DOM-owned marked text authoritative for this short window.
-      // Input events still update Alpine's model; only model -> DOM writes are
-      // deferred.  We restore Alpine's original hook and synchronize the
-      // committed DOM value in compositionend/blur below.
-      if (!target._museImeOriginalForceModelUpdate
-          && typeof target._x_forceModelUpdate === "function") {
-        const original = target._x_forceModelUpdate;
-        target._museImeOriginalForceModelUpdate = original;
-        target._x_forceModelUpdate = value => {
-          if (target._museImeComposing) {
-            target._museImeDeferredModelValue = value;
-            return;
-          }
-          original(value);
-        };
+      delete target._museImeSettledOwnerSid;
+      if (!target._museImeOwnerSid) {
+        target._museImeOwnerSid = this.currentId || "";
+      }
+    },
+    onImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      this._markImeComposition(target);
+    },
+    onChatBeforeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      // A few embedded Chromium builds omit compositionstart but still expose
+      // the standard beforeinput signal. Marking here closes that gap before
+      // Alpine or any app handler can reconcile the draft.
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markImeComposition(target);
       }
     },
     onImeCompositionEnd(ev) {
@@ -5190,18 +5198,32 @@ function portal() {
     },
     _finishImeComposition(target) {
       if (!target) return;
+      // Chromium can emit compositionend and then blur for the same commit.
+      // onChatInput's missing-compositionend fallback can also run first. A
+      // second settlement must be a no-op; otherwise the shared textarea's
+      // old value is copied into whichever session became current meanwhile.
+      if (!target._museImeComposing && !target._museImeOwnerSid) return;
+      const ownerSid = target._museImeOwnerSid || this.currentId || "";
       target._museImeComposing = false;
-      const original = target._museImeOriginalForceModelUpdate;
-      if (typeof original === "function") {
-        target._x_forceModelUpdate = original;
-      }
-      delete target._museImeOriginalForceModelUpdate;
-      delete target._museImeDeferredModelValue;
+      delete target._museImeOwnerSid;
+      target._museImeSettledOwnerSid = ownerSid;
       // Safari/WebView may fire compositionend before its final non-composing
       // input event.  Commit the DOM value now; the later input is idempotent.
-      // This also deliberately lets the user's marked text win over a stale
-      // programmatic draft write that was deferred above.
+      // If a tab switch completed first, save the commit back to the textarea's
+      // original draft instead of leaking it into the newly active session.
+      if (ownerSid && ownerSid !== this.currentId) {
+        const ownerState = this.tabState && this.tabState[ownerSid];
+        if (ownerState && ownerState.draft) {
+          ownerState.draft.input = target.value;
+          this._persistChatDraft(ownerSid, target.value);
+        }
+        this.$nextTick(() => this._syncChatInputDom(this.input));
+        return;
+      }
       if (this.input !== target.value) this.input = target.value;
+      const state = ownerSid && this.tabState && this.tabState[ownerSid];
+      if (state && state.draft) state.draft.input = target.value;
+      if (ownerSid) this._persistChatDraft(ownerSid, target.value);
     },
     _resetImeCompositionState(ev) {
       const target = ev && (ev.target || ev.currentTarget);
@@ -5219,6 +5241,24 @@ function portal() {
       return !!(ev.isComposing || ev.keyCode === 229 || ev.which === 229
         || ev.key === "Process" || (target && target._museImeComposing)
         || commitEnter);
+    },
+    _syncChatInputDom(value = this.input, options = {}) {
+      const target = options.target || (this.$refs && this.$refs.chatInput);
+      if (!target || target._museImeComposing) return false;
+      // Ordinary reactive reconciliation must never replace a focused native
+      // editor. Explicit user-facing app actions call with force=true below.
+      if (!options.force && document.activeElement === target) return false;
+      const next = value == null ? "" : String(value);
+      if (target.value !== next) target.value = next;
+      return true;
+    },
+    _setChatInput(value) {
+      const next = value == null ? "" : String(value);
+      this.input = next;
+      // Explicit app actions (history, @ mention, clear, tab activation) may
+      // update a focused textarea, but still never overwrite marked text.
+      this._syncChatInputDom(next, { force: true });
+      return next;
     },
     _claimNonImeEnter(ev) {
       if (!ev || this._isImeComposingEvent(ev)) return false;
@@ -7645,7 +7685,17 @@ function portal() {
       const st = this._ensureTabState(id);
       const draft = st.draft;
       draft._activated = true;
-      this.input = draft.input || "";
+      const ta = this.$refs && this.$refs.chatInput;
+      // Switching ownership while an IME buffer is live must end the old
+      // editor session before the shared textarea receives the new draft.
+      // blur normally emits compositionend; the explicit reset is a fallback
+      // for WebViews that omit it when focus moves programmatically.
+      if (ta && ta._museImeComposing && ta._museImeOwnerSid
+          && ta._museImeOwnerSid !== id) {
+        ta.blur();
+        if (ta._museImeComposing) this._resetImeCompositionState({ target: ta });
+      }
+      this._setChatInput(draft.input || "");
       this.pendingImages = draft.pendingImages;
       this.pendingDocs = draft.pendingDocs;
       this.pendingQuotes = draft.pendingQuotes;
@@ -22963,7 +23013,8 @@ function portal() {
     insertFileMention(path, isDir = false) {
       const mentionPath = this._mentionPath(path, isDir);
       const mention = "@" + mentionPath + " ";
-      this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
+      this._setChatInput((this.input || "")
+        + (this.input && !this.input.endsWith(" ") ? " " : "") + mention);
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       this.toast(this.t("toast.mention_added", { path: mentionPath }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
@@ -23055,13 +23106,14 @@ function portal() {
       const c = this.slashResults[i];
       if (!c) return;
       // Replace current input with the canonical form so user sees what's submitted
-      this.input = "/" + c.name + (c.name === "model" || c.name === "resume" ? " " : "");
+      this._setChatInput("/" + c.name
+        + (c.name === "model" || c.name === "resume" ? " " : ""));
       this.slashShow = false;
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       // For commands with NO argument needed, auto-execute on selection
       if (!["model", "resume"].includes(c.name)) {
         this._runSlash(c.name, "");
-        this.input = "";
+        this._setChatInput("");
       }
     },
 
@@ -23140,7 +23192,7 @@ function portal() {
           this._activateTabState(meta.id);
           await this.loadSession(meta.id);
           // Pre-fill input with the compact prompt — user reviews then sends
-          this.input = this.t("slash.compact_prompt");
+          this._setChatInput(this.t("slash.compact_prompt"));
           this.toast(this.t("slash.compact_ok"), "success", 2500);
           return;
         }
@@ -23241,7 +23293,7 @@ function portal() {
       if (this.settings && this.settings.show) this.settings.show = false;
       // Close skills drawer if open
       if (this.skillsDrawerOpen) this.skillsDrawerOpen = false;
-      this.input = prompt;
+      this._setChatInput(prompt);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -23315,7 +23367,7 @@ function portal() {
         || (zh ? `用 ${s.name} MCP 帮我：` : `Use the ${s.name} MCP to: `);
       this.mcpDrawerOpen = false;
       if (this.settings && this.settings.show) this.settings.show = false;
-      this.input = prompt;
+      this._setChatInput(prompt);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -23573,7 +23625,7 @@ function portal() {
       draft._historyDraft = "";
     },
     _showChatHistoryInput(text, ev) {
-      this.input = text;
+      this._setChatInput(text);
       ev.preventDefault();
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
@@ -23644,12 +23696,25 @@ function portal() {
       this.mentionShow = false;
     },
     onChatInput(ev) {
+      const ta = ev.target;
+      // Do not depend on Alpine directive listener order. The native control
+      // is the source of truth while focused, especially during composition.
+      if (this.input !== ta.value) this.input = ta.value;
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markImeComposition(ta);
+      } else if (ta._museImeComposing
+                 && ev.inputType !== "insertCompositionText") {
+        // Some Android/embedded Chromium builds commit through input without
+        // a compositionend event (and may label the final event insertText,
+        // not insertFromComposition). Clear the guard after consuming it.
+        this._finishImeComposition(ta);
+        ta._museImeEndedAt = Number(ev.timeStamp) || 0;
+      }
       // A real edit forks away from the recalled entry. Programmatic history
-      // navigation updates x-model directly and does not emit an input event.
+      // navigation goes through _setChatInput and does not emit an input event.
       this._resetChatInputHistory();
       this._captureComposerState(this.currentId, { persist: false });
       this._schedulePersistChatDraft(this.currentId, this.input || "");
-      const ta = ev.target;
       const pos = ta.selectionStart;
       const text = this.input.slice(0, pos);
 
@@ -23753,7 +23818,7 @@ function portal() {
       const before = this.input.slice(0, this.mentionAnchor);
       const after = this.input.slice(ta.selectionStart);
       const mentionPath = this._mentionPath(item.path, !!item.is_dir);
-      this.input = before + "@" + mentionPath + " " + after;
+      this._setChatInput(before + "@" + mentionPath + " " + after);
       this._cancelMentionLookup();
       this.$nextTick(() => {
         const newPos = (before + "@" + mentionPath + " ").length;
@@ -23783,13 +23848,13 @@ function portal() {
         const ta = this.$refs.chatInput;
         if (ta) {
           const s = ta.selectionStart, e = ta.selectionEnd;
-          this.input = this.input.slice(0, s) + "\n" + this.input.slice(e);
+          this._setChatInput(this.input.slice(0, s) + "\n" + this.input.slice(e));
           this.$nextTick(() => {
             ta.setSelectionRange(s + 1, s + 1);
             this.autoGrow(ta);
           });
         } else {
-          this.input += "\n";
+          this._setChatInput(this.input + "\n");
         }
         return;
       }
@@ -24248,7 +24313,7 @@ function portal() {
           if (ownsSendDraft() && sendDraft.input === composerInput) {
             sendDraft.input = "";
             this._resetChatInputHistory(sendDraft);
-            if (this.currentId === sendSid) this.input = "";
+            if (this.currentId === sendSid) this._setChatInput("");
             this._persistChatDraft(sendSid, "");
           }
           this.$nextTick(() => { if (this.currentId === sendSid && this.$refs.chatInput) this.autoGrow(this.$refs.chatInput); });
@@ -26449,7 +26514,7 @@ function portal() {
       // Drop the failed bubble, put text back in input, and send.
       const idx = this.messages.indexOf(m);
       if (idx >= 0) this.messages.splice(idx, 1);
-      this.input = this.userVisibleText(m);
+      this._setChatInput(this.userVisibleText(m));
       this.pendingQuotes.splice(
         0, this.pendingQuotes.length,
         ...this.userSelectionQuotes(m).map(q => ({ ...q, id: this._uuid() })),
@@ -26510,7 +26575,7 @@ function portal() {
       const msgs = this.messages;
       const idx = msgs.indexOf(m);
       if (idx >= 0) msgs.splice(idx);
-      this.input = newText;
+      this._setChatInput(newText);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) this.autoGrow(ta);
