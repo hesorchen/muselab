@@ -1295,7 +1295,7 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'item.state === "completed" && !!item.read' in app
     assert 'item.state === "cancelled"' in app
     assert "ACTIVITY_GROUP_CAP: 5" in app
-    assert "ACTIVITY_TIMELINE_CAP: 10" in app
+    assert "ACTIVITY_TIMELINE_CAP: 15" in app
     assert 'group?.key === "timeline"' in app
     assert "this.activityGroupCap(group)" in app
     assert "activityHiddenCount(group)" in app
@@ -1318,6 +1318,10 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert '@click.stop="toggleActivityPin(item)"' in html
     assert 'x-show="activity.view === \'timeline\'"' in html
     assert ".activity-pin.active" in css
+    assert ".activity-modal { width:700px" in css
+    assert "max-height:min(82vh,820px)" in css
+    assert "min-height:min(56vh,520px)" in css
+    assert "scrollbar-gutter:stable" in css
 
     # The left marker is unread/action state, not a permanent failure marker.
     assert "activityIsUnreadResult(item) ? ' is-unread'" in html
