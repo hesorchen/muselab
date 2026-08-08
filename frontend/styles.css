@@ -3644,11 +3644,11 @@ pre.text {
   border-right: 0;
 }
 .files-head-workspace .workspace-picker-btn { width: 100%; max-width: none; border-radius: var(--r-sm); }
-.activity-modal { width:620px; max-width:calc(100vw - 32px); }
+.activity-modal { width:700px; max-width:calc(100vw - 32px); }
 /* The later generic desktop modal cap is 480px. Keep this ledger wide enough
    for conversation + task hierarchy, without overriding mobile fullscreen. */
 @media (min-width:721px) {
-  .modal.activity-modal { width:620px; max-width:calc(100vw - 32px); }
+  .modal.activity-modal { width:700px; max-width:calc(100vw - 32px); }
 }
 .activity-view-switch { display:inline-flex; margin-left:auto; padding:2px; border:1px solid var(--c-border); border-radius:var(--r-md); background:var(--c-bg-2); }
 .activity-view-switch button { padding:4px 9px; border:0; border-radius:calc(var(--r-md) - 2px); background:transparent; color:var(--c-fg-3); font:inherit; font-size:var(--fs-xs); cursor:pointer; }
@@ -3680,12 +3680,12 @@ pre.text {
 .activity-chip.is-empty { opacity:0.42; }
 .activity-chip.is-empty:hover { opacity:0.85; }
 @media (prefers-reduced-motion:reduce) { .activity-chip .activity-chip-dot { animation:none; } }
-.activity-body { position:relative; max-height:min(70vh,680px); overflow:auto; padding:10px 14px 18px; }
+.activity-body { position:relative; max-height:min(82vh,820px); overflow:auto; scrollbar-gutter:stable; padding:10px 14px 18px; }
 /* Keep the desktop ledger geometry stable across cold load → rows.  The
    loading/refresh indicators are absolutely positioned, so neither their
    appearance nor disappearance can push a mounted row or resize the modal. */
 @media (min-width:721px) {
-  .activity-body { min-height:min(46vh,420px); }
+  .activity-body { min-height:min(56vh,520px); }
 }
 .activity-loading-overlay {
   position:absolute;

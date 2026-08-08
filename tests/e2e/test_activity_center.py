@@ -132,6 +132,107 @@ def test_cached_activity_refresh_does_not_shift_rows_or_modal(
         assert abs(after[key] - before[key]) < 1, (before, after)
 
 
+def test_desktop_timeline_defaults_to_fifteen_rows_in_larger_modal(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.expanded = {};
+          app.activity.loading = false;
+          app.activity.events = Array.from({length: 20}, (_, index) => ({
+            id: `timeline-cap-${index}`,
+            kind: 'turn',
+            session_id: `timeline-session-${index}`,
+            session_name: `Timeline session ${index + 1}`,
+            task_summary: `Timeline task ${index + 1}`,
+            workspace: '/tmp/e2e',
+            workspace_name: 'e2e',
+            state: 'completed',
+            read: true,
+            started_at: 100 + index,
+            finished_at: 200 + index,
+            updated_at: 300 + index,
+          }));
+          app.activity.summary = {
+            running: 0, unread: 0, attention: 0,
+            groups: {review: 0, running: 0, failed: 0, history: 20},
+            group_unread: {review: 0, running: 0, failed: 0, history: 0},
+            workspaces: [],
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    modal = page.locator(".activity-modal")
+    expect(modal).to_be_visible()
+    expect(page.locator(".activity-row")).to_have_count(15)
+    expect(page.locator(".activity-group-more")).to_have_text("还有 5 条")
+    page.wait_for_timeout(250)
+
+    geometry = page.evaluate(
+        """() => {
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const modalRect = modal.getBoundingClientRect();
+          const bodyRect = body.getBoundingClientRect();
+          return {
+            modalWidth: modalRect.width,
+            modalHeight: modalRect.height,
+            modalTop: modalRect.top,
+            modalBottom: modalRect.bottom,
+            bodyHeight: bodyRect.height,
+            bodyScrollHeight: body.scrollHeight,
+            viewportHeight: window.innerHeight,
+          };
+        }"""
+    )
+    assert geometry["modalWidth"] >= 690
+    assert geometry["modalHeight"] >= 560
+    assert geometry["bodyHeight"] >= 500
+    assert geometry["bodyScrollHeight"] >= geometry["bodyHeight"]
+    assert geometry["modalTop"] >= 0
+    assert geometry["modalBottom"] <= geometry["viewportHeight"]
+
+    page.locator(".activity-group-more").click()
+    expect(page.locator(".activity-row")).to_have_count(20)
+    expect(page.locator(".activity-group-more")).to_have_text("收起")
+
+    # The larger ledger is desktop-only. The existing phone contract remains
+    # a full-width modal with an internally scrolling body.
+    page.set_viewport_size({"width": 390, "height": 844})
+    mobile_geometry = page.evaluate(
+        """() => {
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const rect = modal.getBoundingClientRect();
+          return {
+            left: rect.left,
+            right: rect.right,
+            width: rect.width,
+            bottom: rect.bottom,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+            bodyMaxHeight: getComputedStyle(body).maxHeight,
+          };
+        }"""
+    )
+    assert mobile_geometry["left"] == 0
+    assert mobile_geometry["right"] <= mobile_geometry["viewportWidth"]
+    assert mobile_geometry["width"] == mobile_geometry["viewportWidth"]
+    assert mobile_geometry["bottom"] <= mobile_geometry["viewportHeight"]
+    assert mobile_geometry["bodyMaxHeight"] == "none"
+
+
 def test_session_rename_updates_loaded_activity_row_immediately(
     page: Page, backend_url, auth_token
 ):
@@ -140,6 +241,8 @@ def test_session_rename_updates_loaded_activity_row_immediately(
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
           const sid = app.currentId;
           const before = app.sessions.find(row => row.id === sid)?.name || '';
           app.activity.events = [{
@@ -324,7 +427,7 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
               workspaces: [],
             },
           });
-          for (let index = 0; index < 9; index += 1) {
+          for (let index = 0; index < 14; index += 1) {
             app.activity.events.push({
               ...base,
               id: `extra-${index}`,
@@ -341,8 +444,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
 
     session_labels = page.locator(".activity-group .activity-session-name")
     task_labels = page.locator(".activity-group .activity-task-summary")
-    expect(session_labels).to_have_count(10)
-    expect(task_labels).to_have_count(10)
+    expect(session_labels).to_have_count(15)
+    expect(task_labels).to_have_count(15)
     assert session_labels.all_text_contents()[:3] == [
         "Activity test", "Activity test", "Activity test",
     ]
@@ -380,8 +483,8 @@ def test_live_updates_and_all_status_time_view(page: Page, backend_url, auth_tok
     more = page.locator(".activity-group-more")
     expect(more).to_have_text("2 more")
     more.click()
-    expect(session_labels).to_have_count(12)
-    expect(task_labels).to_have_count(12)
+    expect(session_labels).to_have_count(17)
+    expect(task_labels).to_have_count(17)
 
 
 def test_terminal_event_wins_over_stale_tab_activity_snapshot(

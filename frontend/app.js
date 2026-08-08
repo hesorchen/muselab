@@ -26958,7 +26958,7 @@ function portal() {
       ];
     },
     ACTIVITY_GROUP_CAP: 5,
-    ACTIVITY_TIMELINE_CAP: 10,
+    ACTIVITY_TIMELINE_CAP: 15,
     activityMatchesGroup(item, key) {
       if (!item) return false;
       if (key === "timeline") return true;
