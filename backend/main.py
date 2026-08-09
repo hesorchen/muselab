@@ -12,6 +12,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from .auth import require_token
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from .files import router as files_router
 from .chat import router as chat_router
 from .api_settings import router as settings_router
@@ -348,9 +349,8 @@ app = FastAPI(title="muselab", version=project_version(), lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
-@app.middleware("http")
-async def _security_headers(request: Request, call_next):
-    """Attach defensive headers to every response.
+class _SecurityHeadersMiddleware:
+    """Attach defensive headers without BaseHTTPMiddleware task boundaries.
 
     Why these three and not a full CSP:
     - `X-Content-Type-Options: nosniff` — prevents browsers from MIME-sniffing
@@ -374,13 +374,34 @@ async def _security_headers(request: Request, call_next):
       typically runs at 127.0.0.1; HSTS on plaintext localhost would just
       confuse reverse-proxy setups.
     """
-    response = await call_next(request)
-    # Don't clobber explicit headers set by the endpoint (e.g. iframe
-    # preview that needs different X-Frame-Options).
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "same-origin")
-    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
-    return response
+
+    _HEADERS = (
+        (b"x-content-type-options", b"nosniff"),
+        (b"referrer-policy", b"same-origin"),
+        (b"x-frame-options", b"SAMEORIGIN"),
+    )
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_security_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or ())
+                existing = {name.lower() for name, _ in headers}
+                headers.extend(header for header in self._HEADERS
+                               if header[0] not in existing)
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
 
 
 app.include_router(files_router)

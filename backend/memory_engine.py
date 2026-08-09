@@ -15,6 +15,7 @@ from pathlib import Path
 from .memory_config import MemoryConfig, database_path, load_config, memory_dir
 from .memory_providers import (
     EmbeddingProvider,
+    GenerationError,
     GenerationProvider,
     Reranker,
     vector_store,
@@ -253,6 +254,7 @@ class MemoryEngine:
                     pass
                 continue
             error: str | None = None
+            retryable = True
             # Owner fence. Jobs carry the owner that enqueued them; the
             # handlers below resolve everything else from the LIVE config, so
             # a job that outlives an owner change (config edit / profile
@@ -288,11 +290,13 @@ class MemoryEngine:
                 raise
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
+                retryable = not isinstance(exc, GenerationError) or exc.retryable
                 log.warning("memory job %s failed: %s", job["id"], error)
             attempts = int(job.get("attempts", 0)) + 1
             await asyncio.to_thread(
                 self.store.finish_job, job["id"], error=error,
-                retry_seconds=(min(300.0, 2 ** attempts) if error and attempts < 3 else None))
+                retry_seconds=(min(300.0, 2 ** attempts)
+                               if error and retryable and attempts < 3 else None))
 
     async def _sweep_idle_episodes(self) -> None:
         cfg = self.config()
