@@ -130,13 +130,26 @@ def test_set_queue_paused_toggles(app_module):
     assert sess.set_queue_paused(sid, False)["paused"] is False
 
 
-def test_pause_empty_queue_persists_flag(app_module):
-    """Pausing an empty queue still records paused=True (the file is written
-    because paused is truthy even with no items)."""
+def test_pause_empty_queue_is_a_noop(app_module):
+    """A pause cannot outlive (or predate) the work it protects."""
     sess = _sess(app_module)
     sid = "s-pause-empty"
-    sess.set_queue_paused(sid, True)
-    assert sess.get_queue(sid)["paused"] is True
+    assert sess.set_queue_paused(sid, True)["paused"] is False
+    assert sess.get_queue(sid) == {"items": [], "paused": False}
+    assert not sess._queue_path(sid).exists()
+
+
+def test_legacy_empty_paused_queue_is_normalized_before_next_enqueue(app_module):
+    """Upgrade an already-stranded queue instead of only preventing new ones."""
+    sess = _sess(app_module)
+    sid = "s-legacy-empty-paused"
+    sess._queue_path(sid).write_text(
+        '{"items": [], "paused": true}', encoding="utf-8",
+    )
+
+    assert sess.get_queue(sid) == {"items": [], "paused": False}
+    sess.enqueue_message(sid, "fresh after upgrade")
+    assert sess.dequeue_message(sid)["text"] == "fresh after upgrade"
 
 
 def test_remove_queue_item(app_module):
@@ -214,7 +227,15 @@ def _mint_session(client, auth) -> str:
     return r.json()["id"]
 
 
-def test_queue_endpoint_enqueue_and_get(client, auth):
+@pytest.fixture()
+def queue_autodrain_disabled(monkeypatch):
+    """Keep CRUD endpoint tests from launching a real headless SDK turn."""
+    from backend import chat
+
+    monkeypatch.setattr(chat, "_schedule_queue_drain", lambda _sid: None)
+
+
+def test_queue_endpoint_enqueue_and_get(client, auth, queue_autodrain_disabled):
     sid = _mint_session(client, auth)
     r = client.post(f"/api/chat/sessions/{sid}/queue", headers=auth,
                     json={"text": "hello"})
@@ -225,17 +246,70 @@ def test_queue_endpoint_enqueue_and_get(client, auth):
     assert r.status_code == 200
     body = r.json()
     assert [it["text"] for it in body["items"]] == ["hello"]
+    assert [it["display_text"] for it in body["items"]] == ["hello"]
     assert body["paused"] is False
 
 
-def test_queue_endpoint_rejects_empty_message(client, auth):
+def test_queue_endpoint_preserves_bounded_selection_quote_presentation(
+    client, auth, queue_autodrain_disabled,
+):
+    sid = _mint_session(client, auth)
+    quote = {
+        "id": "quote-1",
+        "source": "preview",
+        "role": "",
+        "sessionId": sid,
+        "messageId": "",
+        "path": "README.md",
+        "text": "selected context",
+        "truncated": False,
+    }
+    response = client.post(
+        f"/api/chat/sessions/{sid}/queue",
+        headers=auth,
+        json={
+            "text": "引用自 `README.md`：\n\n> selected context\n\nquestion",
+            "display_text": "question",
+            "selection_quotes": [quote],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    item = client.get(
+        f"/api/chat/sessions/{sid}/queue", headers=auth,
+    ).json()["items"][0]
+    assert item["display_text"] == "question"
+    assert item["selection_quotes"] == [quote]
+
+
+def test_queue_endpoint_schedules_drain_kick(client, auth, monkeypatch):
+    from backend import chat
+
+    kicks = []
+    monkeypatch.setattr(chat, "_schedule_queue_drain", kicks.append)
+    sid = _mint_session(client, auth)
+    response = client.post(
+        f"/api/chat/sessions/{sid}/queue",
+        headers=auth,
+        json={"text": "wake me"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert kicks == [sid]
+
+
+def test_queue_endpoint_rejects_empty_message(
+    client, auth, queue_autodrain_disabled,
+):
     sid = _mint_session(client, auth)
     r = client.post(f"/api/chat/sessions/{sid}/queue", headers=auth,
                     json={"text": "   "})
     assert r.status_code == 400
 
 
-def test_queue_endpoint_full_returns_409(client, auth):
+def test_queue_endpoint_full_returns_409(
+    client, auth, queue_autodrain_disabled,
+):
     sid = _mint_session(client, auth)
     from backend import sessions as sess
     for i in range(sess._QUEUE_MAX):
@@ -247,7 +321,9 @@ def test_queue_endpoint_full_returns_409(client, auth):
     assert over.status_code == 409
 
 
-def test_queue_endpoint_reorder_roundtrip(client, auth):
+def test_queue_endpoint_reorder_roundtrip(
+    client, auth, queue_autodrain_disabled,
+):
     sid = _mint_session(client, auth)
     ids = []
     for t in ("a", "b", "c"):
@@ -261,7 +337,7 @@ def test_queue_endpoint_reorder_roundtrip(client, auth):
     assert [it["id"] for it in r.json()["items"]] == new_order
 
 
-def test_queue_endpoint_remove_item(client, auth):
+def test_queue_endpoint_remove_item(client, auth, queue_autodrain_disabled):
     sid = _mint_session(client, auth)
     r = client.post(f"/api/chat/sessions/{sid}/queue", headers=auth,
                     json={"text": "doomed"})
@@ -271,7 +347,7 @@ def test_queue_endpoint_remove_item(client, auth):
     assert r.json()["items"] == []
 
 
-def test_queue_endpoint_clear(client, auth):
+def test_queue_endpoint_clear(client, auth, queue_autodrain_disabled):
     sid = _mint_session(client, auth)
     client.post(f"/api/chat/sessions/{sid}/queue", headers=auth,
                 json={"text": "m1"})
@@ -284,7 +360,9 @@ def test_queue_endpoint_clear(client, auth):
                       headers=auth).json()["items"] == []
 
 
-def test_queue_endpoint_pause_toggle(client, auth, monkeypatch):
+def test_queue_endpoint_pause_toggle(
+    client, auth, monkeypatch, queue_autodrain_disabled,
+):
     from backend import chat
 
     drains = []
@@ -318,6 +396,105 @@ def test_queue_endpoint_requires_auth(client):
     """At least one route enforces the token — no header → 401."""
     r = client.get("/api/chat/sessions/whatever/queue")
     assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_late_enqueue_after_empty_completion_check_kicks_idle_queue(
+    app_module, monkeypatch,
+):
+    """Closing the exact lost-wakeup window starts the just-enqueued item."""
+    import asyncio
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    starts = []
+    started = asyncio.Event()
+
+    async def fake_start_turn(session_id, prompt, **kwargs):
+        starts.append((session_id, prompt, kwargs))
+        started.set()
+
+    monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+
+    # The previous turn/background watcher has just run its final drain and
+    # observed no work. A stale browser then posts while it still renders the
+    # session as streaming — this used to leave the item stranded forever.
+    await chat._maybe_drain_queue(sid)
+    response = await chat.enqueue_api(sid, chat.QueueEnqueueReq(text="late"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task = chat._queue_drain_tasks.get(sid)
+    if task is not None:
+        await task
+
+    assert response["ok"] is True
+    assert [(item[0], item[1]) for item in starts] == [(sid, "late")]
+    assert sess.get_queue(sid)["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_drain_kicks_serialize_dequeue_and_preserve_fifo(
+    app_module, monkeypatch,
+):
+    import asyncio
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    sess.enqueue_message(sid, "first")
+    sess.enqueue_message(sid, "second")
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_entered = asyncio.Event()
+    starts = []
+
+    async def fake_start_turn(_sid, prompt, **_kwargs):
+        starts.append(prompt)
+        if prompt == "first":
+            first_entered.set()
+            await release_first.wait()
+        else:
+            second_entered.set()
+
+    monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
+    first = asyncio.create_task(chat._maybe_drain_queue(sid))
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+    second = asyncio.create_task(chat._maybe_drain_queue(sid))
+    await asyncio.sleep(0)
+    assert not second_entered.is_set()
+
+    release_first.set()
+    await asyncio.gather(first, second)
+    assert starts == ["first", "second"]
+    assert sess.get_queue(sid)["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_scheduled_drain_restores_accepted_message(
+    app_module, monkeypatch,
+):
+    import asyncio
+    from backend import chat
+
+    sess = _sess(app_module)
+    sid = sess.create_session()["id"]
+    sess.enqueue_message(sid, "survive restart")
+    entered = asyncio.Event()
+
+    async def stalled_start(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(chat, "_start_turn", stalled_start)
+    task = asyncio.create_task(chat._maybe_drain_queue(sid))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    queue = sess.get_queue(sid)
+    assert [item["text"] for item in queue["items"]] == ["survive restart"]
+    assert queue["paused"] is False
 
 
 @pytest.mark.asyncio

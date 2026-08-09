@@ -6,6 +6,7 @@ that aborts, reactive tab state, and editor buffers settle on the right owner.
 from __future__ import annotations
 
 from collections import Counter
+import json
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -28,6 +29,1160 @@ def _login(page: Page, base: str, token: str) -> None:
           return app && app.authed && app.appReady && app._sessionsInitialized;
         }"""
     )
+
+
+def _select_rendered_preview_text(page: Page) -> str:
+    # Alpine can publish ``previewMode`` one render tick before the Markdown
+    # body is mounted.  Wait for the actual selectable surface so callers do
+    # not race an otherwise healthy preview on slower CI runners.
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll(
+          '.pane.preview .markdown, .pane.preview pre.text, '
+          + '.pane.preview .xlsx-preview'
+        )).some(el => el.getClientRects().length && el.textContent.trim())"""
+    )
+    return page.evaluate(
+        """() => {
+          const roots = Array.from(document.querySelectorAll(
+            '.pane.preview .markdown, .pane.preview pre.text, '
+            + '.pane.preview .xlsx-preview'
+          )).filter(el => el.getClientRects().length && el.textContent.trim());
+          const root = roots[0];
+          if (!root) throw new Error('no visible selectable preview');
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+              return node.data.trim().length >= 8
+                ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+            },
+          });
+          const node = walker.nextNode();
+          if (!node) throw new Error('no preview text node');
+          const leading = node.data.length - node.data.trimStart().length;
+          const length = Math.min(32, node.data.trim().length);
+          const range = document.createRange();
+          range.setStart(node, leading);
+          range.setEnd(node, leading + length);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.dispatchEvent(new Event('selectionchange'));
+          return selection.toString();
+        }"""
+    )
+
+
+def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.desktopFullPane = '';
+          app.leftOpen = true;
+          app.previewOpen = true;
+          app.leftWidth = 280;
+          app.previewWidth = 440;
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+
+          const files = document.querySelector('.pane.files');
+          const chat = document.querySelector('.pane.chat');
+          const preview = document.querySelector('.pane.preview');
+          const chatNode = chat;
+          const rect = node => {
+            const r = node.getBoundingClientRect();
+            return {left: r.left, right: r.right, width: r.width};
+          };
+          const before = {
+            files: rect(files), chat: rect(chat), preview: rect(preview),
+            orders: [files, chat, preview].map(node => getComputedStyle(node).order),
+          };
+
+          app.togglePreviewPane();
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const hidden = {
+            previewDisplay: getComputedStyle(preview).display,
+            chat: rect(chat),
+            sameChatNode: document.querySelector('.pane.chat') === chatNode,
+          };
+
+          app.togglePreviewPane();
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const restored = {
+            previewDisplay: getComputedStyle(preview).display,
+            chat: rect(chat), preview: rect(preview),
+            sameChatNode: document.querySelector('.pane.chat') === chatNode,
+          };
+          const prefs = JSON.parse(localStorage.getItem('muselab_prefs') || '{}');
+          localStorage.setItem('muselab_prefs', JSON.stringify({
+            schema: 8, leftWidth: 280, previewWidth: 440,
+          }));
+          app.leftWidth = 280;
+          app.loadPrefs();
+          const fileWidthMigration = app.leftWidth;
+          localStorage.setItem('muselab_prefs', JSON.stringify({
+            schema: 7, rightOpen: false, rightWidth: 512,
+          }));
+          app.previewOpen = true;
+          app.previewWidth = 440;
+          app.loadPrefs();
+          const migration = {
+            previewOpen: app.previewOpen,
+            previewWidth: app.previewWidth,
+          };
+          app.previewOpen = false;
+          app.toggleDesktopFull('preview');
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const previewFullscreen = {
+            previewOpen: app.previewOpen,
+            preview: rect(preview),
+            chatDisplay: getComputedStyle(chat).display,
+          };
+          app.toggleDesktopFull('preview');
+          await new Promise(resolve => app.$nextTick(resolve));
+          app.toggleDesktopFull('chat');
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const chatFullscreen = {
+            chat: rect(chat),
+            previewDisplay: getComputedStyle(preview).display,
+            sameChatNode: document.querySelector('.pane.chat') === chatNode,
+          };
+          app.toggleDesktopFull('chat');
+          return {
+            before, hidden, restored, prefs, migration, fileWidthMigration,
+            previewFullscreen, chatFullscreen,
+          };
+        }"""
+    )
+
+    before = result["before"]
+    assert before["files"]["right"] <= before["chat"]["left"]
+    assert before["chat"]["right"] <= before["preview"]["left"]
+    assert before["chat"]["width"] > before["preview"]["width"]
+    assert before["orders"] == ["1", "3", "5"]
+
+    assert result["hidden"]["previewDisplay"] == "none"
+    assert result["hidden"]["chat"]["width"] > before["chat"]["width"]
+    assert result["hidden"]["sameChatNode"] is True
+    assert result["restored"]["previewDisplay"] == "flex"
+    assert result["restored"]["chat"]["right"] <= result["restored"]["preview"]["left"]
+    assert result["restored"]["sameChatNode"] is True
+    assert result["prefs"]["schema"] == 9
+    assert result["prefs"]["previewOpen"] is True
+    assert result["prefs"]["previewWidth"] == 440
+    assert "rightOpen" not in result["prefs"]
+    assert "rightWidth" not in result["prefs"]
+    assert result["fileWidthMigration"] == 340
+    assert result["migration"] == {"previewOpen": True, "previewWidth": 512}
+    assert result["previewFullscreen"]["previewOpen"] is True
+    assert result["previewFullscreen"]["preview"]["width"] == 1440
+    assert result["previewFullscreen"]["chatDisplay"] == "none"
+    assert result["chatFullscreen"]["chat"]["width"] == 1440
+    assert result["chatFullscreen"]["previewDisplay"] == "none"
+    assert result["chatFullscreen"]["sameChatNode"] is True
+
+
+def test_os_file_drop_uses_whole_window_root_except_explicit_directory(
+        page: Page, backend_url, auth_token):
+    """Composer/tree blank/file rows are root; only a dir row is nested."""
+    errors: list[str] = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const uploads = [];
+          const attachments = [];
+          const internalMoves = [];
+          app._uploadFilesToDir = async (dir, files) => {
+            uploads.push({dir, names: Array.from(files, file => file.name)});
+          };
+          app._attachFile = async file => attachments.push(file.name);
+          app.moveTreeItems = async (paths, dir) => {
+            internalMoves.push({paths: Array.from(paths), dir});
+          };
+
+          const list = document.querySelector('.filelist');
+          const dirRow = document.createElement('li');
+          dirRow.className = 'dir';
+          dirRow.dataset.path = 'drop-target-dir';
+          dirRow.innerHTML = '<span class="name">drop-target-dir</span>';
+          const dirNode = {is_dir: true, path: 'drop-target-dir'};
+          dirRow.addEventListener('dragover', event => {
+            event.preventDefault();
+            app.onTreeNodeDragOver(event, dirNode);
+          });
+          dirRow.addEventListener('drop', event => {
+            event.preventDefault();
+            void app.onDrop(event, dirNode);
+          });
+          list.appendChild(dirRow);
+          const fileRow = document.createElement('li');
+          fileRow.className = 'file';
+          fileRow.dataset.path = 'drop-target-dir/existing.txt';
+          fileRow.innerHTML = '<span class="name">existing.txt</span>';
+          list.appendChild(fileRow);
+
+          const overlay = document.querySelector('.global-file-drop-overlay');
+          const settle = () => new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const transfer = name => {
+            const dt = new DataTransfer();
+            dt.items.add(new File(['fixture'], name, {type: 'text/plain'}));
+            return dt;
+          };
+          const enter = async (target, name) => {
+            const dt = transfer(name);
+            target.dispatchEvent(new DragEvent('dragenter', {
+              bubbles: true, cancelable: true, dataTransfer: dt,
+            }));
+            target.dispatchEvent(new DragEvent('dragover', {
+              bubbles: true, cancelable: true, dataTransfer: dt,
+            }));
+            await settle();
+            return dt;
+          };
+          const drop = async (target, dt) => {
+            target.dispatchEvent(new DragEvent('drop', {
+              bubbles: true, cancelable: true, dataTransfer: dt,
+            }));
+            await settle();
+          };
+
+          const chat = document.querySelector('.chat-input-wrap');
+          let dt = await enter(chat, 'chat-root.txt');
+          const rootOverlay = {
+            visible: !!overlay.getClientRects().length,
+            directory: app.osFileDropOnDirectory,
+            text: overlay.textContent.replace(/\\s+/g, ' ').trim(),
+          };
+          await drop(chat, dt);
+
+          dt = await enter(list, 'tree-blank-root.txt');
+          await drop(list, dt);
+
+          dt = await enter(dirRow.querySelector('.name'), 'nested.txt');
+          const dirOverlay = {
+            visible: !!overlay.getClientRects().length,
+            directory: app.osFileDropOnDirectory,
+            dir: app.osFileDropDir,
+            text: overlay.textContent.replace(/\\s+/g, ' ').trim(),
+          };
+          await drop(dirRow.querySelector('.name'), dt);
+
+          dt = await enter(fileRow.querySelector('.name'), 'file-row-root.txt');
+          await drop(fileRow.querySelector('.name'), dt);
+
+          // The document capture route must ignore MuseLab's own tree drag.
+          const internal = new DataTransfer();
+          internal.setData(app._DRAG_MIME_INTERNAL, 'README.md');
+          internal.setData('text/plain', 'README.md');
+          app._dragSrcPath = 'README.md';
+          dirRow.querySelector('.name').dispatchEvent(new DragEvent('dragover', {
+            bubbles: true, cancelable: true, dataTransfer: internal,
+          }));
+          dirRow.querySelector('.name').dispatchEvent(new DragEvent('drop', {
+            bubbles: true, cancelable: true, dataTransfer: internal,
+          }));
+          await settle();
+          const internalOverlay = app.osFileDragging;
+          dirRow.remove();
+          fileRow.remove();
+          return {
+            uploads, attachments, internalMoves, internalOverlay,
+            rootOverlay, dirOverlay,
+            dragging: app.osFileDragging,
+            dropDir: app.osFileDropDir,
+          };
+        }"""
+    )
+
+    assert result["uploads"] == [
+        {"dir": "", "names": ["chat-root.txt"]},
+        {"dir": "", "names": ["tree-blank-root.txt"]},
+        {"dir": "drop-target-dir", "names": ["nested.txt"]},
+        {"dir": "", "names": ["file-row-root.txt"]},
+    ]
+    assert result["attachments"] == []
+    assert result["internalMoves"] == [
+        {"paths": ["README.md"], "dir": "drop-target-dir"},
+    ]
+    assert result["internalOverlay"] is False
+    assert result["rootOverlay"]["visible"] is True
+    assert result["rootOverlay"]["directory"] is False
+    assert ("工作区根目录" in result["rootOverlay"]["text"]
+            or "workspace root" in result["rootOverlay"]["text"])
+    assert result["dirOverlay"]["visible"] is True
+    assert result["dirOverlay"]["directory"] is True
+    assert result["dirOverlay"]["dir"] == "drop-target-dir"
+    assert "/drop-target-dir" in result["dirOverlay"]["text"]
+    assert result["dragging"] is False
+    assert result["dropDir"] == ""
+    assert errors == []
+
+
+def test_file_metadata_layout_is_compact_and_human_readable(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'README.md' && app.selectedMeta?.path === 'README.md';
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          const now = Date.now();
+          app.fileMetaClock = now;
+          await new Promise(resolve => app.$nextTick(resolve));
+          const row = document.querySelector('.filelist li[data-path="README.md"]');
+          const size = row.querySelector('.size');
+          const meta = document.querySelector('.pane-fileinfo-meta');
+          return {
+            sizes: [0, 1024, 1536, 1024 ** 3, 1024 ** 4].map(n => app.fmtSize(n)),
+            relative: app.fmtRelativeMtime((now - 5 * 60_000) / 1000),
+            breadcrumb: app.fileBreadcrumb('one/two/three/four/file.md'),
+            rowHeight: row.getBoundingClientRect().height,
+            sizeText: size.textContent.trim(),
+            sizeFont: getComputedStyle(size).fontFamily,
+            metaText: meta.textContent.replace(/\\s+/g, ' ').trim(),
+            metaTitle: meta.title,
+          };
+        }"""
+    )
+
+    assert result["sizes"] == ["0 B", "1 KB", "1.5 KB", "1 GB", "1 TB"]
+    assert result["relative"] == "5 分钟前"
+    assert result["breadcrumb"] == "… › two › three › four"
+    assert result["rowHeight"] >= 28
+    assert result["sizeText"].endswith(" B")
+    assert "mono" not in result["sizeFont"].lower()
+    assert "B" in result["metaText"]
+    assert "修改于" in result["metaTitle"]
+
+
+def test_preview_selection_quotes_as_attachment_and_asks_in_side_session(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const visible = Array.from(document.querySelectorAll(
+            '.pane.preview .markdown'
+          )).some(el => el.getClientRects().length && el.textContent.trim());
+          return app.selected === 'README.md' && app.previewMode === 'md' && visible;
+        }"""
+    )
+
+    before = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          app._setChatInput('alphaomega');
+          await new Promise(resolve => app.$nextTick(resolve));
+          app._captureComposerState(app.currentId);
+          const ta = app.$refs.chatInput;
+          ta.setSelectionRange(5, 5);
+          return {
+            session: app.currentId,
+            sessionCount: app.sessions.length,
+            openTabs: [...app.openTabIds],
+            messageCount: app.messages.length,
+          };
+        }"""
+    )
+    selected = _select_rendered_preview_text(page)
+    expect(page.locator(".preview-selection-actions")).to_be_visible(timeout=3000)
+    page.locator(".preview-selection-actions button").nth(0).click()
+    expect(page.locator(".preview-selection-popover")).to_be_hidden()
+
+    quoted = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const quote = app.pendingQuotes[0];
+          return {
+            input: app.input,
+            draft: app.tabState[app.currentId].draft.input,
+            quoteCount: app.pendingQuotes.length,
+            quoteText: quote && quote.text,
+            quotePath: quote && quote.path,
+            session: app.currentId,
+            sessionCount: app.sessions.length,
+            openTabs: [...app.openTabIds],
+            messageCount: app.messages.length,
+          };
+        }"""
+    )
+    assert quoted["input"] == quoted["draft"]
+    assert quoted["input"] == "alphaomega"
+    assert quoted["quoteCount"] == 1
+    assert quoted["quoteText"] == selected
+    assert quoted["quotePath"] == "README.md"
+    assert quoted["session"] == before["session"]
+    assert quoted["sessionCount"] == before["sessionCount"]
+    assert quoted["openTabs"] == before["openTabs"]
+    assert quoted["messageCount"] == before["messageCount"]
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          // Programmatic composer changes use the native-editor bridge so the
+          // focused textarea and the reactive draft advance together.
+          app._setChatInput('KEEP EXISTING DRAFT');
+          app.pendingImages = [{id: 'keep-image'}];
+          app.pendingDocs = [{id: 'keep-doc'}];
+          app.pendingQuotes.splice(0);
+          app._captureComposerState(app.currentId);
+          window.__previewAskOriginalSend = app.send;
+          window.__previewAskOriginalCreate = app._createPreviewSelectionAskSession;
+          app._createPreviewSelectionAskSession = async (snapshot, question) => {
+            const meta = {
+              id: 'preview-side-question', name: 'Preview side question',
+              model: app.model, permission: 'default', active: false,
+              cwd: app.currentWorkspacePath(),
+            };
+            app.sessions = [meta, ...app.sessions.filter(s => s.id !== meta.id)];
+            const st = app._ensureTabState(meta.id);
+            st._loaded = true;
+            window.__previewAskCreate = {snapshot, question};
+            return meta;
+          };
+          app.send = async opts => {
+            window.__previewAskOptions = window.__previewAskOptions || [];
+            window.__previewAskOptions.push(JSON.parse(JSON.stringify(opts)));
+            const st = app._ensureTabState(opts.sessionId);
+            const turn = window.__previewAskOptions.length;
+            if (turn === 1) st.messages.splice(0, st.messages.length);
+            st.messages.push(
+              {role: 'user', text: opts.detachedText,
+               displayText: opts.detachedDisplayText},
+              {role: 'assistant', text: `SIDE_ANSWER_MARKER_${turn}`});
+            st.streaming = false;
+            return true;
+          };
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    selected_for_ask = _select_rendered_preview_text(page)
+    expect(page.locator(".preview-selection-actions")).to_be_visible(timeout=3000)
+    page.locator(".preview-selection-actions button").nth(1).click()
+    ask = page.locator(".preview-selection-ask")
+    expect(ask).to_be_visible()
+    ask.locator("textarea").fill("这段内容的核心是什么？")
+    ask.locator('button[type="submit"]').click()
+    expect(page.locator(".preview-selection-answer")).to_be_visible()
+    expect(page.locator(".preview-selection-answer-body")).to_contain_text(
+        "SIDE_ANSWER_MARKER_1"
+    )
+    followup = page.locator(".preview-selection-followup textarea")
+    followup.fill("能再举一个例子吗？")
+    page.locator(".preview-selection-followup-send").click()
+    expect(page.locator(".preview-selection-conversation")).to_contain_text(
+        "SIDE_ANSWER_MARKER_2"
+    )
+    expect(page.locator(".preview-selection-conversation")).to_contain_text(
+        "能再举一个例子吗？"
+    )
+
+    asked = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const opts = window.__previewAskOptions;
+          app.send = window.__previewAskOriginalSend;
+          app._createPreviewSelectionAskSession = window.__previewAskOriginalCreate;
+          return {
+            opts,
+            create: window.__previewAskCreate,
+            input: app.input,
+            draft: app.tabState[app.currentId].draft.input,
+            images: app.pendingImages.map(item => item.id),
+            docs: app.pendingDocs.map(item => item.id),
+            quotes: app.pendingQuotes.length,
+            session: app.currentId,
+            sessionCount: app.sessions.length,
+            openTabs: [...app.openTabIds],
+            messageCount: app.messages.length,
+            askSessionId: app.previewQuote.askSessionId,
+            popover: app.previewQuote.show,
+          };
+        }"""
+    )
+    assert len(asked["opts"]) == 2
+    first, followup_opts = asked["opts"]
+    assert first["sessionId"] == followup_opts["sessionId"] == "preview-side-question"
+    assert first["permissionMode"] == followup_opts["permissionMode"] == "default"
+    assert "引用自 `README.md`" in first["detachedText"]
+    assert selected_for_ask in first["detachedText"]
+    assert "这段内容的核心是什么？" in first["detachedText"]
+    assert first["detachedDisplayText"] == "这段内容的核心是什么？"
+    assert "追问：" in followup_opts["detachedText"]
+    assert "能再举一个例子吗？" in followup_opts["detachedText"]
+    assert followup_opts["detachedDisplayText"] == "能再举一个例子吗？"
+    assert asked["create"]["snapshot"]["sessionId"] == before["session"]
+    assert asked["create"]["question"] == "这段内容的核心是什么？"
+    assert asked["input"] == asked["draft"] == "KEEP EXISTING DRAFT"
+    assert asked["images"] == ["keep-image"]
+    assert asked["docs"] == ["keep-doc"]
+    assert asked["quotes"] == 0
+    assert asked["session"] == before["session"]
+    assert asked["sessionCount"] == before["sessionCount"] + 1
+    assert asked["openTabs"] == before["openTabs"]
+    assert asked["messageCount"] == before["messageCount"]
+    assert asked["askSessionId"] == "preview-side-question"
+    assert asked["popover"] is True
+
+
+def test_selection_side_session_forks_without_opening_or_switching_tab(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    source = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId"
+    )
+    child = "11111111-2222-4333-8444-555555555555"
+    fork_bodies: list[dict] = []
+
+    def handle_fork(route) -> None:
+        fork_bodies.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "id": child,
+                "session_id": child,
+                "name": "Source · 独立侧问：why",
+                "model": "e2e-model",
+                "permission": "bypassPermissions",
+                "cwd": "/e2e-workspace",
+                "forked_from": source,
+                "forked_from_message_id": "assistant-boundary",
+            }),
+        )
+
+    page.route(f"**/api/chat/sessions/{source}/fork", handle_fork)
+    result = page.evaluate(
+        """async arg => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          const beforeTabs = [...app.openTabIds];
+          const meta = await app._createPreviewSelectionAskSession({
+            source: 'chat', role: 'assistant', sessionId: arg.source,
+            messageId: 'assistant-boundary', path: '', text: 'selected',
+            truncated: false,
+          }, 'why');
+          return {
+            id: meta.id,
+            currentId: app.currentId,
+            openTabs: [...app.openTabIds],
+            beforeTabs,
+            stateLoaded: app.tabState[meta.id]._loaded,
+            statePermission: app.tabState[meta.id].permission,
+          };
+        }""",
+        {"source": source},
+    )
+
+    assert fork_bodies == [{
+        "up_to_message_id": "assistant-boundary",
+        "title": fork_bodies[0]["title"],
+        "activity_hidden": True,
+        "runtime_profile": "side_question",
+    }]
+    assert "独立侧问" in fork_bodies[0]["title"]
+    assert result["id"] == child
+    assert result["currentId"] == source
+    assert result["openTabs"] == result["beforeTabs"]
+    assert child not in result["openTabs"]
+    assert result["stateLoaded"] is True
+    assert result["statePermission"] == "default"
+
+
+def test_side_question_window_stays_floating_until_explicit_close(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1200, "height": 800})
+    _login(page, backend_url, auth_token)
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'README.md' && app.previewMode === 'md';
+        }"""
+    )
+    _select_rendered_preview_text(page)
+    page.locator(".preview-selection-actions button").nth(1).click()
+    popover = page.locator(".preview-selection-popover")
+    textarea = page.locator(".preview-selection-ask:visible textarea")
+    expect(textarea).to_be_visible()
+    textarea.fill("FLOATING_QUESTION_DRAFT")
+
+    # An ordinary click elsewhere used to close the window in capture phase.
+    page.locator(".filelist").click(position={"x": 6, "y": 6})
+    expect(popover).to_be_visible()
+    expect(textarea).to_have_value("FLOATING_QUESTION_DRAFT")
+
+    # File selection, chat-tab ownership and preview scrolling are all page
+    # navigation, not an implicit close command for an independent question.
+    state = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const source = app.currentId;
+          const other = '22222222-3333-4444-8555-666666666666';
+          app.sessions = [...app.sessions, {
+            id: other, name: 'Other chat', model: app.model,
+            permission: 'default', cwd: app.currentWorkspacePath(),
+          }];
+          app.openTabIds = [...app.openTabIds, other];
+          app._ensureTabState(other)._loaded = true;
+          app.selected = 'notes/a.md';
+          app.currentId = other;
+          app.onPreviewViewportScroll();
+          await new Promise(resolve => app.$nextTick(resolve));
+          const switched = {
+            show: app.previewQuote.show,
+            mode: app.previewQuote.mode,
+            question: app.previewQuote.question,
+          };
+          app.currentId = source;
+          app.openTabIds = app.openTabIds.filter(id => id !== other);
+          app.sessions = app.sessions.filter(row => row.id !== other);
+          delete app.tabState[other];
+          await new Promise(resolve => app.$nextTick(resolve));
+          return switched;
+        }"""
+    )
+    assert state == {
+        "show": True,
+        "mode": "ask",
+        "question": "FLOATING_QUESTION_DRAFT",
+    }
+    expect(popover).to_be_visible()
+
+    page.locator(".preview-selection-ask:visible .preview-selection-close").click()
+    expect(popover).to_be_hidden()
+
+
+def test_selection_side_question_window_drags_by_header_and_stays_in_view(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 1000, "height": 720})
+    _login(page, backend_url, auth_token)
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'README.md' && app.previewMode === 'md';
+        }"""
+    )
+    _select_rendered_preview_text(page)
+    actions = page.locator(".preview-selection-actions")
+    expect(actions).to_be_visible(timeout=3000)
+    actions.locator("button").nth(1).click()
+
+    popover = page.locator(".preview-selection-popover")
+    form_head = page.locator(
+        ".preview-selection-ask:not([style*='display: none']) "
+        ".preview-selection-ask-head"
+    )
+    expect(form_head).to_be_visible()
+    before = popover.bounding_box()
+    head_box = form_head.bounding_box()
+    assert before is not None and head_box is not None
+    start_x = head_box["x"] + 32
+    start_y = head_box["y"] + head_box["height"] / 2
+    target_left = 80
+    target_top = 120
+    page.mouse.move(start_x, start_y)
+    page.mouse.down()
+    page.mouse.move(
+        start_x + target_left - before["x"],
+        start_y + target_top - before["y"],
+        steps=8,
+    )
+    page.mouse.up()
+
+    after = popover.bounding_box()
+    assert after is not None
+    assert abs(after["x"] - target_left) < 2
+    assert abs(after["y"] - target_top) < 2
+    state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const el = document.querySelector('.preview-selection-popover');
+          return {
+            dragged: app.previewQuote.dragged,
+            dragging: app.previewQuote.dragging,
+            transform: getComputedStyle(el).transform,
+            x: app.previewQuote.x,
+            y: app.previewQuote.y,
+          };
+        }"""
+    )
+    assert state["dragged"] is True
+    assert state["dragging"] is False
+    assert state["transform"] == "none"
+    assert abs(state["x"] - after["x"]) < 1
+    assert abs(state["y"] - after["y"]) < 1
+
+    # Pointer capture keeps the drag alive when the cursor leaves the header;
+    # the position is clamped to a 12 px viewport margin in both directions.
+    head_box = form_head.bounding_box()
+    assert head_box is not None
+    page.mouse.move(head_box["x"] + 32, head_box["y"] + 12)
+    page.mouse.down()
+    page.mouse.move(995, 715, steps=8)
+    page.mouse.up()
+    lower_right = popover.bounding_box()
+    assert lower_right is not None
+    assert lower_right["x"] + lower_right["width"] <= 988.5
+    assert lower_right["y"] + lower_right["height"] <= 708.5
+
+    head_box = form_head.bounding_box()
+    assert head_box is not None
+    page.mouse.move(head_box["x"] + 32, head_box["y"] + 12)
+    page.mouse.down()
+    page.mouse.move(1, 1, steps=8)
+    page.mouse.up()
+    upper_left = popover.bounding_box()
+    assert upper_left is not None
+    assert upper_left["x"] >= 11.5
+    assert upper_left["y"] >= 11.5
+
+    # The answer-state header remains the same drag handle after the form is
+    # replaced by the compact branch response.
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = 'drag-side-answer';
+          const state = app._ensureTabState(sid);
+          state._loaded = true;
+          state.messages.splice(0, state.messages.length,
+            {role: 'user', text: 'drag prompt'},
+            {role: 'assistant', text: 'DRAG ANSWER'});
+          app.previewQuote.question = 'drag question';
+          app.previewQuote.askPrompt = 'drag prompt';
+          app.previewQuote.askSessionId = sid;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    answer = page.locator(".preview-selection-answer")
+    answer_head = answer.locator(".preview-selection-ask-head")
+    expect(answer_head).to_be_visible()
+    answer_before = popover.bounding_box()
+    answer_head_box = answer_head.bounding_box()
+    assert answer_before is not None and answer_head_box is not None
+    page.mouse.move(answer_head_box["x"] + 32, answer_head_box["y"] + 12)
+    page.mouse.down()
+    page.mouse.move(
+        answer_head_box["x"] + 170,
+        answer_head_box["y"] + 100,
+        steps=8,
+    )
+    page.mouse.up()
+    answer_after = popover.bounding_box()
+    assert answer_after is not None
+    assert answer_after["x"] > answer_before["x"] + 80
+    assert answer_after["y"] > answer_before["y"] + 45
+
+    answer.locator(".preview-selection-close").click()
+    expect(popover).to_be_hidden()
+    reset = page.evaluate(
+        """() => {
+          const q = document.querySelector('#app')._x_dataStack[0].previewQuote;
+          return {x: q.x, y: q.y, dragged: q.dragged, dragging: q.dragging};
+        }"""
+    )
+    assert reset == {"x": 0, "y": 0, "dragged": False, "dragging": False}
+
+
+def test_selection_side_question_window_supports_touch_drag(
+        page: Page, browser_name, backend_url, auth_token):
+    if browser_name != "chromium":
+        pytest.skip("touch input dispatch runs on Chromium")
+    page.set_viewport_size({"width": 390, "height": 844})
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Emulation.setTouchEmulationEnabled", {
+        "enabled": True,
+        "maxTouchPoints": 5,
+    })
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .setMobileTab('files')"""
+    )
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.mobileTab === 'preview' && app.selected === 'README.md'
+            && app.previewMode === 'md';
+        }"""
+    )
+    _select_rendered_preview_text(page)
+    actions = page.locator(".preview-selection-actions")
+    expect(actions).to_be_visible(timeout=3000)
+    actions.locator("button").nth(1).click()
+    popover = page.locator(".preview-selection-popover")
+    head = page.locator(".preview-selection-ask .preview-selection-ask-head")
+    expect(head).to_be_visible()
+    before = popover.bounding_box()
+    head_box = head.bounding_box()
+    assert before is not None and head_box is not None
+    start = {
+        "x": head_box["x"] + 40,
+        "y": head_box["y"] + head_box["height"] / 2,
+    }
+    target = {
+        "x": start["x"],
+        "y": min(760, start["y"] + 170),
+    }
+    cdp.send("Input.dispatchTouchEvent", {
+        "type": "touchStart",
+        "touchPoints": [{**start, "id": 1}],
+    })
+    cdp.send("Input.dispatchTouchEvent", {
+        "type": "touchMove",
+        "touchPoints": [{**target, "id": 1}],
+    })
+    cdp.send("Input.dispatchTouchEvent", {
+        "type": "touchEnd",
+        "touchPoints": [],
+    })
+    page.wait_for_function(
+        """() => {
+          const q = document.querySelector('#app')._x_dataStack[0].previewQuote;
+          return q.dragged && !q.dragging;
+        }"""
+    )
+    after = popover.bounding_box()
+    assert after is not None
+    assert after["y"] > before["y"] + 70
+    assert after["x"] >= 11.5
+    assert after["x"] + after["width"] <= 378.5
+    assert after["y"] + after["height"] <= 832.5
+
+
+def test_detached_preview_question_uses_send_pipeline_without_touching_draft(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    ticket_bodies: list[dict] = []
+
+    def handle_ticket(route) -> None:
+        ticket_bodies.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "preview-detached-ticket"}),
+        )
+
+    page.route("**/api/chat/stream/start", handle_ticket)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              setTimeout(() => {
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event('open'));
+              }, 0);
+            }
+            close() { this.readyState = 2; }
+          }
+          const originalEventSource = window.EventSource;
+          const originalBusy = app._confirmSessionBusy;
+          const originalRuntimeWait = app._awaitRuntimeSettingPatches;
+          const originalCommit = app._commitChatRecoveryDraft;
+          window.EventSource = FakeEventSource;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          let recoveryCommits = 0;
+          app._commitChatRecoveryDraft = () => { recoveryCommits += 1; };
+          try {
+            const sid = app.currentId;
+            const image = {id: 'draft-image', uploading: false};
+            const doc = {id: 'draft-doc', uploading: false};
+            app.input = 'PRESERVE THIS DRAFT';
+            app.pendingImages = [image];
+            app.pendingDocs = [doc];
+            app._captureComposerState(sid);
+            const messageCount = app.messages.length;
+            const sendResult = await app.send({
+              sessionId: sid,
+              detachedText: 'DETACHED PREVIEW QUESTION',
+            });
+            await new Promise(resolve => setTimeout(resolve, 20));
+            const state = app.tabState[sid];
+            return {
+              sendResult: sendResult === undefined ? 'undefined' : sendResult,
+              input: app.input,
+              draft: state.draft.input,
+              images: state.draft.pendingImages.map(item => item.id),
+              docs: state.draft.pendingDocs.map(item => item.id),
+              lastMessage: state.messages.at(-1)?.text,
+              messageDelta: state.messages.length - messageCount,
+              recoveryCommits,
+              recovery: app._chatDraftRecord(sid),
+            };
+          } finally {
+            if (app.es) app.es.close();
+            window.EventSource = originalEventSource;
+            app._confirmSessionBusy = originalBusy;
+            app._awaitRuntimeSettingPatches = originalRuntimeWait;
+            app._commitChatRecoveryDraft = originalCommit;
+          }
+        }"""
+    )
+
+    assert len(ticket_bodies) == 1
+    assert ticket_bodies[0]["prompt"] == "DETACHED PREVIEW QUESTION"
+    assert ticket_bodies[0]["image_ids"] == ""
+    assert result["sendResult"] == "undefined"
+    assert result["input"] == result["draft"] == "PRESERVE THIS DRAFT"
+    assert result["images"] == ["draft-image"]
+    assert result["docs"] == ["draft-doc"]
+    assert result["lastMessage"] == "DETACHED PREVIEW QUESTION"
+    assert result["messageDelta"] == 1
+    assert result["recoveryCommits"] == 0
+    assert result["recovery"]["text"] == "PRESERVE THIS DRAFT"
+    assert result["recovery"]["pending"] == ""
+
+
+def test_composer_quote_sends_context_without_rewriting_visible_text(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    ticket_bodies: list[dict] = []
+
+    def handle_ticket(route) -> None:
+        ticket_bodies.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": "selection-quote-ticket"}),
+        )
+
+    page.route("**/api/chat/stream/start", handle_ticket)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          class FakeEventSource extends EventTarget {
+            constructor(url) {
+              super();
+              this.url = url;
+              this.readyState = 0;
+              setTimeout(() => {
+                this.readyState = 1;
+                if (this.onopen) this.onopen(new Event('open'));
+              }, 0);
+            }
+            close() { this.readyState = 2; }
+          }
+          const originalEventSource = window.EventSource;
+          const originalBusy = app._confirmSessionBusy;
+          const originalRuntimeWait = app._awaitRuntimeSettingPatches;
+          window.EventSource = FakeEventSource;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          try {
+            const sid = app.currentId;
+            app.lang = 'zh';
+            app.input = 'VISIBLE QUESTION';
+            app.pendingQuotes = [{
+              id: 'quote-context', source: 'preview', role: '',
+              sessionId: sid, messageId: '', path: 'README.md',
+              text: 'SELECTED CONTEXT', truncated: false,
+            }];
+            app._captureComposerState(sid);
+            const before = app.messages.length;
+            const sendResult = await app.send();
+            await new Promise(resolve => setTimeout(resolve, 20));
+            const state = app.tabState[sid];
+            const user = state.messages.slice(before).find(m => m.role === 'user');
+            return {
+              sendResult: sendResult === undefined ? 'undefined' : sendResult,
+              input: app.input,
+              draft: state.draft.input,
+              pendingQuotes: state.draft.pendingQuotes.length,
+              promptText: user && user.text,
+              displayText: user && user.displayText,
+              quoteText: user && user.selectionQuotes[0].text,
+            };
+          } finally {
+            if (app.es) app.es.close();
+            window.EventSource = originalEventSource;
+            app._confirmSessionBusy = originalBusy;
+            app._awaitRuntimeSettingPatches = originalRuntimeWait;
+          }
+        }"""
+    )
+
+    assert len(ticket_bodies) == 1
+    prompt = ticket_bodies[0]["prompt"]
+    assert "引用自 `README.md`" in prompt
+    assert "SELECTED CONTEXT" in prompt
+    assert prompt.endswith("VISIBLE QUESTION")
+    assert result["sendResult"] == "undefined"
+    assert result["input"] == result["draft"] == ""
+    assert result["pendingQuotes"] == 0
+    assert result["promptText"] == prompt
+    assert result["displayText"] == "VISIBLE QUESTION"
+    assert result["quoteText"] == "SELECTED CONTEXT"
+
+
+def test_preview_selection_quote_fits_mobile_and_reveals_chat(
+        page: Page, browser_name, backend_url, auth_token):
+    if browser_name != "chromium":
+        pytest.skip("touch media emulation runs on Chromium")
+    page.set_viewport_size({"width": 390, "height": 844})
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Emulation.setTouchEmulationEnabled", {
+        "enabled": True,
+        "maxTouchPoints": 5,
+    })
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.lang = 'zh';
+          app.input = '';
+          app._captureComposerState(app.currentId);
+          app.setMobileTab('files');
+        }"""
+    )
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.mobileTab === 'preview' && app.selected === 'README.md'
+            && app.previewMode === 'md';
+        }"""
+    )
+    selected = _select_rendered_preview_text(page)
+    actions = page.locator(".preview-selection-actions")
+    expect(actions).to_be_visible(timeout=3000)
+    geometry = actions.evaluate(
+        """el => {
+          const box = el.getBoundingClientRect();
+          return {
+            left: box.left,
+            right: box.right,
+            top: box.top,
+            bottom: box.bottom,
+            buttonHeights: Array.from(el.querySelectorAll('button'))
+              .map(button => button.getBoundingClientRect().height),
+          };
+        }"""
+    )
+    assert geometry["left"] >= 0
+    assert geometry["right"] <= 390
+    assert geometry["top"] >= 0
+    assert geometry["bottom"] <= 844
+    assert min(geometry["buttonHeights"]) >= 38
+
+    actions.locator("button").nth(0).click()
+    page.wait_for_function(
+        """expected => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.mobileTab === 'chat'
+            && app.input === ''
+            && app.pendingQuotes.length === 1
+            && app.pendingQuotes[0].path === 'README.md'
+            && app.pendingQuotes[0].text.includes(expected);
+        }""",
+        arg=selected,
+    )
+    result = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            mobileTab: app.mobileTab,
+            input: app.input,
+            quoteCount: app.pendingQuotes.length,
+            quoteText: app.pendingQuotes[0]?.text || '',
+            popover: app.previewQuote.show,
+            chatDisplay: getComputedStyle(document.querySelector('.pane.chat')).display,
+            chipDisplay: getComputedStyle(document.querySelector('.selection-quote-chip')).display,
+          };
+        }"""
+    )
+    assert result["mobileTab"] == "chat"
+    assert result["popover"] is False
+    assert result["chatDisplay"] == "flex"
+    assert result["input"] == ""
+    assert result["quoteCount"] == 1
+    assert selected in result["quoteText"]
+    assert result["chipDisplay"] in {"flex", "inline-flex"}
+
+
+def test_file_metadata_stays_inside_mobile_header(
+        page: Page, browser_name, backend_url, auth_token):
+    if browser_name != "chromium":
+        pytest.skip("touch media emulation runs on Chromium")
+    page.set_viewport_size({"width": 390, "height": 844})
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Emulation.setTouchEmulationEnabled", {
+        "enabled": True,
+        "maxTouchPoints": 5,
+    })
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .setMobileTab('files')"""
+    )
+    file_row_height = page.locator(
+        '.filelist li[data-path="README.md"]'
+    ).evaluate("row => row.getBoundingClientRect().height")
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'README.md' && !!app.selectedMeta;
+        }"""
+    )
+    page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .setMobileTab('preview')"""
+    )
+
+    geometry = page.evaluate(
+        """() => {
+          const head = document.querySelector('.pane.preview .pane-head');
+          const meta = head.querySelector('.pane-fileinfo-meta');
+          const headBox = head.getBoundingClientRect();
+          const metaBox = meta.getBoundingClientRect();
+          return {
+            headTop: headBox.top,
+            headBottom: headBox.bottom,
+            metaTop: metaBox.top,
+            metaBottom: metaBox.bottom,
+            metaHeight: metaBox.height,
+            themeDisplay: getComputedStyle(
+              document.querySelector('.files-theme-toggle')).display,
+            hiddenDisplay: getComputedStyle(
+              document.querySelector('.files-hidden-toggle')).display,
+          };
+        }"""
+    )
+
+    assert geometry["metaTop"] >= geometry["headTop"]
+    assert geometry["metaBottom"] <= geometry["headBottom"]
+    assert geometry["metaHeight"] < 20
+    assert file_row_height >= 40
+    assert geometry["themeDisplay"] != "none"
+    assert geometry["hiddenDisplay"] == "none"
 
 
 def test_directory_can_be_mentioned_from_search_and_tree_action(
@@ -1814,6 +2969,8 @@ def test_hidden_toggle_does_not_replay_expanded_directories(page: Page,
                                                             backend_url,
                                                             auth_token):
     _login(page, backend_url, auth_token)
+    expect(page.locator(".pane.files .files-hidden-toggle")).to_be_visible()
+    expect(page.locator(".pane.files .files-tools")).to_have_count(0)
     result = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];

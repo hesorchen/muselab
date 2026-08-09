@@ -130,6 +130,17 @@ def _normalize_session_permission_fields(row: dict) -> dict:
     normalized["service_tier"] = (
         "fast" if normalized.get("service_tier") == "fast" else ""
     )
+    normalized["activity_hidden"] = bool(
+        normalized.get("activity_hidden", False)
+    )
+    # Runtime profiles are deliberately closed rather than free-form.  The
+    # side-question profile narrows the SDK tool surface to public web lookup;
+    # an unknown/legacy value must fall back to the ordinary session runtime.
+    normalized["runtime_profile"] = (
+        "side_question"
+        if normalized.get("runtime_profile") == "side_question"
+        else ""
+    )
     return normalized
 
 
@@ -424,6 +435,16 @@ def _merge_sdk_with_index(
         "forked_from": m.get("forked_from", ""),
         "forked_from_name": m.get("forked_from_name", ""),
         "forked_from_message_id": m.get("forked_from_message_id", ""),
+        # Lightweight side-question branches are real resumable sessions, but
+        # they are deliberately absent from the global task ledger. Keep that
+        # distinction in durable session metadata so reloads and later turns
+        # do not accidentally promote them into Task Center.
+        "activity_hidden": bool(m.get("activity_hidden", False)),
+        "runtime_profile": (
+            "side_question"
+            if m.get("runtime_profile") == "side_question"
+            else ""
+        ),
         # Every conversation is bound to the directory the Claude SDK was
         # started in.  Keep it in the sidecar so history, files and previews
         # switch as one workspace instead of silently falling back to ROOT.
@@ -579,11 +600,15 @@ def create_session(
     cwd: str | Path | None = None,
     permission: str = "",
     plan_return_permission: str | None = None,
+    activity_hidden: bool = False,
+    runtime_profile: str = "",
 ) -> dict:
     return register_session(str(uuid.uuid4()), name=name, model=model,
                             permission=permission,
                             plan_return_permission=plan_return_permission,
-                            auto_named=True, cwd=cwd)
+                            auto_named=True, cwd=cwd,
+                            activity_hidden=activity_hidden,
+                            runtime_profile=runtime_profile)
 
 
 def register_session(sid: str, *, name: str = "", model: str = "",
@@ -598,12 +623,16 @@ def register_session(sid: str, *, name: str = "", model: str = "",
                      forked_from: str = "",
                      forked_from_name: str = "",
                      forked_from_message_id: str = "",
+                     activity_hidden: bool = False,
+                     runtime_profile: str = "",
                      cwd: str | Path | None = None) -> dict:
     """Add a session that already has a UUID (e.g. one minted by SDK
     fork_session) to the muselab index. Same shape as create_session
     but without generating a fresh UUID."""
     now = time.time()
     workspace = workspace_registry.resolve(cwd)
+    if runtime_profile not in ("", "side_question"):
+        raise ValueError("invalid runtime profile")
     meta = {
         "id": sid,
         "name": name or _default_session_name(),
@@ -625,6 +654,8 @@ def register_session(sid: str, *, name: str = "", model: str = "",
         "effort": str(effort or "").strip() or "auto",
         "service_tier": "fast" if service_tier == "fast" else "",
         "thinking": bool(thinking),
+        "activity_hidden": bool(activity_hidden),
+        "runtime_profile": runtime_profile,
         "cwd": str(workspace),
     }
     if forked_from:
@@ -1037,8 +1068,20 @@ def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
         data = _load_sidecar(sid, use_cache=False)
         msgs = data.setdefault("messages", {})
         cur = msgs.setdefault(msg_uuid, {})
+        # Explicit user cancellation is monotonic truth.  A force-stopped CLI
+        # can append its AssistantMessage/ResultMessage late; generic terminal
+        # bookkeeping then attempts to write ``completed`` for the same UUID.
+        # Preserve both the status and the click-time footer metrics in that
+        # race, while still allowing the cancellation healer to replace an
+        # earlier inferred ``completed`` with ``cancelled``.
+        sticky_cancelled = (
+            cur.get("turn_status") == "cancelled"
+            and fields.get("turn_status") not in (None, "cancelled")
+        )
         for k, v in fields.items():
             if v is None:
+                continue
+            if sticky_cancelled and k in {"turn_status", "ts", "elapsed_s"}:
                 continue
             cur[k] = v
         _save_sidecar(sid, data)
@@ -1265,7 +1308,8 @@ def set_message_count(sid: str, message_count: int,
 # window between a queue mutation and an annotation write. A dedicated file +
 # lock keeps the two independent.
 #
-# Shape: {"items": [{"id","text","image_ids","permission",
+# Shape: {"items": [{"id","text","display_text","selection_quotes",
+#                    "image_ids","permission",
 #                    "plan_return_permission","enqueued_at"}], "paused": bool}
 #   - items: FIFO; head is sent next by the drain trigger in chat.py
 #   - paused: set True when a queued turn errors / hits ask_user_question /
@@ -1302,6 +1346,13 @@ def _load_queue(sid: str) -> dict:
                 if isinstance(item, dict) else item
                 for item in d["items"]
             ]
+        # ``paused`` describes queued work that must wait for an explicit
+        # resume.  With no work it has no referent and becomes a trap for the
+        # *next* enqueue: dequeue_message would refuse that fresh item forever.
+        # Normalize legacy/stale ``{items: [], paused: true}`` files on read so
+        # an already-affected installation recovers immediately after upgrade.
+        if not d["items"]:
+            d["paused"] = False
         return d
     except Exception:
         return {"items": [], "paused": False}
@@ -1316,6 +1367,10 @@ def _save_queue(sid: str, data: dict) -> None:
             if isinstance(item, dict) else item
             for item in items
         ]
+    # Enforce the same invariant on every write.  This also removes stale
+    # empty-paused files the next time any queue mutation touches them.
+    if not canonical.get("items"):
+        canonical["paused"] = False
     # An empty, un-paused queue leaves no file behind (avoids littering
     # sessions/ with thousands of empty queue.json files over time).
     if not canonical.get("items") and not canonical.get("paused"):
@@ -1340,6 +1395,8 @@ def get_queue(sid: str) -> dict:
 
 def enqueue_message(sid: str, text: str, image_ids: str = "",
                     permission: str = "",
+                    display_text: str = "",
+                    selection_quotes: list[dict] | None = None,
                     plan_return_permission: str | None = None) -> dict:
     """Append a message to the session's queue. Returns
     {'ok': bool, 'item'?: dict, 'queue': dict, 'error'?: str}. Rejects past
@@ -1355,6 +1412,8 @@ def enqueue_message(sid: str, text: str, image_ids: str = "",
         item = {
             "id": "q-" + uuid.uuid4().hex[:8],
             "text": text or "",
+            "display_text": display_text or "",
+            "selection_quotes": selection_quotes or [],
             "image_ids": image_ids or "",
             "permission": permission or "",
             "plan_return_permission": _normalize_plan_return_permission(
@@ -1428,7 +1487,7 @@ def set_queue_paused(sid: str, paused: bool) -> dict:
     (paused=False) does NOT itself drain — the caller kicks the drain."""
     with _QUEUE_LOCK:
         data = _load_queue(sid)
-        data["paused"] = bool(paused)
+        data["paused"] = bool(paused) and bool(data["items"])
         _save_queue(sid, data)
         return data
 

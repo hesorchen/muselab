@@ -7,6 +7,17 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_model_numbers_reject_malformed_output_without_retry():
+    from backend.memory_engine import _model_float
+    from backend.memory_providers import GenerationError
+
+    with pytest.raises(GenerationError) as exc_info:
+        _model_float("high")
+
+    assert exc_info.value.retryable is False
+    assert exc_info.value.category == "malformed_response"
+
+
 def test_endpoint_rejects_credentials_query_and_non_http():
     from backend.memory_providers import _safe_http_url
     for value in (

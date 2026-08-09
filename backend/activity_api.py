@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .activity import activity
@@ -18,6 +18,24 @@ _EVENT_TICKET_TTL_S = 45
 
 class ActivityPatchRequest(BaseModel):
     pinned: bool
+
+
+class ActivityGroupCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=48)
+    color: str = Field(default="blue", max_length=16)
+
+
+class ActivityGroupUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=48)
+    color: str | None = Field(default=None, max_length=16)
+
+
+class ActivityGroupOrderRequest(BaseModel):
+    ids: list[str] = Field(max_length=40)
+
+
+class ActivityGroupAssignmentRequest(BaseModel):
+    group_id: str = Field(default="", max_length=64)
 
 
 def _json(request: Request, response: Response, payload: dict):
@@ -101,6 +119,63 @@ async def activity_events() -> EventSourceResponse:
 @router.post("/ack-all", dependencies=[Depends(require_token)])
 def ack_all():
     return {"ok": True, "changed": activity.ack(), "summary": activity.summary()}
+
+
+@router.get("/groups", dependencies=[Depends(require_token)])
+def list_activity_groups():
+    return {"custom_groups": activity.list_groups()}
+
+
+@router.post("/groups", dependencies=[Depends(require_token)])
+def create_activity_group(req: ActivityGroupCreateRequest):
+    try:
+        update = activity.create_group(req.name, req.color)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **update}
+
+
+@router.put("/groups/order", dependencies=[Depends(require_token)])
+def reorder_activity_groups(req: ActivityGroupOrderRequest):
+    try:
+        update = activity.reorder_groups(req.ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **update}
+
+
+@router.patch("/groups/{group_id}", dependencies=[Depends(require_token)])
+def update_activity_group(group_id: str, req: ActivityGroupUpdateRequest):
+    try:
+        update = activity.update_group(
+            group_id,
+            name=req.name,
+            color=req.color,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if update is None:
+        raise HTTPException(status_code=404, detail="activity group not found")
+    return {"ok": True, **update}
+
+
+@router.delete("/groups/{group_id}", dependencies=[Depends(require_token)])
+def delete_activity_group(group_id: str):
+    update = activity.delete_group(group_id)
+    if update is None:
+        raise HTTPException(status_code=404, detail="activity group not found")
+    return {"ok": True, **update}
+
+
+@router.put("/{event_id}/group", dependencies=[Depends(require_token)])
+def assign_activity_group(event_id: str, req: ActivityGroupAssignmentRequest):
+    try:
+        update = activity.set_group(event_id, req.group_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if update is None:
+        raise HTTPException(status_code=404, detail="activity not found")
+    return {"ok": True, **update}
 
 
 @router.patch("/{event_id}", dependencies=[Depends(require_token)])

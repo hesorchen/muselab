@@ -427,6 +427,33 @@ def test_annotation_partial_update_preserves_other_fields(app_module):
     assert anns["uuid-x"]["images"] == [{"mime": "image/png"}]
 
 
+def test_cancelled_annotation_is_not_downgraded_by_late_completion(app_module):
+    """User cancellation and its click-time metrics are monotonic truth."""
+    from backend import sessions as sess
+
+    sid = sess.create_session()["id"]
+    sess.set_message_annotation(
+        sid, "uuid-late",
+        turn_status="cancelled", ts=1_700_000_002_000, elapsed_s=2.0,
+        model="codex:gpt-5.6-sol",
+    )
+    # A late ResultMessage may still contribute cost/model, but it cannot turn
+    # the footer green or move its boundary several seconds past the click.
+    sess.set_message_annotation(
+        sid, "uuid-late",
+        cost="$0.0100", model="codex:gpt-5.6-sol",
+        ts=1_700_000_009_000, turn_status="completed", elapsed_s=9.0,
+    )
+    annotation = sess.get_message_annotations(sid)["uuid-late"]
+    assert annotation == {
+        "turn_status": "cancelled",
+        "ts": 1_700_000_002_000,
+        "elapsed_s": 2.0,
+        "model": "codex:gpt-5.6-sol",
+        "cost": "$0.0100",
+    }
+
+
 def test_session_usage_endpoint_returns_meter_data(client, auth, app_module):
     r = client.get("/api/chat/usage/never-existed?model=claude-opus-4-7",
                     headers=auth)
@@ -673,6 +700,37 @@ def test_create_session_leaves_model_empty_when_no_provider(app_module, monkeypa
     monkeypatch.setattr(endpoints, "has_anthropic_auth", lambda: False)
     meta = chat.create_session_api(chat.CreateReq(name="fresh", model=""))
     assert (meta.get("model") or "") == ""
+
+
+def test_lightweight_session_persists_activity_hidden(app_module):
+    from backend import sessions as sess
+
+    hidden = sess.create_session("side question", activity_hidden=True)
+    normal = sess.create_session("normal chat")
+
+    assert hidden["activity_hidden"] is True
+    assert sess.get_session(hidden["id"])["activity_hidden"] is True
+    listed = {row["id"]: row for row in sess.list_sessions()}
+    assert listed[hidden["id"]]["activity_hidden"] is True
+    assert normal["activity_hidden"] is False
+    assert listed[normal["id"]]["activity_hidden"] is False
+
+
+def test_side_question_runtime_profile_is_durable_and_closed(app_module):
+    from backend import sessions as sess
+
+    side = sess.create_session(
+        "side question",
+        activity_hidden=True,
+        runtime_profile="side_question",
+    )
+    assert side["runtime_profile"] == "side_question"
+    assert sess.get_session(side["id"])["runtime_profile"] == "side_question"
+    listed = {row["id"]: row for row in sess.list_sessions()}
+    assert listed[side["id"]]["runtime_profile"] == "side_question"
+
+    with pytest.raises(ValueError, match="invalid runtime profile"):
+        sess.create_session("unsafe", runtime_profile="workspace_agent")
 
 
 def test_reset_session_endpoint(client, auth):
