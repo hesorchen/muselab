@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -35,11 +36,16 @@ _MEMORY_STATUSES = {"active", "pending_review"}
 def _model_float(value: object) -> float:
     """Parse a model-produced number without turning bad output into a retry."""
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise GenerationError(
             retryable=False, category="malformed_response"
         ) from exc
+    if not math.isfinite(parsed):
+        raise GenerationError(
+            retryable=False, category="malformed_response"
+        )
+    return parsed
 
 
 # Credential redaction. The key/value separator must tolerate the quoting that

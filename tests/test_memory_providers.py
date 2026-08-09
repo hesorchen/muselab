@@ -3,16 +3,18 @@ import asyncio
 
 import pytest
 
+
 def _run(coro):
     return asyncio.run(coro)
 
 
-def test_model_numbers_reject_malformed_output_without_retry():
+@pytest.mark.parametrize("value", ["high", "nan", "inf", "-inf"])
+def test_model_numbers_reject_malformed_output_without_retry(value):
     from backend.memory_engine import _model_float
     from backend.memory_providers import GenerationError
 
     with pytest.raises(GenerationError) as exc_info:
-        _model_float("high")
+        _model_float(value)
 
     assert exc_info.value.retryable is False
     assert exc_info.value.category == "malformed_response"
