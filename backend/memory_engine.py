@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ from pathlib import Path
 from .memory_config import MemoryConfig, database_path, load_config, memory_dir
 from .memory_providers import (
     EmbeddingProvider,
+    GenerationError,
     GenerationProvider,
     Reranker,
     vector_store,
@@ -29,6 +31,23 @@ _MEMORY_KINDS = {"fact", "preference", "decision", "state", "episode", "reflecti
 # `deleted` are terminal outcomes of a governance action and are deliberately
 # not creatable.
 _MEMORY_STATUSES = {"active", "pending_review"}
+
+
+def _model_float(value: object) -> float:
+    """Parse a model-produced number without turning bad output into a retry."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise GenerationError(
+            retryable=False, category="malformed_response"
+        ) from exc
+    if not math.isfinite(parsed):
+        raise GenerationError(
+            retryable=False, category="malformed_response"
+        )
+    return parsed
+
+
 # Credential redaction. The key/value separator must tolerate the quoting that
 # real payloads use — JSON (`"api_key": "sk-…"`), YAML (`api_key: "…"`) and
 # shell (`API_KEY='…'`) — otherwise the closing quote after the key name sits
@@ -253,6 +272,7 @@ class MemoryEngine:
                     pass
                 continue
             error: str | None = None
+            retryable = True
             # Owner fence. Jobs carry the owner that enqueued them; the
             # handlers below resolve everything else from the LIVE config, so
             # a job that outlives an owner change (config edit / profile
@@ -288,11 +308,13 @@ class MemoryEngine:
                 raise
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
+                retryable = not isinstance(exc, GenerationError) or exc.retryable
                 log.warning("memory job %s failed: %s", job["id"], error)
             attempts = int(job.get("attempts", 0)) + 1
             await asyncio.to_thread(
                 self.store.finish_job, job["id"], error=error,
-                retry_seconds=(min(300.0, 2 ** attempts) if error and attempts < 3 else None))
+                retry_seconds=(min(300.0, 2 ** attempts)
+                               if error and retryable and attempts < 3 else None))
 
     async def _sweep_idle_episodes(self) -> None:
         cfg = self.config()
@@ -468,7 +490,7 @@ class MemoryEngine:
         kind = kind_override or str(candidate.get("kind", "fact"))
         if not content or kind not in _MEMORY_KINDS:
             return None
-        future_use = float(candidate.get("future_use", 0) or 0)
+        future_use = _model_float(candidate.get("future_use", 0) or 0)
         if future_use < 0.35:
             return None
         existing = await asyncio.to_thread(
@@ -521,7 +543,7 @@ class MemoryEngine:
         supported = verification.get("supported") is True
         conflict = verification.get("conflict") is True
         model_value = max(0.0, min(
-            1.0, float(verification.get("prediction_value", 0) or 0)))
+            1.0, _model_float(verification.get("prediction_value", 0) or 0)))
         source_episode_count = max(
             1, len(set(candidate.get("episode_ids", [episode_id]))))
         independence = min(1.0, source_episode_count / 3)
@@ -564,7 +586,7 @@ class MemoryEngine:
         memory = await asyncio.to_thread(
             self.store.create_memory, cfg.owner_id, kind, content,
             authority="inferred",
-            confidence=max(0.0, min(1.0, float(candidate.get("confidence", 0.5) or 0.5))),
+            confidence=max(0.0, min(1.0, _model_float(candidate.get("confidence", 0.5) or 0.5))),
             status=status,
             attributes={
                 "attributed_to": candidate.get("attributed_to", "derived"),

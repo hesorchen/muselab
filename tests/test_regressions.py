@@ -462,6 +462,76 @@ def test_security_headers_present_on_every_response(client, auth):
     assert r.headers.get("X-Frame-Options") == "SAMEORIGIN"
 
 
+def test_security_header_asgi_middleware_preserves_explicit_headers(app_module):
+    import asyncio
+
+    sent = []
+
+    async def endpoint(scope, receive, send):
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": ((b"x-frame-options", b"DENY"),),
+        })
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = app_module._SecurityHeadersMiddleware(endpoint)
+    asyncio.run(middleware({"type": "http"}, receive, send))
+
+    headers = dict(sent[0]["headers"])
+    assert headers[b"x-content-type-options"] == b"nosniff"
+    assert headers[b"referrer-policy"] == b"same-origin"
+    assert headers[b"x-frame-options"] == b"DENY"
+
+
+def test_security_header_asgi_middleware_passes_non_http_scope_unchanged(
+        app_module):
+    import asyncio
+
+    observed = []
+
+    async def endpoint(scope, receive, send):
+        observed.append(scope)
+
+    middleware = app_module._SecurityHeadersMiddleware(endpoint)
+    scope = {"type": "websocket", "path": "/socket"}
+    asyncio.run(middleware(scope, None, None))
+    assert observed == [scope]
+
+
+def test_security_header_asgi_middleware_propagates_disconnect_cancellation(
+    app_module,
+):
+    import asyncio
+    import pytest
+
+    sent = []
+
+    async def streaming_endpoint(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        message = await receive()
+        assert message["type"] == "http.disconnect"
+        raise asyncio.CancelledError
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = app_module._SecurityHeadersMiddleware(streaming_endpoint)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(middleware({"type": "http"}, receive, send))
+
+    assert sent[0]["type"] == "http.response.start"
+
+
 def test_robots_txt_disallows_all(client):
     """Defense-in-depth for accidental public exposure. If a user
     misconfigures their reverse proxy or Cloudflare tunnel, at least

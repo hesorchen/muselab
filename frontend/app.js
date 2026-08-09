@@ -28,6 +28,7 @@
   const DEDUP_WINDOW_MS = 10_000;
   const ring = window.__museErrors__ = [];
   const seen = new Map(); // sig -> last-ts
+  const telemetry = window.__museTelemetry__ = [];
 
   // Last fetch URL/method, captured by the wrapper below. Safari's
   // "TypeError: Load failed" has no info about which request died;
@@ -38,22 +39,10 @@
     return [rec.kind, rec.message || "", rec.filename || "", rec.lineno || ""].join("|");
   }
 
-  function _report(rec) {
-    const sig = _sig(rec);
-    const now = Date.now();
-    const last = seen.get(sig) || 0;
-    if (now - last < DEDUP_WINDOW_MS) return;
-    seen.set(sig, now);
-
-    rec.ts = new Date(now).toISOString();
-    rec.ua = navigator.userAgent;
-    rec.url = location.href;
-    rec.lastFetch = window.__museLastFetch__;
-
-    ring.push(rec);
-    if (ring.length > RING_MAX) ring.shift();
-
-    try { console.error("[muse-capture]", rec); } catch (_) { /* noop */ }
+  function _deliverClientErrorRecord(rec, targetRing, label, consoleMethod = "error") {
+    targetRing.push(rec);
+    if (targetRing.length > RING_MAX) targetRing.shift();
+    try { console[consoleMethod](label, rec); } catch (_) { /* noop */ }
 
     // sendBeacon is fire-and-forget, survives page-unload, and Safari
     // supports it. Falls back to fetch+keepalive if sendBeacon refuses
@@ -72,6 +61,48 @@
       }
     } catch (_) { /* never let logging break the app */ }
   }
+
+  function _report(rec) {
+    const sig = _sig(rec);
+    const now = Date.now();
+    const last = seen.get(sig) || 0;
+    if (now - last < DEDUP_WINDOW_MS) return;
+    seen.set(sig, now);
+
+    rec.ts = new Date(now).toISOString();
+    rec.ua = navigator.userAgent;
+    rec.url = location.href;
+    rec.lastFetch = window.__museLastFetch__;
+    void _deliverClientErrorRecord(rec, ring, "[muse-capture]");
+  }
+
+  // Recoverable render-boundary diagnostics use a separate, content-free
+  // channel: they must be observable without being promoted to uncaught errors.
+  // A malformed pane is reported as one deterministic issue batch rather than
+  // one request per message, preserving the endpoint's client-error quota.
+  window.__museReportTelemetry__ = (record) => {
+    const allowedIssues = new Set(["duplicate", "missing"]);
+    const counts = new Map();
+    for (const item of ((record && record.issues) || [])) {
+      const issue = String((item && item.issue) || "");
+      const count = Number(item && item.count);
+      if (allowedIssues.has(issue) && Number.isInteger(count) && count > 0) {
+        counts.set(issue, (counts.get(issue) || 0) + count);
+      }
+    }
+    const rec = {
+      kind: record && record.kind === "message_render_key"
+        ? "message_render_key" : "frontend_diagnostic",
+      pane: String((record && record.pane) || "").slice(0, 128),
+      session: String((record && record.session) || "").slice(0, 128),
+      issues: Array.from(counts, ([issue, count]) => ({
+        issue, count: Math.min(count, 10_000),
+      }))
+        .sort((a, b) => a.issue < b.issue ? -1 : (a.issue > b.issue ? 1 : 0)),
+    };
+    if (!rec.issues.length) return;
+    void _deliverClientErrorRecord(rec, telemetry, "[muse-telemetry]", "warn");
+  };
 
   window.addEventListener("unhandledrejection", (ev) => {
     const r = ev.reason;
@@ -3755,6 +3786,8 @@ function portal() {
       const data = await r.json();
       if (this.tabState[sid] !== st) return false;
       const win = this._historyEnvelopes(sid, data.messages || []);
+      this._markPaneRenderKeysDirty(st);
+      this._rebuildPaneMessageRenderKeys(sid, win);
       for (const m of win) {
         if (m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
       }
@@ -3772,6 +3805,7 @@ function portal() {
       // or older backend returns more than the cache cap, _capHistoryCache
       // advances _loadedOffset for every discarded head bubble.
       this._capMountedWindow(st, "around", uuid);
+      this._recordPaneRenderKeyShape(st);
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
       if (sid === this.currentId) {
         this.messages = st.messages;
@@ -6661,6 +6695,20 @@ function portal() {
         // Monotonic per-tab sequence for optimistic/live messages. Historical
         // envelopes use transcript identity; live keys never depend on array index.
         _nextLiveKey: 1,
+        // Defensive render-key repair is pane-local and identity-based. These
+        // objects are diagnostics metadata, not reactive UI state.
+        _renderKeyByObject: new WeakMap(),
+        _renderKeyOwners: new Map(),
+        _renderKeyGeneration: 0,
+        _renderKeyNormalizedGeneration: -1,
+        _renderKeyShape: null,
+        _nextRenderRepairKey: 1,
+        _renderKeyTelemetry: {
+          lastReportedAt: -Infinity,
+          pendingDuplicate: 0,
+          pendingMissing: 0,
+          flushTimer: null,
+        },
         // Newer half of the bounded bidirectional window. Chronological order is
         // always: _earlierMessages + messages + _laterMessages.
         _laterMessages: [],
@@ -6855,6 +6903,29 @@ function portal() {
       if (st._hasServerLater === undefined) st._hasServerLater = false;
       if (st._fetchingLater === undefined) st._fetchingLater = false;
       if (!Number.isInteger(st._nextLiveKey)) st._nextLiveKey = 1;
+      if (!(st._renderKeyByObject instanceof WeakMap)) {
+        st._renderKeyByObject = new WeakMap();
+      }
+      if (!(st._renderKeyOwners instanceof Map)) st._renderKeyOwners = new Map();
+      if (!Number.isInteger(st._renderKeyGeneration)) st._renderKeyGeneration = 0;
+      if (!Number.isInteger(st._renderKeyNormalizedGeneration)) {
+        st._renderKeyNormalizedGeneration = -1;
+      }
+      if (!st._renderKeyShape || typeof st._renderKeyShape !== "object") {
+        st._renderKeyShape = null;
+      }
+      if (!Number.isInteger(st._nextRenderRepairKey)) st._nextRenderRepairKey = 1;
+      if (!st._renderKeyTelemetry || typeof st._renderKeyTelemetry !== "object") {
+        st._renderKeyTelemetry = {
+          lastReportedAt: -Infinity,
+          pendingDuplicate: 0,
+          pendingMissing: 0,
+          flushTimer: null,
+        };
+      }
+      if (st._renderKeyTelemetry.flushTimer === undefined) {
+        st._renderKeyTelemetry.flushTimer = null;
+      }
       if (st.activeTurnId === undefined) st.activeTurnId = "";
       if (st.parentTurnId === undefined) st.parentTurnId = "";
       if (!Number.isFinite(st.lastEventSeq)) st.lastEventSeq = 0;
@@ -7740,6 +7811,7 @@ function portal() {
     // before ownership changes.
     _activateTabState(id) {
       const st = this._ensureTabState(id);
+      this._ensurePaneMessageRenderKeys(id);
       const meta = (this.sessions || []).find(s => s.id === id);
       const selectedModel = st._modelExpected
         ? st._modelExpected.value : (meta && meta.model);
@@ -7811,12 +7883,195 @@ function portal() {
       if (!tid) return null;
       return (this.tabState && this.tabState[tid]) || null;
     },
+    _paneRenderKeyShape(st) {
+      return {
+        messages: st.messages, messagesLength: (st.messages || []).length,
+        messagesFirst: st.messages && st.messages[0],
+        messagesLast: st.messages && st.messages[st.messages.length - 1],
+        earlier: st._earlierMessages,
+        earlierLength: (st._earlierMessages || []).length,
+        earlierFirst: st._earlierMessages && st._earlierMessages[0],
+        earlierLast: st._earlierMessages
+          && st._earlierMessages[st._earlierMessages.length - 1],
+        later: st._laterMessages,
+        laterLength: (st._laterMessages || []).length,
+        laterFirst: st._laterMessages && st._laterMessages[0],
+        laterLast: st._laterMessages && st._laterMessages[st._laterMessages.length - 1],
+      };
+    },
+    _recordPaneRenderKeyShape(st) {
+      st._renderKeyShape = this._paneRenderKeyShape(st);
+      st._renderKeyNormalizedGeneration = st._renderKeyGeneration;
+    },
+    _paneRenderKeyShapeChanged(st) {
+      const before = st._renderKeyShape;
+      if (!before) return true;
+      const after = this._paneRenderKeyShape(st);
+      return before.messages !== after.messages
+        || before.messagesLength !== after.messagesLength
+        || before.messagesFirst !== after.messagesFirst
+        || before.messagesLast !== after.messagesLast
+        || before.earlier !== after.earlier
+        || before.earlierLength !== after.earlierLength
+        || before.earlierFirst !== after.earlierFirst
+        || before.earlierLast !== after.earlierLast
+        || before.later !== after.later
+        || before.laterLength !== after.laterLength
+        || before.laterFirst !== after.laterFirst
+        || before.laterLast !== after.laterLast;
+    },
+    _markPaneRenderKeysDirty(st) {
+      if (st) st._renderKeyGeneration++;
+    },
+    _flushPaneRenderKeyTelemetry(tid, st) {
+      if (!st || typeof window === "undefined" || !window.__museReportTelemetry__) {
+        return false;
+      }
+      const telemetry = st._renderKeyTelemetry;
+      const now = Date.now();
+      if (now - telemetry.lastReportedAt < 60_000) return false;
+      const issues = [
+        { issue: "duplicate", count: telemetry.pendingDuplicate },
+        { issue: "missing", count: telemetry.pendingMissing },
+      ].filter(item => item.count > 0);
+      if (!issues.length) return false;
+      if (telemetry.flushTimer) clearTimeout(telemetry.flushTimer);
+      telemetry.flushTimer = null;
+      window.__museReportTelemetry__({
+        kind: "message_render_key",
+        pane: String(tid || "pane"),
+        session: String(st._sid || tid || ""),
+        issues,
+      });
+      telemetry.lastReportedAt = now;
+      telemetry.pendingDuplicate = 0;
+      telemetry.pendingMissing = 0;
+      return true;
+    },
+    _reportPaneRenderKeyIssues(tid, st, issueCounts) {
+      if (!st || !issueCounts.size) return;
+      const telemetry = st._renderKeyTelemetry;
+      telemetry.pendingDuplicate = Math.min(10_000,
+        telemetry.pendingDuplicate + (issueCounts.get("duplicate") || 0));
+      telemetry.pendingMissing = Math.min(10_000,
+        telemetry.pendingMissing + (issueCounts.get("missing") || 0));
+      if (this._flushPaneRenderKeyTelemetry(tid, st)
+          || typeof window === "undefined" || !window.__museReportTelemetry__
+          || telemetry.flushTimer) return;
+      const delay = Math.max(0, 60_000 - (Date.now() - telemetry.lastReportedAt));
+      telemetry.flushTimer = setTimeout(() => {
+        telemetry.flushTimer = null;
+        if (this.tabState[tid] !== st) return;
+        this._flushPaneRenderKeyTelemetry(tid, st);
+      }, delay);
+    },
+    _nextPaneRenderRepairKey(tid, st, reserved) {
+      let key;
+      do {
+        key = String(tid || "pane") + ":render-repair:" + st._nextRenderRepairKey++;
+      } while (st._renderKeyOwners.has(key) || (reserved && reserved.has(key)));
+      return key;
+    },
+    _claimPaneMessageRenderKeys(
+      tid, messages, skipped = null, reservedKeys = null, initialIssues = null,
+    ) {
+      const st = this._ensureTabState(tid);
+      const list = [];
+      const objects = new Set();
+      for (const message of (Array.isArray(messages) ? messages : [])) {
+        if (!message || typeof message !== "object" || objects.has(message)
+            || (skipped && skipped.has(message))) continue;
+        objects.add(message);
+        list.push(message);
+      }
+      const reserved = reservedKeys ? new Set(reservedKeys) : new Set();
+      for (const message of list) {
+        if (st._renderKeyByObject.has(message)) continue;
+        const raw = message._k == null ? "" : String(message._k).trim();
+        if (raw) reserved.add(raw);
+      }
+      const issueCounts = initialIssues ? new Map(initialIssues) : new Map();
+      for (const message of list) {
+        const assigned = st._renderKeyByObject.get(message);
+        const assignedOwner = assigned && st._renderKeyOwners.get(assigned);
+        if (assigned && (!assignedOwner || assignedOwner === message)) {
+          message._k = assigned;
+          if (!assignedOwner) st._renderKeyOwners.set(assigned, message);
+          continue;
+        }
+        const raw = message._k == null ? "" : String(message._k).trim();
+        const owner = raw && st._renderKeyOwners.get(raw);
+        let key = raw;
+        if (!raw || (owner && owner !== message)) {
+          const issue = raw ? "duplicate" : "missing";
+          issueCounts.set(issue, (issueCounts.get(issue) || 0) + 1);
+          key = this._nextPaneRenderRepairKey(tid, st, reserved);
+        }
+        message._k = key;
+        st._renderKeyByObject.set(message, key);
+        st._renderKeyOwners.set(key, message);
+      }
+      this._reportPaneRenderKeyIssues(tid, st, issueCounts);
+      return list;
+    },
+    _rebuildPaneMessageRenderKeys(tid, messages = null) {
+      const st = this._ensureTabState(tid);
+      const oldByObject = st._renderKeyByObject;
+      const list = [];
+      const objects = new Set();
+      // Prefer the mounted window when overlapping pagination temporarily
+      // exposes the same object in more than one segment.
+      const sources = messages ? [messages]
+        : [st.messages || [], st._earlierMessages || [], st._laterMessages || []];
+      let duplicateOccurrences = 0;
+      for (const source of sources) {
+        for (let i = 0; i < source.length; i++) {
+          const message = source[i];
+          if (!message || typeof message !== "object") continue;
+          if (objects.has(message)) {
+            source.splice(i--, 1);
+            duplicateOccurrences++;
+            continue;
+          }
+          objects.add(message);
+          list.push(message);
+        }
+      }
+      const occurrenceIssues = duplicateOccurrences
+        ? new Map([["duplicate", duplicateOccurrences]]) : null;
+      const reserved = new Set();
+      for (const message of list) {
+        const assigned = oldByObject.get(message);
+        const raw = assigned || (message._k == null ? "" : String(message._k).trim());
+        if (raw) reserved.add(raw);
+      }
+      st._renderKeyByObject = new WeakMap();
+      st._renderKeyOwners = new Map();
+      const pending = [];
+      for (const message of list) {
+        const assigned = oldByObject.get(message);
+        if (assigned && !st._renderKeyOwners.has(assigned)) {
+          message._k = assigned;
+          st._renderKeyByObject.set(message, assigned);
+          st._renderKeyOwners.set(assigned, message);
+        } else {
+          pending.push(message);
+        }
+      }
+      this._claimPaneMessageRenderKeys(tid, pending, null, reserved, occurrenceIssues);
+      if (!messages) this._recordPaneRenderKeyShape(st);
+      return list;
+    },
+    _ensurePaneMessageRenderKeys(tid) {
+      const st = this._ensureTabState(tid);
+      if (st._renderKeyNormalizedGeneration === st._renderKeyGeneration
+          && !this._paneRenderKeyShapeChanged(st)) return false;
+      this._rebuildPaneMessageRenderKeys(tid);
+      return true;
+    },
     paneMessages(tid) {
-      // Pure read: must NOT mutate tabState (this runs inside an x-for render
-      // getter — creating state here via _ensureTabState both side-effects the
-      // store during render AND races tab teardown, which surfaced as an
-      // uncaught "reading 'length'" when a closing pane briefly resolved to an
-      // undefined iterable). Always hand Alpine a real array.
+      // Pure O(1) render lookup. Key normalization happens at pane data ingress
+      // and activation boundaries, never from this repeatedly-evaluated getter.
       if (!tid) return [];
       const st = this.tabState && this.tabState[tid];
       return (st && st.messages) || [];
@@ -9416,6 +9671,10 @@ function portal() {
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
         if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
+        if (st._renderKeyTelemetry && st._renderKeyTelemetry.flushTimer) {
+          clearTimeout(st._renderKeyTelemetry.flushTimer);
+          st._renderKeyTelemetry.flushTimer = null;
+        }
         st.es = null;
         st._streamStartController = null;
         st._cancelBeforeStream = false;
@@ -12506,6 +12765,7 @@ function portal() {
         }
         const s = this._retainExpectedSessionSettings(await r.json());
         if (this.tabState[sid] !== st) return false;
+        if (st.streaming || st.es) return true;
         const loadedUpdated = Number(s.updated_at) || 0;
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
@@ -12553,6 +12813,12 @@ function portal() {
           // them as `sid:uuid:*` / `sid:hist:*`.
           all = this._preserveCanonicalMessageIdentity(st, all);
         }
+        const incomingCount = all.length;
+        const cacheCap = this._historyCacheCap();
+        const trimmedHead = Math.max(0, all.length - cacheCap);
+        if (trimmedHead) all = all.slice(trimmedHead);
+        this._markPaneRenderKeysDirty(st);
+        this._rebuildPaneMessageRenderKeys(sid, all);
         // Lazy-load thresholds — only render the tail of the conversation on
         // first paint; older messages stay in a "to-render" stash and get
         // mdRender'd on demand when the user clicks "Load earlier".
@@ -12684,8 +12950,8 @@ function portal() {
         // first bubble it returned (`s.offset`); everything before that
         // still lives on disk and pages in via _fetchOlderWindow. full /
         // no-window responses report offset 0 (whole chain in hand).
-        st._loadedOffset = Number.isInteger(s.offset) ? s.offset : 0;
-        st._total = Number.isInteger(s.total) ? s.total : all.length;
+        st._loadedOffset = (Number.isInteger(s.offset) ? s.offset : 0) + trimmedHead;
+        st._total = Number.isInteger(s.total) ? s.total : incomingCount;
         st._preTotal = Number.isInteger(s.pre_total) ? s.pre_total : 0;
         // Trimming may evict the oldest cached bubbles and advance the cursor,
         // so it must run after the response coordinate has been installed.
@@ -12693,6 +12959,7 @@ function portal() {
         // visible slice exceeds the DOM cap, retain its tail so the actual
         // latest reply remains mounted.
         this._capMountedWindow(st, "newer");
+        this._recordPaneRenderKeyShape(st);
         // More history exists if either the in-memory stash has older
         // bubbles OR the server holds bubbles before our window.
         st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
@@ -12920,14 +13187,21 @@ function portal() {
         // was deleted): our st is now orphaned. Stop pushing — the new
         // loadSession owns the reveal. Prevents double-fill / duplicate keys.
         if (this.tabState[sid] !== st || st.streaming || st.es) return;
-        st.messages.push(...visible.slice(i, i + CH));
-        i += CH;
+        const chunk = visible.slice(i, i + CH);
+        this._claimPaneMessageRenderKeys(sid, chunk);
+        st.messages.push(...chunk);
+        i += chunk.length;
         // Tab switched away mid-reveal: the array is no longer on screen and a
         // later return won't re-run loadSession (st._loaded is set by the
         // caller), so finish filling it in one shot to keep it complete, then
         // stop yielding.
         if (sid !== this.currentId) {
-          if (i < visible.length) st.messages.push(...visible.slice(i));
+          if (i < visible.length) {
+            const rest = visible.slice(i);
+            this._claimPaneMessageRenderKeys(sid, rest);
+            st.messages.push(...rest);
+          }
+          this._recordPaneRenderKeyShape(st);
           return;
         }
         if (i < visible.length) {
@@ -12935,7 +13209,10 @@ function portal() {
             ? requestAnimationFrame(() => r()) : setTimeout(r, 16)));
         }
       }
-      if (this.tabState[sid] === st) this._capMountedWindow(st, "older");
+      if (this.tabState[sid] === st) {
+        this._capMountedWindow(st, "older");
+        this._recordPaneRenderKeyShape(st);
+      }
     },
     // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
     // markdown loadSession skipped so first paint wasn't blocked on the whole
@@ -13158,7 +13435,16 @@ function portal() {
       return result;
     },
     _assignLiveKey(st, m) {
-      if (!m._k) m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
+      // A late async callback may still hold a disposed pane state after the
+      // same session is reopened. Never claim keys in the replacement pane.
+      if (this.tabState[st._sid] !== st) return m;
+      this._ensurePaneMessageRenderKeys(st._sid);
+      if (!m._k) {
+        do {
+          m._k = (st._sid || "tab") + ":live:" + st._nextLiveKey++;
+        } while (st._renderKeyOwners.has(m._k));
+      }
+      this._claimPaneMessageRenderKeys(st._sid, [m]);
       return m;
     },
     _allPaneMessages(st) {
@@ -13169,14 +13455,52 @@ function portal() {
         || (st._earlierMessages || []).includes(m)
         || (st._laterMessages || []).includes(m));
     },
+    _releasePaneMessageRenderKeys(st, messages) {
+      if (!st || !Array.isArray(messages)) return;
+      for (const message of messages) {
+        const key = message && st._renderKeyByObject.get(message);
+        if (key && st._renderKeyOwners.get(key) === message) {
+          st._renderKeyOwners.delete(key);
+        }
+      }
+    },
     _removePaneMessage(st, m) {
       if (!st || !m) return false;
       for (const list of [st.messages, st._earlierMessages, st._laterMessages]) {
         if (!list) continue;
         const idx = list.indexOf(m);
-        if (idx >= 0) { list.splice(idx, 1); return true; }
+        if (idx >= 0) {
+          list.splice(idx, 1);
+          if (!this._containsPaneMessage(st, m)) this._releasePaneMessageRenderKeys(st, [m]);
+          this._recordPaneRenderKeyShape(st);
+          return true;
+        }
       }
       return false;
+    },
+    _truncatePaneMessagesFrom(st, m) {
+      if (!st || !m) return false;
+      const lists = [st._earlierMessages, st.messages, st._laterMessages];
+      const removed = [];
+      let found = false;
+      for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        if (found) {
+          removed.push(...list.splice(0));
+          continue;
+        }
+        const idx = list.indexOf(m);
+        if (idx < 0) continue;
+        removed.push(...list.splice(idx));
+        found = true;
+      }
+      if (!found) return false;
+      st._hasServerLater = false;
+      st._total = (st._loadedOffset || 0) + this._allPaneMessages(st).length;
+      this._releasePaneMessageRenderKeys(st,
+        removed.filter(message => !this._containsPaneMessage(st, message)));
+      this._recordPaneRenderKeyShape(st);
+      return true;
     },
     _appendLiveMessage(st, m) {
       // Alpine must see footer dependencies when the live object first enters
@@ -13200,6 +13524,7 @@ function portal() {
       target.push(m);
       if (target === st.messages) this._capMountedWindow(st, "newer");
       this._capHistoryCache(st);
+      this._recordPaneRenderKeyShape(st);
       return target[target.length - 1];
     },
     // Keep the phone DOM deliberately small. Rich tool/diff/code bubbles can
@@ -13232,17 +13557,19 @@ function portal() {
         st._earlierMessages = (st._earlierMessages || []).concat(head);
       }
       this._capHistoryCache(st, direction);
+      this._recordPaneRenderKeyShape(st);
       return { head, tail };
     },
     _capHistoryCache(st, direction = "newer") {
-      if (!st) return;
+      if (!st) return new Set();
       const cap = this._historyCacheCap();
+      const dropped = [];
       let held = (st._earlierMessages || []).length + (st.messages || []).length
         + (st._laterMessages || []).length;
       const dropEarlier = () => {
         if (!(st._earlierMessages && st._earlierMessages.length) || held <= cap) return;
         const drop = Math.min(held - cap, st._earlierMessages.length);
-        st._earlierMessages.splice(0, drop);
+        dropped.push(...st._earlierMessages.splice(0, drop));
         st._loadedOffset = (st._loadedOffset || 0) + drop;
         held -= drop;
       };
@@ -13252,7 +13579,7 @@ function portal() {
         // front creates an unrecoverable hole before loadLaterMessages' next
         // item; dropping the far future preserves one contiguous range.
         const drop = Math.min(held - cap, st._laterMessages.length);
-        st._laterMessages.splice(st._laterMessages.length - drop, drop);
+        dropped.push(...st._laterMessages.splice(st._laterMessages.length - drop, drop));
         st._hasServerLater = true;
         held -= drop;
       };
@@ -13278,6 +13605,15 @@ function portal() {
         dropEarlier();
         dropLater();
       }
+      if (dropped.length) {
+        const retained = new Set();
+        for (const list of [st._earlierMessages, st.messages, st._laterMessages]) {
+          for (const message of (list || [])) retained.add(message);
+        }
+        this._releasePaneMessageRenderKeys(
+          st, dropped.filter(message => !retained.has(message)));
+      }
+      return new Set(dropped);
     },
     _captureMessageAnchor(scrollEl, m) {
       const key = m && m._k;
@@ -13287,11 +13623,13 @@ function portal() {
       const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(key)}"]`);
       if (!el) return null;
-      return { key, top: el.getBoundingClientRect().top };
+      return { key, tid: this.currentId || "", top: el.getBoundingClientRect().top };
     },
     _restoreMessageAnchor(scrollEl, anchor) {
       if (!scrollEl || !anchor) return;
-      const el = scrollEl.querySelector(
+      const pane = scrollEl.querySelector(
+        `.msg-pane[data-tid="${CSS.escape(anchor.tid || "")}"]`);
+      const el = (pane || scrollEl).querySelector(
         `.msg[data-message-key="${CSS.escape(anchor.key)}"]`);
       if (!el) return;
       scrollEl.scrollTop += el.getBoundingClientRect().top - anchor.top;
@@ -13416,7 +13754,9 @@ function portal() {
         }
         if (!r.ok) return 0;
         const data = await r.json();
+        if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
+        this._ensurePaneMessageRenderKeys(sid);
         // Prepend (older bubbles go to the front of the stash). mdRender is
         // still deferred until a bubble is paged into messages[].
         st._earlierMessages = win.concat(st._earlierMessages || []);
@@ -13426,7 +13766,9 @@ function portal() {
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "older");
+        const dropped = this._capHistoryCache(st, "older");
+        this._claimPaneMessageRenderKeys(sid, win, dropped);
+        this._recordPaneRenderKeyShape(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         st._hasMoreHistory =
@@ -13472,13 +13814,16 @@ function portal() {
         const data = await r.json();
         if (this.tabState[sid] !== st) return 0;
         const win = this._historyEnvelopes(sid, data.messages || []);
+        this._ensurePaneMessageRenderKeys(sid);
         st._laterMessages = (st._laterMessages || []).concat(win);
         if (Number.isInteger(data.total)) st._total = data.total;
         if (Number.isInteger(data.pre_total)) st._preTotal = data.pre_total;
         st.historyGeneration = data.history_generation || st.historyGeneration || "";
         st._historyOrder = data.history_order === "full" ? "full" : "normal";
         if (sid === this.currentId) this.historyGeneration = st.historyGeneration;
-        this._capHistoryCache(st, "newer");
+        const dropped = this._capHistoryCache(st, "newer");
+        this._claimPaneMessageRenderKeys(sid, win, dropped);
+        this._recordPaneRenderKeyShape(st);
         st._hasServerLater = (st._loadedOffset + this._allPaneMessages(st).length)
           < st._total;
         return win.length;
@@ -13577,6 +13922,7 @@ function portal() {
       if ((!st._earlierMessages || !st._earlierMessages.length)
           && st._loadedOffset > 0) {
         await this._fetchOlderWindow(sid);
+        if (this.tabState[sid] !== st) return;
       }
       if (!st._earlierMessages || !st._earlierMessages.length) {
         // Nothing local and nothing (more) on the server: recompute flags
@@ -13606,8 +13952,10 @@ function portal() {
         if (end < batch.length) {
           await new Promise(r => (typeof requestAnimationFrame !== "undefined"
             ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
+          if (this.tabState[sid] !== st) return;
         }
       }
+      if (this.tabState[sid] !== st) return;
       // These are OLD history bubbles being revealed, not new arrivals — flag
       // them so the .msg entrance animation (msg-in) doesn't replay across the
       // whole batch the instant they mount, which janks the scroll-to-top load.
@@ -13621,6 +13969,8 @@ function portal() {
       // also removes tall bubbles from the bottom.
       const anchor = this._captureMessageAnchor(scrollEl, st.messages[0]);
       st.messages.unshift(...batch);
+      this._markPaneRenderKeysDirty(st);
+      this._ensurePaneMessageRenderKeys(sid);
       this._capMountedWindow(st, "older");
       if (isCurrent) this.messages = st.messages;
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
@@ -24584,7 +24934,10 @@ function portal() {
         const roles = sendState.messages.map(m => m.role);
         const lastUserIdx = roles.lastIndexOf("user");
         if (lastUserIdx >= 0 && lastUserIdx < sendState.messages.length - 1) {
-          sendState.messages.splice(lastUserIdx + 1);
+          const removed = sendState.messages.splice(lastUserIdx + 1);
+          this._releasePaneMessageRenderKeys(sendState,
+            removed.filter(message => !this._containsPaneMessage(sendState, message)));
+          this._recordPaneRenderKeyShape(sendState);
         }
       }
       // (isContinuation: keep the existing messages intact — the watcher's
@@ -26627,8 +26980,8 @@ function portal() {
       if (!m || m.role !== "user" || !m._failed) return;
       if (this.workspaceSwitching) return;
       // Drop the failed bubble, put text back in input, and send.
-      const idx = this.messages.indexOf(m);
-      if (idx >= 0) this.messages.splice(idx, 1);
+      const st = this.tabState[this.currentId];
+      if (!st || !this._removePaneMessage(st, m)) return;
       this._setChatInput(this.userVisibleText(m));
       this.pendingQuotes.splice(
         0, this.pendingQuotes.length,
@@ -26687,9 +27040,8 @@ function portal() {
       // (original message + all replies that followed) is discarded from
       // the in-memory view. The JSONL on disk is NOT modified; a reload
       // will show both branches, which is acceptable for now.
-      const msgs = this.messages;
-      const idx = msgs.indexOf(m);
-      if (idx >= 0) msgs.splice(idx);
+      const st = this.tabState[this.currentId];
+      if (!this._truncatePaneMessagesFrom(st, m)) return;
       this._setChatInput(newText);
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;

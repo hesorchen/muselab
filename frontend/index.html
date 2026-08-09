@@ -1855,7 +1855,7 @@
               <span x-text="lang==='zh' ? '分支自' : 'Forked from'"></span>
               <button type="button"
                       @click="openForkSource()"
-                      x-text="currentForkSource().name"></button>
+                      x-text="currentForkSource()?.name || ''"></button>
             </div>
           </template>
 

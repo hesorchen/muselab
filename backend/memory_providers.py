@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -63,10 +64,19 @@ class EmbeddingProvider:
                 response.raise_for_status()
                 body = response.json()
                 rows = body.get("data", []) if isinstance(body, dict) else []
-                rows = sorted(rows, key=lambda item: int(item.get("index", 0)))
-                chunk_vectors = [item.get("embedding") for item in rows]
-                if len(chunk_vectors) != len(chunk):
+                try:
+                    if any(not isinstance(item["index"], int)
+                           or isinstance(item["index"], bool) for item in rows):
+                        raise ValueError
+                    indexed_rows = {item["index"]: item for item in rows}
+                except (KeyError, TypeError, ValueError):
+                    raise ValueError(
+                        "embedding provider returned an invalid response") from None
+                if (len(indexed_rows) != len(rows)
+                        or set(indexed_rows) != set(range(len(chunk)))):
                     raise ValueError("embedding provider returned an invalid response")
+                chunk_vectors = [indexed_rows[index].get("embedding")
+                                 for index in range(len(chunk))]
                 vectors.extend(chunk_vectors)
         if len(vectors) != len(texts) or not all(isinstance(v, list) and v for v in vectors):
             raise ValueError("embedding provider returned an invalid response")
@@ -352,6 +362,165 @@ class Reranker:
         return {"ok": True, "model": self.config.model, "results": len(result)}
 
 
+_GENERATION_TIMEOUT_ENV = "MUSELAB_MEMORY_GENERATION_TIMEOUT_SECONDS"
+_GENERATION_TIMEOUT_DEFAULT = 60.0
+_GENERATION_TIMEOUT_MAX = 600.0
+_RETRYABLE_GENERATION_STATUS_CODES = {408, 409, 429, 529}
+_SDK_TERMINAL_ERROR_NAMES = {
+    "AuthenticationError",
+    "BadRequestError",
+    "CLINotFoundError",
+    "ConfigurationError",
+    "InvalidConfigurationError",
+    "PermissionDeniedError",
+}
+_SDK_RETRYABLE_ERROR_NAMES = {
+    "CLIConnectionError",
+    "CLIJSONDecodeError",
+    "ConnectionError",
+    "MessageParseError",
+    "ProcessError",
+    "SDKJSONDecodeError",
+    "TransportError",
+}
+
+
+def generation_timeout_seconds() -> float:
+    """Return the background generation deadline without affecting chat."""
+    from .settings import env_float
+
+    value = env_float(_GENERATION_TIMEOUT_ENV, _GENERATION_TIMEOUT_DEFAULT)
+    if not math.isfinite(value) or value <= 0:
+        return _GENERATION_TIMEOUT_DEFAULT
+    return min(value, _GENERATION_TIMEOUT_MAX)
+
+
+def _generation_error_status(exc: BaseException) -> int | None:
+    for value in (
+        getattr(exc, "api_error_status", None),
+        getattr(exc, "status_code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+    ):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _sdk_error_names(exc: BaseException) -> set[str]:
+    if not any(cls.__module__.startswith("claude_agent_sdk")
+               for cls in type(exc).__mro__):
+        return set()
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def _retryable_status(status: int | None) -> bool:
+    return bool(status is not None and (
+        status in _RETRYABLE_GENERATION_STATUS_CODES or 500 <= status <= 599
+    ))
+
+
+def _status_category(status: int | None) -> str:
+    if status in {401, 403, 407}:
+        return "authentication" if status == 401 else "permission"
+    if status == 400:
+        return "bad_request"
+    if _retryable_status(status):
+        return "transient_provider"
+    return "provider_error"
+
+
+def _sdk_exception_category(exc: BaseException) -> str | None:
+    names = _sdk_error_names(exc)
+    if not names:
+        return None
+    if "AuthenticationError" in names:
+        return "authentication"
+    if "PermissionDeniedError" in names:
+        return "permission"
+    if "BadRequestError" in names:
+        return "bad_request"
+    if names & {"CLINotFoundError", "ConfigurationError",
+                "InvalidConfigurationError"}:
+        return "invalid_configuration"
+    if names & _SDK_RETRYABLE_ERROR_NAMES:
+        return "transient_provider"
+    return "generation_failure"
+
+
+def is_retryable_generation_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    status = _generation_error_status(exc)
+    if status is not None:
+        return _retryable_status(status)
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    sdk_names = _sdk_error_names(exc)
+    if sdk_names & _SDK_TERMINAL_ERROR_NAMES:
+        return False
+    return bool(sdk_names & _SDK_RETRYABLE_ERROR_NAMES)
+
+
+def _classify_sdk_result_error(message: Any) -> tuple[bool, str, int | None]:
+    status = getattr(message, "api_error_status", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = None
+    if status is not None:
+        return _retryable_status(status), _status_category(status), status
+
+    # Inspect only in memory to choose a safe category. The raw result/error
+    # strings may contain response bodies, paths, or credentials and are never
+    # persisted or logged.
+    detail = " ".join([
+        str(getattr(message, "subtype", "") or ""),
+        str(getattr(message, "result", "") or ""),
+        *(str(value) for value in (getattr(message, "errors", None) or [])),
+    ]).casefold()
+    strong_terminal = (
+        ("missing_credentials", ("not logged in", "login required")),
+        ("authentication", ("authentication", "unauthorized", "invalid api key")),
+        ("permission", ("permission", "forbidden", "access denied")),
+        ("invalid_configuration", (
+            "invalid configuration", "config error", "cli not found")),
+        ("max_turns", ("max turns", "max_turns")),
+        ("bad_request", ("bad request", "invalid request")),
+    )
+    for category, needles in strong_terminal:
+        if any(needle in detail for needle in needles):
+            return False, category, None
+    if any(needle in detail for needle in (
+        "connection", "transport", "timeout", "timed out", "process exited",
+        "broken pipe", "eof", "rate limit", "quota", "overloaded",
+        "service unavailable",
+    )):
+        return True, "transient_provider", None
+    if "credential" in detail:
+        return False, "missing_credentials", None
+    if any(needle in detail for needle in (
+        "configuration", "config error", "cli not found",
+    )):
+        return False, "invalid_configuration", None
+    return False, "generation_failure", None
+
+
+class GenerationError(RuntimeError):
+    """Sanitized generation failure carrying only retry/log metadata."""
+
+    def __init__(self, *, retryable: bool, provider: str = "", model: str = "",
+                 api_error_status: int | None = None,
+                 category: str | None = None):
+        category = category or (
+            "transient_provider" if retryable else "generation_failure")
+        super().__init__(category)
+        self.retryable = retryable
+        self.provider = provider
+        self.model = model
+        self.api_error_status = api_error_status
+        self.category = category
+
+
 class GenerationProvider:
     """Small no-tool Anthropic-compatible client for consolidation jobs."""
 
@@ -366,7 +535,12 @@ class GenerationProvider:
             key = os.environ.get(provider.env_key, "")
             base = endpoints._resolve_base_url(provider.env_key, provider)
             if not key:
-                raise RuntimeError(f"{provider.display} API key is not configured")
+                raise GenerationError(
+                    retryable=False,
+                    provider=provider.display,
+                    model=model,
+                    category="missing_credentials",
+                )
             return base.rstrip("/") + "/v1/messages", key, endpoints.normalize_model_id(model)
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
@@ -377,40 +551,98 @@ class GenerationProvider:
         base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
         return base + "/v1/messages", key, model
 
+    def metadata(self) -> tuple[str, str]:
+        from . import endpoints
+        provider = endpoints.lookup(self.config.generation_model)
+        return ((provider.display if provider is not None else "anthropic"),
+                self.config.generation_model)
+
     async def complete(self, system: str, prompt: str, *,
                        max_tokens: int = 3000) -> str:
-        route = self._route()
-        if route is None:
-            return await self._complete_with_sdk(system, prompt)
-        url, key, model = route
-        payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
-                   "system": system,
-                   "messages": [{"role": "user", "content": prompt}]}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            response = await client.post(
-                url,
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                         "Content-Type": "application/json"},
-                json=payload,
-            )
-            if response.status_code == 400 and "temperature" in response.text.lower():
-                # Extended-thinking models (GLM/Claude thinking variants) reject
-                # any temperature other than 1 with a 400. Consolidation only
-                # wants determinism as a preference, not a hard requirement, so
-                # drop the knob and retry rather than failing the whole job.
-                log.debug("generation endpoint rejected temperature, retrying without")
-                payload.pop("temperature", None)
-                response = await client.post(
-                    url,
-                    headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                             "Content-Type": "application/json"},
-                    json=payload,
-                )
-            response.raise_for_status()
-            body = response.json()
-        blocks = body.get("content", [])
-        return "".join(block.get("text", "") for block in blocks
-                       if block.get("type") == "text")
+        provider, configured_model = self.metadata()
+        timeout = generation_timeout_seconds()
+        try:
+            async with asyncio.timeout(timeout):
+                route = self._route()
+                if route is None:
+                    return await self._complete_with_sdk(system, prompt)
+                url, key, model = route
+                payload = {"model": model, "max_tokens": max_tokens, "temperature": 0,
+                           "system": system,
+                           "messages": [{"role": "user", "content": prompt}]}
+                async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+                    response = await client.post(
+                        url,
+                        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                                 "Content-Type": "application/json"},
+                        json=payload,
+                    )
+                    if (response.status_code == 400
+                            and "temperature" in response.text.lower()):
+                        # Extended-thinking models reject deterministic temperature.
+                        log.debug("generation endpoint rejected temperature, retrying without")
+                        payload.pop("temperature", None)
+                        response = await client.post(
+                            url,
+                            headers={"x-api-key": key,
+                                     "anthropic-version": "2023-06-01",
+                                     "Content-Type": "application/json"},
+                            json=payload,
+                        )
+                    response.raise_for_status()
+                    try:
+                        body = response.json()
+                    except json.JSONDecodeError as exc:
+                        raise GenerationError(
+                            retryable=False,
+                            provider=provider,
+                            model=configured_model,
+                            api_error_status=response.status_code,
+                            category="malformed_response",
+                        ) from exc
+                if not isinstance(body, dict) or not isinstance(body.get("content"), list):
+                    raise GenerationError(
+                        retryable=False,
+                        provider=provider,
+                        model=configured_model,
+                        api_error_status=response.status_code,
+                        category="malformed_response",
+                    )
+                blocks = body["content"]
+                text_blocks = [block.get("text") for block in blocks
+                               if isinstance(block, dict)
+                               and block.get("type") == "text"]
+                if (any(not isinstance(block, dict) for block in blocks)
+                        or not text_blocks
+                        or any(not isinstance(text, str) for text in text_blocks)):
+                    raise GenerationError(
+                        retryable=False,
+                        provider=provider,
+                        model=configured_model,
+                        api_error_status=response.status_code,
+                        category="malformed_response",
+                    )
+                return "".join(text_blocks)
+        except asyncio.CancelledError:
+            raise
+        except GenerationError:
+            raise
+        except Exception as exc:
+            status = _generation_error_status(exc)
+            retryable = is_retryable_generation_error(exc)
+            raise GenerationError(
+                retryable=retryable,
+                provider=provider,
+                model=configured_model,
+                api_error_status=status,
+                category=(
+                    _status_category(status) if status is not None
+                    else _sdk_exception_category(exc)
+                    or ("invalid_configuration" if isinstance(exc, ValueError)
+                        else "transient_provider" if retryable
+                        else "generation_failure")
+                ),
+            ) from exc
 
     async def _complete_with_sdk(self, system: str, prompt: str) -> str:
         from claude_agent_sdk import ClaudeAgentOptions, query
@@ -434,22 +666,27 @@ class GenerationProvider:
             include_partial_messages=False,
         )
         parts: list[str] = []
-        async with asyncio.timeout(60.0):
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content or []:
-                        if isinstance(block, TextBlock):
-                            parts.append(block.text or "")
-                elif isinstance(message, ResultMessage) and message.is_error:
-                    errors = "; ".join(str(value) for value in (message.errors or []))
-                    raise RuntimeError(
-                        f"background generation failed ({message.subtype})"
-                        + (f": {errors}" if errors else ""))
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content or []:
+                    if isinstance(block, TextBlock):
+                        parts.append(block.text or "")
+            elif isinstance(message, ResultMessage) and message.is_error:
+                retryable, category, status = _classify_sdk_result_error(message)
+                provider, model = self.metadata()
+                raise GenerationError(
+                    retryable=retryable,
+                    provider=provider,
+                    model=model,
+                    api_error_status=status,
+                    category=category,
+                )
         text = "".join(parts)
         if not text.strip():
-            raise RuntimeError(
-                "Claude OAuth generation returned no text; run `claude login` "
-                "or configure ANTHROPIC_API_KEY")
+            provider, model = self.metadata()
+            raise GenerationError(
+                retryable=False, provider=provider, model=model,
+                category="malformed_response")
         return text
 
     async def complete_json(self, system: str, prompt: str) -> dict:
@@ -457,14 +694,23 @@ class GenerationProvider:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         try:
-            value = json.loads(text)
-        except json.JSONDecodeError:
-            start, end = text.find("{"), text.rfind("}")
-            if start < 0 or end <= start:
-                raise ValueError("generation model did not return JSON")
-            value = json.loads(text[start:end + 1])
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                start, end = text.find("{"), text.rfind("}")
+                if start < 0 or end <= start:
+                    raise
+                value = json.loads(text[start:end + 1])
+        except json.JSONDecodeError as exc:
+            provider, model = self.metadata()
+            raise GenerationError(
+                retryable=False, provider=provider, model=model,
+                category="malformed_response") from exc
         if not isinstance(value, dict):
-            raise ValueError("generation model returned a non-object JSON value")
+            provider, model = self.metadata()
+            raise GenerationError(
+                retryable=False, provider=provider, model=model,
+                category="malformed_response")
         return value
 
     async def probe(self) -> dict:
