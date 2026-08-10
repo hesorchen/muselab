@@ -311,20 +311,20 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.2.128"
+version = "0.2.132"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "mcp" },
     { name = "sniffio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a7/e8/3a9622b31f9ee22274e13a620e5e75ac38454d14538391b2fe3bc7eb76dc/claude_agent_sdk-0.2.128.tar.gz", hash = "sha256:2ac7b2b3bc56ae9037fd284c8690d3dafab9493ecd28d8974bba79a418e1b800", size = 309369, upload-time = "2026-07-25T01:48:25.884Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/1d/dbf95d13ff3d7dab474035ba5a58b94bb75d2f9b78eef5b1c578d9da20d3/claude_agent_sdk-0.2.132.tar.gz", hash = "sha256:efc54a6fac96232105a40b6aed870a482dea221151a3b3356c5c514a5844cf7f", size = 312206, upload-time = "2026-08-07T04:14:22.84Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/ff/03613a38a84285cd85f114fc26d4431f545d2b3b344eb8f69f9b0f18f3c6/claude_agent_sdk-0.2.128-py3-none-macosx_11_0_arm64.whl", hash = "sha256:2e47ee95be68cb07612fd5288a40f3307763da5a5adf66d6e03ea49dc0495c9c", size = 75183825, upload-time = "2026-07-25T01:48:30.45Z" },
-    { url = "https://files.pythonhosted.org/packages/a3/df/2adbd3077f1a1cada39cd1508990d4008a8ac9ec74c801b24b1b302348b0/claude_agent_sdk-0.2.128-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:55e8fa28918af5620f391692efe80527ad9f2294cec14dadeea93c5161dbefc4", size = 80305667, upload-time = "2026-07-25T01:48:35.091Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/56/776a41af67a53d794b420dcd2f1075b585ed3725faa9827164f4a2e945dd/claude_agent_sdk-0.2.128-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:6c10cc1c5403b2b0b3d8deb79ad5271a8e49b9db6460193599b91f49f16b4cf7", size = 84617823, upload-time = "2026-07-25T01:48:39.297Z" },
-    { url = "https://files.pythonhosted.org/packages/17/1c/37044abbddf2141c4eeb6cc8e15a486491549a27283029d73db2c4f3c3b7/claude_agent_sdk-0.2.128-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:cc4a0f20337e227fe16f00edf7cbe109349707adb440fe51ca6c44f9f8d7d21a", size = 85663462, upload-time = "2026-07-25T01:48:43.982Z" },
-    { url = "https://files.pythonhosted.org/packages/a3/c9/ffbd8113080f87a4cd7bbfc8b00a974ea7189e3f666b5d7a2903dec7b74f/claude_agent_sdk-0.2.128-py3-none-win_amd64.whl", hash = "sha256:37b87c8e75daa2a6dc74da6d788e0981a2e5e3a6be80cfa4c287abce2bf70e0b", size = 85566882, upload-time = "2026-07-25T01:48:48.635Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/2c/77d9e3d03884b1ed0f34cfc6766960c2aed096de8bace1eef593ab900fbd/claude_agent_sdk-0.2.132-py3-none-macosx_11_0_arm64.whl", hash = "sha256:9162fd2675f366d376529b017fdff6dc522658f88c5f3c49afdd45d77228a4ef", size = 80319863, upload-time = "2026-08-07T04:14:27.073Z" },
+    { url = "https://files.pythonhosted.org/packages/40/e7/6644d29b1fafa25ef4872aebd0cd46577aff4674ad0faf48e1a566332694/claude_agent_sdk-0.2.132-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:1465ca52437921be79dfe1a4e5e1d35a2f850d5dbe5025256729de9befa7a62b", size = 85489278, upload-time = "2026-08-07T04:14:31.344Z" },
+    { url = "https://files.pythonhosted.org/packages/94/67/7f2ac654b919c99f16e68aaeb8bd19f8bac06cedd79c39362b3d5e547ccc/claude_agent_sdk-0.2.132-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:cd13af6ee4240b48fb01831a41248f57f3c83d235f218704f9a14e8c29af8a61", size = 89830986, upload-time = "2026-08-07T04:14:36.192Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/78/7306f398ac3f605211b13c4b02119e91e31c0c566a37ec8e4db243a5b6c7/claude_agent_sdk-0.2.132-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:a1085b8be7fcda441cfb1c86966e008ba72d4d2f6e20da5466bebb15c4765b55", size = 90914461, upload-time = "2026-08-07T04:14:40.815Z" },
+    { url = "https://files.pythonhosted.org/packages/95/d4/7296a1533233a1542dbdb7844efc81f3106eee6f037b0d542cecfd16a3b8/claude_agent_sdk-0.2.132-py3-none-win_amd64.whl", hash = "sha256:4860d059b89d0394acce8a7e767ea1b2da4fa73c07cf5c0ccdd86aa7ad5173ba", size = 90506408, upload-time = "2026-08-07T04:14:45.582Z" },
 ]
 
 [[package]]
@@ -871,7 +871,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.3" },
-    { name = "claude-agent-sdk", specifier = ">=0.2.120,<0.3" },
+    { name = "claude-agent-sdk", specifier = ">=0.2.132,<0.3" },
     { name = "fastapi", specifier = ">=0.138.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "openpyxl", specifier = ">=3.1.5" },
