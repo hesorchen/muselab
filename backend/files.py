@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import heapq
 import os
 import json
 import re
@@ -464,7 +465,6 @@ def list_dir(
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="not a directory")
     entries: list[dict] = []
-    truncated = False
     # Keep the caller's logical path when `path` traverses a directory
     # symlink. `target` is the resolved real directory (required for the
     # containment check), but DirEntry.path therefore points at that real
@@ -484,27 +484,41 @@ def list_dir(
     # syscall-heavy.
     try:
         with os.scandir(target) as scan:
-            candidates = []
-            for child in scan:
-                if is_root_listing and child.name in {
-                    TRASH_DIR_NAME,
-                    INTERNAL_DIR_NAME,
-                }:
-                    continue
-                if not show_hidden and child.name.startswith("."):
-                    continue
-                try:
-                    is_dir = child.is_dir()
-                except OSError:
-                    continue
-                candidates.append((child.name.lower(), child, is_dir))
+            # Keep only the first UI page while scanning. The previous code
+            # accumulated and sorted every DirEntry before slicing to 500, so a
+            # dump directory with tens of thousands of files caused a large
+            # allocation and O(N log N) sort even though the browser could never
+            # receive more than MAX_LIST_ENTRIES rows. nsmallest still preserves
+            # deterministic directory-first ordering while bounding memory and
+            # sorting work to O(MAX_LIST_ENTRIES).
+            def candidates():
+                for child in scan:
+                    if is_root_listing and child.name in {
+                        TRASH_DIR_NAME,
+                        INTERNAL_DIR_NAME,
+                    }:
+                        continue
+                    if not show_hidden and child.name.startswith("."):
+                        continue
+                    try:
+                        is_dir = child.is_dir()
+                    except OSError:
+                        continue
+                    yield (
+                        (not is_dir, child.name.lower(), child.name),
+                        child,
+                        is_dir,
+                    )
+
+            selected = heapq.nsmallest(
+                MAX_LIST_ENTRIES + 1,
+                candidates(),
+                key=lambda item: item[0],
+            )
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"failed to list: {e}")
-    candidates.sort(key=lambda item: (not item[2], item[0]))
-    for _, child, is_dir in candidates:
-        if len(entries) >= MAX_LIST_ENTRIES:
-            truncated = True
-            break
+    truncated = len(selected) > MAX_LIST_ENTRIES
+    for _, child, is_dir in selected[:MAX_LIST_ENTRIES]:
         try:
             stat = child.stat()
         except OSError:

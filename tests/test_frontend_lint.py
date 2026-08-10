@@ -203,6 +203,9 @@ def test_preview_tabs_persist_reading_positions_and_html_frames():
     open_file = app[start:end]
 
     assert "this._capturePreviewViewState(this.selected)" in open_file
+    assert "opts.reveal !== false && !this._isMobileLayout()" in open_file
+    assert 'this.desktopFullPane = ""' in open_file
+    assert "this.previewOpen = true" in open_file
     assert "this._schedulePreviewViewRestore(cachedPath, loadSeq)" in open_file
     assert "this.csvLoadPage(targetView.csvOffset)" in open_file
     assert 'x-ref="previewBody"' in html
@@ -1300,6 +1303,36 @@ def test_chat_file_link_fallback_prefers_suffix_then_unique_basename():
     assert "await this.chooseOne({" in open_path
 
 
+def test_chat_file_urls_are_routed_through_workspace_preview():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    helper_start = app.index("_localFileUrlPath(href)")
+    helper_end = app.index("\n    // Rewrite author-relative", helper_start)
+    helper = app[helper_start:helper_end]
+    linkify_start = app.index("_linkifyFilePaths(rootEl)")
+    linkify_end = app.index("\n    // Delegated click handler", linkify_start)
+    linkify = app[linkify_start:linkify_end]
+    click_start = app.index("onChatClick(ev)")
+    click_end = app.index("\n    // Fallback resolver", click_start)
+    click = app[click_start:click_end]
+
+    sanitize_start = app.index("window.DOMPurify.sanitize(raw")
+    sanitize_end = app.index("\n      // Restore protected math", sanitize_start)
+    sanitize = app[sanitize_start:sanitize_end]
+
+    assert 'if (!/^file:/i.test(String(href || ""))) return null' in helper
+    assert 'url.hostname !== "localhost"' in helper
+    assert "decodeURIComponent(url.pathname" in helper
+    assert "ALLOWED_URI_REGEXP" in sanitize
+    assert "file|mailto|tel" in sanitize
+    assert "const localFilePath = this._localFileUrlPath(href)" in linkify
+    assert 'a.removeAttribute("href")' in linkify
+    assert 'a.classList.add("file-link")' in linkify
+    assert 'a.setAttribute("href", "#")' in linkify
+    assert "const localFilePath = this._localFileUrlPath(href)" in click
+    assert "href = localFilePath" in click
+    assert "this.openByPathToasted(p)" in click
+
+
 def test_activity_center_groups_by_attention_order_and_read_state():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1336,6 +1369,14 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "!opts.summaryOnly && this._activityFetchPromises.summary" in app
     assert "const rank = (activeRank[a.state] ?? 9)" in app
     assert "return this.activityEventTimestamp(b)" in app
+    ungrouped_sort = app.index('group.key === "custom:__ungrouped__"')
+    custom_sort = app.index("if (group.custom) {", ungrouped_sort)
+    assert ungrouped_sort < custom_sort
+    assert "this.activityEventTimestamp(b) - this.activityEventTimestamp(a)" in app[
+        ungrouped_sort:custom_sort
+    ]
+    assert "attentionRank" not in app[ungrouped_sort:custom_sort]
+    assert "pinRank" not in app[ungrouped_sort:custom_sort]
     assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
     assert '"/api/activity/events-ticket"' in app
     assert "new EventSource(" in app
@@ -1372,6 +1413,44 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert ".activity-row.failed .activity-state-dot,.activity-row.waiting_approval" not in css
 
 
+def test_activity_center_searches_loaded_sessions_before_group_caps():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    activity_state = app[app.index("activity: {"):app.index("_activityEtags:")]
+    match_start = app.index("activityMatchesSearch(item)")
+    match_end = app.index("\n    activitySearchResultCount", match_start)
+    matcher = app[match_start:match_end]
+    all_start = app.index("activityAllEvents(group)")
+    all_end = app.index("\n    activityEvents(group)", all_start)
+    all_events = app[all_start:all_end]
+    count_start = app.index("activityGroupCount(group)")
+    count_end = app.index("\n    activityVisibleGroups()", count_start)
+    counts = app[count_start:count_end]
+
+    assert 'query: ""' in activity_state
+    for field in (
+        "session_name", "task_summary", "session_id", "thread_id",
+        "workspace", "workspace_name", "state", "status_detail",
+    ):
+        assert f"item?.{field}" in matcher
+    assert "this.activityStateLabel(item?.state)" in matcher
+    assert ".filter(item => this.activityMatchesSearch(item))" in all_events
+    assert all_events.index("activityMatchesSearch") < all_events.index(".sort(")
+    assert "this.activitySearchQuery()" in counts
+    assert 'role="search"' in html
+    assert 'x-model="activity.query"' in html
+    assert "activitySearchResultCount() + ' 条匹配'" in html
+    assert '@keydown.escape.stop.prevent="clearActivitySearch()"' in html
+    assert 'class="activity-search-clear"' in html
+    assert 'class="hint-row activity-search-empty"' in html
+    assert "没有匹配的会话" in html
+    assert "group.custom && !activitySearchQuery()" in html
+    assert ".activity-searchbar" in css
+    assert ".activity-search-empty" in css
+
+
 def test_memory_recall_details_use_a_root_fixed_portal():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
@@ -1390,6 +1469,48 @@ def test_memory_recall_details_use_a_root_fixed_portal():
     portal_css = portal_css[:portal_css.index("}")]
     assert "position: fixed" in portal_css
     assert "z-index: 880" in portal_css
+
+
+def test_chat_header_exposes_authenticated_session_todo_board():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert "sessionTodoOpen: false" in app
+    assert 'sessionTodoDraft: ""' in app
+    assert "userTodos: []" in app
+    assert 'return "muselab.userTodos."' in app
+    assert "addSessionUserTodo()" in app
+    assert "toggleSessionUserTodo(id)" in app
+    assert "deleteSessionUserTodo(id)" in app
+    assert "sessionTodosForPriority(priority)" in app
+    assert "onSessionTodoDragStart(ev, item)" in app
+    assert "onSessionTodoDrop(ev, priority" in app
+    assert 'priority: "medium"' in app
+    todo_impl = app[app.index("_sessionUserTodoStorageKey"):app.index("taskLogLine(m)")]
+    assert "TodoWrite" not in todo_impl
+    assert "TaskCreate" not in todo_impl
+    assert "TaskUpdate" not in todo_impl
+    button = html.index('class="session-todo-btn icon-btn"')
+    activity = html.index('class="activity-center-btn"', button)
+    assert button < activity
+    assert '@click="toggleSessionTodoBoard()"' in html
+    assert 'class="modal session-todo-modal"' in html
+    assert "'待办事项'" in html
+    assert 'x-show="sessionTodoOpen"' in html
+    assert '@click.self="sessionTodoOpen=false"' in html
+    assert '@submit.prevent="addSessionUserTodo()"' in html
+    assert "['high','medium','low']" in html
+    assert '@dragstart="onSessionTodoDragStart($event, item)"' in html
+    assert '@drop="onSessionTodoDrop($event, priority)"' in html
+    assert '@drop.stop="onSessionTodoDrop($event, priority, item.id)"' in html
+    assert '@click="toggleSessionUserTodo(item.id)"' in html
+    assert '@click="deleteSessionUserTodo(item.id)"' in html
+    assert ".session-todo-modal" in css
+    assert ".session-todo-board" in css
+    assert ".session-todo-lane.is-high" in css
+    assert ".session-todo-compose" in css
+    assert "@media (max-width:720px)" in css
 
 
 def test_activity_center_uses_two_compact_numberless_status_dots():
@@ -2539,11 +2660,16 @@ def test_workspace_cache_uses_delta_without_blocking_or_copying_hidden_bursts():
     assert "[404, 405, 501].includes(response.status)" in sync
     assert 'ownerHeaders["X-Muselab-Workspace"]' in sync
     fallback = sync[sync.index("if ([404, 405, 501].includes(response.status))"):]
-    assert fallback.index("treeSeq !== this._treeLoadSeq") < fallback.index(
-        '`/api/files/bootstrap${query ? `?${query}` : ""}`')
-    assert "{ headers: ownerHeaders }" in fallback
-    assert "this.fileHdr()" not in fallback
-    assert '`/api/files/bootstrap${query ? `?${query}` : ""}`' in sync
+    assert "return false" in fallback
+    assert '`/api/files/bootstrap${query ? `?${query}` : ""}`' not in sync
+    assert "legacy full-snapshot GET" in sync
+    assert "Array.isArray(payload.truncated_parents)" in sync
+    assert "payload.children_per_parent_limit" in sync
+    assert "snapshotHasTruncatedParents" in sync
+    assert "this._workspaceTreeCursors.delete(ownerWorkspace)" in sync
+    truncated_cursor = sync.index("if (snapshotHasTruncatedParents)")
+    delta_cursor = sync.index("} else if (nextCursor != null)", truncated_cursor)
+    assert truncated_cursor < delta_cursor
     assert 'params.set("show_hidden", "true")' in sync
     assert "const hasCursor = hydrated && cursor != null" in sync
     assert "void task.then(release, release)" in app

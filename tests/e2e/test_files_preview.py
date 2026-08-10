@@ -2444,7 +2444,7 @@ def test_workspace_switch_only_waits_for_cold_tree_not_auxiliary_refreshes(
     assert result["runtime"]["terminalId"] == "terminal-slow"
 
 
-def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
+def test_workspace_compact_bootstrap_never_falls_back_to_unbounded_get(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
     result = page.evaluate(
@@ -2508,7 +2508,7 @@ def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
           }
         }"""
     )
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert {call["workspace"] for call in result["calls"]} == {result["owner"]}
     calls = [
         {key: value for key, value in call.items() if key != "workspace"}
@@ -2523,10 +2523,9 @@ def test_workspace_compact_bootstrap_posts_expanded_parents_and_falls_back(
                 "parents": ["src", "src/deep"],
             },
         },
-        {"method": "GET", "query": "?show_hidden=true", "body": None},
     ]
-    assert result["visible"] == ["src", "src/deep", "src/deep/file.txt", ".hidden"]
-    assert result["cursor"] == 9
+    assert result["visible"] == []
+    assert result["cursor"] is None
 
 
 def test_terminal_foreground_still_persists_cursor_matched_tree_snapshot(

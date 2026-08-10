@@ -586,6 +586,12 @@ function portal() {
         session_mode: "fresh",
       },
     },
+    // User-owned scratch TODO clipboard for the active conversation. It is
+    // deliberately independent from Muse/Claude Task tools and stored only in
+    // this browser, per session.
+    sessionTodoOpen: false,
+    sessionTodoDraft: "",
+    sessionTodoDragId: "",
     activity: {
       show: false, loading: false, events: [],
       // Custom groups are the primary organization surface. An explicit user
@@ -602,6 +608,9 @@ function portal() {
       expanded: {},
       // Selected group keys. Empty array = no filter = show every group.
       filter: [],
+      // Local search over the loaded activity snapshot. Keep this derived from
+      // events so SSE updates and session renames appear without another query.
+      query: "",
       customGroups: [],
       groupEditor: {
         open: false, id: "", name: "", color: "blue", saving: false,
@@ -4067,6 +4076,24 @@ function portal() {
       return p;
     },
 
+    // Convert a local file: URL emitted by the model into its decoded absolute
+    // pathname so the normal workspace-root safety check can handle it. Browsers
+    // block http(s) pages from navigating to file://, so these links must be
+    // intercepted by Muse. Remote file hosts stay rejected instead of being
+    // mistaken for local workspace paths. Returns null for non-file schemes and
+    // "" for malformed or non-local file URLs.
+    _localFileUrlPath(href) {
+      if (!/^file:/i.test(String(href || ""))) return null;
+      try {
+        const url = new URL(href);
+        if (url.protocol !== "file:") return "";
+        if (url.hostname && url.hostname !== "localhost") return "";
+        return decodeURIComponent(url.pathname || "");
+      } catch (_) {
+        return "";
+      }
+    },
+
     // Rewrite author-relative <img src> in rendered-markdown HTML to the backend
     // raw endpoint. A README's `![](promo/media/x.png)` is relative to the file,
     // but once injected into the preview pane the browser resolves it against the
@@ -4376,6 +4403,11 @@ function portal() {
         FORBID_TAGS: ["style", "iframe", "form", "object", "embed"],
         FORBID_ATTR: ["style", "formaction"],
         ADD_ATTR: ["aria-hidden"],                            // KaTeX uses these
+        // DOMPurify drops file: hrefs by default before _linkifyFilePaths can
+        // convert them into workspace-safe links. Keep the upstream allowlist
+        // plus file:, then intercept every file URL below; local paths are
+        // normalized under MUSELAB_ROOT and remote/malformed hosts are disabled.
+        ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|file|mailto|tel|callto|sms|cid|xmpp):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
       });
       // Restore protected math (HTML-escaped) now that markdown can no longer
       // mangle it. Done before the length-loss heuristic so short placeholders
@@ -4534,14 +4566,21 @@ function portal() {
         code.classList.add("has-file-link");
       }
       // 2) markdown links — [label](path/to/file.md) — marked renders as <a>.
-      // Convert to .file-link if href is relative (no protocol) and matches the
-      // path regex; otherwise leave the anchor alone (real URLs stay clickable).
+      // Convert relative, workspace-absolute, and local file:/// links to
+      // .file-link; otherwise leave real external URLs clickable.
       const anchors = rootEl.querySelectorAll("a[href]");
       for (const a of anchors) {
         if (a.classList.contains("file-link")) continue;
         let href = a.getAttribute("href") || "";
         if (!href || href.startsWith("#")) continue;
-        if (/^[a-z]+:/i.test(href)) {                  // http: / https: / mailto: / etc.
+        const localFilePath = this._localFileUrlPath(href);
+        if (localFilePath !== null) {
+          href = localFilePath;
+          if (!href) {
+            a.removeAttribute("href");
+            continue;
+          }
+        } else if (/^[a-z]+:/i.test(href)) {            // http: / https: / mailto: / etc.
           // External web links open in a NEW tab so a click never unloads the
           // chat SPA (the default same-tab navigation threw the user out of
           // the conversation). rel guards against tab-nabbing + referrer leak.
@@ -4551,11 +4590,13 @@ function portal() {
             a.setAttribute("rel", "noopener noreferrer");
           }
           continue;
+        } else {
+          // marked / the model may URL-encode the href (e.g. Chinese filenames
+          // come through as %E8%B5%84...). Decode so the regex + backend list
+          // lookup operate on the raw UTF-8 form. file: paths were decoded by
+          // _localFileUrlPath already.
+          try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
         }
-        // marked / the model may URL-encode the href (e.g. Chinese filenames
-        // come through as %E8%B5%84...). Decode so the regex + backend list
-        // lookup operate on the raw UTF-8 form.
-        try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
         const m = href.match(RE);
         if (!m) continue;
         const path = toRel(m[1]);
@@ -4593,9 +4634,16 @@ function portal() {
         window.open(href, "_blank", "noopener,noreferrer");
         return;
       }
-      if (/^[a-z]+:/i.test(href)) return;             // mailto:/tel:/… → let browser handle
-      try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
-      ev.preventDefault();
+      const localFilePath = this._localFileUrlPath(href);
+      if (localFilePath !== null) {
+        ev.preventDefault();
+        if (!localFilePath) return;
+        href = localFilePath;
+      } else {
+        if (/^[a-z]+:/i.test(href)) return;           // mailto:/tel:/… → let browser handle
+        try { href = decodeURIComponent(href); } catch (_) { /* malformed → leave as-is */ }
+        ev.preventDefault();
+      }
       // Try ROOT-relative normalization first (absolute under ROOT, or ROOT
       // basename duplicated as prefix). If that returns "" (e.g. /etc/passwd),
       // fall back to the raw href minus leading slash so the user at least
@@ -6814,6 +6862,9 @@ function portal() {
         // different tab — drives a green dot on the tab strip so the user
         // notices "this one's ready". Cleared when the user activates the tab.
         unread: false,
+        // User-maintained scratch TODOs for this conversation. Loaded from
+        // localStorage when the tab state is first created.
+        userTodos: [],
         // Per-session message queue. Populated when the user sends while
         // this tab's turn is still streaming OR while a compact is in
         // flight. Drained automatically on the next `done` event /
@@ -6887,6 +6938,7 @@ function portal() {
         this.tabState[id] = this._blankTabState();
         this.tabState[id]._sid = id;
         this.tabState[id].draft.input = this._consumePersistedChatDraft(id);
+        this.tabState[id].userTodos = this._loadSessionUserTodos(id);
         // The queue now lives server-side (sessions/{sid}.queue.json). We do
         // NOT pull it here — _ensureTabState is called synchronously all over
         // the place and shouldn't fire a fetch each time. The queue mirror is
@@ -10860,6 +10912,103 @@ function portal() {
       if (dirty) this._storeTaskSubjects(map);
       this._cachedTaskSubjectMap = { key: cacheKey, map };
       return map;
+    },
+    _sessionUserTodoStorageKey(sid = this.currentId) {
+      return "muselab.userTodos." + (sid || "_default");
+    },
+    _loadSessionUserTodos(sid) {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(
+          this._sessionUserTodoStorageKey(sid)) || "[]");
+        return Array.isArray(parsed)
+          ? parsed.filter(item => item && item.text).slice(0, 100).map(item => ({
+              ...item,
+              priority: ["high", "medium", "low"].includes(item.priority)
+                ? item.priority : "medium",
+            })) : [];
+      } catch (_) { return []; }
+    },
+    _persistSessionUserTodos() {
+      if (!this.currentId) return;
+      try {
+        localStorage.setItem(
+          this._sessionUserTodoStorageKey(),
+          JSON.stringify(this.sessionTodoItems()),
+        );
+      } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
+    },
+    sessionTodoItems() {
+      if (!this.currentId) return [];
+      const state = this._ensureTabState(this.currentId);
+      return Array.isArray(state.userTodos) ? state.userTodos : [];
+    },
+    sessionTodoCount(completed = null) {
+      const items = this.sessionTodoItems();
+      return completed == null
+        ? items.length : items.filter(item => !!item.completed === completed).length;
+    },
+    addSessionUserTodo() {
+      const text = String(this.sessionTodoDraft || "").trim();
+      if (!text || !this.currentId) return;
+      const state = this._ensureTabState(this.currentId);
+      state.userTodos = [
+        ...(state.userTodos || []),
+        { id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          text, completed: false, priority: "medium" },
+      ].slice(-100);
+      this.sessionTodoDraft = "";
+      this._persistSessionUserTodos();
+    },
+    toggleSessionUserTodo(id) {
+      const state = this._ensureTabState(this.currentId);
+      state.userTodos = (state.userTodos || []).map(item =>
+        item.id === id ? { ...item, completed: !item.completed } : item);
+      this._persistSessionUserTodos();
+    },
+    deleteSessionUserTodo(id) {
+      const state = this._ensureTabState(this.currentId);
+      state.userTodos = (state.userTodos || []).filter(item => item.id !== id);
+      this._persistSessionUserTodos();
+    },
+    clearCompletedSessionUserTodos() {
+      const state = this._ensureTabState(this.currentId);
+      state.userTodos = (state.userTodos || []).filter(item => !item.completed);
+      this._persistSessionUserTodos();
+    },
+    sessionTodosForPriority(priority) {
+      return this.sessionTodoItems().filter(item => item.priority === priority);
+    },
+    onSessionTodoDragStart(ev, item) {
+      this.sessionTodoDragId = item.id;
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", item.id);
+      }
+    },
+    onSessionTodoDragEnd() {
+      this.sessionTodoDragId = "";
+    },
+    onSessionTodoDrop(ev, priority, beforeId = "") {
+      ev?.preventDefault?.();
+      const id = this.sessionTodoDragId
+        || ev?.dataTransfer?.getData("text/plain") || "";
+      if (!id || !["high", "medium", "low"].includes(priority)) return;
+      const state = this._ensureTabState(this.currentId);
+      const current = (state.userTodos || []).slice();
+      const source = current.findIndex(item => item.id === id);
+      if (source < 0) return;
+      const [moved] = current.splice(source, 1);
+      moved.priority = priority;
+      const target = beforeId ? current.findIndex(item => item.id === beforeId) : -1;
+      if (target >= 0) current.splice(target, 0, moved);
+      else current.push(moved);
+      state.userTodos = current;
+      this.sessionTodoDragId = "";
+      this._persistSessionUserTodos();
+    },
+    toggleSessionTodoBoard() {
+      this.sessionTodoOpen = !this.sessionTodoOpen;
+      if (!this.sessionTodoOpen) this.sessionTodoDraft = "";
     },
     taskLogLine(m) {
       if (!m || !m.name) return null;
@@ -16102,17 +16251,12 @@ function portal() {
             }),
           });
           if ([404, 405, 501].includes(response.status)) {
-            if (treeSeq !== this._treeLoadSeq
-                || !this._workspaceIsCurrent(ownerWorkspace)
-                || !this._workspaceGenerationIsCurrent(
-                  ownerWorkspace, workspaceGeneration,
-                )) return false;
-            // Rolling deploy compatibility with a backend that only knows the
-            // original full-snapshot GET contract.
-            response = await fetch(
-              `/api/files/bootstrap${query ? `?${query}` : ""}`,
-              { headers: ownerHeaders },
-            );
+            // Never fall back to the legacy full-snapshot GET here: one expanded
+            // dump directory can make that response unbounded and freeze the
+            // browser before virtual scrolling gets a chance to help. Returning
+            // false lets _loadRootNow use the already-capped /api/files/list
+            // compatibility path instead.
+            return false;
           }
         }
       } catch (_) { return false; }
@@ -16136,6 +16280,7 @@ function portal() {
           && responseWorkspaceId !== expectedWorkspaceId) return false;
       const nextCursor = payload.cursor ?? payload.next_cursor ?? payload.nextCursor;
       let applied = false;
+      let snapshotHasTruncatedParents = false;
       if (!hasCursor && Array.isArray(payload.entries)) {
         const tree = this._materializeFileSnapshot(
           payload.entries, Array.from(this.expanded || []),
@@ -16145,6 +16290,19 @@ function portal() {
         this.expanded = tree.expanded;
         this._pendingExpanded = Array.from(this.expanded);
         this._scheduleFileTreeViewportSync(true);
+        const truncatedParents = Array.isArray(payload.truncated_parents)
+          ? payload.truncated_parents : [];
+        snapshotHasTruncatedParents = truncatedParents.length > 0;
+        if (snapshotHasTruncatedParents) {
+          const sample = truncatedParents[0] || "/";
+          const limit = Number(payload.children_per_parent_limit) || 500;
+          this.toast(
+            this.t("toast.dir_truncated", { path: sample, n: limit })
+              + (truncatedParents.length > 1
+                ? ` (+${truncatedParents.length - 1})` : ""),
+            "warn", 4500,
+          );
+        }
         applied = true;
       } else if (payload.resync === true) {
         this._workspaceTreeCursors.delete(ownerWorkspace);
@@ -16156,7 +16314,14 @@ function portal() {
           ? this._applyFileTreeDelta(payload.changes) : true;
       }
       if (!applied) return false;
-      if (nextCursor != null) {
+      if (snapshotHasTruncatedParents) {
+        // A capped sibling list is not a complete delta base. Keeping its
+        // workspace cursor would let later add/delete events grow it beyond the
+        // cap or leave it under-filled because the hidden 501st row emits no
+        // compensating event. Force the next sync through another bounded
+        // compact snapshot instead of applying deltas to incomplete parents.
+        this._workspaceTreeCursors.delete(ownerWorkspace);
+      } else if (nextCursor != null) {
         const currentCursor = Number(this._workspaceTreeCursors.get(ownerWorkspace) || 0);
         const numericCursor = Number(nextCursor);
         if (Number.isFinite(numericCursor)) {
@@ -19722,6 +19887,15 @@ function portal() {
 
     async openFile(n, opts = {}) {
       if (!n || !n.path) return false;
+      // A file open is an explicit request to see the preview. Restore the
+      // desktop preview rail even when it was hidden (or chat/files fullscreen
+      // collapsed it). Mobile already switches to the preview tab below.
+      if (opts.reveal !== false && !this._isMobileLayout()
+          && (!this.previewOpen || this.desktopFullPane)) {
+        this.desktopFullPane = "";
+        this.previewOpen = true;
+        this.savePrefs();
+      }
       this.dismissTransientPreviewQuote(true);
       if (this.previewSurface === "terminal") this._teardownTerminalView();
       this.previewSurface = "file";
@@ -27475,6 +27649,35 @@ function portal() {
       }
       return false;
     },
+    activitySearchQuery() {
+      return String(this.activity.query || "").trim().toLocaleLowerCase();
+    },
+    activityMatchesSearch(item) {
+      const query = this.activitySearchQuery();
+      if (!query) return true;
+      const fields = [
+        item?.session_name,
+        item?.task_summary,
+        item?.session_id,
+        item?.thread_id,
+        item?.workspace,
+        item?.workspace_name,
+        item?.state,
+        this.activityStateLabel(item?.state),
+        item?.status_detail,
+        item?.kind,
+        item?.source_id,
+        item?.id,
+      ];
+      return fields.some(value => String(value || "").toLocaleLowerCase().includes(query));
+    },
+    activitySearchResultCount() {
+      if (!this.activitySearchQuery()) return (this.activity.events || []).length;
+      return (this.activity.events || []).filter(item => this.activityMatchesSearch(item)).length;
+    },
+    clearActivitySearch() {
+      this.activity.query = "";
+    },
     activityEventTimestamp(item) {
       return Number(item?.updated_at || item?.finished_at || item?.started_at || 0);
     },
@@ -27488,10 +27691,18 @@ function portal() {
       };
       return (this.activity.events || [])
         .filter(item => this.activityMatchesGroup(item, group.key))
+        // Search before applying the per-group row cap so a matching older
+        // session remains discoverable even when it was outside the first page.
+        .filter(item => this.activityMatchesSearch(item))
         .sort((a, b) => {
           if (group.key === "timeline") {
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
+            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+          }
+          if (group.key === "custom:__ungrouped__") {
+            // Ungrouped is an inbox of recent sessions, not an attention queue.
+            // Keep its order predictable: newest activity always comes first.
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
           if (group.custom) {
@@ -27525,7 +27736,11 @@ function portal() {
       this.activity.expanded[key] = !this.activity.expanded[key];
     },
     activityGroupCount(group) {
-      if (group?.custom) return this.activityAllEvents(group).length;
+      // While searching, counts must describe the visible result set rather
+      // than the unfiltered backend summary.
+      if (group?.custom || this.activitySearchQuery()) {
+        return this.activityAllEvents(group).length;
+      }
       const count = this.activity.summary?.groups?.[group.key];
       return Number.isFinite(Number(count))
         ? Number(count) : this.activityAllEvents(group).length;
@@ -27567,7 +27782,7 @@ function portal() {
       return !!item && ["waiting_approval", "paused"].includes(item.state);
     },
     activityGroupUnread(group) {
-      if (group?.custom) {
+      if (group?.custom || this.activitySearchQuery()) {
         return this.activityAllEvents(group)
           .filter(item => this.activityIsUnreadResult(item)
             || this.activityRequiresAction(item)).length;

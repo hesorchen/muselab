@@ -1320,6 +1320,15 @@
           <span x-text="t('pane.chat')"></span>
         </span>
         <span class="spacer"></span>
+        <button class="session-todo-btn icon-btn" type="button"
+                @click="toggleSessionTodoBoard()"
+                :class="{ active: sessionTodoOpen, 'has-active': sessionTodoCount(false) }"
+                :aria-expanded="sessionTodoOpen"
+                :title="lang==='zh' ? '待办事项' : 'Current session TODOs'">
+          <svg><use href="#i-check-circle"/></svg>
+          <span class="session-todo-badge" x-show="sessionTodoCount()"
+                x-text="sessionTodoCount(true) + '/' + sessionTodoCount()"></span>
+        </button>
         <!-- Global task center — moved here from the files header to sit
              immediately left of the Skills entry (2026-07-21). -->
         <button class="activity-center-btn" type="button" @click="openActivityCenter()"
@@ -5751,6 +5760,81 @@
     </template>
   </div>
 
+  <div class="modal-backdrop" x-show="sessionTodoOpen"
+       @click.self="sessionTodoOpen=false" x-cloak>
+    <div class="modal session-todo-modal" role="dialog" aria-modal="true"
+         @keydown.escape.window="sessionTodoOpen=false">
+      <div class="modal-head">
+        <span class="modal-title">
+          <svg class="modal-title-icon"><use href="#i-check-circle"/></svg>
+          <span x-text="lang==='zh' ? '待办事项' : 'To-do board'"></span>
+        </span>
+        <span class="session-todo-modal-count"
+              x-text="sessionTodoCount(true) + '/' + sessionTodoCount()"></span>
+        <button class="btn-ghost sm" type="button" x-show="sessionTodoCount(true)"
+                @click="clearCompletedSessionUserTodos()"
+                x-text="lang==='zh' ? '清除已完成' : 'Clear completed'"></button>
+        <button class="modal-close" @click="sessionTodoOpen=false" aria-label="Close">×</button>
+      </div>
+      <form class="session-todo-compose" @submit.prevent="addSessionUserTodo()">
+        <input type="text" maxlength="240" autocomplete="off" autofocus
+               x-model="sessionTodoDraft"
+               :placeholder="lang==='zh' ? '添加一条待办…' : 'Add a TODO…'"
+               :aria-label="lang==='zh' ? '待办内容' : 'TODO text'" />
+        <button type="submit" :disabled="!sessionTodoDraft.trim()"
+                x-text="lang==='zh' ? '添加' : 'Add'"></button>
+      </form>
+      <div class="modal-body session-todo-modal-body">
+        <div class="session-todo-empty" x-show="!sessionTodoCount()"
+             x-text="lang==='zh' ? '暂无待办。' : 'No TODOs yet.'"></div>
+        <div class="session-todo-board" x-show="sessionTodoCount()">
+          <template x-for="priority in ['high','medium','low']" :key="priority">
+            <section class="session-todo-lane" :class="'is-' + priority"
+                     @dragover.prevent
+                     @drop="onSessionTodoDrop($event, priority)">
+              <header>
+                <span class="session-todo-priority-dot"></span>
+                <strong x-text="priority==='high'
+                  ? (lang==='zh' ? '高优先级' : 'High')
+                  : priority==='medium'
+                    ? (lang==='zh' ? '中优先级' : 'Medium')
+                    : (lang==='zh' ? '低优先级' : 'Low')"></strong>
+                <small x-text="sessionTodosForPriority(priority).length"></small>
+              </header>
+              <div class="session-todo-lane-empty"
+                   x-show="!sessionTodosForPriority(priority).length"
+                   x-text="lang==='zh' ? '拖动到这里' : 'Drop here'"></div>
+              <template x-for="item in sessionTodosForPriority(priority)" :key="item.id">
+                <div class="session-todo-item"
+                     :class="{ 'is-completed': item.completed,
+                               'is-dragging': sessionTodoDragId === item.id }"
+                     draggable="true"
+                     @dragstart="onSessionTodoDragStart($event, item)"
+                     @dragend="onSessionTodoDragEnd()"
+                     @dragover.prevent
+                     @drop.stop="onSessionTodoDrop($event, priority, item.id)">
+                  <span class="session-todo-grip" aria-hidden="true">⋮⋮</span>
+                  <button class="session-todo-check" type="button"
+                          @click="toggleSessionUserTodo(item.id)"
+                          :aria-label="item.completed
+                            ? (lang==='zh' ? '标为未完成' : 'Mark incomplete')
+                            : (lang==='zh' ? '标为完成' : 'Mark complete')">
+                    <svg x-show="item.completed"><use href="#i-check"/></svg>
+                    <span x-show="!item.completed" class="todo-dot"></span>
+                  </button>
+                  <span class="session-todo-copy"><strong x-text="item.text"></strong></span>
+                  <button class="session-todo-delete" type="button"
+                          @click="deleteSessionUserTodo(item.id)"
+                          :aria-label="lang==='zh' ? '删除待办' : 'Delete TODO'">×</button>
+                </div>
+              </template>
+            </section>
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-backdrop" x-show="activity.show" @click.self="closeActivityCenter()" x-cloak>
     <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="closeActivityCenter()">
       <div class="modal-head">
@@ -5775,6 +5859,22 @@
           <span class="spinner-sm"></span>
         </span>
         <button class="modal-close" @click="closeActivityCenter()" aria-label="Close">×</button>
+      </div>
+      <div class="activity-searchbar" role="search">
+        <svg aria-hidden="true"><use href="#i-search"/></svg>
+        <input type="search" autocomplete="off" autocorrect="off" spellcheck="false"
+               x-model="activity.query"
+               @keydown.escape.stop.prevent="clearActivitySearch()"
+               :placeholder="lang==='zh' ? '搜索会话、任务、工作区或状态…' : 'Search sessions, tasks, workspaces, or status…'"
+               :aria-label="lang==='zh' ? '搜索任务中心会话' : 'Search activity sessions'" />
+        <span class="activity-search-count" x-show="activitySearchQuery()"
+              x-text="lang==='zh'
+                ? activitySearchResultCount() + ' 条匹配'
+                : activitySearchResultCount() + ' matches'"></span>
+        <button type="button" class="activity-search-clear"
+                x-show="activitySearchQuery()" @click="clearActivitySearch()"
+                :aria-label="lang==='zh' ? '清除搜索' : 'Clear search'"
+                :title="lang==='zh' ? '清除搜索' : 'Clear search'">×</button>
       </div>
       <!-- One chip per attention group, in the same order as the sections below:
            completed results to review, live work, failures, then viewed history. -->
@@ -5855,7 +5955,8 @@
         </div>
         <template x-for="group in activityVisibleGroups()" :key="group.key">
           <section class="activity-group"
-                   x-show="group.custom || activityEvents(group).length"
+                   x-show="activityEvents(group).length
+                     || (group.custom && !activitySearchQuery())"
                    :class="{
                      'is-timeline': group.key === 'timeline',
                      'is-custom': group.custom,
@@ -5895,7 +5996,8 @@
               </div>
             </div>
             <div class="activity-custom-group-empty"
-                 x-show="group.custom && !activityAllEvents(group).length"
+                 x-show="group.custom && !activitySearchQuery()
+                   && !activityAllEvents(group).length"
                  x-text="lang==='zh' ? '拖动会话到这里' : 'Drag sessions here'"></div>
             <template x-for="item in activityEvents(group)" :key="item.id">
               <div class="activity-row-wrap"
@@ -5972,11 +6074,23 @@
           </section>
         </template>
         <div class="hint-row" x-show="!activity.loading && !activity.events.length" x-text="lang==='zh' ? '暂无任务记录' : 'No activity yet'"></div>
+        <div class="hint-row activity-search-empty"
+             x-show="!activity.loading && activity.events.length
+               && activitySearchQuery()
+               && !activityVisibleGroups().some(g => activityEvents(g).length)">
+          <strong x-text="lang==='zh' ? '没有匹配的会话' : 'No matching sessions'"></strong>
+          <small x-text="lang==='zh'
+            ? '试试会话名、任务摘要、工作区、状态或会话 ID'
+            : 'Try a session name, task summary, workspace, status, or session ID'"></small>
+          <button type="button" class="btn-ghost sm" @click="clearActivitySearch()"
+                  x-text="lang==='zh' ? '清除搜索' : 'Clear search'"></button>
+        </div>
         <!-- Filtering to an empty group must say so, or the body just goes
              blank and reads as a loading failure. -->
         <div class="hint-row"
              x-show="!activity.loading && activity.view === 'status'
-               && activity.events.length && activity.filter.length
+               && activity.events.length && !activitySearchQuery()
+               && activity.filter.length
                && !activityVisibleGroups().some(g => activityEvents(g).length)"
              x-text="lang==='zh' ? '该状态下暂无任务' : 'No tasks in this state'"></div>
       </div>

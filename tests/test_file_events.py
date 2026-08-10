@@ -49,6 +49,8 @@ def test_selected_bootstrap_post_is_bounded_and_validates_parents(
     payload = response.json()
     assert payload["partial"] is True
     assert payload["parents"] == ["notes", "notes/deep"]
+    assert payload["truncated_parents"] == []
+    assert payload["children_per_parent_limit"] == 500
     assert {row["path"] for row in payload["entries"]} == {
         "README.md",
         "notes",

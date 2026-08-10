@@ -114,6 +114,51 @@ def test_compact_bootstrap_reads_only_root_and_expanded_children(
     }
 
 
+def test_compact_bootstrap_caps_each_expanded_directory(
+    app_module,
+    temp_root: Path,
+):
+    from backend.workspace_store import WorkspaceStore
+    from backend.workspaces import registry
+
+    huge = temp_root / "huge"
+    huge.mkdir()
+    for index in range(550):
+        (huge / f"item-{index:04d}.txt").write_text("x", encoding="utf-8")
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    snapshot = store.bootstrap(workspace_id, parents=["huge"])
+
+    huge_rows = [
+        row for row in snapshot["entries"]
+        if row["path"].startswith("huge/")
+    ]
+    assert len(huge_rows) == 500
+    assert huge_rows[0]["path"] == "huge/item-0000.txt"
+    assert huge_rows[-1]["path"] == "huge/item-0499.txt"
+    assert snapshot["truncated_parents"] == ["huge"]
+    assert snapshot["children_per_parent_limit"] == 500
+
+    with store._connect() as db:
+        plan = db.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT path, name
+            FROM files INDEXED BY files_workspace_parent_kind_name
+            WHERE workspace_id = ? AND parent = ?
+            ORDER BY is_dir DESC, name COLLATE NOCASE, name, path
+            LIMIT ?
+            """,
+            (workspace_id, "huge", 501),
+        ).fetchall()
+    assert any(
+        "files_workspace_parent_kind_name" in str(row["detail"])
+        for row in plan
+    ), plan
+
+
 def test_bootstrap_cursor_and_rows_share_one_read_snapshot(
     app_module,
     temp_root: Path,
