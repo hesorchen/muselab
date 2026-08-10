@@ -12,6 +12,9 @@ fake, keeping queue permission and rollback semantics hermetic.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import pytest
 
 
@@ -521,11 +524,11 @@ async def test_drain_replays_snapshot_without_reverting_session_permission(
 
 
 @pytest.mark.asyncio
-async def test_drain_waits_until_background_reader_releases_session(
+async def test_drain_starts_queued_turn_while_background_task_pending(
     app_module, monkeypatch,
 ):
-    """Queued follow-ups stay queued while the previous turn's task watcher
-    owns the SDK stream."""
+    """Queued sends follow the same background-task concurrency contract as
+    direct sends: a watcher is not an active user turn and must not block FIFO."""
     from backend import chat
 
     sess = _sess(app_module)
@@ -538,12 +541,17 @@ async def test_drain_waits_until_background_reader_releases_session(
 
     monkeypatch.setattr(chat, "_start_turn", fake_start_turn)
     chat._sessions_with_inflight_tasks[sid] = {"task-1"}
+    watcher = asyncio.create_task(asyncio.sleep(60))
+    chat._task_watchers[sid] = watcher
     try:
         await chat._maybe_drain_queue(sid)
     finally:
         chat._sessions_with_inflight_tasks.pop(sid, None)
+        chat._task_watchers.pop(sid, None)
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
 
-    assert starts == []
-    assert [item["text"] for item in sess.get_queue(sid)["items"]] == [
-        "follow-up"
-    ]
+    assert len(starts) == 1
+    assert starts[0][0][:2] == (sid, "follow-up")
+    assert sess.get_queue(sid)["items"] == []

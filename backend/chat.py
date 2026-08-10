@@ -13011,10 +13011,11 @@ async def _maybe_drain_queue(session_id: str) -> None:
     async with _queue_drain_lock_for(session_id):
         if session_id in _active_turns and not _active_turns[session_id].done:
             return
-        watcher = _task_watchers.get(session_id)
-        if (_sessions_with_inflight_tasks.get(session_id)
-                or (watcher is not None and not watcher.done())):
-            return
+        # Background task watchers no longer block user turns. _SessionStream is
+        # the single SDK reader and safely routes messages between an active turn
+        # and the watcher, so queued turns must follow the same concurrency
+        # contract as direct sends. Only an actually active user turn blocks the
+        # next FIFO item.
         item = sess.dequeue_message(session_id)
         if item is None:
             return

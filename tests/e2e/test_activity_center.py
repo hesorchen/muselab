@@ -233,6 +233,90 @@ def test_desktop_timeline_defaults_to_fifteen_rows_in_larger_modal(
     assert mobile_geometry["bodyMaxHeight"] == "none"
 
 
+def test_activity_search_finds_capped_sessions_and_combines_with_status_filter(
+    page: Page, backend_url, auth_token,
+):
+    page.set_viewport_size({"width": 1200, "height": 820})
+    _login(page, backend_url, auth_token)
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app._stopActivityEvents();
+          await Promise.allSettled(Object.values(app._activityFetchPromises || {}));
+          app.lang = 'zh';
+          app.activity.viewLoaded = true;
+          app.activity.view = 'timeline';
+          app.activity.filter = [];
+          app.activity.query = '';
+          app.activity.expanded = {};
+          app.activity.loading = false;
+          app.activity.customGroups = [];
+          app.activity.events = Array.from({length: 20}, (_, index) => ({
+            id: `search-row-${index}`,
+            kind: 'turn',
+            session_id: index === 0 ? 'needle-session-uuid' : `session-${index}`,
+            session_name: index === 0 ? 'Needle Alpha' : `Generic session ${index}`,
+            task_summary: index === 0 ? 'Quant platform audit' : `Generic task ${index}`,
+            workspace: index === 0 ? '/srv/quant-research' : '/tmp/e2e',
+            workspace_name: index === 0 ? 'quant-research' : 'e2e',
+            state: 'completed', read: true,
+            started_at: 100 + index,
+            finished_at: 200 + index,
+            updated_at: 300 + index,
+          }));
+          app.activity.events.push({
+            id: 'failed-search-row', kind: 'scheduled',
+            session_id: 'failed-session', session_name: 'Broken delivery',
+            task_summary: 'Publish report', status_detail: 'Renderer crashed',
+            workspace: '/srv/delivery', workspace_name: 'delivery',
+            state: 'failed', read: false,
+            started_at: 500, finished_at: 510, updated_at: 510,
+          });
+          app.activity.summary = {
+            running: 0, unread: 1, attention: 1,
+            groups: {review: 0, running: 0, failed: 1, history: 20},
+            group_unread: {review: 0, running: 0, failed: 1, history: 0},
+            workspaces: ['/tmp/e2e', '/srv/quant-research', '/srv/delivery'],
+          };
+          app.activity.show = true;
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+
+    search = page.locator(".activity-searchbar input")
+    expect(search).to_be_visible()
+    expect(page.locator(".activity-row")).to_have_count(15)
+
+    # The target is older than the timeline cap, so filtering must happen before
+    # the 15-row slice rather than against the already-visible rows.
+    search.fill("Needle")
+    expect(page.locator(".activity-row")).to_have_count(1)
+    expect(page.locator(".activity-row")).to_contain_text("Needle Alpha")
+    expect(page.locator(".activity-search-count")).to_have_text("1 条匹配")
+
+    search.fill("quant-research")
+    expect(page.locator(".activity-row")).to_have_count(1)
+    search.fill("needle-session-uuid")
+    expect(page.locator(".activity-row")).to_have_count(1)
+
+    page.get_by_role("button", name="按状态").click()
+    page.locator(".activity-chip.failed").click()
+    expect(page.locator(".activity-search-empty")).to_be_visible()
+
+    # Localized state labels and status details are searchable, and the text
+    # query intersects with the selected failed-status group.
+    search.fill("失败")
+    expect(page.locator(".activity-row")).to_have_count(1)
+    expect(page.locator(".activity-row")).to_contain_text("Broken delivery")
+    search.fill("Renderer crashed")
+    expect(page.locator(".activity-row")).to_have_count(1)
+
+    page.locator(".activity-search-clear").click()
+    expect(search).to_have_value("")
+    expect(page.locator(".activity-row")).to_have_count(1)
+
+
 def test_custom_groups_show_empty_sections_and_move_sessions(
     page: Page, backend_url, auth_token,
 ):

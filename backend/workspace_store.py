@@ -41,6 +41,10 @@ _EVENT_LIMIT = 20_000
 # (for example when a formerly indexed cache tree becomes opaque). Replaying
 # that many rows is slower than one clean snapshot and would be pruned anyway.
 _RECONCILE_REPLAY_LIMIT = 500
+# Compact bootstrap restores root plus previously expanded directories. Cap each
+# sibling set independently so one generated/dump directory cannot turn a cold
+# page load into a multi-megabyte JSON response and browser main-thread stall.
+_BOOTSTRAP_CHILDREN_PER_PARENT = 500
 
 
 class WorkspaceScanIncomplete(RuntimeError):
@@ -221,6 +225,19 @@ class WorkspaceStore:
                     """
                     CREATE INDEX IF NOT EXISTS files_workspace_parent_path
                     ON files(workspace_id, parent, path)
+                    """
+                )
+                db.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS files_workspace_parent_kind_name
+                    ON files(
+                        workspace_id,
+                        parent,
+                        is_dir DESC,
+                        name COLLATE NOCASE,
+                        name,
+                        path
+                    )
                     """
                 )
             self._secure_database_files()
@@ -794,20 +811,20 @@ class WorkspaceStore:
                 ).fetchone()
                 if workspace is None:
                     raise KeyError(f"unknown workspace: {workspace_id}")
-                rows = (
-                    self._file_rows(
+                truncated_parents: list[str] = []
+                if normalized_parents is None:
+                    rows = self._file_rows(
                         db,
                         workspace_id,
                         show_hidden=show_hidden,
                     )
-                    if normalized_parents is None
-                    else self._file_rows_for_parents(
+                else:
+                    rows, truncated_parents = self._file_rows_for_parents(
                         db,
                         workspace_id,
                         normalized_parents,
                         show_hidden=show_hidden,
                     )
-                )
                 entries = [
                     {
                         key: value
@@ -831,6 +848,8 @@ class WorkspaceStore:
                 {
                     "partial": True,
                     "parents": normalized_parents,
+                    "truncated_parents": truncated_parents,
+                    "children_per_parent_limit": _BOOTSTRAP_CHILDREN_PER_PARENT,
                 }
                 if normalized_parents is not None
                 else {}
@@ -1026,28 +1045,43 @@ class WorkspaceStore:
         parents: Iterable[str],
         *,
         show_hidden: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Read root and expanded-directory children through a bounded index."""
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Read bounded children for root and each expanded directory.
+
+        The parent-count bound alone is insufficient: a single generated
+        directory can contain tens of thousands of direct children. Query each
+        selected parent through the directory-order index with a hard sibling
+        cap so compact bootstrap stays bounded per expanded directory.
+        """
         selected_parents = ["", *dict.fromkeys(parents)]
-        placeholders = ", ".join("?" for _ in selected_parents)
-        parameters: list[Any] = [workspace_id, *selected_parents]
         hidden_clause = ""
         if not show_hidden:
             hidden_clause = (
                 " AND path NOT GLOB '.*'"
                 " AND path NOT GLOB '*/.*'"
             )
-        rows = db.execute(
-            f"""
-            SELECT path, name, is_dir, size, mtime, mtime_ns, ctime_ns, inode
-            FROM files INDEXED BY files_workspace_parent_path
-            WHERE workspace_id = ?
-              AND parent IN ({placeholders}){hidden_clause}
-            ORDER BY path
-            """,
-            parameters,
-        ).fetchall()
-        return [
+        rows: list[sqlite3.Row] = []
+        truncated_parents: list[str] = []
+        for parent in selected_parents:
+            parent_rows = db.execute(
+                f"""
+                SELECT path, name, is_dir, size, mtime, mtime_ns,
+                       ctime_ns, inode
+                FROM files INDEXED BY files_workspace_parent_kind_name
+                WHERE workspace_id = ? AND parent = ?{hidden_clause}
+                ORDER BY is_dir DESC, name COLLATE NOCASE, name, path
+                LIMIT ?
+                """,
+                (
+                    workspace_id,
+                    parent,
+                    _BOOTSTRAP_CHILDREN_PER_PARENT + 1,
+                ),
+            ).fetchall()
+            if len(parent_rows) > _BOOTSTRAP_CHILDREN_PER_PARENT:
+                truncated_parents.append(parent)
+            rows.extend(parent_rows[:_BOOTSTRAP_CHILDREN_PER_PARENT])
+        entries = [
             {
                 "path": row["path"],
                 "name": row["name"],
@@ -1060,6 +1094,7 @@ class WorkspaceStore:
             }
             for row in rows
         ]
+        return entries, truncated_parents
 
     @staticmethod
     def _subtree_pattern(path: str) -> str:

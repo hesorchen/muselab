@@ -1,5 +1,6 @@
 """File CRUD + search + hidden-toggle endpoints."""
 import io
+from pathlib import Path
 
 
 # ---- list / read ----
@@ -520,6 +521,22 @@ def test_list_truncated_flag(client, auth, temp_root):
     d = r.json()
     assert d["truncated"] is True
     assert len(d["entries"]) == 500   # MAX_LIST_ENTRIES
+    assert [row["name"] for row in d["entries"]] == [
+        f"f{i:04d}.txt" for i in range(500)
+    ]
+
+
+def test_large_list_uses_bounded_top_page_selection():
+    """The implementation must not collect and sort every DirEntry in memory."""
+    source = Path(__file__).parents[1].joinpath("backend/files.py").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("def list_dir(")
+    end = source.index("\n\n# xlsx preview caps", start)
+    listing = source[start:end]
+    assert "heapq.nsmallest(" in listing
+    assert "MAX_LIST_ENTRIES + 1" in listing
+    assert "candidates.sort(" not in listing
 
 
 def test_no_extension_text_file(client, auth, temp_root):
