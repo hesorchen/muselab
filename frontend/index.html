@@ -413,7 +413,7 @@
                 @dragleave="onPreviewTabDragLeave(t.path)"
                 @drop.prevent="onPreviewTabDrop($event, t.path)"
                 @dragend="onPreviewTabDragEnd()"
-                @click="switchTab(t.path)"
+                @click="switchTab(t.path, { reveal: true })"
                 @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                 :title="t.path">
               <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
@@ -581,7 +581,7 @@
             <span class="count" x-text="'('+grepHits.length+(grepTruncated?'+':'')+')'"></span>
           </div>
           <template x-for="(h,i) in grepHits" :key="'grep-'+i">
-            <div :class="'srow ' + (selected===h.path?'sel':'')" @click="openByPath(h.path)">
+            <div :class="'srow ' + (selected===h.path?'sel':'')" @click="openByPath(h.path, { reveal: true })">
               <span class="icon"><svg><use :href="iconRef(h)"/></svg></span>
               <div class="body">
                 <div class="name" x-text="h.name + ':' + h.line"></div>
@@ -882,7 +882,7 @@
                @dragleave="onPreviewTabDragLeave(t.path)"
                @drop.prevent="onPreviewTabDrop($event, t.path)"
                @dragend="onPreviewTabDragEnd()"
-               @click="switchTab(t.path)"
+               @click="switchTab(t.path, { reveal: true })"
                @dblclick="pinTab(t.path)"
                @contextmenu.prevent="showPreviewTabMenu($event, t.path)"
                @auxclick.prevent="onPreviewTabAuxClick($event, t.path)"
@@ -3596,13 +3596,13 @@
         <span class="icon"><svg><use href="#i-folder"/></svg></span>
         <span x-text="t('pane.files')"></span>
       </button>
-      <button :class="{active: mobileTab==='preview'}" @click="setMobileTab('preview')">
-        <span class="icon"><svg><use href="#i-file-text"/></svg></span>
-        <span x-text="t('pane.preview')"></span>
-      </button>
       <button :class="{active: mobileTab==='chat'}" @click="setMobileTab('chat')">
         <span class="icon"><svg><use href="#i-brain"/></svg></span>
         <span x-text="t('pane.chat')"></span>
+      </button>
+      <button :class="{active: mobileTab==='preview'}" @click="setMobileTab('preview')">
+        <span class="icon"><svg><use href="#i-file-text"/></svg></span>
+        <span x-text="t('pane.preview')"></span>
       </button>
     </nav>
 
@@ -5849,7 +5849,9 @@
   </div>
 
   <div class="modal-backdrop" x-show="activity.show" @click.self="closeActivityCenter()" x-cloak>
-    <div class="modal activity-modal" role="dialog" aria-modal="true" @keydown.escape.window="closeActivityCenter()">
+    <div class="modal activity-modal" role="dialog" aria-modal="true"
+         :class="{ 'is-group-board': activity.view === 'groups' }"
+         @keydown.escape.window="closeActivityCenter()">
       <div class="modal-head">
         <span class="modal-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
         <div class="activity-view-switch" role="group"
@@ -5957,7 +5959,9 @@
                     : (lang==='zh' ? '保存' : 'Save')"></button>
         </div>
       </form>
-      <div class="modal-body activity-body" :aria-busy="activity.loading">
+      <div class="modal-body activity-body"
+           :class="{ 'is-group-board': activity.view === 'groups' }"
+           :aria-busy="activity.loading">
         <!-- Loading is an overlay, not a list row.  A normal-flow hint used to
              disappear above the mounted rows when fetchActivity settled,
              shifting the entire ledger (and modal height) in one frame. -->

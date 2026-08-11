@@ -243,15 +243,38 @@ def test_refresh_restores_file_without_reopening_hidden_preview(
         "previewDisplay": "none",
     }
 
-    # The ordinary openFile path remains the explicit user action: clicking the
-    # already-selected file must reveal the rail without requiring a reload.
-    revealed = page.evaluate(
+    # A plain internal load is layout-neutral by default. Only an explicitly
+    # user-owned call with reveal:true may reopen the hidden rail.
+    reveal_contract = page.evaluate(
         """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
           await app.openFile({path: 'README.md', name: 'README.md'});
+          const afterBackground = {
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+          await app.reloadPreview();
+          const afterReload = {
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+          await app._maybeReloadPreview('README.md');
+          const afterToolReload = {
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+          await app.onNodeClick({}, {
+            path: 'README.md', name: 'README.md', is_dir: false,
+          });
           await new Promise(resolve => app.$nextTick(resolve));
           await new Promise(resolve => requestAnimationFrame(resolve));
           return {
+            afterBackground,
+            afterReload,
+            afterToolReload,
             selected: app.selected,
             previewOpen: app.previewOpen,
             previewDisplay: getComputedStyle(
@@ -259,7 +282,19 @@ def test_refresh_restores_file_without_reopening_hidden_preview(
           };
         }"""
     )
-    assert revealed == {
+    assert reveal_contract == {
+        "afterBackground": {
+            "previewOpen": False,
+            "previewDisplay": "none",
+        },
+        "afterReload": {
+            "previewOpen": False,
+            "previewDisplay": "none",
+        },
+        "afterToolReload": {
+            "previewOpen": False,
+            "previewDisplay": "none",
+        },
         "selected": "README.md",
         "previewOpen": True,
         "previewDisplay": "flex",
@@ -3272,6 +3307,81 @@ def test_reopening_current_file_does_not_discard_editor_buffer(page: Page,
         "editText": "unsaved draft",
         "dirty": True,
         "pinned": True,
+    }
+
+
+def test_cancelled_dirty_switch_preserves_hidden_layout_and_terminal(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.selected = 'draft.txt';
+          app.editing = true;
+          app.previewOpen = false;
+          app.desktopFullPane = 'chat';
+          app.previewSurface = 'terminal';
+          let teardowns = 0;
+          const realConfirm = app._confirmLoseEdits;
+          const realTeardown = app._teardownTerminalView;
+          app._confirmLoseEdits = () => false;
+          app._teardownTerminalView = () => { teardowns += 1; };
+          try {
+            const ok = await app.openFile(
+              {path: 'other.txt', name: 'other.txt'}, {reveal: true});
+            return {
+              ok, teardowns, selected: app.selected,
+              previewOpen: app.previewOpen,
+              desktopFullPane: app.desktopFullPane,
+              previewSurface: app.previewSurface,
+            };
+          } finally {
+            app._confirmLoseEdits = realConfirm;
+            app._teardownTerminalView = realTeardown;
+            app.editing = false;
+          }
+        }"""
+    )
+    assert result == {
+        "ok": False,
+        "teardowns": 0,
+        "selected": "draft.txt",
+        "previewOpen": False,
+        "desktopFullPane": "chat",
+        "previewSurface": "terminal",
+    }
+
+
+def test_mobile_reopening_current_editor_reveals_preview_without_discarding(
+        page: Page, backend_url, auth_token):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.tabs = [{path: 'draft.txt', name: 'draft.txt', preview: false}];
+          app.selected = 'draft.txt';
+          app.previewMode = 'text';
+          app.editText = 'unsaved mobile draft';
+          app.editing = true;
+          app.cmStatus = {...app.cmStatus, dirty: true};
+          app.mobileTab = 'files';
+          const ok = await app.openFile(
+            {path: 'draft.txt', name: 'draft.txt'}, {reveal: true});
+          const state = {
+            ok, mobileTab: app.mobileTab, editing: app.editing,
+            editText: app.editText, dirty: app.cmStatus.dirty,
+          };
+          app.editing = false;
+          return state;
+        }"""
+    )
+    assert result == {
+        "ok": True,
+        "mobileTab": "preview",
+        "editing": True,
+        "editText": "unsaved mobile draft",
+        "dirty": True,
     }
 
 

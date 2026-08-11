@@ -4760,7 +4760,7 @@ function portal() {
             if (!resolved) return;   // cancelled
           }
           if (resolved) {
-            await this.openFile({ path: resolved, name });
+            await this.openFile({ path: resolved, name }, { reveal: true });
             if (!this._workspaceIsCurrent(ownerWorkspace)) return;
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});
             return;
@@ -4772,7 +4772,7 @@ function portal() {
           this.toast(this.lang === "zh" ? `这是目录：${path}` : `Is a directory: ${path}`, "warn");
           return;
         }
-        await this.openFile({ path, name });
+        await this.openFile({ path, name }, { reveal: true });
         if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         // Mirror the click into the file tree: expand parents + scroll the
         // row into view so the user sees where the file lives. Use background
@@ -4803,7 +4803,7 @@ function portal() {
         + encodeURIComponent(this.currentId)
         + "&path=" + encodeURIComponent(path);
       try {
-        await this.openFile({ path, name }, { readUrl: url });
+        await this.openFile({ path, name }, { readUrl: url, reveal: true });
       } catch (e) {
         this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
       }
@@ -11819,7 +11819,7 @@ function portal() {
           // Switch first, mutate second. openFile owns the dirty-editor guard;
           // if the user cancels, keep the original tab array intact.
           if (this.selected !== path) {
-            await this.switchTab(path);
+            await this.switchTab(path, { reveal: true });
             if (this.selected !== path) return;
           }
           this.tabs = this.tabs.filter(t => t.path === path);
@@ -11829,7 +11829,7 @@ function portal() {
           const idx = this.tabs.findIndex(t => t.path === path);
           const selectedIdx = this.tabs.findIndex(t => t.path === this.selected);
           if (idx >= 0 && selectedIdx > idx) {
-            await this.switchTab(path);
+            await this.switchTab(path, { reveal: true });
             if (this.selected !== path) return;
           }
           if (idx >= 0) this.tabs = this.tabs.slice(0, idx + 1);
@@ -12237,7 +12237,7 @@ function portal() {
     },
     pickEditorTab(path) {
       this.editorTabPickerOpen = false;
-      this.switchTab(path);
+      this.switchTab(path, { reveal: true });
     },
     pickerRowMenu(ev, sid) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
@@ -17470,7 +17470,9 @@ function portal() {
         // reliable double-click gesture to pin it, so recycling A when B is
         // tapped would also discard A's saved reading position. Mobile taps
         // therefore open normal, closable tabs.
-        await this.openFile(n, { preview: !this._isMobileLayout() });
+        await this.openFile(n, {
+          preview: !this._isMobileLayout(), reveal: true,
+        });
       }
     },
     // ===== multi-select helpers =====
@@ -17603,7 +17605,9 @@ function portal() {
     // promotes that slot to permanent (openFile's `existing && !asPreview`
     // branch clears the preview flag).
     async onNodeDblClick(n) {
-      if (n && !n.is_dir) await this.openFile(n, { preview: false });
+      if (n && !n.is_dir) {
+        await this.openFile(n, { preview: false, reveal: true });
+      }
     },
     // Pin a preview (italic) tab so it stays open: double-clicking the tab
     // itself, or starting to edit its file, promotes it to permanent.
@@ -17715,7 +17719,7 @@ function portal() {
       if (!n) return;
       switch (action) {
         case "open":
-          if (!n.is_dir) await this.openFile(n);
+          if (!n.is_dir) await this.openFile(n, { reveal: true });
           break;
         case "mention":
           this.insertFileMention(n.path, !!n.is_dir);
@@ -17787,7 +17791,7 @@ function portal() {
         if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast(this.t("toast.created_name", { name }), "success");
         // 自动打开编辑
-        await this.openFile({ path, name });
+        await this.openFile({ path, name }, { reveal: true });
         if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         if (this.selected === path) await this.toggleEdit();
       } else {
@@ -19964,35 +19968,42 @@ function portal() {
 
     async openFile(n, opts = {}) {
       if (!n || !n.path) return false;
-      // A file open is an explicit request to see the preview. Restore the
-      // desktop preview rail even when it was hidden (or chat/files fullscreen
-      // collapsed it). Mobile already switches to the preview tab below.
-      if (opts.reveal !== false && !this._isMobileLayout()
+      // Loading file content and revealing the preview rail are separate
+      // operations. Background refresh/restore/remap paths call openFile too;
+      // only a direct user gesture opts into layout changes with reveal:true.
+      const reveal = opts.reveal === true;
+      const keepCurrentEditor = this.editing
+        && n.path === this.selected && !opts.forceReload;
+      // Confirm before mutating layout or surface ownership. Cancelling a dirty
+      // file switch must leave a hidden rail/fullscreen pane and terminal intact.
+      if (!keepCurrentEditor && this.editing
+          && !opts.editsConfirmed && !this._confirmLoseEdits()) {
+        return false;
+      }
+      if (reveal && !this._isMobileLayout()
           && (!this.previewOpen || this.desktopFullPane)) {
         this.desktopFullPane = "";
         this.previewOpen = true;
         this.savePrefs();
       }
       this.dismissTransientPreviewQuote(true);
-      if (this.previewSurface === "terminal") this._teardownTerminalView();
-      this.previewSurface = "file";
+      // A hidden background reload must not evict a terminal that currently
+      // owns the preview surface. Direct user opens explicitly activate files.
+      if (this.previewSurface !== "terminal" || reveal) {
+        if (this.previewSurface === "terminal") this._teardownTerminalView();
+        this.previewSurface = "file";
+      }
       // Clicking / double-clicking the file that already owns the editor is a
       // focus or pin gesture, not a request to throw the buffer away and read
       // it again. The old path guard only prompted for a *different* file, but
       // then unconditionally set editing=false below — so one innocent repeat
       // click silently discarded dirty text. Explicit force-reload is the one
       // same-path operation that is allowed to replace the buffer.
-      if (this.editing && n.path === this.selected && !opts.forceReload) {
+      if (keepCurrentEditor) {
         if (!opts.preview) this.pinTab(n.path);
         this.treeFocusPath = n.path;
+        if (this._isMobileLayout() && reveal) this.setMobileTab("preview");
         return true;
-      }
-      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
-      // is dirty, or explicitly force-reloading the current one, would replace
-      // the buffer. Confirm first; reloadPreview can pass the confirmation it
-      // already obtained so the user never sees the same dialog twice.
-      if (this.editing && !opts.editsConfirmed && !this._confirmLoseEdits()) {
-        return false;
       }
       this._capturePreviewViewState(this.selected);
       this._cancelPreviewViewRestore();
@@ -20061,7 +20072,7 @@ function portal() {
       this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
-      if (this._isMobileLayout() && opts.reveal !== false) {
+      if (this._isMobileLayout() && reveal) {
         this.setMobileTab("preview");
       }
       // When many files are open, the active row/tab can end up off-screen
@@ -20364,10 +20375,22 @@ function portal() {
       };
       return map[ext] || "plaintext";
     },
-    async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
+    async openByPath(path, opts = {}) {
+      await this.openFile(
+        { path, name: path.split("/").pop() },
+        { reveal: opts.reveal === true },
+      );
+    },
 
-    async switchTab(path) {
-      if (!path || (path === this.selected && this.previewSurface === "file")) return true;
+    async switchTab(path, opts = {}) {
+      if (!path) return true;
+      const revealNeeded = opts.reveal === true && (
+        this._isMobileLayout()
+          ? this.mobileTab !== "preview"
+          : (!this.previewOpen || !!this.desktopFullPane)
+      );
+      if (path === this.selected && this.previewSurface === "file"
+          && !revealNeeded) return true;
       // A terminal overlays the last selected file without clearing
       // `selected`. Clicking that same (usually rightmost) file tab must still
       // route through openFile so the preview surface leaves terminal mode.
@@ -20379,7 +20402,7 @@ function portal() {
       const cur = this.tabs.find(t => t.path === path);
       const opened = await this.openFile(
         { path, name: path.split("/").pop() },
-        { preview: !!(cur && cur.preview) },
+        { preview: !!(cur && cur.preview), reveal: opts.reveal === true },
       );
       if (!opened) return false;
       // Pass mode:"background" so we expand/scroll the tree quietly —
@@ -22554,7 +22577,7 @@ function portal() {
     },
     async onSearchClick(n) {
       if (n.is_dir) { this.clearSearch(); await this.expandPath(n.path); }
-      else { await this.openFile(n); }
+      else { await this.openFile(n, { reveal: true }); }
     },
     async expandPath(path) {
       const parts = path.split("/");
@@ -24130,7 +24153,9 @@ function portal() {
       if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
       await this.loadRoot();
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
-      await this.openFile({ path: trimmed, name: trimmed });
+      await this.openFile(
+        { path: trimmed, name: trimmed }, { reveal: true },
+      );
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       // Enter through the normal editor setup so CodeMirror receives the
       // newly-created body instead of reusing a previous file's buffer.
@@ -27526,7 +27551,7 @@ function portal() {
           type: "file",
           label: n.name,
           hint: n.path,
-          run: () => this.openFile(n),
+          run: () => this.openFile(n, { reveal: true }),
         });
       }
 
@@ -27694,6 +27719,7 @@ function portal() {
       ];
     },
     ACTIVITY_GROUP_CAP: 5,
+    ACTIVITY_CUSTOM_GROUP_CAP: 50,
     ACTIVITY_TIMELINE_CAP: 15,
     ACTIVITY_GROUP_COLORS: [
       "blue", "violet", "cyan", "green", "amber", "rose", "gray",
@@ -27807,8 +27833,9 @@ function portal() {
       return all.slice(0, this.activityGroupCap(group));
     },
     activityGroupCap(group) {
-      return group?.key === "timeline"
-        ? this.ACTIVITY_TIMELINE_CAP : this.ACTIVITY_GROUP_CAP;
+      if (group?.key === "timeline") return this.ACTIVITY_TIMELINE_CAP;
+      if (group?.custom) return this.ACTIVITY_CUSTOM_GROUP_CAP;
+      return this.ACTIVITY_GROUP_CAP;
     },
     activityHiddenCount(group) {
       return Math.max(
