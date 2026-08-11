@@ -188,6 +188,84 @@ def test_desktop_chat_is_center_primary_pane_and_preview_is_right_rail(
     assert result["chatFullscreen"]["sameChatNode"] is True
 
 
+def test_refresh_restores_file_without_reopening_hidden_preview(
+        page: Page, backend_url, auth_token):
+    """Background file restoration preserves the user's hidden right rail."""
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+
+    prepared = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const opened = await app.openFile({path: 'README.md', name: 'README.md'});
+          app.desktopFullPane = '';
+          app.previewOpen = false;
+          app.savePrefs();
+          return {
+            opened,
+            selected: app.selected,
+            previewOpen: app.previewOpen,
+            savedPreviewOpen: JSON.parse(
+              localStorage.getItem('muselab_prefs') || '{}').previewOpen,
+          };
+        }"""
+    )
+    assert prepared == {
+        "opened": True,
+        "selected": "README.md",
+        "previewOpen": False,
+        "savedPreviewOpen": False,
+    }
+
+    # A fresh boot should reload the selected file in the background without
+    # treating restoration as a user click that reveals the preview rail.
+    _login(page, backend_url, auth_token)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')?._x_dataStack?.[0];
+          return app && app.selected === 'README.md' && !app.previewOpen;
+        }"""
+    )
+    restored = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const preview = document.querySelector('.pane.preview');
+          return {
+            selected: app.selected,
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(preview).display,
+          };
+        }"""
+    )
+    assert restored == {
+        "selected": "README.md",
+        "previewOpen": False,
+        "previewDisplay": "none",
+    }
+
+    # The ordinary openFile path remains the explicit user action: clicking the
+    # already-selected file must reveal the rail without requiring a reload.
+    revealed = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.openFile({path: 'README.md', name: 'README.md'});
+          await new Promise(resolve => app.$nextTick(resolve));
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          return {
+            selected: app.selected,
+            previewOpen: app.previewOpen,
+            previewDisplay: getComputedStyle(
+              document.querySelector('.pane.preview')).display,
+          };
+        }"""
+    )
+    assert revealed == {
+        "selected": "README.md",
+        "previewOpen": True,
+        "previewDisplay": "flex",
+    }
+
+
 def test_os_file_drop_uses_whole_window_root_except_explicit_directory(
         page: Page, backend_url, auth_token):
     """Composer/tree blank/file rows are root; only a dir row is nested."""

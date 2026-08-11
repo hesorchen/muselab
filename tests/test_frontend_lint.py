@@ -207,6 +207,8 @@ def test_preview_tabs_persist_reading_positions_and_html_frames():
     assert 'this.desktopFullPane = ""' in open_file
     assert "this.previewOpen = true" in open_file
     assert "this._schedulePreviewViewRestore(cachedPath, loadSeq)" in open_file
+    restore_call = "{ preview: !!(_restored && _restored.preview), reveal: false }"
+    assert app.count(restore_call) == 2
     assert "this.csvLoadPage(targetView.csvOffset)" in open_file
     assert 'x-ref="previewBody"' in html
     assert '@scroll.passive="onPreviewViewportScroll()"' in html
@@ -276,6 +278,11 @@ def test_preview_selection_quote_attachment_and_side_question_are_safely_wired()
     assert "finishPreviewQuoteDrag(ev)" in app
     assert "window.visualViewport.addEventListener" in app
     assert "new ResizeObserver" in app
+    scroll_intent_start = app.index("\n    _userScrollIntent() {")
+    scroll_intent_end = app.index("\n    scrollToBottom(", scroll_intent_start)
+    scroll_intent = app[scroll_intent_start:scroll_intent_end]
+    assert "this.dismissPreviewQuote(false)" in scroll_intent
+    assert "this.dismissPreviewQuote(true)" not in scroll_intent
 
     quote_start = app.index("quotePreviewSelection()")
     quote_end = app.index("\n\n    removePendingQuote", quote_start)
@@ -1478,37 +1485,67 @@ def test_chat_header_exposes_authenticated_session_todo_board():
 
     assert "sessionTodoOpen: false" in app
     assert 'sessionTodoDraft: ""' in app
+    assert 'sessionTodoEditId: ""' in app
+    assert 'sessionTodoEditDraft: ""' in app
     assert "userTodos: []" in app
-    assert 'return "muselab.userTodos."' in app
+    assert "_globalUserTodoStorageKey()" in app
+    assert 'return "muselab.userTodos.global"' in app
     assert "addSessionUserTodo()" in app
     assert "toggleSessionUserTodo(id)" in app
     assert "deleteSessionUserTodo(id)" in app
+    assert "startSessionTodoEdit(item, ev)" in app
+    assert "saveSessionTodoEdit(id = this.sessionTodoEditId)" in app
+    assert "cancelSessionTodoEdit()" in app
     assert "sessionTodosForPriority(priority)" in app
+    assert "sessionTodoIndicatorPriority()" in app
+    assert 'item.priority === "high"' in app
+    assert 'item.priority === "medium"' in app
     assert "onSessionTodoDragStart(ev, item)" in app
     assert "onSessionTodoDrop(ev, priority" in app
     assert 'priority: "medium"' in app
-    todo_impl = app[app.index("_sessionUserTodoStorageKey"):app.index("taskLogLine(m)")]
+    todo_start = app.index("\n    _globalUserTodoStorageKey() {")
+    todo_impl = app[todo_start:app.index("taskLogLine(m)", todo_start)]
+    assert "this.currentId" not in todo_impl
+    assert "_ensureTabState" not in todo_impl
+    assert "tabState" not in todo_impl
+    assert 'startsWith("muselab.userTodos.")' in todo_impl
     assert "TodoWrite" not in todo_impl
     assert "TaskCreate" not in todo_impl
     assert "TaskUpdate" not in todo_impl
-    button = html.index('class="session-todo-btn icon-btn"')
-    activity = html.index('class="activity-center-btn"', button)
-    assert button < activity
+    activity = html.index('class="activity-center-btn"')
+    button = html.index('class="session-todo-btn icon-btn"', activity)
+    assert activity < button
     assert '@click="toggleSessionTodoBoard()"' in html
+    todo_button = html[button:html.index("</button>", button)]
+    assert 'x-show="sessionTodoIndicatorPriority()"' in todo_button
+    assert ':class="\'is-\' + sessionTodoIndicatorPriority()"' in todo_button
+    assert "sessionTodoCount(true) + '/' + sessionTodoCount()" not in todo_button
     assert 'class="modal session-todo-modal"' in html
     assert "'待办事项'" in html
     assert 'x-show="sessionTodoOpen"' in html
-    assert '@click.self="sessionTodoOpen=false"' in html
+    assert '@click.self="closeSessionTodoBoard()"' in html
     assert '@submit.prevent="addSessionUserTodo()"' in html
     assert "['high','medium','low']" in html
+    assert '@dblclick.prevent="startSessionTodoEdit(item, $event)"' in html
+    assert ':draggable="sessionTodoEditId !== item.id"' in html
+    assert 'class="session-todo-edit"' in html
+    assert '@keydown.enter.prevent="saveSessionTodoEdit(item.id)"' in html
+    assert '@keydown.escape.stop.prevent="cancelSessionTodoEdit()"' in html
+    assert '@blur="saveSessionTodoEdit(item.id)"' in html
     assert '@dragstart="onSessionTodoDragStart($event, item)"' in html
     assert '@drop="onSessionTodoDrop($event, priority)"' in html
     assert '@drop.stop="onSessionTodoDrop($event, priority, item.id)"' in html
     assert '@click="toggleSessionUserTodo(item.id)"' in html
     assert '@click="deleteSessionUserTodo(item.id)"' in html
     assert ".session-todo-modal" in css
+    assert ".modal.session-todo-modal" in css
+    assert "width:min(1040px,calc(100vw - 64px))" in css
+    assert "height:min(76vh,720px)" in css
     assert ".session-todo-board" in css
     assert ".session-todo-lane.is-high" in css
+    assert ".session-todo-badge.is-high" in css
+    assert ".session-todo-badge.is-medium" in css
+    assert ".session-todo-modal .session-todo-edit" in css
     assert ".session-todo-compose" in css
     assert "@media (max-width:720px)" in css
 

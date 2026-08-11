@@ -586,12 +586,15 @@ function portal() {
         session_mode: "fresh",
       },
     },
-    // User-owned scratch TODO clipboard for the active conversation. It is
-    // deliberately independent from Muse/Claude Task tools and stored only in
-    // this browser, per session.
+    // User-owned global scratch TODO clipboard. It is deliberately independent
+    // from Muse/Claude Task tools and shared across every conversation and
+    // workspace in this browser.
     sessionTodoOpen: false,
     sessionTodoDraft: "",
     sessionTodoDragId: "",
+    sessionTodoEditId: "",
+    sessionTodoEditDraft: "",
+    userTodos: [],
     activity: {
       show: false, loading: false, events: [],
       // Custom groups are the primary organization surface. An explicit user
@@ -1420,6 +1423,18 @@ function portal() {
         }
         localStorage.removeItem(oldK);
       }
+      this.userTodos = this._loadGlobalUserTodos();
+      window.addEventListener("storage", ev => {
+        const key = this._globalUserTodoStorageKey();
+        if (ev.key === key) {
+          // Read the authoritative current value instead of the event snapshot:
+          // rapid writes from multiple tabs can deliver an older event after a
+          // newer write has already landed in localStorage.
+          this.userTodos = this._normalizeUserTodos(
+            localStorage.getItem(key) || "[]",
+          );
+        }
+      });
       // `pagehide` is bfcache-friendly (unlike an unconditional
       // beforeunload handler) and still fires for browser refresh/PWA close.
       // Flush the current composer synchronously so even a refresh immediately
@@ -2063,7 +2078,7 @@ function portal() {
         // selection must not silently pin a tab that was left in preview.
         const _restored = this.tabs.find(t => t.path === path);
         this.openFile({ path, name: path.split("/").pop() },
-                      { preview: !!(_restored && _restored.preview) })
+                      { preview: !!(_restored && _restored.preview), reveal: false })
             .catch(() => { /* file gone — silent */ });
       }
       // Restore mobile tab choice AFTER openFile (which would otherwise
@@ -4851,7 +4866,7 @@ function portal() {
           // Preserve the restored tab's preview/pinned state (see _bootApp).
           const _restored = this.tabs.find(t => t.path === path);
           this.openFile({ path, name: path.split("/").pop() },
-                        { preview: !!(_restored && _restored.preview) })
+                        { preview: !!(_restored && _restored.preview), reveal: false })
               .catch(() => { /* file went away — nothing to do */ });
         }
         // login() is the first-sign-in counterpart of _bootApp(). Keep the
@@ -6862,9 +6877,6 @@ function portal() {
         // different tab — drives a green dot on the tab strip so the user
         // notices "this one's ready". Cleared when the user activates the tab.
         unread: false,
-        // User-maintained scratch TODOs for this conversation. Loaded from
-        // localStorage when the tab state is first created.
-        userTodos: [],
         // Per-session message queue. Populated when the user sends while
         // this tab's turn is still streaming OR while a compact is in
         // flight. Drained automatically on the next `done` event /
@@ -6938,7 +6950,6 @@ function portal() {
         this.tabState[id] = this._blankTabState();
         this.tabState[id]._sid = id;
         this.tabState[id].draft.input = this._consumePersistedChatDraft(id);
-        this.tabState[id].userTodos = this._loadSessionUserTodos(id);
         // The queue now lives server-side (sessions/{sid}.queue.json). We do
         // NOT pull it here — _ensureTabState is called synchronously all over
         // the place and shouldn't fire a fetch each time. The queue mirror is
@@ -10913,67 +10924,129 @@ function portal() {
       this._cachedTaskSubjectMap = { key: cacheKey, map };
       return map;
     },
-    _sessionUserTodoStorageKey(sid = this.currentId) {
-      return "muselab.userTodos." + (sid || "_default");
+    _globalUserTodoStorageKey() {
+      return "muselab.userTodos.global";
     },
-    _loadSessionUserTodos(sid) {
+    _normalizeUserTodos(value) {
       try {
-        const parsed = JSON.parse(localStorage.getItem(
-          this._sessionUserTodoStorageKey(sid)) || "[]");
+        const parsed = typeof value === "string" ? JSON.parse(value) : value;
         return Array.isArray(parsed)
-          ? parsed.filter(item => item && item.text).slice(0, 100).map(item => ({
+          ? parsed.filter(item => item && item.text).slice(-100).map((item, index) => ({
               ...item,
+              id: String(item.id || `u-migrated-${index}`),
+              text: String(item.text).slice(0, 240),
+              completed: !!item.completed,
               priority: ["high", "medium", "low"].includes(item.priority)
                 ? item.priority : "medium",
             })) : [];
       } catch (_) { return []; }
     },
-    _persistSessionUserTodos() {
-      if (!this.currentId) return;
+    _loadGlobalUserTodos() {
+      try {
+        const storageKey = this._globalUserTodoStorageKey();
+        const saved = localStorage.getItem(storageKey);
+        if (saved != null) return this._normalizeUserTodos(saved);
+
+        // One-time migration from the original per-session clipboard. Keep the
+        // old keys as a recovery backup; the presence of the global key prevents
+        // deleted global items from ever being re-imported on a later refresh.
+        const migrated = [];
+        for (let index = 0; index < localStorage.length; index++) {
+          const key = localStorage.key(index) || "";
+          if (!key.startsWith("muselab.userTodos.") || key === storageKey) continue;
+          migrated.push(...this._normalizeUserTodos(localStorage.getItem(key) || "[]"));
+        }
+        const seen = new Set();
+        const result = migrated.filter(item => {
+          if (seen.has(item.id)) return false;
+          seen.add(item.id);
+          return true;
+        }).slice(-100);
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(result));
+        } catch (_) {
+          // Quota/private-mode failure must not hide successfully recovered
+          // per-session items from the current in-memory board.
+        }
+        return result;
+      } catch (_) { return []; }
+    },
+    _persistGlobalUserTodos() {
       try {
         localStorage.setItem(
-          this._sessionUserTodoStorageKey(),
+          this._globalUserTodoStorageKey(),
           JSON.stringify(this.sessionTodoItems()),
         );
       } catch (_) { /* private mode / quota: keep the in-memory clipboard */ }
     },
     sessionTodoItems() {
-      if (!this.currentId) return [];
-      const state = this._ensureTabState(this.currentId);
-      return Array.isArray(state.userTodos) ? state.userTodos : [];
+      return Array.isArray(this.userTodos) ? this.userTodos : [];
     },
     sessionTodoCount(completed = null) {
       const items = this.sessionTodoItems();
       return completed == null
         ? items.length : items.filter(item => !!item.completed === completed).length;
     },
+    sessionTodoIndicatorPriority() {
+      const active = this.sessionTodoItems().filter(item => !item.completed);
+      if (active.some(item => item.priority === "high")) return "high";
+      if (active.some(item => item.priority === "medium")) return "medium";
+      return "";
+    },
     addSessionUserTodo() {
       const text = String(this.sessionTodoDraft || "").trim();
-      if (!text || !this.currentId) return;
-      const state = this._ensureTabState(this.currentId);
-      state.userTodos = [
-        ...(state.userTodos || []),
+      if (!text) return;
+      this.userTodos = [
+        ...this.sessionTodoItems(),
         { id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
           text, completed: false, priority: "medium" },
       ].slice(-100);
       this.sessionTodoDraft = "";
-      this._persistSessionUserTodos();
+      this._persistGlobalUserTodos();
     },
     toggleSessionUserTodo(id) {
-      const state = this._ensureTabState(this.currentId);
-      state.userTodos = (state.userTodos || []).map(item =>
+      this.userTodos = this.sessionTodoItems().map(item =>
         item.id === id ? { ...item, completed: !item.completed } : item);
-      this._persistSessionUserTodos();
+      this._persistGlobalUserTodos();
     },
     deleteSessionUserTodo(id) {
-      const state = this._ensureTabState(this.currentId);
-      state.userTodos = (state.userTodos || []).filter(item => item.id !== id);
-      this._persistSessionUserTodos();
+      this.userTodos = this.sessionTodoItems().filter(item => item.id !== id);
+      if (this.sessionTodoEditId === id) this.cancelSessionTodoEdit();
+      this._persistGlobalUserTodos();
+    },
+    startSessionTodoEdit(item, ev) {
+      if (!item || !item.id || ev?.target?.closest?.("button")) return;
+      const host = ev?.currentTarget;
+      this.sessionTodoEditId = item.id;
+      this.sessionTodoEditDraft = String(item.text || "");
+      this.$nextTick(() => {
+        // Run after the browser finishes the native dblclick sequence; focusing
+        // in the same event microtask is immediately undone by Chromium's
+        // default double-click text-selection step.
+        setTimeout(() => {
+          const input = host?.querySelector?.(".session-todo-edit");
+          if (input) { input.focus(); input.select(); }
+        }, 0);
+      });
+    },
+    saveSessionTodoEdit(id = this.sessionTodoEditId) {
+      if (!id || id !== this.sessionTodoEditId) return;
+      const text = String(this.sessionTodoEditDraft || "").trim();
+      if (text) {
+        this.userTodos = this.sessionTodoItems().map(item =>
+          item.id === id ? { ...item, text: text.slice(0, 240) } : item);
+        this._persistGlobalUserTodos();
+      }
+      this.sessionTodoEditId = "";
+      this.sessionTodoEditDraft = "";
+    },
+    cancelSessionTodoEdit() {
+      this.sessionTodoEditId = "";
+      this.sessionTodoEditDraft = "";
     },
     clearCompletedSessionUserTodos() {
-      const state = this._ensureTabState(this.currentId);
-      state.userTodos = (state.userTodos || []).filter(item => !item.completed);
-      this._persistSessionUserTodos();
+      this.userTodos = this.sessionTodoItems().filter(item => !item.completed);
+      this._persistGlobalUserTodos();
     },
     sessionTodosForPriority(priority) {
       return this.sessionTodoItems().filter(item => item.priority === priority);
@@ -10993,22 +11066,26 @@ function portal() {
       const id = this.sessionTodoDragId
         || ev?.dataTransfer?.getData("text/plain") || "";
       if (!id || !["high", "medium", "low"].includes(priority)) return;
-      const state = this._ensureTabState(this.currentId);
-      const current = (state.userTodos || []).slice();
+      const current = this.sessionTodoItems().slice();
       const source = current.findIndex(item => item.id === id);
       if (source < 0) return;
-      const [moved] = current.splice(source, 1);
-      moved.priority = priority;
+      const [sourceItem] = current.splice(source, 1);
+      const moved = { ...sourceItem, priority };
       const target = beforeId ? current.findIndex(item => item.id === beforeId) : -1;
       if (target >= 0) current.splice(target, 0, moved);
       else current.push(moved);
-      state.userTodos = current;
+      this.userTodos = current;
       this.sessionTodoDragId = "";
-      this._persistSessionUserTodos();
+      this._persistGlobalUserTodos();
     },
     toggleSessionTodoBoard() {
-      this.sessionTodoOpen = !this.sessionTodoOpen;
-      if (!this.sessionTodoOpen) this.sessionTodoDraft = "";
+      if (this.sessionTodoOpen) this.closeSessionTodoBoard();
+      else this.sessionTodoOpen = true;
+    },
+    closeSessionTodoBoard() {
+      this.sessionTodoOpen = false;
+      this.sessionTodoDraft = "";
+      this.cancelSessionTodoEdit();
     },
     taskLogLine(m) {
       if (!m || !m.name) return null;
@@ -24576,7 +24653,12 @@ function portal() {
     _userScrollIntent() {
       if (this.previewQuote.show && this.previewQuote.source === "chat"
           && this.previewQuote.mode !== "ask") {
-        this.dismissPreviewQuote(true);
+        // Hide the contextual actions while the transcript moves, but preserve
+        // the browser selection. Clearing it here made wheel-assisted text
+        // selection impossible: once the actions popover appeared, the next
+        // wheel tick called removeAllRanges() even while the mouse button was
+        // still held, so users could not extend a selection across viewports.
+        this.dismissPreviewQuote(false);
       }
       this._userScrollAt = Date.now();
       const st = this.currentId && this.tabState && this.tabState[this.currentId];

@@ -1320,17 +1320,7 @@
           <span x-text="t('pane.chat')"></span>
         </span>
         <span class="spacer"></span>
-        <button class="session-todo-btn icon-btn" type="button"
-                @click="toggleSessionTodoBoard()"
-                :class="{ active: sessionTodoOpen, 'has-active': sessionTodoCount(false) }"
-                :aria-expanded="sessionTodoOpen"
-                :title="lang==='zh' ? '待办事项' : 'Current session TODOs'">
-          <svg><use href="#i-check-circle"/></svg>
-          <span class="session-todo-badge" x-show="sessionTodoCount()"
-                x-text="sessionTodoCount(true) + '/' + sessionTodoCount()"></span>
-        </button>
-        <!-- Global task center — moved here from the files header to sit
-             immediately left of the Skills entry (2026-07-21). -->
+        <!-- Global task center is the first action after the title spacer. -->
         <button class="activity-center-btn" type="button" @click="openActivityCenter()"
                 :class="{ active: activity.summary.running || activity.summary.unread, danger: activity.summary.attention }"
                 :title="lang==='zh' ? '全局任务中心' : 'Global activity center'">
@@ -1340,6 +1330,16 @@
           <svg><use href="#i-inbox"/></svg>
           <span class="activity-running" x-show="activity.summary.running" aria-hidden="true"></span>
           <span class="activity-unread" x-show="activity.summary.unread" aria-hidden="true"></span>
+        </button>
+        <button class="session-todo-btn icon-btn" type="button"
+                @click="toggleSessionTodoBoard()"
+                :class="{ active: sessionTodoOpen, 'has-active': sessionTodoCount(false) }"
+                :aria-expanded="sessionTodoOpen"
+                :title="lang==='zh' ? '待办事项' : 'Global TODOs'">
+          <svg><use href="#i-check-circle"/></svg>
+          <span class="session-todo-badge" aria-hidden="true"
+                x-show="sessionTodoIndicatorPriority()"
+                :class="'is-' + sessionTodoIndicatorPriority()"></span>
         </button>
         <button class="icon-btn" type="button" @click="openMemoryCenter()"
                 :title="lang==='zh' ? '记忆中心' : 'Memory Center'"
@@ -5761,9 +5761,9 @@
   </div>
 
   <div class="modal-backdrop" x-show="sessionTodoOpen"
-       @click.self="sessionTodoOpen=false" x-cloak>
+       @click.self="closeSessionTodoBoard()" x-cloak>
     <div class="modal session-todo-modal" role="dialog" aria-modal="true"
-         @keydown.escape.window="sessionTodoOpen=false">
+         @keydown.escape.window="closeSessionTodoBoard()">
       <div class="modal-head">
         <span class="modal-title">
           <svg class="modal-title-icon"><use href="#i-check-circle"/></svg>
@@ -5774,7 +5774,7 @@
         <button class="btn-ghost sm" type="button" x-show="sessionTodoCount(true)"
                 @click="clearCompletedSessionUserTodos()"
                 x-text="lang==='zh' ? '清除已完成' : 'Clear completed'"></button>
-        <button class="modal-close" @click="sessionTodoOpen=false" aria-label="Close">×</button>
+        <button class="modal-close" @click="closeSessionTodoBoard()" aria-label="Close">×</button>
       </div>
       <form class="session-todo-compose" @submit.prevent="addSessionUserTodo()">
         <input type="text" maxlength="240" autocomplete="off" autofocus
@@ -5807,8 +5807,10 @@
               <template x-for="item in sessionTodosForPriority(priority)" :key="item.id">
                 <div class="session-todo-item"
                      :class="{ 'is-completed': item.completed,
-                               'is-dragging': sessionTodoDragId === item.id }"
-                     draggable="true"
+                               'is-dragging': sessionTodoDragId === item.id,
+                               'is-editing': sessionTodoEditId === item.id }"
+                     :draggable="sessionTodoEditId !== item.id"
+                     @dblclick.prevent="startSessionTodoEdit(item, $event)"
                      @dragstart="onSessionTodoDragStart($event, item)"
                      @dragend="onSessionTodoDragEnd()"
                      @dragover.prevent
@@ -5822,7 +5824,18 @@
                     <svg x-show="item.completed"><use href="#i-check"/></svg>
                     <span x-show="!item.completed" class="todo-dot"></span>
                   </button>
-                  <span class="session-todo-copy"><strong x-text="item.text"></strong></span>
+                  <span class="session-todo-copy">
+                    <strong x-show="sessionTodoEditId !== item.id" x-text="item.text"></strong>
+                    <template x-if="sessionTodoEditId === item.id">
+                      <input class="session-todo-edit" type="text" maxlength="240" autofocus
+                             x-model="sessionTodoEditDraft"
+                             @click.stop @dblclick.stop
+                             @keydown.enter.prevent="saveSessionTodoEdit(item.id)"
+                             @keydown.escape.stop.prevent="cancelSessionTodoEdit()"
+                             @blur="saveSessionTodoEdit(item.id)"
+                             :aria-label="lang==='zh' ? '编辑待办内容' : 'Edit TODO text'" />
+                    </template>
+                  </span>
                   <button class="session-todo-delete" type="button"
                           @click="deleteSessionUserTodo(item.id)"
                           :aria-label="lang==='zh' ? '删除待办' : 'Delete TODO'">×</button>
