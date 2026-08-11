@@ -4464,7 +4464,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
           path: "reports/perf-preview.md",
           name: "perf-preview.md",
           is_dir: false,
-        }, { preview: false });
+        }, { preview: false, reveal: true });
         """,
     )
     page.wait_for_function(
@@ -4483,7 +4483,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
         """() => document.querySelector("#app")._x_dataStack[0].mobileTab === "files" """,
         timeout=5000,
     )
-    page.locator(SEL_MOBILE_TAB).nth(1).click()
+    page.locator(SEL_MOBILE_TAB).nth(2).click()
     page.wait_for_function(
         """() => document.querySelector("#app")._x_dataStack[0].mobileTab === "preview" """,
         timeout=5000,
@@ -4512,7 +4512,7 @@ def test_mobile_pwa_tabs_preview_rotation_keep_chat_usable(page: Page, backend_u
         }""",
         timeout=5000,
     )
-    page.locator(SEL_MOBILE_TAB).nth(2).click()
+    page.locator(SEL_MOBILE_TAB).nth(1).click()
     page.wait_for_function(
         """() => document.querySelector("#app")._x_dataStack[0].mobileTab === "chat" """,
         timeout=5000,

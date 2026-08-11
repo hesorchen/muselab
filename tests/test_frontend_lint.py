@@ -203,12 +203,22 @@ def test_preview_tabs_persist_reading_positions_and_html_frames():
     open_file = app[start:end]
 
     assert "this._capturePreviewViewState(this.selected)" in open_file
-    assert "opts.reveal !== false && !this._isMobileLayout()" in open_file
+    assert "const reveal = opts.reveal === true" in open_file
+    assert "const keepCurrentEditor = this.editing" in open_file
+    assert open_file.index("this._confirmLoseEdits()") < open_file.index(
+        "if (reveal && !this._isMobileLayout()")
+    assert "if (this._isMobileLayout() && reveal) this.setMobileTab(\"preview\")" in open_file
+    assert "if (reveal && !this._isMobileLayout()" in open_file
+    assert 'this.previewSurface !== "terminal" || reveal' in open_file
     assert 'this.desktopFullPane = ""' in open_file
     assert "this.previewOpen = true" in open_file
     assert "this._schedulePreviewViewRestore(cachedPath, loadSeq)" in open_file
     restore_call = "{ preview: !!(_restored && _restored.preview), reveal: false }"
     assert app.count(restore_call) == 2
+    assert html.count('@click="switchTab(t.path, { reveal: true })"') == 2
+    assert '@click="openByPath(h.path, { reveal: true })"' in html
+    assert "this.switchTab(path, { reveal: true })" in app
+    assert app.count("await this.switchTab(path, { reveal: true });") == 2
     assert "this.csvLoadPage(targetView.csvOffset)" in open_file
     assert 'x-ref="previewBody"' in html
     assert '@scroll.passive="onPreviewViewportScroll()"' in html
@@ -342,7 +352,8 @@ def test_side_question_stays_floating_and_is_hidden_from_activity_center():
         "async openFile(n, opts = {})",
     ):
         start = app.index(owner_change)
-        assert "dismissTransientPreviewQuote" in app[start:start + 700]
+        window = 1800 if owner_change.startswith("async openFile") else 700
+        assert "dismissTransientPreviewQuote" in app[start:start + window]
 
     create_start = app.index("async _createPreviewSelectionAskSession(")
     create_end = app.index("\n    previewSelectionAskMessages()", create_start)
@@ -594,10 +605,9 @@ def test_external_file_drop_is_global_root_by_default_and_directory_explicit():
 
     nav = html[html.index('<nav class="mobile-tab-bar"'):
                html.index("</nav>", html.index('<nav class="mobile-tab-bar"'))]
-    # This is a desktop-only layout change; preserve the established mobile
-    # navigation order and its muscle memory.
+    # Keep the primary conversation action in the centre of the mobile nav.
     assert nav.index("mobileTab==='files'") < nav.index(
-        "mobileTab==='preview'") < nav.index("mobileTab==='chat'")
+        "mobileTab==='chat'") < nav.index("mobileTab==='preview'")
 
 
 def test_multi_workspace_ui_and_folder_browser_are_wired_end_to_end():
@@ -1399,6 +1409,7 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert '}/group`' in app
     assert 'class="activity-groups-toolbar"' in html
     assert 'class="activity-group-editor"' in html
+    assert "'is-group-board': activity.view === 'groups'" in html
     assert 'class="activity-row-group"' in html
     assert '@dragstart="onActivityDragStart($event, item)"' in html
     assert ".activity-group.is-custom.is-drag-over" in css
@@ -1410,6 +1421,15 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert 'x-show="activity.view === \'timeline\'"' in html
     assert ".activity-pin.active" in css
     assert ".activity-modal { width:700px" in css
+    assert ".modal.activity-modal.is-group-board" in css
+    assert "width:min(1120px,calc(100vw - 64px))" in css
+    assert "height:auto" in css
+    assert "flex:1 1 auto" in css
+    assert "grid-template-columns:repeat(auto-fit,minmax(300px,1fr))" in css
+    assert "grid-auto-rows:300px" in css
+    assert ".activity-body.is-group-board > .activity-group.is-custom" in css
+    assert "ACTIVITY_CUSTOM_GROUP_CAP: 50" in app
+    assert "if (group?.custom) return this.ACTIVITY_CUSTOM_GROUP_CAP" in app
     assert "max-height:min(82vh,820px)" in css
     assert "min-height:min(56vh,520px)" in css
     assert "scrollbar-gutter:stable" in css

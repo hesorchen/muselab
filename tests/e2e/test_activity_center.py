@@ -395,6 +395,30 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
     assert page.locator(
         ".activity-custom-group-head > strong"
     ).all_text_contents() == ["Research", "Delivery", "未分组"]
+    board_geometry = page.evaluate(
+        """() => {
+          const modal = document.querySelector('.activity-modal');
+          const body = document.querySelector('.activity-body');
+          const lanes = Array.from(body.querySelectorAll('.activity-group.is-custom'));
+          const rects = lanes.map(node => node.getBoundingClientRect());
+          return {
+            modalWidth: modal.getBoundingClientRect().width,
+            modalHeight: modal.getBoundingClientRect().height,
+            bodyDisplay: getComputedStyle(body).display,
+            columns: getComputedStyle(body).gridTemplateColumns.split(' ').length,
+            laneWidths: rects.map(rect => rect.width),
+            laneTops: rects.map(rect => Math.round(rect.top)),
+          };
+        }"""
+    )
+    assert board_geometry["modalWidth"] >= 1050
+    # One board row should size the modal to its content instead of stretching
+    # it to most of the viewport and leaving a large empty area underneath.
+    assert 450 <= board_geometry["modalHeight"] <= 650, board_geometry
+    assert board_geometry["bodyDisplay"] == "grid"
+    assert board_geometry["columns"] == 3
+    assert min(board_geometry["laneWidths"]) >= 300
+    assert len(set(board_geometry["laneTops"])) == 1
     delivery = groups.filter(has_text="Delivery")
     expect(delivery.locator(".activity-custom-group-empty")).to_be_visible()
 
@@ -422,6 +446,42 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
     editor.locator('button[type="submit"]').click()
     expect(page.locator(".activity-custom-group-head > strong")).to_contain_text(
         ["Research", "Delivery", "Writing", "未分组"]
+    )
+
+    # A busy group is an independently scrollable lane. The old five-row cap
+    # plus a constrained grid lane clipped everything below roughly four rows,
+    # including the "more" control, so there was no way to reach older sessions.
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.activity.events = Array.from({length: 12}, (_, index) => ({
+            id: `busy-group-${index}`,
+            session_id: `busy-session-${index}`,
+            session_name: `Busy session ${index + 1}`,
+            task_summary: `Busy task ${index + 1}`,
+            workspace: '/tmp/e2e', workspace_name: 'e2e',
+            state: 'completed', read: true, group_id: 'research',
+            started_at: index, finished_at: index + 10, updated_at: index + 20,
+          }));
+          await new Promise(resolve => app.$nextTick(resolve));
+        }"""
+    )
+    research = page.locator(".activity-group.is-custom").filter(
+        has=page.locator(".activity-custom-group-head > strong", has_text="Research")
+    )
+    expect(research.locator(".activity-row-wrap")).to_have_count(12)
+    lane_scroll = research.evaluate(
+        """lane => {
+          const before = {clientHeight: lane.clientHeight, scrollHeight: lane.scrollHeight};
+          lane.scrollTop = lane.scrollHeight;
+          return {...before, scrollTop: lane.scrollTop};
+        }"""
+    )
+    assert 280 <= lane_scroll["clientHeight"] <= 320
+    assert lane_scroll["scrollHeight"] > lane_scroll["clientHeight"]
+    assert lane_scroll["scrollTop"] > 0
+    expect(research.locator(".activity-session-name").last).to_have_text(
+        "Busy session 1"
     )
 
     calls = page.evaluate("() => window.__activityGroupCalls")

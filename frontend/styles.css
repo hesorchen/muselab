@@ -3734,10 +3734,19 @@ pre.text {
 }
 .files-head-workspace .workspace-picker-btn { width: 100%; max-width: none; border-radius: var(--r-sm); }
 .activity-modal { width:700px; max-width:calc(100vw - 32px); }
-/* The later generic desktop modal cap is 480px. Keep this ledger wide enough
-   for conversation + task hierarchy, without overriding mobile fullscreen. */
+/* The later generic desktop modal cap is 480px. Status/time ledgers retain the
+   focused 700px reading width; the custom-group view becomes a real board with
+   the same generous working area as the global TODO lanes. */
 @media (min-width:721px) {
   .modal.activity-modal { width:700px; max-width:calc(100vw - 32px); }
+  .modal.activity-modal.is-group-board {
+    width:min(1120px,calc(100vw - 64px));
+    max-width:calc(100vw - 64px);
+    height:auto;
+    max-height:calc(100vh - 64px);
+    display:flex;
+    flex-direction:column;
+  }
 }
 .activity-view-switch { display:inline-flex; margin-left:auto; padding:2px; border:1px solid var(--c-border); border-radius:var(--r-md); background:var(--c-bg-2); }
 .activity-view-switch button { padding:4px 9px; border:0; border-radius:calc(var(--r-md) - 2px); background:transparent; color:var(--c-fg-3); font:inherit; font-size:var(--fs-xs); cursor:pointer; }
@@ -3801,6 +3810,20 @@ pre.text {
    appearance nor disappearance can push a mounted row or resize the modal. */
 @media (min-width:721px) {
   .activity-body { min-height:min(56vh,520px); }
+  .activity-modal.is-group-board .activity-body.is-group-board {
+    flex:1 1 auto;
+    min-height:0;
+    max-height:none;
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+    /* One lane starts at roughly a header + three session cards. Additional
+       sessions stay in the lane and are reached by its own scrollbar. */
+    grid-auto-rows:300px;
+    align-content:start;
+    align-items:stretch;
+    gap:12px;
+    padding:14px 16px 18px;
+  }
 }
 .activity-loading-overlay {
   position:absolute;
@@ -3853,6 +3876,71 @@ pre.text {
 .activity-custom-group-actions button:disabled { opacity:.25; cursor:default; }
 .activity-custom-group-actions svg { width:12px; height:12px; }
 .activity-custom-group-empty { margin:0 4px 4px; padding:12px; border:1px dashed var(--c-border); border-radius:var(--r-sm); color:var(--c-fg-4); font-size:var(--fs-xs); text-align:center; }
+/* Group view mirrors the clearer TODO-board hierarchy: each custom group is a
+   self-contained lane with a strong header, card-like sessions and a generous
+   empty drop target. The ledger/status views keep their compact row styling. */
+@media (min-width:721px) {
+  .activity-body.is-group-board > .activity-group.is-custom {
+    min-width:0;
+    min-height:300px;
+    height:100%;
+    max-height:100%;
+    margin:0;
+    padding:10px;
+    display:flex;
+    flex-direction:column;
+    overflow-x:hidden;
+    overflow-y:auto;
+    scrollbar-gutter:stable;
+    border-radius:var(--r-lg);
+    background:var(--c-bg-2);
+  }
+  .activity-body.is-group-board .activity-custom-group-head {
+    position:sticky;
+    top:-10px;
+    z-index:1;
+    min-height:38px;
+    padding:12px 3px 9px;
+    border-bottom:1px solid var(--c-border);
+    background:var(--c-bg-2);
+  }
+  .activity-body.is-group-board .activity-custom-group-head > strong {
+    font-size:var(--fs-md);
+  }
+  .activity-body.is-group-board .activity-custom-group-dot {
+    width:9px;
+    height:9px;
+    flex-basis:9px;
+  }
+  .activity-body.is-group-board .activity-custom-group-empty {
+    min-height:118px;
+    margin:8px 0 0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+  .activity-body.is-group-board .activity-row-wrap {
+    margin-top:8px;
+    border:1px solid var(--c-border);
+    background:var(--c-bg-1);
+  }
+  .activity-body.is-group-board .activity-row-wrap:hover {
+    border-color:var(--c-border-strong);
+  }
+  .activity-body.is-group-board .activity-row {
+    padding:10px 9px;
+  }
+  .activity-body.is-group-board .activity-row:hover {
+    background:var(--c-bg-3);
+  }
+  .activity-body.is-group-board .activity-group-more {
+    margin-top:8px;
+    padding:7px 8px;
+    border:1px dashed var(--c-border);
+    text-align:center;
+  }
+  .activity-body.is-group-board > .hint-row { grid-column:1 / -1; }
+}
 .activity-group-more { display:block; width:100%; margin:2px 0 0; padding:6px 8px; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); font:inherit; font-size:var(--fs-xs); text-align:left; cursor:pointer; }
 .activity-group-more:hover { background:var(--c-bg-2); color:var(--c-fg-1); }
 .activity-row-wrap { display:flex; align-items:center; border-radius:var(--r-sm); }
