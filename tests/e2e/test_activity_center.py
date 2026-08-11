@@ -34,9 +34,11 @@ def test_memory_shortcut_opens_memory_settings_page(
 ):
     _login(page, backend_url, auth_token)
 
-    shortcut = page.locator(".activity-center-btn + .icon-btn")
+    shortcut = page.locator(
+        ".pane.chat > .pane-head button.icon-btn",
+        has=page.locator('use[href="#i-brain"]'),
+    )
     expect(shortcut).to_have_count(1)
-    expect(shortcut.locator('use[href="#i-brain"]')).to_have_count(1)
     shortcut.click()
 
     expect(page.locator(".settings-modal")).to_be_visible()

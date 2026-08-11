@@ -807,6 +807,185 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
     _assert_no_browser_errors(page, errors)
 
 
+def test_chat_wheel_preserves_selection_across_messages(
+    page: Page, backend_url, auth_token,
+):
+    """Scrolling the transcript must not collapse a live browser selection."""
+    errors = _capture_browser_errors(page)
+    _login(page, backend_url, auth_token)
+    sid = "selection-wheel-source"
+    _bootstrap_session_for_real_load(page, sid, "Selection wheel source")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.messages = [
+          {
+            role: "assistant", text: "FIRST_WHEEL_SELECTION_MARKER",
+            html: "<p>FIRST_WHEEL_SELECTION_MARKER</p>",
+            uuid: "selection-wheel-first", _k: "selection-wheel-first",
+            _noAnim: true,
+          },
+          {
+            role: "assistant", text: "SECOND_WHEEL_SELECTION_MARKER",
+            html: "<p>SECOND_WHEEL_SELECTION_MARKER</p>",
+            uuid: "selection-wheel-second", _k: "selection-wheel-second",
+            _noAnim: true,
+          },
+        ];
+        app._activateTabState(arg);
+        app.mobileTab = "chat";
+        return true;
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        """sid => document.querySelectorAll(
+          `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant p`).length === 2""",
+        arg=sid,
+    )
+
+    selected = page.evaluate(
+        """sid => {
+          const nodes = document.querySelectorAll(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant p`);
+          const range = document.createRange();
+          range.selectNodeContents(nodes[0]);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.dispatchEvent(new Event('selectionchange'));
+          return selection.toString();
+        }""",
+        sid,
+    )
+    assert selected == "FIRST_WHEEL_SELECTION_MARKER"
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.previewQuote.show && app.previewQuote.source === 'chat';
+        }"""
+    )
+
+    after_wheel = page.evaluate(
+        """() => {
+          const body = document.querySelector('.chat-body');
+          body.dispatchEvent(new WheelEvent('wheel', {
+            deltaY: 320, bubbles: true, cancelable: true,
+          }));
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return {
+            text: window.getSelection().toString(),
+            rangeCount: window.getSelection().rangeCount,
+            popover: app.previewQuote.show,
+          };
+        }"""
+    )
+    assert after_wheel == {
+        "text": "FIRST_WHEEL_SELECTION_MARKER",
+        "rangeCount": 1,
+        "popover": False,
+    }
+
+    extended = page.evaluate(
+        """sid => {
+          const nodes = document.querySelectorAll(
+            `.msg-pane[data-tid="${CSS.escape(sid)}"] .msg.assistant p`);
+          const range = document.createRange();
+          range.setStart(nodes[0].firstChild, 0);
+          range.setEnd(nodes[1].firstChild, nodes[1].firstChild.length);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.dispatchEvent(new Event('selectionchange'));
+          return selection.toString();
+        }""",
+        sid,
+    )
+    assert "FIRST_WHEEL_SELECTION_MARKER" in extended
+    assert "SECOND_WHEEL_SELECTION_MARKER" in extended
+    _assert_no_browser_errors(page, errors)
+
+
+def test_session_todo_modal_uses_large_desktop_board(
+    page: Page, backend_url, auth_token,
+):
+    """The three priority lanes should use the desktop viewport, not 480px."""
+    _login(page, backend_url, auth_token)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    todo_state = _app_eval(
+        page,
+        """
+        const originalId = app.currentId;
+        app.userTodos = [
+          {id: 'todo-high', text: 'High item', completed: false, priority: 'high'},
+          {id: 'todo-medium', text: 'Medium item', completed: false, priority: 'medium'},
+          {id: 'todo-low', text: 'Low item', completed: false, priority: 'low'},
+        ];
+        app._persistGlobalUserTodos();
+        const beforeSwitch = app.sessionTodoItems().map(item => item.id);
+        app.currentId = 'different-conversation';
+        const afterSwitch = app.sessionTodoItems().map(item => item.id);
+        app.currentId = originalId;
+        const highIndicator = app.sessionTodoIndicatorPriority();
+        app.userTodos = app.userTodos.map(item => item.id === 'todo-high'
+          ? {...item, completed: true} : item);
+        const mediumIndicator = app.sessionTodoIndicatorPriority();
+        app.userTodos = app.userTodos.map(item => item.id === 'todo-medium'
+          ? {...item, completed: true} : item);
+        const lowOnlyIndicator = app.sessionTodoIndicatorPriority();
+        app.userTodos = app.userTodos.map(item => ({...item, completed: false}));
+        app.sessionTodoOpen = true;
+        return {
+          beforeSwitch,
+          afterSwitch,
+          storageKey: app._globalUserTodoStorageKey(),
+          highIndicator,
+          mediumIndicator,
+          lowOnlyIndicator,
+        };
+        """,
+    )
+    assert todo_state == {
+        "beforeSwitch": ["todo-high", "todo-medium", "todo-low"],
+        "afterSwitch": ["todo-high", "todo-medium", "todo-low"],
+        "storageKey": "muselab.userTodos.global",
+        "highIndicator": "high",
+        "mediumIndicator": "medium",
+        "lowOnlyIndicator": "",
+    }
+    modal = page.locator(".session-todo-modal")
+    expect(modal).to_be_visible()
+    box = modal.bounding_box()
+    assert box is not None
+    assert box["width"] >= 900
+    assert box["height"] >= 600
+    expect(modal.locator(".session-todo-lane")).to_have_count(3)
+
+    high_item = modal.locator(".session-todo-item", has_text="High item")
+    high_item.dblclick()
+    edit = high_item.locator(".session-todo-edit")
+    expect(edit).to_be_visible()
+    expect(edit).to_be_focused()
+    edit.fill("Edited high item")
+    edit.press("Enter")
+    expect(high_item.locator("strong")).to_have_text("Edited high item")
+    saved = page.evaluate(
+        """() => JSON.parse(localStorage.getItem(
+          'muselab.userTodos.global') || '[]').find(item => item.id === 'todo-high')?.text"""
+    )
+    assert saved == "Edited high item"
+
+    medium_item = modal.locator(".session-todo-item", has_text="Medium item")
+    medium_item.dblclick()
+    medium_edit = medium_item.locator(".session-todo-edit")
+    medium_edit.fill("Must not save")
+    medium_edit.press("Escape")
+    expect(medium_item.locator("strong")).to_have_text("Medium item")
+    expect(modal).to_be_visible()
+
+
 def test_effort_fast_capabilities_and_session_restore(
     page: Page, backend_url, auth_token,
 ):

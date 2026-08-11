@@ -3632,9 +3632,30 @@ pre.text {
 .session-todo-modal-count { margin-left:auto; color:var(--c-fg-3); font:var(--fs-xs) var(--font-mono); }
 .session-todo-modal .session-todo-compose { margin:0; padding:12px 14px; border-bottom:1px solid var(--c-border); }
 .session-todo-modal-body { max-height:min(60vh,520px); padding:12px 14px 16px; overflow:auto; }
-@media (max-width:600px) { .session-todo-modal { width:100vw; max-width:none; } }
+/* The generic desktop `.modal` rule later in this stylesheet caps dialogs at
+   480px. The two-class selector intentionally outranks that cap: a three-lane
+   board needs real horizontal and vertical working space for reading + drag. */
+@media (min-width:721px) {
+  .modal.session-todo-modal {
+    width:min(1040px,calc(100vw - 64px));
+    max-width:calc(100vw - 64px);
+    height:min(76vh,720px);
+    max-height:calc(100vh - 64px);
+    display:flex;
+    flex-direction:column;
+  }
+  .modal.session-todo-modal .session-todo-modal-body {
+    flex:1;
+    min-height:0;
+    max-height:none;
+  }
+  .modal.session-todo-modal .session-todo-board { min-height:100%; }
+}
+@media (max-width:600px) { .modal.session-todo-modal { width:100vw; max-width:none; } }
 
-.session-todo-badge { position:absolute; right:-5px; top:-5px; min-width:18px; height:16px; padding:0 4px; display:flex; align-items:center; justify-content:center; border:2px solid var(--c-bg-1); border-radius:var(--r-full); background:var(--c-accent); color:var(--c-on-accent); font:9px/1 var(--font-mono); }
+.session-todo-badge { position:absolute; right:-2px; top:-2px; width:10px; height:10px; border:2px solid var(--c-bg-1); border-radius:50%; box-sizing:border-box; pointer-events:none; }
+.session-todo-badge.is-high { background:var(--c-danger); box-shadow:0 0 0 2px color-mix(in srgb,var(--c-danger) 18%,transparent); }
+.session-todo-badge.is-medium { background:var(--c-warn); box-shadow:0 0 0 2px color-mix(in srgb,var(--c-warn) 18%,transparent); }
 .session-todo-panel { flex:0 0 auto; max-height:min(42vh,380px); overflow:auto; padding:10px 14px 12px; border-bottom:1px solid var(--c-border); background:var(--c-bg-1); box-shadow:0 5px 16px rgba(0,0,0,.08); }
 .session-todo-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:8px; }
 .session-todo-head > div { display:flex; flex-direction:column; gap:2px; }
@@ -3649,7 +3670,7 @@ pre.text {
 .session-todo-item + .session-todo-item { border-top:1px solid var(--c-border); }
 .session-todo-state { width:16px; height:18px; flex:0 0 16px; display:flex; align-items:center; justify-content:center; }
 .session-todo-state svg { width:14px; height:14px; color:var(--c-success); }
-.session-todo-copy { min-width:0; display:flex; flex-direction:column; gap:2px; }
+.session-todo-copy { min-width:0; flex:1; display:flex; flex-direction:column; gap:2px; }
 .session-todo-copy strong { overflow:hidden; color:var(--c-fg-1); font-size:var(--fs-xs); font-weight:var(--fw-medium); line-height:1.35; text-overflow:ellipsis; }
 .session-todo-copy small { color:var(--c-fg-3); font-size:10px; line-height:1.35; }
 .session-todo-item.is-completed .session-todo-copy strong { color:var(--c-fg-3); text-decoration:line-through; }
@@ -3682,6 +3703,8 @@ pre.text {
 .session-todo-lane .session-todo-item { margin:3px 0; border:1px solid var(--c-border); background:var(--c-bg-1); cursor:grab; }
 .session-todo-lane .session-todo-item:active { cursor:grabbing; }
 .session-todo-item.is-dragging { opacity:.35; }
+.session-todo-item.is-editing { cursor:text; border-color:var(--c-accent); }
+.session-todo-modal .session-todo-edit { width:100%; min-width:0; height:28px; margin:0; padding:0 7px; border:1px solid var(--c-accent); border-radius:var(--r-sm); outline:0; background:var(--c-bg-0); color:var(--c-fg-0); font:inherit; font-size:var(--fs-xs); box-shadow:0 0 0 2px var(--c-accent-soft); }
 .session-todo-grip { flex:0 0 auto; color:var(--c-fg-4); font:12px/1 var(--font-mono); letter-spacing:-3px; }
 @media (max-width:720px) {
   .session-todo-board { grid-template-columns:1fr; }
