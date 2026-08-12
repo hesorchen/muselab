@@ -1386,14 +1386,10 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "!opts.summaryOnly && this._activityFetchPromises.summary" in app
     assert "const rank = (activeRank[a.state] ?? 9)" in app
     assert "return this.activityEventTimestamp(b)" in app
-    ungrouped_sort = app.index('group.key === "custom:__ungrouped__"')
-    custom_sort = app.index("if (group.custom) {", ungrouped_sort)
-    assert ungrouped_sort < custom_sort
-    assert "this.activityEventTimestamp(b) - this.activityEventTimestamp(a)" in app[
-        ungrouped_sort:custom_sort
-    ]
-    assert "attentionRank" not in app[ungrouped_sort:custom_sort]
-    assert "pinRank" not in app[ungrouped_sort:custom_sort]
+    custom_sort = app.index("const aManual = Number.isFinite")
+    assert "if (aManual !== bManual) return aManual ? 1 : -1" in app[custom_sort:]
+    assert "Number(a.group_order) - Number(b.group_order)" in app[custom_sort:]
+    assert 'group.key === "custom:__ungrouped__"' in app[custom_sort:]
     assert "this._activityAppliedSeq = ++this._activityRequestSeq" in app
     assert '"/api/activity/events-ticket"' in app
     assert "new EventSource(" in app
@@ -1412,7 +1408,28 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert "'is-group-board': activity.view === 'groups'" in html
     assert 'class="activity-row-group"' in html
     assert '@dragstart="onActivityDragStart($event, item)"' in html
+    assert '@dragover.stop.prevent="onActivityRowDragOver($event, group, item)"' in html
+    assert '@drop.stop.prevent="onActivityRowDrop(group, item)"' in html
+    assert '@dragstart.stop="onActivityGroupOrderDragStart($event, group)"' in html
+    assert '@drop.stop.prevent="group.custom && onActivityLaneDrop(group)"' in html
+    assert "before_event_id" in app
+    assert 'groupOrder: ["__ungrouped__"]' in app
+    assert 'result.push("__ungrouped__")' in app
+    assert 'x-show="!group.builtin"' in html
+    assert "|| group?.builtin) return" in app
+    assert "async persistActivityGroupOrder(next, previous)" in app
+    assert "const task = prior.catch(() => {}).then(run)" in app
+    assert "json: { ids: requestedOrder }" in app
+    assert "incomingRevision < this._activityRevision" in app
+    assert "if (this.activitySearchQuery() || group?.builtin) return false" in app
+    update_start = app.index("_applyActivityUpdate(payload)")
+    update_end = app.index("\n    async _startActivityEvents()", update_start)
+    update = app[update_start:update_end]
+    assert update.index("revision && revision <= this._activityRevision") < update.index(
+        "this.applyActivityGroupPayload(payload)")
     assert ".activity-group.is-custom.is-drag-over" in css
+    assert ".activity-group.is-custom.is-group-drop-before" in css
+    assert ".activity-row-wrap.drop-before::before" in css
     assert ".activity-move-menu" in css
     assert "const pinRank = Number(!!b.pinned) - Number(!!a.pinned)" in app
     assert "async toggleActivityPin(item)" in app

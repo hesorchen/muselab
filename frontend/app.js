@@ -615,12 +615,18 @@ function portal() {
       // events so SSE updates and session renames appear without another query.
       query: "",
       customGroups: [],
+      groupOrder: ["__ungrouped__"],
       groupEditor: {
         open: false, id: "", name: "", color: "blue", saving: false,
       },
       moveMenu: { show: false, eventId: "", style: "" },
       dragEventId: "",
       dragOverGroupId: null,
+      dragOverEventId: "",
+      dragInsertAfter: false,
+      dragGroupId: "",
+      dragOverGroupOrderId: "",
+      dragGroupInsertAfter: false,
     },
     _activityEtags: {},
     _activityFetchPromises: {},
@@ -634,6 +640,8 @@ function portal() {
     _activityLiveVisibilityBound: false,
     _activityPinPending: {},
     _activityGroupPending: {},
+    _activityGroupOrderSeq: 0,
+    _activityGroupOrderQueue: null,
     // Per-task "run-now" inflight flag — disables retry / send buttons until
     // activity SSE reports a terminal state. Keyed by task id.
     schedRunning: {},
@@ -27644,8 +27652,15 @@ function portal() {
           if (etag) this._activityEtags[key] = etag;
           const data = await r.json();
           if (seq < this._activityAppliedSeq) return false;
-          this._activityAppliedSeq = seq;
           const summary = opts.summaryOnly ? data : data.summary;
+          const incomingGeneration = String(summary?.generation || "");
+          const incomingRevision = Number(summary?.revision) || 0;
+          const sameGeneration = !incomingGeneration
+            || !this._activityGeneration
+            || incomingGeneration === this._activityGeneration;
+          if (sameGeneration && incomingRevision
+              && incomingRevision < this._activityRevision) return false;
+          this._activityAppliedSeq = seq;
           if (summary) {
             this.activity.summary = summary;
             const generation = String(summary.generation || "");
@@ -27662,9 +27677,7 @@ function portal() {
             this.activity.events = data.events;
             this._syncScheduledActivitySnapshot(data.events);
           }
-          if (!opts.summaryOnly && Array.isArray(data.custom_groups)) {
-            this.activity.customGroups = data.custom_groups;
-          }
+          if (!opts.summaryOnly) this.applyActivityGroupPayload(data);
           this._syncAppBadge();
           return true;
         } catch (_) { return false; }
@@ -27698,12 +27711,14 @@ function portal() {
       this.closeActivityMoveMenu();
       this.cancelActivityGroupEditor();
       this.onActivityDragEnd();
+      this.onActivityGroupOrderDragEnd();
     },
     setActivityView(view) {
       if (!["status", "groups", "timeline"].includes(view)) return;
       this.closeActivityMoveMenu();
       this.cancelActivityGroupEditor();
       this.onActivityDragEnd();
+      this.onActivityGroupOrderDragEnd();
       this.activity.view = view;
       try { localStorage.setItem("muselab_activity_view", view); } catch (_) {}
     },
@@ -27724,23 +27739,53 @@ function portal() {
     ACTIVITY_GROUP_COLORS: [
       "blue", "violet", "cyan", "green", "amber", "rose", "gray",
     ],
+    normalizeActivityGroupOrder(order = this.activity.groupOrder) {
+      const customIds = (this.activity.customGroups || [])
+        .map(group => String(group.id || "")).filter(Boolean);
+      const valid = new Set(customIds);
+      const result = [];
+      for (const value of Array.isArray(order) ? order : []) {
+        const groupId = String(value || "");
+        if (valid.has(groupId) && !result.includes(groupId)) result.push(groupId);
+      }
+      for (const groupId of customIds) {
+        if (!result.includes(groupId)) result.push(groupId);
+      }
+      result.push("__ungrouped__");
+      return result;
+    },
+    applyActivityGroupPayload(data) {
+      if (Array.isArray(data?.custom_groups)) {
+        this.activity.customGroups = data.custom_groups;
+      }
+      if (Array.isArray(data?.group_order)) {
+        this.activity.groupOrder = this.normalizeActivityGroupOrder(data.group_order);
+      } else {
+        this.activity.groupOrder = this.normalizeActivityGroupOrder();
+      }
+    },
     activityCustomGroupSections() {
-      const sections = (this.activity.customGroups || []).map(group => ({
-        key: `custom:${group.id}`,
-        label: group.name,
-        custom: true,
-        groupId: group.id,
-        color: group.color || "blue",
-      }));
-      sections.push({
+      const lookup = new Map((this.activity.customGroups || []).map(group => [
+        String(group.id || ""), {
+          key: `custom:${group.id}`,
+          label: group.name,
+          custom: true,
+          groupId: group.id,
+          orderId: String(group.id || ""),
+          color: group.color || "blue",
+        },
+      ]));
+      lookup.set("__ungrouped__", {
         key: "custom:__ungrouped__",
         label: this.lang === "zh" ? "未分组" : "Ungrouped",
         custom: true,
         groupId: "",
+        orderId: "__ungrouped__",
         color: "gray",
         builtin: true,
       });
-      return sections;
+      return this.normalizeActivityGroupOrder()
+        .map(groupId => lookup.get(groupId)).filter(Boolean);
     },
     activityMatchesGroup(item, key) {
       if (!item) return false;
@@ -27808,12 +27853,19 @@ function portal() {
             if (pinRank) return pinRank;
             return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
           }
-          if (group.key === "custom:__ungrouped__") {
-            // Ungrouped is an inbox of recent sessions, not an attention queue.
-            // Keep its order predictable: newest activity always comes first.
-            return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
-          }
           if (group.custom) {
+            const aManual = Number.isFinite(Number(a.group_order));
+            const bManual = Number.isFinite(Number(b.group_order));
+            // Newly arrived rows without a manual position remain visible at the
+            // top. Once the user drags a lane, numbered rows keep that exact order.
+            if (aManual !== bManual) return aManual ? 1 : -1;
+            if (aManual && bManual) {
+              const order = Number(a.group_order) - Number(b.group_order);
+              if (order) return order;
+            }
+            if (group.key === "custom:__ungrouped__") {
+              return this.activityEventTimestamp(b) - this.activityEventTimestamp(a);
+            }
             const pinRank = Number(!!b.pinned) - Number(!!a.pinned);
             if (pinRank) return pinRank;
             const rank = attentionRank(a) - attentionRank(b);
@@ -28032,10 +28084,13 @@ function portal() {
         if (!ok || !Array.isArray(data?.custom_groups)) {
           throw new Error(error || "activity group save failed");
         }
-        this.activity.customGroups = data.custom_groups;
-        this._activityRevision = Math.max(
-          this._activityRevision, Number(data.revision) || 0,
-        );
+        const responseRevision = Number(data.revision) || 0;
+        if (!responseRevision || responseRevision >= this._activityRevision) {
+          this.applyActivityGroupPayload(data);
+        } else {
+          this.fetchActivity().catch(() => {});
+        }
+        this._activityRevision = Math.max(this._activityRevision, responseRevision);
         this.cancelActivityGroupEditor();
       } catch (error) {
         draft.saving = false;
@@ -28070,48 +28125,140 @@ function portal() {
         );
         return;
       }
-      this.activity.customGroups = data?.custom_groups || [];
-      for (const item of this.activity.events) {
-        if (String(item.group_id || "") === groupId) delete item.group_id;
+      const responseRevision = Number(data?.revision) || 0;
+      if (!responseRevision || responseRevision >= this._activityRevision) {
+        this.applyActivityGroupPayload(data || {});
+        if (Array.isArray(data?.items)) {
+          const byId = new Map(data.items.map(row => [String(row.id), row]));
+          this.activity.events = this.activity.events.map(
+            row => byId.get(String(row.id)) || row,
+          );
+        } else {
+          for (const item of this.activity.events) {
+            if (String(item.group_id || "") === groupId) {
+              delete item.group_id;
+              delete item.group_order;
+            }
+          }
+          this.activity.events = [...this.activity.events];
+        }
+      } else {
+        this.fetchActivity().catch(() => {});
       }
-      this.activity.events = [...this.activity.events];
       this.activity.expanded = {};
-      this._activityRevision = Math.max(
-        this._activityRevision, Number(data?.revision) || 0,
-      );
+      this._activityRevision = Math.max(this._activityRevision, responseRevision);
+    },
+    async persistActivityGroupOrder(next, previous) {
+      const opSeq = ++this._activityGroupOrderSeq;
+      const baseRevision = this._activityRevision;
+      const requestedOrder = this.normalizeActivityGroupOrder(next);
+      this.activity.groupOrder = requestedOrder;
+      const lookup = new Map((this.activity.customGroups || [])
+        .map(group => [String(group.id || ""), group]));
+      this.activity.customGroups = requestedOrder
+        .map(groupId => lookup.get(groupId)).filter(Boolean);
+
+      const run = async () => {
+        const { ok, data } = await this.api("/api/activity/groups/order", {
+          method: "PUT",
+          json: { ids: requestedOrder },
+        });
+        if (opSeq !== this._activityGroupOrderSeq) return false;
+        const responseRevision = Number(data?.revision) || 0;
+        if (!ok) {
+          if (this._activityRevision <= baseRevision) {
+            this.activity.groupOrder = this.normalizeActivityGroupOrder(previous);
+            this.activity.customGroups = this.activity.groupOrder
+              .map(groupId => lookup.get(groupId)).filter(Boolean);
+          } else {
+            this.fetchActivity().catch(() => {});
+          }
+          this.toast(this.lang === "zh" ? "分组排序失败" : "Could not reorder groups", "error");
+          return false;
+        }
+        if (responseRevision && responseRevision < this._activityRevision) return true;
+        this.applyActivityGroupPayload(data || {});
+        this._activityRevision = Math.max(this._activityRevision, responseRevision);
+        return true;
+      };
+      const prior = this._activityGroupOrderQueue || Promise.resolve();
+      const task = prior.catch(() => {}).then(run);
+      this._activityGroupOrderQueue = task;
+      try {
+        return await task;
+      } finally {
+        if (this._activityGroupOrderQueue === task) {
+          this._activityGroupOrderQueue = null;
+        }
+      }
     },
     async moveActivityGroup(group, delta) {
-      if (!group?.groupId || !delta) return;
-      const previous = [...(this.activity.customGroups || [])];
-      const at = previous.findIndex(row => row.id === group.groupId);
+      if (this.activitySearchQuery()) return;
+      const orderId = String(group?.orderId || group?.groupId || "");
+      if (!orderId || !delta) return;
+      const previous = this.normalizeActivityGroupOrder();
+      const customOrder = previous.filter(groupId => groupId !== "__ungrouped__");
+      const at = customOrder.indexOf(orderId);
       const target = at + delta;
-      if (at < 0 || target < 0 || target >= previous.length) return;
-      const next = [...previous];
+      if (at < 0 || target < 0 || target >= customOrder.length) return;
+      const next = [...customOrder];
       const [moved] = next.splice(at, 1);
       next.splice(target, 0, moved);
-      this.activity.customGroups = next;
-      const { ok, data } = await this.api("/api/activity/groups/order", {
-        method: "PUT",
-        json: { ids: next.map(row => row.id) },
-      });
-      if (!ok) {
-        this.activity.customGroups = previous;
-        this.toast(this.lang === "zh" ? "分组排序失败" : "Could not reorder groups", "error");
-        return;
-      }
-      if (Array.isArray(data?.custom_groups)) {
-        this.activity.customGroups = data.custom_groups;
-      }
-      this._activityRevision = Math.max(
-        this._activityRevision, Number(data?.revision) || 0,
-      );
+      next.push("__ungrouped__");
+      await this.persistActivityGroupOrder(next, previous);
     },
     activityGroupCanMove(group, delta) {
-      if (!group?.groupId) return false;
-      const at = (this.activity.customGroups || [])
-        .findIndex(row => row.id === group.groupId);
-      return at >= 0 && at + delta >= 0
-        && at + delta < (this.activity.customGroups || []).length;
+      if (this.activitySearchQuery() || group?.builtin) return false;
+      const orderId = String(group?.orderId || group?.groupId || "");
+      if (!orderId) return false;
+      const order = this.normalizeActivityGroupOrder()
+        .filter(groupId => groupId !== "__ungrouped__");
+      const at = order.indexOf(orderId);
+      return at >= 0 && at + delta >= 0 && at + delta < order.length;
+    },
+    onActivityGroupOrderDragStart(ev, group) {
+      if (this.activity.view !== "groups" || this.activitySearchQuery()
+          || group?.builtin) return;
+      const orderId = String(group?.orderId || group?.groupId || "");
+      if (!orderId) return;
+      this.onActivityDragEnd();
+      this.activity.dragGroupId = orderId;
+      if (ev?.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("application/x-muselab-activity-group", orderId);
+        ev.dataTransfer.setData("text/plain", orderId);
+      }
+    },
+    onActivityGroupOrderDragOver(ev, group) {
+      if (!this.activity.dragGroupId || this.activitySearchQuery()) return;
+      const orderId = String(group?.orderId || group?.groupId || "");
+      if (!orderId || orderId === this.activity.dragGroupId) return;
+      const rect = ev?.currentTarget?.getBoundingClientRect();
+      const vertical = rect && Math.abs((ev?.clientY || 0) - rect.top - rect.height / 2)
+        > Math.abs((ev?.clientX || 0) - rect.left - rect.width / 2);
+      this.activity.dragOverGroupOrderId = orderId;
+      this.activity.dragGroupInsertAfter = !!rect && (vertical
+        ? (ev.clientY > rect.top + rect.height / 2)
+        : (ev.clientX > rect.left + rect.width / 2));
+    },
+    async onActivityGroupOrderDrop(group) {
+      const sourceId = this.activity.dragGroupId;
+      const targetId = String(group?.orderId || group?.groupId || "");
+      const insertAfter = this.activity.dragGroupInsertAfter;
+      this.onActivityGroupOrderDragEnd();
+      if (!sourceId || !targetId || sourceId === targetId) return;
+      const previous = this.normalizeActivityGroupOrder();
+      const next = previous.filter(groupId => groupId !== sourceId);
+      let targetAt = next.indexOf(targetId);
+      if (targetAt < 0) return;
+      if (insertAfter) targetAt += 1;
+      next.splice(targetAt, 0, sourceId);
+      await this.persistActivityGroupOrder(next, previous);
+    },
+    onActivityGroupOrderDragEnd() {
+      this.activity.dragGroupId = "";
+      this.activity.dragOverGroupOrderId = "";
+      this.activity.dragGroupInsertAfter = false;
     },
     openActivityMoveMenu(ev, item) {
       if (!item?.id) return;
@@ -28140,43 +28287,136 @@ function portal() {
       const eventId = this.activity.moveMenu.eventId;
       return this.activity.events.find(row => String(row.id) === eventId) || null;
     },
-    async assignActivityGroup(item, groupId = "") {
+    activityGroupSectionForId(groupId = "") {
+      return this.activityCustomGroupSections().find(
+        group => String(group.groupId || "") === String(groupId || ""),
+      ) || null;
+    },
+    placeActivityEventLocally(item, groupId, beforeEventId) {
+      const eventId = String(item?.id || "");
+      if (!eventId) return;
+      const sourceId = String(item.group_id || "");
+      const targetId = String(groupId || "");
+      const sourceGroup = this.activityGroupSectionForId(sourceId);
+      const targetGroup = this.activityGroupSectionForId(targetId);
+      if (!targetGroup) return;
+      const sourceItems = sourceGroup
+        ? this.activityAllEvents(sourceGroup).filter(row => String(row.id) !== eventId)
+        : [];
+      const targetItems = sourceId === targetId
+        ? sourceItems
+        : this.activityAllEvents(targetGroup).filter(row => String(row.id) !== eventId);
+      let insertAt = targetItems.length;
+      const before = String(beforeEventId || "");
+      if (before) {
+        const found = targetItems.findIndex(row => String(row.id) === before);
+        if (found >= 0) insertAt = found;
+      }
+      if (targetId) item.group_id = targetId;
+      else delete item.group_id;
+      targetItems.splice(insertAt, 0, item);
+      if (sourceId !== targetId) {
+        sourceItems.forEach((row, index) => { row.group_order = index; });
+      }
+      targetItems.forEach((row, index) => { row.group_order = index; });
+      this.activity.events = [...this.activity.events];
+      return [...new Set([...sourceItems, ...targetItems]
+        .map(row => String(row.id || "")).filter(Boolean))];
+    },
+    async assignActivityGroup(item, groupId = "", beforeEventId = null) {
       if (!item?.id) return false;
       const eventId = String(item.id);
       if (this._activityGroupPending[eventId]) return false;
       const target = String(groupId || "");
       const previous = String(item.group_id || "");
+      const hasPlacement = beforeEventId !== null;
       this.closeActivityMoveMenu();
-      if (target === previous) return true;
+      if (!hasPlacement && target === previous) return true;
+      const previousPlacement = new Map(this.activity.events.map(row => [
+        String(row.id), {
+          hasGroup: Object.prototype.hasOwnProperty.call(row, "group_id"),
+          groupId: String(row.group_id || ""),
+          hasOrder: Object.prototype.hasOwnProperty.call(row, "group_order"),
+          order: row.group_order,
+        },
+      ]));
       this._activityGroupPending = {
         ...this._activityGroupPending,
         [eventId]: true,
       };
-      if (target) item.group_id = target;
-      else delete item.group_id;
-      this.activity.events = [...this.activity.events];
+      let affectedIds;
+      if (hasPlacement) {
+        affectedIds = this.placeActivityEventLocally(item, target, beforeEventId) || [eventId];
+      } else {
+        if (target) item.group_id = target;
+        else delete item.group_id;
+        delete item.group_order;
+        this.activity.events = [...this.activity.events];
+        affectedIds = [eventId];
+      }
+      const baseRevision = this._activityRevision;
+      const optimisticPlacement = new Map(affectedIds.map(id => {
+        const row = this.activity.events.find(itemRow => String(itemRow.id) === id);
+        return [id, {
+          groupId: String(row?.group_id || ""),
+          hasOrder: !!row && Object.prototype.hasOwnProperty.call(row, "group_order"),
+          order: row?.group_order,
+        }];
+      }));
       this._activityAppliedSeq = ++this._activityRequestSeq;
       try {
+        const json = { group_id: target };
+        if (hasPlacement) json.before_event_id = String(beforeEventId || "");
         const { ok, data, error } = await this.api(
           `/api/activity/${encodeURIComponent(eventId)}/group`,
-          { method: "PUT", json: { group_id: target } },
+          { method: "PUT", json },
         );
         if (!ok || !data?.item) throw new Error(error || "group assignment failed");
-        const at = this.activity.events.findIndex(row => row.id === eventId);
-        if (at >= 0) this.activity.events.splice(at, 1, data.item);
-        this.activity.events = [...this.activity.events];
-        if (Array.isArray(data.custom_groups)) {
-          this.activity.customGroups = data.custom_groups;
+        const responseRevision = Number(data.revision) || 0;
+        if (!responseRevision || responseRevision >= this._activityRevision) {
+          const updates = Array.isArray(data.items) ? data.items : [data.item];
+          const byId = new Map(updates.map(row => [String(row.id), row]));
+          this.activity.events = this.activity.events.map(row => {
+            const update = byId.get(String(row.id));
+            if (!update) return row;
+            if (update.group_id) row.group_id = update.group_id;
+            else delete row.group_id;
+            if (Object.prototype.hasOwnProperty.call(update, "group_order")) {
+              row.group_order = update.group_order;
+            } else {
+              delete row.group_order;
+            }
+            return row;
+          });
+          this.activity.events = [...this.activity.events];
+          this.applyActivityGroupPayload(data);
         }
-        this._activityRevision = Math.max(
-          this._activityRevision, Number(data.revision) || 0,
-        );
+        this._activityRevision = Math.max(this._activityRevision, responseRevision);
         return true;
       } catch (_) {
-        const latest = this.activity.events.find(row => row.id === eventId);
-        if (latest) {
-          if (previous) latest.group_id = previous;
-          else delete latest.group_id;
+        if (this._activityRevision > baseRevision) {
+          this.fetchActivity().catch(() => {});
+          this.toast(this.lang === "zh" ? "移动会话失败" : "Could not move session", "error");
+          return false;
+        }
+        const affected = new Set(affectedIds);
+        for (const row of this.activity.events) {
+          const id = String(row.id);
+          if (!affected.has(id)) continue;
+          const optimistic = optimisticPlacement.get(id);
+          const currentOrder = Object.prototype.hasOwnProperty.call(row, "group_order")
+            ? row.group_order : undefined;
+          if (!optimistic
+              || String(row.group_id || "") !== optimistic.groupId
+              || currentOrder !== (optimistic.hasOrder ? optimistic.order : undefined)) {
+            continue;
+          }
+          const prior = previousPlacement.get(id);
+          if (!prior) continue;
+          if (prior.hasGroup) row.group_id = prior.groupId;
+          else delete row.group_id;
+          if (prior.hasOrder) row.group_order = prior.order;
+          else delete row.group_order;
         }
         this.activity.events = [...this.activity.events];
         this.toast(this.lang === "zh" ? "移动会话失败" : "Could not move session", "error");
@@ -28188,27 +28428,76 @@ function portal() {
       }
     },
     onActivityDragStart(ev, item) {
-      if (this.activity.view !== "groups" || !item?.id) return;
+      if (this.activity.view !== "groups" || this.activitySearchQuery() || !item?.id) return;
+      this.onActivityGroupOrderDragEnd();
       this.activity.dragEventId = String(item.id);
       if (ev?.dataTransfer) {
         ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("application/x-muselab-activity-event", String(item.id));
         ev.dataTransfer.setData("text/plain", String(item.id));
       }
     },
     onActivityDragEnd() {
       this.activity.dragEventId = "";
       this.activity.dragOverGroupId = null;
+      this.activity.dragOverEventId = "";
+      this.activity.dragInsertAfter = false;
     },
-    onActivityGroupDragOver(group) {
-      if (!this.activity.dragEventId) return;
+    onActivityLaneDragOver(ev, group) {
+      if (this.activity.dragGroupId) {
+        this.onActivityGroupOrderDragOver(ev, group);
+        return;
+      }
+      if (!this.activity.dragEventId || this.activitySearchQuery()) return;
       this.activity.dragOverGroupId = group.groupId || "";
+      this.activity.dragOverEventId = "";
+      this.activity.dragInsertAfter = false;
     },
-    async onActivityGroupDrop(group) {
+    onActivityRowDragOver(ev, group, item) {
+      if (this.activity.dragGroupId) {
+        this.onActivityGroupOrderDragOver(ev, group);
+        return;
+      }
+      if (!this.activity.dragEventId || this.activitySearchQuery()
+          || String(item?.id || "") === this.activity.dragEventId) return;
+      const rect = ev?.currentTarget?.getBoundingClientRect();
+      this.activity.dragOverGroupId = group.groupId || "";
+      this.activity.dragOverEventId = String(item.id);
+      this.activity.dragInsertAfter = !!rect && ev.clientY > rect.top + rect.height / 2;
+    },
+    activityDropBeforeId(group, targetItem, insertAfter) {
+      if (!targetItem?.id) return "";
+      if (!insertAfter) return String(targetItem.id);
+      const sourceId = this.activity.dragEventId;
+      const rows = this.activityAllEvents(group)
+        .filter(row => String(row.id) !== sourceId);
+      const at = rows.findIndex(row => String(row.id) === String(targetItem.id));
+      return at >= 0 && at + 1 < rows.length ? String(rows[at + 1].id) : "";
+    },
+    async onActivityRowDrop(group, targetItem) {
+      if (this.activity.dragGroupId) {
+        await this.onActivityGroupOrderDrop(group);
+        return;
+      }
+      const eventId = this.activity.dragEventId;
+      const beforeId = this.activityDropBeforeId(
+        group, targetItem, this.activity.dragInsertAfter,
+      );
+      this.onActivityDragEnd();
+      if (!eventId) return;
+      const item = this.activity.events.find(row => String(row.id) === eventId);
+      if (item) await this.assignActivityGroup(item, group.groupId || "", beforeId);
+    },
+    async onActivityLaneDrop(group) {
+      if (this.activity.dragGroupId) {
+        await this.onActivityGroupOrderDrop(group);
+        return;
+      }
       const eventId = this.activity.dragEventId;
       this.onActivityDragEnd();
       if (!eventId) return;
       const item = this.activity.events.find(row => String(row.id) === eventId);
-      if (item) await this.assignActivityGroup(item, group.groupId || "");
+      if (item) await this.assignActivityGroup(item, group.groupId || "", "");
     },
     _stopActivityEvents() {
       ++this._activityLiveSeq;
@@ -28264,11 +28553,11 @@ function portal() {
         this._activityGeneration = generation;
         this._activityRevision = 0;
       }
-      if (Array.isArray(payload?.custom_groups)) {
-        this.activity.customGroups = payload.custom_groups;
-      }
       const revision = Number(payload?.revision) || 0;
       if (revision && revision <= this._activityRevision) return;
+      if (Array.isArray(payload?.custom_groups) || Array.isArray(payload?.group_order)) {
+        this.applyActivityGroupPayload(payload);
+      }
       if (payload?.resync) {
         this._activityRevision = Math.max(this._activityRevision, revision);
         this._activityAppliedSeq = ++this._activityRequestSeq;

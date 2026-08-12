@@ -31,11 +31,12 @@ class ActivityGroupUpdateRequest(BaseModel):
 
 
 class ActivityGroupOrderRequest(BaseModel):
-    ids: list[str] = Field(max_length=40)
+    ids: list[str] = Field(max_length=41)
 
 
 class ActivityGroupAssignmentRequest(BaseModel):
     group_id: str = Field(default="", max_length=64)
+    before_event_id: str | None = Field(default=None, max_length=128)
 
 
 def _json(request: Request, response: Response, payload: dict):
@@ -123,7 +124,7 @@ def ack_all():
 
 @router.get("/groups", dependencies=[Depends(require_token)])
 def list_activity_groups():
-    return {"custom_groups": activity.list_groups()}
+    return activity.group_state()
 
 
 @router.post("/groups", dependencies=[Depends(require_token)])
@@ -170,7 +171,11 @@ def delete_activity_group(group_id: str):
 @router.put("/{event_id}/group", dependencies=[Depends(require_token)])
 def assign_activity_group(event_id: str, req: ActivityGroupAssignmentRequest):
     try:
-        update = activity.set_group(event_id, req.group_id)
+        update = activity.set_group(
+            event_id,
+            req.group_id,
+            before_event_id=req.before_event_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if update is None:

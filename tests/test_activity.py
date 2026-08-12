@@ -219,6 +219,163 @@ def test_custom_groups_persist_reorder_and_assignment_without_rewriting_task(
     assert state["assignments"] == {}
 
 
+def test_group_layout_order_includes_ungrouped_and_persists(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    research = service.create_group("Research", "violet")["group"]
+    delivery = service.create_group("Delivery", "green")["group"]
+
+    requested = ["__ungrouped__", delivery["id"], research["id"]]
+    order = [delivery["id"], research["id"], "__ungrouped__"]
+    update = service.reorder_groups(requested)
+    assert update["group_order"] == order
+    assert service.group_state()["group_order"] == order
+
+    restarted = ActivityService(tmp_path)
+    assert restarted.group_state()["group_order"] == order
+    assert [row["id"] for row in restarted.list_groups()] == [
+        delivery["id"], research["id"],
+    ]
+
+
+def test_activity_rows_reorder_within_and_across_groups_and_persist(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    items = [service.start(f"s{index}", summary=f"task {index}")
+             for index in range(1, 5)]
+    group_a = service.create_group("A", "blue")["group"]
+    group_b = service.create_group("B", "green")["group"]
+
+    service.set_group(items[0]["id"], group_a["id"], before_event_id="")
+    service.set_group(items[1]["id"], group_a["id"], before_event_id="")
+    service.set_group(
+        items[2]["id"], group_a["id"], before_event_id=items[1]["id"],
+    )
+    service.set_group(items[3]["id"], group_b["id"], before_event_id="")
+
+    def ordered(group_id):
+        return [
+            row["id"] for row in sorted(
+                (row for row in service.list(500)
+                 if str(row.get("group_id") or "") == group_id),
+                key=lambda row: row["group_order"],
+            )
+        ]
+
+    assert ordered(group_a["id"]) == [
+        items[0]["id"], items[2]["id"], items[1]["id"],
+    ]
+    service.set_group(
+        items[2]["id"], group_b["id"], before_event_id=items[3]["id"],
+    )
+    assert ordered(group_a["id"]) == [items[0]["id"], items[1]["id"]]
+    assert ordered(group_b["id"]) == [items[2]["id"], items[3]["id"]]
+
+    restarted = ActivityService(tmp_path)
+    restored = {
+        row["id"]: row for row in restarted.list(500)
+        if str(row.get("group_id") or "") == group_b["id"]
+    }
+    assert sorted(restored, key=lambda event_id: restored[event_id]["group_order"]) == [
+        items[2]["id"], items[3]["id"],
+    ]
+
+
+def test_group_placement_rolls_back_memory_and_files_when_second_save_fails(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    item = service.start("s1", summary="task")
+    group = service.create_group("Ordered", "blue")["group"]
+    real_save = service._save
+    calls = 0
+
+    def fail_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated activity write failure")
+        real_save()
+
+    monkeypatch.setattr(service, "_save", fail_once)
+    with pytest.raises(OSError, match="simulated activity write failure"):
+        service.set_group(item["id"], group["id"], before_event_id="")
+
+    current = next(row for row in service.list() if row["id"] == item["id"])
+    assert "group_id" not in current
+    assert "group_order" not in current
+    assert service._group_assignments == {}
+
+    restarted = ActivityService(tmp_path)
+    restored = next(row for row in restarted.list() if row["id"] == item["id"])
+    assert "group_id" not in restored
+    assert "group_order" not in restored
+    assert restarted._group_assignments == {}
+
+
+def test_group_transaction_journal_recovers_when_disk_rollback_also_fails(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    item = service.start("s1", summary="task")
+    group = service.create_group("Ordered", "blue")["group"]
+
+    real_save = service._save
+
+    def always_fail():
+        raise OSError("simulated persistent activity write failure")
+
+    monkeypatch.setattr(service, "_save", always_fail)
+    with pytest.raises(OSError, match="simulated persistent activity write failure"):
+        service.set_group(item["id"], group["id"], before_event_id="")
+    assert service.transaction_path.exists()
+    monkeypatch.setattr(service, "_save", real_save)
+    with pytest.raises(RuntimeError, match="unrecovered transaction"):
+        service.set_group(item["id"], group["id"], before_event_id="")
+    with pytest.raises(RuntimeError, match="unrecovered transaction"):
+        service.start("s2", summary="must not be accepted")
+
+    restarted = ActivityService(tmp_path)
+    restored = next(row for row in restarted.list() if row["id"] == item["id"])
+    assert "group_id" not in restored
+    assert "group_order" not in restored
+    assert restarted._group_assignments == {}
+    assert not restarted.transaction_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_group_placement_pushes_resync_for_sibling_order_changes(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    first = service.start("s1", summary="first")
+    second = service.start("s2", summary="second")
+    group = service.create_group("Ordered", "amber")["group"]
+    service.set_group(first["id"], group["id"], before_event_id="")
+
+    async with service.subscribe() as queue:
+        update = await asyncio.to_thread(
+            service.set_group,
+            second["id"],
+            group["id"],
+            before_event_id=first["id"],
+        )
+        payload = await asyncio.wait_for(queue.get(), timeout=1)
+
+    assert update is not None
+    assert [row["id"] for row in update["items"]] == [
+        second["id"], first["id"],
+    ]
+    assert payload["resync"] is True
+
+
 @pytest.mark.asyncio
 async def test_group_delete_pushes_resync_for_all_affected_rows(
     tmp_path,
