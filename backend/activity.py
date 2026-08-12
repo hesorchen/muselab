@@ -197,16 +197,15 @@ class ActivityService:
             if str(sid) and str(group_id) in seen
         }
         order: list[str] = []
-        valid_order_ids = seen | {_UNGROUPED_GROUP_ID}
         for value in source_order:
             group_id = str(value or "").strip()
-            if group_id in valid_order_ids and group_id not in order:
+            if group_id in seen and group_id not in order:
                 order.append(group_id)
         for group in groups:
             if group["id"] not in order:
                 order.append(group["id"])
-        if _UNGROUPED_GROUP_ID not in order:
-            order.append(_UNGROUPED_GROUP_ID)
+        # Ungrouped is a system-managed inbox lane and always stays last.
+        order.append(_UNGROUPED_GROUP_ID)
         lookup = {group["id"]: group for group in groups}
         groups = [lookup[group_id] for group_id in order if group_id in lookup]
         return groups, assignments, order
@@ -670,16 +669,16 @@ class ActivityService:
             custom_ids = [group["id"] for group in self._custom_groups]
             full_ids = custom_ids + [_UNGROUPED_GROUP_ID]
             requested = [str(group_id or "").strip() for group_id in group_ids]
-            if len(requested) == len(custom_ids) and set(requested) == set(custom_ids):
-                iterator = iter(requested)
+            if len(requested) == len(full_ids) and set(requested) == set(full_ids):
                 requested = [
-                    group_id if group_id == _UNGROUPED_GROUP_ID else next(iterator)
-                    for group_id in self._group_order
+                    group_id for group_id in requested
+                    if group_id != _UNGROUPED_GROUP_ID
                 ]
-            elif len(requested) != len(full_ids) or set(requested) != set(full_ids):
+            elif len(requested) != len(custom_ids) or set(requested) != set(custom_ids):
                 raise ValueError("group order must contain every group exactly once")
             if len(requested) != len(set(requested)):
                 raise ValueError("group order must contain every group exactly once")
+            requested.append(_UNGROUPED_GROUP_ID)
 
             if requested != self._group_order:
                 self._group_order = requested

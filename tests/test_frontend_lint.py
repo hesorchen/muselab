@@ -1414,11 +1414,14 @@ def test_activity_center_groups_by_attention_order_and_read_state():
     assert '@drop.stop.prevent="group.custom && onActivityLaneDrop(group)"' in html
     assert "before_event_id" in app
     assert 'groupOrder: ["__ungrouped__"]' in app
+    assert 'result.push("__ungrouped__")' in app
+    assert 'x-show="!group.builtin"' in html
+    assert "|| group?.builtin) return" in app
     assert "async persistActivityGroupOrder(next, previous)" in app
     assert "const task = prior.catch(() => {}).then(run)" in app
     assert "json: { ids: requestedOrder }" in app
     assert "incomingRevision < this._activityRevision" in app
-    assert "if (this.activitySearchQuery()) return false" in app
+    assert "if (this.activitySearchQuery() || group?.builtin) return false" in app
     update_start = app.index("_applyActivityUpdate(payload)")
     update_end = app.index("\n    async _startActivityEvents()", update_start)
     update = app[update_start:update_end]

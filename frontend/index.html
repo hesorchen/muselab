@@ -5995,7 +5995,8 @@
             <h3 x-show="!group.custom && group.key !== 'timeline'" x-text="group.label"></h3>
             <div class="activity-custom-group-head" x-show="group.custom">
               <span class="activity-group-drag-handle"
-                    :draggable="!activitySearchQuery()"
+                    x-show="!group.builtin"
+                    :draggable="!group.builtin && !activitySearchQuery()"
                     @dragstart.stop="onActivityGroupOrderDragStart($event, group)"
                     @dragend.stop="onActivityGroupOrderDragEnd()"
                     :title="activitySearchQuery()

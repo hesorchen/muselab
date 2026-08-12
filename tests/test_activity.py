@@ -227,8 +227,9 @@ def test_group_layout_order_includes_ungrouped_and_persists(
     research = service.create_group("Research", "violet")["group"]
     delivery = service.create_group("Delivery", "green")["group"]
 
-    order = ["__ungrouped__", delivery["id"], research["id"]]
-    update = service.reorder_groups(order)
+    requested = ["__ungrouped__", delivery["id"], research["id"]]
+    order = [delivery["id"], research["id"], "__ungrouped__"]
+    update = service.reorder_groups(requested)
     assert update["group_order"] == order
     assert service.group_state()["group_order"] == order
 

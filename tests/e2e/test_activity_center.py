@@ -485,9 +485,9 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
           app.activity.dragInsertAfter = false;
           await app.onActivityRowDrop(research, target);
 
-          const ungrouped = app.activityCustomGroupSections()
-            .find(group => group.orderId === '__ungrouped__');
-          app.activity.dragGroupId = ungrouped.orderId;
+          const writing = app.activityCustomGroupSections()
+            .find(group => group.orderId === 'writing');
+          app.activity.dragGroupId = writing.orderId;
           const fakeRect = {left: 0, top: 0, width: 300, height: 300};
           app.onActivityRowDragOver({
             clientX: 10, clientY: 10,
@@ -506,11 +506,14 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
     assert drag_state["forwardedTarget"] == "research"
     assert drag_state["researchOrder"] == ["ungrouped-row", "grouped-row"]
     assert drag_state["groupOrder"] == [
-        "__ungrouped__", "research", "delivery", "writing",
+        "writing", "research", "delivery", "__ungrouped__",
     ]
     assert page.locator(
         ".activity-custom-group-head > strong"
-    ).all_text_contents() == ["未分组", "Research", "Delivery", "Writing"]
+    ).all_text_contents() == ["Writing", "Research", "Delivery", "未分组"]
+    expect(page.locator(".activity-group.is-custom").last.locator(
+        ".activity-group-drag-handle"
+    )).to_be_hidden()
 
     calls = page.evaluate("() => window.__activityGroupCalls")
     placement = next(
@@ -524,7 +527,7 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
         if call["path"] == "/api/activity/groups/order"
     )
     assert reorder["options"]["json"]["ids"] == [
-        "__ungrouped__", "research", "delivery", "writing",
+        "writing", "research", "delivery", "__ungrouped__",
     ]
 
     # A busy group is an independently scrollable lane. The old five-row cap

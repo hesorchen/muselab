@@ -27742,7 +27742,7 @@ function portal() {
     normalizeActivityGroupOrder(order = this.activity.groupOrder) {
       const customIds = (this.activity.customGroups || [])
         .map(group => String(group.id || "")).filter(Boolean);
-      const valid = new Set([...customIds, "__ungrouped__"]);
+      const valid = new Set(customIds);
       const result = [];
       for (const value of Array.isArray(order) ? order : []) {
         const groupId = String(value || "");
@@ -27751,7 +27751,7 @@ function portal() {
       for (const groupId of customIds) {
         if (!result.includes(groupId)) result.push(groupId);
       }
-      if (!result.includes("__ungrouped__")) result.push("__ungrouped__");
+      result.push("__ungrouped__");
       return result;
     },
     applyActivityGroupPayload(data) {
@@ -28197,24 +28197,28 @@ function portal() {
       const orderId = String(group?.orderId || group?.groupId || "");
       if (!orderId || !delta) return;
       const previous = this.normalizeActivityGroupOrder();
-      const at = previous.indexOf(orderId);
+      const customOrder = previous.filter(groupId => groupId !== "__ungrouped__");
+      const at = customOrder.indexOf(orderId);
       const target = at + delta;
-      if (at < 0 || target < 0 || target >= previous.length) return;
-      const next = [...previous];
+      if (at < 0 || target < 0 || target >= customOrder.length) return;
+      const next = [...customOrder];
       const [moved] = next.splice(at, 1);
       next.splice(target, 0, moved);
+      next.push("__ungrouped__");
       await this.persistActivityGroupOrder(next, previous);
     },
     activityGroupCanMove(group, delta) {
-      if (this.activitySearchQuery()) return false;
+      if (this.activitySearchQuery() || group?.builtin) return false;
       const orderId = String(group?.orderId || group?.groupId || "");
       if (!orderId) return false;
-      const order = this.normalizeActivityGroupOrder();
+      const order = this.normalizeActivityGroupOrder()
+        .filter(groupId => groupId !== "__ungrouped__");
       const at = order.indexOf(orderId);
       return at >= 0 && at + delta >= 0 && at + delta < order.length;
     },
     onActivityGroupOrderDragStart(ev, group) {
-      if (this.activity.view !== "groups" || this.activitySearchQuery()) return;
+      if (this.activity.view !== "groups" || this.activitySearchQuery()
+          || group?.builtin) return;
       const orderId = String(group?.orderId || group?.groupId || "");
       if (!orderId) return;
       this.onActivityDragEnd();
