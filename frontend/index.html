@@ -5977,15 +5977,31 @@
                    :class="{
                      'is-timeline': group.key === 'timeline',
                      'is-custom': group.custom,
-                     'is-drag-over': group.custom
-                       && activity.dragOverGroupId === (group.groupId || '')
+                     'is-drag-over': group.custom && activity.dragEventId
+                       && activity.dragOverGroupId === (group.groupId || ''),
+                     'is-group-dragging': group.custom
+                       && activity.dragGroupId === group.orderId,
+                     'is-group-drop-before': group.custom
+                       && activity.dragOverGroupOrderId === group.orderId
+                       && !activity.dragGroupInsertAfter,
+                     'is-group-drop-after': group.custom
+                       && activity.dragOverGroupOrderId === group.orderId
+                       && activity.dragGroupInsertAfter
                    }"
-                   @dragover.prevent="group.custom && onActivityGroupDragOver(group)"
-                   @drop.prevent="group.custom && onActivityGroupDrop(group)">
+                   @dragover.prevent="group.custom && onActivityLaneDragOver($event, group)"
+                   @drop.stop.prevent="group.custom && onActivityLaneDrop(group)">
             <!-- The timeline toggle already communicates ordering. Repeating
                  "all tasks · pinned first · newest" here adds visual noise. -->
             <h3 x-show="!group.custom && group.key !== 'timeline'" x-text="group.label"></h3>
             <div class="activity-custom-group-head" x-show="group.custom">
+              <span class="activity-group-drag-handle"
+                    :draggable="!activitySearchQuery()"
+                    @dragstart.stop="onActivityGroupOrderDragStart($event, group)"
+                    @dragend.stop="onActivityGroupOrderDragEnd()"
+                    :title="activitySearchQuery()
+                      ? (lang==='zh' ? '搜索时不能调整分组顺序' : 'Clear search to reorder groups')
+                      : (lang==='zh' ? '拖动调整分组顺序' : 'Drag to reorder group')"
+                    aria-hidden="true">⋮⋮</span>
               <span class="activity-custom-group-dot"
                     :class="'is-' + (group.color || 'gray')"></span>
               <strong x-text="group.label"></strong>
@@ -6020,10 +6036,16 @@
               <div class="activity-row-wrap"
                    :class="{
                      pinned: activity.view === 'timeline' && item.pinned,
-                     dragging: activity.dragEventId === String(item.id)
+                     dragging: activity.dragEventId === String(item.id),
+                     'drop-before': activity.dragOverEventId === String(item.id)
+                       && !activity.dragInsertAfter,
+                     'drop-after': activity.dragOverEventId === String(item.id)
+                       && activity.dragInsertAfter
                    }"
-                   :draggable="activity.view === 'groups'"
+                   :draggable="activity.view === 'groups' && !activitySearchQuery()"
                    @dragstart="onActivityDragStart($event, item)"
+                   @dragover.stop.prevent="onActivityRowDragOver($event, group, item)"
+                   @drop.stop.prevent="onActivityRowDrop(group, item)"
                    @dragend="onActivityDragEnd()">
                 <button class="activity-row" type="button"
                         @click="openActivityEvent(item)"
@@ -6128,7 +6150,7 @@
     <template x-for="group in activityCustomGroupSections()" :key="group.key">
       <button type="button" role="menuitem"
               :class="{ active: String(activityMoveMenuItem()?.group_id || '') === String(group.groupId || '') }"
-              @click="assignActivityGroup(activityMoveMenuItem(), group.groupId || '')">
+              @click="assignActivityGroup(activityMoveMenuItem(), group.groupId || '', '')">
         <span class="activity-custom-group-dot"
               :class="'is-' + (group.color || 'gray')"></span>
         <span x-text="group.label"></span>

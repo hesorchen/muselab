@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import threading
 import time
@@ -18,6 +19,7 @@ from . import sessions
 _MAX_EVENTS = 500
 _MAX_CUSTOM_GROUPS = 40
 _MAX_GROUP_NAME = 48
+_UNGROUPED_GROUP_ID = "__ungrouped__"
 _GROUP_COLORS = frozenset({
     "blue", "violet", "cyan", "green", "amber", "rose", "gray",
 })
@@ -85,13 +87,17 @@ class ActivityService:
     def __init__(self, root: Path = ROOT):
         self.path = root / ".muselab" / "activity.json"
         self.groups_path = root / ".muselab" / "activity-groups.json"
+        self.transaction_path = root / ".muselab" / "activity-transaction.json"
+        self._group_event_transaction_active = False
         self._lock = threading.RLock()
         self._generation = uuid.uuid4().hex
         self._revision = 0
         self._subscribers: dict[
             asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop
         ] = {}
-        self._custom_groups, self._group_assignments = self._load_group_state()
+        self._recover_group_event_transaction()
+        (self._custom_groups, self._group_assignments,
+         self._group_order) = self._load_group_state()
         self._events = self._load()
         changed = self._collapse_sessions()
         changed = self._reconcile_event_groups() or changed
@@ -121,11 +127,39 @@ class ActivityService:
             raise ValueError("invalid group color")
         return color
 
-    def _load_group_state(self) -> tuple[list[dict[str, str]], dict[str, str]]:
+    def _recover_group_event_transaction(self) -> None:
+        try:
+            payload = json.loads(self.transaction_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot parse activity transaction: {self.transaction_path}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("activity transaction must be an object")
+        events = payload.get("events")
+        group_state = payload.get("group_state")
+        if not isinstance(events, list) or not isinstance(group_state, dict):
+            raise RuntimeError("invalid activity transaction")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            self.groups_path,
+            json.dumps(group_state, ensure_ascii=False, indent=2),
+        )
+        atomic_write_text(
+            self.path,
+            json.dumps(events[-_MAX_EVENTS:], ensure_ascii=False, indent=2),
+        )
+        self.transaction_path.unlink(missing_ok=True)
+
+    def _load_group_state(
+        self,
+    ) -> tuple[list[dict[str, str]], dict[str, str], list[str]]:
         try:
             raw = json.loads(self.groups_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return [], {}
+            return [], {}, [_UNGROUPED_GROUP_ID]
         except (OSError, ValueError) as exc:
             raise RuntimeError(
                 f"cannot parse activity groups: {self.groups_path}"
@@ -135,8 +169,10 @@ class ActivityService:
 
         source_groups = raw.get("groups", [])
         source_assignments = raw.get("assignments", {})
+        source_order = raw.get("order", [])
         if (not isinstance(source_groups, list)
-                or not isinstance(source_assignments, dict)):
+                or not isinstance(source_assignments, dict)
+                or not isinstance(source_order, list)):
             raise RuntimeError("invalid activity group state")
 
         groups: list[dict[str, str]] = []
@@ -145,7 +181,7 @@ class ActivityService:
             if not isinstance(row, dict):
                 continue
             group_id = str(row.get("id") or "").strip()
-            if not group_id or group_id in seen:
+            if not group_id or group_id in seen or group_id == _UNGROUPED_GROUP_ID:
                 continue
             try:
                 name = self._group_name(row.get("name"))
@@ -160,18 +196,135 @@ class ActivityService:
             for sid, group_id in source_assignments.items()
             if str(sid) and str(group_id) in seen
         }
-        return groups, assignments
+        order: list[str] = []
+        valid_order_ids = seen | {_UNGROUPED_GROUP_ID}
+        for value in source_order:
+            group_id = str(value or "").strip()
+            if group_id in valid_order_ids and group_id not in order:
+                order.append(group_id)
+        for group in groups:
+            if group["id"] not in order:
+                order.append(group["id"])
+        if _UNGROUPED_GROUP_ID not in order:
+            order.append(_UNGROUPED_GROUP_ID)
+        lookup = {group["id"]: group for group in groups}
+        groups = [lookup[group_id] for group_id in order if group_id in lookup]
+        return groups, assignments, order
+
+    def _ensure_writes_available(self) -> None:
+        if (self.transaction_path.exists()
+                and not self._group_event_transaction_active):
+            raise RuntimeError(
+                "activity writes are blocked by an unrecovered transaction"
+            )
 
     def _save_group_state(self) -> None:
+        self._ensure_writes_available()
         self.groups_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self.groups_path, json.dumps({
-            "version": 1,
+            "version": 2,
             "groups": self._custom_groups,
             "assignments": self._group_assignments,
+            "order": self._group_order,
         }, ensure_ascii=False, indent=2))
 
     def _group_payload_locked(self) -> list[dict[str, str]]:
         return [dict(group) for group in self._custom_groups]
+
+    def _group_order_payload_locked(self) -> list[str]:
+        return list(self._group_order)
+
+    @staticmethod
+    def _event_group_id(item: dict[str, Any]) -> str:
+        return str(item.get("group_id") or "")
+
+    @staticmethod
+    def _manual_group_order(item: dict[str, Any]) -> float | None:
+        value = item.get("group_order")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def _ordered_group_items_locked(
+        self,
+        group_id: str,
+        *,
+        exclude_id: str = "",
+    ) -> list[dict[str, Any]]:
+        items = [
+            item for item in self._events
+            if self._event_group_id(item) == group_id
+            and str(item.get("id") or "") != exclude_id
+        ]
+
+        def order_key(item: dict[str, Any]) -> tuple[float, float, str]:
+            manual = self._manual_group_order(item)
+            if manual is None:
+                return (0, -_activity_at(item), str(item.get("id") or ""))
+            return (1, manual, str(item.get("id") or ""))
+
+        return sorted(items, key=order_key)
+
+    @staticmethod
+    def _renumber_group_locked(items: list[dict[str, Any]]) -> None:
+        for index, item in enumerate(items):
+            item["group_order"] = index
+
+    def _group_event_snapshot_locked(self) -> tuple[
+        list[dict[str, Any]], list[dict[str, str]], dict[str, str], list[str]
+    ]:
+        return (
+            copy.deepcopy(self._events),
+            copy.deepcopy(self._custom_groups),
+            dict(self._group_assignments),
+            list(self._group_order),
+        )
+
+    def _save_group_event_state_locked(
+        self,
+        snapshot: tuple[
+            list[dict[str, Any]], list[dict[str, str]], dict[str, str], list[str]
+        ],
+    ) -> None:
+        old_events, old_groups, old_assignments, old_order = snapshot
+        self._ensure_writes_available()
+        transaction = {
+            "version": 1,
+            "events": old_events,
+            "group_state": {
+                "version": 2,
+                "groups": old_groups,
+                "assignments": old_assignments,
+                "order": old_order,
+            },
+        }
+        self._group_event_transaction_active = True
+        try:
+            try:
+                self.transaction_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(
+                    self.transaction_path,
+                    json.dumps(transaction, ensure_ascii=False, indent=2),
+                )
+                self._save_group_state()
+                self._save()
+                self.transaction_path.unlink(missing_ok=True)
+            except Exception:
+                (self._events, self._custom_groups,
+                 self._group_assignments, self._group_order) = snapshot
+                rollback_ok = True
+                try:
+                    self._save_group_state()
+                    self._save()
+                except Exception:
+                    rollback_ok = False
+                if rollback_ok:
+                    self.transaction_path.unlink(missing_ok=True)
+                # If rollback also fails, leave the journal in place. The next
+                # service start restores both files from the same pre-mutation state.
+                raise
+        finally:
+            self._group_event_transaction_active = False
 
     def _apply_assignment_locked(self, item: dict[str, Any]) -> bool:
         sid = str(item.get("session_id") or item.get("thread_id") or "")
@@ -183,6 +336,7 @@ class ActivityService:
             item["group_id"] = assigned
         else:
             item.pop("group_id", None)
+        item.pop("group_order", None)
         return True
 
     def _reconcile_event_groups(self) -> bool:
@@ -207,6 +361,7 @@ class ActivityService:
         return []
 
     def _save(self) -> None:
+        self._ensure_writes_available()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(self.path, json.dumps(
             self._events[-_MAX_EVENTS:], ensure_ascii=False, indent=2))
@@ -251,6 +406,7 @@ class ActivityService:
             "revision": self._revision,
             "summary": summary,
             "custom_groups": self._group_payload_locked(),
+            "group_order": self._group_order_payload_locked(),
         }
         if resync:
             payload["resync"] = True
@@ -422,6 +578,7 @@ class ActivityService:
         with self._lock:
             events = [dict(x) for x in self._events]
             custom_groups = self._group_payload_locked()
+            group_order = self._group_order_payload_locked()
             generation = self._generation
             revision = self._revision
         ordered = sorted(events, key=_activity_at, reverse=True)
@@ -432,11 +589,19 @@ class ActivityService:
             "events": ordered[:min(max(limit, 1), _MAX_EVENTS)],
             "summary": summary,
             "custom_groups": custom_groups,
+            "group_order": group_order,
         }
 
     def list_groups(self) -> list[dict[str, str]]:
         with self._lock:
             return self._group_payload_locked()
+
+    def group_state(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "custom_groups": self._group_payload_locked(),
+                "group_order": self._group_order_payload_locked(),
+            }
 
     def create_group(self, name: str, color: str = "blue") -> dict[str, Any]:
         clean_name = self._group_name(name)
@@ -453,6 +618,8 @@ class ActivityService:
                 "color": clean_color,
             }
             self._custom_groups.append(group)
+            ungrouped_at = self._group_order.index(_UNGROUPED_GROUP_ID)
+            self._group_order.insert(ungrouped_at, group["id"])
             self._save_group_state()
             self._publish_locked()
             return {
@@ -460,6 +627,7 @@ class ActivityService:
                 "revision": self._revision,
                 "group": dict(group),
                 "custom_groups": self._group_payload_locked(),
+                "group_order": self._group_order_payload_locked(),
             }
 
     def update_group(
@@ -494,30 +662,50 @@ class ActivityService:
                 "revision": self._revision,
                 "group": dict(group),
                 "custom_groups": self._group_payload_locked(),
+                "group_order": self._group_order_payload_locked(),
             }
 
     def reorder_groups(self, group_ids: list[str]) -> dict[str, Any]:
         with self._lock:
-            current = [group["id"] for group in self._custom_groups]
-            if len(group_ids) != len(current) or set(group_ids) != set(current):
+            custom_ids = [group["id"] for group in self._custom_groups]
+            full_ids = custom_ids + [_UNGROUPED_GROUP_ID]
+            requested = [str(group_id or "").strip() for group_id in group_ids]
+            if len(requested) == len(custom_ids) and set(requested) == set(custom_ids):
+                iterator = iter(requested)
+                requested = [
+                    group_id if group_id == _UNGROUPED_GROUP_ID else next(iterator)
+                    for group_id in self._group_order
+                ]
+            elif len(requested) != len(full_ids) or set(requested) != set(full_ids):
                 raise ValueError("group order must contain every group exactly once")
-            lookup = {group["id"]: group for group in self._custom_groups}
-            if group_ids != current:
-                self._custom_groups = [lookup[group_id] for group_id in group_ids]
+            if len(requested) != len(set(requested)):
+                raise ValueError("group order must contain every group exactly once")
+
+            if requested != self._group_order:
+                self._group_order = requested
+                lookup = {group["id"]: group for group in self._custom_groups}
+                self._custom_groups = [
+                    lookup[group_id] for group_id in requested if group_id in lookup
+                ]
                 self._save_group_state()
                 self._publish_locked()
             return {
                 "generation": self._generation,
                 "revision": self._revision,
                 "custom_groups": self._group_payload_locked(),
+                "group_order": self._group_order_payload_locked(),
             }
 
     def delete_group(self, group_id: str) -> dict[str, Any] | None:
         with self._lock:
             if not any(group["id"] == group_id for group in self._custom_groups):
                 return None
+            snapshot = self._group_event_snapshot_locked()
             self._custom_groups = [
                 group for group in self._custom_groups if group["id"] != group_id
+            ]
+            self._group_order = [
+                value for value in self._group_order if value != group_id
             ]
             cleared_sessions = {
                 sid for sid, assigned in self._group_assignments.items()
@@ -528,24 +716,32 @@ class ActivityService:
                 for sid, assigned in self._group_assignments.items()
                 if assigned != group_id
             }
-            changed_events = 0
-            for item in self._events:
-                if str(item.get("group_id") or "") == group_id:
-                    item.pop("group_id", None)
-                    changed_events += 1
-            self._save_group_state()
-            if changed_events:
-                self._save()
+            ungrouped = self._ordered_group_items_locked("")
+            moved = self._ordered_group_items_locked(group_id)
+            for item in moved:
+                item.pop("group_id", None)
+            ordered_ungrouped = ungrouped + moved
+            self._renumber_group_locked(ordered_ungrouped)
+            self._save_group_event_state_locked(snapshot)
             self._publish_locked(resync=True)
             return {
                 "generation": self._generation,
                 "revision": self._revision,
                 "cleared_sessions": len(cleared_sessions),
+                "items": [dict(row) for row in ordered_ungrouped],
                 "custom_groups": self._group_payload_locked(),
+                "group_order": self._group_order_payload_locked(),
             }
 
-    def set_group(self, event_id: str, group_id: str) -> dict[str, Any] | None:
+    def set_group(
+        self,
+        event_id: str,
+        group_id: str,
+        *,
+        before_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
         target = str(group_id or "").strip()
+        before = None if before_event_id is None else str(before_event_id or "").strip()
         with self._lock:
             if target and not any(group["id"] == target
                                   for group in self._custom_groups):
@@ -554,15 +750,67 @@ class ActivityService:
                          if row.get("id") == event_id), None)
             if item is None:
                 return None
+            snapshot = self._group_event_snapshot_locked()
             sid = str(item.get("session_id") or item.get("thread_id") or "")
-            current = str(item.get("group_id") or "")
-            if target == current:
+            current = self._event_group_id(item)
+
+            # Old clients only assign a lane. Preserve that API while making a
+            # freshly moved row float above an existing manual order.
+            if before is None:
+                if target == current:
+                    return {
+                        "generation": self._generation,
+                        "revision": self._revision,
+                        "item": dict(item),
+                        "custom_groups": self._group_payload_locked(),
+                        "group_order": self._group_order_payload_locked(),
+                    }
+                if target:
+                    if sid:
+                        self._group_assignments[sid] = target
+                    item["group_id"] = target
+                else:
+                    if sid:
+                        self._group_assignments.pop(sid, None)
+                    item.pop("group_id", None)
+                item.pop("group_order", None)
+                self._save_group_event_state_locked(snapshot)
+                self._publish_locked(item=item)
                 return {
                     "generation": self._generation,
                     "revision": self._revision,
                     "item": dict(item),
                     "custom_groups": self._group_payload_locked(),
+                    "group_order": self._group_order_payload_locked(),
                 }
+
+            if before == event_id and target == current:
+                return {
+                    "generation": self._generation,
+                    "revision": self._revision,
+                    "item": dict(item),
+                    "items": [dict(item)],
+                    "custom_groups": self._group_payload_locked(),
+                    "group_order": self._group_order_payload_locked(),
+                }
+
+            source_items = self._ordered_group_items_locked(
+                current, exclude_id=event_id,
+            )
+            target_items = (
+                source_items if target == current
+                else self._ordered_group_items_locked(target, exclude_id=event_id)
+            )
+            if before:
+                insert_at = next((
+                    index for index, row in enumerate(target_items)
+                    if str(row.get("id") or "") == before
+                ), -1)
+                if insert_at < 0:
+                    raise ValueError("activity placement anchor not found in target group")
+            else:
+                insert_at = len(target_items)
+
             if target:
                 if sid:
                     self._group_assignments[sid] = target
@@ -571,14 +819,25 @@ class ActivityService:
                 if sid:
                     self._group_assignments.pop(sid, None)
                 item.pop("group_id", None)
-            self._save_group_state()
-            self._save()
-            self._publish_locked(item=item)
+            target_items.insert(insert_at, item)
+            if target != current:
+                self._renumber_group_locked(source_items)
+            self._renumber_group_locked(target_items)
+            changed_items = source_items + (
+                target_items if target != current else []
+            )
+            if target == current:
+                changed_items = target_items
+
+            self._save_group_event_state_locked(snapshot)
+            self._publish_locked(resync=True)
             return {
                 "generation": self._generation,
                 "revision": self._revision,
                 "item": dict(item),
+                "items": [dict(row) for row in changed_items],
                 "custom_groups": self._group_payload_locked(),
+                "group_order": self._group_order_payload_locked(),
             }
 
     def rename_session(self, sid: str, name: str) -> dict[str, Any] | None:

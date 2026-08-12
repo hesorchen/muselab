@@ -339,6 +339,7 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
             {id: 'research', name: 'Research', color: 'violet'},
             {id: 'delivery', name: 'Delivery', color: 'green'},
           ];
+          app.activity.groupOrder = ['research', 'delivery', '__ungrouped__'];
           app.activity.events = [{
             id: 'grouped-row', session_id: 'grouped-session',
             session_name: 'Research session', task_summary: 'Grouped task',
@@ -369,6 +370,15 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
               return {ok: true, data: {
                 revision: app._activityRevision + 1,
                 custom_groups: [...app.activity.customGroups, group],
+                group_order: [...app.activity.groupOrder.filter(id => id !== '__ungrouped__'), 'writing', '__ungrouped__'],
+              }};
+            }
+            if (path === '/api/activity/groups/order' && options.method === 'PUT') {
+              const lookup = new Map(app.activity.customGroups.map(group => [group.id, group]));
+              return {ok: true, data: {
+                revision: app._activityRevision + 1,
+                custom_groups: options.json.ids.map(id => lookup.get(id)).filter(Boolean),
+                group_order: [...options.json.ids],
               }};
             }
             if (path.endsWith('/group') && options.method === 'PUT') {
@@ -380,7 +390,9 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
               return {ok: true, data: {
                 revision: app._activityRevision + 1,
                 item: updated,
+                items: [{...updated}],
                 custom_groups: [...app.activity.customGroups],
+                group_order: [...app.activity.groupOrder],
               }};
             }
             return {ok: false, data: null, error: 'unexpected test request'};
@@ -431,6 +443,18 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
     expect(menu).to_be_visible()
     expect(menu.locator("button")).to_have_count(3)
     menu.locator("button").filter(has_text="Research").click()
+    page.wait_for_function(
+        "() => window.__activityGroupCalls.some(call => call.path.endsWith('/ungrouped-row/group'))"
+    )
+    moved_state = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.activity.events.map(row => ({
+            id: row.id, group: row.group_id || '', order: row.group_order,
+          }));
+        }"""
+    )
+    assert next(row for row in moved_state if row["id"] == "ungrouped-row")["group"] == "research", moved_state
 
     research = groups.filter(has_text="Research")
     expect(research.locator(".activity-row-wrap")).to_have_count(2)
@@ -447,6 +471,61 @@ def test_custom_groups_show_empty_sections_and_move_sessions(
     expect(page.locator(".activity-custom-group-head > strong")).to_contain_text(
         ["Research", "Delivery", "Writing", "未分组"]
     )
+
+    # Rows can be inserted at an exact position, and every visible lane —
+    # including the built-in Ungrouped lane — participates in board ordering.
+    drag_state = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const research = app.activityCustomGroupSections()
+            .find(group => group.groupId === 'research');
+          const source = app.activity.events.find(row => row.id === 'ungrouped-row');
+          const target = app.activity.events.find(row => row.id === 'grouped-row');
+          app.activity.dragEventId = source.id;
+          app.activity.dragInsertAfter = false;
+          await app.onActivityRowDrop(research, target);
+
+          const ungrouped = app.activityCustomGroupSections()
+            .find(group => group.orderId === '__ungrouped__');
+          app.activity.dragGroupId = ungrouped.orderId;
+          const fakeRect = {left: 0, top: 0, width: 300, height: 300};
+          app.onActivityRowDragOver({
+            clientX: 10, clientY: 10,
+            currentTarget: {getBoundingClientRect: () => fakeRect},
+          }, research, target);
+          const forwardedTarget = app.activity.dragOverGroupOrderId;
+          await app.onActivityRowDrop(research, target);
+          await new Promise(resolve => app.$nextTick(resolve));
+          return {
+            forwardedTarget,
+            groupOrder: [...app.activity.groupOrder],
+            researchOrder: app.activityAllEvents(research).map(row => row.id),
+          };
+        }"""
+    )
+    assert drag_state["forwardedTarget"] == "research"
+    assert drag_state["researchOrder"] == ["ungrouped-row", "grouped-row"]
+    assert drag_state["groupOrder"] == [
+        "__ungrouped__", "research", "delivery", "writing",
+    ]
+    assert page.locator(
+        ".activity-custom-group-head > strong"
+    ).all_text_contents() == ["未分组", "Research", "Delivery", "Writing"]
+
+    calls = page.evaluate("() => window.__activityGroupCalls")
+    placement = next(
+        call for call in calls
+        if call["path"].endswith("/ungrouped-row/group")
+        and call["options"]["json"].get("before_event_id") == "grouped-row"
+    )
+    assert placement["options"]["json"]["group_id"] == "research"
+    reorder = next(
+        call for call in reversed(calls)
+        if call["path"] == "/api/activity/groups/order"
+    )
+    assert reorder["options"]["json"]["ids"] == [
+        "__ungrouped__", "research", "delivery", "writing",
+    ]
 
     # A busy group is an independently scrollable lane. The old five-row cap
     # plus a constrained grid lane clipped everything below roughly four rows,
