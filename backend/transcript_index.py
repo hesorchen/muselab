@@ -367,6 +367,7 @@ def ensure_index(
             atomic_write_text(
                 index_path,
                 json.dumps(index, ensure_ascii=False, separators=(",", ":")),
+                mode=0o600,
             )
         _index_cache.pop(sid, None)
         _index_cache[sid] = (index_path, _index_signature(index_path), index)

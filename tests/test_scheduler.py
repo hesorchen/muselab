@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 
 def _sched_mod(app_module):
@@ -112,6 +113,34 @@ def test_sdk_turn_rejects_session_with_interactive_owner(
         chat._session_runtime_locks.pop(sid, None)
 
 
+def test_sdk_turn_rejects_session_with_background_watcher(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat
+
+    sid = "busy-background-session"
+
+    async def should_not_get_client(*_args, **_kwargs):
+        raise AssertionError("scheduler must not steal the background pump")
+
+    async def run():
+        watcher = asyncio.create_task(asyncio.Event().wait())
+        chat._task_watchers[sid] = watcher
+        monkeypatch.setattr(chat, "get_client", should_not_get_client)
+        try:
+            with pytest.raises(RuntimeError, match="background task watcher"):
+                await sched._run_sdk_task_turn(sid, "model", "prompt")
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            chat._task_watchers.pop(sid, None)
+            chat._session_runtime_locks.pop(sid, None)
+
+    asyncio.run(run())
+
+
 def test_sdk_turn_preserves_session_effort_and_service_tier(
     app_module, monkeypatch,
 ):
@@ -126,8 +155,16 @@ def test_sdk_turn_preserves_session_effort_and_service_tier(
             observed["prompt"] = prompt
 
         async def receive_response(self):
-            if False:
-                yield None
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=sid,
+                total_cost_usd=0.0,
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
 
     async def fake_get_client(**kwargs):
         observed.update(kwargs)
@@ -151,6 +188,200 @@ def test_sdk_turn_preserves_session_effort_and_service_tier(
     assert observed["prompt"] == "prompt"
 
 
+@pytest.mark.asyncio
+async def test_sdk_turn_reads_through_pooled_stream_pump(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat, sessions
+
+    class FakeStream:
+        queue = None
+        detached = False
+        parked = False
+
+        def attach_turn(self):
+            self.queue = asyncio.Queue()
+            return self.queue
+
+        def detach_turn(self, queue):
+            assert queue is self.queue
+            self.detached = True
+
+        def park_unconsumed(self, queue):
+            assert queue is self.queue
+            self.parked = True
+
+    stream = FakeStream()
+
+    class FakeClient:
+        async def query(self, _prompt):
+            assert stream.queue is not None
+            stream.queue.put_nowait(AssistantMessage(
+                content=[TextBlock(text="scheduled reply")],
+                model="claude-sonnet-4-6",
+            ))
+            stream.queue.put_nowait(ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="scheduled-pump-session",
+                total_cost_usd=0.0,
+                usage={"input_tokens": 1, "output_tokens": 1},
+            ))
+
+        async def receive_response(self):
+            raise AssertionError("pooled client must not open a second reader")
+            yield
+
+    async def fake_get_client(**_kwargs):
+        return FakeClient()
+
+    monkeypatch.setattr(
+        sessions,
+        "get_session",
+        lambda _sid: {"effort": "auto", "service_tier": ""},
+    )
+    monkeypatch.setattr(chat, "get_client", fake_get_client)
+    monkeypatch.setattr(chat, "_stream_for", lambda _client: stream)
+
+    try:
+        reply, error = await sched._run_sdk_task_turn(
+            "scheduled-pump-session", "claude-sonnet-4-6", "prompt")
+    finally:
+        chat._session_runtime_locks.pop("scheduled-pump-session", None)
+
+    assert (reply, error) == ("scheduled reply", None)
+    assert stream.detached is True
+    assert stream.parked is True
+
+
+@pytest.mark.asyncio
+async def test_sdk_turn_rejects_pooled_eof_without_result(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat, sessions
+
+    class FailedStream:
+        _failure = RuntimeError("scheduler stream failed")
+
+        def attach_turn(self):
+            self.queue = asyncio.Queue()
+            return self.queue
+
+        def detach_turn(self, _queue):
+            return None
+
+        def park_unconsumed(self, _queue):
+            return None
+
+    stream = FailedStream()
+
+    class FakeClient:
+        async def query(self, _prompt):
+            stream.queue.put_nowait(chat._STREAM_EOF)
+
+    monkeypatch.setattr(
+        sessions,
+        "get_session",
+        lambda _sid: {"effort": "auto", "service_tier": ""},
+    )
+    monkeypatch.setattr(
+        chat,
+        "get_client",
+        lambda **_kwargs: _async_value(FakeClient()),
+    )
+    monkeypatch.setattr(chat, "_stream_for", lambda _client: stream)
+
+    try:
+        with pytest.raises(RuntimeError, match="scheduler stream failed"):
+            await sched._run_sdk_task_turn(
+                "scheduled-eof-session", "claude-sonnet-4-6", "prompt")
+    finally:
+        chat._session_runtime_locks.pop("scheduled-eof-session", None)
+
+
+@pytest.mark.asyncio
+async def test_sdk_turn_skips_replayed_result_before_current_result(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import chat, sessions
+
+    class FakeStream:
+        _failure = None
+
+        def attach_turn(self):
+            self.queue = asyncio.Queue()
+            return self.queue
+
+        def detach_turn(self, _queue):
+            return None
+
+        def park_unconsumed(self, _queue):
+            return None
+
+    stream = FakeStream()
+
+    def result(uuid):
+        return ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="scheduled-boundary-session",
+            total_cost_usd=0.0,
+            usage={"input_tokens": 1, "output_tokens": 1},
+            uuid=uuid,
+        )
+
+    class FakeClient:
+        async def query(self, _prompt):
+            stream.queue.put_nowait(result("old-result"))
+            stream.queue.put_nowait(AssistantMessage(
+                content=[TextBlock(text="current reply")],
+                model="claude-sonnet-4-6",
+                uuid="current-assistant",
+            ))
+            stream.queue.put_nowait(result("current-result"))
+
+    monkeypatch.setattr(
+        sessions,
+        "get_session",
+        lambda _sid: {"effort": "auto", "service_tier": ""},
+    )
+    monkeypatch.setattr(
+        chat,
+        "get_client",
+        lambda **_kwargs: _async_value(FakeClient()),
+    )
+    monkeypatch.setattr(chat, "_stream_for", lambda _client: stream)
+    monkeypatch.setattr(
+        chat,
+        "_session_message_uuids",
+        lambda _sid, _model: frozenset({"old-result"}),
+    )
+
+    try:
+        reply, error = await sched._run_sdk_task_turn(
+            "scheduled-boundary-session", "claude-sonnet-4-6", "prompt")
+    finally:
+        chat._session_runtime_locks.pop("scheduled-boundary-session", None)
+
+    assert (reply, error) == ("current reply", None)
+
+
+async def _async_value(value):
+    return value
+
+
 def _execution_task(tid: str = "exec-task") -> dict:
     return {
         "id": tid,
@@ -171,7 +402,14 @@ async def test_execute_task_publishes_activity_and_success_history(
     from backend import activity as activity_module
     transitions = []
 
-    async def run_turn(*_args, **_kwargs):
+    async def run_turn(sid, _model, _prompt, **kwargs):
+        activity_module.activity.start(
+            sid,
+            summary=kwargs["activity_summary"],
+            kind="scheduled",
+            source_id=kwargs["activity_source_id"],
+            owner_id=kwargs["activity_owner_id"],
+        )
         return "finished", None
 
     monkeypatch.setattr(sched, "_run_sdk_task_turn", run_turn)
@@ -183,7 +421,8 @@ async def test_execute_task_publishes_activity_and_success_history(
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda sid, status: transitions.append(("finish", sid, status)),
+        lambda sid, status, **kwargs: transitions.append(
+            ("finish", sid, status, kwargs)),
     )
     from backend import presence
     monkeypatch.setattr(presence, "recently_active", lambda: True)
@@ -201,9 +440,12 @@ async def test_execute_task_publishes_activity_and_success_history(
             "summary": task["name"],
             "kind": "scheduled",
             "source_id": task["id"],
+            "owner_id": transitions[0][2]["owner_id"],
         },
     )
-    assert transitions[-1] == ("finish", task["session_id"], "completed")
+    assert transitions[-1][:3] == (
+        "finish", task["session_id"], "completed")
+    assert transitions[-1][3]["owner_id"] == transitions[0][2]["owner_id"]
 
 
 @pytest.mark.asyncio
@@ -216,7 +458,14 @@ async def test_execute_task_cancellation_is_not_recorded_as_success(
     entered = asyncio.Event()
     transitions = []
 
-    async def blocked(*_args, **_kwargs):
+    async def blocked(sid, _model, _prompt, **kwargs):
+        activity_module.activity.start(
+            sid,
+            summary=kwargs["activity_summary"],
+            kind="scheduled",
+            source_id=kwargs["activity_source_id"],
+            owner_id=kwargs["activity_owner_id"],
+        )
         entered.set()
         await asyncio.Event().wait()
 
@@ -229,7 +478,8 @@ async def test_execute_task_cancellation_is_not_recorded_as_success(
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda sid, status: transitions.append(("finish", sid, status)),
+        lambda sid, status, **kwargs: transitions.append(
+            ("finish", sid, status, kwargs)),
     )
 
     task = _execution_task("cancel-task")
@@ -243,7 +493,9 @@ async def test_execute_task_cancellation_is_not_recorded_as_success(
     assert len(history) == 1
     assert history[0]["ok"] is False
     assert "cancelled" in history[0]["error"]
-    assert transitions[-1] == ("finish", task["session_id"], "cancelled")
+    assert transitions[-1][:3] == (
+        "finish", task["session_id"], "cancelled")
+    assert transitions[-1][3]["owner_id"] == transitions[0][2]["owner_id"]
 
 
 @pytest.mark.asyncio
@@ -278,6 +530,74 @@ async def test_execute_task_has_bounded_unattended_runtime(
 
 
 # ---- delete_task ----
+
+@pytest.mark.asyncio
+async def test_delete_task_endpoint_joins_running_owner_before_purge(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import activity as activity_module
+    from backend import api_scheduler, chat
+
+    task = _execution_task("delete-running-task")
+    sched._state["tasks"][task["id"]] = task
+    entered = asyncio.Event()
+    transitions = []
+
+    async def blocked_turn(sid, _model, _prompt, **kwargs):
+        sched._mark_current_run_activity_started()
+        activity_module.activity.start(
+            sid,
+            summary=kwargs["activity_summary"],
+            kind="scheduled",
+            source_id=kwargs["activity_source_id"],
+            owner_id=kwargs["activity_owner_id"],
+        )
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sched, "_run_sdk_task_turn", blocked_turn)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "start",
+        lambda sid, **_kwargs: transitions.append(("start", sid)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda sid, status, **_kwargs:
+            transitions.append(("finish", sid, status)),
+    )
+
+    running = sched._track_task(
+        asyncio.create_task(sched._execute_task(task)),
+        task_id=task["id"],
+        session_id=task["session_id"],
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    async def purge_after_join(sid):
+        assert sid == task["session_id"]
+        assert running.done()
+        assert sched._state["history"] == []
+        assert sched._state["unread_count"] == 0
+        transitions.append(("purge", sid))
+        return True
+
+    monkeypatch.setattr(chat, "purge_session_storage_async", purge_after_join)
+
+    assert await api_scheduler.delete_task_endpoint(task["id"]) == {
+        "deleted": task["id"]
+    }
+    assert running.cancelled()
+    assert task["id"] not in sched._state["tasks"]
+    assert transitions == [
+        ("start", task["session_id"]),
+        ("finish", task["session_id"], "cancelled"),
+        ("purge", task["session_id"]),
+    ]
+
 
 def test_delete_task_reuse_removes_bound_session(app_module):
     sched = _sched_mod(app_module)

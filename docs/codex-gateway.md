@@ -10,8 +10,8 @@ request to the user's own Codex/OpenAI backend and translates the response back.
 muselab does **not** store Codex OAuth credentials and does **not** call
 OpenAI-native APIs directly.
 
-The compatibility baseline tested on 2026-07-31 is CLIProxyAPI `v7.2.111`,
-Claude Agent SDK `0.2.128`, and its bundled Claude CLI `2.1.220`. Newer
+The compatibility baseline tested on 2026-08-12 is CLIProxyAPI `v7.2.111`,
+Claude Agent SDK `0.2.136`, and its bundled Claude CLI `2.1.228`. Newer
 CLIProxyAPI builds include fixes relevant to this bridge for Codex cache-token
 accounting, reasoning effort, tool-call replay, and Anthropic response
 translation.
@@ -257,9 +257,12 @@ The effective meter/compact window is resolved in this order:
 `max_context_window` is displayed as a configurable ceiling only; it never
 silently inflates the active denominator. When muselab creates a Codex SDK
 client, it also injects the resolved effective value through
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS`. Claude CLI's `/context`, native auto-compact,
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` and explicitly enables that same window through
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Claude CLI's `/context`, native auto-compact,
 muselab's preflight compact, the breakdown popup, and the bottom ring therefore
-share one denominator.
+share one denominator. The full effective value is passed to both variables;
+Claude CLI applies its own output/compaction reserve when deriving the lower
+auto-compact threshold.
 
 The bottom ring distinguishes both halves of the measurement:
 
@@ -274,7 +277,11 @@ Before sending a new user message, muselab asks the SDK for current context usag
 If the session is close to the effective window, it runs Claude Code's native
 `/compact` first, then sends the user's message. This preflight compact happens
 earlier than the post-reply auto-compact path and reduces gateway-side
-`input exceeds the context window` failures at request entry.
+`input exceeds the context window` failures at request entry. If a Codex runtime
+created with older compaction settings reports success or an in-band API error
+but makes no measurable room, muselab safely rebuilds that runtime and retries
+`/compact` once. It never performs this rebuild while a background task is
+attached, and it never retries the user's prompt as part of recovery.
 
 A gateway can still fail with `input exceeds the context window` if its
 translation layer, selected backend model, or account tier has an even smaller

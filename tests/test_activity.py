@@ -1,5 +1,6 @@
 import asyncio
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -8,11 +9,135 @@ from backend.activity import ActivityService
 
 
 def _service(tmp_path, monkeypatch):
+    service = ActivityService(tmp_path)
+    workspace = str(tmp_path / "ws")
     monkeypatch.setattr(
-        "backend.activity.sessions.get_session",
-        lambda sid: {"id": sid, "name": f"Session {sid}", "cwd": str(tmp_path / "ws")},
+        service,
+        "_metadata",
+        lambda sid: (f"Session {sid}", workspace, "ws"),
     )
-    return ActivityService(tmp_path)
+    return service
+
+
+def test_deferred_activity_initialization_is_import_safe(tmp_path):
+    storage = tmp_path / ".muselab"
+    storage.mkdir(mode=0o777)
+    storage.chmod(0o777)
+    activity_path = storage / "activity.json"
+    groups_path = storage / "activity-groups.json"
+    transaction_path = storage / "activity-transaction.json"
+    activity_path.write_text("[]", encoding="utf-8")
+    groups_path.write_text("{}", encoding="utf-8")
+    transaction_path.write_text(json.dumps({
+        "version": 1,
+        "events": [{
+            "id": "event-1", "session_id": "s1", "state": "completed",
+            "read": False, "started_at": 1, "finished_at": 2, "updated_at": 2,
+        }],
+        "group_state": {
+            "version": 2, "groups": [], "assignments": {}, "order": [],
+        },
+    }), encoding="utf-8")
+    for path in (activity_path, groups_path, transaction_path):
+        path.chmod(0o666)
+
+    def snapshot(path: Path) -> tuple[bytes, int, int]:
+        info = path.stat()
+        return path.read_bytes(), stat.S_IMODE(info.st_mode), info.st_mtime_ns
+
+    before = {
+        path: snapshot(path)
+        for path in (activity_path, groups_path, transaction_path)
+    }
+    directory_before = stat.S_IMODE(storage.stat().st_mode)
+
+    service = ActivityService(tmp_path, initialize_runtime_state=False)
+
+    assert stat.S_IMODE(storage.stat().st_mode) == directory_before
+    assert all(snapshot(path) == expected for path, expected in before.items())
+
+    service.initialize_runtime_state()
+    assert not transaction_path.exists()
+    assert service.list()[0]["session_id"] == "s1"
+    assert stat.S_IMODE(storage.stat().st_mode) == 0o700
+    assert stat.S_IMODE(activity_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(groups_path.stat().st_mode) == 0o600
+
+
+def test_deferred_activity_initialization_retries_failed_reconciliation_write(
+    tmp_path,
+    monkeypatch,
+):
+    storage = tmp_path / ".muselab"
+    storage.mkdir()
+    activity_path = storage / "activity.json"
+    activity_path.write_text(json.dumps([{
+        "id": "event-1",
+        "session_id": "s1",
+        "state": "running",
+        "read": True,
+        "started_at": 1,
+        "updated_at": 1,
+    }]), encoding="utf-8")
+
+    service = ActivityService(tmp_path, initialize_runtime_state=False)
+    real_save = service._save
+    attempts = 0
+
+    def flaky_save() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary activity write failure")
+        real_save()
+
+    monkeypatch.setattr(service, "_save", flaky_save)
+    with pytest.raises(OSError, match="temporary activity write failure"):
+        service.initialize_runtime_state()
+
+    assert service._initialized is False
+    row = service.list()[0]
+    assert attempts == 2
+    assert service._initialized is True
+    assert row["state"] == "failed"
+    assert json.loads(activity_path.read_text(encoding="utf-8"))[0]["state"] == "failed"
+
+
+def test_activity_storage_repairs_and_preserves_private_permissions(
+    tmp_path,
+    monkeypatch,
+):
+    storage = tmp_path / ".muselab"
+    storage.mkdir(mode=0o777)
+    storage.chmod(0o777)
+    activity_path = storage / "activity.json"
+    groups_path = storage / "activity-groups.json"
+    activity_path.write_text("[]", encoding="utf-8")
+    groups_path.write_text(
+        json.dumps({"version": 2, "groups": [], "assignments": {}, "order": []}),
+        encoding="utf-8",
+    )
+    activity_path.chmod(0o666)
+    groups_path.chmod(0o666)
+
+    service = _service(tmp_path, monkeypatch)
+    assert stat.S_IMODE(storage.stat().st_mode) == 0o700
+    assert stat.S_IMODE(activity_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(groups_path.stat().st_mode) == 0o600
+
+    item = service.start("s1", summary="private task prompt")
+    group = service.create_group("Private", "blue")["group"]
+
+    def fail_group_save() -> None:
+        raise OSError("leave the private transaction journal for recovery")
+
+    monkeypatch.setattr(service, "_save_group_state", fail_group_save)
+    with pytest.raises(OSError, match="private transaction journal"):
+        service.set_group(item["id"], group["id"])
+
+    transaction_path = storage / "activity-transaction.json"
+    assert transaction_path.exists()
+    assert stat.S_IMODE(transaction_path.stat().st_mode) == 0o600
 
 
 def test_one_row_per_session_and_latest_prompt(tmp_path, monkeypatch):
@@ -45,7 +170,63 @@ def test_start_records_source_kind_and_clears_it_for_plain_turn(
     service.finish("s1", "completed")
     plain = service.start("s1", summary="follow-up")
     assert plain["kind"] == "turn"
+    assert plain["activity_source"] == "direct"
     assert "source_id" not in plain
+
+
+def test_activity_source_tracks_direct_queue_and_background_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+
+    direct = service.start("s1", summary="watched reply")
+    assert direct["activity_source"] == "direct"
+    service.finish("s1", "completed")
+
+    queued = service.start(
+        "s1", summary="durable follow-up", activity_source="queued")
+    assert queued["activity_source"] == "queued"
+    assert service.finish("s1", "completed")["activity_source"] == "queued"
+
+    service.start("s1", summary="launch background work")
+    settled = service.finish(
+        "s1", "completed", activity_source="background")
+    assert settled["activity_source"] == "background"
+
+
+def test_stale_background_owner_cannot_finish_new_foreground_turn(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    service.start(
+        "s1", summary="old background", activity_source="background",
+        owner_id="turn-old")
+    service.start(
+        "s1", summary="new foreground", activity_source="direct",
+        owner_id="turn-new")
+
+    stale = service.finish(
+        "s1", "completed", activity_source="background",
+        owner_id="turn-old")
+    assert stale["state"] == "running"
+    assert stale["owner_id"] == "turn-new"
+    assert stale["activity_source"] == "direct"
+
+    current = service.finish(
+        "s1", "completed", activity_source="direct",
+        owner_id="turn-new")
+    assert current["state"] == "completed"
+
+
+def test_owner_finish_without_started_row_is_noop(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+
+    assert service.finish(
+        "missing-session", "completed", owner_id="missing-owner"
+    ) == {}
+    assert service.list() == []
 
 
 def test_summary_and_ack(tmp_path, monkeypatch):
@@ -80,6 +261,30 @@ def test_completed_moves_from_review_to_history_after_ack(tmp_path, monkeypatch)
     summary = service.summary()
     assert summary["groups"]["review"] == 0
     assert summary["groups"]["history"] == 1
+
+
+def test_repeated_same_terminal_finish_preserves_ack_and_is_a_noop(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path, monkeypatch)
+    started = service.start("s1", summary="produce result")
+    service.finish("s1", "completed")
+    assert service.ack(started["id"]) == 1
+
+    before = service.list()[0]
+    revision = service.revision
+    persisted = service.path.read_bytes()
+
+    repeated = service.finish(
+        "s1", "completed", activity_source="background")
+
+    assert repeated == before
+    assert repeated["read"] is True
+    assert repeated["activity_source"] == "direct"
+    assert service.revision == revision
+    assert service.path.read_bytes() == persisted
+    assert service.summary()["groups"]["history"] == 1
 
 
 def test_waiting_for_user_is_actionable_but_not_an_unread_result(tmp_path, monkeypatch):
@@ -159,7 +364,7 @@ def test_pin_persists_without_rewriting_activity_time(tmp_path, monkeypatch):
     # to the task center's timeline presentation.
     assert [row["session_id"] for row in service.list()] == ["s2", "s1"]
 
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     restored = next(row for row in restarted.list() if row["session_id"] == "s1")
     assert restored["pinned"] is True
     resumed = restarted.start("s1", summary="same task, next turn")
@@ -201,7 +406,7 @@ def test_custom_groups_persist_reorder_and_assignment_without_rewriting_task(
     assert [row["id"] for row in ordered["custom_groups"]] == [
         delivery["id"], research["id"],
     ]
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     assert [row["id"] for row in restarted.list_groups()] == [
         delivery["id"], research["id"],
     ]
@@ -233,7 +438,7 @@ def test_group_layout_order_includes_ungrouped_and_persists(
     assert update["group_order"] == order
     assert service.group_state()["group_order"] == order
 
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     assert restarted.group_state()["group_order"] == order
     assert [row["id"] for row in restarted.list_groups()] == [
         delivery["id"], research["id"],
@@ -275,7 +480,7 @@ def test_activity_rows_reorder_within_and_across_groups_and_persist(
     assert ordered(group_a["id"]) == [items[0]["id"], items[1]["id"]]
     assert ordered(group_b["id"]) == [items[2]["id"], items[3]["id"]]
 
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     restored = {
         row["id"]: row for row in restarted.list(500)
         if str(row.get("group_id") or "") == group_b["id"]
@@ -311,7 +516,7 @@ def test_group_placement_rolls_back_memory_and_files_when_second_save_fails(
     assert "group_order" not in current
     assert service._group_assignments == {}
 
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     restored = next(row for row in restarted.list() if row["id"] == item["id"])
     assert "group_id" not in restored
     assert "group_order" not in restored
@@ -341,7 +546,7 @@ def test_group_transaction_journal_recovers_when_disk_rollback_also_fails(
     with pytest.raises(RuntimeError, match="unrecovered transaction"):
         service.start("s2", summary="must not be accepted")
 
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     restored = next(row for row in restarted.list() if row["id"] == item["id"])
     assert "group_id" not in restored
     assert "group_order" not in restored
@@ -429,7 +634,7 @@ async def test_rename_persists_and_pushes_without_reordering_task(
         assert after[field] == before[field]
     assert [row["session_id"] for row in service.list()] == ["s2", "s1"]
 
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     restored = next(row for row in restarted.list()
                     if row["session_id"] == "s1")
     assert restored["session_name"] == "Renamed conversation"
@@ -439,7 +644,7 @@ async def test_rename_persists_and_pushes_without_reordering_task(
 def test_restart_marks_running_as_failed(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     service.start("s1", summary="long task")
-    restarted = ActivityService(tmp_path)
+    restarted = _service(tmp_path, monkeypatch)
     row = restarted.list()[0]
     assert row["state"] == "failed"
     assert row["needs_attention"] is False

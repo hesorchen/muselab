@@ -257,6 +257,34 @@ def test_register_retry_preserves_existing_plan_return_permission(app_module):
     assert len(json.loads(sess.INDEX.read_text(encoding="utf-8"))) == 1
 
 
+def test_deletion_fence_survives_register_retry_and_blocks_late_footer(
+        app_module):
+    from backend import sessions as sess
+
+    sid = "11111111-2222-4333-8444-555555555556"
+    original = sess.register_session(sid, name="being deleted")
+    sess.begin_session_delete(sid)
+
+    # An optimistic-create retry may still see the pre-delete index row, but it
+    # must not clear the tombstone that rejects new turns.
+    assert sess.register_session(sid, name="retry")["name"] == original["name"]
+    assert sess.session_is_deleting(sid) is True
+
+    sess.set_message_annotation(sid, "late-result", turn_status="completed")
+    assert "late-result" not in sess.get_message_annotations(sid)
+
+    assert sess.delete_session(sid) is True
+    sidecar = sess._sidecar_path(sid)
+    assert not sidecar.exists()
+    sess.set_session_ctx_window(sid, 200_000)
+    sess.append_pending_attachments(
+        sid, images=[{"name": "private-image.png"}])
+    assert sess.consume_one_pending_attachments(sid, "late-user") is None
+    assert not sidecar.exists()
+    with pytest.raises(ValueError, match="session is being deleted"):
+        sess.register_session(sid, name="stale retry after delete")
+
+
 def test_queue_plan_return_permission_roundtrip_and_legacy_migration(app_module):
     from backend import sessions as sess
 

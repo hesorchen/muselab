@@ -710,6 +710,7 @@ function portal() {
     WORKSPACE_EVENT_BATCH_DESKTOP_MS: 40,
     WORKSPACE_EVENT_BATCH_MOBILE_MS: 250,
     SESSION_SETTING_EXPECTED_TTL_MS: 15_000,
+    IME_STALE_AFTER_MS: 5000,
     _fileMetaCache: new Map(),
     _paletteFileSeq: 0,
     _sessionLoadPromises: {},
@@ -2124,12 +2125,13 @@ function portal() {
       this._startPresence();
       this._startSessionsSync();
       if (fileEvents) this._startFileEvents();
-      this.fetchActivity();
+      // Source-aware ACK needs the persisted ledger row on a cold boot.  Run
+      // it after the first snapshot instead of racing an empty events array.
+      Promise.resolve(this.fetchActivity()).finally(
+        () => this.ackCurrentActivity(),
+      );
       this._startActivityEvents();
       this._startMemoryMonitor();
-      // Restoring a saved current session means the user is already looking at
-      // it; clear any completion that landed before this page loaded.
-      this.ackCurrentActivity();
     },
 
     // FIX ⑪: near-real-time multi-device sync for the session LIST while the
@@ -5297,10 +5299,86 @@ function portal() {
     // newly selected Chinese IME produces no text until the page is rebuilt.
     // Programmatic composer edits go through _setChatInput(), which also
     // refuses DOM writes for the short marked-text window.
-    _markImeComposition(target) {
+    _markLocalImeComposition(target, restart = false) {
       if (!target) return;
+      // beforeinput/input can repeat many times during one composition. Keep
+      // the original start time so those updates cannot postpone stale-state
+      // recovery forever. A real compositionstart explicitly begins a new
+      // lifecycle and therefore requests a fresh timestamp.
+      const startedAt = Number(target._museImeStartedAt) || 0;
+      if (restart || !target._museImeComposing || startedAt <= 0) {
+        target._museImeStartedAt = Date.now();
+      }
       target._museImeComposing = true;
       target._museImeEndedAt = 0;
+    },
+    _clearImeCommitEnterGuard(target) {
+      if (!target) return;
+      target._museImeCommitEnterDown = false;
+      target._museImeCommitEnterAt = 0;
+      target._museImeEndedAt = 0;
+    },
+    _trackImeCommitKeydown(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target || !this._isImeComposingEvent(ev)) return;
+      const isEnter = ev.key === "Enter" || ev.code === "Enter"
+        || ev.keyCode === 13 || ev.which === 13;
+      if (isEnter) {
+        target._museImeCommitEnterDown = true;
+        target._museImeCommitEnterAt = Number(ev.timeStamp) || 0;
+      } else {
+        // Space and mouse-driven candidate commits must not make a later,
+        // ordinary Enter look like a duplicate candidate-confirming key.
+        target._museImeCommitEnterDown = false;
+        target._museImeCommitEnterAt = 0;
+      }
+    },
+    onLocalImeKeydown(ev) {
+      this._trackImeCommitKeydown(ev);
+    },
+    onImeEnterKeyup(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      this._clearImeCommitEnterGuard(target);
+    },
+    onLocalImeCompositionStart(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      this._clearImeCommitEnterGuard(target);
+      this._markLocalImeComposition(target, true);
+    },
+    onLocalImeBeforeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+        this._markLocalImeComposition(target);
+      }
+    },
+    onLocalImeInput(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      if (ev.isComposing === true) {
+        this._markLocalImeComposition(target);
+      } else if (target._museImeComposing) {
+        // Android/WebView can omit compositionend while still labeling the
+        // final, explicitly non-composing input as insertCompositionText.
+        // Trust isComposing=false so the editor cannot remain permanently
+        // attached to a dead IME session.
+        target._museImeComposing = false;
+        target._museImeStartedAt = 0;
+        target._museImeEndedAt = target._museImeCommitEnterDown
+          ? (Number(ev.timeStamp) || 0) : 0;
+      }
+    },
+    onLocalImeCompositionEnd(ev) {
+      const target = ev && (ev.target || ev.currentTarget);
+      if (!target) return;
+      target._museImeComposing = false;
+      target._museImeStartedAt = 0;
+      target._museImeEndedAt = target._museImeCommitEnterDown
+        ? (Number(ev.timeStamp) || 0) : 0;
+    },
+    _markImeComposition(target, restart = false) {
+      if (!target) return;
+      this._markLocalImeComposition(target, restart);
       delete target._museImeSettledOwnerSid;
       if (!target._museImeOwnerSid) {
         target._museImeOwnerSid = this.currentId || "";
@@ -5309,7 +5387,11 @@ function portal() {
     onImeCompositionStart(ev) {
       const target = ev && (ev.target || ev.currentTarget);
       if (!target) return;
-      this._markImeComposition(target);
+      this._clearImeCommitEnterGuard(target);
+      this._markImeComposition(target, true);
+    },
+    onImeKeydown(ev) {
+      this._trackImeCommitKeydown(ev);
     },
     onChatBeforeInput(ev) {
       const target = ev && (ev.target || ev.currentTarget);
@@ -5325,7 +5407,8 @@ function portal() {
       const target = ev && (ev.target || ev.currentTarget);
       if (!target) return;
       this._finishImeComposition(target);
-      target._museImeEndedAt = Number(ev.timeStamp) || 0;
+      target._museImeEndedAt = target._museImeCommitEnterDown
+        ? (Number(ev.timeStamp) || 0) : 0;
     },
     _finishImeComposition(target) {
       if (!target) return;
@@ -5336,6 +5419,7 @@ function portal() {
       if (!target._museImeComposing && !target._museImeOwnerSid) return;
       const ownerSid = target._museImeOwnerSid || this.currentId || "";
       target._museImeComposing = false;
+      target._museImeStartedAt = 0;
       delete target._museImeOwnerSid;
       target._museImeSettledOwnerSid = ownerSid;
       // Safari/WebView may fire compositionend before its final non-composing
@@ -5360,18 +5444,66 @@ function portal() {
       const target = ev && (ev.target || ev.currentTarget);
       if (!target) return;
       this._finishImeComposition(target);
-      target._museImeEndedAt = 0;
+      this._clearImeCommitEnterGuard(target);
     },
     _isImeComposingEvent(ev) {
       if (!ev) return false;
       const target = ev.target || ev.currentTarget;
+      return this._hasExplicitImeSignal(ev)
+        || !!(target && target._museImeComposing);
+    },
+    _hasExplicitImeSignal(ev) {
+      return !!(ev && (ev.isComposing === true || ev.keyCode === 229
+        || ev.which === 229 || ev.key === "Process"));
+    },
+    _recoverStaleImeCompositionOnPlainEnter(ev) {
+      if (!ev) return false;
+      const target = ev.target || ev.currentTarget;
+      const isEnter = ev.key === "Enter" || ev.code === "Enter"
+        || ev.keyCode === 13 || ev.which === 13;
+      // Never second-guess a live signal from the OS/browser, even if the
+      // locally remembered lifecycle is old. Only an otherwise ordinary
+      // Enter may repair a missing compositionend.
+      if (!isEnter || !target || !target._museImeComposing
+          || ev.shiftKey || ev.ctrlKey || ev.metaKey || ev.altKey
+          || this._hasExplicitImeSignal(ev)) return false;
+      const startedAt = Number(target._museImeStartedAt) || 0;
+      if (startedAt <= 0
+          || Date.now() - startedAt < this.IME_STALE_AFTER_MS) return false;
+
+      // Chat composition owns a session draft and must settle through the
+      // normal bridge. Rename/side-question inputs use the DOM-local guard and
+      // only need their stale marker cleared; copying those values into the
+      // chat draft would corrupt the composer.
+      const chatTarget = this.$refs && this.$refs.chatInput;
+      const ownsChatDraft = target === chatTarget
+        || Object.prototype.hasOwnProperty.call(target, "_museImeOwnerSid");
+      if (ownsChatDraft) this._finishImeComposition(target);
+      else {
+        target._museImeComposing = false;
+        target._museImeStartedAt = 0;
+      }
+      this._clearImeCommitEnterGuard(target);
+      return true;
+    },
+    _isRecentImeCommitEnter(ev) {
+      if (!ev || ev.key !== "Enter") return false;
+      const target = ev.target || ev.currentTarget;
       const endedAt = Number(target && target._museImeEndedAt) || 0;
       const eventAt = Number(ev.timeStamp) || 0;
-      const commitEnter = ev.key === "Enter" && endedAt > 0
-        && eventAt >= endedAt && eventAt - endedAt <= 80;
-      return !!(ev.isComposing || ev.keyCode === 229 || ev.which === 229
-        || ev.key === "Process" || (target && target._museImeComposing)
-        || commitEnter);
+      // Scope suppression to the same physical Enter key that ended the IME
+      // composition. A keyup clears the guard, so a later deliberate Enter is
+      // never swallowed merely because it followed a mouse/Space commit.
+      return !!(target && target._museImeCommitEnterDown)
+        && endedAt > 0 && eventAt >= endedAt && eventAt - endedAt <= 1000;
+    },
+    _consumeRecentImeCommitEnter(ev) {
+      if (!this._isRecentImeCommitEnter(ev)) return false;
+      const target = ev.target || ev.currentTarget;
+      this._clearImeCommitEnterGuard(target);
+      ev.preventDefault();
+      ev.stopPropagation();
+      return true;
     },
     _syncChatInputDom(value = this.input, options = {}) {
       const target = options.target || (this.$refs && this.$refs.chatInput);
@@ -5392,7 +5524,25 @@ function portal() {
       return next;
     },
     _claimNonImeEnter(ev) {
-      if (!ev || this._isImeComposingEvent(ev)) return false;
+      if (!ev) return false;
+      // Some WebViews report the candidate-confirming Enter as a plain keydown
+      // immediately after compositionend.  It must not submit, but it must be
+      // consumed: leaving it to the textarea inserts a line break and makes
+      // the next intended send look like "Enter only adds a newline".  Clear
+      // the grace marker once so a rapid second Enter can send immediately.
+      if (this._consumeRecentImeCommitEnter(ev)) return false;
+      // A WebView can lose compositionend (and, rarely, the final non-
+      // composing input) when its native editor is detached. Keep a short
+      // safety window for genuine candidate work, then let a plain Enter heal
+      // that stale local flag. Explicit isComposing/229/Process signals below
+      // still win regardless of age.
+      this._recoverStaleImeCompositionOnPlainEnter(ev);
+      // Active marked text remains entirely owned by the IME; preventing that
+      // event can cancel or corrupt candidate selection on native WebViews.
+      if (this._isImeComposingEvent(ev)) {
+        this._trackImeCommitKeydown(ev);
+        return false;
+      }
       ev.preventDefault();
       ev.stopPropagation();
       return true;
@@ -6862,6 +7012,7 @@ function portal() {
         _thinkingPatchSeq: 0,
         _queueSyncSeq: 0,
         _queueAppliedSeq: 0,
+        _queueRevision: 0,
         _permissionExpected: null,
         _modelExpected: null,
         _effortExpected: null,
@@ -7040,9 +7191,6 @@ function portal() {
     },
     async _confirmSessionBusy(sid, st = this.tabState[sid]) {
       if (!sid) return false;
-      // A pending SDK background task no longer blocks a prompt: the backend
-      // pump owns the session stream, so the task's completion just arrives
-      // later as its own message instead of colliding with this turn.
       if (st && (st.streaming || st.compacting)) return true;
       const session = (this.sessions || []).find(s => s.id === sid);
       if (!session || !session.active) return false;
@@ -7063,11 +7211,12 @@ function portal() {
             sid, active, status.started_at, status.background_tasks_pending);
         }
         if (!active && session) session.active = false;
-        // `active` is the union of "a turn is streaming" and "a background
-        // task is pending"; the response distinguishes them via `background`.
-        // Only the former blocks a prompt — keep the task card and footer
-        // alive (done above) without parking the message on the queue.
-        if (status.background) return false;
+        // `active` includes a background watcher. Although the pump is the
+        // sole SDK reader, the CLI does not expose a reliable request id that
+        // can separate an old task's late auto-continuation from a new query.
+        // Queue until the watcher closes; it advances FIFO immediately after
+        // releasing the response boundary.
+        if (status.background) return true;
         return active;
       } catch (_) {
         return true;
@@ -7162,12 +7311,15 @@ function portal() {
       let data;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue",
-                               { headers: this.hdr() });
+                               { headers: this.hdr(), cache: "no-store" });
         if (!r.ok) return;   // graceful: leave the current mirror untouched
         data = await r.json();
       } catch (_e) { return; }
       if (this.tabState[sid] !== st || seq < st._queueAppliedSeq) return;
+      const revision = Math.max(0, Number(data.revision) || 0);
+      if (revision < (Number(st._queueRevision) || 0)) return;
       st._queueAppliedSeq = seq;
+      st._queueRevision = revision;
       st.pendingQueue = (data.items || []).map(it => {
         // FIX ③: the server now resolves each upload id against its in-memory
         // store and returns `attachments: [{id, kind, name, mime, available}]`.
@@ -7621,7 +7773,9 @@ function portal() {
         delete this._bgContPollers[sid];
       }
     },
-    _reconcileCompletedTurn(sid, ownerState, expectedText = "", attempt = 0) {
+    _reconcileCompletedTurn(
+      sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
+    ) {
       // The live turn is an optimistic rendering of the server-owned
       // transcript. `done` deliberately arrives before slow UUID/annotation
       // bookkeeping, so poll the cheap tail until it contains a persisted
@@ -7631,7 +7785,7 @@ function portal() {
       const retry = () => {
         if (attempt < 30) {
           this._reconcileCompletedTurn(
-            sid, ownerState, expectedText, attempt + 1,
+            sid, ownerState, expectedText, attempt + 1, expectedAssistantUuid,
           );
         }
       };
@@ -7681,10 +7835,21 @@ function portal() {
           const hasBoundary = canonicalTurn.some(
             m => m && m.role !== "user" && m.uuid,
           );
-          const hasFinal = !expectedText || canonicalTurn.some(
-            m => m && m.role === "assistant" && m.uuid
-              && (m.text || "") === expectedText,
-          );
+          // The backend's AssistantMessage UUID is the authoritative turn
+          // boundary. Prefer it over live text equality: a transport can lose
+          // the final delta, and synthetic API errors intentionally use a
+          // structured done payload whose wording need not equal the raw
+          // transcript TextBlock byte-for-byte.
+          const hasExpectedAssistant = !expectedAssistantUuid
+            || canonicalTurn.some(
+              m => m && m.uuid === expectedAssistantUuid,
+            );
+          const hasFinal = expectedAssistantUuid
+            ? hasExpectedAssistant
+            : (!expectedText || canonicalTurn.some(
+                m => m && m.role === "assistant" && m.uuid
+                  && (m.text || "") === expectedText,
+              ));
           if (!hasBoundary || !hasFinal) { retry(); return; }
           if (!stillOwned()) return;
           const loaded = await this.loadSession(sid, { quiet: true });
@@ -7699,9 +7864,11 @@ function portal() {
       // an overall ~45s barrier without generating a hot polling loop.
       }, attempt ? Math.min(2000, 250 + attempt * 100) : 80);
     },
-    _reconcileCompletedContinuation(sid, ownerState, expectedText = "", attempt = 0) {
+    _reconcileCompletedContinuation(
+      sid, ownerState, expectedText = "", attempt = 0, expectedAssistantUuid = "",
+    ) {
       return this._reconcileCompletedTurn(
-        sid, ownerState, expectedText, attempt,
+        sid, ownerState, expectedText, attempt, expectedAssistantUuid,
       );
     },
     async removePendingQueueItem(sid, idx) {
@@ -13575,7 +13742,13 @@ function portal() {
       // Tool/task identifiers survive the live → canonical boundary. UUID is
       // also useful for canonical → canonical refreshes, but a live assistant
       // bubble usually has no UUID yet, so text remains a required fallback.
-      for (const value of [m.uuid, m.id, m.tool_use_id, m.task_id]) {
+      // `forkUuid` is the backend's early AssistantMessage boundary from done;
+      // use it only for assistant continuity so a synthetic API error whose
+      // displayed wording differs from its canonical TextBlock can still keep
+      // the same mounted DOM node through the quiet reconciliation.
+      const continuityIds = [m.uuid, m.id, m.tool_use_id, m.task_id];
+      if (role === "assistant") continuityIds.push(m.forkUuid);
+      for (const value of continuityIds) {
         push("id", value);
       }
       push("text", m.text);
@@ -13594,6 +13767,7 @@ function portal() {
             elapsed: existingTail.elapsed,
             model: existingTail.model,
             turn_status: existingTail.turn_status,
+            memoryRecall: existingTail.memoryRecall,
           }
         : null;
       const candidates = new Map();
@@ -13664,6 +13838,9 @@ function portal() {
         }
         if (!canonicalTail.turn_status && liveFooter.turn_status) {
           canonicalTail.turn_status = liveFooter.turn_status;
+        }
+        if (!canonicalTail.memoryRecall && liveFooter.memoryRecall) {
+          canonicalTail.memoryRecall = liveFooter.memoryRecall;
         }
       }
       return result;
@@ -14396,7 +14573,37 @@ function portal() {
         recall,
         style: "position:fixed;left:12px;top:12px;visibility:hidden;",
       };
-      this.$nextTick(() => this._positionMemoryRecallPopover());
+      const hydrate = async () => {
+        const items = Array.isArray(recall.items) ? recall.items : [];
+        const needsDetails = items.some(item => item?.id && !item.content);
+        if (!needsDetails) return;
+        const hydrated = await Promise.all(items.map(async item => {
+          if (!item?.id || item.content) return item;
+          try {
+            const response = await fetch(
+              "/api/memory/items/" + encodeURIComponent(item.id),
+              { headers: this.hdr(), cache: "no-store" },
+            );
+            if (!response.ok) return item;
+            const detail = await response.json();
+            return {
+              ...item,
+              kind: detail.kind || item.kind,
+              content: detail.content || "",
+            };
+          } catch (_) { return item; }
+        }));
+        if (!this.memoryRecallPopover.show
+            || this._memoryRecallOwner !== message) return;
+        const nextRecall = { ...recall, items: hydrated };
+        message.memoryRecall = nextRecall;
+        this.memoryRecallPopover.recall = nextRecall;
+      };
+      this.$nextTick(() => {
+        this._positionMemoryRecallPopover();
+        hydrate().finally(() => this.$nextTick(
+          () => this._positionMemoryRecallPopover()));
+      });
     },
 
     _queueMemoryRecallPosition() {
@@ -21617,11 +21824,13 @@ function portal() {
     },
 
     onPreviewQuoteAskEnter(ev) {
-      if (!ev || ev.isComposing || ev.keyCode === 229) return;
+      if (!ev || this._consumeRecentImeCommitEnter(ev)
+          || this._isImeComposingEvent(ev)) return;
       const isTouch = (window.matchMedia
         && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
       if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
       ev.preventDefault();
+      ev.stopPropagation();
       this.sendPreviewSelectionQuestion();
     },
 
@@ -21840,11 +22049,13 @@ function portal() {
     },
 
     onPreviewQuoteFollowupEnter(ev) {
-      if (!ev || ev.isComposing || ev.keyCode === 229) return;
+      if (!ev || this._consumeRecentImeCommitEnter(ev)
+          || this._isImeComposingEvent(ev)) return;
       const isTouch = (window.matchMedia
         && window.matchMedia("(pointer: coarse)").matches) || window.innerWidth < 768;
       if (isTouch || ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
       ev.preventDefault();
+      ev.stopPropagation();
       this.sendPreviewSelectionFollowup();
     },
 
@@ -24226,11 +24437,34 @@ function portal() {
     },
     // Real compact: a) make sure the OLD session has been summarized in chat,
     // b) fork it, c) the fork inherits the summary as starting context.
-    // Easier path: just send a /compact instruction to the CURRENT session that
-    // asks the model to produce a self-contained summary, which the user can
-    // copy / use as basis. The "true" compact is a feature of the underlying
-    // CLI we don't have direct API for, so we implement it as a synthesized
-    // summarize-and-fork workflow.
+    async _adoptRecoveredSession(payload, sourceSid, opts = {}) {
+      const raw = payload && (payload.recovered_session || payload.session || payload);
+      const newId = String(raw && (raw.id || raw.session_id) || "");
+      if (!newId) return null;
+      const source = (this.sessions || []).find(session => session.id === sourceSid) || {};
+      const meta = {
+        ...raw,
+        id: newId,
+        session_id: newId,
+        active: false,
+        cwd: raw.cwd || source.cwd || this.currentWorkspacePath(),
+      };
+      const alreadyKnown = !!(this.sessions || []).find(session => session.id === newId);
+      this.sessions = [
+        meta,
+        ...(this.sessions || []).filter(session => session.id !== newId),
+      ];
+      this._sessionsEtag = "";
+      const state = this._ensureTabState(newId);
+      if (!alreadyKnown) state._loaded = false;
+      const shouldFocus = opts.focus !== false && this.currentId === sourceSid;
+      await this.openTab(newId, shouldFocus);
+      return { meta, state, shouldFocus, alreadyKnown };
+    },
+
+    // Run the CLI-native compact on the target session. If the transcript is
+    // already too large for that command itself, the backend preserves the
+    // source and returns a bounded recovery fork instead.
     async runCompact(targetSid, opts = {}) {
       // Default to the active session — the manual ctx-ring click + the
       // command palette both want "compact what I'm looking at". The
@@ -24291,6 +24525,7 @@ function portal() {
       // along to unrelated tabs.
       const cst = this._ensureTabState(sid);
       cst.compacting = true;
+      let recoveredSession = null;
       // A short toast confirms the kick — the bottom pending bubble is what
       // the user actually watches for the full 20–60s window, not the toast.
       this.toast(this.lang === "zh" ? "📦 开始压缩..." : "📦 Compacting…", "info", 2000);
@@ -24321,6 +24556,20 @@ function portal() {
               : undefined);
           return;
         }
+        const compactResult = await r.json();
+        if (compactResult && compactResult.recovered_session) {
+          recoveredSession = await this._adoptRecoveredSession(
+            compactResult, sid, { focus: true },
+          );
+          await this.refreshSessions();
+          this.toast(
+            this.lang === "zh"
+              ? "原会话已超出原地压缩范围，已保留原记录并创建恢复会话"
+              : "The original session was too large to compact in place; a recovered session was created",
+            "success", 5000,
+          );
+          return;
+        }
         // Reload the compacted session if it's the active one; on a
         // background tab activateTab will reload it lazily later.
         if (sid === this.currentId) {
@@ -24341,7 +24590,9 @@ function portal() {
         // Auto-drain runs against the compacted session, not currentId —
         // a background auto-compact must drain its own queue, not the
         // user's currently-visible tab's queue.
-        this.$nextTick(() => this._drainPendingQueue(sid));
+        if (!recoveredSession) {
+          this.$nextTick(() => this._drainPendingQueue(sid));
+        }
         // Refresh ctx-meter for background compacts — when compact finishes
         // on a non-current tab the try-block's _refreshCtxMeter is skipped,
         // so we re-run it here unconditionally (it's cheap and idempotent).
@@ -24448,15 +24699,16 @@ function portal() {
       // Do not depend on Alpine directive listener order. The native control
       // is the source of truth while focused, especially during composition.
       if (this.input !== ta.value) this.input = ta.value;
-      if (ev.isComposing || ev.inputType === "insertCompositionText") {
+      if (ev.isComposing === true) {
         this._markImeComposition(ta);
-      } else if (ta._museImeComposing
-                 && ev.inputType !== "insertCompositionText") {
+      } else if (ta._museImeComposing) {
         // Some Android/embedded Chromium builds commit through input without
-        // a compositionend event (and may label the final event insertText,
-        // not insertFromComposition). Clear the guard after consuming it.
+        // a compositionend event. Some still label the final event
+        // insertCompositionText, so explicit isComposing=false is the only
+        // reliable signal that the native editor has released marked text.
         this._finishImeComposition(ta);
-        ta._museImeEndedAt = Number(ev.timeStamp) || 0;
+        ta._museImeEndedAt = ta._museImeCommitEnterDown
+          ? (Number(ev.timeStamp) || 0) : 0;
       }
       // A real edit forks away from the recalled entry. Programmatic history
       // navigation goes through _setChatInput and does not emit an input event.
@@ -24588,10 +24840,14 @@ function portal() {
       // mid-paragraph editing — previously `input += "\n"` always tacked
       // the newline onto the end, which made it impossible to split a
       // paragraph at the caret.
-      const isTouch = (window.matchMedia
-                        && window.matchMedia("(pointer: coarse)").matches)
-                      || window.innerWidth < 768;
-      const wantNewline = ev.shiftKey || ev.ctrlKey || ev.metaKey || isTouch;
+      // Use the actual single-pane layout, not bare `(pointer: coarse)`.
+      // Windows touch laptops and desktop tablets still have a physical
+      // keyboard; treating their Enter as mobile input made it insert a line
+      // break instead of sending, despite a wide PC layout. `_isMobileLayout`
+      // mirrors the CSS breakpoint and only includes coarse pointers for a
+      // phone-sized landscape viewport.
+      const wantNewline = ev.shiftKey || ev.ctrlKey || ev.metaKey
+        || this._isMobileLayout();
       if (wantNewline) {
         const ta = this.$refs.chatInput;
         if (ta) {
@@ -25006,6 +25262,17 @@ function portal() {
       // to subscribe to the existing TurnBroadcast (empty prompt =
       // attach), all the EventSource handlers below stay the same.
       const isReconnect = !!opts.reconnect;
+      // A context-recovery replay owns the one automatic retry allowed for
+      // its original turn. Preserve that fact across transport reconnects,
+      // but reset it for every later user/queue turn in the same session.
+      // Without this turn-scoped marker, a recovery fork that also exceeds
+      // context returns a new recovered_session id and the id-based guards
+      // below mistake it for permission to fork + resend forever.
+      const contextRecoveryAttempted = !!opts.contextRecoveryAttempted
+        || (isReconnect && !!sendState._contextRecoveryAttempted);
+      if (!isReconnect) {
+        sendState._contextRecoveryAttempted = contextRecoveryAttempted;
+      }
       // Continuation mode: a reconnect that attaches to the bg-task watcher's
       // HEADLESS CONTINUATION turn (it published the finished task's card flip
       // + the model's auto-continue reaction). Unlike a queue-drain reconnect,
@@ -25444,12 +25711,12 @@ function portal() {
       // created. Remove the optimistic bubble, restore the full local payload,
       // and reset every stream flag/timer without relying on the later-scoped
       // _markDone closure.
-      const rollbackUnstartedSend = () => {
+      const rollbackUnstartedSend = (restoreDraft = true) => {
         if (sentUserBubble) {
           this._removePaneMessage(streamState, sentUserBubble);
           sentUserBubble = null;
         }
-        restoreSubmittedComposer(true);
+        if (restoreDraft) restoreSubmittedComposer(true);
         if (streamState._streamTimer) clearInterval(streamState._streamTimer);
         if (streamState._stallWatch) clearInterval(streamState._stallWatch);
         streamState._streamTimer = null;
@@ -25716,6 +25983,33 @@ function portal() {
         // array through the proxy).
         acc = "";
         return true;
+      };
+      const surfaceTerminalError = detail => {
+        const text = String(detail || "");
+        if (!text) return;
+        if (ownsCurBubble()) {
+          if (!curBubble.text) {
+            acc = text;
+            curBubble.text = text;
+            curBubble.error = text;
+            renderNow(true);
+            return;
+          }
+          if ((curBubble.text || "") === text) {
+            curBubble.error = text;
+            return;
+          }
+          // Preserve a legitimate partial/complete answer and surface the
+          // terminal failure as its own visible row. `m.error` is metadata,
+          // not rendered prose, so stamping it on a non-empty prior bubble
+          // would leave the actual failure visible only in the toast.
+          closeAsst();
+        }
+        if (!openAsst() || !ownsCurBubble()) return;
+        acc = text;
+        curBubble.text = text;
+        curBubble.error = text;
+        renderNow(true);
       };
       // Throttle markdown rendering during fast token streams. mdRender
       // re-parses the FULL accumulated text every tick, so the per-render cost
@@ -26527,7 +26821,7 @@ function portal() {
         // SDK-level turn failure (max turns / budget / permission denied /
         // API error) arrives as a NORMAL done event with is_error=true —
         // previously rendered identically to success. Surface it.
-        if (d.is_error) {
+        if (d.is_error && !d.cancelled) {
           const _detail = d.error || ((Array.isArray(d.errors) && d.errors.length)
             ? d.errors.join("; ")
             : (d.result_subtype || "unknown"));
@@ -26536,7 +26830,10 @@ function portal() {
             markUserFailed(_detail, d.kind, d.cta, d.retryable);
           }
           restoreSubmittedComposer(false);
-          if (ownsCurBubble()) curBubble.error = _detail;
+          // Synthetic SDK/API errors are suppressed from the ordinary text
+          // stream so they are never mistaken for a normal Muse answer. They
+          // still need a visible terminal bubble in this same frame.
+          surfaceTerminalError(_detail);
         }
         // Pass the backend's `cancelled` flag through to _markDone so it
         // can skip the green-dot unread cue for user-cancelled turns.
@@ -26564,22 +26861,31 @@ function portal() {
           memoryRecall: d.memory_recall,
         });
         _stopTimer();
-        if (isContinuation && !d.cancelled) {
+        if (d.is_error && !d.cancelled && d.snapshot_ready) {
+          // A terminal failure's private display snapshot owns both any valid
+          // partial answer and the separate error bubble. Adopt it only after
+          // the backend confirms the atomic write; otherwise retain the live
+          // objects instead of replacing them with an older canonical view.
+          this.loadSession(streamSid, { quiet: true });
+        } else if (d.is_error && !d.cancelled) {
+          streamState._seenUpdated = undefined;
+          if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+        } else if (isContinuation && !d.cancelled) {
           this._reconcileCompletedContinuation(
-            streamSid, streamState, continuationFinalText,
+            streamSid, streamState, continuationFinalText, 0,
+            String(d.assistant_uuid || ""),
           );
         } else if (!d.cancelled) {
           this._reconcileCompletedTurn(
-            streamSid, streamState, completedFinalText,
+            streamSid, streamState, d.is_error ? "" : completedFinalText, 0,
+            String(d.assistant_uuid || ""),
           );
         }
-        const _viewedStream = this.currentId === streamSid
-          || (this.tabState && this.tabState[this.currentId] === streamState);
-        if (!d.cancelled && _viewedStream) {
-          // The user watched this reply finish in the current foreground tab.
-          // Resolve through currentId so an adopted/aliased session id cannot
-          // make the acknowledgement miss the durable activity row.
-          this.ackCurrentActivity(3);
+        if (!d.cancelled) {
+          // Delivery source does not matter once the result is actually
+          // rendered in the visible conversation. Non-current/headless work
+          // remains unread because it fails the visibility/ownership guard.
+          this._ackViewedActivity(streamSid, streamState, 3);
         }
         // We rendered this reply live — re-baseline the open-session resync
         // cursor so the post-done list poll (updated_at now advanced) doesn't
@@ -26665,8 +26971,13 @@ function portal() {
         // changing user-facing retry semantics.
         streamState._canonicalResyncReason = reason;
       });
-      es.addEventListener("error", ev => {
+      es.addEventListener("error", async ev => {
         flushRender();
+        // One terminal server error may be followed by EventSource's own EOF
+        // error. Busy handoff performs async durable persistence, so claim the
+        // transport before its first await and make every later callback a
+        // no-op instead of allowing a reconnect to steal tab ownership.
+        if (streamState._busyQueueHandoff === es) return;
         // A deliberate bounded-stream resync closes EventSource and can queue
         // a transport `error` event. Its canonical poll owns recovery; never
         // enter the ordinary reconnect loop (which would immediately receive
@@ -26687,8 +26998,10 @@ function portal() {
         let errKind = "unknown";
         let errCta = "retry";
         let errRetryable = true;
+        let errorMeta = {};
         try {
           const d = JSON.parse(ev.data);
+          if (d && typeof d === "object") errorMeta = d;
           if (d && d.error) serverError = d.error;
           if (d && d.kind) errKind = d.kind;
           if (d && typeof d.cta === "string") errCta = d.cta;
@@ -26705,6 +27018,7 @@ function portal() {
         // let the queue drain continue.
         if (serverError === "no active turn") {
           es.close(); _markDone(false, false, true); _stopTimer();
+          this._ackViewedActivity(streamSid, streamState, 3);
           // This is a terminal reconciliation of content that is already on
           // screen (especially a background continuation whose task-complete
           // toast just fired), not a cold session open. A normal load flips
@@ -26717,18 +27031,95 @@ function portal() {
           return;
         }
 
+        // The busy probe and stream start cannot be one browser transaction:
+        // a background watcher may claim the session in between. This precise
+        // server response guarantees the prompt was NOT executed, so move the
+        // immutable send snapshot into the durable queue instead of marking
+        // it failed and forcing a manual resend. Reconnects/resumed queue
+        // items never re-enqueue, which prevents duplicates.
+        if (serverError && errKind === "turn_busy"
+            && !isReconnect && !resumed) {
+          streamState._busyQueueHandoff = es;
+          try { es.close(); } catch (_) {}
+          const queued = await this._enqueueMessage(streamSid, {
+            text,
+            displayText: hasDetachedText ? detachedDisplayText : composerInput,
+            pendingImages: hasDetachedText ? [] : composerImages,
+            pendingDocs: hasDetachedText ? [] : composerDocs,
+            pendingQuotes: hasDetachedText ? [] : composerQuotes,
+            permission: sendPermission,
+            plan_return_permission: sendPlanReturnPermission,
+          });
+          if (queued) {
+            if (sentUserBubble) {
+              this._removePaneMessage(streamState, sentUserBubble);
+              sentUserBubble = null;
+            }
+            // Reset only while this closed transport still owns the tab. A
+            // user action that started a newer send during persistence wins.
+            if (streamState.es === es) rollbackUnstartedSend(false);
+            if (streamState._busyQueueHandoff === es) {
+              streamState._busyQueueHandoff = null;
+            }
+            this.toast(
+              this.lang === "zh"
+                ? "当前任务仍在收尾，消息已加入队列"
+                : "The current task is still finishing; message queued",
+              "info", 2800,
+            );
+            return;
+          }
+          if (streamState._busyQueueHandoff === es) {
+            streamState._busyQueueHandoff = null;
+          }
+          // Queue persistence failed. Continue through the ordinary terminal
+          // error path, which restores the user's draft for a safe retry.
+        }
+
         if (serverError) {
-          this.toast(this._humanizeStreamError(serverError), "error", 6000);
+          // A recovered retry may itself overflow. Its payload can contain a
+          // fresh recovery id, but this original turn has already consumed
+          // its one automatic recovery. Treat the second failure as ordinary
+          // and never adopt/resend into an unbounded recovery chain.
+          const hasContextRecovery = !!(
+            errorMeta && errorMeta.recovered_session
+            && !contextRecoveryAttempted
+          );
+          const sourceWasViewed = this.currentId === streamSid
+            && (typeof document === "undefined" || document.visibilityState === "visible");
+          this.toast(
+            hasContextRecovery
+              ? (this.lang === "zh"
+                ? "原会话已满，正在切换到安全恢复会话…"
+                : "The original session is full; switching to a safe recovered session…")
+              : this._humanizeStreamError(serverError),
+            hasContextRecovery ? "info" : "error", 6000,
+          );
           if (!isContinuation) {
             markUserFailed(serverError, errKind, errCta, errRetryable);
           }
-          restoreSubmittedComposer(false);
+          if (!hasContextRecovery) restoreSubmittedComposer(false);
+          surfaceTerminalError(serverError);
           es.close();
           _markDone(false, false, true, {
-            model: modelForBubble,
+            assistantUuid: errorMeta.assistant_uuid,
+            completedAtMs: errorMeta.completed_at_ms,
+            durationMs: errorMeta.duration_ms,
+            model: errorMeta.model || modelForBubble,
             turnStatus: "failed",
+            memoryRecall: errorMeta.memory_recall,
           });
           _stopTimer();
+          this._ackViewedActivity(streamSid, streamState, 3);
+          // Adopt canonical+snapshot history only after the backend confirms
+          // the atomic display write. On disk/permission failure, retaining
+          // live objects is safer than immediately erasing the visible error.
+          if (errorMeta.snapshot_ready) {
+            this.loadSession(streamSid, { quiet: true });
+          } else {
+            streamState._seenUpdated = undefined;
+            if (streamSid === this.currentId) this._openSeenUpdated = undefined;
+          }
           // Pause auto-drain — same context likely fails the next message
           // too (quota / auth / cross-vendor signature). The failed user
           // bubble surfaces a "resume queue (N)" CTA so the user can
@@ -26743,6 +27134,83 @@ function portal() {
                 this._syncQueueFromServer(streamSid);
               }
             }, 800);
+          }
+          if (hasContextRecovery) {
+            const recoveryId = String(
+              errorMeta.recovered_session.id
+              || errorMeta.recovered_session.session_id
+              || "",
+            );
+            this._contextRecoveryHandled = this._contextRecoveryHandled || {};
+            if (recoveryId && !this._contextRecoveryHandled[recoveryId]) {
+              this._contextRecoveryHandled[recoveryId] = true;
+              const attachmentRecovery = attachIds.length > 0;
+              const canRetryOnce = sourceWasViewed
+                && !isReconnect && !isContinuation && !resumed
+                && !attachmentRecovery && !!text;
+              Promise.resolve(this._adoptRecoveredSession(
+                errorMeta, streamSid, { focus: sourceWasViewed },
+              )).then(async adopted => {
+                if (!adopted) {
+                  restoreSubmittedComposer(false);
+                  return;
+                }
+                if (canRetryOnce) {
+                  this._contextRecoveryAutoSent = this._contextRecoveryAutoSent || {};
+                  if (!this._contextRecoveryAutoSent[recoveryId]) {
+                    this._contextRecoveryAutoSent[recoveryId] = true;
+                    const retryStarted = await this.send({
+                      sessionId: recoveryId,
+                      detachedText: text,
+                      detachedDisplayText: composerInput || text,
+                      contextRecoveryAttempted: true,
+                    });
+                    if (retryStarted === false) {
+                      adopted.state.draft.input = this._mergeChatDraftText(
+                        composerInput || text, adopted.state.draft.input || "",
+                      );
+                      this._persistChatDraft(
+                        recoveryId, adopted.state.draft.input,
+                      );
+                      if (this.currentId === recoveryId) {
+                        this._activateComposerState(recoveryId);
+                      }
+                    }
+                  }
+                  return;
+                }
+                // Upload ids are single-use and their durable files belong to
+                // the source sid. Never replay them into the fork. Preserve
+                // only the user's plain text so they can review/re-attach.
+                const recoveryDraft = composerInput || text;
+                if (recoveryDraft) {
+                  adopted.state.draft.input = this._mergeChatDraftText(
+                    recoveryDraft, adopted.state.draft.input || "",
+                  );
+                  this._persistChatDraft(recoveryId, adopted.state.draft.input);
+                  if (this.currentId === recoveryId) {
+                    this._activateComposerState(recoveryId);
+                  }
+                }
+                this.toast(
+                  attachmentRecovery
+                    ? (this.lang === "zh"
+                      ? "已创建恢复会话；为避免误用旧附件，请重新添加附件后发送"
+                      : "Recovered session created; re-attach files before sending")
+                    : (this.lang === "zh"
+                      ? "已创建恢复会话，原消息已保留在输入框"
+                      : "Recovered session created; the original message is in the composer"),
+                  "warn", 5200,
+                );
+              }).catch(() => {
+                restoreSubmittedComposer(false);
+                this.toast(
+                  this.lang === "zh" ? "恢复会话打开失败，请从会话列表重试"
+                    : "Could not open the recovered session; retry from the session list",
+                  "error", 5000,
+                );
+              });
+            }
           }
           return;
         }
@@ -26816,6 +27284,7 @@ function portal() {
               // partial/live transcript is already visible, so keep this a
               // quiet reconciliation rather than flashing a cold-load skeleton.
               _markDone(false, false, true); _stopTimer();
+              this._ackViewedActivity(streamSid, streamState, 3);
               if (this.currentId === streamSid) {
                 this.loadSession(streamSid, { quiet: true });
               }
@@ -28570,7 +29039,22 @@ function portal() {
       // flight. Retire those requests so a slow response cannot roll back the
       // just-applied live state.
       this._activityAppliedSeq = ++this._activityRequestSeq;
-      const item = payload?.item;
+      let item = payload?.item;
+      let viewedTerminalAck = false;
+      if (item && item.id && !item.read
+          && ["completed", "failed"].includes(item.state)) {
+        const sid = String(item.session_id || item.thread_id || "");
+        // Activity and chat use independent SSE connections, so either can
+        // win the network race after the backend commits the terminal row.
+        // If this result belongs to the conversation visibly mounted here,
+        // treat it as read in this frame and reconcile the durable ACK in the
+        // background. Otherwise an older read:false Activity frame can flash
+        // a notification after the chat's done ACK already succeeded.
+        viewedTerminalAck = this._ackViewedActivity(
+          sid, this.tabState?.[sid], 0,
+        ) !== false;
+        if (viewedTerminalAck) item = { ...item, read: true };
+      }
       if (item && item.id) {
         const at = this.activity.events.findIndex(row => row.id === item.id);
         if (at >= 0) this.activity.events.splice(at, 1, item);
@@ -28587,7 +29071,13 @@ function portal() {
         }
         this.activity.events = [...this.activity.events];
       }
-      if (payload?.summary) this.activity.summary = payload.summary;
+      // The terminal payload's summary was captured before the visible ACK.
+      // Keep the last read summary until the ACK response/SSE supplies its
+      // newer revision; adopting this stale unread count causes the toolbar
+      // badge to blink even though the row above is already marked read.
+      if (payload?.summary && !viewedTerminalAck) {
+        this.activity.summary = payload.summary;
+      }
       this._activityRevision = Math.max(this._activityRevision, revision);
       this._syncAppBadge();
     },
@@ -28719,32 +29209,57 @@ function portal() {
         this._syncAppBadge();
       } catch (_) {}
     },
+    _ackViewedActivity(sid, streamState, retries = 0) {
+      if (!sid || typeof document === "undefined"
+          || document.visibilityState !== "visible") return false;
+      const viewed = this.currentId === sid
+        || (streamState && this.tabState && this.tabState[this.currentId] === streamState);
+      if (!viewed) return false;
+      // Resolve through currentId when two ids alias the same mounted state;
+      // the durable activity row follows the adopted session id.
+      return this.ackActivitySession(this.currentId || sid, retries);
+    },
     ackCurrentActivity(retries = 0) {
-      if (!this.currentId || typeof document === "undefined"
-          || document.visibilityState !== "visible") return;
-      return this.ackActivitySession(this.currentId, retries);
+      if (!this.currentId) return false;
+      return this._ackViewedActivity(
+        this.currentId,
+        this.tabState?.[this.currentId],
+        retries,
+      );
     },
     async ackActivitySession(sid, retries = 0) {
       if (!sid) return;
-      try {
-        const r = await fetch(`/api/activity/session/${encodeURIComponent(sid)}/ack`,
-          { method: "POST", headers: this.hdr() });
-        if (!r.ok) return;
-        const d = await r.json();
-        this._activityAppliedSeq = ++this._activityRequestSeq;
-        if (d.summary) this.activity.summary = d.summary;
-        if (Number(d.changed) > 0) {
+      const attempts = Math.max(0, Number(retries) || 0) + 1;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const r = await fetch(`/api/activity/session/${encodeURIComponent(sid)}/ack`,
+            { method: "POST", headers: this.hdr() });
+          if (!r.ok) throw new Error("activity ACK failed");
+          const d = await r.json();
+          this._activityAppliedSeq = ++this._activityRequestSeq;
+          if (d.summary) this.activity.summary = d.summary;
+          // changed=0 also means the server already considers this session
+          // read (usually because the done ACK beat a delayed Activity SSE).
+          // The local row may still carry that older read:false snapshot, so
+          // successful reconciliation always clears it.
           for (const item of this.activity.events || []) {
             if ((item.session_id || item.thread_id) === sid) item.read = true;
           }
           this.activity.events = [...this.activity.events];
+          this._syncAppBadge();
+          if (Number(d.changed) > 0 || attempt + 1 >= attempts) return true;
+        } catch (_) {
+          if (attempt + 1 >= attempts) {
+            // Re-read authoritative state after the retry budget. If the ACK
+            // truly failed, the unread result reappears instead of being
+            // hidden forever by the optimistic visible-frame suppression.
+            this._refreshActivityFromSignal().catch(() => {});
+            return false;
+          }
         }
-        this._syncAppBadge();
-        if (Number(d.changed) === 0 && retries > 0
-            && this.currentId === sid && document.visibilityState === "visible") {
-          setTimeout(() => this.ackActivitySession(sid, retries - 1), 400);
-        }
-      } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+      return false;
     },
     _syncAppBadge() {
       const count = Number(this.activity?.summary?.unread) || 0;

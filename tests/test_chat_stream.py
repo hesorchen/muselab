@@ -11,6 +11,7 @@ No real network, no real CLI subprocess, no Anthropic API.
 import asyncio
 import base64
 import collections
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, ResultMessage, StreamEvent,
     TextBlock, ToolUseBlock, ToolResultBlock,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
-    TaskUpdatedMessage,
+    TaskUpdatedMessage, SystemMessage,
 )
 
 from tests.conftest import TEST_TOKEN
@@ -228,9 +229,11 @@ def test_stream_happy_path_text_tooluse_result_done(stream_env, client, monkeypa
 
     # done carries cost + model + cumulative session usage.
     done = next(json.loads(d) for e, d in events if e == "done")
+    assert done["turn_id"]
     assert done["total_cost_usd"] == pytest.approx(0.0042)
     assert done["model"] == "claude-sonnet-4-6"
     assert done["cancelled"] is False
+    assert done["activity_source"] == "direct"
     assert done["duration_ms"] == 1500
     assert done["assistant_uuid"] == "assistant-final-uuid"
     assert isinstance(done["completed_at_ms"], int)
@@ -251,6 +254,13 @@ def test_tool_only_turn_persists_completion_annotation(
     chat_mod = stream_env
     sid = _make_session(client)
     assistant_uuid = "assistant-tool-only-uuid"
+    recall = {
+        "id": "recall-tool-tail", "count": 1, "status": "ok",
+        "latency_ms": 4, "items": [{
+            "id": "memory-1", "kind": "preference",
+            "content": "A non-private regression fixture",
+        }],
+    }
     messages = [
         AssistantMessage(
             content=[
@@ -278,6 +288,8 @@ def test_tool_only_turn_persists_completion_annotation(
 
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
     monkeypatch.setattr(
+        chat_mod.mem0, "pop_recall_trace", lambda _sid: recall)
+    monkeypatch.setattr(
         chat_mod,
         "_recent_turn_uuids",
         lambda _sid, _want_image_user: (
@@ -293,10 +305,17 @@ def test_tool_only_turn_persists_completion_annotation(
 
     assert done["assistant_uuid"] == assistant_uuid
     assert done["duration_ms"] == 2500
+    assert done["memory_recall"] == recall
     annotations = chat_mod.sess.get_message_annotations(sid)
     assert annotations[assistant_uuid]["ts"] == done["completed_at_ms"]
     assert annotations[assistant_uuid]["elapsed_s"] == 2.5
     assert annotations[assistant_uuid]["turn_status"] == "completed"
+    persisted_recall = annotations[assistant_uuid]["memory_recall"]
+    assert persisted_recall == {
+        "id": recall["id"], "count": 1, "latency_ms": 4, "status": "ok",
+        "items": [{"id": "memory-1", "kind": "preference"}],
+    }
+    assert "content" not in persisted_recall["items"][0]
     persisted = chat_mod._RawMsg(
         assistant_uuid,
         "assistant",
@@ -309,6 +328,10 @@ def test_tool_only_turn_persists_completion_annotation(
     assert shaped[-1]["role"] == "tool_use"
     assert shaped[-1]["model"] == "claude-sonnet-4-6"
     assert shaped[-1]["turn_status"] == "completed"
+    assert shaped[-1]["memoryRecall"] == persisted_recall
+    chat_mod._complete_turn_footer_metadata(
+        shaped, "claude-sonnet-4-6", has_later=False)
+    assert shaped[-1]["memoryRecall"] == persisted_recall
 
 
 def test_forced_interrupt_persists_refreshable_footer_and_private_snapshot(
@@ -353,6 +376,119 @@ def test_forced_interrupt_persists_refreshable_footer_and_private_snapshot(
     assert path is not None and path.exists()
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_failed_snapshot_survives_partial_canonical_assistant(
+        stream_env, client, monkeypatch, tmp_path):
+    """A partial JSONL assistant is not equivalent to the terminal error row."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    bc = chat_mod.TurnBroadcast(
+        session_id=sid, model="codex:gpt-5.6-sol")
+    bc.user_text = "continue the long task"
+    bc.started_at = 1_700_000_000.0
+    bc.publish({
+        "event": "text",
+        "data": json.dumps({"text": "valid partial answer"}),
+    })
+    assert chat_mod._persist_failed_turn_snapshot(
+        bc,
+        "API Error: context window exceeded",
+        terminal_at_ms=1_700_000_003_000,
+        elapsed_s=3.0,
+        canonical_terminal_published=False,
+    ) is True
+
+    # Simulate a delayed transcript flush containing this turn's legitimate
+    # partial AssistantMessage. The healer may annotate it, but must not delete
+    # the snapshot because canonical JSONL has no equivalent terminal error row.
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        chat_mod,
+        "_ensure_transcript_index",
+        lambda _sid: (transcript, {"records": []}),
+    )
+    monkeypatch.setattr(
+        chat_mod,
+        "_cancelled_snapshot_canonical_span",
+        lambda *_args: (["user-current", "assistant-partial"],
+                        "assistant-partial"),
+    )
+
+    snapshots, generation = chat_mod._load_cancelled_turn_snapshots(sid)
+    assert generation
+    assert len(snapshots) == 1
+    assert [m.get("text") for m in snapshots[0]["messages"]
+            if m.get("role") == "assistant"] == [
+        "valid partial answer",
+        "API Error: context window exceeded",
+    ]
+    assert chat_mod._cancelled_turn_snapshot_path(sid, bc.turn_id).exists()
+    annotation = chat_mod.sess.get_message_annotations(sid)["assistant-partial"]
+    assert annotation["turn_status"] == "failed"
+
+
+def test_result_only_error_persists_tail_bubble_without_relabeling_old_turn(
+        stream_env, client, monkeypatch):
+    """A UUID-less Result error stays visible after reload and owns no old UUID."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod.sess.set_message_annotation(
+        sid,
+        "assistant-from-previous-turn",
+        model="codex:gpt-5.6-sol",
+        ts=1_700_000_000_000,
+        turn_status="completed",
+        elapsed_s=2.0,
+    )
+    result = ResultMessage(
+        subtype="error", duration_ms=1500, duration_api_ms=1400,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    fake = _FakeStreamClient([result])
+
+    async def fake_get_client(
+        session_id, model, permission="bypassPermissions", effort="",
+        service_tier="",
+    ):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=keep-going&model=codex:gpt-5.6-sol",
+    )
+    assert response.status_code == 200, response.text
+    done = next(
+        json.loads(data)
+        for event, data in _parse_sse(response.text)
+        if event == "done"
+    )
+    assert done["is_error"] is True
+    assert done["assistant_uuid"] == ""
+    assert done["snapshot_ready"] is True
+
+    old = chat_mod.sess.get_message_annotations(sid)[
+        "assistant-from-previous-turn"]
+    assert old["turn_status"] == "completed"
+    assert old["ts"] == 1_700_000_000_000
+
+    history = client.get(
+        f"/api/chat/sessions/{sid}",
+        params={"tail": 80},
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert history.status_code == 200, history.text
+    messages = history.json()["messages"]
+    assert any(m.get("role") == "user" and m.get("text") == "keep-going"
+               for m in messages)
+    terminal = messages[-1]
+    assert terminal["role"] == "assistant"
+    assert "context window" in terminal["text"]
+    assert terminal["turn_status"] == "failed"
 
 
 def test_activity_hidden_turn_never_enters_global_task_center(
@@ -463,13 +599,13 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
         monkeypatch.setattr(
             activity_module.activity,
             "start",
-            lambda activity_sid, *, summary="": activity_transitions.append(
+            lambda activity_sid, *, summary="", activity_source="", owner_id="": activity_transitions.append(
                 ("start", activity_sid, summary)),
         )
         monkeypatch.setattr(
             activity_module.activity,
             "finish",
-            lambda activity_sid, status: activity_transitions.append(
+            lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
                 ("finish", activity_sid, status)),
         )
 
@@ -482,6 +618,11 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
             event.get("event") == "done"
             for event in broadcast.replay_events()
         )
+        main_done = next(
+            event for event in broadcast.replay_events()
+            if event.get("event") == "done"
+        )
+        assert json.loads(main_done["data"])["activity_source"] == "direct"
         assert activity_transitions == [
             ("start", sid, "quick reply"),
             ("finish", sid, "completed"),
@@ -492,6 +633,13 @@ def test_done_is_published_before_slow_post_turn_bookkeeping(
         await asyncio.wait_for(broadcast.task, timeout=1)
         assert broadcast.done is True
         assert sid not in chat_mod._active_turns
+        # The ResultMessage already committed Activity before ``done``.  A
+        # second terminal write after the browser ACK would make this visible
+        # current-session completion unread again.
+        assert activity_transitions == [
+            ("start", sid, "quick reply"),
+            ("finish", sid, "completed"),
+        ]
         recent = chat_mod._recent_turns.pop(sid, None)
         if recent is not None:
             recent.close()
@@ -560,13 +708,13 @@ def test_activity_stays_running_until_background_continuation_finishes(
         monkeypatch.setattr(
             activity_module.activity,
             "start",
-            lambda activity_sid, *, summary="": activity_transitions.append(
+            lambda activity_sid, *, summary="", activity_source="", owner_id="": activity_transitions.append(
                 ("start", activity_sid, summary)),
         )
         monkeypatch.setattr(
             activity_module.activity,
             "finish",
-            lambda activity_sid, status: activity_transitions.append(
+            lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
                 ("finish", activity_sid, status)),
         )
 
@@ -580,10 +728,16 @@ def test_activity_stays_running_until_background_continuation_finishes(
         assert activity_transitions == [
             ("start", sid, "run a background task"),
         ]
+        main_done = next(
+            event for event in broadcast.replay_events()
+            if event.get("event") == "done"
+        )
+        assert json.loads(main_done["data"])["activity_source"] == "background"
         assert chat_mod._sessions_with_inflight_tasks[sid] == {
             "task_deferred",
         }
-        assert chat_mod._background_activity_finishes[sid] == "completed"
+        assert chat_mod._background_activity_finishes[sid] == (
+            "completed", broadcast.turn_id)
 
         await asyncio.wait_for(broadcast.task, timeout=1)
         watcher = chat_mod._task_watchers[sid]
@@ -637,14 +791,15 @@ def test_background_stream_eof_releases_dead_task_and_closes_activity(
     async def exercise():
         chat_mod._pin_background_task(sid, task_id)
         chat_mod._bg_task_descriptions[task_id] = "sleep 30"
-        chat_mod._background_activity_finishes[sid] = deferred_status
+        chat_mod._background_activity_finishes[sid] = (
+            deferred_status, "background-owner")
         await chat_mod._watch_inflight_tasks(
             sid, _ClosedClient(), {task_id: "sleep 30"})
 
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status: transitions.append(
+        lambda activity_sid, status, *, activity_source="", owner_id="": transitions.append(
             (activity_sid, status)),
     )
     try:
@@ -769,6 +924,23 @@ def test_sdk_error_extractors_keep_result_and_assistant_detail(stream_env):
     assert merged["api_error_status"] == 502
 
 
+def test_activity_source_is_explicit_for_broadcasts_and_error_frames(stream_env):
+    chat_mod = stream_env
+    broadcast = chat_mod.TurnBroadcast(session_id="source-contract", model="m")
+    assert broadcast.activity_source == "direct"
+
+    broadcast.queue_item_id = "queue-item"
+    assert broadcast.activity_source == "queued"
+
+    broadcast.is_continuation = True
+    assert broadcast.activity_source == "background"
+
+    error = chat_mod._error_event(
+        "queued turn failed", activity_source="queued")
+    payload = json.loads(error["data"])
+    assert payload["activity_source"] == "queued"
+
+
 def test_run_sdk_command_checked_rejects_in_band_result_error(stream_env):
     chat_mod = stream_env
     result = ResultMessage(
@@ -794,6 +966,44 @@ def test_run_sdk_command_checked_rejects_in_band_result_error(stream_env):
     assert fake.queries == ["/compact"]
 
 
+def test_run_sdk_command_checked_rejects_local_command_api_error(stream_env):
+    """`/compact` may hide its API failure in a generic SystemMessage."""
+    chat_mod = stream_env
+    messages = [
+        SystemMessage(
+            subtype="local_command",
+            data={
+                "content": (
+                    "API Error: 400 Your input exceeds the context window "
+                    "of this model"
+                ),
+                # Real Claude CLI records this failure at info level.
+                "level": "info",
+            },
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id="sid", result="ok",
+        ),
+    ]
+
+    class FakeClient:
+        def __init__(self):
+            self.queries = []
+
+        async def query(self, prompt):
+            self.queries.append(prompt)
+
+        async def receive_response(self):
+            for message in messages:
+                yield message
+
+    fake = FakeClient()
+    with pytest.raises(chat_mod._SDKCommandError, match="context window"):
+        asyncio.run(chat_mod._run_sdk_command_checked(fake, "/compact"))
+    assert fake.queries == ["/compact"]
+
+
 def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env):
     chat_mod = stream_env
     boundary = chat_mod._TurnResponseBoundary({"old"})
@@ -812,13 +1022,18 @@ def test_turn_response_boundary_accepts_lifecycle_and_uuid_less_error(stream_env
     assert boundary.classify(error_result) == "current_result"
 
 
-def test_preflight_compact_failure_blocks_original_prompt(stream_env, client, monkeypatch):
+def test_preflight_compact_failure_blocks_original_prompt(
+        stream_env, client, monkeypatch, capsys):
     chat_mod = stream_env
     sid = _make_session(client)
+    private_marker = "PRIVATE_UPSTREAM_DETAIL_MUST_NOT_BE_LOGGED"
     compact_error = ResultMessage(
         subtype="error", duration_ms=1, duration_api_ms=1,
         is_error=True, num_turns=1, session_id=sid,
-        result="Your input exceeds the context window of this model",
+        result=(
+            "Your input exceeds the context window of this model "
+            f"{private_marker}"
+        ),
         api_error_status=400,
     )
     fake = _FakeStreamClient([compact_error])
@@ -845,6 +1060,7 @@ def test_preflight_compact_failure_blocks_original_prompt(stream_env, client, mo
     assert fake.queried == ["/compact"]
     assert error["kind"] == "context_window"
     assert error["retryable"] is False
+    assert private_marker not in capsys.readouterr().err
 
 
 def test_stream_done_classifies_synthetic_context_error(stream_env, client, monkeypatch):
@@ -987,6 +1203,44 @@ def test_stream_text_attachment_goes_to_disk_not_into_prompt(
     assert str(attach_path) in text
     assert "数据 表.csv" in text          # display name stays the original
     assert secret not in text            # …but the CONTENTS never ship
+
+
+def test_direct_stream_attachment_still_consumes_available_ids_once(
+        stream_env, client, monkeypatch):
+    """Queue all-or-none claiming must not change ordinary direct sends."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    body = b"direct attachment"
+    aid = "direct-once"
+    chat_mod._image_store[aid] = {
+        "kind": "text",
+        "mime": "text/plain",
+        "name": "direct.txt",
+        "raw": body,
+        "text": body.decode(),
+        "ts": chat_mod.time.time(),
+    }
+    fake = _FakeStreamClient([
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+    ])
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        f"&prompt=read-direct&image_ids={aid}&model=claude-sonnet-4-6"
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(fake.queried) == 1
+    assert aid not in chat_mod._image_store
+    assert (chat_mod._attachments_base() / sid / f"{aid}-direct.txt").read_bytes() == body
 
 
 def test_stream_background_task_messages_flow_through(stream_env, client, monkeypatch):
@@ -1237,6 +1491,7 @@ def test_watcher_opens_continuation_turn_and_unpins(stream_env):
         done = json.loads(done_ev["data"])
         assert done["duration_ms"] == 1120
         assert done["assistant_uuid"] == "continuation-assistant-uuid"
+        assert done["activity_source"] == "background"
         assert isinstance(done["completed_at_ms"], int)
         assert done["completed_at_ms"] > 0
         # The task_notification carries the launching card's tool_use_id so the
@@ -1565,6 +1820,7 @@ def test_active_surfaces_grace_kept_continuation(stream_env, client):
         d = r.json()
         assert d["active"] is True, d
         assert d["continuation"] is True, d
+        assert d["activity_source"] == "background", d
         assert d["turn_id"] == cont.turn_id
 
         # Once a reconnect subscriber has consumed it, /active must stop
@@ -1575,12 +1831,14 @@ def test_active_surfaces_grace_kept_continuation(stream_env, client):
         r = client.get(f"/api/chat/sessions/{sid}/active",
                        headers={"X-Auth-Token": TEST_TOKEN})
         assert r.json()["active"] is False, r.json()
+        assert r.json()["activity_source"] == "background", r.json()
     finally:
         chat_mod._recent_turns.pop(sid, None)
 
     # 2) A grace-kept PLAIN turn (not a continuation) → active:false.
     plain = chat_mod.TurnBroadcast(session_id=sid, model="")
     plain.is_continuation = False
+    plain.queue_item_id = "queued-item"
     plain.finish()
     chat_mod._recent_turns[sid] = plain
     try:
@@ -1588,6 +1846,7 @@ def test_active_surfaces_grace_kept_continuation(stream_env, client):
                        headers={"X-Auth-Token": TEST_TOKEN})
         assert r.status_code == 200, r.text
         assert r.json()["active"] is False, r.json()
+        assert r.json()["activity_source"] == "queued", r.json()
     finally:
         chat_mod._recent_turns.pop(sid, None)
 
@@ -1617,6 +1876,7 @@ def test_active_reports_background_reader_as_busy_not_attachable(
         assert data["background"] is True
         assert data["attachable"] is False
         assert data["continuation"] is False
+        assert data["activity_source"] == "background"
         assert data["background_tasks_pending"] == 1
         assert data["started_at"] == original_started_at
         assert data["turn_id"] == "origin-turn"
@@ -1626,37 +1886,79 @@ def test_active_reports_background_reader_as_busy_not_attachable(
         chat_mod._background_origin_turn_id.pop(sid, None)
 
 
-def test_start_turn_allowed_while_background_task_pending(
+def test_start_turn_is_queued_while_background_task_pending(
     stream_env, client,
 ):
-    """A pending background task must NOT block the user from sending.
-
-    This used to raise _TurnBusy: the detached watcher was the sole reader of
-    the session's SDK stream, so a concurrent turn was refused and the user's
-    message was parked on the queue instead. The session pump owns the stream
-    now, so the turn is allowed and the task's completion simply arrives later
-    as its own message in the conversation.
-    """
+    """A pending task retains the response boundary until its watcher exits."""
     chat_mod = stream_env
     sid = _make_session(client)
     chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
     try:
-        # The contract is only that we are not REFUSED as busy. Whether the
-        # turn then survives is environmental — there is no real CLI behind
-        # this session, so the detached pump tears the broadcast down again
-        # (racing any assertion on _active_turns).
-        try:
+        with pytest.raises(chat_mod._TurnBusy):
             asyncio.run(chat_mod._start_turn(sid, "new user prompt"))
-        except chat_mod._TurnBusy:
-            pytest.fail("a pending background task must not block a new turn")
-        except Exception:
-            pass
     finally:
         bc = chat_mod._active_turns.pop(sid, None)
         if bc is not None:
             bc.finish()
             bc.close()
         chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+
+def test_draining_reservation_rechecks_background_owner(stream_env, client):
+    """Interrupted-turn handoff must not bypass the background queue gate."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+
+    async def exercise():
+        draining = chat_mod.TurnBroadcast(sid, model="claude-sonnet-4-6")
+        draining.cancelled = True
+        chat_mod._active_turns[sid] = draining
+
+        async def hand_off_to_watcher():
+            await asyncio.sleep(0)
+            chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+            draining.finish()
+            chat_mod._active_turns.pop(sid, None)
+
+        handoff = asyncio.create_task(hand_off_to_watcher())
+        try:
+            with pytest.raises(chat_mod._TurnBusy):
+                await chat_mod._start_turn(sid, "queue after interrupt")
+            await handoff
+        finally:
+            draining.close()
+            chat_mod._active_turns.pop(sid, None)
+            chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+    asyncio.run(exercise())
+
+
+def test_stream_busy_response_is_machine_queueable(stream_env, client):
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-1"}
+    try:
+        response = client.get(
+            f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+            "&prompt=queue-me&model=claude-sonnet-4-6"
+        )
+    finally:
+        chat_mod._sessions_with_inflight_tasks.pop(sid, None)
+
+    assert response.status_code == 200
+    assert '"kind": "turn_busy"' in response.text
+    assert '"cta": "queue"' in response.text
+
+
+def test_pooled_stream_attaches_before_query_and_parks_leftovers(stream_env):
+    """Keep the fast-response ordering and lifecycle handoff explicit."""
+    source = inspect.getsource(stream_env._start_turn)
+    pooled = source[source.index("stream = _stream_for(client)"):]
+
+    assert pooled.index("turn_q = stream.attach_turn()") < pooled.index(
+        "await _send_query()"
+    )
+    assert "stream.park_unconsumed(turn_q)" in pooled
 
 
 def test_turn_does_not_consume_buffered_continuation(stream_env):
@@ -1891,6 +2193,96 @@ def test_attached_subscriber_gets_deltas_not_the_coalesced_duplicate(stream_env)
                  for e in received if e["event"] == "text"]
         # Three deltas and no fourth, coalesced copy of the same sentence.
         assert texts == ["Hel", "lo ", "world"]
+        bc.close()
+
+    asyncio.run(exercise())
+
+
+def test_slow_live_subscriber_receives_final_text_before_done(stream_env):
+    """A terminal spool row must never overtake queued live text deltas."""
+    import asyncio
+    import json
+
+    chat_mod = stream_env
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(session_id="ordered-final-text")
+        live = bc.subscribe()
+        # Deliberately do not consume between publishes. This is the browser
+        # backpressure shape that used to produce done -> text and lose the
+        # final bubble when EventSource closed on done.
+        bc.publish({"event": "text", "data": json.dumps({"text": "FINAL"})})
+        bc.publish({"event": "done", "data": "{}"})
+        bc.finish()
+
+        received = []
+        while True:
+            event = await live.get()
+            if event is None:
+                break
+            received.append(event)
+        assert [event["event"] for event in received] == ["text", "done"]
+        assert json.loads(received[0]["data"])["text"] == "FINAL"
+        bc.close()
+
+    asyncio.run(exercise())
+
+
+def test_slow_live_subscriber_preserves_text_tool_text_done_order(stream_env):
+    """Each coalesced segment drains only to its own live delimiter."""
+    import asyncio
+    import json
+
+    chat_mod = stream_env
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(session_id="ordered-multi-segment")
+        live = bc.subscribe()
+        for chunk in ("A1", "A2"):
+            bc.publish({"event": "text", "data": json.dumps({"text": chunk})})
+        bc.publish({"event": "tool_result", "data": json.dumps({"id": "tool"})})
+        for chunk in ("B1", "B2"):
+            bc.publish({"event": "text", "data": json.dumps({"text": chunk})})
+        bc.publish({"event": "done", "data": "{}"})
+        bc.finish()
+
+        received = []
+        while True:
+            event = await live.get()
+            if event is None:
+                break
+            received.append(event)
+        assert [event["event"] for event in received] == [
+            "text", "text", "tool_result", "text", "text", "done",
+        ]
+        assert [
+            json.loads(event["data"])["text"]
+            for event in received if event["event"] == "text"
+        ] == ["A1", "A2", "B1", "B2"]
+        bc.close()
+
+    asyncio.run(exercise())
+
+
+def test_waiting_live_subscriber_emits_resync_after_backlog_overflow(
+        stream_env, monkeypatch):
+    """Overflow can close the replay reader while get() is asleep."""
+    chat_mod = stream_env
+    monkeypatch.setattr(chat_mod, "_BROADCAST_LIVE_DELTA_MAX", 2)
+
+    async def exercise():
+        bc = chat_mod.TurnBroadcast(session_id="overflow-resync")
+        live = bc.subscribe()
+        waiting = asyncio.create_task(live.get())
+        await asyncio.sleep(0)
+        # No await between publishes: resync closes the reader in the same
+        # event-loop tick that wakes the sleeping subscriber.
+        for text in ("A", "B", "C"):
+            bc.publish({"event": "text", "data": json.dumps({"text": text})})
+        event = await waiting
+        assert event["event"] == "resync"
+        assert json.loads(event["data"])["reason"] == "live_backlog"
+        assert await live.get() is None
         bc.close()
 
     asyncio.run(exercise())
@@ -2136,6 +2528,7 @@ def test_stream_error_path_classifies_auth_error(stream_env, client, monkeypatch
     err = next((json.loads(d) for e, d in events if e == "error"), None)
     assert err is not None, f"no error frame: {events}"
     assert err["kind"] == "auth", f"misclassified: {err}"
+    assert err["activity_source"] == "direct"
     assert err["cta"] == "open_settings"
     assert err["retryable"] is False
     # Reservation released even on error so the user can retry.
@@ -2160,13 +2553,13 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     monkeypatch.setattr(
         activity_module.activity,
         "start",
-        lambda activity_sid, *, summary="": activity_transitions.append(
+        lambda activity_sid, *, summary="", activity_source="", owner_id="": activity_transitions.append(
             ("start", activity_sid, summary)),
     )
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status: activity_transitions.append(
+        lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
             ("finish", activity_sid, status)),
     )
 
@@ -2177,6 +2570,7 @@ def test_stream_early_get_client_failure_emits_error_frame(stream_env, client, m
     err = next((json.loads(d) for e, d in events if e == "error"), None)
     assert err is not None, f"no error frame: {events}"
     assert err["kind"] == "auth"
+    assert err["activity_source"] == "direct"
     assert sid not in chat_mod._active_turns
     assert activity_transitions == [
         ("start", sid, "hi"),
@@ -2588,6 +2982,36 @@ def test_sdk_command_reads_through_the_session_pump(stream_env):
     assert asyncio.run(go()) is result
 
 
+def test_compact_tail_outcome_reads_only_new_native_records(
+        stream_env, tmp_path):
+    chat_mod = stream_env
+    transcript = tmp_path / "compact-tail.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "system", "subtype": "local_command",
+            "content": "old context window error",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    offset = transcript.stat().st_size
+    with transcript.open("a", encoding="utf-8") as handle:
+        for entry in (
+            {"type": "system", "subtype": "compact_boundary"},
+            {"type": "user", "isCompactSummary": True},
+            {
+                "type": "system", "subtype": "local_command",
+                "data": {"content": "API Error: input exceeds the context window"},
+            },
+        ):
+            handle.write(json.dumps(entry) + "\n")
+
+    assert chat_mod._compact_tail_outcome(transcript, offset) == {
+        "boundary": True,
+        "summary": True,
+        "context_error": True,
+    }
+
+
 def test_failed_session_stream_evicts_dead_cached_client(stream_env):
     """A parser/transport failure must not poison every later turn.
 
@@ -2729,6 +3153,597 @@ def test_preflight_compact_trusts_the_token_count_over_the_verdict(
     # The prompt survived the scare — it was sent after the compact, not dropped.
     assert fake.queried[0] == "/compact"
     assert len(fake.queried) == 2
+
+
+def test_preflight_does_not_steal_background_watchers_sdk_stream(
+        stream_env, client, monkeypatch):
+    """Slash-command compaction must not consume task lifecycle messages."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    answer = [
+        AssistantMessage(
+            content=[TextBlock(text="foreground reply")],
+            model="claude-sonnet-4-6", uuid="a-foreground",
+            usage={"input_tokens": 4, "output_tokens": 2},
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 4, "output_tokens": 2},
+            result="foreground reply", uuid="r-foreground",
+        ),
+    ]
+    fake = _FakeStreamClient(answer)
+
+    async def near_limit_context():
+        return {
+            "maxTokens": 200_000, "rawMaxTokens": 200_000,
+            "autoCompactThreshold": 160_000, "totalTokens": 190_000,
+        }
+
+    fake.get_context_usage = near_limit_context
+
+    async def fake_get_client(
+            session_id, model, permission="bypassPermissions", effort="",
+            service_tier=""):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_session_has_live_watcher", lambda _sid: True)
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=send-once&model=claude-sonnet-4-6",
+    )
+    events = _parse_sse(response.text)
+
+    assert fake.queried == ["send-once"]
+    assert not [event for event, _data in events if event == "compact_progress"]
+    assert not [event for event, _data in events if event == "error"]
+
+
+def test_codex_preflight_rebuilds_stalled_runtime_and_retries_once(
+        stream_env, client, monkeypatch):
+    """An old Codex CLI runtime must not leave a session permanently dead.
+
+    A no-op /compact is retried once on a fresh process, whose explicit
+    auto-compact window can recover the existing transcript.  The user's real
+    prompt is sent exactly once, and only after a measured token drop.
+    """
+    chat_mod = stream_env
+    response = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN,
+                 "Content-Type": "application/json"},
+        json={"name": "codex compact recovery", "model": "codex:gpt-5.6-sol"},
+    )
+    assert response.status_code == 200, response.text
+    sid = response.json()["id"]
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    answer = [
+        AssistantMessage(
+            content=[TextBlock(text="recovered")],
+            model="gpt-5.6-sol", uuid="a-recovered",
+            usage={"input_tokens": 4, "output_tokens": 2},
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0,
+            usage={"input_tokens": 4, "output_tokens": 2},
+            result="recovered", uuid="r-recovered",
+        ),
+    ]
+    stale = _FakeStreamClient([compact_error])
+    fresh = _FakeBatchedStreamClient([answer])
+    stale_reads = 0
+
+    async def stale_context():
+        nonlocal stale_reads
+        stale_reads += 1
+        return {
+            "maxTokens": 320_000, "rawMaxTokens": 320_000,
+            "autoCompactThreshold": 287_000, "totalTokens": 310_000,
+        }
+
+    async def fresh_context():
+        return {
+            "maxTokens": 320_000, "rawMaxTokens": 320_000,
+            "autoCompactThreshold": 287_000,
+            "totalTokens": 60_000,
+        }
+
+    stale.get_context_usage = stale_context
+    fresh.get_context_usage = fresh_context
+    clients = [stale, fresh]
+
+    async def fake_get_client(
+            session_id, model, permission="bypassPermissions", effort="",
+            service_tier="", plan_return_permission=""):
+        return clients.pop(0)
+
+    disconnected = []
+
+    async def fake_disconnect(session_id):
+        disconnected.append(session_id)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _model: True)
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability",
+        lambda _model: asyncio.sleep(0, result={
+            "max_input_tokens": 320_000,
+            "effective_context_window_percent": 100,
+        }),
+    )
+
+    result = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=send-once&model=codex:gpt-5.6-sol",
+    )
+    events = _parse_sse(result.text)
+
+    assert disconnected == [sid]
+    assert stale.queried == ["/compact"]
+    # The fresh runtime sees the compact boundary written by the stale one;
+    # never summarize the already-shrunk transcript a second time.
+    assert fresh.queried == ["send-once"]
+    assert not [data for event, data in events if event == "error"]
+    assert any(event == "text" and "recovered" in data
+               for event, data in events)
+
+
+def test_codex_preflight_fresh_runtime_retries_compact_once_when_still_full(
+        stream_env, client, monkeypatch):
+    """A genuinely unchanged fresh runtime gets one, and only one, retry."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    compact_ok = ResultMessage(
+        subtype="success", duration_ms=2, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=sid, result="Compacted",
+    )
+    answer = [
+        AssistantMessage(
+            content=[TextBlock(text="recovered after retry")],
+            model="gpt-5.6-sol", uuid="a-retry", usage={}),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={}, result="recovered", uuid="r-retry"),
+    ]
+    stale = _FakeStreamClient([compact_error])
+    fresh = _FakeBatchedStreamClient([[compact_ok], answer])
+
+    async def stale_context():
+        return {"maxTokens": 320_000, "rawMaxTokens": 320_000,
+                "autoCompactThreshold": 287_000, "totalTokens": 310_000}
+
+    fresh_reads = 0
+
+    async def fresh_context():
+        nonlocal fresh_reads
+        fresh_reads += 1
+        return {"maxTokens": 320_000, "rawMaxTokens": 320_000,
+                "autoCompactThreshold": 287_000,
+                "totalTokens": 310_000 if fresh_reads == 1 else 60_000}
+
+    stale.get_context_usage = stale_context
+    fresh.get_context_usage = fresh_context
+    clients = [stale, fresh]
+
+    async def fake_get_client(*_args, **_kwargs):
+        return clients.pop(0)
+
+    disconnected = []
+
+    async def fake_disconnect(target_sid):
+        disconnected.append(target_sid)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability",
+        lambda _m: asyncio.sleep(0, result={"max_input_tokens": 320_000}),
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=send-once&model=codex:gpt-5.6-sol",
+    )
+    events = _parse_sse(response.text)
+    assert disconnected == [sid]
+    assert stale.queried == ["/compact"]
+    assert fresh.queried == ["/compact", "send-once"]
+    assert not [data for event, data in events if event == "error"]
+    assert any(event == "text" and "recovered after retry" in data
+               for event, data in events)
+
+
+def test_codex_preflight_probe_context_error_recovers_from_cached_usage(
+        stream_env, client, monkeypatch):
+    """A poisoned control probe recovers without sending the real prompt."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    fake = _FakeStreamClient([])
+
+    async def failed_context_probe():
+        raise RuntimeError(
+            "API Error: 400 Your input exceeds the context window of this model"
+        )
+
+    fake.get_context_usage = failed_context_probe
+    recovered_id = "3e41f694-7481-49d3-94c7-2fca83c2f8a3"
+    recoveries = []
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    async def fake_recover(target_sid, model, *, pre_tokens, context_limit):
+        recoveries.append((target_sid, model, pre_tokens, context_limit))
+        return {
+            "session": {
+                "id": recovered_id,
+                "session_id": recovered_id,
+                "name": "Recovered",
+                "model": model,
+            },
+            "stats": {"estimated_post_tokens": 24_000},
+        }
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_recover_context_session", fake_recover)
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    monkeypatch.setattr(
+        chat_mod,
+        "_heal_unreachable_locked_model",
+        lambda _sid, locked, _requested: locked,
+    )
+    monkeypatch.setitem(chat_mod._session_usage, sid, {
+        "input_tokens": 300_000,
+        "cache_read_tokens": 42_000,
+        "cache_creation_tokens": 22_270,
+        "context_used": 364_270,
+        "context_limit": 353_400,
+    })
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=must-not-send&model=codex:gpt-5.6-sol",
+    )
+    events = _parse_sse(response.text)
+    error = next(json.loads(data) for event, data in events if event == "error")
+
+    assert fake.queried == []
+    assert recoveries == [(
+        sid, "codex:gpt-5.6-sol", 364_270, 353_400,
+    )]
+    assert error["kind"] == "context_window"
+    assert error["recovered_session"]["id"] == recovered_id
+
+
+def test_codex_preflight_compact_context_error_recovers_when_probe_unavailable(
+        stream_env, client, monkeypatch):
+    """Repeated context rejects recover even when neither probe is available."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    stale = _FakeStreamClient([compact_error])
+    fresh = _FakeStreamClient([compact_error])
+    context_reads = {"stale": 0, "fresh": 0}
+
+    async def stale_context():
+        context_reads["stale"] += 1
+        if context_reads["stale"] > 1:
+            raise RuntimeError("post-compact context probe unavailable")
+        return {"maxTokens": 320_000, "rawMaxTokens": 320_000,
+                "autoCompactThreshold": 287_000, "totalTokens": 310_000}
+
+    async def fresh_context():
+        context_reads["fresh"] += 1
+        raise RuntimeError("fresh context probe unavailable")
+
+    stale.get_context_usage = stale_context
+    fresh.get_context_usage = fresh_context
+    clients = [stale, fresh]
+    get_calls = []
+
+    async def fake_get_client(*args, **_kwargs):
+        get_calls.append(args)
+        return clients.pop(0)
+
+    recoveries = []
+
+    async def fake_recover(target_sid, model, *, pre_tokens, context_limit):
+        recoveries.append((target_sid, model, pre_tokens, context_limit))
+        recovered_id = "b0dc1a95-b1ab-42d6-bd0c-acde3b4bdb20"
+        return {
+            "session": {
+                "id": recovered_id,
+                "session_id": recovered_id,
+                "name": "Recovered",
+                "model": model,
+            },
+            "stats": {
+                "included_messages": 12,
+                "omitted_messages": 4,
+                "truncated_messages": 1,
+                "estimated_post_tokens": 24000,
+            },
+        }
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_recover_context_session", fake_recover)
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    monkeypatch.setattr(
+        chat_mod, "_heal_unreachable_locked_model",
+        lambda _sid, locked, _requested: locked,
+    )
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability",
+        lambda _m: asyncio.sleep(0, result={
+            "context_limit": 320_000,
+            "context_raw_limit": 320_000,
+            "context_max_limit": 320_000,
+            "context_effective_percent": 100,
+            "catalog_auto_compact_threshold": 0,
+            "context_limit_source": "test_catalog",
+            "context_limit_is_estimate": False,
+        }),
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=must-not-send&model=codex:gpt-5.6-sol",
+    )
+    events = _parse_sse(response.text)
+    error = next(json.loads(data) for event, data in events if event == "error")
+    assert error["kind"] == "context_window"
+    assert error["recovered_session"]["id"] == (
+        "b0dc1a95-b1ab-42d6-bd0c-acde3b4bdb20")
+    assert error["recovery_stats"]["estimated_post_tokens"] == 24000
+    assert len(get_calls) == 2
+    assert context_reads == {"stale": 2, "fresh": 2}
+    assert stale.queried == ["/compact"]
+    assert fresh.queried == ["/compact"]
+    assert recoveries == [(
+        sid, "codex:gpt-5.6-sol", 310_000, 320_000,
+    )]
+
+
+def test_codex_preflight_context_tail_skips_pointless_second_compact(
+        stream_env, client, monkeypatch):
+    """A transcript-level context 400 goes straight to offline recovery."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    stale = _FakeStreamClient([compact_error])
+
+    async def full_context():
+        return {"maxTokens": 372_000, "rawMaxTokens": 372_000,
+                "autoCompactThreshold": 335_000, "totalTokens": 364_270}
+
+    stale.get_context_usage = full_context
+    recovered_id = "99fc776a-a812-4a53-baa2-c932fd0a4412"
+    recovery_calls = []
+
+    async def fake_recover(target_sid, model, *, pre_tokens, context_limit):
+        recovery_calls.append((target_sid, pre_tokens, context_limit))
+        return {
+            "session": {
+                "id": recovered_id, "session_id": recovered_id,
+                "name": "oversize · recovery", "model": model,
+            },
+            "stats": {"estimated_post_tokens": 20_000},
+        }
+
+    get_calls = []
+
+    async def fake_get_client(*args, **_kwargs):
+        get_calls.append(args)
+        return stale
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    monkeypatch.setattr(
+        chat_mod, "_heal_unreachable_locked_model",
+        lambda _sid, locked, _requested: locked,
+    )
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability",
+        lambda _m: asyncio.sleep(0, result={"max_input_tokens": 372_000}),
+    )
+    monkeypatch.setattr(
+        chat_mod, "_compact_tail_outcome",
+        lambda _path, _offset: {
+            "boundary": False, "summary": False, "context_error": True,
+        },
+    )
+    monkeypatch.setattr(chat_mod, "_recover_context_session", fake_recover)
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=must-not-hit-gateway&model=codex:gpt-5.6-sol",
+    )
+    error = next(
+        json.loads(data) for event, data in _parse_sse(response.text)
+        if event == "error"
+    )
+
+    assert len(get_calls) == 1
+    assert stale.queried == ["/compact"]
+    assert recovery_calls == [(sid, 364_270, 353_400)]
+    assert error["recovered_session"]["id"] == recovered_id
+    assert error["activity_source"] == "direct"
+
+
+def test_preflight_failure_snapshot_is_anchored_after_long_history(
+        stream_env, client, monkeypatch, tmp_path):
+    """A compact failure appends its durable bubble instead of jumping to top."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    transcript = tmp_path / f"{sid}.jsonl"
+    entries = []
+    parent = None
+    for index in range(12):
+        user_uuid = f"old-user-{index}"
+        assistant_uuid = f"old-assistant-{index}"
+        entries.extend([
+            {
+                "uuid": user_uuid,
+                "parentUuid": parent,
+                "type": "user",
+                "sessionId": sid,
+                "message": {"content": f"old prompt {index}"},
+            },
+            {
+                "uuid": assistant_uuid,
+                "parentUuid": user_uuid,
+                "type": "assistant",
+                "sessionId": sid,
+                "message": {"content": f"old answer {index}"},
+            },
+        ])
+        parent = assistant_uuid
+    transcript.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+    chat_mod._JSONL_PATH_CACHE[sid] = transcript
+
+    compact_error = ResultMessage(
+        subtype="error", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id=sid,
+        result="Your input exceeds the context window of this model",
+        api_error_status=400,
+    )
+    fake = _FakeStreamClient([compact_error])
+
+    async def full_context():
+        return {"maxTokens": 320_000, "rawMaxTokens": 320_000,
+                "autoCompactThreshold": 287_000, "totalTokens": 310_000}
+
+    fake.get_context_usage = full_context
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: False)
+    try:
+        response = client.get(
+            f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+            "&prompt=new-failed-prompt&model=codex:gpt-5.6-sol",
+        )
+        error = next(
+            json.loads(data)
+            for event, data in _parse_sse(response.text)
+            if event == "error"
+        )
+        assert error["snapshot_ready"] is True
+
+        history = client.get(
+            f"/api/chat/sessions/{sid}",
+            headers={"X-Auth-Token": TEST_TOKEN},
+            params={"tail": 6},
+        )
+        assert history.status_code == 200, history.text
+        messages = history.json()["messages"]
+        assert messages[-2]["role"] == "user"
+        assert messages[-2]["text"] == "new-failed-prompt"
+        assert messages[-1]["role"] == "assistant"
+        assert "Your input exceeds the context window" in messages[-1]["text"]
+        assert messages[-3]["text"] == "old answer 11"
+        assert messages[-1]["turn_status"] == "failed"
+    finally:
+        chat_mod._JSONL_PATH_CACHE.pop(sid, None)
+
+
+def test_codex_preflight_fresh_probe_recovers_after_stale_measurement_failure(
+        stream_env, client, monkeypatch):
+    """A successful boundary observed by the new process skips duplicate compact."""
+    chat_mod = stream_env
+    sid = _make_session(client)
+    compact_ok = ResultMessage(
+        subtype="success", duration_ms=2, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=sid, result="Compacted",
+    )
+    answer = [
+        AssistantMessage(
+            content=[TextBlock(text="recovered from probe")],
+            model="gpt-5.6-sol", uuid="a-probe", usage={}),
+        ResultMessage(
+            subtype="success", duration_ms=10, duration_api_ms=9,
+            is_error=False, num_turns=1, session_id=sid,
+            total_cost_usd=0.0, usage={}, result="ok", uuid="r-probe"),
+    ]
+    stale = _FakeStreamClient([compact_ok])
+    fresh = _FakeBatchedStreamClient([answer])
+    stale_reads = 0
+
+    async def stale_context():
+        nonlocal stale_reads
+        stale_reads += 1
+        if stale_reads > 1:
+            raise RuntimeError("stale probe transport closed")
+        return {"maxTokens": 320_000, "rawMaxTokens": 320_000,
+                "autoCompactThreshold": 287_000, "totalTokens": 310_000}
+
+    async def fresh_context():
+        return {"maxTokens": 320_000, "rawMaxTokens": 320_000,
+                "autoCompactThreshold": 287_000, "totalTokens": 60_000}
+
+    stale.get_context_usage = stale_context
+    fresh.get_context_usage = fresh_context
+    clients = [stale, fresh]
+
+    async def fake_get_client(*_args, **_kwargs):
+        return clients.pop(0)
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "disconnect_client", lambda _sid: asyncio.sleep(0))
+    monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    monkeypatch.setattr(
+        chat_mod, "_detect_gateway_context_capability",
+        lambda _m: asyncio.sleep(0, result={"max_input_tokens": 320_000}),
+    )
+
+    response = client.get(
+        f"/api/chat/stream?token={TEST_TOKEN}&session_id={sid}"
+        "&prompt=send-once&model=codex:gpt-5.6-sol",
+    )
+    events = _parse_sse(response.text)
+    assert stale.queried == ["/compact"]
+    assert fresh.queried == ["send-once"]
+    assert not [data for event, data in events if event == "error"]
 
 
 def test_watcher_publishes_settlement_into_live_turn_when_slot_is_busy(stream_env):
@@ -2894,7 +3909,10 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
 
     try:
         chat_mod._task_watchers[sid] = LiveWatcher()
-        assert chat_mod.session_active_status(sid) == {"active": False}
+        assert chat_mod.session_active_status(sid) == {
+            "active": False,
+            "activity_source": "",
+        }
 
         chat_mod._pin_background_task(sid, "task_live")
         active = chat_mod.session_active_status(sid)
@@ -2904,3 +3922,29 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
     finally:
         chat_mod._task_watchers.pop(sid, None)
         chat_mod._release_task_pins(sid, {"task_live"})
+
+
+def test_unpinned_watcher_is_retired_after_foreground_consumes_terminal(
+        stream_env):
+    """A watcher that missed its notification must not live for 30 minutes."""
+    chat_mod = stream_env
+    sid = "sid-stale-watcher-after-foreground"
+
+    async def run():
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        chat_mod._task_watchers[sid] = blocker
+        chat_mod._pin_background_task(sid, "task-foreground-won")
+        # The foreground turn wins routing of TaskNotification and clears the
+        # authoritative pin. The old watcher still waits on its own queue.
+        assert chat_mod._settle_background_task(
+            sid, "task-foreground-won") is True
+        await chat_mod._retire_unpinned_task_watcher(sid)
+        assert blocker.cancelled()
+        assert sid not in chat_mod._task_watchers
+        assert chat_mod._session_has_live_watcher(sid) is False
+
+    try:
+        asyncio.run(run())
+    finally:
+        chat_mod._task_watchers.pop(sid, None)
+        chat_mod._release_task_pins(sid, {"task-foreground-won"})

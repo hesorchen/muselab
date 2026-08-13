@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 
 def _capture_build_options(chat_mod, monkeypatch):
     captured = {}
@@ -26,6 +28,51 @@ def _capture_build_options(chat_mod, monkeypatch):
     monkeypatch.setattr(chat_mod, "UnsignedThinkingCompatibleClient", FakeClient)
     monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda sid: None)
     return captured
+
+
+@pytest.mark.asyncio
+async def test_cancelled_connect_disconnects_unpooled_client(
+    app_module,
+    monkeypatch,
+    tmp_path,
+):
+    from backend import chat as chat_mod
+    from backend import endpoints
+
+    connect_entered = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class CancelledConnectClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            connect_entered.set()
+            await asyncio.Event().wait()
+
+        async def disconnect(self):
+            disconnected.set()
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(
+        endpoints, "_VENDOR_CONFIG_DIR", tmp_path / "vendor-cfg")
+    monkeypatch.setattr(chat_mod, "ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr(
+        chat_mod, "UnsignedThinkingCompatibleClient", CancelledConnectClient)
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: None)
+
+    building = asyncio.create_task(chat_mod._build_and_connect_client(
+        "sid-cancel-connect", "deepseek-v4-pro", "bypassPermissions", ""))
+    await asyncio.wait_for(connect_entered.wait(), timeout=1)
+    building.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(building, timeout=1)
+    assert disconnected.is_set()
 
 
 def test_third_party_provider_enables_sdk_skills(app_module, monkeypatch, tmp_path):
@@ -288,8 +335,28 @@ def test_codex_gateway_effort_reaches_sdk_options(app_module, monkeypatch, tmp_p
     # Claude CLI must use the same effective window as the meter and native
     # compact preflight instead of its unrelated built-in 200K default.
     assert captured["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "258400"
+    assert captured["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "258400"
+    skill_guards = captured["hooks"]["PreToolUse"]
+    assert len(skill_guards) == 1
+    assert skill_guards[0].matcher == "Skill"
+
+    async def invoke_skill_guard(name):
+        return await skill_guards[0].hooks[0](
+            {"tool_input": {"skill": name}}, None, None)
+
+    denied = asyncio.run(invoke_skill_guard("claude-api"))
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "too large" in denied["hookSpecificOutput"]["permissionDecisionReason"]
+    assert asyncio.run(invoke_skill_guard("deep-research")) == {}
     for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
         assert captured["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == "gpt-5.5"
+
+    monkeypatch.setenv("MUSELAB_ALLOW_LARGE_CODEX_CLAUDE_API_SKILL", "1")
+    opted_out = _capture_build_options(chat_mod, monkeypatch)
+    asyncio.run(chat_mod._build_and_connect_client(
+        "sid-codex-skill-optout", "codex:gpt-5.5",
+        "bypassPermissions", "high"))
+    assert "PreToolUse" not in opted_out["hooks"]
 
 
 def test_codex_auto_and_ultra_fast_use_gateway_headers(
@@ -393,6 +460,7 @@ def test_bare_gpt_provider_never_inherits_codex_gateway_headers(
     assert captured["effort"] == "high"
     assert captured["thinking"] == {"type": "disabled"}
     assert "ANTHROPIC_CUSTOM_HEADERS" not in captured["env"]
+    assert "PreToolUse" not in captured["hooks"]
 
 
 def test_disable_skills_env_still_opts_out(app_module, monkeypatch, tmp_path):

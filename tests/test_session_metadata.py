@@ -23,6 +23,28 @@ def test_new_session_has_no_system_prompt(app_module):
     assert "system_prompt" not in s
 
 
+def test_session_state_files_are_private(app_module):
+    from backend import sessions as sess
+
+    legacy_dir = sess.SESS_DIR / "legacy"
+    legacy_dir.mkdir(mode=0o755)
+    legacy_path = legacy_dir / "old.sidecar.json"
+    legacy_path.write_text("{}", encoding="utf-8")
+    legacy_path.chmod(0o644)
+
+    sess.ensure_private_session_storage()
+    assert sess.SESS_DIR.stat().st_mode & 0o777 == 0o700
+    assert legacy_dir.stat().st_mode & 0o777 == 0o700
+    assert legacy_path.stat().st_mode & 0o777 == 0o600
+    sess.set_message_annotation(
+        "privacy-sidecar-test", "assistant-privacy", model="fixture")
+    path = sess.SESS_DIR / "privacy-sidecar-test.sidecar.json"
+    try:
+        assert path.stat().st_mode & 0o777 == 0o600
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_legacy_system_prompt_is_inert_and_hidden(app_module, monkeypatch):
     from backend import sessions as sess
     from backend.settings import atomic_write_text
