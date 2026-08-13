@@ -12,6 +12,8 @@ POST   /api/scheduler/ack           — mark unread = 0 (called when user opens 
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -125,9 +127,55 @@ def patch_task_endpoint(tid: str, req: TaskPatch) -> dict:
 
 
 @router.delete("/tasks/{tid}", dependencies=[Depends(require_token)])
-def delete_task_endpoint(tid: str) -> dict:
-    if not sched.delete_task(tid):
+async def delete_task_endpoint(tid: str) -> dict:
+    task = sched.get_task(tid)
+    if not task:
         raise HTTPException(404, "task not found")
+    # Remove scheduler ownership first, then use chat's async purge path so
+    # asyncio turns/watchers are cancelled on the event-loop thread. The sync
+    # scheduler helper remains available for non-server callers and tests.
+    if not sched.delete_task(tid, purge_bound_session=False):
+        raise HTTPException(404, "task not found")
+    # delete_task() installs the durable in-process revocation fence before it
+    # returns.  Now cancel and join every tracked incarnation so a run that was
+    # already inside the SDK cannot append history/unread state after DELETE
+    # has acknowledged success.  This is required for fresh tasks too even
+    # though their completed sessions are intentionally retained.
+    async def _finish_cleanup() -> None:
+        runs, _, session_ids = sched.cancel_runs_for_task_now(tid)
+        # A cancelled SDK receive/connect may not unwind until its CLI
+        # transport is closed. Disconnect captured runtimes before waiting
+        # for the owners; fresh sessions remain on disk, this only releases
+        # live clients.
+        if session_ids:
+            from .chat import disconnect_client
+            results = await asyncio.gather(
+                *(disconnect_client(sid) for sid in session_ids),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        await sched.join_cancelled_runs(runs)
+        if (sched._effective_session_mode(task) == "reuse"
+                and task.get("session_id")):
+            from .chat import purge_session_storage_async
+            await purge_session_storage_async(task["session_id"])
+
+    cleanup = asyncio.create_task(_finish_cleanup())
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        # Once the task has been durably removed/revoked, an HTTP disconnect
+        # must not leave its runtime half-cleaned. Preserve caller cancellation
+        # only after the exact cleanup owner reaches a terminal result.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
     return {"deleted": tid}
 
 

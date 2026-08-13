@@ -27,7 +27,7 @@ from claude_agent_sdk import (
     ToolUseBlock, ToolResultBlock, StreamEvent,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
     TaskUpdatedMessage, TERMINAL_TASK_STATUSES,
-    RateLimitEvent,
+    RateLimitEvent, SystemMessage,
     ClaudeSDKError,
     ThinkingConfigEnabled, ThinkingConfigDisabled, ThinkingConfigAdaptive,
     EffortLevel,
@@ -52,6 +52,7 @@ from .settings import (
 )
 from . import sessions as sess
 from . import endpoints
+from . import context_recovery
 from . import transcript_index as transcript_idx
 from .workspaces import (
     registry as workspace_registry,
@@ -227,6 +228,43 @@ def _build_ultra_skill_hook():
     return ultra_skill_hook
 
 
+def _build_codex_skill_guard_hook():
+    """Keep one known-oversized built-in Skill from killing Codex sessions.
+
+    Claude Code's bundled ``claude-api`` Skill can inject hundreds of
+    thousands of characters in a single tool call.  A Codex Gateway turn can
+    therefore jump from below the preflight threshold to beyond the model's
+    hard window before native auto-compaction gets another chance to run.  A
+    PreToolUse hook is used instead of a broad ``Skill`` deny so every normal
+    project/user Skill remains available.  Operators who knowingly run a
+    larger-window gateway can opt out explicitly.
+    """
+    async def guard(input_data, _tool_use_id, _context):
+        tool_input = (
+            input_data.get("tool_input")
+            if isinstance(input_data, dict) else {}
+        )
+        name = str(
+            (tool_input or {}).get("skill")
+            or (tool_input or {}).get("name")
+            or ""
+        ).strip().lower()
+        if name not in {"claude-api", "claude_api"}:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "The claude-api Skill is too large for this Codex Gateway "
+                    "context window. Use focused documentation/search instead."
+                ),
+            }
+        }
+
+    return guard
+
+
 def _cli_project_roots() -> list[Path]:
     """Return the directories where Claude CLI writes session JSONLs:
 
@@ -305,6 +343,71 @@ def _find_session_jsonl(sid: str) -> Path | None:
                 _JSONL_PATH_CACHE[sid] = hit
                 return hit
     return None
+
+
+def _compact_tail_cursor(sid: str) -> tuple[Path | None, int]:
+    """Snapshot the transcript byte boundary before one native compact.
+
+    Only the newly appended tail is inspected afterwards.  This avoids both a
+    repeated multi-megabyte scan and accidentally treating an older compact or
+    API failure as the outcome of the command that just ran.
+    """
+    path = _find_session_jsonl(sid)
+    if path is None:
+        return None, 0
+    try:
+        return path, path.stat().st_size
+    except OSError:
+        return path, 0
+
+
+def _compact_tail_outcome(path: Path | None, offset: int) -> dict[str, bool]:
+    """Return privacy-safe facts from records appended by one ``/compact``.
+
+    Some CLI/Gateway combinations return a nominally successful ResultMessage
+    while writing the real context-window 400 only as a ``system``
+    ``local_command`` transcript record.  Token verification catches the
+    no-op, but without this tail check MuseLab wastes another identical retry
+    on a fresh process.  Conversely, a real compact boundary is authoritative
+    even when the control-plane usage reading is briefly stale.
+    """
+    result = {
+        "boundary": False,
+        "summary": False,
+        "context_error": False,
+    }
+    if path is None:
+        return result
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(offset if 0 <= offset <= size else 0)
+            raw = handle.read()
+    except OSError:
+        return result
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("subtype") == "compact_boundary":
+            result["boundary"] = True
+        if entry.get("isCompactSummary") is True:
+            result["summary"] = True
+        if entry.get("subtype") != "local_command":
+            continue
+        data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+        text = str(entry.get("content") or data.get("content") or "").lower()
+        if any(marker in text for marker in (
+            "context window", "context length", "input exceeds",
+            "maximum context", "prompt too long", "too many tokens",
+        )):
+            result["context_error"] = True
+    return result
 
 
 @contextmanager
@@ -535,6 +638,10 @@ _BROADCAST_SUBSCRIBER_MAX_EVENTS = env_int(
 _BROADCAST_SUBSCRIBER_MAX_BYTES = env_int(
     "MUSELAB_STREAM_SUBSCRIBER_MAX_BYTES", 1024 * 1024, min_value=1024)
 
+# Internal delimiter between one message's ephemeral live deltas and the next
+# durable spool event.  It never leaves `_TurnSubscriber` or reaches the wire.
+_LIVE_MESSAGE_BARRIER = object()
+
 
 def _broadcast_event_size(event: dict) -> int:
     try:
@@ -652,25 +759,65 @@ class _TurnSubscriber:
         # Deltas produced while attached. Bounded: a stalled HTTP connection
         # must not grow this without limit. Overflow degrades to a resync
         # rather than silently dropping text (see publish_live()).
-        self._live_q: deque[dict] = deque()
+        self._live_q: deque[Any] = deque()
+        self._draining_live_barrier = False
         self._wake = asyncio.Event()
         self._done = False
 
     async def get(self):
-        if self._resync_reason:
-            reason, self._resync_reason = self._resync_reason, ""
-            return {
-                "event": "resync",
-                "data": json.dumps({"reason": reason, "retryable": True}),
-            }
-        if self._replay is None:
-            return None
         while True:
+            # `resync()` can run while this coroutine is asleep in
+            # `_wake.wait()`. It closes the reader immediately, so re-check at
+            # every loop boundary before touching `_replay`; checking only at
+            # function entry turned an intended resync frame into a None.tell
+            # AttributeError under live-delta backpressure.
+            if self._resync_reason:
+                reason, self._resync_reason = self._resync_reason, ""
+                return {
+                    "event": "resync",
+                    "data": json.dumps({"reason": reason, "retryable": True}),
+                }
+            if self._replay is None:
+                return None
+            if self._draining_live_barrier:
+                if self._live_q:
+                    event = self._live_q.popleft()
+                    if event is _LIVE_MESSAGE_BARRIER:
+                        self._draining_live_barrier = False
+                        continue
+                    return event
+                if self._done:
+                    # Every skipped coalesced record is paired synchronously
+                    # with a marker. Reaching terminal state without it means
+                    # the presentation channel cannot prove ordering; force a
+                    # canonical resync instead of emitting a later `done`.
+                    self._draining_live_barrier = False
+                    return {
+                        "event": "resync",
+                        "data": json.dumps({
+                            "reason": "live_barrier_missing",
+                            "retryable": True,
+                        }),
+                    }
+                self._wake.clear()
+                if self._live_q:
+                    continue
+                await self._wake.wait()
+                continue
             event = self._next_spool_event()
+            if event is _LIVE_MESSAGE_BARRIER:
+                self._draining_live_barrier = True
+                continue
             if event is not None:
                 return event
             if self._live_q:
-                return self._live_q.popleft()
+                event = self._live_q.popleft()
+                # Defensive only: a paired coalesced spool line is always read
+                # first. Never leak an internal marker if a corrupt line made
+                # that pair unreadable.
+                if event is _LIVE_MESSAGE_BARRIER:
+                    continue
+                return event
             if self._done:
                 self.close_reader()
                 return None
@@ -678,10 +825,16 @@ class _TurnSubscriber:
             # Close the clear/append race: publish() may have written between
             # the first EOF read and clear(). Recheck before sleeping.
             event = self._next_spool_event()
+            if event is _LIVE_MESSAGE_BARRIER:
+                self._draining_live_barrier = True
+                continue
             if event is not None:
                 return event
             if self._live_q:
-                return self._live_q.popleft()
+                event = self._live_q.popleft()
+                if event is _LIVE_MESSAGE_BARRIER:
+                    continue
+                return event
             if self._done:
                 self.close_reader()
                 return None
@@ -703,8 +856,11 @@ class _TurnSubscriber:
             coalesced = event.pop("_coalesced", False)
             if coalesced and offset >= self._skip_from:
                 # Streamed to us live, token by token — emitting the coalesced
-                # form too would duplicate the whole message.
-                continue
+                # form too would duplicate the whole message. Stop at its
+                # live-channel delimiter before reading a later tool/done row;
+                # otherwise a slow subscriber observes `done` before the text
+                # still queued for this exact segment.
+                return _LIVE_MESSAGE_BARRIER
             return event
 
     def qsize(self) -> int:
@@ -730,6 +886,14 @@ class _TurnSubscriber:
             self.resync("live_backlog")
             return False
         self._live_q.append(event)
+        self._wake.set()
+        return True
+
+    def publish_live_barrier(self) -> bool:
+        """Close the current live-delta segment without emitting a wire event."""
+        if self._done:
+            return False
+        self._live_q.append(_LIVE_MESSAGE_BARRIER)
         self._wake.set()
         return True
 
@@ -809,6 +973,9 @@ class TurnBroadcast:
         # cannot distinguish the classic ABA race where turn A finishes and
         # turn B starts before a reconnect for A reaches the server.
         self.turn_id = str(uuid.uuid4())
+        # Queue ownership is durable. A claimed item stays in the queue sidecar
+        # until this exact turn finishes and acknowledges it.
+        self.queue_item_id: str = ""
         # Headless background-task continuations are separate turns, linked to
         # the user turn that launched the task for observability and recovery.
         self.parent_turn_id: str = ""
@@ -838,6 +1005,10 @@ class TurnBroadcast:
         self.transcript_boundary: dict[str, Any] = {}
         self.canonical_terminal_published = False
         self.cancelled_snapshot_persisted = False
+        # Result-only/API transport failures can end without a canonical
+        # AssistantMessage UUID. Keep their display record separately so a
+        # refresh cannot erase the visible error or relabel an older reply.
+        self.failed_snapshot_persisted = False
         self.cancelled_snapshot_suppressed = False
         self.cancelled_snapshot_lock = threading.Lock()
         # True for a HEADLESS CONTINUATION turn: the cross-turn task watcher
@@ -866,11 +1037,33 @@ class TurnBroadcast:
         # before the client exists in `_clients` and before `self.task` above is
         # created. `_start_turn` owns and clears this handle.
         self.startup_task: "asyncio.Task | None" = None
+        # Outer task currently running `_start_turn`.  Deletion must join this
+        # owner, not only the nested SDK startup task: cancelling the latter
+        # makes the outer owner create the Activity/snapshot cleanup slightly
+        # later.  Without this handle DELETE could return before that late
+        # cleanup existed and the deleted session could re-enter replay state.
+        self.startup_owner_task: "asyncio.Task | None" = None
         # The global activity row starts as soon as this broadcast reserves the
         # session, before cold client/MCP startup. Startup failure/cancellation
         # uses this bit to close only rows that were actually created.
         self.activity_started = False
         self.activity_hidden = False
+
+    @property
+    def activity_source(self) -> str:
+        """Stable notification class for this logical turn.
+
+        Session id alone cannot tell a foreground reply from a turn claimed
+        by the durable queue, and continuation broadcasts deliberately reuse
+        the originating session.  Send this explicit class on every terminal
+        and active-state payload so the browser only auto-acknowledges work it
+        was actually watching.
+        """
+        if self.is_continuation:
+            return "background"
+        if self.queue_item_id:
+            return "queued"
+        return "direct"
 
     def publish(self, event: dict) -> None:
         """Route one SSE event to the record channel, the live channel, or both.
@@ -952,6 +1145,12 @@ class TurnBroadcast:
         self._compact_parts = []
         self._compact_chars = 0
         self._append_replay(event)
+        # `_append_replay` and these markers run synchronously on the same
+        # event-loop turn: a reader woken by the spool append cannot interleave
+        # before every currently-attached subscriber receives its delimiter.
+        for subscriber in tuple(self.subscribers):
+            if not subscriber.publish_live_barrier():
+                self.subscribers.discard(subscriber)
 
     def replay_count(self) -> int:
         return len(self.events) + (1 if self._compact_kind is not None else 0)
@@ -1126,12 +1325,11 @@ _background_turn_started_at: dict[str, float] = {}
 # continuation gets its own turn_id and exposes this value as parent_turn_id.
 _background_origin_turn_id: dict[str, str] = {}
 # Activity Center completion deferred past the main ResultMessage while an SDK
-# background task still owns the logical turn.  The value is the status the
-# originating turn would have published at its terminal boundary.  The final
-# watcher generation consumes it only after the last task notification and its
-# auto-continuation have both settled, keeping the global running dot aligned
-# with the tab's ``background_active`` dot.
-_background_activity_finishes: dict[str, str] = {}
+# background task still owns the logical turn. The value retains both the
+# terminal status and the Activity incarnation owner. A later foreground turn
+# may reuse the same session row while the old watcher is still alive; the
+# owner id prevents that stale watcher from closing the newer row.
+_background_activity_finishes: dict[str, tuple[str, str]] = {}
 # Monotonic per-session ownership token for detached continuation readers.
 # Cancelling a task is cooperative, so a replaced watcher can receive one more
 # message before CancelledError lands. Generation checks keep that stale reader
@@ -1254,6 +1452,7 @@ def _write_active_turn_sidecar(bc: TurnBroadcast) -> None:
                 "started_at": bc.started_at,
                 "turn_id": bc.turn_id,
             }, ensure_ascii=False),
+            mode=0o600,
         )
     except Exception as e:
         sys.stderr.write(
@@ -2366,6 +2565,17 @@ async def _build_and_connect_client(
                 hooks=user_prompt_hooks,
                 timeout=mem0.RECALL_HOOK_TIMEOUT,
             )],
+            **({
+                "PreToolUse": [HookMatcher(
+                    matcher="Skill",
+                    hooks=[_build_codex_skill_guard_hook()],
+                )],
+            } if (
+                _is_codex_gateway_model(model)
+                and os.environ.get(
+                    "MUSELAB_ALLOW_LARGE_CODEX_CLAUDE_API_SKILL", ""
+                ).strip().lower() not in {"1", "true", "yes", "on"}
+            ) else {}),
             "PostToolUse": [HookMatcher(
                 matcher="ExitPlanMode",
                 hooks=[post_exit_hook],
@@ -2488,6 +2698,13 @@ async def _build_and_connect_client(
             if effective_limit:
                 env_ovr = dict(env_ovr)
                 env_ovr["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(effective_limit)
+                # Since Claude CLI 2.1.159, local/SDK sessions can silently
+                # skip turn-internal auto-compaction unless its window source
+                # is explicit. Pass the full effective window here: the CLI
+                # itself subtracts output/compaction reserves and reports the
+                # resulting lower autoCompactThreshold. Pre-multiplying by
+                # 0.9 would reserve twice and compact far too early.
+                env_ovr["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(effective_limit)
         opts_kwargs["env"] = env_ovr
     else:
         # DUCC owns auth through claude-go and does not use native Claude's
@@ -2636,7 +2853,14 @@ async def _build_and_connect_client(
     )
     try:
         client = client_cls(options=ClaudeAgentOptions(**opts_kwargs))
-        await client.connect()
+        try:
+            await client.connect()
+        except BaseException:
+            # connect() may already have spawned the CLI before it becomes
+            # cancellable. Until this function returns, the client is not in
+            # the pool and no other cleanup path can reach it.
+            await _disconnect_unpooled_client(client, session_id)
+            raise
         return client
     except Exception as e:
         # Two failure modes we recover from by swapping session_id ⇔ resume:
@@ -2673,7 +2897,11 @@ async def _build_and_connect_client(
             try:
                 client = client_cls(
                     options=ClaudeAgentOptions(**opts_kwargs))
-                await client.connect()
+                try:
+                    await client.connect()
+                except BaseException:
+                    await _disconnect_unpooled_client(client, session_id)
+                    raise
                 if attempt > 0:
                     sys.stderr.write(
                         f"[chat] sid={session_id[:8]} connect retry "
@@ -2843,6 +3071,42 @@ def _has_enabled_external_mcp() -> bool:
     return False
 
 
+async def _disconnect_unpooled_client(
+    client: ClaudeSDKClient,
+    session_id: str,
+) -> None:
+    """Boundedly close a connected client that never entered the pool.
+
+    Once a cold client exists locally, cancellation must not drop its only
+    Python handle before the CLI subprocess is reaped. A child task plus
+    shield lets cleanup finish under the original cancellation; a repeated
+    cancellation is re-raised only after the bounded disconnect settles.
+    """
+    async def _sdk_disconnect() -> None:
+        try:
+            # The SDK close path is already bounded and escalates graceful →
+            # TERM → KILL. Wrapping it in a shorter wait_for cancels at the
+            # graceful boundary and skips that escalation, which can leave the
+            # only handle to an unpooled CLI orphaned for the service lifetime.
+            await client.disconnect()
+        except Exception as exc:
+            sys.stderr.write(
+                f"[client-pool] unpooled {session_id[:8]} disconnect err: "
+                f"{type(exc).__name__}\n"
+            )
+
+    cleanup = asyncio.create_task(_sdk_disconnect())
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def get_client(session_id: str, model: str, permission: str = "bypassPermissions",
                      effort: str = "",
                      service_tier: str = "",
@@ -2859,6 +3123,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
 
     effort: "auto" / "low" / "medium" / "high" / "xhigh" / "max" / "ultra".
     Empty string remains accepted as a legacy spelling of ``auto``."""
+    if sess.session_is_deleting(session_id):
+        raise RuntimeError("session is being deleted")
     if session_id in _pending_runtime_rebuilds:
         # Callers that operate a session hold its runtime lock. Consuming the
         # marker here closes the race where a new turn reserves the active slot
@@ -2887,6 +3153,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
             _client_plan_return.get(key, "") if cached is not None else "")
 
     if cached is not None:
+        if sess.session_is_deleting(session_id):
+            raise RuntimeError("session is being deleted")
         # Permission is part of the runtime's launch contract even though it
         # is not part of the storage key. In particular, a process launched in
         # default mode may reject a later switch to bypassPermissions. Never
@@ -2923,6 +3191,8 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         # different launch modes. The creation lock coalesces them, but the
         # waiter must still reject the runtime built with the other mode.
         if cached is not None:
+            if sess.session_is_deleting(session_id):
+                raise RuntimeError("session is being deleted")
             if (cached_perm == permission
                     and (permission != "plan"
                          or cached_plan_return == plan_return_permission)):
@@ -2946,8 +3216,12 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         # entirely when no external MCP server is configured (the default):
         # the in-process 'muselab' server connects synchronously during
         # connect(), so there's nothing left to settle.
-        if _has_enabled_external_mcp():
-            await _await_mcp_ready(client)
+        try:
+            if _has_enabled_external_mcp():
+                await _await_mcp_ready(client)
+        except BaseException:
+            await _disconnect_unpooled_client(client, session_id)
+            raise
 
         # Commit + LRU eviction. Eviction's await disconnect() runs
         # OUTSIDE _lock (the disconnect can take up to 5 s). Eviction
@@ -2957,19 +3231,30 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
         to_disconnect: list[
             tuple[_ClientKey, ClaudeSDKClient, "_SessionStream | None"]
         ] = []
+        reject_deleting = False
         async with _lock:
-            _clients[key] = client
-            _client_permission[key] = permission
-            if permission == "plan":
-                _client_plan_return[key] = plan_return_permission
-            else:
-                _client_plan_return.pop(key, None)
-            # Start the sole reader for this client BEFORE anyone can consume
-            # it. Turns and the background-task watcher both attach to this
-            # pump instead of opening their own iterator over the same stream.
-            _ensure_session_stream(key, client)
-            _client_lru.append(key)
-            while len(_client_lru) > _CLIENT_POOL_CAP:
+            # Linearize pool commit with DELETE's lifecycle tombstone. If
+            # commit wins, DELETE's later disconnect sees this client; if the
+            # tombstone wins, no pool/stream/LRU state is published at all.
+            # Keep this synchronous section await-free. Lock order is
+            # _lock(async) -> lifecycle(threading) -> queue(threading).
+            with sess.session_lifecycle_lock(session_id):
+                reject_deleting = sess.session_is_deleting(session_id)
+                if not reject_deleting:
+                    _clients[key] = client
+                    _client_permission[key] = permission
+                    if permission == "plan":
+                        _client_plan_return[key] = plan_return_permission
+                    else:
+                        _client_plan_return.pop(key, None)
+                    # Start the sole reader for this client BEFORE anyone can
+                    # consume it. Turns and the background-task watcher both
+                    # attach to this pump instead of opening their own
+                    # iterator over the same stream.
+                    _ensure_session_stream(key, client)
+                    _client_lru.append(key)
+            while (not reject_deleting
+                   and len(_client_lru) > _CLIENT_POOL_CAP):
                 # Find the oldest evictable client: not ourselves, not
                 # currently streaming. If every cached client is live,
                 # leave the pool over its cap until the next eviction
@@ -2984,6 +3269,12 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                     # kills the CLI subprocess, which would abort the running
                     # task and the watcher draining its notification stream.
                     if k[0] in _sessions_with_inflight_tasks:
+                        continue
+                    # A just-settled task can clear its pin before the watcher
+                    # finishes the final auto-continuation/grace cleanup. The
+                    # pump is still owned during that window, so eviction is
+                    # just as destructive as it is while the pin is present.
+                    if _session_has_live_watcher(k[0]):
                         continue
                     candidate_idx = i
                     break
@@ -3003,6 +3294,10 @@ async def get_client(session_id: str, model: str, permission: str = "bypassPermi
                     # client, leaving that whole stream graph alive forever.
                     old_stream = _session_streams.pop(old_key, None)
                     to_disconnect.append((old_key, old_client, old_stream))
+
+        if reject_deleting:
+            await _disconnect_unpooled_client(client, session_id)
+            raise RuntimeError("session is being deleted")
 
         for old_key, c, old_stream in to_disconnect:
             if old_stream is not None:
@@ -3264,7 +3559,7 @@ async def shutdown_runtime() -> None:
     tasks.update(task for task in _maintenance_tasks if not task.done())
     for broadcast in tuple(_active_turns.values()):
         broadcast.cancelled = True
-        for attr in ("startup_task", "task"):
+        for attr in ("startup_task", "startup_owner_task", "task"):
             task = getattr(broadcast, attr, None)
             if isinstance(task, asyncio.Task) and not task.done():
                 tasks.add(task)
@@ -4394,6 +4689,13 @@ def _sdk_messages_to_ui(sm_list: list, annotations: dict[str, dict],
         turn_status = ann.get("turn_status")
         if turn_status and "turn_status" not in entry:
             entry["turn_status"] = turn_status
+        # Recall trace is footer metadata too.  The live `done` event carries
+        # it for the first paint; fan the persisted sidecar value across every
+        # bubble produced by the assistant UUID so a refresh/tool-ending turn
+        # keeps the same memory badge on its actual visual tail.
+        memory_recall = ann.get("memory_recall")
+        if memory_recall and "memoryRecall" not in entry:
+            entry["memoryRecall"] = memory_recall
         # User-msg image annotations (thumb + url for the lightbox)
         # live in the sidecar — the inline `image_refs` extracted from
         # the SDK content blocks only carry `mime`. Layer the sidecar's
@@ -4453,11 +4755,20 @@ def _describe_transcript_record(entry: dict) -> dict:
 
 
 def _ensure_transcript_index(sid: str) -> tuple[Path, dict] | None:
-    path = _find_session_jsonl(sid)
-    if path is None:
-        return None
-    return path, transcript_idx.ensure_index(
-        sid, path, _transcript_index_path(sid), _describe_transcript_record)
+    # Index construction runs in worker threads and cannot be interrupted by
+    # cancelling the awaiting asyncio task. Linearize its final disk write with
+    # explicit session deletion: if indexing wins, DELETE waits and then
+    # removes the file; if the tombstone wins, this worker becomes a no-op.
+    # Holding the lifecycle stripe across ensure_index is intentional because
+    # checking only before its atomic write still leaves a check/write race.
+    with sess.session_lifecycle_lock(sid):
+        if sess.session_is_deleting(sid):
+            return None
+        path = _find_session_jsonl(sid)
+        if path is None:
+            return None
+        return path, transcript_idx.ensure_index(
+            sid, path, _transcript_index_path(sid), _describe_transcript_record)
 
 
 def _indexed_turn_context(
@@ -4572,6 +4883,82 @@ def _indexed_ui_records(
                         bubble["bash"] = parsed
         elif bubble.get("role") == "tool_use" and tool_id in task_status:
             bubble["task_status"] = task_status[tool_id]
+
+    # A bounded tail can begin after the AssistantMessage that owns the
+    # completion annotation while still containing the actual visual tail
+    # (for example 100 tool-result rows after one assistant tool-use record).
+    # Pull the footer donor through the index, but only when this window
+    # contains that logical turn's true final visible record. This preserves
+    # memory/status on cold reload without inventing a footer in the middle of
+    # an older paged window.
+    records = index.get("records") or []
+    selected_ids = set(record_indices)
+    by_uuid = {
+        str(record.get("uuid") or ""): record_i
+        for record_i, record in enumerate(records)
+        if record.get("uuid")
+    }
+    origin_cache: dict[int, str] = {}
+    origin_resolving: set[int] = set()
+
+    def logical_origin(record_i: int) -> str:
+        cached = origin_cache.get(record_i)
+        if cached is not None:
+            return cached
+        record = records[record_i]
+        uid = str(record.get("uuid") or "")
+        if record_i in origin_resolving:
+            return uid
+        if record.get("real_user_prompt") or record.get("task_notifications"):
+            origin_cache[record_i] = uid
+            return uid
+        origin_resolving.add(record_i)
+        parent_i = by_uuid.get(str(record.get("parent") or ""))
+        origin = logical_origin(parent_i) if parent_i is not None else uid
+        origin_resolving.discard(record_i)
+        origin_cache[record_i] = origin
+        return origin
+
+    orders = index.get("orders") or {}
+    normal_order = list(orders.get("normal") or [])
+    chosen_order = (
+        normal_order
+        if selected_ids.issubset(set(normal_order))
+        else list(orders.get("full") or [])
+    )
+    terminal_record: dict[str, int] = {}
+    donors: dict[str, dict[str, Any]] = {}
+    for record_i in chosen_order:
+        if record_i < 0 or record_i >= len(records):
+            continue
+        record = records[record_i]
+        origin = logical_origin(record_i)
+        if int(record.get("bubble_count") or 0) > 0:
+            terminal_record[origin] = record_i
+        ann = annotations.get(str(record.get("uuid") or "")) or {}
+        if ann:
+            donor = donors.setdefault(origin, {})
+            for source, target in (
+                ("ts", "ts"),
+                ("elapsed_s", "elapsed"),
+                ("model", "model"),
+                ("turn_status", "turn_status"),
+                ("memory_recall", "memoryRecall"),
+            ):
+                value = ann.get(source)
+                if value is not None and value != "":
+                    donor[target] = value
+    tail_by_origin: dict[str, dict] = {}
+    for bubble in bubbles:
+        origin = str(bubble.get("_turn_origin_uuid") or "")
+        if origin:
+            tail_by_origin[origin] = bubble
+    for origin, tail in tail_by_origin.items():
+        if terminal_record.get(origin) not in selected_ids:
+            continue
+        for field, value in (donors.get(origin) or {}).items():
+            if tail.get(field) is None or tail.get(field) == "":
+                tail[field] = value
     return bubbles
 
 
@@ -4680,6 +5067,38 @@ def _complete_turn_footer_metadata(
             tail["elapsed"] = elapsed
         if footer_model:
             tail["model"] = footer_model
+        memory_recall = last_value("memoryRecall")
+        if memory_recall:
+            tail["memoryRecall"] = memory_recall
+
+
+def _persistable_memory_recall(trace: Any) -> dict | None:
+    """Return the privacy-minimal recall receipt safe for a session sidecar.
+
+    Memory contents already live in the private memory registry.  Persist only
+    stable IDs and non-content diagnostics here; the authenticated UI hydrates
+    item details on demand.  This avoids creating a second long-lived copy of
+    recalled personal text in every conversation annotation file.
+    """
+    if not isinstance(trace, dict):
+        return None
+    out = {
+        key: trace.get(key)
+        for key in ("id", "count", "latency_ms", "status")
+        if trace.get(key) is not None
+    }
+    items = []
+    for item in trace.get("items") or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        items.append({
+            key: item.get(key)
+            for key in ("id", "kind", "score")
+            if item.get(key) is not None
+        })
+    if items:
+        out["items"] = items
+    return out or None
 
 
 def _bind_pending_attachments(sid: str, messages: list[dict]) -> None:
@@ -5590,6 +6009,7 @@ def _cancelled_snapshot_canonical_span(
     started_ms = int(snapshot.get("started_at_ms") or 0)
     interrupted_ms = int(snapshot.get("interrupted_at_ms") or 0)
     canonical_terminal = bool(snapshot.get("canonical_terminal_published"))
+    terminal_status = str(snapshot.get("terminal_status") or "")
     origin_i: int | None = None
     for candidate_position, record_i in enumerate(real_user_ids):
         record_uuid = str(records[record_i].get("uuid") or "")
@@ -5598,17 +6018,29 @@ def _cancelled_snapshot_canonical_span(
             # A canonical ResultMessage means this query definitely reached
             # the transcript even on legacy rows without timestamps.  The
             # first real prompt after the pre-query boundary is therefore it.
-            if canonical_terminal and candidate_position == 0:
+            # Failed display snapshots are stricter: they may represent a
+            # gateway rejection before the user row was flushed. Treating the
+            # first later legacy/no-timestamp prompt as that failed turn would
+            # hide a legitimate resend and relabel its assistant failed.
+            if (canonical_terminal and candidate_position == 0
+                    and snapshot.get("terminal_status") != "failed"):
                 origin_i = record_i
             break
         if started_ms and ts_ms < started_ms - 5_000:
             continue
-        if interrupted_ms and ts_ms <= interrupted_ms + 250:
+        # Failed snapshots can be created before the rejected user row ever
+        # reaches the transcript. A deliberate retry may happen immediately;
+        # never absorb a timestamped prompt *after* the failure merely because
+        # it arrived inside the normal 250 ms late-flush tolerance. Interrupted
+        # turns still retain that tolerance because their original user row is
+        # known to have entered the live SDK stream.
+        terminal_slack_ms = 0 if terminal_status == "failed" else 250
+        if interrupted_ms and ts_ms <= interrupted_ms + terminal_slack_ms:
             origin_i = record_i
             break
         # A post-interrupt prompt belongs to a resend/new turn.  Never borrow
         # its assistant merely because the user repeated the exact same text.
-        if interrupted_ms and ts_ms > interrupted_ms + 250:
+        if interrupted_ms and ts_ms > interrupted_ms + terminal_slack_ms:
             break
 
     if origin_i is None:
@@ -5665,6 +6097,60 @@ def _cancelled_snapshot_canonical_span(
     return span, tail_assistant_uuid
 
 
+def _turn_uuids_from_boundary(
+    sid: str,
+    boundary: dict[str, Any],
+    *,
+    started_at_ms: int,
+    terminal_at_ms: int,
+    want_image_user: bool,
+) -> tuple[str | None, str | None]:
+    """Resolve only UUIDs owned by the turn after a pre-query boundary.
+
+    A naive "latest assistant" tail scan can return the previous turn when
+    the current Gateway failure has only a ResultMessage. Reuse the indexed
+    parent-chain resolver used by recovery snapshots so a UUID is returned
+    only when it descends from this turn's real user prompt after the exact
+    pre-query record coordinate.
+    """
+    try:
+        indexed = _ensure_transcript_index(sid)
+        if indexed is None:
+            return None, None
+        transcript_path, index = indexed
+        probe = {
+            "transcript_boundary": dict(boundary or {}),
+            "started_at_ms": int(started_at_ms or 0),
+            "terminal_at_ms": int(terminal_at_ms or 0),
+            "interrupted_at_ms": int(terminal_at_ms or 0),
+            "canonical_terminal_published": True,
+        }
+        span, assistant_uuid = _cancelled_snapshot_canonical_span(
+            transcript_path, index, probe)
+        if not span:
+            return assistant_uuid or None, None
+        span_set = set(span)
+        user_uuid: str | None = None
+        for record in index.get("records") or []:
+            uid = str(record.get("uuid") or "")
+            if uid not in span_set or not record.get("real_user_prompt"):
+                continue
+            if want_image_user and not record.get("has_inline_images"):
+                continue
+            user_uuid = uid
+            break
+        return assistant_uuid or None, user_uuid
+    except Exception as exc:
+        # Annotation enrichment is best-effort. Never fall back to an
+        # unbounded/latest UUID on failure; leaving a footer receipt absent is
+        # safer than mutating a prior turn.
+        sys.stderr.write(
+            f"[chat] turn UUID boundary resolve skipped sid={sid[:8]} "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        return None, None
+
+
 def _heal_cancelled_snapshot_from_canonical(
     sid: str,
     path: Path,
@@ -5672,11 +6158,14 @@ def _heal_cancelled_snapshot_from_canonical(
     transcript_path: Path,
     index: dict,
 ) -> bool:
-    """Promote a late canonical assistant to the snapshot's cancelled truth.
+    """Promote a late canonical assistant to the snapshot's terminal truth.
 
     Until an assistant exists, dynamically hide any duplicate canonical user
-    rows and keep rendering the private snapshot.  Once the assistant arrives,
-    annotate its exact UUID and retire only this validated snapshot file.
+    rows and keep rendering the private snapshot.  An interrupted snapshot can
+    retire once the assistant arrives because its missing truth is only footer
+    metadata.  A failed snapshot also owns a separate terminal error bubble;
+    an arbitrary partial assistant does not prove that bubble was persisted,
+    so the display snapshot must remain authoritative.
     """
     span, assistant_uuid = _cancelled_snapshot_canonical_span(
         transcript_path, index, snapshot)
@@ -5687,22 +6176,34 @@ def _heal_cancelled_snapshot_from_canonical(
     if not assistant_uuid:
         return False
     started_ms = int(snapshot.get("started_at_ms") or 0)
-    interrupted_ms = int(snapshot.get("interrupted_at_ms") or 0)
-    elapsed_s = round(max(0, interrupted_ms - started_ms) / 1000, 1)
+    terminal_ms = int(
+        snapshot.get("terminal_at_ms")
+        or snapshot.get("interrupted_at_ms")
+        or 0
+    )
+    elapsed_s = round(max(0, terminal_ms - started_ms) / 1000, 1)
+    terminal_status = str(snapshot.get("terminal_status") or "cancelled")
     try:
         sess.set_message_annotation(
             sid,
             assistant_uuid,
             model=str(snapshot.get("model") or ""),
-            ts=interrupted_ms or None,
-            turn_status="cancelled",
+            ts=terminal_ms or None,
+            turn_status=terminal_status,
             elapsed_s=elapsed_s,
+            memory_recall=snapshot.get("memory_recall") or None,
         )
     except Exception as exc:
         sys.stderr.write(
             f"[chat] late cancelled footer heal failed sid={sid[:8]} "
             f"exc={type(exc).__name__}\n")
         return False
+    if terminal_status == "failed":
+        # Keep replacing the whole canonical turn with the display snapshot.
+        # Otherwise a partial AssistantMessage causes the healer to delete the
+        # only durable copy of the terminal error row on the first quiet reload.
+        return False
+
     # Exact path comes from the already-validated canonical sid/turn snapshot
     # directory.  Failure to unlink is harmless: subsequent reads resolve and
     # exclude it again, while the sidecar remains authoritative.
@@ -5911,6 +6412,7 @@ def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
         atomic_write_text(
             path,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            mode=0o600,
         )
         with suppress(OSError):
             path.chmod(0o600)
@@ -5944,6 +6446,153 @@ def _persist_cancelled_turn_snapshot_locked(bc: "TurnBroadcast") -> bool:
             f"exc={type(exc).__name__}\n")
         sys.stderr.flush()
     return True
+
+
+def _persist_failed_turn_snapshot(
+    bc: "TurnBroadcast",
+    error_text: str,
+    *,
+    terminal_at_ms: int | None = None,
+    elapsed_s: float | None = None,
+    memory_recall: dict | None = None,
+    canonical_terminal_published: bool = False,
+) -> bool:
+    """Persist a refreshable display record for a terminal turn failure.
+
+    The SDK normally writes an AssistantMessage that can own footer metadata.
+    Some Gateway/API/transport failures emit only a ResultMessage (or no
+    ResultMessage at all). In that shape there is no safe UUID to annotate:
+    choosing the transcript's latest assistant would mutate the previous turn.
+    Even when a legitimate partial assistant exists, it cannot own the separate
+    terminal error bubble shown live. Store the exact browser-visible failure
+    in the same private, display-only snapshot channel used for interrupted
+    turns instead. It is never fed back into model context and historical files
+    remain mode 0600.
+    """
+    with bc.cancelled_snapshot_lock:
+        if bc.failed_snapshot_persisted:
+            return True
+        if bc.cancelled_snapshot_suppressed or bc.cancelled:
+            return False
+        path = _cancelled_turn_snapshot_path(bc.session_id, bc.turn_id)
+        if path is None:
+            return False
+
+        now_ms = int(terminal_at_ms or time.time() * 1000)
+        duration = (
+            max(0.0, float(elapsed_s))
+            if elapsed_s is not None
+            else max(0.0, now_ms / 1000.0 - float(bc.started_at or 0))
+        )
+        duration = round(duration, 1)
+        visible_error = str(error_text or "Turn failed without an assistant response.")
+        messages = _broadcast_to_ui_messages(bc)
+
+        # Match the live UI: retain any legitimate partial answer, then show
+        # the terminal failure as its own assistant row. Avoid a duplicate if
+        # the provider already streamed the exact same text before dying.
+        last_assistant = next(
+            (message for message in reversed(messages)
+             if message.get("role") == "assistant"),
+            None,
+        )
+        if not last_assistant or str(last_assistant.get("text") or "") != visible_error:
+            messages.append({
+                "role": "assistant",
+                "text": visible_error,
+                "model": bc.model,
+                "error": visible_error,
+            })
+        if not messages:
+            return False
+
+        for index, message in enumerate(messages):
+            message["_key"] = f"failed:{bc.turn_id}:{index}"
+            message["_terminalTurnId"] = bc.turn_id
+            if message.get("role") == "user":
+                message["_failed"] = True
+                message["_error_text"] = visible_error
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                continue
+            message.setdefault("ts", now_ms)
+            if duration >= 1:
+                message.setdefault("elapsed", duration)
+            message.setdefault("model", bc.model)
+            message.setdefault("turn_status", "failed")
+            if memory_recall:
+                message.setdefault("memoryRecall", memory_recall)
+            break
+
+        boundary = dict(bc.transcript_boundary or {})
+        payload = {
+            "schema": _CANCELLED_TURN_SNAPSHOT_SCHEMA,
+            "sid": bc.session_id,
+            "turn_id": bc.turn_id,
+            "model": bc.model,
+            "terminal_status": "failed",
+            "started_at_ms": int(float(bc.started_at or 0) * 1000),
+            "terminal_at_ms": now_ms,
+            # Retain this legacy coordinate so the existing canonical-span
+            # resolver can safely pair/hide the just-written user JSONL row.
+            "interrupted_at_ms": now_ms,
+            "canonical_terminal_published": bool(
+                canonical_terminal_published),
+            "memory_recall": memory_recall,
+            "transcript_boundary": {
+                "record_count": int(boundary.get("record_count") or 0),
+                "source_dev": int(boundary.get("source_dev") or 0),
+                "source_inode": int(boundary.get("source_inode") or 0),
+            },
+            "anchors": {
+                "normal": {
+                    "uuid": boundary.get("normal_uuid") or "",
+                    "total": int(boundary.get("normal_total") or 0),
+                },
+                "full": {
+                    "uuid": boundary.get("full_uuid") or "",
+                    "total": int(boundary.get("full_total") or 0),
+                },
+            },
+            "hidden_uuids": [],
+            "messages": messages,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with suppress(OSError):
+                path.parent.chmod(0o700)
+            atomic_write_text(
+                path,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                mode=0o600,
+            )
+            with suppress(OSError):
+                path.chmod(0o600)
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] failed snapshot write failed sid={bc.session_id[:8]} "
+                f"exc={type(exc).__name__}\n")
+            sys.stderr.flush()
+            return False
+
+        bc.failed_snapshot_persisted = True
+        try:
+            snapshots, _ = _load_cancelled_turn_snapshots(bc.session_id)
+            indexed = _ensure_transcript_index(bc.session_id)
+            index = indexed[1] if indexed is not None else None
+            total, turns = _interrupted_history_stats(index, snapshots, "normal")
+            sess.bump_session(
+                bc.session_id,
+                message_count=total,
+                turn_count=turns,
+                auto_rename_from=bc.user_text,
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[chat] failed snapshot metadata sync failed "
+                f"sid={bc.session_id[:8]} exc={type(exc).__name__}\n")
+            sys.stderr.flush()
+        return True
 
 
 def _interrupted_history_segments(
@@ -6127,7 +6776,7 @@ def _interrupted_history_window(
             for message in messages:
                 if turn_id:
                     message.setdefault(
-                        "_turn_origin_uuid", f"cancelled:{turn_id}")
+                        "_turn_origin_uuid", f"terminal:{turn_id}")
                 if started_at_ms > 0:
                     message.setdefault("turn_started_at", started_at_ms)
         window.extend(messages[local_start:local_end])
@@ -6209,8 +6858,14 @@ def export_session_markdown(sid: str) -> Response:
                     headers=headers)
 
 
-def _clear_session_runtime_state(sid: str) -> None:
-    """Forget detached turn/continuation state owned by a deleted session."""
+def _clear_session_runtime_state(sid: str) -> list[asyncio.Task]:
+    """Forget loop-owned state and return tasks that deletion should join.
+
+    This function must run on the event-loop thread. Disk/SDK cleanup runs in
+    a worker separately; cancelling asyncio objects from that worker is not
+    thread-safe.
+    """
+    cancelled_tasks: list[asyncio.Task] = []
     perm.clear_session_permissions(sid)
     _pending_runtime_rebuilds.discard(sid)
     runtime_lock = _session_runtime_locks.get(sid)
@@ -6219,6 +6874,7 @@ def _clear_session_runtime_state(sid: str) -> None:
     drain_task = _queue_drain_tasks.pop(sid, None)
     if drain_task is not None and not drain_task.done():
         drain_task.cancel()
+        cancelled_tasks.append(drain_task)
     drain_lock = _queue_drain_locks.get(sid)
     if drain_lock is not None and not drain_lock.locked():
         _queue_drain_locks.pop(sid, None)
@@ -6226,6 +6882,7 @@ def _clear_session_runtime_state(sid: str) -> None:
     watcher = _task_watchers.pop(sid, None)
     if watcher is not None and not watcher.done():
         watcher.cancel()
+        cancelled_tasks.append(watcher)
     _background_turn_started_at.pop(sid, None)
     _background_origin_turn_id.pop(sid, None)
     _background_activity_finishes.pop(sid, None)
@@ -6246,14 +6903,53 @@ def _clear_session_runtime_state(sid: str) -> None:
         # the snapshot directory. A later writer observes the suppression bit.
         with broadcast.cancelled_snapshot_lock:
             pass
+        # Every terminal path must observe deletion before cancellation is
+        # delivered.  In particular, the outer `_start_turn` owner decides
+        # between ordinary startup rollback and deletion-safe cleanup from
+        # this flag.
+        broadcast.cancelled = True
         task = getattr(broadcast, "task", None)
         if task is not None and not task.done():
             task.cancel()
-        broadcast.cancelled = True
+            cancelled_tasks.append(task)
+        startup_task = getattr(broadcast, "startup_task", None)
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
+            cancelled_tasks.append(startup_task)
+        startup_owner = getattr(broadcast, "startup_owner_task", None)
+        if startup_owner is not None and not startup_owner.done():
+            startup_owner.cancel()
+            cancelled_tasks.append(startup_owner)
+        cancelled_cleanup = getattr(
+            broadcast, "_cancelled_startup_cleanup_task", None)
+        if cancelled_cleanup is not None and not cancelled_cleanup.done():
+            # This cleanup may be joining an Activity/snapshot worker that
+            # cannot be cancelled. The async purge path waits it explicitly;
+            # cancelling the wrapper would lose the only handle to that write.
+            cancelled_tasks.append(cancelled_cleanup)
         broadcast.finish()
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    return list({
+        task for task in cancelled_tasks
+        if task is not current and not task.done()
+    })
 
 
 def purge_session_storage(sid: str) -> bool:
+    """Synchronously delete disk-owned session state.
+
+    This compatibility path performs no asyncio mutation and is safe from a
+    worker thread. Request handlers use :func:`purge_session_storage_async` so
+    loop-owned turns/watchers are cancelled and joined as well.
+    """
+    with sess.session_lifecycle_lock(sid):
+        return _purge_session_storage_disk_locked(sid)
+
+
+def _purge_session_storage_disk_locked(sid: str) -> bool:
     """Remove EVERY per-session artifact: SDK JSONL, muselab sidecar/index/
     queue, attachments dir, and in-memory state. Returns True if any layer
     existed (SDK transcript OR sidecar) — callers treat that as "the session
@@ -6263,7 +6959,7 @@ def purge_session_storage(sid: str) -> bool:
     cascade so both delete the same set of artifacts. Deliberately tolerant:
     a session may exist in only ONE layer (SDK-only when the sidecar was
     lost; sidecar-only when the session never streamed), and local cleanup
-    (attachments / usage / active-turn sidecar) runs regardless so nothing
+    (attachments / active-turn sidecars) runs regardless so nothing
     is orphaned by a partial state."""
     removed = False
     workspace = sess.session_workspace(sid)
@@ -6287,26 +6983,121 @@ def purge_session_storage(sid: str) -> bool:
             shutil.rmtree(attach_dir, ignore_errors=True)
         except OSError:
             pass
-    # Clear in-memory per-session state too — otherwise deleting a session
-    # leaks its usage accumulator and leaves a phantom entry in
-    # /interrupted-turns (the interrupted-at-startup map + active-turn
-    # sidecar file both keyed by sid).
-    _session_usage.pop(sid, None)
-    _interrupted_at_startup.pop(sid, None)
-    _clear_session_runtime_state(sid)
     _delete_active_turn_sidecar(sid)
     _delete_cancelled_turn_snapshots(sid)
     return removed
 
 
+async def _purge_session_storage_async_inner(sid: str) -> bool:
+    # Fence queue writes before any await. A cancelled drain can still finish a
+    # synchronous RMW, but every later save observes the tombstone.
+    await asyncio.to_thread(sess.begin_session_delete, sid)
+    # Scheduler runs are separate from chat's TurnBroadcast/task-watcher
+    # ownership.  Revoke and join them immediately after the tombstone so an
+    # already-running scheduled query cannot append history, unread state, or
+    # recreate the SDK transcript after the disk purge.
+    from . import scheduler as _scheduler
+    scheduler_runs, had_scheduled_activity, _ = (
+        _scheduler.cancel_runs_for_session_now(sid)
+    )
+    # Capture and cancel the outer owner before another await. A cold startup
+    # can otherwise unwind only after disconnect_client(), create its
+    # cancellation cleanup after our pending-task snapshot, and outlive the
+    # disk purge. The deletion tombstone prevents any replacement reservation.
+    active = _active_turns.get(sid)
+    had_active_activity = bool(
+        active is not None and active.activity_started)
+    # A completed foreground Result may have transferred its Activity row to a
+    # still-running background watcher. `_clear_session_runtime_state` removes
+    # that ownership marker, so retain it long enough to close the ledger row.
+    had_background_activity = (
+        sid in _background_activity_finishes
+        or sid in _task_watchers
+    )
+    pending = _clear_session_runtime_state(sid)
+    # Cancellation alone does not reliably tear down a CLI blocked in
+    # connect/receive. Pop and disconnect the pooled runtime before joining
+    # scheduler owners; otherwise DELETE can wait forever on the very process
+    # that the later disconnect was supposed to stop.
+    await disconnect_client(sid)
+    await _scheduler.join_cancelled_runs(scheduler_runs)
+    critical_cleanup = (
+        getattr(active, "_cancelled_startup_cleanup_task", None)
+        if active is not None else None
+    )
+    if critical_cleanup in pending:
+        pending.remove(critical_cleanup)
+    if critical_cleanup is not None and not critical_cleanup.done():
+        # Snapshot and Activity writes run in worker threads. Their wrapper is
+        # the only reliable join handle, so deletion must wait for its known
+        # outcome before removing files and returning success.
+        await asyncio.gather(critical_cleanup, return_exceptions=True)
+    if pending:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            # The deletion fence already prevents a late queue resurrection;
+            # bounded cleanup keeps a wedged SDK task from hanging DELETE.
+            pass
+    # A bounded owner join protects DELETE from a permanently wedged SDK, but
+    # the global Activity ledger must never be left in `running` if that bound
+    # is reached.  The normal owner cleanup clears this bit first; this is an
+    # idempotent fallback for the timeout/future-cleanup race.
+    if (had_active_activity or had_background_activity
+            or had_scheduled_activity):
+        try:
+            from .activity import activity as _activity
+            await asyncio.to_thread(
+                _activity.finish,
+                sid,
+                "cancelled",
+                activity_source=(
+                    "background"
+                    if had_background_activity
+                    else (
+                        active.activity_source
+                        if had_active_activity
+                        else "scheduled"
+                    )
+                ),
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                f"[activity] delete finish failed sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+    _session_usage.pop(sid, None)
+    _interrupted_at_startup.pop(sid, None)
+    return await asyncio.to_thread(purge_session_storage, sid)
+
+
+async def purge_session_storage_async(sid: str) -> bool:
+    """Delete runtime and disk state completely, even if HTTP disconnects."""
+    cleanup = asyncio.create_task(_purge_session_storage_async_inner(sid))
+    try:
+        return await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        # Deletion is an explicit destructive decision. Once fenced, finish it
+        # deterministically instead of leaving half-deleted state.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
+
+
 @router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
 async def delete_session_api(sid: str) -> dict:
-    await disconnect_client(sid)
     # 404 only when NEITHER layer existed. Previously the sidecar was
     # authoritative: an SDK-only session (sidecar lost / never written) got
     # its JSONL deleted and THEN returned 404 — the user saw a failure while
     # the transcript was already gone, and local cleanup was skipped.
-    if not purge_session_storage(sid):
+    if not await purge_session_storage_async(sid):
         raise HTTPException(404, "session not found")
     return {"ok": True}
 
@@ -6351,8 +7142,7 @@ async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
                 "ids": victims, "days": days}
     deleted: list[str] = []
     for sid in victims:
-        await disconnect_client(sid)
-        if purge_session_storage(sid):
+        if await purge_session_storage_async(sid):
             deleted.append(sid)
     return {"ok": True, "deleted": len(deleted), "ids": deleted, "days": days}
 
@@ -6424,7 +7214,8 @@ def _normalize_queue_selection_quotes(raw: list[dict] | None) -> list[dict]:
 
 
 @router.get("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
-def get_queue_api(sid: str) -> dict:
+def get_queue_api(sid: str, response: Response) -> dict:
+    response.headers["Cache-Control"] = "private, no-store"
     data = sess.get_queue(sid)
     # FIX ③: resolve each queued item's attachment ids against the in-memory
     # upload store so the queued bubble can render real thumbnails / doc chips
@@ -6461,18 +7252,6 @@ async def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
     # headless failure when the drain replays the item later.
     if (req.permission or "").strip():
         _validate_permission(req.permission)
-    plan_return_permission = req.plan_return_permission
-    if req.permission == "plan" and plan_return_permission is None:
-        # Cached clients predating this field still preserve the current
-        # session's complete Plan contract. If they enqueue Plan while the
-        # session is non-Plan, capture that current mode just like a direct
-        # send entering Plan Mode would.
-        current = sess.get_session(sid) or {}
-        plan_return_permission = (
-            current.get("plan_return_permission")
-            if current.get("permission") == "plan"
-            else current.get("permission")
-        )
     selection_quotes = _normalize_queue_selection_quotes(
         req.selection_quotes)
     display_text = (
@@ -6480,16 +7259,39 @@ async def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
         if selection_quotes
         else (req.display_text or text)
     )
-    res = sess.enqueue_message(
-        sid,
-        text,
-        req.image_ids or "",
-        permission=req.permission or "",
-        display_text=display_text,
-        selection_quotes=selection_quotes,
-        plan_return_permission=plan_return_permission,
+    # Session discovery can walk SDK workspaces.  The sessions-layer helper
+    # also holds the per-session lifecycle lock through the queue commit so an
+    # explicit DELETE cannot race an SDK-only preflight and be resurrected.
+    enqueue_task = asyncio.create_task(
+        asyncio.to_thread(
+            sess.enqueue_existing_message,
+            sid,
+            text,
+            req.image_ids or "",
+            permission=req.permission or "",
+            display_text=display_text,
+            selection_quotes=selection_quotes,
+            plan_return_permission=req.plan_return_permission,
+        )
     )
+    try:
+        res = await asyncio.shield(enqueue_task)
+    except asyncio.CancelledError:
+        # to_thread cannot be stopped after the disk mutation starts. Join the
+        # known outcome and schedule a successful commit before propagating the
+        # disconnect; otherwise accepted work can sit forever with no drain.
+        while not enqueue_task.done():
+            try:
+                await asyncio.shield(enqueue_task)
+            except asyncio.CancelledError:
+                continue
+        res = enqueue_task.result()
+        if res.get("ok"):
+            _schedule_queue_drain(sid)
+        raise
     if not res.get("ok"):
+        if res.get("error") == "session_not_found":
+            raise HTTPException(404, "session not found")
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
     # Do not await SDK startup in the HTTP request: an idle/cold session can
@@ -6503,13 +7305,15 @@ async def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
 
 @router.delete("/sessions/{sid}/queue/{item_id}", dependencies=[Depends(require_token)])
 def remove_queue_item_api(sid: str, item_id: str) -> dict:
-    return sess.remove_queue_item(sid, item_id)
+    try:
+        return sess.remove_queue_item(sid, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.delete("/sessions/{sid}/queue", dependencies=[Depends(require_token)])
 def clear_queue_api(sid: str) -> dict:
-    sess.clear_queue(sid)
-    return {"ok": True, "items": [], "paused": False}
+    return {"ok": True, **sess.clear_queue(sid)}
 
 
 @router.post("/sessions/{sid}/queue/pause", dependencies=[Depends(require_token)])
@@ -7587,6 +8391,31 @@ def _sdk_assistant_error(msg: Any) -> dict | None:
     }
 
 
+def _sdk_system_error(msg: Any) -> dict | None:
+    """Recognize slash-command failures encoded as local SystemMessage rows.
+
+    Claude CLI can finish `/compact` with a nominally successful ResultMessage
+    while putting the actual Gateway/API failure only in a generic
+    `system/local_command` message. Ignore normal local-command prose; promote
+    only text that our public stream classifier already recognizes as an API,
+    auth, quota, model-route, network, or context failure.
+    """
+    if not isinstance(msg, SystemMessage) or msg.subtype != "local_command":
+        return None
+    data = msg.data if isinstance(msg.data, dict) else {}
+    text = str(data.get("content") or "").strip()
+    if not text:
+        return None
+    classified = _classify_stream_error(text)
+    if classified.get("kind") == "unknown" and "api error" not in text.lower():
+        return None
+    return {
+        "message": text,
+        "source": "system_local_command",
+        "api_error_status": None,
+    }
+
+
 def _sdk_result_error(msg: Any) -> dict | None:
     if not bool(getattr(msg, "is_error", False)):
         return None
@@ -7630,6 +8459,198 @@ class _SDKCommandError(RuntimeError):
         super().__init__(info.get("message") or "SDK command failed")
 
 
+class _ContextRecovered(RuntimeError):
+    """Stop the old turn after creating a safe, resumable recovery fork."""
+
+    def __init__(self, recovery: dict[str, Any]):
+        self.recovered_session = dict(recovery.get("session") or {})
+        self.recovery_stats = dict(recovery.get("stats") or {})
+        super().__init__(
+            "context window could not be compacted; a recovery session was created"
+        )
+
+
+def _context_recovery_inputs(
+    sid: str,
+    model: str,
+    *,
+    pre_tokens: int = 0,
+    context_limit: int = 0,
+) -> tuple[int, int]:
+    """Fill recovery metadata from already-known, privacy-safe context state.
+
+    This helper deliberately performs no network or transcript I/O: it is used
+    after the live SDK context probe has already failed.  Cached values only
+    size/describe the recovery summary; they are never evidence that recovery
+    is required.  That decision must come from an explicit context-window
+    error, a transcript marker, or a verified no-shrink result.
+    """
+    cached = _session_usage.get(sid) or {}
+    used = _positive_int(pre_tokens) or _positive_int(
+        cached.get("context_used")
+    )
+    if not used:
+        used = sum(
+            _positive_int(cached.get(key))
+            for key in (
+                "input_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+            )
+        )
+
+    limit = _positive_int(context_limit) or _positive_int(
+        cached.get("context_limit")
+    )
+    if not limit:
+        details = _context_limit_details(
+            model,
+            capability=_cached_gateway_context_capability(model),
+        )
+        limit = _positive_int(details.get("context_limit"))
+    return used, limit
+
+
+def _create_context_recovery_session(
+    source_sid: str,
+    model: str,
+    *,
+    pre_tokens: int = 0,
+    context_limit: int = 0,
+) -> dict[str, Any]:
+    """Fork an over-limit transcript onto a bounded synthetic compact root.
+
+    This runs in a worker thread.  The source JSONL is never modified; the
+    recovery module first makes an SDK-native fork and appends the compact pair
+    only to that new file.  Register the new UUID in MuseLab only after the
+    fork is complete, so the browser can never discover a half-built session.
+    """
+    source_meta = sess.get_session_meta(source_sid)
+    if source_meta is None:
+        raise context_recovery.ContextRecoveryError("source session is unavailable")
+    source_path = _find_session_jsonl(source_sid)
+    if source_path is None:
+        raise context_recovery.ContextRecoveryError("source transcript is unavailable")
+
+    source_model = (source_meta.get("model") or model or MODEL).strip()
+    source_name = (source_meta.get("name") or "会话").strip()
+    suffix = "恢复" if is_chinese_locale() else "Recovered"
+    recovery_name = f"{source_name} · {suffix}"
+    workspace = sess.session_workspace(source_sid)
+
+    with _session_config_dir(source_model):
+        result = context_recovery.create_recovery_fork(
+            source_sid,
+            source_path,
+            workspace,
+            title=recovery_name,
+            pre_tokens=pre_tokens,
+            model_config_context=context_limit or None,
+        )
+
+    try:
+        meta = sess.register_session(
+            result.session_id,
+            name=recovery_name,
+            model=source_model,
+            permission=source_meta.get("permission") or "",
+            plan_return_permission=source_meta.get("plan_return_permission"),
+            auto_named=False,
+            # The active SDK chain contains the compact summary.  Full-history
+            # mode can still read the copied records behind its boundary.
+            message_count=1,
+            turn_count=0,
+            effort=_normalize_effort(source_meta.get("effort")),
+            service_tier=source_meta.get("service_tier") or "",
+            thinking=source_meta.get("thinking") is not False,
+            forked_from=source_sid,
+            forked_from_name=source_name,
+            activity_hidden=bool(source_meta.get("activity_hidden", False)),
+            runtime_profile=source_meta.get("runtime_profile") or "",
+            cwd=source_meta.get("cwd") or str(workspace),
+        )
+    except Exception:
+        # register_session normally has no partial failure, but storage errors
+        # must not leave an unindexed recovery transcript behind.
+        try:
+            with _session_config_dir(source_model):
+                sdk_delete_session(result.session_id, directory=str(workspace))
+        except Exception:
+            result.path.unlink(missing_ok=True)
+        raise
+
+    _JSONL_PATH_CACHE[result.session_id] = result.path
+    if context_limit:
+        try:
+            sess.set_session_ctx_window(result.session_id, context_limit)
+        except Exception:
+            pass
+    _session_usage[result.session_id] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_cost_usd": 0.0,
+        "last_turn_at": 0.0,
+        "context_used": result.stats.estimated_post_tokens,
+        "context_used_pct": (
+            round(result.stats.estimated_post_tokens / context_limit * 100, 1)
+            if context_limit else 0.0
+        ),
+        "context_limit": context_limit,
+        "context_used_source": "recovery_summary_estimate",
+        "context_used_is_estimate": True,
+        "context_is_estimate": True,
+    }
+    public_meta = {**meta, "session_id": result.session_id}
+    return {
+        "session": public_meta,
+        "stats": {
+            "included_messages": result.stats.included_messages,
+            "omitted_messages": result.stats.omitted_messages,
+            "truncated_messages": result.stats.truncated_messages,
+            "estimated_post_tokens": result.stats.estimated_post_tokens,
+        },
+    }
+
+
+async def _recover_context_session(
+    source_sid: str,
+    model: str,
+    *,
+    pre_tokens: int = 0,
+    context_limit: int = 0,
+) -> dict[str, Any]:
+    """Flush the failed runtime and build a cold recovery session."""
+    if (_sessions_with_inflight_tasks.get(source_sid)
+            or _session_has_live_watcher(source_sid)):
+        raise context_recovery.ContextRecoveryError(
+            "cannot recover while a background task owns the source runtime"
+        )
+    await disconnect_client(source_sid)
+    recovery_task = asyncio.create_task(
+        asyncio.to_thread(
+            _create_context_recovery_session,
+            source_sid,
+            model,
+            pre_tokens=pre_tokens,
+            context_limit=context_limit,
+        )
+    )
+    try:
+        return await asyncio.shield(recovery_task)
+    except asyncio.CancelledError:
+        # Fork + index registration is a mutating disk transaction and the
+        # worker cannot be stopped. Join to a known committed/failed outcome so
+        # timeout/cancellation cannot create an unseen, duplicate recovery fork.
+        while not recovery_task.done():
+            try:
+                await asyncio.shield(recovery_task)
+            except asyncio.CancelledError:
+                continue
+        return recovery_task.result()
+
+
 async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> ResultMessage:
     """Run a CLI slash command and require an explicitly successful Result.
 
@@ -7657,6 +8678,9 @@ async def _run_sdk_command_checked(client: ClaudeSDKClient, command: str) -> Res
         nonlocal result
         if isinstance(msg, AssistantMessage):
             if info := _sdk_assistant_error(msg):
+                errors.append(info)
+        elif isinstance(msg, SystemMessage):
+            if info := _sdk_system_error(msg):
                 errors.append(info)
         if isinstance(msg, ResultMessage):
             result = msg
@@ -7775,6 +8799,12 @@ async def context_breakdown(session_id: str, model: str = "") -> dict:
 async def native_compact_session_api(sid: str) -> dict:
     timeout_s = env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)
     try:
+        # Fast rejection avoids spending the whole compact deadline waiting on
+        # a turn that is already known to own this session.  The same check is
+        # repeated under the runtime lock to close the race with a new turn.
+        bc = _active_turns.get(sid)
+        if bc is not None and not bc.done:
+            raise HTTPException(409, "cannot compact while a turn is active")
         # One deadline covers lock acquisition, client startup, /compact and
         # the authoritative post-command token verification. Previously only
         # the slash command itself was bounded, so a wedged control probe could
@@ -7784,8 +8814,27 @@ async def native_compact_session_api(sid: str) -> dict:
                 bc = _active_turns.get(sid)
                 if bc is not None and not bc.done:
                     raise HTTPException(409, "cannot compact while a turn is active")
-                return await _native_compact_session_locked(sid)
+                try:
+                    return await _native_compact_session_locked(sid)
+                except asyncio.CancelledError:
+                    # The outer deadline fired after compact acquired the
+                    # runtime.  Tear the unknown client down while this lock is
+                    # still held; otherwise a waiting turn could acquire the
+                    # lock and reuse it in the gap before endpoint cleanup.
+                    _pending_runtime_rebuilds.add(sid)
+                    await disconnect_client(sid)
+                    raise
+                except HTTPException as exc:
+                    if exc.status_code == 504:
+                        # The inner command deadline has the same unknown-
+                        # outcome contract. Cleanup must precede lock release.
+                        _pending_runtime_rebuilds.add(sid)
+                        await disconnect_client(sid)
+                    raise
     except asyncio.TimeoutError:
+        # If compact had acquired the lock, its CancelledError handler above
+        # already completed teardown before releasing it.  A timeout that only
+        # waited for the lock must NOT kill the legitimate lock holder.
         sys.stderr.write(f"[chat] native /compact total timeout sid={sid[:8]}\n")
         sys.stderr.flush()
         raise HTTPException(
@@ -7882,10 +8931,21 @@ async def _native_compact_session_locked(sid: str) -> dict:
         )
     client = await get_client(sid, model, permission, **client_kwargs)
     before_total = 0
+    context_limit = _positive_int(
+        (_session_usage.get(sid) or {}).get("context_limit"))
     post_compact_usage: dict | None = None
+    tail_path, tail_offset = _compact_tail_cursor(sid)
+    tail_outcome: dict[str, bool] = {
+        "boundary": False,
+        "summary": False,
+        "context_error": False,
+    }
     try:
         try:
-            before_total = _positive_int((await client.get_context_usage()).get("totalTokens"))
+            before_usage = dict(await client.get_context_usage())
+            before_total = _positive_int(before_usage.get("totalTokens"))
+            context_limit = context_limit or _positive_int(
+                before_usage.get("maxTokens"))
         except Exception:
             pass
         # Bound the command too for direct internal callers. The HTTP endpoint
@@ -7894,9 +8954,14 @@ async def _native_compact_session_locked(sid: str) -> dict:
         # the command reads through the pump instead of racing it.
         async with asyncio.timeout(env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)):
             await _run_sdk_command_checked(client, "/compact")
+        tail_outcome = await asyncio.to_thread(
+            _compact_tail_outcome, tail_path, tail_offset)
         post_compact_usage = dict(await client.get_context_usage())
         after_total = _positive_int(post_compact_usage.get("totalTokens"))
-        if before_total and after_total and after_total >= before_total:
+        compact_pair_written = bool(
+            tail_outcome.get("boundary") and tail_outcome.get("summary"))
+        if (before_total and after_total and after_total >= before_total
+                and not compact_pair_written):
             raise _SDKCommandError({
                 "message": (
                     "native /compact reported success but context usage did not decrease "
@@ -7906,11 +8971,56 @@ async def _native_compact_session_locked(sid: str) -> dict:
                 "api_error_status": None,
             })
     except asyncio.TimeoutError:
+        # Direct callers still need a hard cache barrier.  The public endpoint
+        # disconnects immediately outside its expired deadline; this marker is
+        # the fallback that forces any other caller to rebuild before reuse.
+        _pending_runtime_rebuilds.add(sid)
         sys.stderr.write(f"[chat] native /compact timed out for sid={sid[:8]}\n")
         sys.stderr.flush()
         raise HTTPException(504, "native /compact timed out — CLI may be hung") from None
     except _SDKCommandError as e:
+        if not any(tail_outcome.values()):
+            tail_outcome = await asyncio.to_thread(
+                _compact_tail_outcome, tail_path, tail_offset)
+        if tail_outcome.get("boundary") and tail_outcome.get("summary"):
+            # The durable transcript commit wins over an in-band acknowledgement
+            # failure. Start the next turn from a fresh process that reads the
+            # new compact root.
+            await disconnect_client(sid)
+            _schedule_post_compact_refresh(sid, model, {})
+            return {"ok": True, "recovered": False}
         classified = _classify_stream_error(str(e))
+        verified_no_shrink = e.info.get("source") == "verification"
+        deterministic_context_failure = bool(
+            tail_outcome.get("context_error")
+            or classified["kind"] == "context_window"
+            or verified_no_shrink
+        )
+        if (_is_codex_gateway_model(model)
+                and deterministic_context_failure
+                and not _sessions_with_inflight_tasks.get(sid)
+                and not _session_has_live_watcher(sid)):
+            try:
+                recovery = await _recover_context_session(
+                    sid,
+                    model,
+                    pre_tokens=before_total,
+                    context_limit=context_limit,
+                )
+            except Exception as recovery_error:
+                sys.stderr.write(
+                    f"[chat] context recovery failed sid={sid[:8]}: "
+                    f"{type(recovery_error).__name__}\n")
+                sys.stderr.flush()
+                raise HTTPException(
+                    500, "native compact failed and recovery could not be created"
+                ) from None
+            return {
+                "ok": True,
+                "recovered": True,
+                "recovered_session": recovery["session"],
+                "recovery_stats": recovery["stats"],
+            }
         status = (409 if classified["kind"] == "context_window"
                   else 502 if classified["kind"] == "model_route"
                   else int(e.info.get("api_error_status") or 500))
@@ -7921,6 +9031,47 @@ async def _native_compact_session_locked(sid: str) -> dict:
         sys.stderr.flush()
         raise HTTPException(status, str(e)) from None
     except Exception as e:
+        if not any(tail_outcome.values()):
+            tail_outcome = await asyncio.to_thread(
+                _compact_tail_outcome, tail_path, tail_offset)
+        if tail_outcome.get("boundary") and tail_outcome.get("summary"):
+            # A generic transport exception can race the durable compact
+            # commit just like an in-band SDK error.  The new transcript root
+            # remains authoritative.
+            await disconnect_client(sid)
+            _schedule_post_compact_refresh(sid, model, {})
+            return {"ok": True, "recovered": False}
+        if (_is_codex_gateway_model(model)
+                and _is_context_window_failure(e)
+                and not _sessions_with_inflight_tasks.get(sid)
+                and not _session_has_live_watcher(sid)):
+            recovery_used, recovery_limit = _context_recovery_inputs(
+                sid,
+                model,
+                pre_tokens=before_total,
+                context_limit=context_limit,
+            )
+            try:
+                recovery = await _recover_context_session(
+                    sid,
+                    model,
+                    pre_tokens=recovery_used,
+                    context_limit=recovery_limit,
+                )
+            except Exception as recovery_error:
+                sys.stderr.write(
+                    f"[chat] context recovery failed sid={sid[:8]}: "
+                    f"{type(recovery_error).__name__}\n")
+                sys.stderr.flush()
+                raise HTTPException(
+                    500, "native compact failed and recovery could not be created"
+                ) from None
+            return {
+                "ok": True,
+                "recovered": True,
+                "recovered_session": recovery["session"],
+                "recovery_stats": recovery["stats"],
+            }
         sys.stderr.write(f"[chat] native /compact failed for sid={sid[:8]}: "
                           f"{type(e).__name__}: {e}\n")
         sys.stderr.flush()
@@ -7974,7 +9125,7 @@ async def _native_compact_session_locked(sid: str) -> dict:
     # after the verified token drop so the browser can leave "compacting"
     # immediately. The next session read also self-heals these counters.
     _schedule_post_compact_refresh(sid, model, dict(post_compact_usage or {}))
-    return {"ok": True}
+    return {"ok": True, "recovered": False}
 
 
 class ForkReq(BaseModel):
@@ -8795,13 +9946,29 @@ def _classify_stream_error(err: Any) -> dict:
     return {"kind": kind, "retryable": retryable, "cta": cta}
 
 
-def _error_event(err: Any) -> dict:
+def _is_context_window_failure(error: Any) -> bool:
+    """Return True only for an explicit context-window error signal."""
+    return bool(
+        error is not None
+        and _classify_stream_error(str(error)).get("kind") == "context_window"
+    )
+
+
+def _error_event(err: Any, *, activity_source: str = "") -> dict:
     """Bundle a stream-error message with its classification into an SSE
     `error` event payload — single call site so the FE always sees the
     same shape regardless of which yield-error branch fired."""
     msg = str(err) if err is not None else ""
-    return {"event": "error",
-            "data": json.dumps({"error": msg, **_classify_stream_error(msg)})}
+    payload = {"error": msg, **_classify_stream_error(msg)}
+    if isinstance(err, _ContextRecovered):
+        # Only public session metadata and aggregate counts cross the SSE
+        # boundary.  The synthetic summary, source path and original prompt
+        # remain local to the recovery transcript.
+        payload["recovered_session"] = err.recovered_session
+        payload["recovery_stats"] = err.recovery_stats
+    if activity_source:
+        payload["activity_source"] = activity_source
+    return {"event": "error", "data": json.dumps(payload)}
 
 
 def _parse_bash_result(text: str) -> dict | None:
@@ -8877,6 +10044,12 @@ def _render_tool_result(block: ToolResultBlock,
 # Stored in-memory; on restart pending uploads are lost (fine — re-attach).
 
 _image_store: dict[str, dict] = {}     # id -> {kind, mime, b64|text, name, ts}
+# Most staged-upload mutations run on the event loop, but the sync queue/image
+# GET endpoints run in FastAPI's worker pool and can trigger TTL collection too.
+# A threading lock therefore protects multi-step operations such as
+# "validate every id, then remove every id" from a concurrent collector or
+# budget eviction.  Never hold it across an await.
+_image_store_lock = threading.RLock()
 _IMAGE_TTL_S = 600
 _IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 10 MB per file
 # Total in-memory budget for *staged* (not-yet-consumed) uploads + a hard entry
@@ -8927,9 +10100,53 @@ _XLSX_ATTACH_CELL_MAX_CHARS = 200
 def _gc_images() -> None:
     """Drop entries older than TTL."""
     cutoff = time.time() - _IMAGE_TTL_S
-    for k in list(_image_store.keys()):
-        if _image_store[k]["ts"] < cutoff:
-            del _image_store[k]
+    with _image_store_lock:
+        for k in list(_image_store.keys()):
+            entry = _image_store.get(k)
+            if entry is not None and entry["ts"] < cutoff:
+                _image_store.pop(k, None)
+
+
+def _claim_staged_attachments(
+    image_ids: str,
+    *,
+    require_all: bool,
+) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Consume staged uploads once, optionally with all-or-none semantics.
+
+    Queue items are durable while staged uploads are not.  Their final claim
+    therefore happens only after client startup, immediately before the turn is
+    wired for query.  Holding the store lock across validation and removal
+    closes the TTL/budget-eviction TOCTOU window: if any requested id is gone,
+    a queued caller receives nothing and can restore its durable queue claim.
+
+    Direct sends retain their historical best-effort behaviour (`require_all`
+    false): available uploads are consumed once and missing ids are ignored.
+    """
+    ids = list(dict.fromkeys(
+        aid.strip() for aid in str(image_ids or "").split(",") if aid.strip()
+    ))
+    if not ids:
+        return [], []
+    with _image_store_lock:
+        # Inline the TTL sweep under this same lock. Calling _gc_images() would
+        # also be safe because the lock is re-entrant, but keeping the cutoff and
+        # all-or-none validation in one critical section makes the guarantee
+        # explicit.
+        cutoff = time.time() - _IMAGE_TTL_S
+        for aid in list(_image_store.keys()):
+            entry = _image_store.get(aid)
+            if entry is not None and entry["ts"] < cutoff:
+                _image_store.pop(aid, None)
+        missing = [aid for aid in ids if aid not in _image_store]
+        if require_all and missing:
+            return [], missing
+        claimed = [
+            (aid, _image_store.pop(aid))
+            for aid in ids
+            if aid in _image_store
+        ]
+        return claimed, missing
 
 
 def _image_entry_bytes(entry: dict) -> int:
@@ -8947,20 +10164,22 @@ def _image_entry_bytes(entry: dict) -> int:
 def _enforce_image_budget() -> None:
     """Evict oldest staged uploads until the store is within its byte + entry
     caps. Bounds the unbounded-growth / OOM risk of many uploads that never get
-    consumed by a turn. Event-loop-only access → no lock needed."""
-    total = sum(_image_entry_bytes(e) for e in _image_store.values())
-    if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
-            and total <= _IMAGE_STORE_MAX_BYTES):
-        return
-    # Oldest first (by insertion ts). The just-added entry has the newest ts so
-    # it's evicted last — and one entry is ≤ ~13 MB ≪ budget, never self-evicts.
-    for aid, entry in sorted(_image_store.items(),
-                             key=lambda kv: kv[1].get("ts", 0.0)):
+    consumed by a turn."""
+    with _image_store_lock:
+        total = sum(_image_entry_bytes(e) for e in _image_store.values())
         if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
                 and total <= _IMAGE_STORE_MAX_BYTES):
-            break
-        total -= _image_entry_bytes(entry)
-        del _image_store[aid]
+            return
+        # Oldest first (by insertion ts). The just-added entry has the newest ts
+        # so it's evicted last — and one entry is ≤ ~13 MB ≪ budget, never
+        # self-evicts.
+        for aid, entry in sorted(_image_store.items(),
+                                 key=lambda kv: kv[1].get("ts", 0.0)):
+            if (len(_image_store) <= _IMAGE_STORE_MAX_ENTRIES
+                    and total <= _IMAGE_STORE_MAX_BYTES):
+                break
+            total -= _image_entry_bytes(entry)
+            _image_store.pop(aid, None)
 
 
 def _classify_attachment(mime: str, name: str) -> str:
@@ -10005,14 +11224,22 @@ async def stream(
             permission=permission, image_ids=image_ids)
     except _TurnBusy:
         async def _busy_gen():
-            yield _error_event("previous turn still running")
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "error": "previous turn still running",
+                    "kind": "turn_busy",
+                    "cta": "queue",
+                    "retryable": True,
+                }),
+            }
         return EventSourceResponse(_busy_gen(), headers=_SSE_HEADERS)
     except _TurnStartError as e:
         if getattr(e, "status", None) == 504:
             raise HTTPException(504, str(e))
         _err_msg = str(e)
         async def _early_err_gen():
-            yield _error_event(_err_msg)
+            yield _error_event(_err_msg, activity_source="direct")
         return EventSourceResponse(_early_err_gen(), headers=_SSE_HEADERS)
     return EventSourceResponse(
         _subscribe_broadcast(broadcast, mobile=mobile),
@@ -10030,9 +11257,16 @@ class _TurnStartError(Exception):
     `status` carries an optional HTTP status hint the /stream handler uses
     to preserve the original 504 response; the headless queue-drain caller
     ignores it (pauses the queue + pushes instead)."""
-    def __init__(self, msg: str, status: int | None = None):
+    def __init__(
+        self,
+        msg: str,
+        status: int | None = None,
+        *,
+        queue_claim_settled: bool = False,
+    ):
         super().__init__(msg)
         self.status = status
+        self.queue_claim_settled = bool(queue_claim_settled)
 
 
 # ---------------------------------------------------------------------------
@@ -10261,6 +11495,7 @@ async def _watch_inflight_tasks(
     client: ClaudeSDKClient,
     pending: dict[str, str | None],
     generation: int | None = None,
+    activity_owner_id: str = "",
 ) -> None:
     """Detached reader keeping an originating CLI client alive past its turn so
     SDK background tasks started in that turn can deliver their terminal
@@ -10292,6 +11527,9 @@ async def _watch_inflight_tasks(
     cont_state: dict | None = None
     activity_failed = False
     watcher_cancelled = False
+    if not activity_owner_id:
+        deferred = _background_activity_finishes.get(session_id)
+        activity_owner_id = deferred[1] if deferred else ""
     # The continuation is a real assistant turn for display/accounting even
     # though it has no user bubble.  Keep the session's public model id on its
     # broadcast so live and persisted footers do not reload with a blank model.
@@ -10399,6 +11637,7 @@ async def _watch_inflight_tasks(
             "cancelled": cancelled,
             "model": b.model,
             "continuation": True,
+            "activity_source": b.activity_source,
             "duration_ms": duration_ms,
             "assistant_uuid": assistant_uuid,
             "completed_at_ms": completed_at_ms,
@@ -10421,7 +11660,7 @@ async def _watch_inflight_tasks(
         # that boundary directly in the same event-loop turn as done; rescanning
         # "the latest assistant" raced both delayed JSONL flushes and the next
         # user turn, which is why continuation footers disappeared on refresh.
-        if assistant_uuid:
+        if assistant_uuid and not sess.session_is_deleting(session_id):
             try:
                 # Keep this synchronous inside the current event-loop turn:
                 # publish() only queues the frame, so subscribers cannot act
@@ -10445,7 +11684,8 @@ async def _watch_inflight_tasks(
         async with _lock:
             if _active_turns.get(session_id) is b:
                 _active_turns.pop(session_id, None)
-        _remember_recent_turn(session_id, b)
+        if not sess.session_is_deleting(session_id):
+            _remember_recent_turn(session_id, b)
     async def _request_explicit_resume(reason: str) -> bool:
         """Ask the existing SDK session to finish the originating request.
 
@@ -10584,8 +11824,8 @@ async def _watch_inflight_tasks(
                         # from the chat pane.  Watcher replacement/shutdown
                         # arrives as CancelledError instead and deliberately
                         # retains ownership, so releasing only on EOF is safe.
-                        deferred_status = _background_activity_finishes.get(
-                            session_id)
+                        deferred = _background_activity_finishes.get(session_id)
+                        deferred_status = deferred[0] if deferred else None
                         activity_failed = deferred_status != "cancelled"
                         sys.stderr.write(
                             f"[chat] task watcher: stream ended with "
@@ -10785,7 +12025,10 @@ async def _watch_inflight_tasks(
                 and _owns_generation()
                 and not _sessions_with_inflight_tasks.get(session_id)):
             await _finish_background_activity(
-                session_id, failed=activity_failed)
+                session_id,
+                failed=activity_failed,
+                owner_id=activity_owner_id,
+            )
         # Only clear the registry slot if it still points at us (a fresh
         # watcher may have replaced it).
         if _task_watchers.get(session_id) is asyncio.current_task():
@@ -10878,7 +12121,34 @@ def _spawn_task_watcher(
         f"[chat] task watcher spawned sid={session_id[:8]} "
         f"generation={generation} pending={sorted(pending)}\n")
     _task_watchers[session_id] = asyncio.create_task(
-        _watch_inflight_tasks(session_id, client, pending, generation))
+        _watch_inflight_tasks(
+            session_id,
+            client,
+            pending,
+            generation,
+            activity_owner_id=origin_turn_id,
+        ))
+
+
+async def _retire_unpinned_task_watcher(session_id: str) -> None:
+    """Stop a stale watcher after a foreground turn consumed its last task.
+
+    The session pump gives a foreground turn priority over the background
+    sink.  A terminal TaskNotification that arrives during that turn therefore
+    clears the global pin in `_handle_task_message`, while the old watcher's
+    private `pending` set never sees it.  Once the turn confirms there are no
+    pins left, cancel that now-ownerless reader so it cannot suppress compact
+    and LRU reclamation until the 30-minute task timeout.
+    """
+    if _sessions_with_inflight_tasks.get(session_id):
+        return
+    watcher = _task_watchers.get(session_id)
+    if watcher is None or watcher.done() or watcher is asyncio.current_task():
+        return
+    watcher.cancel()
+    await asyncio.gather(watcher, return_exceptions=True)
+    if _task_watchers.get(session_id) is watcher:
+        _task_watchers.pop(session_id, None)
 
 
 async def _handoff_task_watcher(session_id: str) -> None:
@@ -10905,22 +12175,75 @@ async def _finish_cancelled_startup(
     session_id: str,
     broadcast: TurnBroadcast,
 ) -> TurnBroadcast:
-    """Finish a turn cancelled before its SDK client/query was ready."""
-    if not broadcast.done:
-        snapshot_ready = await asyncio.to_thread(
-            _persist_cancelled_turn_snapshot, broadcast)
-        broadcast.publish({
-            "event": "cancelled",
-            "data": json.dumps({"snapshot_ready": snapshot_ready}),
-        })
-        broadcast.finish()
-    async with _lock:
-        if _active_turns.get(session_id) is broadcast:
-            _active_turns.pop(session_id, None)
-    await _finish_activity(session_id, broadcast, "cancelled")
-    _remember_recent_turn(session_id, broadcast)
-    _delete_active_turn_sidecar(session_id)
-    return broadcast
+    """Finish a pre-query cancellation without exposing an ABA window.
+
+    Snapshot persistence uses a worker thread and cannot actually stop once it
+    starts. Keep one shielded cleanup owner per broadcast, retain the active
+    reservation until Activity is terminal, and only then publish/remember/pop
+    the turn atomically under ``_lock``.
+    """
+    cleanup = getattr(broadcast, "_cancelled_startup_cleanup_task", None)
+    if cleanup is None:
+        async def _cleanup() -> TurnBroadcast:
+            if broadcast.queue_item_id:
+                try:
+                    sess.release_queue_claim(
+                        session_id,
+                        broadcast.queue_item_id,
+                        turn_id=broadcast.turn_id,
+                        pause=True,
+                    )
+                except Exception as exc:
+                    # Deletion/corruption must not strand the active slot or
+                    # Activity row. Restart recovery retains uncertain claims.
+                    sys.stderr.write(
+                        f"[chat] cancelled queue rollback failed "
+                        f"sid={session_id[:8]} "
+                        f"item={broadcast.queue_item_id[:8]} "
+                        f"exc={type(exc).__name__}\n"
+                    )
+            snapshot_ready = False
+            if not broadcast.done:
+                try:
+                    snapshot_ready = await asyncio.to_thread(
+                        _persist_cancelled_turn_snapshot, broadcast)
+                except Exception as exc:
+                    sys.stderr.write(
+                        f"[chat] cancelled snapshot failed sid={session_id[:8]} "
+                        f"exc={type(exc).__name__}\n"
+                    )
+            await _finish_activity(session_id, broadcast, "cancelled")
+            async with _lock:
+                if not broadcast.done:
+                    broadcast.publish({
+                        "event": "cancelled",
+                        "data": json.dumps({
+                            "snapshot_ready": snapshot_ready,
+                        }),
+                    })
+                    broadcast.finish()
+                if not sess.session_is_deleting(session_id):
+                    _remember_recent_turn(session_id, broadcast)
+                _delete_active_turn_sidecar(session_id)
+                if _active_turns.get(session_id) is broadcast:
+                    _active_turns.pop(session_id, None)
+            return broadcast
+
+        cleanup = asyncio.create_task(_cleanup())
+        broadcast._cancelled_startup_cleanup_task = cleanup
+    try:
+        return await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        # A disconnected subscriber may cancel this task while the Stop-button
+        # cleanup is already running. Join the single owner before propagating
+        # cancellation so no reservation/Activity/replay state is left behind.
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
 
 
 async def _start_activity_early(
@@ -10933,9 +12256,39 @@ async def _start_activity_early(
         return
     try:
         from .activity import activity as _activity
-        await asyncio.to_thread(
-            _activity.start, session_id, summary=prompt)
-        broadcast.activity_started = True
+        start_task = asyncio.create_task(
+            asyncio.to_thread(
+                _activity.start,
+                session_id,
+                summary=prompt,
+                activity_source=broadcast.activity_source,
+                owner_id=broadcast.turn_id,
+            )
+        )
+        try:
+            await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            # A worker-thread write cannot be cancelled once it starts. Join it
+            # before startup rollback, otherwise it can create a late phantom
+            # "running" row after the rollback already tried to finish it.
+            while not start_task.done():
+                try:
+                    await asyncio.shield(start_task)
+                except asyncio.CancelledError:
+                    # More than one owner may cancel the same startup (request
+                    # disconnect plus Stop). Keep the worker wrapper alive and
+                    # consume every cancellation until its outcome is known.
+                    continue
+            try:
+                start_task.result()
+            except Exception as e:
+                sys.stderr.write(
+                    f"[activity] start failed sid={session_id}: {e}\n")
+            else:
+                broadcast.activity_started = True
+            raise
+        else:
+            broadcast.activity_started = True
     except Exception as e:
         sys.stderr.write(f"[activity] start failed sid={session_id}: {e}\n")
 
@@ -10950,12 +12303,131 @@ async def _finish_activity(
         return
     try:
         from .activity import activity as _activity
-        await asyncio.to_thread(_activity.finish, session_id, status)
+        finish_task = asyncio.create_task(
+            asyncio.to_thread(
+                _activity.finish,
+                session_id,
+                status,
+                activity_source=broadcast.activity_source,
+                owner_id=broadcast.turn_id,
+            )
+        )
+        try:
+            await asyncio.shield(finish_task)
+        except asyncio.CancelledError:
+            while not finish_task.done():
+                try:
+                    await asyncio.shield(finish_task)
+                except asyncio.CancelledError:
+                    continue
+            finish_task.result()
+            raise
     except Exception as e:
         sys.stderr.write(
             f"[activity] startup finish failed sid={session_id}: {e}\n")
     finally:
         broadcast.activity_started = False
+
+
+async def _abort_turn_startup(
+    session_id: str,
+    broadcast: TurnBroadcast,
+    status: str,
+    *,
+    pause_queue: bool = True,
+) -> bool:
+    """Settle every owner created before an SDK query has been sent."""
+    queue_settled = False
+    if broadcast.queue_item_id:
+        try:
+            queue_settled = sess.release_queue_claim(
+                session_id,
+                broadcast.queue_item_id,
+                turn_id=broadcast.turn_id,
+                pause=pause_queue,
+            )
+        except Exception as exc:
+            # Queue corruption/deletion is already durable uncertainty. It must
+            # not prevent Activity and active-turn ownership from terminating.
+            sys.stderr.write(
+                f"[chat] startup queue rollback failed sid={session_id[:8]} "
+                f"item={broadcast.queue_item_id[:8]} "
+                f"exc={type(exc).__name__}\n"
+            )
+    async def _finalize_owner() -> None:
+        await _finish_activity(session_id, broadcast, status)
+        # Keep the reservation until the Activity row is terminal. Otherwise a
+        # new turn can start a replacement row that this older cleanup closes.
+        async with _lock:
+            if _active_turns.get(session_id) is broadcast:
+                broadcast.finish()
+                _active_turns.pop(session_id, None)
+
+    activity_finish = asyncio.create_task(_finalize_owner())
+    try:
+        await asyncio.shield(activity_finish)
+    except asyncio.CancelledError:
+        while not activity_finish.done():
+            try:
+                await asyncio.shield(activity_finish)
+            except asyncio.CancelledError:
+                continue
+        activity_finish.result()
+        raise
+    return queue_settled
+
+
+async def _fail_queued_attachment_startup(
+    session_id: str,
+    broadcast: TurnBroadcast,
+) -> bool:
+    """Roll a bound queued turn back when its staged uploads disappeared.
+
+    This path runs after the client has started but before the final query is
+    wired.  Keep the active reservation until Activity Center is terminal so a
+    direct send cannot start a new row and then be overwritten by this older
+    cleanup.  The durable claim is released with the exact turn id; the item and
+    its attachment ids remain visible in the paused queue for edit/reattach.
+    """
+    queue_settled = False
+    try:
+        queue_settled = sess.release_queue_claim(
+            session_id,
+            broadcast.queue_item_id,
+            turn_id=broadcast.turn_id,
+            pause=True,
+        )
+    except Exception as e:
+        # Leave a failed release bound on disk for conservative restart
+        # recovery. Never guess ownership or drop the accepted item.
+        sys.stderr.write(
+            f"[chat] queued attachment rollback failed sid={session_id[:8]} "
+            f"item={broadcast.queue_item_id[:8]} exc={type(e).__name__}\n")
+        sys.stderr.flush()
+
+    activity_finish = asyncio.create_task(
+        _finish_activity(session_id, broadcast, "failed"))
+    try:
+        try:
+            await asyncio.shield(activity_finish)
+        except asyncio.CancelledError:
+            # The ledger writes in a worker thread and cannot actually be
+            # cancelled once started. Join it before exposing the session slot,
+            # or its late finish-by-sid could close a newer direct turn's row.
+            await activity_finish
+            raise
+    finally:
+        # No SDK query was sent, so there is no detached pump/recent-turn replay
+        # to own this broadcast. Synchronous identity cleanup is atomic on the
+        # event loop and still runs if Activity cleanup is cancelled.
+        if not broadcast.done:
+            broadcast.finish()
+        broadcast.close()
+        if _active_turns.get(session_id) is broadcast:
+            _active_turns.pop(session_id, None)
+        _interrupted_at_startup.pop(session_id, None)
+        _delete_active_turn_sidecar(session_id)
+    return queue_settled
 
 
 def _defer_activity_finish(
@@ -10973,7 +12445,7 @@ def _defer_activity_finish(
     """
     if not broadcast.activity_started:
         return False
-    _background_activity_finishes[session_id] = status
+    _background_activity_finishes[session_id] = (status, broadcast.turn_id)
     broadcast.activity_started = False
     return True
 
@@ -10982,16 +12454,41 @@ async def _finish_background_activity(
     session_id: str,
     *,
     failed: bool = False,
+    owner_id: str = "",
 ) -> None:
     """Close a deferred activity row after the detached logical turn ends."""
-    status = _background_activity_finishes.pop(session_id, None)
-    if status is None:
+    deferred = _background_activity_finishes.get(session_id)
+    if deferred is None:
         return
+    status, current_owner_id = deferred
+    if owner_id and current_owner_id != owner_id:
+        return
+    if _background_activity_finishes.get(session_id) == deferred:
+        _background_activity_finishes.pop(session_id, None)
+    owner_id = current_owner_id
     if failed:
         status = "failed"
     try:
         from .activity import activity as _activity
-        await asyncio.to_thread(_activity.finish, session_id, status)
+        finish_task = asyncio.create_task(
+            asyncio.to_thread(
+                _activity.finish,
+                session_id,
+                status,
+                activity_source="background",
+                owner_id=owner_id,
+            )
+        )
+        try:
+            await asyncio.shield(finish_task)
+        except asyncio.CancelledError:
+            while not finish_task.done():
+                try:
+                    await asyncio.shield(finish_task)
+                except asyncio.CancelledError:
+                    continue
+            finish_task.result()
+            raise
     except Exception as e:
         sys.stderr.write(
             f"[activity] background finish failed sid={session_id}: {e}\n")
@@ -11006,6 +12503,7 @@ async def _start_turn(
     plan_return_permission: str = "",
     image_ids: str = "",
     persist_permission: bool = True,
+    queue_item_id: str = "",
 ) -> "TurnBroadcast":
     """Reserve + launch a turn as a detached background task; return its
     TurnBroadcast (already inserted into _active_turns and pumping via
@@ -11047,6 +12545,11 @@ async def _start_turn(
     # fill its `user_text` / images / etc. below once we've parsed them.
     draining = None
     async with _lock:
+        # Explicit deletion fences queue and direct sends before its first
+        # asynchronous teardown step. A request that began earlier is either
+        # already visible here and will be cancelled by purge, or is rejected.
+        if sess.session_is_deleting(session_id):
+            raise _TurnStartError("session is being deleted", status=404)
         cur = _active_turns.get(session_id)
         if cur is not None and not cur.done:
             if not cur.cancelled:
@@ -11056,13 +12559,13 @@ async def _start_turn(
             # tearing it down). Rather than bounce the user's resend with
             # "previous turn still running", wait below for the slot to free.
             draining = cur
-        # NOTE: pending background tasks no longer block a new turn. They used
-        # to, because the detached watcher was the SOLE reader of this
-        # session's SDK stream — starting a turn cancelled it and then drained
-        # the old continuation as if it answered the new prompt. The session
-        # pump (_SessionStream) now owns the stream and routes messages to the
-        # active turn or to the watcher, so both coexist and the user can keep
-        # talking while a background task runs.
+        # One pump prevents competing SDK readers, but it cannot correlate an
+        # old background task's late auto-continuation with a simultaneous new
+        # query on the same CLI. Keep the new message in the durable queue
+        # until the watcher fully drains and then advances FIFO itself.
+        elif (_sessions_with_inflight_tasks.get(session_id)
+              or _session_has_live_watcher(session_id)):
+            raise _TurnBusy()
         else:
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -11076,9 +12579,19 @@ async def _start_turn(
                 break
             await asyncio.sleep(0.1)
         async with _lock:
+            if sess.session_is_deleting(session_id):
+                raise _TurnStartError(
+                    "session is being deleted", status=404)
             cur = _active_turns.get(session_id)
             if cur is not None and not cur.done:
                 # Teardown still hasn't completed — give up cleanly.
+                raise _TurnBusy()
+            # The interrupted turn can publish its background-task watcher
+            # immediately before releasing `_active_turns`. Re-check that
+            # logical response owner at the same reservation point; otherwise
+            # this draining path bypasses the ordinary background gate above.
+            if (_sessions_with_inflight_tasks.get(session_id)
+                    or _session_has_live_watcher(session_id)):
                 raise _TurnBusy()
             broadcast = TurnBroadcast(session_id=session_id, model=model or MODEL)
             _active_turns[session_id] = broadcast
@@ -11087,16 +12600,35 @@ async def _start_turn(
     # as soon as this broadcast owns the session so startup cancellation can
     # persist the same user bubble the browser is displaying.
     broadcast.user_text = prompt
+    broadcast.startup_owner_task = asyncio.current_task()
+    broadcast.queue_item_id = str(queue_item_id or "")
+    # The reservation above is the commit point: bind the durable queue claim
+    # before any SDK startup await can be cancelled. From here, only this turn's
+    # terminal cleanup may ack or release the item.
+    if broadcast.queue_item_id:
+        try:
+            sess.bind_queue_turn(
+                session_id, broadcast.queue_item_id, broadcast.turn_id)
+        except Exception:
+            async with _lock:
+                if _active_turns.get(session_id) is broadcast:
+                    broadcast.finish()
+                    _active_turns.pop(session_id, None)
+            raise _TurnStartError("could not bind queued message to turn")
     # Clear a completed watcher defensively. A live watcher must never be
     # cancelled here: it still owns the stream and its continuation belongs to
     # the previous turn.
     try:
         await _handoff_task_watcher(session_id)
+    except asyncio.CancelledError:
+        if broadcast.cancelled:
+            return await _finish_cancelled_startup(session_id, broadcast)
+        await _abort_turn_startup(
+            session_id, broadcast, "cancelled", pause_queue=True)
+        raise
     except _TurnBusy:
-        async with _lock:
-            if _active_turns.get(session_id) is broadcast:
-                broadcast.finish()
-                _active_turns.pop(session_id, None)
+        await _abort_turn_startup(
+            session_id, broadcast, "failed", pause_queue=False)
         raise
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
@@ -11148,7 +12680,14 @@ async def _start_turn(
     # not that a cold CLI/MCP client has already finished starting. Publishing
     # here removes the user-visible startup gap while the terminal cleanup
     # paths below prevent failed starts from becoming phantom running rows.
-    await _start_activity_early(session_id, broadcast, prompt)
+    try:
+        await _start_activity_early(session_id, broadcast, prompt)
+    except asyncio.CancelledError:
+        if broadcast.cancelled:
+            return await _finish_cancelled_startup(session_id, broadcast)
+        await _abort_turn_startup(
+            session_id, broadcast, "cancelled", pause_queue=True)
+        raise
     if broadcast.cancelled:
         return await _finish_cancelled_startup(session_id, broadcast)
     # Wrap get_client so SDK / auth pre-check errors surface as a typed
@@ -11179,14 +12718,12 @@ async def _start_turn(
                 if broadcast.startup_task is startup_task:
                     broadcast.startup_task = None
     except asyncio.TimeoutError:
-        async with _lock:
-            if _active_turns.get(session_id) is broadcast:
-                broadcast.finish()
-                _active_turns.pop(session_id, None)
-        await _finish_activity(session_id, broadcast, "failed")
+        queue_settled = await _abort_turn_startup(
+            session_id, broadcast, "failed", pause_queue=True)
         raise _TurnStartError(
             "Client connection timed out — CLI process may be hung",
-            status=504)
+            status=504,
+            queue_claim_settled=queue_settled)
     except asyncio.CancelledError:
         if broadcast.cancelled:
             return await _finish_cancelled_startup(session_id, broadcast)
@@ -11196,22 +12733,17 @@ async def _start_turn(
         # every subsequent send on this sid is rejected as "previous
         # turn still running." CancelledError is a BaseException, NOT
         # an Exception, so the broader handler below would miss it.
-        async with _lock:
-            if _active_turns.get(session_id) is broadcast:
-                broadcast.finish()
-                _active_turns.pop(session_id, None)
-        await _finish_activity(session_id, broadcast, "cancelled")
+        await _abort_turn_startup(
+            session_id, broadcast, "cancelled", pause_queue=True)
         raise
     except Exception as e:
         err_msg = str(e) or f"{type(e).__name__}"
         # Free the reservation so the user can fix their config (e.g. add an
         # API key) and immediately retry without waiting for any timeout.
-        async with _lock:
-            if _active_turns.get(session_id) is broadcast:
-                broadcast.finish()
-                _active_turns.pop(session_id, None)
-        await _finish_activity(session_id, broadcast, "failed")
-        raise _TurnStartError(err_msg)
+        queue_settled = await _abort_turn_startup(
+            session_id, broadcast, "failed", pause_queue=True)
+        raise _TurnStartError(
+            err_msg, queue_claim_settled=queue_settled)
 
     # Stop can race the final instant of client startup: the client may have
     # committed to the pool just after /interrupt snapshotted an empty target
@@ -11232,14 +12764,23 @@ async def _start_turn(
     persisted_imgs: list[dict] = []
     persisted_docs: list[dict] = []
     if image_ids:
-        # Sweep expired entries before consuming. Previously _gc_images
-        # only ran on upload, so a user who never uploaded again would
-        # leak their old attachments in memory past TTL. Reads check too.
-        _gc_images()
-        for aid in [x.strip() for x in image_ids.split(",") if x.strip()]:
-            entry = _image_store.pop(aid, None)
-            if entry is None:
-                continue   # expired or unknown — silently skip
+        # This is the final attachment boundary before query wiring. Queue
+        # uploads are claimed all-or-none under the store lock: client startup
+        # may have taken long enough for a previously successful drain precheck
+        # to go stale, but the durable message must never degrade to text-only.
+        # Direct sends keep their historical best-effort missing-id behaviour.
+        claimed_attachments, missing_attachments = _claim_staged_attachments(
+            image_ids,
+            require_all=bool(broadcast.queue_item_id),
+        )
+        if broadcast.queue_item_id and missing_attachments:
+            queue_settled = await _fail_queued_attachment_startup(
+                session_id, broadcast)
+            raise _TurnStartError(
+                "queued attachment is missing or expired",
+                queue_claim_settled=queue_settled,
+            )
+        for aid, entry in claimed_attachments:
             kind = entry.get("kind", "image")
             if kind == "image":
                 img_blocks.append({
@@ -11448,6 +12989,7 @@ async def _start_turn(
         then the SDK-native `/compact` slash command if the effective window is
         close to full.
         """
+        nonlocal client
         try:
             # This probe is advisory when no compact is needed. Never let a
             # wedged SDK control request delay the user's real prompt for the
@@ -11460,10 +13002,48 @@ async def _start_turn(
                 ),
             )
         except Exception as e:
+            safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
             sys.stderr.write(
                 f"[chat-preflight] get_context_usage skipped sid={session_id[:8]} "
-                f"model={model_to_use}: {type(e).__name__}\n")
-            return
+                f"model={model_to_use}: {type(e).__name__} kind={safe_kind}\n")
+            sys.stderr.flush()
+            if not (
+                _is_codex_gateway_model(model_to_use)
+                and _is_context_window_failure(e)
+            ):
+                return
+            # An explicit Gateway context rejection is terminal for this
+            # transcript.  Do not submit the user's real prompt to the same
+            # poisoned runtime.  A background-task owner must keep its process;
+            # the outer error path records a deferred rebuild after it settles.
+            if (_sessions_with_inflight_tasks.get(session_id)
+                    or _session_has_live_watcher(session_id)):
+                raise
+            recovery_used, recovery_limit = _context_recovery_inputs(
+                session_id,
+                model_to_use,
+            )
+            await _emit_compact(
+                emit,
+                "start",
+                used=recovery_used,
+                limit=recovery_limit,
+                threshold=0,
+            )
+            recovery = await _recover_context_session(
+                session_id,
+                model_to_use,
+                pre_tokens=recovery_used,
+                context_limit=recovery_limit,
+            )
+            await _emit_compact(
+                emit,
+                "end",
+                ok=True,
+                recovered=True,
+                session_id=recovery["session"].get("id", ""),
+            )
+            raise _ContextRecovered(recovery)
         total = _positive_int(cu.get("totalTokens"))
         sdk_max = _positive_int(cu.get("maxTokens"))
         sdk_raw = _positive_int(cu.get("rawMaxTokens"))
@@ -11511,6 +13091,21 @@ async def _start_turn(
                 sess_u["context_used_pct"] = round(
                     sess_u["context_used"] / sess_u["context_limit"] * 100, 1)
             return
+        # A background watcher shares this client's single SDK message pump.
+        # `/compact` uses a temporary turn consumer; if it ran here, task
+        # notifications and the model's auto-continuation could be routed into
+        # the slash-command queue and discarded at its Result boundary. Let the
+        # real user query proceed instead: the ordinary turn dispatcher knows
+        # how to forward those lifecycle messages, and the CLI's explicitly
+        # configured native auto-compact window still gets a chance to act.
+        if (_sessions_with_inflight_tasks.get(session_id)
+                or _session_has_live_watcher(session_id)):
+            sys.stderr.write(
+                f"[chat-preflight] native compact deferred for background "
+                f"owner sid={session_id[:8]} model={model_to_use} "
+                f"total={total} threshold={threshold}\n")
+            sys.stderr.flush()
+            return
         sys.stderr.write(
             f"[chat-preflight] native compact sid={session_id[:8]} model={model_to_use} "
             f"total={total} next~={next_est} threshold={threshold} limit={limit}\n")
@@ -11528,7 +13123,53 @@ async def _start_turn(
         # shrank is the fact. Keep the command's verdict aside and let the token
         # count adjudicate, so a compaction that succeeded but failed to
         # acknowledge itself cannot kill the turn it just made room for.
+        async def _compact_and_measure(
+                target: ClaudeSDKClient,
+        ) -> tuple[Exception | None, dict, Exception | None, dict[str, bool]]:
+            """Run one compact attempt and return its observed token state.
+
+            A slash command can report an in-band failure even after the CLI
+            changed its transcript.  Keep that verdict separate from the
+            authoritative post-command context reading so a real token drop
+            still wins.
+            """
+            tail_path, tail_offset = _compact_tail_cursor(session_id)
+            cmd_error: Exception | None = None
+            try:
+                await _run_sdk_command_checked(target, "/compact")
+            except Exception as e:
+                cmd_error = e
+                safe_kind = _classify_stream_error(str(e)).get("kind", "unknown")
+                sys.stderr.write(
+                    f"[chat-preflight] native compact reported failure "
+                    f"sid={session_id[:8]} model={model_to_use}: "
+                    f"{type(e).__name__} kind={safe_kind} — verifying\n")
+                sys.stderr.flush()
+            try:
+                measured = dict(await target.get_context_usage())
+                measure_error: Exception | None = None
+                if not _positive_int(measured.get("totalTokens")):
+                    measure_error = RuntimeError(
+                        "post-compact context usage did not include totalTokens")
+            except Exception as e:
+                measured = {}
+                measure_error = e
+                sys.stderr.write(
+                    f"[chat-preflight] post-compact context probe failed "
+                    f"sid={session_id[:8]} model={model_to_use}: "
+                    f"{type(e).__name__}\n")
+                sys.stderr.flush()
+            tail_outcome = await asyncio.to_thread(
+                _compact_tail_outcome, tail_path, tail_offset)
+            return cmd_error, measured, measure_error, tail_outcome
+
         cmd_error: Exception | None = None
+        measure_error: Exception | None = None
+        tail_outcome: dict[str, bool] = {
+            "boundary": False,
+            "summary": False,
+            "context_error": False,
+        }
         try:
             # One compact deadline covers both the slash command and the
             # authoritative token-drop verification. The old split left the
@@ -11537,17 +13178,82 @@ async def _start_turn(
             async with asyncio.timeout(
                 env_int("MUSELAB_COMPACT_TIMEOUT_S", 300, min_value=1)
             ):
-                try:
-                    await _run_sdk_command_checked(client, "/compact")
-                except Exception as e:
-                    cmd_error = e
+                cmd_error, cu2, measure_error, tail_outcome = (
+                    await _compact_and_measure(client))
+                real_total = _positive_int(cu2.get("totalTokens"))
+                compact_pair_written = (
+                    tail_outcome.get("boundary")
+                    and tail_outcome.get("summary")
+                )
+
+                # A Codex Gateway session created by an older bundled CLI may
+                # have auto-compaction disabled for the lifetime of that CLI
+                # process.  If /compact made no room, rebuild the runtime with
+                # the now-explicit auto-compact window and retry exactly once.
+                # This is deliberately forbidden while a background task is
+                # attached: disconnecting that CLI would terminate real work.
+                if (not (total and real_total and real_total < total)
+                        and not tail_outcome.get("context_error")
+                        and _is_codex_gateway_model(model_to_use)
+                        and not _sessions_with_inflight_tasks.get(session_id)
+                        and not _session_has_live_watcher(session_id)):
                     sys.stderr.write(
-                        f"[chat-preflight] native compact reported failure "
-                        f"sid={session_id[:8]} model={model_to_use}: "
-                        f"{type(e).__name__}: {e} — verifying\n")
+                        f"[chat-preflight] rebuilding stalled Codex runtime "
+                        f"sid={session_id[:8]} model={model_to_use} "
+                        f"total={total} after={real_total}; retrying once\n")
                     sys.stderr.flush()
-                cu2 = await client.get_context_usage()
+                    await disconnect_client(session_id)
+                    client = await get_client(
+                        session_id, model_to_use, permission,
+                        **client_kwargs,
+                    )
+                    # The fresh runtime may observe a compact boundary written
+                    # by the first process even when that process's follow-up
+                    # probe failed. Measure before issuing a second slash
+                    # command; never compact twice when the first one worked.
+                    fresh_probe: dict = {}
+                    fresh_probe_error: Exception | None = None
+                    try:
+                        fresh_probe = dict(await client.get_context_usage())
+                    except Exception as e:
+                        fresh_probe_error = e
+                    fresh_total = _positive_int(fresh_probe.get("totalTokens"))
+                    if not fresh_total and fresh_probe_error is None:
+                        fresh_probe_error = RuntimeError(
+                            "fresh runtime context usage did not include totalTokens")
+                    if total and fresh_total and fresh_total < total:
+                        cmd_error = None
+                        measure_error = None
+                        cu2 = fresh_probe
+                    elif compact_pair_written:
+                        # The transcript pair is the CLI's durable compact
+                        # commit. A control-plane usage reading can lag one
+                        # process generation; trust the new root rather than
+                        # running /compact twice or forking unnecessarily.
+                        cmd_error = None
+                        measure_error = None
+                        cu2 = fresh_probe
+                    elif cmd_error is None and measure_error is not None \
+                            and fresh_probe_error is not None:
+                        # The first slash command reported success, but neither
+                        # process can tell us whether the compact boundary took
+                        # effect. A blind second /compact could summarize an
+                        # already summarized transcript. Fail this send and
+                        # evict the runtime; the next attempt will re-probe a
+                        # clean process instead of risking double compaction.
+                        cu2 = fresh_probe
+                        measure_error = fresh_probe_error
+                    else:
+                        cmd_error, cu2, measure_error, tail_outcome = (
+                            await _compact_and_measure(client))
+        except asyncio.CancelledError:
+            # An operator-configured whole-turn timeout or explicit task
+            # cancellation can land midway through /compact. Its CLI state is
+            # unknowable; never leave that process cached for the next prompt.
+            _pending_runtime_rebuilds.add(session_id)
+            raise
         except asyncio.TimeoutError:
+            _pending_runtime_rebuilds.add(session_id)
             await _emit_compact(
                 emit,
                 "end",
@@ -11556,28 +13262,86 @@ async def _start_turn(
             )
             raise
         except Exception as e:
+            _pending_runtime_rebuilds.add(session_id)
             # Can't observe the outcome, so the command's verdict is all we
             # have. No reading also means no evidence of success.
             await _emit_compact(emit, "end", ok=False,
                                 error=f"{type(e).__name__}: {e}")
-            raise cmd_error or e
+            # This block covers failures in the rebuild/probe orchestration
+            # itself. Do not mask a fresh disconnect/client-creation error with
+            # an older compact verdict captured before the recovery attempt.
+            raise
         real_total = _positive_int(cu2.get("totalTokens"))
-        if not (total and real_total and real_total < total):
+        compact_pair_written = bool(
+            tail_outcome.get("boundary") and tail_outcome.get("summary"))
+        made_room = bool(
+            (total and real_total and real_total < total)
+            or compact_pair_written
+        )
+        if not made_room:
             # Genuinely no room made. Once the SDK says compaction is required,
             # that is terminal for this turn — sending the original prompt
             # anyway only produces a second context-window error and trains the
             # UI to offer a useless retry loop.
-            reason = (f"{type(cmd_error).__name__}: {cmd_error}" if cmd_error
-                      else f"context did not shrink ({total} -> {real_total})")
+            reason = (
+                f"{type(measure_error).__name__}: {measure_error}"
+                if measure_error is not None
+                else f"{type(cmd_error).__name__}: {cmd_error}"
+                if cmd_error is not None
+                else f"context did not shrink ({total} -> {real_total})"
+            )
+            failure = measure_error or cmd_error
+            safe_reason = (
+                f"{type(failure).__name__} "
+                f"kind={_classify_stream_error(str(failure)).get('kind', 'unknown')}"
+                if failure is not None
+                else f"context did not shrink ({total} -> {real_total})"
+            )
             sys.stderr.write(
                 f"[chat-preflight] native compact failed sid={session_id[:8]} "
-                f"model={model_to_use}: {reason}\n")
+                f"model={model_to_use}: {safe_reason}\n")
             sys.stderr.flush()
             # The `error` SSE that follows tears the stream down, and the FE
             # clears `compacting` on stream teardown regardless — but emit the
             # terminal phase anyway so the bubble's reason is the compact's,
             # not a generic transport failure.
+            deterministic_failure = bool(
+                tail_outcome.get("context_error")
+                or any(
+                    _is_context_window_failure(error)
+                    for error in (cmd_error, measure_error)
+                )
+                or (
+                    total and real_total and real_total >= total
+                    and measure_error is None
+                )
+            )
+            if (_is_codex_gateway_model(model_to_use)
+                    and deterministic_failure):
+                # Once the transcript itself is beyond the Gateway request
+                # limit, another native /compact is a catch-22: the model must
+                # read the history in order to summarize it, but the request is
+                # rejected before inference. Flush/retire the dead runtime,
+                # preserve the source, and make a bounded recovery fork.
+                recovery = await _recover_context_session(
+                    session_id,
+                    model_to_use,
+                    pre_tokens=total,
+                    context_limit=limit,
+                )
+                await _emit_compact(
+                    emit,
+                    "end",
+                    ok=True,
+                    recovered=True,
+                    session_id=recovery["session"].get("id", ""),
+                )
+                raise _ContextRecovered(recovery)
+
+            _pending_runtime_rebuilds.add(session_id)
             await _emit_compact(emit, "end", ok=False, error=reason)
+            if measure_error is not None:
+                raise measure_error
             if cmd_error is not None:
                 raise cmd_error
             raise _SDKCommandError({
@@ -11678,6 +13442,18 @@ async def _start_turn(
                 # shaped as {"event", "data"} and passed straight through.
                 async def _emit_side(evt: dict) -> None:
                     await merge_q.put(("side", evt))
+
+                # Capture a display-safe tail anchor before preflight. A
+                # failing /compact never reaches the ordinary pre-query
+                # snapshot below; leaving the default zero anchor would place
+                # its durable user+error snapshot at the beginning of a long
+                # conversation after refresh. This is only a fallback — a
+                # successful compact may change the transcript root, so we
+                # refresh it again immediately before the real user query.
+                existing_uuids, transcript_boundary = await asyncio.to_thread(
+                    _turn_transcript_boundary, session_id, model_to_use)
+                broadcast.transcript_boundary = transcript_boundary
+                _write_active_turn_sidecar(broadcast)
                 await _preflight_compact_if_needed(_emit_side)
                 # Snapshot AFTER preflight compact (which may write a new compact
                 # boundary) and immediately BEFORE this user query. A cache hit is
@@ -11692,18 +13468,22 @@ async def _start_turn(
                 # Multimodal path when binary blocks (image/pdf) are present.
                 # Text-only attachments were already inlined into `prompt`.
                 binary_blocks = [*img_blocks, *pdf_blocks]
-                if binary_blocks:
-                    text_block = {"type": "text", "text": prompt}
-                    content = [*binary_blocks, text_block]
 
-                    async def gen():
-                        yield {
-                            "type": "user",
-                            "message": {"role": "user", "content": content},
-                        }
-                    await client.query(gen())
-                else:
-                    await client.query(prompt)
+                async def _send_query() -> None:
+                    if binary_blocks:
+                        text_block = {"type": "text", "text": prompt}
+                        content = [*binary_blocks, text_block]
+
+                        async def gen():
+                            yield {
+                                "type": "user",
+                                "message": {
+                                    "role": "user", "content": content,
+                                },
+                            }
+                        await client.query(gen())
+                    else:
+                        await client.query(prompt)
 
                 replay_dropped = 0
 
@@ -11719,14 +13499,15 @@ async def _start_turn(
 
                 stream = _stream_for(client)
                 if stream is not None:
-                    # Attach to the session's sole reader instead of opening a
-                    # second iterator over the same stream. The old outer loop
-                    # existed only because receive_response() returns at EVERY
-                    # ResultMessage — including a stale replayed one — and had
-                    # to be re-entered; a queue has no such boundary, so a
-                    # stale result just keeps draining.
+                    # Attach BEFORE query(): query() yields to the transport,
+                    # so an immediate response can otherwise reach the pump's
+                    # orphan park before this consumer exists. The old outer
+                    # loop existed only because receive_response() returns at
+                    # EVERY ResultMessage — including a replayed one. A queue
+                    # has no such boundary, so stale results keep draining.
                     turn_q = stream.attach_turn()
                     try:
+                        await _send_query()
                         while True:
                             msg = await turn_q.get()
                             if msg is _STREAM_EOF:
@@ -11745,10 +13526,16 @@ async def _start_turn(
                                 break
                     finally:
                         stream.detach_turn(turn_q)
+                        # The pump may have already queued lifecycle records
+                        # after Result. Return every leftover to the orphan
+                        # park so a background watcher can adopt them instead
+                        # of silently losing task settlements/continuations.
+                        stream.park_unconsumed(turn_q)
                 else:
                     # No pump: this client was not created through get_client
                     # (test doubles inject their own). Fall back to the SDK's
                     # bounded iterator with the original re-entry loop.
+                    await _send_query()
                     while True:
                         stale_terminal = False
                         current_terminal = False
@@ -11769,14 +13556,25 @@ async def _start_turn(
             try:
                 async with _session_runtime_lock_for(session_id):
                     await _run_query()
-            except Exception as e:
-                # Log the full exception type + message + traceback for diagnosis.
-                # SDK transport errors / vendor 401s land here. Without this we
-                # silently die and the user just sees "卡着，无法对话".
-                import traceback
+            except _ContextRecovered as e:
+                # Expected control transfer: the old transcript was preserved
+                # and the browser will adopt the returned recovery session.
+                # Keep service logs concise and never dump summary/prompt data.
                 sys.stderr.write(
-                    f"[chat-stream] sid={session_id} model={model_to_use} "
-                    f"exc={type(e).__name__}: {e}\n{traceback.format_exc()}\n")
+                    f"[chat-preflight] recovery session ready "
+                    f"sid={session_id[:8]} model={model_to_use}\n")
+                sys.stderr.flush()
+                await merge_q.put(("error", e))
+            except Exception as e:
+                # Keep enough structure for diagnosis without copying an SDK
+                # exception, prompt, path, credential or protocol payload into
+                # service logs. The authenticated SSE error remains the user's
+                # detailed surface.
+                error_kind = _classify_stream_error(str(e)).get(
+                    "kind", "unknown")
+                sys.stderr.write(
+                    f"[chat-stream] sid={session_id[:8]} model={model_to_use} "
+                    f"exc={type(e).__name__} kind={error_kind}\n")
                 sys.stderr.flush()
                 await merge_q.put(("error", e))
             finally:
@@ -11862,16 +13660,20 @@ async def _start_turn(
                  stream may have skipped; forward tool_use / tool_result.
             """
             nonlocal assistant_acc, streamed_in_bubble, last_assistant_uuid
+            # Capture the canonical boundary even for a synthetic API-error
+            # AssistantMessage. Its text is intentionally suppressed from the
+            # normal token stream, but done/footer persistence and canonical
+            # reconciliation still need the exact UUID.
+            assistant_uuid = getattr(msg, "uuid", None)
+            if assistant_uuid:
+                last_assistant_uuid = str(assistant_uuid)
+                broadcast.last_assistant_uuid = last_assistant_uuid
             if error_info := _sdk_assistant_error(msg):
                 turn_sdk_errors.append(error_info)
                 # Synthetic API-error assistants often carry the raw error as a
                 # TextBlock. Do not render it as if it were a normal Muse reply;
                 # the terminal done event below surfaces the classified failure.
                 return
-            assistant_uuid = getattr(msg, "uuid", None)
-            if assistant_uuid:
-                last_assistant_uuid = str(assistant_uuid)
-                broadcast.last_assistant_uuid = last_assistant_uuid
             a_usage = getattr(msg, "usage", None) or {}
             if a_usage:
                 in_t = int(a_usage.get("input_tokens", 0) or 0)
@@ -12240,8 +14042,34 @@ async def _start_turn(
                                 "failed" if _is_error else "completed")
             _done_session_usage = dict(sess_u)
             _done_memory_recall = mem0.pop_recall_trace(session_id)
+            _done_memory_receipt = _persistable_memory_recall(
+                _done_memory_recall)
+            _completed_at_ms = int(time.time() * 1000)
+            _msg_duration_ms = getattr(msg, "duration_ms", None)
+            _elapsed_s = (round(_msg_duration_ms / 1000, 1)
+                          if _msg_duration_ms else None)
+            # A failed turn needs a durable copy of the terminal error bubble,
+            # including when a legitimate partial AssistantMessage precedes
+            # the Result error. Commit it before `done` so a quiet/hard reload
+            # cannot collapse the live partial+error pair into bare JSONL.
+            _failed_snapshot_ready = False
+            if _is_error and not was_cancelled:
+                _failed_snapshot_ready = await asyncio.to_thread(
+                    _persist_failed_turn_snapshot,
+                    broadcast,
+                    _error_message,
+                    terminal_at_ms=_completed_at_ms,
+                    elapsed_s=_elapsed_s,
+                    memory_recall=_done_memory_receipt,
+                    canonical_terminal_published=True,
+                )
             _done_background_tasks = len(
                 _merge_session_inflight(session_id, inflight_tasks)
+            )
+            _done_activity_source = (
+                "background"
+                if _done_background_tasks
+                else broadcast.activity_source
             )
             if _done_background_tasks:
                 _defer_activity_finish(
@@ -12255,10 +14083,6 @@ async def _start_turn(
             # turn can otherwise arrive while the slower context/transcript
             # bookkeeping below is still running and observe a bare assistant
             # record with no status/model/duration.
-            _completed_at_ms = int(time.time() * 1000)
-            _msg_duration_ms = getattr(msg, "duration_ms", None)
-            _elapsed_s = (round(_msg_duration_ms / 1000, 1)
-                          if _msg_duration_ms else None)
             _footer_annotation_uuid = ""
             if last_assistant_uuid:
                 try:
@@ -12271,6 +14095,7 @@ async def _start_turn(
                         ts=_completed_at_ms,
                         turn_status=_activity_status,
                         elapsed_s=_elapsed_s,
+                        memory_recall=_done_memory_receipt,
                     )
                     _footer_annotation_uuid = last_assistant_uuid
                 except Exception as exc:
@@ -12279,6 +14104,7 @@ async def _start_turn(
                         f"sid={session_id[:8]} exc={type(exc).__name__}\n")
                     sys.stderr.flush()
             yield {"event": "done", "data": json.dumps({
+                "turn_id": broadcast.turn_id,
                 "duration_ms": _msg_duration_ms,
                 "assistant_uuid": last_assistant_uuid,
                 "completed_at_ms": _completed_at_ms,
@@ -12311,7 +14137,9 @@ async def _start_turn(
                     if _budget_usd() > 0 else 0
                 ),
                 "memory_recall": _done_memory_recall,
+                "snapshot_ready": _failed_snapshot_ready,
                 "background_tasks_pending": _done_background_tasks,
+                "activity_source": _done_activity_source,
             })}
 
             # Everything below is post-turn persistence/telemetry. It remains
@@ -12399,14 +14227,10 @@ async def _start_turn(
                         f"[chat-stream] get_context_usage skipped for "
                         f"sid={session_id}: {type(_e).__name__}\n")
 
-            # Sidecar annotations: find the just-appended turn's user/assistant
-            # UUIDs, then write cost / model / images / docs against those rows
-            # in muselab's per-session sidecar. The turn that just finished is
-            # at the very END of the JSONL, so read only the tail rather than
-            # parsing the whole transcript — on a long session that full parse
-            # was a multi-second, GIL-holding hitch at every turn's end ("发消息
-            # /流式回复时卡"). Fall back to the full parse if the tail read can't
-            # resolve both UUIDs (e.g. a turn with >tail_lines tool entries).
+            # Sidecar annotations: resolve UUIDs from the exact pre-query
+            # transcript coordinate. A simple "latest assistant" tail scan is
+            # unsafe for Result-only Gateway errors: it would select the prior
+            # turn and overwrite its footer with this turn's failed state.
             # all_msgs holds the full transcript parse. The fast UUID path
             # below may skip the parse, but the count/auto-rename block further
             # down (message_count, turn_count, first_user_text) still needs the
@@ -12415,40 +14239,18 @@ async def _start_turn(
             # fallback branch, which previously left it unbound on the fast path
             # → UnboundLocalError at every turn's end.
             all_msgs: list | None = None
-            scanned_asst_uuid, new_user_uuid = await asyncio.to_thread(
-                _recent_turn_uuids, session_id, bool(persisted_imgs))
-            # AssistantMessage is the exact boundary for this turn.  A scan of
-            # the mutable transcript tail can already see a continuation or a
-            # fast next turn, so it is fallback-only.
-            new_asst_uuid = last_assistant_uuid or scanned_asst_uuid
-            if not (new_asst_uuid and new_user_uuid):
-                try:
-                    all_msgs = await asyncio.to_thread(
-                        _get_session_msgs, session_id, model_to_use)
-                except Exception:
-                    all_msgs = []
-                for sm in reversed(all_msgs):
-                    if sm.type == "assistant" and not new_asst_uuid:
-                        new_asst_uuid = sm.uuid
-                    elif sm.type == "user" and not new_user_uuid:
-                        if persisted_imgs:
-                            # When images were sent, match the user message that
-                            # actually contains image blocks — not just any last
-                            # user message. Without this, if the user sends more
-                            # messages while the stream is running, reversed()
-                            # finds a later (non-image) user UUID and the image
-                            # annotation ends up on the wrong message.
-                            content = (sm.message or {}).get("content") or []
-                            has_img_block = isinstance(content, list) and any(
-                                isinstance(b, dict) and b.get("type") == "image"
-                                for b in content
-                            )
-                            if has_img_block:
-                                new_user_uuid = sm.uuid
-                        else:
-                            new_user_uuid = sm.uuid
-                    if new_asst_uuid and new_user_uuid:
-                        break
+            boundary_asst_uuid, new_user_uuid = await asyncio.to_thread(
+                _turn_uuids_from_boundary,
+                session_id,
+                broadcast.transcript_boundary,
+                started_at_ms=int(float(broadcast.started_at or 0) * 1000),
+                terminal_at_ms=_completed_at_ms,
+                want_image_user=bool(persisted_imgs),
+            )
+            # AssistantMessage observed in this stream is authoritative. The
+            # indexed boundary is a safe fallback for older SDKs that omit the
+            # UUID on the in-memory object but still write it to JSONL.
+            new_asst_uuid = last_assistant_uuid or boundary_asst_uuid
             if new_asst_uuid and new_asst_uuid != _footer_annotation_uuid:
                 # ts (ms epoch) stamps the turn's completion time. The
                 # frontend's turn-footer (.turn-footer in index.html)
@@ -12467,7 +14269,8 @@ async def _start_turn(
                     cost=f"${cost:.4f}", model=model_to_use,
                     ts=_completed_at_ms,
                     turn_status=_activity_status,
-                    elapsed_s=_elapsed_s)
+                    elapsed_s=_elapsed_s,
+                    memory_recall=_done_memory_receipt)
             if new_user_uuid and (persisted_imgs or persisted_docs):
                 sess.set_message_annotation(
                     session_id, new_user_uuid,
@@ -12636,7 +14439,9 @@ async def _start_turn(
             # evidence-only (never fact candidates), which preserves the useful
             # failed trajectory without teaching the partial answer as truth.
             # Legacy Mem0 keeps its historical success-only behaviour.
-            if mem0.enabled() and not was_cancelled and not _is_error:
+            if sess.session_is_deleting(session_id):
+                memory_outcome_scheduled = False
+            elif mem0.enabled() and not was_cancelled and not _is_error:
                 _asst_full = "".join(assistant_acc)
                 if _asst_full.strip():
                     memory_outcome_scheduled = mem0.schedule_store(
@@ -12735,6 +14540,8 @@ async def _start_turn(
                     started_at=broadcast.started_at,
                     origin_turn_id=broadcast.turn_id,
                 )
+            else:
+                await _retire_unpinned_task_watcher(session_id)
         except asyncio.CancelledError:
             # Hard cancel (task cancelled / 30-min timeout cancel) — mark so
             # the queue drain pauses rather than charging ahead.
@@ -12792,6 +14599,10 @@ async def _start_turn(
     broadcast.user_text = prompt
     broadcast.user_images = list(persisted_imgs)
     broadcast.user_docs = list(persisted_docs)
+    # Recall traces are keyed by session for the SDK hook bridge. A prior turn
+    # that died before ResultMessage may have left one behind; discard it at
+    # the new turn boundary so it can never be attributed to this prompt.
+    mem0.pop_recall_trace(session_id)
     # Persist an in-flight breadcrumb so a process crash / restart can
     # surface this turn to the user on next boot. Auto-dismiss any
     # stale entry for this sid — starting a new turn supersedes whatever
@@ -12804,6 +14615,89 @@ async def _start_turn(
         turn_errored = False
         turn_error_text = ""
         terminal_published = False
+        queue_settled = False
+
+        async def _durable_error_event(
+            error: Any,
+            source_payload: dict[str, Any] | None = None,
+        ) -> dict:
+            """Persist and enrich a terminal error before subscribers see it."""
+            nonlocal turn_error_text
+            turn_error_text = str(error or turn_error_text or "turn stream failed")
+            has_recovery = isinstance(
+                (source_payload or {}).get("recovered_session"), dict)
+            if (_classify_stream_error(turn_error_text).get("kind") == "context_window"
+                    and not has_recovery):
+                # A process that crossed the hard window can remain poisoned
+                # even after this request ends. Evict it at the safe turn
+                # boundary so the user's next attempt gets the current compact
+                # settings instead of reusing the same dead runtime forever.
+                _pending_runtime_rebuilds.add(session_id)
+            terminal_at_ms = int(time.time() * 1000)
+            duration_ms = max(
+                0, terminal_at_ms - int(float(broadcast.started_at or 0) * 1000))
+            recall = mem0.pop_recall_trace(session_id)
+            receipt = _persistable_memory_recall(recall)
+            snapshot_ready = await asyncio.to_thread(
+                _persist_failed_turn_snapshot,
+                broadcast,
+                turn_error_text,
+                terminal_at_ms=terminal_at_ms,
+                elapsed_s=round(duration_ms / 1000, 1),
+                memory_recall=receipt,
+                canonical_terminal_published=False,
+            )
+            event = _error_event(turn_error_text)
+            try:
+                data = json.loads(event.get("data") or "{}")
+            except (TypeError, ValueError):
+                data = {"error": turn_error_text}
+            data.update({
+                "completed_at_ms": terminal_at_ms,
+                "duration_ms": duration_ms,
+                "model": model_to_use,
+                "assistant_uuid": str(broadcast.last_assistant_uuid or ""),
+                "memory_recall": recall,
+                "snapshot_ready": snapshot_ready,
+                "activity_source": broadcast.activity_source,
+            })
+            source_payload = source_payload or {}
+            recovered = source_payload.get("recovered_session")
+            if isinstance(recovered, dict):
+                recovered_id = str(
+                    recovered.get("id") or recovered.get("session_id") or "")
+                try:
+                    valid_recovered_id = str(uuid.UUID(recovered_id))
+                except (ValueError, AttributeError):
+                    valid_recovered_id = ""
+                if valid_recovered_id:
+                    # The metadata was produced by sess.register_session. Copy
+                    # it as a public object, while refusing any accidental
+                    # content-bearing fields should that internal contract
+                    # expand later.
+                    safe_recovered = {
+                        key: value for key, value in recovered.items()
+                        if key not in {
+                            "summary", "prompt", "messages", "content",
+                            "source_path", "path",
+                        }
+                    }
+                    safe_recovered["id"] = valid_recovered_id
+                    safe_recovered["session_id"] = valid_recovered_id
+                    data["recovered_session"] = safe_recovered
+                    stats = source_payload.get("recovery_stats")
+                    if isinstance(stats, dict):
+                        data["recovery_stats"] = {
+                            key: int(value)
+                            for key, value in stats.items()
+                            if key in {
+                                "included_messages", "omitted_messages",
+                                "truncated_messages", "estimated_post_tokens",
+                            } and isinstance(value, (int, float))
+                        }
+            event["data"] = json.dumps(data, ensure_ascii=False)
+            return event
+
         try:
             # None → asyncio.timeout is a no-op wrapper (no deadline armed).
             async with asyncio.timeout(BG_TIMEOUT_S or None):
@@ -12813,12 +14707,17 @@ async def _start_turn(
                     # must pause on these exactly like an exception-path error.
                     if isinstance(ev, dict) and ev.get("event") == "error":
                         turn_errored = True
+                        payload: dict[str, Any] = {}
                         try:
                             payload = json.loads(ev.get("data") or "{}")
+                            if not isinstance(payload, dict):
+                                payload = {}
                             turn_error_text = str(
                                 payload.get("error") or payload.get("message") or "")
                         except (ValueError, TypeError):
                             pass
+                        ev = await _durable_error_event(
+                            turn_error_text, payload)
                     # SDK-level failures arrive as a NORMAL done event with
                     # is_error=True (max turns / budget / permission denied /
                     # API error — see _handle_result_message). Treat them as
@@ -12834,6 +14733,27 @@ async def _start_turn(
                         # Even a graceful done(cancelled=true) must not get a
                         # duplicate display snapshot layered over JSONL.
                         broadcast.canonical_terminal_published = True
+                        if broadcast.queue_item_id:
+                            done_data = {}
+                            try:
+                                done_data = json.loads(ev.get("data") or "{}")
+                            except (TypeError, ValueError):
+                                pass
+                            if done_data.get("is_error") or done_data.get("cancelled"):
+                                queue_settled = sess.release_queue_claim(
+                                    session_id,
+                                    broadcast.queue_item_id,
+                                    turn_id=broadcast.turn_id,
+                                    pause=True,
+                                )
+                            else:
+                                queue_settled = sess.ack_queue_message(
+                                    session_id,
+                                    broadcast.queue_item_id,
+                                    broadcast.turn_id,
+                                )
+                            if not queue_settled:
+                                raise RuntimeError("queue terminal ownership mismatch")
                     if (isinstance(ev, dict)
                             and ev.get("event") == "cancelled"
                             and broadcast.cancelled):
@@ -12864,27 +14784,36 @@ async def _start_turn(
                 f"[chat] turn exceeded MUSELAB_TURN_TIMEOUT_S={BG_TIMEOUT_S}s, "
                 f"aborting sid={session_id}\n")
             sys.stderr.flush()
-            broadcast.publish(
-                _error_event(f"turn exceeded {BG_TIMEOUT_S}s"))
+            broadcast.publish(await _durable_error_event(turn_error_text))
         except Exception as e:
             if terminal_published:
                 sys.stderr.write(
-                    f"[chat] post-turn bookkeeping failed sid={session_id} "
-                    f"exc={type(e).__name__}: {e}\n")
+                    f"[chat] post-turn bookkeeping failed "
+                    f"sid={session_id[:8]} exc={type(e).__name__}\n")
                 return
             turn_errored = True
             turn_error_text = f"{type(e).__name__}: {e}"
-            import traceback as _tb
+            error_kind = _classify_stream_error(str(e)).get("kind", "unknown")
+            # The authenticated SSE frame below is the user-facing error
+            # surface. Server logs keep only safe diagnostics: SDK/Gateway
+            # exception strings and tracebacks can contain prompts, paths,
+            # credentials, or upstream protocol payloads.
             sys.stderr.write(
-                f"[chat] background turn crashed sid={session_id} "
-                f"exc={type(e).__name__}: {e}\n{_tb.format_exc()}\n")
+                f"[chat] background turn crashed sid={session_id[:8]} "
+                f"exc={type(e).__name__} kind={error_kind}\n")
             sys.stderr.flush()
-            broadcast.publish(_error_event(f"{type(e).__name__}: {e}"))
+            broadcast.publish(await _durable_error_event(turn_error_text))
         finally:
+            # Successful ResultMessage already popped its trace into the done
+            # payload. Every other terminal path (transport error, timeout,
+            # forced stop) must clear it here to isolate the next turn.
+            if not terminal_published:
+                mem0.pop_recall_trace(session_id)
             # A force-stop can terminate receive_response() before the SDK
             # emits ResultMessage. Keep that turn as trajectory evidence, but
             # never let partial output become a fact/Skill candidate.
-            if not memory_outcome_scheduled:
+            deleting_session = sess.session_is_deleting(session_id)
+            if not memory_outcome_scheduled and not deleting_session:
                 if broadcast.cancelled:
                     memory_outcome_scheduled = mem0.schedule_cancelled(
                         session_id, prompt, broadcast.turn_id)
@@ -12899,20 +14828,56 @@ async def _start_turn(
                     and not broadcast.cancelled_snapshot_persisted):
                 await asyncio.to_thread(
                     _persist_cancelled_turn_snapshot, broadcast)
-            _activity_status = ("cancelled" if broadcast.cancelled else
-                                "failed" if turn_errored else "completed")
-            await _finish_activity(
-                session_id, broadcast, _activity_status)
+            # ResultMessage settles (or deliberately defers) Activity before
+            # publishing ``done``.  Finishing it again here races the browser's
+            # read ACK and turns the current, already-viewed result unread; for
+            # detached tasks it also collapses the intended running state too
+            # early.  Only exceptional paths that never published a terminal
+            # Result still need the cleanup fallback.
+            if not terminal_published:
+                _activity_status = (
+                    "cancelled" if broadcast.cancelled
+                    else "failed" if turn_errored
+                    else "completed"
+                )
+                await _finish_activity(
+                    session_id, broadcast, _activity_status)
+            if broadcast.queue_item_id and not queue_settled:
+                try:
+                    if turn_errored or broadcast.cancelled:
+                        if not sess.release_queue_claim(
+                            session_id,
+                            broadcast.queue_item_id,
+                            turn_id=broadcast.turn_id,
+                            pause=True,
+                        ):
+                            raise RuntimeError("queue terminal ownership mismatch")
+                    else:
+                        if not sess.ack_queue_message(
+                            session_id,
+                            broadcast.queue_item_id,
+                            broadcast.turn_id,
+                        ):
+                            raise RuntimeError("queue terminal ownership mismatch")
+                except Exception as e:
+                    # Never duplicate a turn by guessing. The durable inflight
+                    # record remains for restart recovery if acknowledgement fails.
+                    sys.stderr.write(
+                        f"[chat] queue terminal ack failed sid={session_id[:8]} "
+                        f"item={broadcast.queue_item_id[:8]} "
+                        f"exc={type(e).__name__}\n")
             broadcast.finish()
             _active_turns.pop(session_id, None)
-            if session_id in _pending_runtime_rebuilds:
+            if (not deleting_session
+                    and session_id in _pending_runtime_rebuilds):
                 await _rebuild_session_runtime(session_id)
             # Grace-keep: a fast (esp. server-drained) turn can finish + get
             # popped here BEFORE the browser's reconnect SSE attaches. Stash the
             # finished broadcast so a slightly-late reconnect still replays it
             # (full events + done sentinel) instead of seeing "no active turn"
             # and silently dropping the rendered content until a manual refresh.
-            _remember_recent_turn(session_id, broadcast)
+            if not deleting_session:
+                _remember_recent_turn(session_id, broadcast)
             # Main ResultMessage is terminal only when no detached background
             # task watcher still owns the logical turn. Keep the breadcrumb
             # through that gap so a restart after TaskNotification but before
@@ -12926,7 +14891,9 @@ async def _start_turn(
             #     turn's own cleanup re-enters here, keeping the chain going
             #     until the queue empties — all with no browser attached.
             try:
-                if turn_errored:
+                if deleting_session:
+                    pass
+                elif turn_errored:
                     # Only pause + notify if items are actually waiting —
                     # a lone failed turn with an empty queue is just a normal
                     # error the user already saw in-stream; no need to buzz.
@@ -12951,6 +14918,7 @@ async def _start_turn(
     # Keep a handle to the detached pump so the force-stop watchdog can cancel
     # it if an interrupt + client teardown ever fails to unblock receive_response.
     broadcast.task = asyncio.create_task(_pump_gen_to_broadcast())
+    broadcast.startup_owner_task = None
 
     return broadcast
 
@@ -13011,14 +14979,41 @@ async def _maybe_drain_queue(session_id: str) -> None:
     async with _queue_drain_lock_for(session_id):
         if session_id in _active_turns and not _active_turns[session_id].done:
             return
-        # Background task watchers no longer block user turns. _SessionStream is
-        # the single SDK reader and safely routes messages between an active turn
-        # and the watcher, so queued turns must follow the same concurrency
-        # contract as direct sends. Only an actually active user turn blocks the
-        # next FIFO item.
-        item = sess.dequeue_message(session_id)
+        # The watcher owns a logical response boundary even though no ordinary
+        # TurnBroadcast is open. It will trigger this drain again after its
+        # final continuation releases the single SDK pump.
+        if (_sessions_with_inflight_tasks.get(session_id)
+                or _session_has_live_watcher(session_id)):
+            return
+        item = sess.claim_queue_message(session_id)
         if item is None:
             return
+        item_id = str(item.get("id") or "")
+        # Queue files survive a process restart; staged uploads deliberately do
+        # not, and they can also expire while waiting behind a long turn.  Never
+        # degrade an attachment-bearing message into a text-only turn.  Check
+        # the complete set before `_start_turn` consumes even one upload, then
+        # atomically restore + pause the exact claim.  GET /queue resolves the
+        # now-missing ids as `available: false`, which keeps the prompt visible
+        # and gives the browser an explicit edit/reattach recovery path.
+        attachment_ids = [
+            aid.strip()
+            for aid in str(item.get("image_ids") or "").split(",")
+            if aid.strip()
+        ]
+        if attachment_ids:
+            _gc_images()
+            unavailable_count = sum(
+                1 for aid in attachment_ids if aid not in _image_store)
+            if unavailable_count:
+                restored = sess.release_queue_claim(
+                    session_id, item_id, pause=True)
+                sys.stderr.write(
+                    f"[chat] queued attachments unavailable "
+                    f"sid={session_id[:8]} item={item_id[:8]} "
+                    f"count={unavailable_count} restored={restored}\n")
+                sys.stderr.flush()
+                return
         # Replay under the permission mode snapshotted at enqueue time. Items
         # from before the snapshot existed (or enqueued without one) fail CLOSED
         # to "default" — requiring tool approval is the safe direction; the old
@@ -13038,36 +15033,36 @@ async def _maybe_drain_queue(session_id: str) -> None:
                 plan_return_permission=item.get("plan_return_permission", ""),
                 image_ids=item.get("image_ids", ""),
                 persist_permission=False,
+                queue_item_id=item_id,
             )
         except asyncio.CancelledError:
-            # A graceful service shutdown can cancel a scheduled kick after it
-            # dequeued but before SDK startup completed. Preserve the accepted
-            # message for the next process. Session deletion removes metadata
-            # before cancelling its task, so deliberately do not recreate a
-            # queue file for an owner that no longer exists.
-            if sess.get_session(session_id) is not None:
-                sess.requeue_head(session_id, item)
+            # If startup never bound the claim, it is safe to restore. Once a
+            # turn id is bound, its detached pump owns acknowledgement; requeueing
+            # here would create the executed+queued duplicate seen in production.
+            q = sess.get_queue(session_id)
+            inflight = q.get("inflight") or {}
+            bound_turn_id = str(inflight.get("turn_id") or "")
+            active = _active_turns.get(session_id)
+            active_owns_claim = bool(
+                bound_turn_id and active is not None and not active.done
+                and active.turn_id == bound_turn_id
+                and active.queue_item_id == item_id
+            )
+            if (sess.get_session(session_id) is not None
+                    and not active_owns_claim):
+                sess.release_queue_claim(
+                    session_id, item_id, turn_id=bound_turn_id)
             raise
         except _TurnBusy:
-            # A manual turn grabbed the slot between our check and the
-            # reservation. Restore the item; that turn's completion will drain.
-            sess.requeue_head(session_id, item)
-        except _TurnStartError:
-            # Client init / 504 — restore the item and pause so we don't spin on
-            # a broken backend headlessly. User resumes to retry.
-            sess.requeue_head(session_id, item)
-            try:
-                sess.set_queue_paused(session_id, True)
-            except Exception:
-                pass
+            sess.release_queue_claim(session_id, item_id)
+        except _TurnStartError as exc:
+            # If startup failed before binding, this releases the unbound claim.
+            # Bound startup failures settle with their exact turn id in _start_turn.
+            if not exc.queue_claim_settled:
+                sess.release_queue_claim(session_id, item_id, pause=True)
             _notify_queue_paused_on_error(session_id)
         except Exception as e:
-            # Unexpected — restore + pause defensively, never lose the message.
-            sess.requeue_head(session_id, item)
-            try:
-                sess.set_queue_paused(session_id, True)
-            except Exception:
-                pass
+            sess.release_queue_claim(session_id, item_id, pause=True)
             sys.stderr.write(
                 f"[chat] queue drain crashed sid={session_id}: {e}\n")
             _notify_queue_paused_on_error(session_id)
@@ -13183,6 +15178,7 @@ def session_active_status(sid: str) -> dict:
                     "attachable": False,
                     "background": True,
                     "continuation": False,
+                    "activity_source": "background",
                     "turn_id": _background_origin_turn_id.get(sid, ""),
                     "parent_turn_id": "",
                     "started_at": _background_turn_started_at.get(sid, 0),
@@ -13192,7 +15188,16 @@ def session_active_status(sid: str) -> dict:
                     "user_images": [],
                     "user_docs": [],
                 }
-            return {"active": False}
+            return {
+                "active": False,
+                # A just-finished direct or queued turn can disappear from the
+                # live registry before the reconnect probe lands. Preserve its
+                # delivery class through the grace broadcast so the browser
+                # never guesses that a queued completion was foreground work.
+                "activity_source": (
+                    recent.activity_source if recent is not None else ""
+                ),
+            }
     return {
         "active": True,
         "attachable": True,
@@ -13208,6 +15213,7 @@ def session_active_status(sid: str) -> dict:
         # portion (the launching tool_use card lives there; the replayed
         # task_notification flips it to ✅done).
         "continuation": getattr(b, "is_continuation", False),
+        "activity_source": b.activity_source,
         # The turn's user prompt + attachments. The browser needs these to
         # render the user bubble when it LIVE-reconnects to a turn the server
         # drained from the queue headlessly (the browser never "sent" it, so

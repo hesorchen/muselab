@@ -169,6 +169,40 @@ def _launch_background_tasks(coroutines) -> None:
         task.add_done_callback(_BG_TASKS.discard)
 
 
+async def _recover_message_queues_at_startup(session_store) -> int:
+    """Restore durable claims and leave every surviving queue paused.
+
+    Kept as a small helper so the startup safety boundary is regression-testable
+    without booting schedulers, terminals, or file watchers.
+    """
+    import asyncio
+
+    recovered = 0
+    failures = 0
+    for sid in session_store.list_queue_session_ids():
+        try:
+            queue = await asyncio.to_thread(
+                session_store.recover_queue_inflight, sid)
+        except Exception as exc:
+            # Continue the sweep so one unwritable/corrupt sidecar cannot
+            # leave every later queue live.  We still fail startup after the
+            # sweep: serving requests with even one queue whose pause was not
+            # durably committed would re-open automatic draining.
+            failures += 1
+            sys.stderr.write(
+                f"[muselab] queue recovery failed sid={sid[:8]} "
+                f"exc={type(exc).__name__}\n")
+            sys.stderr.flush()
+            continue
+        if queue.get("items"):
+            recovered += 1
+    if failures:
+        raise RuntimeError(
+            f"could not safely recover {failures} message queue(s)"
+        ) from None
+    return recovered
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Boot the in-process scheduler + push subsystem on startup.
@@ -179,9 +213,38 @@ async def _lifespan(app: FastAPI):
     generation hitting a disk-quota error) doesn't take down the
     whole web server — the chat UI is the primary capability and
     must come up even if peripheral subsystems are degraded."""
+    import asyncio as _asyncio
+
+    from . import sessions as _sess
+    from .activity import activity as _activity
     from . import scheduler as _sched
     from . import push as _push
     from . import memory_client as _mem0
+    # Historical releases inherited the process umask for session sidecars.
+    # Repair those permissions only once the final runtime SESS_DIR is known;
+    # doing it during import leaks across hermetic test fixtures.
+    await _asyncio.gather(
+        _asyncio.to_thread(_sess.ensure_private_session_storage),
+        _asyncio.to_thread(_activity.initialize_runtime_state),
+    )
+    try:
+        # Run the fail-closed queue sweep before starting any optional service.
+        # In particular, scheduler catch-up can launch work immediately; it
+        # must never overlap an incomplete queue reconciliation.
+        recovered = await _recover_message_queues_at_startup(_sess)
+    except Exception as exc:
+        sys.stderr.write(
+            "[muselab] queue recovery incomplete; refusing startup "
+            f"exc={type(exc).__name__}\n")
+        sys.stderr.flush()
+        raise RuntimeError(
+            "message queue recovery was not durably completed"
+        ) from None
+    if recovered:
+        sys.stderr.write(
+            f"[muselab] recovered {recovered} paused message queue(s) "
+            "on startup\n")
+        sys.stderr.flush()
     await _start_optional_services(_sched, _push, _mem0)
     # Prune empty sessions + auto-purge expired trash. Both used to block
     # lifespan before yield (50-300 ms total on archives with many
@@ -191,8 +254,6 @@ async def _lifespan(app: FastAPI):
     # >30-day trash items not yet cleaned, are both no-ops from the user's
     # POV. `asyncio.to_thread` runs the sync IO off the event loop so a
     # slow disk doesn't stall concurrent requests either.
-    import asyncio as _asyncio
-
     async def _bg_prune_sessions() -> None:
         try:
             from . import sessions as _sess_mod

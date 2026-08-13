@@ -127,7 +127,13 @@ def ducc_cli_wrapper() -> str:
     return str(Path(__file__).resolve().parent.parent / "scripts" / "muselab-ducc")
 
 
-def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
+def atomic_write_text(
+    path: Path,
+    data: str,
+    encoding: str = "utf-8",
+    *,
+    mode: int | None = None,
+) -> None:
     """Write text atomically: tmpfile in same dir + os.replace().
 
     Survives crash / OOM-kill mid-write — the destination either holds the
@@ -144,11 +150,21 @@ def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     # random suffix so each call's tmp is distinct.
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
-        with open(tmp, "w", encoding=encoding) as f:
+        # Sensitive callers opt into an exact mode.  `os.open(..., mode)` makes
+        # the inode private from creation; a post-open chmod leaves a brief
+        # umask-dependent group-readable window.  The default preserves this
+        # general helper's historical behavior for user workspace files.
+        if mode is None:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        else:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        if mode is not None:
+            os.chmod(path, mode)
         # fsync the directory so the rename itself survives power loss.
         try:
             dfd = os.open(path.parent, os.O_RDONLY)

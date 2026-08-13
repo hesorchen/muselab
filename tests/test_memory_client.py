@@ -116,6 +116,24 @@ def test_search_payload_and_cross_session_scope(monkeypatch, fake_httpx):
     assert payload["user_id"] == "muselab"
 
 
+def test_legacy_recall_exposes_one_time_privacy_minimal_footer_trace(
+        monkeypatch, fake_httpx):
+    mc = _load(monkeypatch)
+    private_memory = "a private fixture that must not enter the trace"
+    fake_httpx.script = lambda url, payload: _FakeResp(
+        {"results": [{"memory": private_memory}, {"memory": "second fact"}]})
+
+    block = _run(mc.search_context("private query", "session-trace"))
+    assert private_memory in block
+    trace = mc.pop_recall_trace("session-trace")
+    assert trace["count"] == 2
+    assert trace["status"] == "ok"
+    assert isinstance(trace["latency_ms"], int)
+    assert private_memory not in json.dumps(trace)
+    assert "private query" not in json.dumps(trace)
+    assert mc.pop_recall_trace("session-trace") is None
+
+
 def test_recall_hook_uses_additional_context(monkeypatch, fake_httpx):
     mc = _load(monkeypatch)
     fake_httpx.script = lambda url, payload: _FakeResp(

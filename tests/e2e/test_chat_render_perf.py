@@ -231,6 +231,142 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
     )
 
 
+def test_context_recovery_replays_plain_text_exactly_once(
+    page: Page, backend_url, auth_token,
+):
+    """A recovered SSE error changes sid and never loops/reuses uploads."""
+    errors = _capture_browser_errors(page)
+    _install_fake_event_source(page)
+    ticket_bodies: list[dict] = []
+
+    def handle_ticket(route) -> None:
+        ticket_bodies.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ticket": f"recovery-{len(ticket_bodies)}"}),
+        )
+
+    page.route("**/api/chat/stream/start", handle_ticket)
+    _login(page, backend_url, auth_token)
+    recovered_id = "792c513d-8a63-4805-9937-b6b79861ce4e"
+    chained_id = "4f60bd20-0636-4d17-b5ce-94d6663da1d6"
+
+    result = page.evaluate(
+        """async ({recoveredId, chainedId}) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sourceSid = app.currentId;
+          const originalAdopt = app._adoptRecoveredSession;
+          const originalBusy = app._confirmSessionBusy;
+          const originalRuntimeWait = app._awaitRuntimeSettingPatches;
+          app._confirmSessionBusy = async () => false;
+          app._awaitRuntimeSettingPatches = async () => true;
+          app.availableModels = [{
+            model: 'e2e-recovery-model', label: 'E2E recovery', group: 'e2e',
+            supports_thinking: true,
+          }];
+          app.model = 'e2e-recovery-model';
+          app.sessions = app.sessions.map(session => session.id === sourceSid
+            ? {...session, model: 'e2e-recovery-model'} : session);
+          const adoptedIds = [];
+          app._adoptRecoveredSession = async payload => {
+            const raw = payload.recovered_session;
+            const nextId = raw.id || raw.session_id;
+            adoptedIds.push(nextId);
+            const meta = {...raw, id: nextId, session_id: nextId};
+            app.sessions = [meta, ...app.sessions.filter(s => s.id !== nextId)];
+            const state = app._ensureTabState(nextId);
+            state._loaded = true;
+            if (!app.openTabIds.includes(nextId)) app.openTabIds.push(nextId);
+            app.currentId = nextId;
+            app._activateTabState(nextId);
+            return {meta, state, shouldFocus: true, alreadyKnown: false};
+          };
+          try {
+            const sourceState = app._ensureTabState(sourceSid);
+            sourceState.draft.input = 'RECOVERY_PLAIN_TEXT_ONCE';
+            sourceState.draft.pendingImages = [];
+            sourceState.draft.pendingDocs = [];
+            sourceState.draft.pendingQuotes = [];
+            app._activateComposerState(sourceSid);
+            await app.send();
+            for (let i = 0; i < 100 && window.__fakeChatStreams().length < 1; i++) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            const sourceStream = window.__fakeChatStreams()[0];
+            if (!sourceStream) throw new Error('source stream did not start');
+            const payload = {
+              error: 'context window could not be compacted; a recovery session was created',
+              kind: 'context_window', retryable: false,
+              cta: 'compact_or_fork', activity_source: 'direct',
+              recovered_session: {
+                id: recoveredId, session_id: recoveredId,
+                name: 'Recovered E2E', model: app.model,
+                permission: app.permission, cwd: app.currentWorkspacePath(),
+              },
+              recovery_stats: {estimated_post_tokens: 20000},
+            };
+            sourceStream.dispatchEvent(new MessageEvent('error', {
+              data: JSON.stringify(payload),
+            }));
+            for (let i = 0; i < 150 && window.__fakeChatStreams().length < 2; i++) {
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            const afterFirst = window.__fakeChatStreams().length;
+            // Replayed terminal frames must not launch another recovery turn.
+            sourceStream.dispatchEvent(new MessageEvent('error', {
+              data: JSON.stringify(payload),
+            }));
+            await new Promise(resolve => setTimeout(resolve, 80));
+            const recoveryStream = window.__fakeChatStreams()[1];
+            if (!recoveryStream) throw new Error('recovery stream did not start');
+            recoveryStream.dispatchEvent(new MessageEvent('error', {
+              data: JSON.stringify({
+                ...payload,
+                recovered_session: {
+                  ...payload.recovered_session,
+                  id: chainedId,
+                  session_id: chainedId,
+                  name: 'Chained recovery must stay unopened',
+                },
+              }),
+            }));
+            await new Promise(resolve => setTimeout(resolve, 120));
+            return {
+              sourceSid, currentId: app.currentId,
+              afterFirst, afterReplay: window.__fakeChatStreams().length,
+              adoptedIds,
+              chainedKnown: app.sessions.some(s => s.id === chainedId),
+              handled: !!app._contextRecoveryHandled?.[recoveredId],
+              autoSent: !!app._contextRecoveryAutoSent?.[recoveredId],
+              recoveryMessages: app._ensureTabState(recoveredId).messages
+                .filter(message => message.role === 'user')
+                .map(message => message.text),
+            };
+          } finally {
+            app._adoptRecoveredSession = originalAdopt;
+            app._confirmSessionBusy = originalBusy;
+            app._awaitRuntimeSettingPatches = originalRuntimeWait;
+            for (const stream of window.__fakeChatStreams()) stream.close();
+          }
+        }""",
+        {"recoveredId": recovered_id, "chainedId": chained_id},
+    )
+
+    assert result["currentId"] == recovered_id
+    assert result["afterFirst"] == result["afterReplay"] == 2
+    assert result["adoptedIds"] == [recovered_id]
+    assert result["chainedKnown"] is False
+    assert result["handled"] is True
+    assert result["autoSent"] is True
+    assert result["recoveryMessages"] == ["RECOVERY_PLAIN_TEXT_ONCE"]
+    assert [body["prompt"] for body in ticket_bodies] == [
+        "RECOVERY_PLAIN_TEXT_ONCE", "RECOVERY_PLAIN_TEXT_ONCE",
+    ]
+    assert all(body["image_ids"] == "" for body in ticket_bodies)
+    _assert_no_browser_errors(page, errors)
+
+
 def _bootstrap_session_for_real_load(page: Page, sid: str, name: str) -> None:
     _app_eval(
         page,
@@ -300,6 +436,13 @@ def test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends(
             data: "你",
             isComposing: true,
           }));
+          // The physical Enter that confirms the highlighted IME candidate is
+          // observed while composition is still active. Some WebViews then
+          // emit a second plain keydown after compositionend for that same key.
+          textarea.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "Enter", code: "Enter", bubbles: true, cancelable: true,
+            isComposing: true,
+          }));
           textarea.dispatchEvent(new CompositionEvent("compositionend", {
             bubbles: true, data: "你",
           }));
@@ -323,7 +466,6 @@ def test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends(
             prevented: commitEnter.defaultPrevented,
           };
 
-          await new Promise(resolve => setTimeout(resolve, 100));
           const sendEnter = new KeyboardEvent("keydown", {
             key: "Enter", code: "Enter", bubbles: true, cancelable: true,
           });
@@ -341,11 +483,383 @@ def test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends(
         "sendCalls": 0,
         "input": "你",
         "value": "你",
-        "prevented": False,
+        "prevented": True,
     }
     assert result["sendCalls"] == 1
     assert result["sendPrevented"] is True
     assert result["composing"] is False
+    _assert_no_browser_errors(page, errors)
+
+
+def test_missing_compositionend_cannot_leave_chat_ime_stuck(
+    page: Page, backend_url, auth_token,
+):
+    """A final non-composing input releases IME even with the old inputType."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "ime-missing-compositionend"
+    _bootstrap_session_for_real_load(page, sid, "Missing compositionend")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.draft.input = "";
+        app._activateTabState(arg);
+        window.__imeSendCalls = 0;
+        app.send = () => { window.__imeSendCalls += 1; return true; };
+        return true;
+        """,
+        sid,
+    )
+    textarea = page.locator(".chat-input-textarea")
+    expect(textarea).to_be_visible(timeout=5000)
+    textarea.focus()
+
+    state = page.evaluate(
+        """() => {
+          const textarea = document.querySelector('.chat-input-textarea');
+          textarea.dispatchEvent(new CompositionEvent('compositionstart', {
+            bubbles: true, data: 'ni',
+          }));
+          textarea.value = '你';
+          textarea.dispatchEvent(new InputEvent('input', {
+            bubbles: true, inputType: 'insertCompositionText',
+            data: '你', isComposing: true,
+          }));
+          // Embedded Chromium occasionally omits compositionend but reports
+          // the final event as explicitly non-composing while retaining the
+          // insertCompositionText inputType.
+          textarea.dispatchEvent(new InputEvent('input', {
+            bubbles: true, inputType: 'insertCompositionText',
+            data: '你', isComposing: false,
+          }));
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return { composing: !!textarea._museImeComposing,
+            input: app.input, value: textarea.value };
+        }"""
+    )
+    assert state == {"composing": False, "input": "你", "value": "你"}
+
+    page.keyboard.press("Enter")
+    sent = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          sends: window.__imeSendCalls };
+        """,
+    )
+    assert sent == {"value": "你", "input": "你", "sends": 1}
+    _assert_no_browser_errors(page, errors)
+
+
+def test_stale_missing_compositionend_recovers_only_on_safe_plain_enter(
+    page: Page, backend_url, auth_token,
+):
+    """A five-second stale flag heals; active IME signals always stay owned."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "ime-stale-missing-compositionend"
+    _bootstrap_session_for_real_load(page, sid, "Stale missing compositionend")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.draft.input = "";
+        app._activateTabState(arg);
+        window.__imeSendCalls = 0;
+        app.send = () => { window.__imeSendCalls += 1; return true; };
+        return true;
+        """,
+        sid,
+    )
+    textarea = page.locator(".chat-input-textarea")
+    expect(textarea).to_be_visible(timeout=5000)
+    textarea.focus()
+
+    guarded = page.evaluate(
+        """() => {
+          const textarea = document.querySelector('.chat-input-textarea');
+          const app = document.querySelector('#app')._x_dataStack[0];
+          textarea.dispatchEvent(new CompositionEvent('compositionstart', {
+            bubbles: true, data: 'ni',
+          }));
+          textarea.value = '你';
+          textarea.dispatchEvent(new InputEvent('input', {
+            bubbles: true, inputType: 'insertCompositionText',
+            data: '你', isComposing: true,
+          }));
+
+          const fresh = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+          });
+          textarea.dispatchEvent(fresh);
+
+          textarea._museImeStartedAt = Date.now()
+            - app.IME_STALE_AFTER_MS - 1;
+          const modified = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+            shiftKey: true,
+          });
+          textarea.dispatchEvent(modified);
+
+          const composing = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+            isComposing: true,
+          });
+          textarea.dispatchEvent(composing);
+
+          const legacy229 = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+          });
+          Object.defineProperty(legacy229, 'keyCode', { get: () => 229 });
+          Object.defineProperty(legacy229, 'which', { get: () => 229 });
+          textarea.dispatchEvent(legacy229);
+
+          const process = new KeyboardEvent('keydown', {
+            key: 'Process', code: 'Enter', bubbles: true, cancelable: true,
+          });
+          app.onEnter(process);
+          return {
+            sends: window.__imeSendCalls,
+            composing: !!textarea._museImeComposing,
+            freshPrevented: fresh.defaultPrevented,
+            modifiedPrevented: modified.defaultPrevented,
+            composingPrevented: composing.defaultPrevented,
+            legacyPrevented: legacy229.defaultPrevented,
+            processPrevented: process.defaultPrevented,
+            staleFor: Date.now() - textarea._museImeStartedAt,
+          };
+        }"""
+    )
+    assert guarded["sends"] == 0
+    assert guarded["composing"] is True
+    assert guarded["freshPrevented"] is False
+    assert guarded["modifiedPrevented"] is False
+    assert guarded["composingPrevented"] is False
+    assert guarded["legacyPrevented"] is False
+    assert guarded["processPrevented"] is False
+    assert guarded["staleFor"] >= 5000
+
+    # Use Chromium's native keyboard path for the recovery trigger. This Enter
+    # has no isComposing, legacy 229, or Process marker, so the stale lifecycle
+    # settles through the normal chat bridge and submits exactly once.
+    page.keyboard.press("Enter")
+    recovered = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          sends: window.__imeSendCalls,
+          composing: !!ta._museImeComposing,
+          startedAt: ta._museImeStartedAt || 0,
+          hasOwner: Object.prototype.hasOwnProperty.call(
+            ta, '_museImeOwnerSid') };
+        """,
+    )
+    assert recovered == {
+        "value": "你", "input": "你", "sends": 1,
+        "composing": False, "startedAt": 0, "hasOwner": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_space_or_keyup_ime_commit_does_not_swallow_next_enter(
+    page: Page, backend_url, auth_token,
+):
+    """Only a duplicate keydown from the same physical Enter is suppressed."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "ime-physical-enter-guard"
+    _bootstrap_session_for_real_load(page, sid, "IME physical Enter guard")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        app._activateTabState(arg);
+        window.__imeSendCalls = 0;
+        app.send = () => { window.__imeSendCalls += 1; return true; };
+        return true;
+        """,
+        sid,
+    )
+    textarea = page.locator(".chat-input-textarea")
+    expect(textarea).to_be_visible(timeout=5000)
+    textarea.focus()
+
+    result = page.evaluate(
+        """() => {
+          const textarea = document.querySelector('.chat-input-textarea');
+          const compose = (value, key) => {
+            textarea.dispatchEvent(new CompositionEvent('compositionstart', {
+              bubbles: true, data: value,
+            }));
+            textarea.value = value;
+            textarea.dispatchEvent(new InputEvent('input', {
+              bubbles: true, inputType: 'insertCompositionText',
+              data: value, isComposing: true,
+            }));
+            textarea.dispatchEvent(new KeyboardEvent('keydown', {
+              key, code: key, bubbles: true, cancelable: true,
+              isComposing: true,
+            }));
+            textarea.dispatchEvent(new CompositionEvent('compositionend', {
+              bubbles: true, data: value,
+            }));
+          };
+
+          // Space-selected candidates never arm Enter suppression.
+          compose('你', 'Space');
+          const afterSpace = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+          });
+          textarea.dispatchEvent(afterSpace);
+          const spaceSends = window.__imeSendCalls;
+
+          // If Enter selected the candidate but no duplicate keydown followed,
+          // its keyup ends the physical-key guard; the next Enter is deliberate.
+          compose('你好', 'Enter');
+          textarea.dispatchEvent(new KeyboardEvent('keyup', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+          }));
+          const afterKeyup = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+          });
+          textarea.dispatchEvent(afterKeyup);
+          return { spaceSends, sends: window.__imeSendCalls,
+            spacePrevented: afterSpace.defaultPrevented,
+            keyupPrevented: afterKeyup.defaultPrevented,
+            composing: !!textarea._museImeComposing };
+        }"""
+    )
+    assert result == {
+        "spaceSends": 1,
+        "sends": 2,
+        "spacePrevented": True,
+        "keyupPrevented": True,
+        "composing": False,
+    }
+    _assert_no_browser_errors(page, errors)
+
+
+def test_native_post_ime_enter_cannot_insert_a_newline(
+    page: Page, backend_url, auth_token,
+):
+    """A real Chromium key event after composition is consumed exactly once."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "ime-native-enter"
+    _bootstrap_session_for_real_load(page, sid, "Native IME Enter")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.draft.input = "你";
+        app._activateTabState(arg);
+        app._setChatInput("你");
+        window.__imeSendCalls = 0;
+        app.send = () => { window.__imeSendCalls += 1; return true; };
+        const textarea = document.querySelector(".chat-input-textarea");
+        const primeCommitEnter = ev => {
+          if (ev.key !== "Enter") return;
+          textarea.removeEventListener("keydown", primeCommitEnter, true);
+          // Capture runs before Alpine's bubble listener. This reproduces a
+          // WebView's plain keydown immediately following compositionend while
+          // retaining Chromium's real textarea default action.
+          textarea._museImeCommitEnterDown = true;
+          textarea._museImeEndedAt = Math.max(0.001, ev.timeStamp - 1);
+        };
+        textarea.addEventListener("keydown", primeCommitEnter, true);
+        textarea.focus();
+        return true;
+        """,
+        sid,
+    )
+    textarea = page.locator(".chat-input-textarea")
+    expect(textarea).to_be_focused()
+
+    page.keyboard.press("Enter")
+    first = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          sends: window.__imeSendCalls, endedAt: ta._museImeEndedAt || 0 };
+        """,
+    )
+    assert first == {"value": "你", "input": "你", "sends": 0, "endedAt": 0}
+
+    page.keyboard.press("Enter")
+    second = _app_eval(
+        page,
+        """
+        const ta = document.querySelector('.chat-input-textarea');
+        return { value: ta.value, input: app.input,
+          sends: window.__imeSendCalls };
+        """,
+    )
+    assert second == {"value": "你", "input": "你", "sends": 1}
+    _assert_no_browser_errors(page, errors)
+
+
+def test_wide_touch_pc_enter_sends_instead_of_inserting_newline(
+    page: Page, backend_url, auth_token,
+):
+    """A touchscreen-capable PC is still a desktop composer at wide width."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    _login(page, backend_url, auth_token)
+    sid = "wide-touch-enter"
+    _bootstrap_session_for_real_load(page, sid, "Wide touch Enter")
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st.draft.input = "send from touch PC";
+        app._activateTabState(arg);
+        app._setChatInput("send from touch PC");
+        const realMatchMedia = window.matchMedia.bind(window);
+        window.__restoreMatchMedia = () => { window.matchMedia = realMatchMedia; };
+        window.matchMedia = query => {
+          if (query === "(pointer: coarse)") {
+            return { matches: true, media: query,
+              addEventListener() {}, removeEventListener() {} };
+          }
+          return realMatchMedia(query);
+        };
+        window.__imeSendCalls = 0;
+        app.send = () => { window.__imeSendCalls += 1; return true; };
+        document.querySelector(".chat-input-textarea").focus();
+        return true;
+        """,
+        sid,
+    )
+    try:
+        page.keyboard.press("Enter")
+        state = _app_eval(
+            page,
+            """
+            const ta = document.querySelector('.chat-input-textarea');
+            return { value: ta.value, input: app.input,
+              sends: window.__imeSendCalls };
+            """,
+        )
+        assert state == {
+            "value": "send from touch PC",
+            "input": "send from touch PC",
+            "sends": 1,
+        }
+    finally:
+        page.evaluate("() => window.__restoreMatchMedia?.()")
     _assert_no_browser_errors(page, errors)
 
 
@@ -763,7 +1277,27 @@ def test_chat_bubble_selection_quotes_as_attachment_and_asks_in_side_session(
     ask = page.locator(".preview-selection-ask textarea")
     expect(ask).to_be_focused()
     ask.fill("这里的结论为什么成立？")
-    page.locator(".preview-selection-send").click()
+    ask.evaluate(
+        """textarea => {
+          textarea.dispatchEvent(new CompositionEvent('compositionstart', {
+            bubbles: true, data: '？',
+          }));
+          textarea.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', bubbles: true, cancelable: true,
+            isComposing: true,
+          }));
+          textarea.dispatchEvent(new CompositionEvent('compositionend', {
+            bubbles: true, data: '？',
+          }));
+        }"""
+    )
+    # A WebView can report the candidate-confirming Enter as a plain keydown
+    # immediately after compositionend. It must neither submit nor add a
+    # newline; the next Enter remains an immediate desktop submit.
+    page.keyboard.press("Enter")
+    assert page.evaluate("() => !window.__selectionAskSend") is True
+    expect(ask).to_have_value("这里的结论为什么成立？")
+    page.keyboard.press("Enter")
     page.wait_for_function("() => !!window.__selectionAskSend")
     expect(page.locator(".preview-selection-answer-body")).to_contain_text(
         "CHAT_SIDE_ANSWER"

@@ -104,13 +104,128 @@ _scheduler_task: asyncio.Task | None = None
 # garbage-collected mid-run, silently cancelling a scheduled run. Each task
 # is added here and removed by its done-callback so the set stays bounded.
 _RUN_TASKS: set[asyncio.Task] = set()
+# Runtime ownership for each tracked execution.  DELETE needs more than the
+# strong-reference set above: it must be able to revoke an already-running
+# task by scheduler id or by the session being removed, then join that exact
+# owner before chat deletes the transcript.  These maps are event-loop owned;
+# the durable revocation fence lives under _STATE_LOCK because delete_task()
+# also has synchronous callers.
+_RUN_TASK_IDS: dict[asyncio.Task, str] = {}
+_RUN_SESSION_IDS: dict[asyncio.Task, str] = {}
+_RUN_ACTIVITY_STARTED: set[asyncio.Task] = set()
+_REVOKED_TASK_IDS: set[str] = set()
+_RUN_REGISTRY_LOCK = threading.Lock()
 
 
-def _track_task(t: asyncio.Task) -> asyncio.Task:
+def _forget_tracked_task(t: asyncio.Task) -> None:
+    with _RUN_REGISTRY_LOCK:
+        _RUN_TASKS.discard(t)
+        _RUN_TASK_IDS.pop(t, None)
+        _RUN_SESSION_IDS.pop(t, None)
+        _RUN_ACTIVITY_STARTED.discard(t)
+
+
+def _track_task(
+    t: asyncio.Task,
+    *,
+    task_id: str = "",
+    session_id: str = "",
+) -> asyncio.Task:
     """Hold a strong ref to a fire-and-forget task until it completes."""
-    _RUN_TASKS.add(t)
-    t.add_done_callback(_RUN_TASKS.discard)
+    with _RUN_REGISTRY_LOCK:
+        _RUN_TASKS.add(t)
+        if task_id:
+            _RUN_TASK_IDS[t] = task_id
+        if session_id:
+            _RUN_SESSION_IDS[t] = session_id
+    t.add_done_callback(_forget_tracked_task)
     return t
+
+
+def _bind_current_run_session(task_id: str, session_id: str) -> None:
+    """Attach the resolved session to the current tracked scheduler run."""
+    current = asyncio.current_task()
+    with _RUN_REGISTRY_LOCK:
+        if current in _RUN_TASKS and _RUN_TASK_IDS.get(current) == task_id:
+            _RUN_SESSION_IDS[current] = session_id
+
+
+def _mark_current_run_activity_started() -> None:
+    current = asyncio.current_task()
+    with _RUN_REGISTRY_LOCK:
+        if current in _RUN_TASKS:
+            _RUN_ACTIVITY_STARTED.add(current)
+
+
+def _task_is_revoked(task_id: str) -> bool:
+    with _STATE_LOCK:
+        return task_id in _REVOKED_TASK_IDS
+
+
+def _cancel_runs(
+    *, task_id: str = "", session_id: str = ""
+) -> tuple[list[asyncio.Task], bool, set[str]]:
+    """Mark matching tracked runs cancelled and return stable join handles.
+
+    A session deletion first installs the sessions tombstone, so a run that
+    has not bound its session yet will fail its later storage gate.  A task
+    deletion installs _REVOKED_TASK_IDS synchronously in delete_task(), which
+    also fences a delayed/catch-up run before this coroutine gets CPU.
+    """
+    current = asyncio.current_task()
+    with _RUN_REGISTRY_LOCK:
+        matches = [
+            task for task in tuple(_RUN_TASKS)
+            if task is not current and not task.done()
+            and (not task_id or _RUN_TASK_IDS.get(task) == task_id)
+            and (not session_id or _RUN_SESSION_IDS.get(task) == session_id)
+        ]
+        had_activity = any(task in _RUN_ACTIVITY_STARTED for task in matches)
+        session_ids = {
+            sid for task in matches
+            if (sid := _RUN_SESSION_IDS.get(task))
+        }
+        for task in matches:
+            task.cancel()
+    return matches, had_activity, session_ids
+
+
+async def join_cancelled_runs(tasks: list[asyncio.Task]) -> None:
+    """Wait for a stable snapshot returned by a cancel_runs_* helper."""
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _cancel_and_join_runs(
+    *, task_id: str = "", session_id: str = ""
+) -> tuple[int, bool]:
+    matches, had_activity, _ = _cancel_runs(
+        task_id=task_id, session_id=session_id)
+    if matches:
+        await join_cancelled_runs(matches)
+    return len(matches), had_activity
+
+
+def cancel_runs_for_task_now(
+    task_id: str,
+) -> tuple[list[asyncio.Task], bool, set[str]]:
+    return _cancel_runs(task_id=task_id)
+
+
+def cancel_runs_for_session_now(
+    session_id: str,
+) -> tuple[list[asyncio.Task], bool, set[str]]:
+    return _cancel_runs(session_id=session_id)
+
+
+async def cancel_runs_for_task(task_id: str) -> tuple[int, bool]:
+    """Cancel and join every in-flight incarnation of a deleted task."""
+    return await _cancel_and_join_runs(task_id=task_id)
+
+
+async def cancel_runs_for_session(session_id: str) -> tuple[int, bool]:
+    """Cancel and join scheduled work that owns a deleting session."""
+    return await _cancel_and_join_runs(session_id=session_id)
 # Serializes every read/write of the module-global _state. The scheduler
 # loop + _execute_task run on the event-loop thread, but the CRUD endpoints
 # in api_scheduler.py are plain `def` handlers → FastAPI runs them in its
@@ -467,7 +582,7 @@ def list_task_history(tid: str, limit: int = 100) -> list[dict]:
     return out
 
 
-def delete_task(tid: str) -> bool:
+def delete_task(tid: str, *, purge_bound_session: bool = True) -> bool:
     """Delete a task and (only for reuse-mode) its bound session.
 
     Behavior by mode (chosen 2026-05-28 per user spec):
@@ -481,19 +596,32 @@ def delete_task(tid: str) -> bool:
         select and delete in the regular sessions list if they want.
 
     Returns True if the task existed and got removed."""
-    with _STATE_LOCK:
-        t = _state["tasks"].pop(tid, None)
-        if not t:
-            return False
-        mode = _effective_session_mode(t)
-        sid = t.get("session_id")
-        _save_state()
+    with _RUN_REGISTRY_LOCK:
+        if purge_bound_session and any(
+            owner_tid == tid and not task.done()
+            for task, owner_tid in tuple(_RUN_TASK_IDS.items())
+        ):
+            raise RuntimeError(
+                "cannot synchronously delete a running scheduler task; "
+                "use the async API cleanup path"
+            )
+        with _STATE_LOCK:
+            t = _state["tasks"].pop(tid, None)
+            if not t:
+                return False
+            # Fence while registration is excluded. A task created just
+            # before this critical section either appears above and rejects
+            # the sync cascade, or starts afterward and observes revocation.
+            _REVOKED_TASK_IDS.add(tid)
+            mode = _effective_session_mode(t)
+            sid = t.get("session_id")
+            _save_state()
     # Cascade OUTSIDE the lock — the purge touches disk (SDK JSONL, sidecar,
     # attachments) and must not stall other scheduler state operations.
     # purge_session_storage is the same full-cleanup path the HTTP session
     # delete uses; the old sess.delete_session-only call left the SDK JSONL
     # behind, so the "deleted" session could re-appear in the session list.
-    if mode == "reuse" and sid:
+    if purge_bound_session and mode == "reuse" and sid:
         try:
             from .chat import purge_session_storage
             purge_session_storage(sid)
@@ -563,31 +691,77 @@ def ack_unread() -> int:
 
 
 async def _run_sdk_task_turn(
-    session_id: str, model: str, prompt: str,
+    session_id: str,
+    model: str,
+    prompt: str,
+    *,
+    activity_owner_id: str = "",
+    activity_source_id: str = "",
+    activity_summary: str = "",
 ) -> tuple[str, str | None]:
     """Run one unattended turn under the session-wide SDK mutex."""
     from .chat import (
+        _STREAM_EOF,
         _active_turns,
+        _session_has_live_watcher,
         _session_runtime_lock_for,
+        _sessions_with_inflight_tasks,
+        _stream_for,
+        _session_message_uuids,
+        _TurnResponseBoundary,
         get_client,
     )
     from . import sessions as session_store
 
     reply_text = ""
     error: str | None = None
+    saw_result = False
     async with _session_runtime_lock_for(session_id):
         # Re-check after acquiring: an interactive request may have reserved
         # the session while this scheduled run was waiting for the mutex.
         active = _active_turns.get(session_id)
         if active is not None and not active.done:
             raise RuntimeError("session is busy with an interactive turn")
+        if (_sessions_with_inflight_tasks.get(session_id)
+                or _session_has_live_watcher(session_id)):
+            raise RuntimeError(
+                "session is busy with a background task watcher")
+        if session_store.session_is_deleting(session_id):
+            raise RuntimeError("session is being deleted")
+        meta = session_store.get_session(session_id)
+        if meta is None:
+            raise RuntimeError("session no longer exists")
+
+        # Start Activity only after this run owns the session runtime and has
+        # rechecked the interactive reservation. The run-specific owner keeps
+        # a late scheduler finish from closing a newer foreground row.
+        if activity_owner_id:
+            try:
+                from .activity import activity as _activity
+                # Mark before the write attempt. Activity.start can fail after
+                # persisting the row (for example during SSE publication); in
+                # that case the finalizer must still close the owner. The
+                # owner-specific missing-row finish is a no-op, so a failure
+                # before persistence cannot synthesize a ghost event.
+                _mark_current_run_activity_started()
+                _activity.start(
+                    session_id,
+                    summary=activity_summary or prompt,
+                    kind="scheduled",
+                    source_id=activity_source_id,
+                    owner_id=activity_owner_id,
+                )
+            except Exception as e:
+                sys.stderr.write(
+                    f"[scheduler] activity start failed: "
+                    f"{type(e).__name__}: {e}\n"
+                )
 
         # Unattended runs intentionally use bypassPermissions: no UI is
         # present to answer a prompt. This is not a sandbox; the process has
         # the service user's OS authority. Deployments that schedule prompts
         # over untrusted content must isolate the service account/container or
         # introduce an explicit non-interactive allow policy.
-        meta = session_store.get_session(session_id) or {}
         client = await get_client(
             session_id=session_id,
             model=model,
@@ -595,20 +769,77 @@ async def _run_sdk_task_turn(
             effort=meta.get("effort") or "auto",
             service_tier=meta.get("service_tier") or "",
         )
-        await client.query(prompt)
-        async for msg in client.receive_response():
+        if session_store.session_is_deleting(session_id):
+            raise RuntimeError("session is being deleted")
+
+        # Scheduler only needs replay UUIDs, not the display-history index.
+        # The latter can write a transcript-index from a worker thread that
+        # outlives Task cancellation and recreates it after session deletion.
+        # This cached SDK read is synchronous and bounded by the session
+        # runtime mutex, so deletion joins the exact scheduler owner first.
+        existing_uuids = _session_message_uuids(session_id, model)
+        boundary = _TurnResponseBoundary(existing_uuids)
+
+        def _consume(msg: Any) -> str:
+            """Collect one scheduler response; True at terminal Result."""
+            nonlocal reply_text, error, saw_result
+            decision = boundary.classify(msg)
+            if decision in {"drop", "stale_result"}:
+                return decision
+            if decision == "forward" and not isinstance(
+                msg, (AssistantMessage, ResultMessage)
+            ):
+                # Lifecycle/rate-limit records are out-of-band. With no live
+                # background watcher (guarded above), they are not scheduler
+                # answer text and must not terminate this query.
+                return decision
             if isinstance(msg, AssistantMessage):
                 for block in getattr(msg, "content", []) or []:
                     if isinstance(block, TextBlock):
                         reply_text += getattr(block, "text", "") or ""
             elif isinstance(msg, ResultMessage):
+                saw_result = True
                 if getattr(msg, "is_error", False):
                     subtype = getattr(msg, "subtype", None) or "error"
                     errors = getattr(msg, "errors", None) or []
                     detail = "; ".join(str(e) for e in errors)
                     error = (f"SDK result error ({subtype})"
                              + (f": {detail}" if detail else ""))
-                break
+                return "current_result"
+            return decision
+
+        stream = _stream_for(client)
+        if stream is not None:
+            # The pooled stream pump is the client's sole SDK reader. Attach
+            # before query so the response cannot land in its orphan park.
+            queue = stream.attach_turn()
+            try:
+                await client.query(prompt)
+                while True:
+                    msg = await queue.get()
+                    if msg is _STREAM_EOF:
+                        raise (
+                            stream._failure
+                            or RuntimeError(
+                                "SDK message stream ended without "
+                                "a ResultMessage"
+                            )
+                        )
+                    if _consume(msg) == "current_result":
+                        break
+            finally:
+                stream.detach_turn(queue)
+                stream.park_unconsumed(queue)
+        else:
+            # Test doubles/unpooled clients have no pump, so the SDK bounded
+            # reader remains the only reader and is safe here.
+            await client.query(prompt)
+            async for msg in client.receive_response():
+                if _consume(msg) == "current_result":
+                    break
+            if not saw_result:
+                raise RuntimeError(
+                    "SDK response ended without a ResultMessage")
     return reply_text, error
 
 
@@ -623,7 +854,15 @@ async def run_task_now(tid: str) -> bool:
         task = _state["tasks"].get(tid)
     if not task:
         return False
-    t = _track_task(asyncio.create_task(_execute_task(task)))
+    t = _track_task(
+        asyncio.create_task(_execute_task(task)),
+        task_id=tid,
+        session_id=(
+            str(task.get("session_id") or "")
+            if _effective_session_mode(task) == "reuse"
+            else ""
+        ),
+    )
     t.add_done_callback(_make_task_done(tid))
     return True
 
@@ -654,9 +893,15 @@ async def _execute_task(task: dict) -> None:
     reply_text = ""
     error: str | None = None
     cancelled = False
-    activity_started = False
+    activity_owner_id = f"{tid}:{uuid.uuid4().hex}"
+    from . import sessions as session_store
+
+    if _task_is_revoked(tid):
+        return
 
     async with _task_lock(tid):
+        if _task_is_revoked(tid):
+            return
         # Resolve `sid` INSIDE the lock so two parallel run-now clicks
         # don't both mint fresh sessions then race on session_id write.
         if mode == "fresh":
@@ -668,8 +913,18 @@ async def _execute_task(task: dict) -> None:
                     model=task.get("model", ""))
                 sid = sess_meta["id"]
                 with _STATE_LOCK:
-                    task["session_id"] = sid   # "most recent run" pointer
-                    _save_state()
+                    revoked = tid in _REVOKED_TASK_IDS
+                    if not revoked:
+                        # "most recent run" pointer
+                        task["session_id"] = sid
+                        _save_state()
+                if revoked:
+                    # A synchronous compatibility caller can revoke while
+                    # create_session is doing disk I/O in another thread.
+                    # This run never owned the freshly minted empty session.
+                    sess.begin_session_delete(sid)
+                    sess.delete_session(sid)
+                    return
             except Exception as e:
                 # If session minting itself fails (disk full, etc.), record
                 # the failure as a history entry rather than crashing the
@@ -679,33 +934,27 @@ async def _execute_task(task: dict) -> None:
                     f"{type(e).__name__}: {e}\n")
                 now = time.time()
                 with _STATE_LOCK:
-                    _state["history"].append({
-                        "task_id": tid,
-                        "task_name": task["name"],
-                        "session_id": "",
-                        "ts": now,
-                        "ok": False,
-                        "error": f"session mint failed: {type(e).__name__}: {e}",
-                        "reply_preview": None,
-                    })
-                    _state["unread_count"] = _state.get("unread_count", 0) + 1
-                    _save_state()
+                    if tid not in _REVOKED_TASK_IDS:
+                        _state["history"].append({
+                            "task_id": tid,
+                            "task_name": task["name"],
+                            "session_id": "",
+                            "ts": now,
+                            "ok": False,
+                            "error": (
+                                "session mint failed: "
+                                f"{type(e).__name__}: {e}"
+                            ),
+                            "reply_preview": None,
+                        })
+                        _state["unread_count"] = (
+                            _state.get("unread_count", 0) + 1
+                        )
+                        _save_state()
                 return
         else:
             sid = task["session_id"]
-        try:
-            from .activity import activity as _activity
-            _activity.start(
-                sid,
-                summary=task["name"],
-                kind="scheduled",
-                source_id=tid,
-            )
-            activity_started = True
-        except Exception as e:
-            sys.stderr.write(
-                f"[scheduler] activity start failed for {tid}: "
-                f"{type(e).__name__}: {e}\n")
+        _bind_current_run_session(tid, sid)
         try:
             # Tasks created before the scheduler UI had a model picker stored
             # model=""; SDK then silently fell back to its built-in default
@@ -719,7 +968,11 @@ async def _execute_task(task: dict) -> None:
                 "MUSELAB_SCHEDULER_TIMEOUT_S", 1800, min_value=0)
             async with asyncio.timeout(timeout_s or None):
                 reply_text, error = await _run_sdk_task_turn(
-                    sid, model, task["prompt"])
+                    sid, model, task["prompt"],
+                    activity_owner_id=activity_owner_id,
+                    activity_source_id=tid,
+                    activity_summary=task["name"],
+                )
             if error:
                 sys.stderr.write(
                     f"[scheduler] task {tid} ({task['name']}) "
@@ -747,7 +1000,6 @@ async def _execute_task(task: dict) -> None:
             # it before firing, and run_task_now() is explicitly an out-of-band
             # run that mustn't disturb the regular cadence.
             now = time.time()
-            task["last_run"] = now
             preview = reply_text.strip()
             if len(preview) > _PREVIEW_CAP_CHARS:
                 preview = preview[:_PREVIEW_CAP_CHARS] + "…"
@@ -761,25 +1013,40 @@ async def _execute_task(task: dict) -> None:
                 "reply_preview": preview if error is None else None,
             }
             with _STATE_LOCK:
-                _state["history"].append(entry)
-                # Successful runs bump unread; errors also bump so the user
-                # notices them — but they show as red in the UI.
-                _state["unread_count"] = _state.get("unread_count", 0) + 1
-                if len(_state["history"]) > _HISTORY_CAP:
-                    _state["history"] = _state["history"][-_HISTORY_CAP:]
-                _save_state()
-            if activity_started:
-                try:
-                    from .activity import activity as _activity
+                revoked = (
+                    tid in _REVOKED_TASK_IDS
+                    or session_store.session_is_deleting(sid)
+                )
+                if not revoked:
+                    task["last_run"] = now
+                    _state["history"].append(entry)
+                    # Successful runs bump unread; errors also bump so the
+                    # user notices them — but they show as red in the UI.
+                    _state["unread_count"] = (
+                        _state.get("unread_count", 0) + 1
+                    )
+                    if len(_state["history"]) > _HISTORY_CAP:
+                        _state["history"] = _state["history"][-_HISTORY_CAP:]
+                    _save_state()
+            try:
+                from .activity import activity as _activity
+                current = asyncio.current_task()
+                with _RUN_REGISTRY_LOCK:
+                    should_finish_activity = (
+                        current not in _RUN_TASKS
+                        or current in _RUN_ACTIVITY_STARTED
+                    )
+                if should_finish_activity:
                     _activity.finish(
                         sid,
-                        "cancelled" if cancelled else (
+                        "cancelled" if (cancelled or revoked) else (
                             "failed" if error else "completed"),
+                        owner_id=activity_owner_id,
                     )
-                except Exception as e:
-                    sys.stderr.write(
-                        f"[scheduler] activity finish failed for {tid}: "
-                        f"{type(e).__name__}: {e}\n")
+            except Exception as e:
+                sys.stderr.write(
+                    f"[scheduler] activity finish failed for {tid}: "
+                    f"{type(e).__name__}: {e}\n")
             # Fire Web Push to every subscribed device — but skip when the
             # user is actively at one of their devices (presence heartbeat
             # within GRACE_SECONDS). In-app the UI already flashes the bell
@@ -792,44 +1059,37 @@ async def _execute_task(task: dict) -> None:
             # 4-toggle UI down to one "notify me" switch).
             # Errors swallowed — push is best-effort, must never break the loop.
             try:
-                if cancelled:
-                    raise
-                from . import presence as _presence
-                if _presence.recently_active():
-                    # User is at their screen — UI badge + foreground vibrate
-                    # handle the notification. Don't double-buzz. Leave a
-                    # journal line so a "scheduler never pushes" report can
-                    # be told apart from an actual delivery failure.
-                    # None-safe: a device can flip to hidden between
-                    # recently_active() and this call (see chat.py sites).
-                    _age = _presence.last_seen_age()
-                    _age_s = f"{_age:.0f}s" if _age is not None else "?"
-                    sys.stderr.write(
-                        f"[push] sched skipped (presence "
-                        f"age={_age_s}) task={tid}\n")
-                else:
-                    from . import push as _push
-                    # Prefix with ⏰ so the notification banner is universally
-                    # recognizable as muselab scheduler output across both zh
-                    # and en users. (Pushes are server-side rendered; we don't
-                    # know the user's lang preference, so language-neutral
-                    # icon beats either zh or en prose.)
-                    title = f"⏰ {task['name']}"
-                    if error:
-                        body = f"❌ {' '.join(error.split())[:120]}"
+                if not cancelled and not revoked:
+                    from . import presence as _presence
+                    if _presence.recently_active():
+                        # User is at their screen — UI badge + foreground
+                        # vibrate handle the notification. Don't double-buzz.
+                        # Leave a journal line so a "scheduler never pushes"
+                        # report can be distinguished from delivery failure.
+                        _age = _presence.last_seen_age()
+                        _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                        sys.stderr.write(
+                            f"[push] sched skipped (presence "
+                            f"age={_age_s}) task={tid}\n")
                     else:
-                        # Strip markdown so the banner shows readable prose
-                        # instead of table rows, code fences, etc.
-                        from .chat import _plain_preview
-                        body = _plain_preview(preview or "")
-                    # Offload pywebpush's synchronous per-subscription HTTPS
-                    # to a thread so a slow/dead push endpoint can't block the
-                    # event loop (and every concurrent SSE/HTTP request) while
-                    # the scheduler fans out task notifications.
-                    await asyncio.to_thread(
-                        _push.send_to_all, title=title, body=body or "—",
-                        url="/", tag=f"task-{tid}",
-                        context=f"sched {tid}")
+                        from . import push as _push
+                        # Prefix with ⏰ so scheduler output is recognizable
+                        # across locales without a server-side language
+                        # preference.
+                        title = f"⏰ {task['name']}"
+                        if error:
+                            body = f"❌ {' '.join(error.split())[:120]}"
+                        else:
+                            # Strip markdown so the banner shows readable
+                            # prose instead of table rows, code fences, etc.
+                            from .chat import _plain_preview
+                            body = _plain_preview(preview or "")
+                        # Offload synchronous subscription HTTPS so a slow
+                        # endpoint cannot block the event loop.
+                        await asyncio.to_thread(
+                            _push.send_to_all, title=title, body=body or "—",
+                            url="/", tag=f"task-{tid}",
+                            context=f"sched {tid}")
             except Exception as e:
                 sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 
@@ -893,7 +1153,15 @@ async def _scheduler_loop() -> None:
                         if (task.get("schedule") or {}).get("kind") == "once":
                             task["enabled"] = False
                         _save_state()
-                    task_obj = _track_task(asyncio.create_task(_execute_task(task)))
+                    task_obj = _track_task(
+                        asyncio.create_task(_execute_task(task)),
+                        task_id=str(task.get("id") or ""),
+                        session_id=(
+                            str(task.get("session_id") or "")
+                            if _effective_session_mode(task) == "reuse"
+                            else ""
+                        ),
+                    )
                     task_obj.add_done_callback(_make_task_done(task.get("id", "?")))
         except Exception as e:
             sys.stderr.write(f"[scheduler] loop error: {e}\n")
@@ -960,8 +1228,17 @@ async def start_scheduler() -> None:
         sys.stderr.write(
             f"[scheduler] catching up missed window for task "
             f"{task['id']} ({task.get('name','?')})\n")
-        t = _track_task(asyncio.create_task(
-            _delayed_execute(task, i * _CATCHUP_STAGGER_S)))
+        t = _track_task(
+            asyncio.create_task(
+                _delayed_execute(task, i * _CATCHUP_STAGGER_S)
+            ),
+            task_id=str(task.get("id") or ""),
+            session_id=(
+                str(task.get("session_id") or "")
+                if _effective_session_mode(task) == "reuse"
+                else ""
+            ),
+        )
         t.add_done_callback(_make_task_done(task.get("id", "?")))
     _scheduler_task = asyncio.create_task(_scheduler_loop())
 
@@ -970,11 +1247,17 @@ async def stop_scheduler() -> None:
     """Stop the tick loop and every scheduled execution owned by this process."""
     global _scheduler_task
 
-    tasks = [task for task in (_scheduler_task, *_RUN_TASKS)
+    with _RUN_REGISTRY_LOCK:
+        tracked = tuple(_RUN_TASKS)
+    tasks = [task for task in (_scheduler_task, *tracked)
              if task is not None and not task.done()]
     _scheduler_task = None
     for task in tasks:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    _RUN_TASKS.clear()
+    with _RUN_REGISTRY_LOCK:
+        _RUN_TASKS.clear()
+        _RUN_TASK_IDS.clear()
+        _RUN_SESSION_IDS.clear()
+        _RUN_ACTIVITY_STARTED.clear()

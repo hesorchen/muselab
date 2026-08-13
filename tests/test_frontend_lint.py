@@ -180,6 +180,9 @@ def test_memory_center_and_chat_recall_trace_are_wired():
     assert "memoryRecall" in index
     assert "_done_memory_recall = mem0.pop_recall_trace(session_id)" in chat
     assert '"memory_recall": _done_memory_recall' in chat
+    assert "_done_memory_receipt = _persistable_memory_recall(" in chat
+    assert "memory_recall=_done_memory_receipt" in chat
+    assert '"/api/memory/items/" + encodeURIComponent(item.id)' in app
     assert '@router.post("/skills/{artifact_id}/approve")' in api
 
 
@@ -441,14 +444,23 @@ def test_enter_submission_waits_for_ime_composition():
     ime_start = app.index("    _isImeComposingEvent(ev) {")
     ime_end = app.index("\n    },", ime_start)
     ime = app[ime_start:ime_end]
-    assert "ev.isComposing" in ime
-    assert "ev.keyCode === 229" in ime
-    assert "ev.which === 229" in ime
-    assert 'ev.key === "Process"' in ime
+    recent_start = app.index("    _isRecentImeCommitEnter(ev) {")
+    recent_end = app.index("\n    },", recent_start)
+    recent = app[recent_start:recent_end]
+    consume_start = app.index("    _consumeRecentImeCommitEnter(ev) {")
+    consume_end = app.index("\n    },", consume_start)
+    consume = app[consume_start:consume_end]
+    assert "this._hasExplicitImeSignal(ev)" in ime
     assert "target._museImeComposing" in ime
-    assert "target._museImeEndedAt" in ime
-    assert "eventAt - endedAt <= 80" in ime
-    assert helper.index("return false") < helper.index("ev.preventDefault()")
+    assert "target._museImeEndedAt" not in ime
+    assert "target._museImeEndedAt" in recent
+    assert "target._museImeCommitEnterDown" in recent
+    assert "eventAt - endedAt <= 1000" in recent
+    assert "this._consumeRecentImeCommitEnter(ev)" in helper
+    assert consume.index("ev.preventDefault()") < consume.index("return true")
+    composing_branch = helper[helper.index("this._isImeComposingEvent(ev)"):]
+    assert composing_branch.index("return false") \
+        < composing_branch.index("ev.preventDefault()")
     assert "_museImeOriginalForceModelUpdate" not in app
     assert "target._x_forceModelUpdate = value =>" not in app
     assert "_syncChatInputDom(value = this.input, options = {})" in app
@@ -456,6 +468,9 @@ def test_enter_submission_waits_for_ime_composition():
     assert "ev.inputType === \"insertCompositionText\"" in app
     assert "this._finishImeComposition(target)" in app
     assert "if (this.input !== target.value) this.input = target.value" in app
+    assert "ev.isComposing === true" in app
+    assert "onImeEnterKeyup(ev)" in app
+    assert '@keyup.enter="onImeEnterKeyup($event)"' in html
 
     assert '@keydown.enter="confirmModalOnEnter($event)"' in html
     assert '@keydown.enter="commitRenameTabOnEnter($event)"' in html
@@ -471,6 +486,52 @@ def test_enter_submission_waits_for_ime_composition():
     assert '@keydown.enter.prevent="commitRenameTab()"' not in html
     assert '@keydown.enter.prevent="pickerCommitInlineRename()"' not in html
     assert '@keydown.enter.prevent.stop="onEnter($event)"' not in html
+
+
+def test_stale_ime_recovery_requires_five_second_plain_enter():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    mark_start = app.index("    _markLocalImeComposition(target, restart = false) {")
+    mark = app[mark_start:app.index("\n    },", mark_start)]
+    explicit_start = app.index("    _hasExplicitImeSignal(ev) {")
+    explicit = app[explicit_start:app.index("\n    },", explicit_start)]
+    recover_start = app.index(
+        "    _recoverStaleImeCompositionOnPlainEnter(ev) {")
+    recover = app[recover_start:app.index("\n    },", recover_start)]
+    claim_start = app.index("    _claimNonImeEnter(ev) {")
+    claim = app[claim_start:app.index("\n    },", claim_start)]
+
+    assert "IME_STALE_AFTER_MS: 5000" in app
+    assert "target._museImeStartedAt = Date.now()" in mark
+    assert "restart || !target._museImeComposing || startedAt <= 0" in mark
+    assert "ev.isComposing === true" in explicit
+    assert "ev.keyCode === 229" in explicit
+    assert "ev.which === 229" in explicit
+    assert 'ev.key === "Process"' in explicit
+    assert 'ev.key === "Enter"' in recover
+    assert "ev.shiftKey || ev.ctrlKey || ev.metaKey || ev.altKey" in recover
+    assert "this._hasExplicitImeSignal(ev)" in recover
+    assert "Date.now() - startedAt < this.IME_STALE_AFTER_MS" in recover
+    assert "this._finishImeComposition(target)" in recover
+    assert "target._museImeStartedAt = 0" in recover
+    assert claim.index("this._recoverStaleImeCompositionOnPlainEnter(ev)") \
+        < claim.index("this._isImeComposingEvent(ev)")
+
+
+def test_side_question_textareas_share_dom_local_ime_guard():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert index.count('@compositionstart="onLocalImeCompositionStart($event)"') >= 2
+    assert index.count('@compositionend="onLocalImeCompositionEnd($event)"') >= 2
+    assert index.count('@beforeinput="onLocalImeBeforeInput($event)"') >= 2
+    assert index.count('@input="onLocalImeInput($event)"') >= 2
+    for name in ("onPreviewQuoteAskEnter(ev)", "onPreviewQuoteFollowupEnter(ev)"):
+        start = app.index(name)
+        block = app[start:app.index("\n    },", start)]
+        assert "this._consumeRecentImeCommitEnter(ev)" in block
+        assert "this._isImeComposingEvent(ev)" in block
+        assert "ev.preventDefault()" in block
 
 
 def test_chat_arrow_keys_walk_user_input_history_and_restore_draft():
@@ -1508,6 +1569,7 @@ def test_memory_recall_details_use_a_root_fixed_portal():
     assert "document.querySelector(\".memory-recall-global\")" in app
     assert '"position:fixed"' in app
     assert "_queueMemoryRecallPosition()" in app
+    assert 'cache: "no-store"' in app
     assert ".memory-recall-global {" in css
     portal_css = css[css.index(".memory-recall-global {"):]
     portal_css = portal_css[:portal_css.index("}")]
@@ -1708,7 +1770,7 @@ def test_stream_done_errors_share_failed_message_state_and_actions():
     error = app[error_start:app.index('es.addEventListener("cancelled"', error_start)]
 
     assert "markUserFailed(_detail, d.kind, d.cta, d.retryable)" in done
-    assert "if (d.is_error)" in done
+    assert "if (d.is_error && !d.cancelled)" in done
     assert "const queueBlockingError = !!d.is_error && !isContinuation" in done
     assert "if (queueBlockingError)" in done
     assert "_drainPendingQueue(streamSid, completedTurnId)" in done
@@ -1742,6 +1804,38 @@ def test_compact_http_failure_parses_detail_and_never_shows_success():
     assert "body.detail" in failure
     assert "_humanizeStreamError(detail)" in failure
     assert "压缩完成" not in failure
+
+
+def test_context_recovery_opens_branch_and_never_reuses_attachment_ids():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    adopt_start = app.index("async _adoptRecoveredSession")
+    adopt = app[adopt_start:app.index("async runCompact", adopt_start)]
+    compact_start = app.index("async runCompact")
+    compact = app[compact_start:app.index("onChatArrowUp", compact_start)]
+    send_start = app.index("async send(opts = {})")
+    send = app[send_start:app.index("async stop()", send_start)]
+    error_start = send.index('es.addEventListener("error"')
+    error = send[error_start:send.index(
+        'es.addEventListener("cancelled"', error_start)]
+
+    assert "recovered_session || payload.session" in adopt
+    assert "this.currentId === sourceSid" in adopt
+    assert "await this.openTab(newId, shouldFocus)" in adopt
+    assert "compactResult.recovered_session" in compact
+    assert "if (!recoveredSession)" in compact
+    assert "const contextRecoveryAttempted = !!opts.contextRecoveryAttempted" in send
+    assert "isReconnect && !!sendState._contextRecoveryAttempted" in send
+    assert "errorMeta.recovered_session" in error
+    assert "&& !contextRecoveryAttempted" in error
+    assert "const attachmentRecovery = attachIds.length > 0" in error
+    assert "!isReconnect && !isContinuation && !resumed" in error
+    assert "this._contextRecoveryAutoSent[recoveryId]" in error
+    assert "detachedText: text" in error
+    assert "detachedDisplayText: composerInput || text" in error
+    assert "contextRecoveryAttempted: true" in error
+    assert "recoveryDraft = composerInput || text" in error
+    assert "pendingImages" not in error[error.index("if (hasContextRecovery)"):]
+    assert "pendingDocs" not in error[error.index("if (hasContextRecovery)"):]
 
 
 def test_workspace_switch_disables_composer_and_gates_programmatic_user_send():
@@ -1796,7 +1890,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "this.isTabStreaming(this.currentId)" in app
 
 
-def test_background_task_gap_stops_footer_without_blocking_composer():
+def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -1804,12 +1898,12 @@ def test_background_task_gap_stops_footer_without_blocking_composer():
 
     assert "backgroundActive: false" in app
     assert "backgroundTaskCount: 0" in app
-    # A pending background task keeps its card alive but must NOT keep the
-    # completed turn's footer timer or make the composer busy: the backend pump
-    # owns the session stream now, so task completion arrives independently.
+    # A pending background task keeps its card alive without extending the
+    # completed turn's footer timer. The composer remains editable, but send()
+    # detects the watcher and persists the message in FIFO until it settles.
     assert "|| (st && st.compacting));" in app
     assert "if (st && (st.streaming || st.compacting)) return true;" in app
-    assert "if (status.background) return false;" in app
+    assert "if (status.background) return true;" in app
     assert "d.background && d.attachable === false" in app
     assert "background_tasks_pending" in app
     assert "_stopTimer();" in app
@@ -1946,7 +2040,7 @@ def test_chat_draft_survives_refresh_and_failed_stream_start():
     assert "this._stageChatRecoveryDraft(sendSid, composerInput)" in send
     assert "clearSubmittedComposer({ preserveForHandshake: true })" in send
     assert "this._commitChatRecoveryDraft(sendSid, composerInput)" in send
-    assert "const rollbackUnstartedSend = () =>" in send
+    assert "const rollbackUnstartedSend = (restoreDraft = true) =>" in send
     assert "restoreSubmittedComposer(true)" in send
     assert "restoreOwned(sendDraft.pendingImages, composerImages)" in send
     assert "restoreOwned(sendDraft.pendingDocs, composerDocs)" in send
@@ -2012,7 +2106,10 @@ def test_active_stream_owns_messages_and_continuation_reconciles_canonical_histo
     assert "this.tabState[sid] !== st || st.streaming || st.es" in reveal
     assert "const ownsCurBubble = () =>" in send
     assert "this._containsPaneMessage(streamState, curBubble)" in send
-    assert "if (ownsCurBubble()) curBubble.error" in send
+    assert "const surfaceTerminalError = detail =>" in send
+    assert "surfaceTerminalError(_detail)" in send
+    assert "surfaceTerminalError(serverError)" in send
+    assert "closeAsst();" in send[send.index("const surfaceTerminalError = detail =>"):]
     assert "this._reconcileCompletedContinuation(" in send
     assert "streamSid, streamState, continuationFinalText" in send
     assert "const loaded = await this.loadSession(sid, { quiet: true })" in app
@@ -2175,12 +2272,13 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert "const completedFinalText = ownsCurBubble()" in done
     assert "} else if (!d.cancelled) {" in done
     assert "this._reconcileCompletedTurn(" in done
-    assert "streamSid, streamState, completedFinalText" in done
+    assert "streamSid, streamState, d.is_error ? \"\" : completedFinalText" in done
+    assert "String(d.assistant_uuid || \"\")" in done
     assert "assistantUuid: d.assistant_uuid" in done
     assert "completedAtMs: d.completed_at_ms" in done
     assert "durationMs: d.duration_ms" in done
 
-    reconcile_start = app.index("_reconcileCompletedTurn(sid, ownerState")
+    reconcile_start = app.index("    _reconcileCompletedTurn(\n      sid, ownerState")
     reconcile_end = app.index(
         "\n    _reconcileCompletedContinuation", reconcile_start)
     reconcile = app[reconcile_start:reconcile_end]
@@ -2189,6 +2287,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     assert '"/api/chat/sessions/" + sid + "?tail=80"' in reconcile
     assert "m && m.role !== \"user\" && m.uuid" in reconcile
     assert "m.role === \"assistant\" && m.uuid" in reconcile
+    assert "m && m.uuid === expectedAssistantUuid" in reconcile
     assert "const loaded = await this.loadSession(sid, { quiet: true })" in reconcile
     assert "attempt < 30" in reconcile
     assert "Math.min(2000, 250 + attempt * 100)" in reconcile
@@ -2197,7 +2296,7 @@ def test_done_immediately_stamps_tool_tail_and_quietly_adopts_fork_boundary():
     continuity_end = app.index(
         "\n    _preserveCanonicalMessageIdentity", continuity_start)
     continuity = app[continuity_start:continuity_end]
-    assert "forkUuid" not in continuity
+    assert 'if (role === "assistant") continuityIds.push(m.forkUuid)' in continuity
     fork_start = app.index("turnForkMessageId(paneMsgs, i)")
     fork_end = app.index("\n    // Normalize a model-emitted path", fork_start)
     fork = app[fork_start:fork_end]
@@ -2242,6 +2341,29 @@ def test_terminal_event_immediately_settles_tab_activity_snapshot():
     assert "_markDone(!!d.cancelled, backgroundPending, true, {" in app
 
 
+def test_any_result_rendered_in_current_visible_turn_is_auto_acknowledged():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    helper_start = app.index("_ackViewedActivity(")
+    helper_end = app.index("\n    ackCurrentActivity", helper_start)
+    helper = app[helper_start:helper_end]
+    send_start = app.index("async send(opts = {})")
+    send = app[send_start:app.index("async stop()", send_start)]
+    done_start = send.index('es.addEventListener("done"')
+    error_start = send.index('es.addEventListener("error"')
+    done = send[done_start:error_start]
+    error = send[
+        error_start:send.index('es.addEventListener("cancelled"', error_start)
+    ]
+
+    assert 'document.visibilityState !== "visible"' in helper
+    assert "this.currentId === sid" in helper
+    assert "this.tabState[this.currentId] === streamState" in helper
+    assert "this._ackViewedActivity(" in done
+    assert "this._ackViewedActivity(" in error
+    assert "isContinuation" in send
+    assert "backgroundPending" in send
+
+
 def test_scheduler_uses_activity_completion_instead_of_fixed_history_polling():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("_applyScheduledActivity(item)")
@@ -2274,7 +2396,10 @@ def test_queue_sync_keeps_older_success_when_newer_read_fails():
     sync = app[start:app.index("_currentQueueLen", start)]
 
     assert "_queueAppliedSeq: 0" in app
+    assert "_queueRevision: 0" in app
     assert "seq < st._queueAppliedSeq" in sync
+    assert "revision < (Number(st._queueRevision) || 0)" in sync
+    assert 'cache: "no-store"' in sync
     assert "st._queueAppliedSeq = seq" in sync
     assert "st._queueSyncSeq !== seq" not in sync
 
@@ -3490,3 +3615,24 @@ def test_midturn_reconnect_storm_guards_are_in_place():
     assert "st._reconcileRetryN = retries + 1;" in reconcile
     assert "&& retries < 6" in reconcile
     assert "Math.min(2000, 250 * (retries + 1))" in reconcile
+
+
+def test_turn_busy_race_falls_back_to_durable_queue():
+    js = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    send = js[js.index("    async send(opts = {}) {"):]
+    busy = send[send.index('if (serverError && errKind === "turn_busy"'):]
+    busy = busy[:busy.index("\n\n        if (serverError) {")]
+
+    assert "await this._enqueueMessage(streamSid" in busy
+    assert "!isReconnect && !resumed" in busy
+    assert "rollbackUnstartedSend(false);" in busy
+    assert "restoreSubmittedComposer" not in busy
+    assert busy.index("es.close()") < busy.index(
+        "await this._enqueueMessage(streamSid"
+    )
+    assert "streamState._busyQueueHandoff === es" in busy
+    assert "if (streamState.es === es) rollbackUnstartedSend(false);" in busy
+    assert busy.index("streamState._busyQueueHandoff = es;") < busy.index(
+        "await this._enqueueMessage(streamSid"
+    )
+    assert "this._removePaneMessage(streamState, sentUserBubble);" in busy

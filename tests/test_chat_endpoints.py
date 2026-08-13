@@ -7,6 +7,7 @@ fan-out, response shape) runs for real without spawning a CLI.
 import asyncio
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -402,13 +403,13 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     monkeypatch.setattr(
         activity_module.activity,
         "start",
-        lambda activity_sid, *, summary="": activity_transitions.append(
+        lambda activity_sid, *, summary="", activity_source="", owner_id="": activity_transitions.append(
             ("start", activity_sid, summary)),
     )
     monkeypatch.setattr(
         activity_module.activity,
         "finish",
-        lambda activity_sid, status: activity_transitions.append(
+        lambda activity_sid, status, *, activity_source="", owner_id="": activity_transitions.append(
             ("finish", activity_sid, status)),
     )
 
@@ -440,6 +441,194 @@ async def test_interrupt_cancels_cold_client_startup_immediately(
     if recent is not None:
         recent.close()
     chat_mod._delete_cancelled_turn_snapshots(sid)
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_during_activity_start_releases_queue_claim(
+        chat_mod, monkeypatch):
+    """Cancellation at the Activity write cannot leave a phantom busy turn."""
+    from backend import activity as activity_module
+
+    sid = "00000000-0000-4000-8000-000000000043"
+    queued = chat_mod.sess.enqueue_message(sid, "queued startup")["item"]
+    chat_mod.sess.claim_queue_message(sid)
+    activity_entered = threading.Event()
+    release_activity = threading.Event()
+    transitions = []
+
+    def blocking_start(
+        activity_sid, *, summary="", activity_source="", owner_id="",
+    ):
+        activity_entered.set()
+        assert release_activity.wait(timeout=2)
+        transitions.append(("start", activity_sid, summary, activity_source))
+
+    def finish(activity_sid, status, *, activity_source="", owner_id=""):
+        transitions.append(("finish", activity_sid, status, activity_source))
+
+    async def no_watcher(_sid):
+        return None
+
+    async def must_not_start_client(*_args, **_kwargs):
+        raise AssertionError("client startup must not begin")
+
+    monkeypatch.setattr(chat_mod, "_handoff_task_watcher", no_watcher)
+    monkeypatch.setattr(chat_mod, "get_client", must_not_start_client)
+    monkeypatch.setattr(
+        chat_mod.sess,
+        "get_session",
+        lambda _sid: {"model": "claude-sonnet-4-6", "effort": "auto"},
+    )
+    monkeypatch.setattr(
+        chat_mod, "_heal_unreachable_locked_model",
+        lambda _sid, locked, _requested: locked,
+    )
+    monkeypatch.setattr(activity_module.activity, "start", blocking_start)
+    monkeypatch.setattr(activity_module.activity, "finish", finish)
+
+    task = asyncio.create_task(chat_mod._start_turn(
+        sid,
+        "queued startup",
+        permission="default",
+        persist_permission=False,
+        queue_item_id=queued["id"],
+    ))
+    assert await asyncio.to_thread(activity_entered.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    release_activity.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    queue = chat_mod.sess.get_queue(sid)
+    assert sid not in chat_mod._active_turns
+    assert queue["inflight"] is None
+    assert queue["paused"] is True
+    assert [item["id"] for item in queue["items"]] == [queued["id"]]
+    assert transitions == [
+        ("start", sid, "queued startup", "queued"),
+        ("finish", sid, "cancelled", "queued"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_activity_start_cannot_leave_phantom(
+        chat_mod, monkeypatch):
+    """Two cancellation sources still join the non-cancellable worker write."""
+    from backend import activity as activity_module
+
+    sid = "sid-double-cancel-activity"
+    broadcast = chat_mod.TurnBroadcast(sid)
+    entered = threading.Event()
+    release = threading.Event()
+    transitions = []
+
+    def blocked_start(
+        activity_sid, *, summary="", activity_source="", owner_id="",
+    ):
+        entered.set()
+        assert release.wait(timeout=2)
+        transitions.append(("start", activity_sid))
+
+    monkeypatch.setattr(activity_module.activity, "start", blocked_start)
+    task = asyncio.create_task(
+        chat_mod._start_activity_early(sid, broadcast, "prompt"))
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert transitions == [("start", sid)]
+    assert broadcast.activity_started is True
+    await chat_mod._finish_activity(sid, broadcast, "cancelled")
+    assert broadcast.activity_started is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_startup_keeps_slot_until_activity_is_terminal(
+        chat_mod, monkeypatch):
+    """Old Activity finish cannot race a replacement turn for the same sid."""
+    sid = "sid-cancel-activity-order"
+    broadcast = chat_mod.TurnBroadcast(sid)
+    broadcast.cancelled = True
+    broadcast.activity_started = True
+    chat_mod._active_turns[sid] = broadcast
+    finish_entered = asyncio.Event()
+    release_finish = asyncio.Event()
+
+    monkeypatch.setattr(
+        chat_mod, "_persist_cancelled_turn_snapshot", lambda _bc: True)
+
+    async def blocked_finish(_sid, _broadcast, status):
+        assert status == "cancelled"
+        finish_entered.set()
+        await release_finish.wait()
+        _broadcast.activity_started = False
+
+    monkeypatch.setattr(chat_mod, "_finish_activity", blocked_finish)
+    cleanup = asyncio.create_task(
+        chat_mod._finish_cancelled_startup(sid, broadcast))
+    await asyncio.wait_for(finish_entered.wait(), timeout=1)
+
+    assert chat_mod._active_turns[sid] is broadcast
+    assert broadcast.done is False
+    release_finish.set()
+    assert await cleanup is broadcast
+    assert sid not in chat_mod._active_turns
+    assert broadcast.done is True
+    assert chat_mod._recent_turns[sid] is broadcast
+    recent = chat_mod._recent_turns.pop(sid)
+    recent.close()
+
+
+@pytest.mark.asyncio
+async def test_second_cancel_during_snapshot_still_finishes_startup_cleanup(
+        chat_mod, monkeypatch):
+    """A subscriber disconnect cannot cancel the worker-backed cleanup."""
+    sid = "sid-cancel-snapshot-join"
+    broadcast = chat_mod.TurnBroadcast(sid)
+    broadcast.cancelled = True
+    broadcast.queue_item_id = "q-corrupt"
+    broadcast.activity_started = True
+    chat_mod._active_turns[sid] = broadcast
+    snapshot_entered = threading.Event()
+    release_snapshot = threading.Event()
+    finished = []
+
+    def bad_release(*_args, **_kwargs):
+        raise RuntimeError("corrupt queue")
+
+    def blocked_snapshot(_broadcast):
+        snapshot_entered.set()
+        assert release_snapshot.wait(timeout=2)
+        return True
+
+    async def finish_activity(_sid, _broadcast, status):
+        finished.append(status)
+        _broadcast.activity_started = False
+
+    monkeypatch.setattr(chat_mod.sess, "release_queue_claim", bad_release)
+    monkeypatch.setattr(
+        chat_mod, "_persist_cancelled_turn_snapshot", blocked_snapshot)
+    monkeypatch.setattr(chat_mod, "_finish_activity", finish_activity)
+
+    task = asyncio.create_task(
+        chat_mod._finish_cancelled_startup(sid, broadcast))
+    assert await asyncio.to_thread(snapshot_entered.wait, 1)
+    task.cancel()
+    release_snapshot.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert finished == ["cancelled"]
+    assert sid not in chat_mod._active_turns
+    assert broadcast.done is True
+    assert chat_mod._recent_turns[sid] is broadcast
+    recent = chat_mod._recent_turns.pop(sid)
+    recent.close()
 
 
 def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
@@ -497,6 +686,301 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
     assert "task-1" not in chat_mod._bg_task_descriptions
     assert broadcast.cancelled is True
     assert broadcast.done is True
+
+
+@pytest.mark.asyncio
+async def test_async_purge_keeps_runtime_mutation_on_event_loop(
+        chat_mod, monkeypatch):
+    from backend import activity as activity_module
+
+    sid = "sid-purge-loop-thread"
+    loop_thread = threading.get_ident()
+    observed_threads = []
+    activity_finishes = []
+    original_clear = chat_mod._clear_session_runtime_state
+
+    def tracked_clear(target_sid):
+        observed_threads.append(threading.get_ident())
+        return original_clear(target_sid)
+
+    async def no_disconnect(_sid):
+        return None
+
+    monkeypatch.setattr(chat_mod, "_clear_session_runtime_state", tracked_clear)
+    monkeypatch.setattr(chat_mod, "disconnect_client", no_disconnect)
+    monkeypatch.setattr(
+        chat_mod,
+        "purge_session_storage",
+        lambda _sid: True,
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda activity_sid, status, *, activity_source="", owner_id="":
+            activity_finishes.append((activity_sid, status, activity_source)),
+    )
+    chat_mod._background_activity_finishes[sid] = (
+        "completed", "background-owner")
+
+    assert await chat_mod.purge_session_storage_async(sid) is True
+    assert observed_threads == [loop_thread]
+    assert activity_finishes == [(sid, "cancelled", "background")]
+
+
+@pytest.mark.asyncio
+async def test_get_client_rejects_cold_commit_after_delete_fence(
+        chat_mod, monkeypatch):
+    sid = "sid-delete-during-client-build"
+    key = (sid, "claude-sonnet-4-6", "auto", "")
+    build_entered = asyncio.Event()
+    release_build = asyncio.Event()
+
+    class FakeClient:
+        disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    fake_client = FakeClient()
+
+    async def blocked_build(*_args, **_kwargs):
+        build_entered.set()
+        await release_build.wait()
+        return fake_client
+
+    monkeypatch.setattr(chat_mod, "_build_and_connect_client", blocked_build)
+    monkeypatch.setattr(chat_mod, "_has_enabled_external_mcp", lambda: False)
+
+    creating = asyncio.create_task(chat_mod.get_client(
+        sid, "claude-sonnet-4-6", effort="auto"))
+    await asyncio.wait_for(build_entered.wait(), timeout=1)
+    await asyncio.to_thread(chat_mod.sess.begin_session_delete, sid)
+    release_build.set()
+
+    with pytest.raises(RuntimeError, match="being deleted"):
+        await asyncio.wait_for(creating, timeout=1)
+    assert fake_client.disconnected is True
+    assert key not in chat_mod._clients
+    assert key not in chat_mod._session_streams
+    assert key not in chat_mod._client_lru
+
+
+@pytest.mark.asyncio
+async def test_async_purge_aborts_when_scheduler_join_fails(
+        chat_mod, monkeypatch):
+    from backend import scheduler
+
+    disk_purges = []
+
+    async def fail_join(_runs):
+        raise RuntimeError("scheduler join failed")
+
+    monkeypatch.setattr(
+        scheduler,
+        "cancel_runs_for_session_now",
+        lambda _sid: ([], False, set()),
+    )
+    monkeypatch.setattr(scheduler, "join_cancelled_runs", fail_join)
+    monkeypatch.setattr(
+        chat_mod,
+        "purge_session_storage",
+        lambda sid: disk_purges.append(sid) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="scheduler join failed"):
+        await chat_mod.purge_session_storage_async("sid-join-failure")
+    assert disk_purges == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mcp_gate_disconnects_unpooled_client(
+        chat_mod, monkeypatch):
+    sid = "sid-cancel-unpooled-mcp"
+    gate_entered = asyncio.Event()
+
+    class FakeClient:
+        disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    fake_client = FakeClient()
+
+    async def build(*_args, **_kwargs):
+        return fake_client
+
+    async def blocked_gate(_client):
+        gate_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(chat_mod, "_build_and_connect_client", build)
+    monkeypatch.setattr(chat_mod, "_has_enabled_external_mcp", lambda: True)
+    monkeypatch.setattr(chat_mod, "_await_mcp_ready", blocked_gate)
+
+    creating = asyncio.create_task(chat_mod.get_client(
+        sid, "claude-sonnet-4-6", effort="auto"))
+    await asyncio.wait_for(gate_entered.wait(), timeout=1)
+    creating.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(creating, timeout=1)
+
+    assert fake_client.disconnected is True
+    assert all(key[0] != sid for key in chat_mod._clients)
+    assert all(key[0] != sid for key in chat_mod._session_streams)
+
+
+@pytest.mark.asyncio
+async def test_async_purge_joins_scheduler_run_before_disk_delete(
+        chat_mod, monkeypatch):
+    from backend import activity as activity_module
+    from backend import scheduler
+
+    sid = "sid-running-scheduler-delete"
+    task = {
+        "id": "scheduled-delete",
+        "name": "Scheduled delete",
+        "prompt": "wait",
+        "session_id": sid,
+        "session_mode": "reuse",
+        "model": "",
+    }
+    entered = asyncio.Event()
+    events = []
+
+    async def blocked_turn(_sid, _model, _prompt, **kwargs):
+        scheduler._mark_current_run_activity_started()
+        activity_module.activity.start(
+            _sid,
+            summary=kwargs["activity_summary"],
+            kind="scheduled",
+            source_id=kwargs["activity_source_id"],
+            owner_id=kwargs["activity_owner_id"],
+        )
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(scheduler, "_run_sdk_task_turn", blocked_turn)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "start",
+        lambda activity_sid, **_kwargs:
+            events.append(("start", activity_sid)),
+    )
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda activity_sid, status, **_kwargs:
+            events.append(("finish", activity_sid, status)),
+    )
+
+    running = scheduler._track_task(
+        asyncio.create_task(scheduler._execute_task(task)),
+        task_id=task["id"],
+        session_id=sid,
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    def disk_purge(target_sid):
+        assert running.done()
+        assert scheduler._state["history"] == []
+        assert scheduler._state["unread_count"] == 0
+        events.append(("disk", target_sid))
+        return True
+
+    async def no_disconnect(_sid):
+        return None
+
+    monkeypatch.setattr(chat_mod, "disconnect_client", no_disconnect)
+    monkeypatch.setattr(chat_mod, "purge_session_storage", disk_purge)
+
+    assert await chat_mod.purge_session_storage_async(sid) is True
+    assert running.cancelled()
+    assert events[0] == ("start", sid)
+    assert events[-1] == ("disk", sid)
+    assert any(event == ("finish", sid, "cancelled") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_async_purge_joins_future_startup_cleanup_before_disk_delete(
+        chat_mod, monkeypatch):
+    """DELETE must join cleanup created only after cold startup is cancelled."""
+    from backend import activity as activity_module
+
+    sid = "00000000-0000-4000-8000-000000000044"
+    chat_mod.sess.register_session(
+        sid,
+        name="deleting cold startup",
+        model="claude-sonnet-4-6",
+    )
+    startup_entered = asyncio.Event()
+    finish_entered = asyncio.Event()
+    release_finish = asyncio.Event()
+    transitions = []
+
+    async def slow_get_client(*_args, **_kwargs):
+        startup_entered.set()
+        await asyncio.Event().wait()
+
+    async def no_watcher(_sid):
+        return None
+
+    async def no_disconnect(_sid):
+        return None
+
+    async def blocked_finish(activity_sid, broadcast, status):
+        if not broadcast.activity_started:
+            return
+        assert status == "cancelled"
+        finish_entered.set()
+        await release_finish.wait()
+        transitions.append(("finish", activity_sid))
+        broadcast.activity_started = False
+
+    def activity_start(
+        activity_sid, *, summary="", activity_source="", owner_id="",
+    ):
+        transitions.append(("start", activity_sid))
+
+    def disk_purge(target_sid):
+        assert target_sid == sid
+        assert transitions == [("start", sid), ("finish", sid)]
+        transitions.append(("disk", target_sid))
+        chat_mod.sess.delete_session(target_sid)
+        return True
+
+    monkeypatch.setattr(chat_mod, "get_client", slow_get_client)
+    monkeypatch.setattr(chat_mod, "_handoff_task_watcher", no_watcher)
+    monkeypatch.setattr(chat_mod, "disconnect_client", no_disconnect)
+    monkeypatch.setattr(chat_mod, "_finish_activity", blocked_finish)
+    monkeypatch.setattr(chat_mod, "purge_session_storage", disk_purge)
+    monkeypatch.setattr(activity_module.activity, "start", activity_start)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda _sid, _status, *, activity_source="", owner_id="": None,
+    )
+
+    start_task = asyncio.create_task(chat_mod._start_turn(sid, "delete me"))
+    await asyncio.wait_for(startup_entered.wait(), timeout=1)
+    broadcast = chat_mod._active_turns[sid]
+    assert broadcast.startup_owner_task is start_task
+
+    purge_task = asyncio.create_task(chat_mod.purge_session_storage_async(sid))
+    await asyncio.wait_for(finish_entered.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    # Disk deletion cannot overtake the late Activity cleanup created by the
+    # outer `_start_turn` owner after its nested SDK startup was cancelled.
+    assert not purge_task.done()
+    assert sid not in chat_mod._recent_turns
+    release_finish.set()
+
+    assert await asyncio.wait_for(purge_task, timeout=1) is True
+    assert await asyncio.wait_for(start_task, timeout=1) is broadcast
+    assert transitions == [("start", sid), ("finish", sid), ("disk", sid)]
+    assert broadcast.activity_started is False
+    assert sid not in chat_mod._active_turns
+    assert sid not in chat_mod._recent_turns
 
 
 @pytest.mark.asyncio
@@ -947,6 +1431,110 @@ def test_native_compact_rejects_success_without_token_drop(chat_mod, client, mon
     assert "did not decrease" in r.json()["detail"]
 
 
+def test_native_codex_compact_recovers_verified_no_shrink(
+    chat_mod, client, monkeypatch,
+):
+    sid = _make_compact_session(client)
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+    result = ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=sid,
+    )
+    fake = _FakeCompactClient(result, totals=(364_270, 364_270))
+    recovered_id = "004208ac-a47b-4b75-999b-d7b6b0e62aa0"
+    calls = []
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    async def fake_recover(target_sid, model, *, pre_tokens, context_limit):
+        calls.append((target_sid, model, pre_tokens, context_limit))
+        return {
+            "session": {
+                "id": recovered_id,
+                "session_id": recovered_id,
+                "name": "compact endpoint · recovery",
+                "model": model,
+            },
+            "stats": {"estimated_post_tokens": 24_000},
+        }
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_recover_context_session", fake_recover)
+
+    response = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["recovered"] is True
+    assert body["recovered_session"]["id"] == recovered_id
+    assert body["recovery_stats"]["estimated_post_tokens"] == 24_000
+    assert fake.queries == ["/compact"]
+    assert calls == [(
+        sid, "codex:gpt-5.6-sol", 364_270, 200_000,
+    )]
+
+
+def test_native_codex_compact_recovers_generic_context_exception(
+    chat_mod, client, monkeypatch,
+):
+    """A transport-level context rejection uses the same safe recovery path."""
+    sid = _make_compact_session(client)
+    chat_mod.sess.update_model(sid, "codex:gpt-5.6-sol")
+
+    class GenericContextClient(_FakeCompactClient):
+        async def query(self, prompt):
+            self.queries.append(prompt)
+            raise RuntimeError(
+                "API Error: 400 Your input exceeds the context window of this model"
+            )
+
+    fake = GenericContextClient(result=None, totals=(364_270,))
+    recovered_id = "f54e160e-2368-46f2-8d76-00499625f9de"
+    calls = []
+
+    async def fake_get_client(*_args, **_kwargs):
+        return fake
+
+    async def fake_recover(target_sid, model, *, pre_tokens, context_limit):
+        calls.append((target_sid, model, pre_tokens, context_limit))
+        return {
+            "session": {
+                "id": recovered_id,
+                "session_id": recovered_id,
+                "name": "compact endpoint · recovery",
+                "model": model,
+            },
+            "stats": {"estimated_post_tokens": 24_000},
+        }
+
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_recover_context_session", fake_recover)
+    monkeypatch.setitem(chat_mod._session_usage, sid, {
+        "context_used": 364_270,
+        "context_limit": 353_400,
+    })
+
+    response = client.post(
+        f"/api/chat/sessions/{sid}/native-compact",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["recovered"] is True
+    assert body["recovered_session"]["id"] == recovered_id
+    assert fake.queries == ["/compact"]
+    assert calls == [(
+        sid, "codex:gpt-5.6-sol", 364_270, 353_400,
+    )]
+
+
 def test_native_compact_total_timeout_covers_post_command_verification(
     chat_mod,
     client,
@@ -972,6 +1560,14 @@ def test_native_compact_total_timeout_covers_post_command_verification(
 
     original_env_int = chat_mod.env_int
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    disconnected = []
+
+    async def fake_disconnect(target_sid):
+        assert chat_mod._session_runtime_lock_for(target_sid).locked()
+        chat_mod._pending_runtime_rebuilds.discard(target_sid)
+        disconnected.append(target_sid)
+
+    monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
     monkeypatch.setattr(
         chat_mod,
         "env_int",
@@ -987,6 +1583,80 @@ def test_native_compact_total_timeout_covers_post_command_verification(
     )
     assert r.status_code == 504, r.text
     assert "timed out" in r.json()["detail"]
+    assert disconnected == [sid]
+
+
+@pytest.mark.asyncio
+async def test_native_compact_lock_wait_timeout_does_not_kill_holder(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    sid = _make_compact_session(client)
+    disconnected = []
+
+    async def fake_disconnect(target_sid):
+        disconnected.append(target_sid)
+
+    original_env_int = chat_mod.env_int
+    monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
+    monkeypatch.setattr(
+        chat_mod,
+        "env_int",
+        lambda name, default, **kwargs: (
+            0.02 if name == "MUSELAB_COMPACT_TIMEOUT_S"
+            else original_env_int(name, default, **kwargs)
+        ),
+    )
+
+    lock = chat_mod._session_runtime_lock_for(sid)
+    async with lock:
+        with pytest.raises(chat_mod.HTTPException) as exc_info:
+            await chat_mod.native_compact_session_api(sid)
+
+    assert exc_info.value.status_code == 504
+    assert disconnected == []
+
+
+@pytest.mark.asyncio
+async def test_native_compact_outer_timeout_cleans_before_unlock(
+    chat_mod,
+    client,
+    monkeypatch,
+):
+    sid = _make_compact_session(client)
+    disconnected = []
+    cleanup_finished = asyncio.Event()
+
+    async def stalled_compact(_sid):
+        await asyncio.Event().wait()
+
+    async def fake_disconnect(target_sid):
+        assert chat_mod._session_runtime_lock_for(target_sid).locked()
+        await asyncio.sleep(0.01)
+        chat_mod._pending_runtime_rebuilds.discard(target_sid)
+        disconnected.append(target_sid)
+        cleanup_finished.set()
+
+    original_env_int = chat_mod.env_int
+    monkeypatch.setattr(chat_mod, "_native_compact_session_locked", stalled_compact)
+    monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
+    monkeypatch.setattr(
+        chat_mod,
+        "env_int",
+        lambda name, default, **kwargs: (
+            0.02 if name == "MUSELAB_COMPACT_TIMEOUT_S"
+            else original_env_int(name, default, **kwargs)
+        ),
+    )
+
+    with pytest.raises(chat_mod.HTTPException) as exc_info:
+        await chat_mod.native_compact_session_api(sid)
+
+    assert exc_info.value.status_code == 504
+    assert cleanup_finished.is_set()
+    assert disconnected == [sid]
+    assert not chat_mod._session_runtime_lock_for(sid).locked()
 
 
 def test_native_compact_returns_after_verification_and_schedules_recount(

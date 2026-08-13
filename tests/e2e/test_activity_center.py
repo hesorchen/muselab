@@ -51,6 +51,199 @@ def test_memory_shortcut_opens_memory_settings_page(
     expect(page.locator(".memory-settings-section")).to_be_visible()
 
 
+def test_auto_ack_accepts_any_result_rendered_in_current_visible_turn(
+    page: Page, backend_url, auth_token,
+):
+    """Visible results are read; non-current completions remain notifications."""
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const directSid = 'activity-source-direct';
+          const otherSid = 'activity-source-other';
+          const directState = app._ensureTabState(directSid);
+          const otherState = app._ensureTabState(otherSid);
+          app.currentId = directSid;
+          app._residentTabIds = [directSid];
+          app._activateTabState(directSid);
+          const calls = [];
+          app.ackActivitySession = async (sid, retries) => {
+            calls.push({sid, retries});
+            return true;
+          };
+
+          const accepted = await app._ackViewedActivity(
+            directSid, directState, 3);
+          const queued = await app._ackViewedActivity(
+            directSid, directState, 3);
+          const background = await app._ackViewedActivity(
+            directSid, directState, 3);
+          const nonCurrent = app._ackViewedActivity(
+            otherSid, otherState, 3);
+
+          app.activity.events = [{
+            id: 'direct-row', session_id: directSid,
+            activity_source: 'direct', state: 'completed', read: false,
+          }];
+          await app.ackCurrentActivity(2);
+          app.activity.events = [{
+            id: 'queued-row', session_id: directSid,
+            activity_source: 'queued', state: 'completed', read: false,
+          }];
+          const currentQueued = await app.ackCurrentActivity(2);
+          return {
+            accepted, queued, background, nonCurrent, currentQueued, calls,
+          };
+        }"""
+    )
+
+    assert result["accepted"] is True
+    assert result["queued"] is True
+    assert result["background"] is True
+    assert result["nonCurrent"] is False
+    assert result["currentQueued"] is True
+    assert result["calls"] == [
+        {"sid": "activity-source-direct", "retries": 3},
+        {"sid": "activity-source-direct", "retries": 3},
+        {"sid": "activity-source-direct", "retries": 3},
+        {"sid": "activity-source-direct", "retries": 2},
+        {"sid": "activity-source-direct", "retries": 2},
+    ]
+
+
+def test_visible_completion_ack_wins_both_done_and_activity_sse_orders(
+    page: Page, backend_url, auth_token,
+):
+    """Independent chat/activity transports cannot revive a viewed unread row."""
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = 'activity-visible-race';
+          app._stopActivityEvents();
+          await Promise.allSettled(
+            Object.values(app._activityFetchPromises || {}));
+          app.currentId = sid;
+          app._residentTabIds = [sid];
+          const st = app._ensureTabState(sid);
+          st._loaded = true;
+          app._activateTabState(sid);
+
+          const realFetch = window.fetch;
+          const ackCalls = [];
+          let serverRead = false;
+          window.fetch = async (url, options) => {
+            if (String(url).includes('/api/activity/session/'
+                + encodeURIComponent(sid) + '/ack')) {
+              const changed = serverRead ? 0 : 1;
+              serverRead = true;
+              ackCalls.push(changed);
+              return new Response(JSON.stringify({
+                ok: true,
+                changed,
+                summary: {
+                  generation: 'ack-race-generation', revision: 3,
+                  running: 0, unread: 0, attention: 0,
+                  groups: {review: 0, running: 0, failed: 0, history: 1},
+                  group_unread: {
+                    review: 0, running: 0, failed: 0, history: 0,
+                  },
+                  workspaces: [],
+                },
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return realFetch(url, options);
+          };
+
+          const reset = () => {
+            app._activityGeneration = 'ack-race-generation';
+            app._activityRevision = 1;
+            app.activity.events = [{
+              id: 'race-row', session_id: sid, activity_source: 'direct',
+              state: 'running', read: true, updated_at: 1,
+            }];
+            app.activity.summary = {
+              generation: 'ack-race-generation', revision: 1,
+              running: 1, unread: 0, attention: 0,
+              groups: {review: 0, running: 1, failed: 0, history: 0},
+              group_unread: {
+                review: 0, running: 0, failed: 0, history: 0,
+              },
+              workspaces: [],
+            };
+          };
+          const terminalPayload = () => ({
+            generation: 'ack-race-generation', revision: 2,
+            item: {
+              id: 'race-row', session_id: sid, activity_source: 'direct',
+              state: 'completed', read: false, updated_at: 2,
+            },
+            summary: {
+              generation: 'ack-race-generation', revision: 2,
+              running: 0, unread: 1, attention: 0,
+              groups: {review: 1, running: 0, failed: 0, history: 0},
+              group_unread: {
+                review: 1, running: 0, failed: 0, history: 0,
+              },
+              workspaces: [{workspace: '/tmp', unread: 1, attention: 0}],
+            },
+          });
+
+          try {
+            // Activity SSE reaches the page just before chat done. Applying it
+            // must be read in the same frame, before its ACK round trip.
+            reset();
+            serverRead = false;
+            app._applyActivityUpdate(terminalPayload());
+            const activityFirstImmediate = {
+              state: app.activity.events[0].state,
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const activityFirstSettled = {
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+
+            // Chat done ACK succeeds first, then an already-buffered older
+            // read:false Activity frame arrives. It must still render the
+            // terminal state without reviving the notification.
+            reset();
+            serverRead = false;
+            await app.ackActivitySession(sid, 0);
+            app._applyActivityUpdate(terminalPayload());
+            const doneFirstImmediate = {
+              state: app.activity.events[0].state,
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const doneFirstSettled = {
+              read: app.activity.events[0].read,
+              unread: app.activity.summary.unread,
+            };
+            return {
+              activityFirstImmediate, activityFirstSettled,
+              doneFirstImmediate, doneFirstSettled, ackCalls,
+            };
+          } finally {
+            window.fetch = realFetch;
+          }
+        }"""
+    )
+
+    expected_immediate = {"state": "completed", "read": True, "unread": 0}
+    expected_settled = {"read": True, "unread": 0}
+    assert result["activityFirstImmediate"] == expected_immediate
+    assert result["activityFirstSettled"] == expected_settled
+    assert result["doneFirstImmediate"] == expected_immediate
+    assert result["doneFirstSettled"] == expected_settled
+    assert result["ackCalls"] == [1, 1, 0]
+
+
 def test_cached_activity_refresh_does_not_shift_rows_or_modal(
     page: Page, backend_url, auth_token,
 ):

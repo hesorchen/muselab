@@ -84,7 +84,12 @@ def _summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
 class ActivityService:
     """Keep one current activity row per conversation."""
 
-    def __init__(self, root: Path = ROOT):
+    def __init__(
+        self,
+        root: Path = ROOT,
+        *,
+        initialize_runtime_state: bool = True,
+    ):
         self.path = root / ".muselab" / "activity.json"
         self.groups_path = root / ".muselab" / "activity-groups.json"
         self.transaction_path = root / ".muselab" / "activity-transaction.json"
@@ -95,21 +100,67 @@ class ActivityService:
         self._subscribers: dict[
             asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop
         ] = {}
-        self._recover_group_event_transaction()
-        (self._custom_groups, self._group_assignments,
-         self._group_order) = self._load_group_state()
-        self._events = self._load()
-        changed = self._collapse_sessions()
-        changed = self._reconcile_event_groups() or changed
-        for item in self._events:
-            if item.get("state") in _ACTIVE:
-                now = time.time()
-                item.update(state="failed", status_detail="Interrupted by service restart",
-                            finished_at=now, updated_at=now,
-                            needs_attention=False, read=False)
-                changed = True
-        if changed:
-            self._save()
+        self._initialized = False
+        self._custom_groups: list[dict[str, str]] = []
+        self._group_assignments: dict[str, str] = {}
+        self._group_order: list[str] = [_UNGROUPED_GROUP_ID]
+        self._events: list[dict[str, Any]] = []
+        if initialize_runtime_state:
+            self.initialize_runtime_state()
+
+    def initialize_runtime_state(self) -> None:
+        """Load and reconcile the ledger exactly once, on first runtime use.
+
+        The module-level service defers this step so importing API routers during
+        test collection cannot read, rewrite, unlink or chmod the real ledger.
+        Production calls it from the lifespan; public methods keep a lazy
+        fallback for direct and TestClient use.
+        """
+        with self._lock:
+            if self._initialized:
+                return
+            self.ensure_private_storage()
+            self._recover_group_event_transaction()
+            (self._custom_groups, self._group_assignments,
+             self._group_order) = self._load_group_state()
+            self._events = self._load()
+            changed = self._collapse_sessions()
+            changed = self._reconcile_event_groups() or changed
+            for item in self._events:
+                if item.get("state") in _ACTIVE:
+                    now = time.time()
+                    item.update(
+                        state="failed",
+                        status_detail="Interrupted by service restart",
+                        finished_at=now,
+                        updated_at=now,
+                        needs_attention=False,
+                        read=False,
+                    )
+                    changed = True
+            if changed:
+                self._save()
+            # Mark initialization complete only after any reconciliation write
+            # succeeds.  A transient disk failure must leave the service
+            # retryable instead of pinning an unsaved in-memory view forever.
+            self._initialized = True
+
+    def ensure_private_storage(self) -> None:
+        """Keep task prompts and workspace paths private on shared hosts."""
+        storage_dir = self.path.parent
+        if storage_dir.is_symlink():
+            raise RuntimeError("activity storage directory must not be a symlink")
+        storage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        storage_dir.chmod(0o700)
+        for private_path in (
+            self.path, self.groups_path, self.transaction_path,
+        ):
+            if private_path.is_symlink():
+                raise RuntimeError(
+                    f"activity state must not be a symlink: {private_path.name}"
+                )
+            if private_path.exists():
+                private_path.chmod(0o600)
 
     @staticmethod
     def _group_name(value: Any) -> str:
@@ -142,14 +193,16 @@ class ActivityService:
         group_state = payload.get("group_state")
         if not isinstance(events, list) or not isinstance(group_state, dict):
             raise RuntimeError("invalid activity transaction")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.ensure_private_storage()
         atomic_write_text(
             self.groups_path,
             json.dumps(group_state, ensure_ascii=False, indent=2),
+            mode=0o600,
         )
         atomic_write_text(
             self.path,
             json.dumps(events[-_MAX_EVENTS:], ensure_ascii=False, indent=2),
+            mode=0o600,
         )
         self.transaction_path.unlink(missing_ok=True)
 
@@ -219,13 +272,13 @@ class ActivityService:
 
     def _save_group_state(self) -> None:
         self._ensure_writes_available()
-        self.groups_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ensure_private_storage()
         atomic_write_text(self.groups_path, json.dumps({
             "version": 2,
             "groups": self._custom_groups,
             "assignments": self._group_assignments,
             "order": self._group_order,
-        }, ensure_ascii=False, indent=2))
+        }, ensure_ascii=False, indent=2), mode=0o600)
 
     def _group_payload_locked(self) -> list[dict[str, str]]:
         return [dict(group) for group in self._custom_groups]
@@ -300,10 +353,11 @@ class ActivityService:
         self._group_event_transaction_active = True
         try:
             try:
-                self.transaction_path.parent.mkdir(parents=True, exist_ok=True)
+                self.ensure_private_storage()
                 atomic_write_text(
                     self.transaction_path,
                     json.dumps(transaction, ensure_ascii=False, indent=2),
+                    mode=0o600,
                 )
                 self._save_group_state()
                 self._save()
@@ -361,9 +415,10 @@ class ActivityService:
 
     def _save(self) -> None:
         self._ensure_writes_available()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.ensure_private_storage()
         atomic_write_text(self.path, json.dumps(
-            self._events[-_MAX_EVENTS:], ensure_ascii=False, indent=2))
+            self._events[-_MAX_EVENTS:], ensure_ascii=False, indent=2),
+            mode=0o600)
 
     @staticmethod
     def _enqueue_update(
@@ -427,6 +482,7 @@ class ActivityService:
         self,
     ) -> AsyncIterator[asyncio.Queue[dict[str, Any]]]:
         """Subscribe to future task transitions from the current event loop."""
+        self.initialize_runtime_state()
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
         loop = asyncio.get_running_loop()
         with self._lock:
@@ -439,11 +495,13 @@ class ActivityService:
 
     @property
     def revision(self) -> int:
+        self.initialize_runtime_state()
         with self._lock:
             return self._revision
 
     @property
     def generation(self) -> str:
+        self.initialize_runtime_state()
         with self._lock:
             return self._generation
 
@@ -483,7 +541,10 @@ class ActivityService:
         summary: str = "",
         kind: str = "turn",
         source_id: str = "",
+        activity_source: str = "",
+        owner_id: str = "",
     ) -> dict[str, Any]:
+        self.initialize_runtime_state()
         now = time.time()
         name, workspace, workspace_name = self._metadata(sid)
         with self._lock:
@@ -494,6 +555,14 @@ class ActivityService:
                 self._events.append(item)
             item.update(
                 kind=(kind or "turn")[:40],
+                # Chat turns use this delivery-class field to distinguish a
+                # reply the user is already watching from work that completed
+                # independently (durable queue / SDK background task).  Keep
+                # it on the ledger row so foreground boot/tab-switch ACKs do
+                # not have to infer the source from a transient SSE frame.
+                activity_source=(activity_source or (
+                    "direct" if (kind or "turn") == "turn" else kind
+                ))[:40],
                 workspace=workspace, workspace_name=workspace_name,
                 session_name=name, state="running",
                 task_summary=(summary or item.get("task_summary") or name)[:500],
@@ -506,12 +575,17 @@ class ActivityService:
                 item["source_id"] = source_id[:200]
             else:
                 item.pop("source_id", None)
+            if owner_id:
+                item["owner_id"] = owner_id[:200]
+            else:
+                item.pop("owner_id", None)
             self._events = self._events[-_MAX_EVENTS:]
             self._save()
             self._publish_locked(item=item)
             return dict(item)
 
     def set_state(self, sid: str, state: str, *, detail: str = "") -> dict[str, Any]:
+        self.initialize_runtime_state()
         if state not in _ACTIVE:
             raise ValueError("invalid activity state")
         with self._lock:
@@ -530,6 +604,7 @@ class ActivityService:
 
     def resume(self, sid: str) -> bool:
         """Resume only the currently waiting turn; never revive a terminal row."""
+        self.initialize_runtime_state()
         with self._lock:
             item = self._latest(sid)
             if item is None or item.get("state") not in {"waiting_approval", "paused"}:
@@ -540,17 +615,65 @@ class ActivityService:
             self._publish_locked(item=item)
             return True
 
-    def finish(self, sid: str, status: str) -> dict[str, Any]:
+    def finish(
+        self,
+        sid: str,
+        status: str,
+        *,
+        activity_source: str = "",
+        owner_id: str = "",
+    ) -> dict[str, Any]:
+        self.initialize_runtime_state()
         state = "completed" if status == "completed" else (
             "cancelled" if status in {"cancelled", "interrupted"} else "failed")
         with self._lock:
             item = self._latest(sid)
-        if item is None:
-            self.start(sid)
-        with self._lock:
-            item = self._latest(sid)
+            if item is None:
+                # A normal owner may only close the Activity incarnation it
+                # successfully started. If its start failed before persisting
+                # a row, synthesizing one here would create a ghost completed
+                # task. Ownerless deletion/repair remains authoritative and
+                # may create a terminal repair row when no ledger entry exists.
+                if owner_id:
+                    return {}
+                # RLock makes the synthesized start atomic with the owner
+                # check below. A concurrent newer start can only happen after
+                # this terminal write, never in the old check/start gap.
+                self.start(
+                    sid,
+                    activity_source=activity_source,
+                    owner_id=owner_id,
+                )
+                item = self._latest(sid)
             assert item is not None
+            # A detached watcher can finish after a newer foreground turn has
+            # reused this session row. Only the owner that started the current
+            # incarnation may close it; deletion intentionally omits owner_id
+            # to force a terminal state for whichever incarnation remains.
+            if owner_id and item.get("owner_id") != owner_id:
+                return dict(item)
+            owner_revoked = False
+            if not owner_id:
+                # Ownerless finish is reserved for explicit deletion/repair.
+                # Revoke the current incarnation so its late ordinary owner can
+                # no longer overwrite this authoritative terminal state.
+                owner_revoked = item.pop("owner_id", None) is not None
+            # Terminal delivery can be observed by more than one cleanup path
+            # (for example the Result boundary and an outer pump fallback).
+            # Repeating the same terminal state must be a true no-op: rewriting
+            # it would reset a user's read ACK, reorder the row, and emit a
+            # duplicate SSE revision. A different terminal state is still
+            # allowed to correct later authoritative information.
+            if item.get("state") == state and state in _TERMINAL:
+                if owner_revoked:
+                    # Persist only the ownership revocation. Do not change the
+                    # timestamp/read bit or publish another SSE revision: the
+                    # terminal state itself is still an idempotent no-op.
+                    self._save()
+                return dict(item)
             now = time.time()
+            if activity_source:
+                item["activity_source"] = activity_source[:40]
             item.update(state=state, finished_at=now, updated_at=now,
                         needs_attention=False, read=state == "cancelled",
                         status_detail={"completed": "Task completed",
@@ -561,11 +684,13 @@ class ActivityService:
             return dict(item)
 
     def list(self, limit: int = 100) -> list[dict[str, Any]]:
+        self.initialize_runtime_state()
         with self._lock:
             events = sorted(self._events, key=_activity_at, reverse=True)
             return [dict(x) for x in events[:min(max(limit, 1), _MAX_EVENTS)]]
 
     def summary(self) -> dict[str, Any]:
+        self.initialize_runtime_state()
         with self._lock:
             result = _summarize([dict(x) for x in self._events])
             result["generation"] = self._generation
@@ -574,6 +699,7 @@ class ActivityService:
 
     def snapshot(self, limit: int = 100) -> dict[str, Any]:
         """Return rows and counters from the same locked ledger snapshot."""
+        self.initialize_runtime_state()
         with self._lock:
             events = [dict(x) for x in self._events]
             custom_groups = self._group_payload_locked()
@@ -592,10 +718,12 @@ class ActivityService:
         }
 
     def list_groups(self) -> list[dict[str, str]]:
+        self.initialize_runtime_state()
         with self._lock:
             return self._group_payload_locked()
 
     def group_state(self) -> dict[str, Any]:
+        self.initialize_runtime_state()
         with self._lock:
             return {
                 "custom_groups": self._group_payload_locked(),
@@ -603,6 +731,7 @@ class ActivityService:
             }
 
     def create_group(self, name: str, color: str = "blue") -> dict[str, Any]:
+        self.initialize_runtime_state()
         clean_name = self._group_name(name)
         clean_color = self._group_color(color)
         with self._lock:
@@ -636,6 +765,7 @@ class ActivityService:
         name: str | None = None,
         color: str | None = None,
     ) -> dict[str, Any] | None:
+        self.initialize_runtime_state()
         with self._lock:
             group = next((row for row in self._custom_groups
                           if row["id"] == group_id), None)
@@ -665,6 +795,7 @@ class ActivityService:
             }
 
     def reorder_groups(self, group_ids: list[str]) -> dict[str, Any]:
+        self.initialize_runtime_state()
         with self._lock:
             custom_ids = [group["id"] for group in self._custom_groups]
             full_ids = custom_ids + [_UNGROUPED_GROUP_ID]
@@ -696,6 +827,7 @@ class ActivityService:
             }
 
     def delete_group(self, group_id: str) -> dict[str, Any] | None:
+        self.initialize_runtime_state()
         with self._lock:
             if not any(group["id"] == group_id for group in self._custom_groups):
                 return None
@@ -739,6 +871,7 @@ class ActivityService:
         *,
         before_event_id: str | None = None,
     ) -> dict[str, Any] | None:
+        self.initialize_runtime_state()
         target = str(group_id or "").strip()
         before = None if before_event_id is None else str(before_event_id or "").strip()
         with self._lock:
@@ -849,6 +982,7 @@ class ActivityService:
         open Activity Center converge immediately through its existing SSE
         connection.
         """
+        self.initialize_runtime_state()
         with self._lock:
             item = self._latest(sid)
             if item is None:
@@ -866,6 +1000,7 @@ class ActivityService:
 
     def set_pin(self, event_id: str, pinned: bool) -> dict[str, Any] | None:
         """Persist a pin and return the exact ledger revision it belongs to."""
+        self.initialize_runtime_state()
         with self._lock:
             item = next(
                 (row for row in self._events if row.get("id") == event_id),
@@ -885,6 +1020,7 @@ class ActivityService:
             }
 
     def ack(self, event_id: str | None = None, *, sid: str | None = None) -> int:
+        self.initialize_runtime_state()
         changed = 0
         acked_ids: list[str] = []
         with self._lock:
@@ -904,4 +1040,7 @@ class ActivityService:
         return changed
 
 
-activity = ActivityService()
+# Importing the API surface must stay read-only for hermetic test collection.
+# The application lifespan initializes it before accepting requests; public
+# methods retain a lazy fallback for direct and TestClient use.
+activity = ActivityService(initialize_runtime_state=False)

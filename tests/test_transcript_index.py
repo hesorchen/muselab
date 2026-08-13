@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -50,6 +51,51 @@ def _describe(entry: dict) -> dict:
         "tool_uses": tools,
         "task_notifications": notifications,
     }
+
+
+def test_transcript_index_writer_is_linearized_with_session_delete(
+    app_module, monkeypatch, tmp_path,
+):
+    """A cancelled worker must not recreate private index data after DELETE."""
+    from backend import chat as chat_mod
+
+    sid = "00000000-0000-4000-8000-000000000099"
+    transcript = tmp_path / f"{sid}.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    entered = threading.Event()
+    release = threading.Event()
+    delete_done = threading.Event()
+    calls: list[str] = []
+
+    monkeypatch.setattr(chat_mod, "_find_session_jsonl", lambda _sid: transcript)
+
+    def slow_index(*_args, **_kwargs):
+        calls.append("write")
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"records": [], "source": {}, "orders": {}, "bubble_prefix": {}}
+
+    monkeypatch.setattr(chat_mod.transcript_idx, "ensure_index", slow_index)
+
+    writer = threading.Thread(target=chat_mod._ensure_transcript_index, args=(sid,))
+    writer.start()
+    assert entered.wait(timeout=2)
+
+    def delete():
+        chat_mod.sess.begin_session_delete(sid)
+        delete_done.set()
+
+    deleter = threading.Thread(target=delete)
+    deleter.start()
+    assert not delete_done.wait(timeout=0.05)
+    release.set()
+    writer.join(timeout=2)
+    deleter.join(timeout=2)
+    assert delete_done.is_set()
+
+    # Once DELETE owns the tombstone, a late/cancelled worker is a no-op.
+    assert chat_mod._ensure_transcript_index(sid) is None
+    assert calls == ["write"]
 
 
 def test_incremental_append_partial_malformed_and_replace(tmp_path):
@@ -701,6 +747,173 @@ def test_reload_footer_moves_cancel_annotation_to_actual_tool_result_tail(
     assert tail["ts"] == 1_786_102_446_000
     assert tail["elapsed"] == 6.0
     assert tail["model"] == "codex:gpt-5.6-sol"
+
+
+def test_tail_inherits_memory_footer_from_annotation_outside_window(
+    client, auth, app_module, tmp_path,
+):
+    """A long tool turn keeps its footer when the assistant donor is paged out."""
+    from backend import chat as chat_mod
+
+    entries = [
+        _entry("u1", "user", "run a long tool chain",
+               timestamp="2026-08-07T12:00:00Z"),
+        _entry("a1", "assistant", [{
+            "type": "tool_use", "id": "toolu_0", "name": "Read",
+            "input": {"file_path": "/tmp/0"},
+        }], "u1", timestamp="2026-08-07T12:00:01Z"),
+    ]
+    parent = "a1"
+    for index in range(100):
+        uid = f"tr{index}"
+        entries.append(_entry(uid, "user", [{
+            "type": "tool_result",
+            "tool_use_id": f"toolu_{index}",
+            "content": f"result {index}",
+        }], parent, timestamp=f"2026-08-07T12:01:{index % 60:02d}Z"))
+        parent = uid
+
+    sid, _ = _make_endpoint_session(client, auth, chat_mod, tmp_path, entries)
+    recall = {
+        "id": "recall-outside-window",
+        "count": 2,
+        "latency_ms": 7,
+        "status": "ok",
+        "items": [{"id": "memory-1", "kind": "fact"}],
+    }
+    chat_mod.sess.set_message_annotation(
+        sid,
+        "a1",
+        model="codex:gpt-5.6-sol",
+        ts=1_786_104_099_000,
+        turn_status="completed",
+        elapsed_s=99.0,
+        memory_recall=recall,
+    )
+
+    tail_response = client.get(
+        f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 1})
+    assert tail_response.status_code == 200, tail_response.text
+    tail = tail_response.json()["messages"][0]
+    assert tail["uuid"] == "tr99"
+    assert tail["turn_status"] == "completed"
+    assert tail["ts"] == 1_786_104_099_000
+    assert tail["elapsed"] == 99.0
+    assert tail["model"] == "codex:gpt-5.6-sol"
+    assert tail["memoryRecall"] == recall
+
+    # A page in the middle of this same turn is not a terminal boundary and
+    # must not grow a misleading completion footer merely because a donor
+    # exists elsewhere in the index.
+    middle_response = client.get(
+        f"/api/chat/sessions/{sid}",
+        headers=auth,
+        params={"offset": 50, "limit": 1},
+    )
+    assert middle_response.status_code == 200, middle_response.text
+    middle = middle_response.json()["messages"][0]
+    assert middle["uuid"] != "tr99"
+    assert "turn_status" not in middle
+    assert "memoryRecall" not in middle
+
+
+def test_failed_snapshot_does_not_hide_later_legacy_resend(
+    client, auth, app_module, tmp_path,
+):
+    """A UUID-less failed turn must fail closed on no-timestamp legacy rows."""
+    from backend import chat as chat_mod
+
+    initial = [
+        _entry("u0", "user", "before"),
+        _entry("a0", "assistant", "before answer", "u0"),
+    ]
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, initial)
+    _, boundary = chat_mod._turn_transcript_boundary(
+        sid, "claude-sonnet-4-6")
+    bc = chat_mod.TurnBroadcast(sid, model="codex:gpt-5.6-sol")
+    bc.user_text = "same prompt"
+    bc.started_at = 1_704_067_201.0
+    bc.transcript_boundary = boundary
+    try:
+        assert chat_mod._persist_failed_turn_snapshot(
+            bc,
+            "API Error: context window exceeded",
+            terminal_at_ms=1_704_067_202_000,
+            elapsed_s=1.0,
+            canonical_terminal_published=True,
+        ) is True
+        snapshot_path = chat_mod._cancelled_turn_snapshot_path(sid, bc.turn_id)
+        assert snapshot_path is not None and snapshot_path.exists()
+
+        # The failed request wrote no user row. A later retry uses an old
+        # transcript shape with no timestamp; it must remain visible/successful.
+        _append(
+            transcript,
+            _entry("u-resend", "user", "same prompt", "a0"),
+            _entry("a-resend", "assistant", "successful resend", "u-resend"),
+        )
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 20})
+        assert response.status_code == 200, response.text
+        messages = response.json()["messages"]
+        assert any(item.get("uuid") == "u-resend" for item in messages)
+        resend = next(item for item in messages
+                      if item.get("uuid") == "a-resend")
+        assert resend["turn_status"] == "completed"
+        assert "a-resend" not in chat_mod.sess.get_message_annotations(sid)
+        assert snapshot_path.exists()
+    finally:
+        bc.close()
+
+
+def test_failed_snapshot_does_not_hide_immediate_timestamped_resend(
+    client, auth, app_module, tmp_path,
+):
+    """A prompt sent just after a failure is a new turn, even within 250 ms."""
+    from backend import chat as chat_mod
+
+    initial = [
+        _entry("u0", "user", "before", timestamp="2024-01-01T00:00:00Z"),
+        _entry("a0", "assistant", "before answer", "u0",
+               timestamp="2024-01-01T00:00:00.500Z"),
+    ]
+    sid, transcript = _make_endpoint_session(
+        client, auth, chat_mod, tmp_path, initial)
+    _, boundary = chat_mod._turn_transcript_boundary(
+        sid, "claude-sonnet-4-6")
+    bc = chat_mod.TurnBroadcast(sid, model="codex:gpt-5.6-sol")
+    bc.user_text = "same prompt"
+    bc.started_at = 1_704_067_201.0
+    try:
+        assert chat_mod._persist_failed_turn_snapshot(
+            bc,
+            "API Error: context window exceeded",
+            terminal_at_ms=1_704_067_202_000,
+            elapsed_s=1.0,
+            canonical_terminal_published=True,
+        ) is True
+
+        # The failed request wrote no user row. The user's retry begins 100 ms
+        # after the error and must remain a separate successful turn.
+        _append(
+            transcript,
+            _entry("u-resend", "user", "same prompt", "a0",
+                   timestamp="2024-01-01T00:00:02.100Z"),
+            _entry("a-resend", "assistant", "successful resend", "u-resend",
+                   timestamp="2024-01-01T00:00:02.500Z"),
+        )
+        response = client.get(
+            f"/api/chat/sessions/{sid}", headers=auth, params={"tail": 20})
+        assert response.status_code == 200, response.text
+        messages = response.json()["messages"]
+        assert any(item.get("uuid") == "u-resend" for item in messages)
+        resend = next(item for item in messages
+                      if item.get("uuid") == "a-resend")
+        assert resend["turn_status"] == "completed"
+        assert "a-resend" not in chat_mod.sess.get_message_annotations(sid)
+    finally:
+        bc.close()
 
 
 def test_reload_footer_exposes_four_fields_for_active_canonical_tail(
