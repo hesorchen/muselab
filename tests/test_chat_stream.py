@@ -3155,9 +3155,9 @@ def test_preflight_compact_trusts_the_token_count_over_the_verdict(
     assert len(fake.queried) == 2
 
 
-def test_preflight_does_not_steal_background_watchers_sdk_stream(
+def test_preflight_queues_while_background_watcher_owns_sdk_stream(
         stream_env, client, monkeypatch):
-    """Slash-command compaction must not consume task lifecycle messages."""
+    """Neither compact nor a prompt may cross a watcher's response boundary."""
     chat_mod = stream_env
     sid = _make_session(client)
     answer = [
@@ -3197,9 +3197,11 @@ def test_preflight_does_not_steal_background_watchers_sdk_stream(
     )
     events = _parse_sse(response.text)
 
-    assert fake.queried == ["send-once"]
+    assert fake.queried == []
     assert not [event for event, _data in events if event == "compact_progress"]
-    assert not [event for event, _data in events if event == "error"]
+    busy = [json.loads(data) for event, data in events if event == "error"]
+    assert busy and busy[-1]["kind"] == "turn_busy"
+    assert busy[-1]["cta"] == "queue"
 
 
 def test_codex_preflight_rebuilds_stalled_runtime_and_retries_once(
@@ -3277,12 +3279,11 @@ def test_codex_preflight_rebuilds_stalled_runtime_and_retries_once(
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
     monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
     monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _model: True)
+    capability = chat_mod._capability_from_model_item(
+        {"max_input_tokens": 320_000}, source="test")
     monkeypatch.setattr(
         chat_mod, "_detect_gateway_context_capability",
-        lambda _model: asyncio.sleep(0, result={
-            "max_input_tokens": 320_000,
-            "effective_context_window_percent": 100,
-        }),
+        lambda _model: asyncio.sleep(0, result=capability),
     )
 
     result = client.get(
@@ -3356,9 +3357,11 @@ def test_codex_preflight_fresh_runtime_retries_compact_once_when_still_full(
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
     monkeypatch.setattr(chat_mod, "disconnect_client", fake_disconnect)
     monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    capability = chat_mod._capability_from_model_item(
+        {"max_input_tokens": 320_000}, source="test")
     monkeypatch.setattr(
         chat_mod, "_detect_gateway_context_capability",
-        lambda _m: asyncio.sleep(0, result={"max_input_tokens": 320_000}),
+        lambda _m: asyncio.sleep(0, result=capability),
     )
 
     response = client.get(
@@ -3577,9 +3580,11 @@ def test_codex_preflight_context_tail_skips_pointless_second_compact(
         chat_mod, "_heal_unreachable_locked_model",
         lambda _sid, locked, _requested: locked,
     )
+    capability = chat_mod._capability_from_model_item(
+        {"max_input_tokens": 372_000}, source="test")
     monkeypatch.setattr(
         chat_mod, "_detect_gateway_context_capability",
-        lambda _m: asyncio.sleep(0, result={"max_input_tokens": 372_000}),
+        lambda _m: asyncio.sleep(0, result=capability),
     )
     monkeypatch.setattr(
         chat_mod, "_compact_tail_outcome",
@@ -3600,7 +3605,7 @@ def test_codex_preflight_context_tail_skips_pointless_second_compact(
 
     assert len(get_calls) == 1
     assert stale.queried == ["/compact"]
-    assert recovery_calls == [(sid, 364_270, 353_400)]
+    assert recovery_calls == [(sid, 364_270, 372_000)]
     assert error["recovered_session"]["id"] == recovered_id
     assert error["activity_source"] == "direct"
 
@@ -3731,9 +3736,11 @@ def test_codex_preflight_fresh_probe_recovers_after_stale_measurement_failure(
     monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
     monkeypatch.setattr(chat_mod, "disconnect_client", lambda _sid: asyncio.sleep(0))
     monkeypatch.setattr(chat_mod, "_is_codex_gateway_model", lambda _m: True)
+    capability = chat_mod._capability_from_model_item(
+        {"max_input_tokens": 320_000}, source="test")
     monkeypatch.setattr(
         chat_mod, "_detect_gateway_context_capability",
-        lambda _m: asyncio.sleep(0, result={"max_input_tokens": 320_000}),
+        lambda _m: asyncio.sleep(0, result=capability),
     )
 
     response = client.get(

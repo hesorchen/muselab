@@ -1890,7 +1890,7 @@ def test_stop_control_interrupts_session_and_never_removes_queue_items():
     assert "this.isTabStreaming(this.currentId)" in app
 
 
-def test_background_task_gap_stops_footer_without_blocking_composer():
+def test_background_task_gap_stops_footer_and_routes_composer_to_queue():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
@@ -1898,12 +1898,12 @@ def test_background_task_gap_stops_footer_without_blocking_composer():
 
     assert "backgroundActive: false" in app
     assert "backgroundTaskCount: 0" in app
-    # A pending background task keeps its card alive but must NOT keep the
-    # completed turn's footer timer or make the composer busy: the backend pump
-    # owns the session stream now, so task completion arrives independently.
+    # A pending background task keeps its card alive without extending the
+    # completed turn's footer timer. The composer remains editable, but send()
+    # detects the watcher and persists the message in FIFO until it settles.
     assert "|| (st && st.compacting));" in app
     assert "if (st && (st.streaming || st.compacting)) return true;" in app
-    assert "if (status.background) return false;" in app
+    assert "if (status.background) return true;" in app
     assert "d.background && d.attachable === false" in app
     assert "background_tasks_pending" in app
     assert "_stopTimer();" in app
