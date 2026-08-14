@@ -7,6 +7,8 @@ import contextlib
 import errno
 import json
 import os
+import sys
+import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -66,6 +68,7 @@ class _WatchState:
     needs_closing_reconcile: bool = False
     reconcile_pending: bool = False
     reconcile_running: bool = False
+    scan_cancel: threading.Event = field(default_factory=threading.Event)
     stop_task: asyncio.Task[None] | None = None
 
 
@@ -292,6 +295,29 @@ class FileWatchManager:
             self._started = True
         try:
             await asyncio.to_thread(self.store.initialize)
+            try:
+                maintenance = await asyncio.to_thread(
+                    self.store.maintain_database
+                )
+                if maintenance["action"] != "none":
+                    before = maintenance["before"]
+                    after = maintenance["after"]
+                    sys.stderr.write(
+                        "[files] workspace index maintenance "
+                        f"action={maintenance['action']} "
+                        f"free_pages={before['freelist_count']}->"
+                        f"{after['freelist_count']} "
+                        f"duration_ms={maintenance['duration_ms']}\n"
+                    )
+                    sys.stderr.flush()
+            except Exception as exc:
+                # Indexing remains available when optional compaction cannot
+                # acquire a lock or the filesystem has no temporary headroom.
+                sys.stderr.write(
+                    "[files] workspace index maintenance skipped "
+                    f"({type(exc).__name__})\n"
+                )
+                sys.stderr.flush()
             for entry in registry.list():
                 await asyncio.to_thread(
                     self.store.register_workspace,
@@ -513,6 +539,7 @@ class FileWatchManager:
                     and not state.reconcile_task.done()
                 ):
                     reconcile_task = state.reconcile_task
+                    state.scan_cancel.set()
                 state.reconcile_pending = False
                 state.reconcile_task = None
                 state.stop_task = None
@@ -807,6 +834,7 @@ class FileWatchManager:
                         state.root,
                         state.name,
                         primary=state.primary,
+                        cancel_event=state.scan_cancel,
                     )
                     # Only the expensive full scan is globally serialized.
                     # Retain the per-workspace mutation lock through delta so
@@ -1040,17 +1068,21 @@ class FileWatchManager:
             self._states.clear()
             self._idle_watchers.clear()
             self._started = False
+            reconcile_tasks: list[asyncio.Task[None]] = []
             tasks = [
                 task
                 for state in states
                 for task in (
                     self._detach_watcher_locked(state),
-                    state.reconcile_task,
                     state.stop_task,
                 )
                 if task is not None
             ]
             for state in states:
+                state.scan_cancel.set()
+                if (state.reconcile_task is not None
+                        and not state.reconcile_task.done()):
+                    reconcile_tasks.append(state.reconcile_task)
                 self._close_subscribers(state)
                 state.reconcile_task = None
                 state.stop_task = None
@@ -1058,7 +1090,19 @@ class FileWatchManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.to_thread(self.store.close)
+        # Do not cancel an outer to_thread await: cancellation would detach the
+        # Python worker and let it keep scanning against a store we immediately
+        # close. The cooperative event makes ordinary scans unwind promptly;
+        # runtime_lifecycle still owns the hard shutdown budget for a blocked
+        # kernel/network filesystem call.
+        try:
+            if reconcile_tasks:
+                await asyncio.gather(*reconcile_tasks, return_exceptions=True)
+        finally:
+            # close() only resets lazy state and uses a short RLock section.
+            # Run it synchronously in finally so an outer lifecycle deadline
+            # cannot cancel the to_thread wrapper before this invariant lands.
+            self.store.close()
 
 
 manager = FileWatchManager()

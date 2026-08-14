@@ -1582,34 +1582,39 @@
         <!-- History picker — leftmost slot so it's the first thing the
              eye hits on the top bar. Click opens the all-sessions picker
              (search + grouped list); click a row to open it as a tab. -->
-        <div class="session-picker chat-tab-history" @click.outside="sessionPickerOpen = false">
-          <button class="chat-tab-history-btn" @click="toggleHistoryPicker($event)" type="button"
+        <div class="session-picker chat-tab-history" @click.outside="closeHistoryPicker(false)">
+          <button id="history-picker-trigger" class="chat-tab-history-btn"
+                  @click="toggleHistoryPicker($event)" type="button"
+                  aria-haspopup="dialog" aria-controls="history-picker-pop"
+                  :aria-expanded="sessionPickerOpen"
+                  :aria-label="lang==='zh' ? '历史会话' : 'Session history'"
                   :title="lang==='zh' ? '历史会话' : 'Session history'">
             <svg><use href="#i-history"/></svg>
           </button>
           <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
+               id="history-picker-pop"
                class="session-picker-pop"
                :style="historyPickerStyle"
-               role="listbox">
+               role="dialog"
+               :aria-label="lang==='zh' ? '历史会话选择器' : 'Session history picker'"
+               @keydown.escape="if (!_isImeComposingEvent($event)) { $event.stopPropagation(); $event.preventDefault(); closeHistoryPicker(); }">
             <input class="session-picker-search"
                    type="text"
                    x-model="sessionPickerSearch"
                    x-ref="sessionPickerSearchInput"
                    :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
-                   @input.debounce.300ms="_searchSessions()"
-                   @keydown.escape="sessionPickerOpen = false" />
+                   @input.debounce.300ms="_searchSessions()" />
             <template x-for="g in groupedFilteredSessions()" :key="g.key">
               <div class="session-picker-group">
                 <div class="session-picker-group-label" x-text="g.label + (g.hiddenCount > 0 ? ' (' + g.items.length + ')' : '')"></div>
                 <template x-for="s in g.visibleItems" :key="s.id">
                   <div class="session-picker-row"
                        :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
-                       @click="pickerOpenSession(s.id)"
                        @mouseenter="prefetchSession(s.id)"
-                       @contextmenu.prevent="pickerRowMenu($event, s.id)"
-                       role="option">
+                       @contextmenu.prevent="pickerRowMenu($event, s.id)">
                     <button class="session-picker-pin"
                             :class="{ active: s.pinned }"
+                            x-show="renamingPickerSid !== s.id"
                             @click.stop="togglePinSession(s.id)"
                             :title="s.pinned ? (lang==='zh'?'取消置顶':'Unpin') : (lang==='zh'?'置顶':'Pin to top')">
                       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
@@ -1626,19 +1631,23 @@
                          the original user-gesture context (iOS Safari only
                          shows the on-screen keyboard for focus() inside the
                          same synchronous tick as the click). -->
-                    <!-- Streaming / unread dots — mirrors tab-strip behavior -->
-                    <span class="chat-tab-stream-dot picker-status-dot"
-                          :class="{ 'is-background': isTabBackgroundActive(s.id) }"
-                          x-show="renamingPickerSid !== s.id && isTabRunning(s.id)"
-                          :title="isTabBackgroundActive(s.id)
-                            ? t('chat.background_running')
-                            : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
-                    <span class="chat-tab-unread-dot picker-status-dot"
-                          x-show="renamingPickerSid !== s.id && isTabUnread(s.id)"
-                          :title="lang==='zh' ? '有新回复' : 'New reply ready'"></span>
-                    <span class="ellipsis"
-                          x-show="renamingPickerSid !== s.id"
-                          x-text="s.name"></span>
+                    <button class="session-picker-open" type="button"
+                            x-show="renamingPickerSid !== s.id"
+                            @click="pickerOpenSession(s.id)"
+                            :aria-current="s.id === currentId ? 'page' : null"
+                            :title="(lang==='zh' ? '打开会话：' : 'Open session: ') + s.name">
+                      <!-- Streaming / unread dots — mirrors tab-strip behavior -->
+                      <span class="chat-tab-stream-dot picker-status-dot"
+                            :class="{ 'is-background': isTabBackgroundActive(s.id) }"
+                            x-show="isTabRunning(s.id)"
+                            :title="isTabBackgroundActive(s.id)
+                              ? t('chat.background_running')
+                              : (lang==='zh' ? '正在生成…' : 'Streaming…')"></span>
+                      <span class="chat-tab-unread-dot picker-status-dot"
+                            x-show="isTabUnread(s.id)"
+                            :title="lang==='zh' ? '有新回复' : 'New reply ready'"></span>
+                      <span class="ellipsis" x-text="s.name"></span>
+                    </button>
                     <button class="session-picker-rename"
                             x-show="renamingPickerSid !== s.id"
                             @click="pickerStartInlineRename($event, s.id)"
@@ -2828,8 +2837,22 @@
                      )">
                 <span class="turn-status"
                       x-show="turnFooterStatus(m, pane)"
-                      :class="turnFooterStatus(m, pane)"
-                      x-text="turnStatusLabel(turnFooterStatus(m, pane))"></span>
+                      :class="[turnFooterStatus(m, pane), {
+                        'background-pending': turnHasPendingBackground(
+                          m, pane, i === paneMsgs.length - 1)
+                      }]">
+                  <span x-text="turnHasPendingBackground(
+                                  m, pane, i === paneMsgs.length - 1)
+                                ? t('chat.main_response_completed')
+                                : turnStatusLabel(turnFooterStatus(m, pane))"></span>
+                  <span class="turn-background-running"
+                        x-show="turnHasPendingBackground(
+                          m, pane, i === paneMsgs.length - 1)"
+                        x-text="' · ' + t('chat.background_running_count', {
+                          count: _backgroundTaskCount(pane),
+                          n: _backgroundTaskCount(pane)
+                        })"></span>
+                </span>
                 <!-- Old transcripts may predate completion annotations.  Their
                      last record still carries mts, which is a close and stable
                      fallback instead of rendering a separator with no time. -->
@@ -3565,15 +3588,23 @@
                  shows while streaming. Same shape + size + fill — they
                  read as a sibling pair (blue send / red stop). -->
             <button @click="send()"
-                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._stopping || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingQuotes.length && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="workspaceSwitching || !availableModels.length || tabState[currentId]?._stopping || tabState[currentId]?._composerSubmitting || tabState[currentId]?._permissionChangePending || runtimeSettingsPending() || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingQuotes.length && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
-                    :aria-label="tabState[currentId]?._stopping
+                    :aria-busy="!!tabState[currentId]?._composerSubmitting"
+                    :aria-label="tabState[currentId]?._composerSubmitting
+                      ? (lang==='zh' ? '正在发送' : 'Sending')
+                      : tabState[currentId]?._stopping
                       ? (lang==='zh' ? '正在中断' : 'Stopping')
-                      : (_isBusy(currentId) ? t('queue.button_hint') : t('btn.send'))"
-                    :title="tabState[currentId]?._stopping
+                      : sendButtonHint(currentId)"
+                    :title="tabState[currentId]?._composerSubmitting
+                      ? (lang==='zh' ? '正在提交消息' : 'Submitting message')
+                      : tabState[currentId]?._stopping
                       ? (lang==='zh' ? '等待上一条任务完成中断' : 'Waiting for the previous turn to stop')
-                      : (_isBusy(currentId) ? t('queue.button_hint') : t('btn.send'))">
-              <span class="icon"><svg><use href="#i-send"/></svg></span>
+                      : sendButtonHint(currentId)">
+              <span class="spinner-sm"
+                    x-show="tabState[currentId]?._composerSubmitting"></span>
+              <span class="icon"
+                    x-show="!tabState[currentId]?._composerSubmitting"><svg><use href="#i-send"/></svg></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
@@ -3838,8 +3869,8 @@
        x-show="imageGen.show"
        x-cloak
        @click.self="closeImageGen()">
-    <div class="modal image-gen-modal"
-         @keydown.escape.window="closeImageGen()"
+    <div class="modal image-gen-modal" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'image-gen')"
          role="dialog" aria-modal="true"
          :aria-label="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
       <div class="modal-head">
@@ -4064,7 +4095,8 @@
 
   <!-- ============ Settings Modal ============ -->
   <div class="modal-backdrop" x-show="settings.show" @click.self="settings.show=false">
-    <div class="modal settings-modal" @keydown.escape.window="settings.show=false"
+    <div class="modal settings-modal" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'settings')"
          role="dialog" aria-modal="true" :aria-label="t('set.title')">
       <div class="modal-head">
         <span class="modal-title">
@@ -4084,20 +4116,26 @@
              current tab on desktop. -->
         <ul class="settings-menu"
             x-show="isWideScreen || !settings.activePage">
-          <li class="settings-menu-item" @click="settings.activePage='lang'"
-              :class="{ active: settings.activePage==='lang' }">
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='lang'"
+                      :class="{ active: settings.activePage==='lang' }"
+                      :aria-current="settings.activePage==='lang' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-globe"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='provider'"
-              :class="{ active: settings.activePage==='provider' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='provider'"
+                      :class="{ active: settings.activePage==='provider' }"
+                      :aria-current="settings.activePage==='provider' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-key"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='memory'; loadMemorySettings()"
-              :class="{ active: settings.activePage==='memory' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='memory'; loadMemorySettings()"
+                      :class="{ active: settings.activePage==='memory' }"
+                      :aria-current="settings.activePage==='memory' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-brain"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '记忆' : 'Memory'"></span>
@@ -4105,52 +4143,65 @@
                   x-show="settings.memory.status?.pending_artifacts"
                   x-text="settings.memory.status?.pending_artifacts || ''"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='appearance'"
-              :class="{ active: settings.activePage==='appearance' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='appearance'"
+                      :class="{ active: settings.activePage==='appearance' }"
+                      :aria-current="settings.activePage==='appearance' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-palette"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.appearance')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='notification'"
-              :class="{ active: settings.activePage==='notification' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='notification'"
+                      :class="{ active: settings.activePage==='notification' }"
+                      :aria-current="settings.activePage==='notification' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-bell"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '通知' : 'Notifications'"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='defaults'"
-              :class="{ active: settings.activePage==='defaults' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='defaults'"
+                      :class="{ active: settings.activePage==='defaults' }"
+                      :aria-current="settings.activePage==='defaults' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-settings"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='skills'"
-              :class="{ active: settings.activePage==='skills' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='skills'"
+                      :class="{ active: settings.activePage==='skills' }"
+                      :aria-current="settings.activePage==='skills' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-puzzle"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='mcp'"
-              :class="{ active: settings.activePage==='mcp' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='mcp'"
+                      :class="{ active: settings.activePage==='mcp' }"
+                      :aria-current="settings.activePage==='mcp' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-plug"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.mcp')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item" @click="settings.activePage='versions'"
-              :class="{ active: settings.activePage==='versions' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='versions'"
+                      :class="{ active: settings.activePage==='versions' }"
+                      :aria-current="settings.activePage==='versions' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
             <span class="settings-menu-title"
                   x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
-          <li class="settings-menu-item"
-              @click="settings.activePage='cost'; loadCostDashboard();"
-              :class="{ active: settings.activePage==='cost' }">
+          </button></li>
+          <li><button type="button" class="settings-menu-item"
+                      @click="settings.activePage='cost'; loadCostDashboard();"
+                      :class="{ active: settings.activePage==='cost' }"
+                      :aria-current="settings.activePage==='cost' ? 'page' : null">
             <span class="settings-menu-icon"><svg><use href="#i-dollar"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.cost')"></span>
             <span class="settings-menu-chevron">›</span>
-          </li>
+          </button></li>
         </ul>
 
         <!-- Content pane: holds the back button (mobile) + every section.
@@ -5302,9 +5353,10 @@
        shortcuts so users discover them without reading the README. -->
   <div class="modal-backdrop" x-show="cheatSheet.show"
        @click.self="cheatSheet.show=false">
-    <div class="modal cheatsheet-modal"
-         @keydown.escape.window="cheatSheet.show=false"
-         role="dialog" aria-modal="true">
+    <div class="modal cheatsheet-modal" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'cheatsheet')"
+         role="dialog" aria-modal="true"
+         :aria-label="lang==='zh' ? '键盘快捷键' : 'Keyboard shortcuts'">
       <div class="modal-head">
         <span class="modal-title">⌨ <span x-text="lang==='zh' ? '键盘快捷键' : 'Keyboard shortcuts'"></span></span>
         <button class="modal-close" @click="cheatSheet.show=false"
@@ -5504,8 +5556,8 @@
        x-show="workspaceBrowser.show" x-cloak
        x-transition.opacity.duration.120ms
        @click.self="closeWorkspaceBrowser()">
-    <div class="modal workspace-browser-modal"
-         @keydown.escape.window="workspaceBrowser.show && !modal.show && closeWorkspaceBrowser()"
+    <div class="modal workspace-browser-modal" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'workspace-browser')"
          role="dialog" aria-modal="true"
          :aria-label="lang==='zh' ? '选择工作目录' : 'Select workspace folder'">
       <div class="modal-head">
@@ -5592,8 +5644,10 @@
   <div class="modal-backdrop" x-show="claudeAuthModal.open"
        @click.self="closeClaudeAuthModal()"
        x-transition.opacity.duration.120ms>
-    <div class="modal claude-auth-modal" @keydown.escape.window="closeClaudeAuthModal()"
-         role="dialog" aria-modal="true">
+    <div class="modal claude-auth-modal" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'claude-auth')"
+         role="dialog" aria-modal="true"
+         :aria-label="t('claude_auth.modal_title')">
       <div class="modal-head">
         <span class="modal-title" x-text="t('claude_auth.modal_title')"></span>
         <button class="modal-close" @click="closeClaudeAuthModal()"
@@ -5638,10 +5692,12 @@
   </div>
 
   <div class="modal-backdrop confirm-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
-    <div class="modal confirm-modal" @keydown.escape.window="modal.cancel && modal.cancel()"
-         role="alertdialog" aria-modal="true">
+    <div class="modal confirm-modal" role="alertdialog" aria-modal="true"
+         aria-labelledby="generic-modal-title"
+         tabindex="-1" @keydown.tab="trapDialogFocus($event, 'generic-modal')"
+         >
       <div class="modal-head">
-        <span class="modal-title" x-text="modal.title"></span>
+        <span class="modal-title" id="generic-modal-title" x-text="modal.title"></span>
         <button class="modal-close" @click="modal.cancel && modal.cancel()"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>
@@ -5679,8 +5735,10 @@
   <div class="modal-backdrop" x-show="trash.modalOpen"
        @click.self="closeTrashModal()"
        x-transition.opacity.duration.120ms>
-    <div class="modal trash-modal" @keydown.escape.window="closeTrashModal()"
-         role="dialog" aria-modal="true">
+    <div class="modal trash-modal" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'trash')"
+         role="dialog" aria-modal="true"
+         :aria-label="lang==='zh' ? '垃圾桶' : 'Trash'">
       <div class="modal-head">
         <span class="modal-title">
           <span class="icon" style="display:inline-flex;width:18px;height:18px;vertical-align:-3px;"><svg><use href="#i-trash"/></svg></span>
@@ -5777,9 +5835,10 @@
   <div class="modal-backdrop" x-show="sessionTodoOpen"
        @click.self="closeSessionTodoBoard()" x-cloak>
     <div class="modal session-todo-modal" role="dialog" aria-modal="true"
-         @keydown.escape.window="closeSessionTodoBoard()">
+         aria-labelledby="session-todo-title" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'session-todo')">
       <div class="modal-head">
-        <span class="modal-title">
+        <span class="modal-title" id="session-todo-title">
           <svg class="modal-title-icon"><use href="#i-check-circle"/></svg>
           <span x-text="lang==='zh' ? '待办事项' : 'To-do board'"></span>
         </span>
@@ -5793,6 +5852,13 @@
       <form class="session-todo-compose" @submit.prevent="addSessionUserTodo()">
         <input type="text" maxlength="240" autocomplete="off" autofocus
                x-model="sessionTodoDraft"
+               @compositionstart="onLocalImeCompositionStart($event)"
+               @compositionend="onLocalImeCompositionEnd($event)"
+               @beforeinput="onLocalImeBeforeInput($event)"
+               @input="onLocalImeInput($event)"
+               @keydown="onLocalImeKeydown($event)"
+               @keyup.enter="onImeEnterKeyup($event)"
+               @keydown.enter="if (_claimNonImeEnter($event)) addSessionUserTodo()"
                :placeholder="lang==='zh' ? '添加一条待办…' : 'Add a TODO…'"
                :aria-label="lang==='zh' ? '待办内容' : 'TODO text'" />
         <button type="submit" :disabled="!sessionTodoDraft.trim()"
@@ -5820,6 +5886,7 @@
                    x-text="lang==='zh' ? '拖动到这里' : 'Drop here'"></div>
               <template x-for="item in sessionTodosForPriority(priority)" :key="item.id">
                 <div class="session-todo-item"
+                     :data-todo-id="item.id"
                      :class="{ 'is-completed': item.completed,
                                'is-dragging': sessionTodoDragId === item.id,
                                'is-editing': sessionTodoEditId === item.id }"
@@ -5844,15 +5911,51 @@
                       <input class="session-todo-edit" type="text" maxlength="240" autofocus
                              x-model="sessionTodoEditDraft"
                              @click.stop @dblclick.stop
-                             @keydown.enter.prevent="saveSessionTodoEdit(item.id)"
-                             @keydown.escape.stop.prevent="cancelSessionTodoEdit()"
+                             @compositionstart="onLocalImeCompositionStart($event)"
+                             @compositionend="onLocalImeCompositionEnd($event)"
+                             @beforeinput="onLocalImeBeforeInput($event)"
+                             @input="onLocalImeInput($event)"
+                             @keydown="onLocalImeKeydown($event)"
+                             @keyup.enter="onImeEnterKeyup($event)"
+                             @keydown.enter="if (_claimNonImeEnter($event)) saveSessionTodoEdit(item.id, true)"
+                             @keydown.escape="if (!_isImeComposingEvent($event)) { $event.stopPropagation(); $event.preventDefault(); cancelSessionTodoEdit(true); }"
                              @blur="saveSessionTodoEdit(item.id)"
                              :aria-label="lang==='zh' ? '编辑待办内容' : 'Edit TODO text'" />
                     </template>
                   </span>
-                  <button class="session-todo-delete" type="button"
-                          @click="deleteSessionUserTodo(item.id)"
-                          :aria-label="lang==='zh' ? '删除待办' : 'Delete TODO'">×</button>
+                  <div class="session-todo-actions" x-show="sessionTodoEditId !== item.id">
+                    <button class="session-todo-edit-button" type="button"
+                            @click="startSessionTodoEdit(item, $event)"
+                            :aria-label="(lang==='zh' ? '编辑待办：' : 'Edit TODO: ') + item.text"
+                            :title="lang==='zh' ? '编辑' : 'Edit'">
+                      <svg><use href="#i-edit"/></svg>
+                    </button>
+                    <select class="session-todo-priority-select"
+                            :value="item.priority"
+                            @change="setSessionTodoPriority(item.id, $event.target.value, true)"
+                            :aria-label="(lang==='zh' ? '待办优先级：' : 'TODO priority: ') + item.text">
+                      <option value="high" x-text="lang==='zh' ? '高' : 'High'"></option>
+                      <option value="medium" x-text="lang==='zh' ? '中' : 'Medium'"></option>
+                      <option value="low" x-text="lang==='zh' ? '低' : 'Low'"></option>
+                    </select>
+                    <button class="session-todo-move" type="button"
+                            :disabled="!canMoveSessionTodo(item, -1)"
+                            @click="moveSessionTodoWithinPriority(item.id, -1)"
+                            :aria-label="(lang==='zh' ? '在同优先级中上移：' : 'Move up within priority: ') + item.text"
+                            :title="lang==='zh' ? '上移' : 'Move up'">
+                      <svg><use href="#i-arrow-up"/></svg>
+                    </button>
+                    <button class="session-todo-move" type="button"
+                            :disabled="!canMoveSessionTodo(item, 1)"
+                            @click="moveSessionTodoWithinPriority(item.id, 1)"
+                            :aria-label="(lang==='zh' ? '在同优先级中下移：' : 'Move down within priority: ') + item.text"
+                            :title="lang==='zh' ? '下移' : 'Move down'">
+                      <svg><use href="#i-arrow-down"/></svg>
+                    </button>
+                    <button class="session-todo-delete" type="button"
+                            @click="deleteSessionUserTodo(item.id)"
+                            :aria-label="(lang==='zh' ? '删除待办：' : 'Delete TODO: ') + item.text">×</button>
+                  </div>
                 </div>
               </template>
             </section>
@@ -5864,10 +5967,11 @@
 
   <div class="modal-backdrop" x-show="activity.show" @click.self="closeActivityCenter()" x-cloak>
     <div class="modal activity-modal" role="dialog" aria-modal="true"
+         aria-labelledby="activity-center-title" tabindex="-1"
          :class="{ 'is-group-board': activity.view === 'groups' }"
-         @keydown.escape.window="closeActivityCenter()">
+         @keydown.tab="trapDialogFocus($event, 'activity')">
       <div class="modal-head">
-        <span class="modal-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
+        <span class="modal-title" id="activity-center-title"><svg class="modal-title-icon"><use href="#i-inbox"/></svg><span x-text="lang==='zh' ? '全局任务中心' : 'Global activity center'"></span></span>
         <div class="activity-view-switch" role="group"
              :aria-label="lang==='zh' ? '任务视图' : 'Task view'">
           <button type="button" @click="setActivityView('groups')"
@@ -6182,9 +6286,11 @@
   <div class="modal-backdrop" x-show="scheduler.show"
        x-transition.opacity.duration.120ms
        @click.self="closeScheduler()">
-    <div class="modal sched-modal" @keydown.escape.window="closeScheduler()">
+    <div class="modal sched-modal" role="dialog" aria-modal="true"
+         aria-labelledby="scheduler-title" tabindex="-1"
+         @keydown.tab="trapDialogFocus($event, 'scheduler')">
       <div class="modal-head">
-        <span class="modal-title"><svg class="modal-title-icon"><use href="#i-clock"/></svg><span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span></span>
+        <span class="modal-title" id="scheduler-title"><svg class="modal-title-icon"><use href="#i-clock"/></svg><span x-text="lang==='zh' ? '定时任务' : 'Scheduled tasks'"></span></span>
         <button class="modal-close" @click="closeScheduler()"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
       </div>

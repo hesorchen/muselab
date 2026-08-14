@@ -114,6 +114,45 @@ def test_compact_bootstrap_reads_only_root_and_expanded_children(
     }
 
 
+def test_cancelled_reconcile_rolls_back_before_commit(
+    app_module,
+    temp_root: Path,
+    monkeypatch,
+):
+    from backend.workspace_store import (
+        WorkspaceScanCancelled,
+        WorkspaceStore,
+    )
+    from backend.workspaces import registry
+
+    workspace_id = registry.id_for(temp_root)
+    store = WorkspaceStore(temp_root)
+    store.reconcile(workspace_id, temp_root, "root", primary=True)
+    baseline = store.bootstrap(workspace_id)
+    baseline_cursor = store.current_cursor(workspace_id)
+    (temp_root / "late-file.txt").write_text("late", encoding="utf-8")
+    cancel_event = threading.Event()
+    original_prune = store._prune
+
+    def cancel_before_commit(*args, **kwargs):
+        result = original_prune(*args, **kwargs)
+        cancel_event.set()
+        return result
+
+    monkeypatch.setattr(store, "_prune", cancel_before_commit)
+    with pytest.raises(WorkspaceScanCancelled):
+        store.reconcile(
+            workspace_id,
+            temp_root,
+            "root",
+            primary=True,
+            cancel_event=cancel_event,
+        )
+
+    assert store.current_cursor(workspace_id) == baseline_cursor
+    assert store.bootstrap(workspace_id) == baseline
+
+
 def test_compact_bootstrap_caps_each_expanded_directory(
     app_module,
     temp_root: Path,

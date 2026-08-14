@@ -207,6 +207,101 @@ def test_delete_nonempty_dir_permanent_still_works(client, auth, temp_root):
     assert not (temp_root / ".muselab-dustbin" / "notes").exists()
 
 
+def test_permanent_delete_failure_is_not_reported_as_success(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    from backend import files
+
+    def fail_remove(_path):
+        raise OSError("simulated permanent delete failure")
+
+    monkeypatch.setattr(files.shutil, "rmtree", fail_remove)
+    response = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": "notes"},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["X-MuseLab-Error-Code"] == "partial_delete"
+    assert response.json() == {
+        "detail": "permanent delete failed; the target may still exist"
+    }
+    assert (temp_root / "notes").is_dir()
+
+
+def test_permanent_delete_permission_failure_is_classified(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    from backend import files
+
+    monkeypatch.setattr(
+        files.shutil,
+        "rmtree",
+        lambda _path: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    response = client.request(
+        "DELETE",
+        "/api/files/delete?permanent=true",
+        headers=auth,
+        json={"path": "notes"},
+    )
+
+    assert response.status_code == 403
+    assert response.headers["X-MuseLab-Error-Code"] == "permission_denied"
+    assert (temp_root / "notes").is_dir()
+
+
+def test_trash_purge_failure_keeps_payload_and_manifest_for_retry(
+    client,
+    auth,
+    temp_root,
+    monkeypatch,
+):
+    moved = client.request(
+        "DELETE",
+        "/api/files/delete",
+        headers=auth,
+        json={"path": "notes"},
+    )
+    assert moved.status_code == 200, moved.text
+    trash_id = moved.json()["trash_id"]
+    dustbin = temp_root / ".muselab-dustbin"
+    payload = dustbin / trash_id
+    manifest = dustbin / f"{trash_id}.json"
+    assert payload.is_dir()
+    assert manifest.is_file()
+
+    from backend import files
+
+    def fail_remove(path):
+        assert Path(path) == payload
+        raise OSError("simulated trash purge failure")
+
+    monkeypatch.setattr(files.shutil, "rmtree", fail_remove)
+    response = client.request(
+        "DELETE",
+        "/api/files/trash/purge",
+        headers=auth,
+        json={"trash_id": trash_id},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["X-MuseLab-Error-Code"] == "partial_delete"
+    assert response.json() == {
+        "detail": "trash purge failed; the item was kept for retry"
+    }
+    assert payload.is_dir()
+    assert manifest.is_file()
+
+
 def test_trash_purge_rejects_path_traversal_in_trash_id(client, auth, temp_root):
     # Without trash_id validation, `"../../tmp/x"` would resolve outside
     # the dustbin and trash_purge would happily rmtree() arbitrary dirs.

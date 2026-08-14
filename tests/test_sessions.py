@@ -109,6 +109,79 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 404
 
 
+def test_fork_annotation_copy_rekeys_message_uuid(app_module):
+    from backend import sessions as sess
+
+    source = sess.create_session("source")
+    child = sess.create_session("child")
+    old_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    new_uuid = "11111111-2222-4333-8444-555555555555"
+    sess.set_message_annotation(
+        source["id"], old_uuid,
+        model="GPT-5.6 Sol", turn_status="completed",
+        memory_recall={"count": 2}, docs=[{"name": "note.md"}],
+    )
+
+    copied = sess.copy_message_annotations(
+        source["id"], child["id"], {old_uuid: new_uuid})
+
+    assert copied == 1
+    annotation = sess.get_message_annotations(child["id"])[new_uuid]
+    assert annotation["model"] == "GPT-5.6 Sol"
+    assert annotation["turn_status"] == "completed"
+    assert annotation["memory_recall"] == {"count": 2}
+    assert annotation["docs"] == [{"name": "note.md"}]
+
+
+@pytest.mark.parametrize("terminal_state", ["completed", "failed", "stopped"])
+def test_runtime_task_overlay_terminal_state_cannot_regress_to_running(
+    app_module, terminal_state,
+):
+    from backend import sessions as sess
+
+    sid = sess.create_session("runtime-overlay-monotonic")["id"]
+    sess.set_runtime_task_overlay(
+        sid, "task-1", state="running", owner_session_id=sid,
+    )
+    sess.set_runtime_task_overlay(
+        sid, "task-1", state=terminal_state, summary="terminal result",
+    )
+
+    # A delayed launch/backfill is still allowed to enrich missing card
+    # metadata, but it cannot turn a terminal task back into a running task.
+    sess.set_runtime_task_overlay(
+        sid, "task-1", state="running", tool_use_id="tool-late",
+    )
+
+    overlay = sess.get_runtime_task_overlays(sid)["task-1"]
+    assert overlay["state"] == terminal_state
+    assert overlay["summary"] == "terminal result"
+    assert overlay["tool_use_id"] == "tool-late"
+
+
+def test_startup_stops_only_stale_running_runtime_task_overlays(app_module):
+    from backend import sessions as sess
+
+    running = sess.create_session("stale-running")["id"]
+    completed = sess.create_session("already-completed")["id"]
+    sess.set_runtime_task_overlay(
+        running, "task-running", state="running", owner_session_id=running,
+    )
+    sess.set_runtime_task_overlay(
+        completed, "task-completed", state="completed",
+        owner_session_id=completed, summary="done",
+    )
+
+    assert sess.stop_stale_runtime_task_overlays() == 1
+    stale = sess.get_runtime_task_overlays(running)["task-running"]
+    terminal = sess.get_runtime_task_overlays(completed)["task-completed"]
+    assert stale["state"] == "stopped"
+    assert stale["restart_recovered"] is True
+    assert terminal["state"] == "completed"
+    assert terminal["summary"] == "done"
+    assert sess.stop_stale_runtime_task_overlays() == 0
+
+
 def test_corrupt_index_is_never_overwritten_by_a_mutator(app_module):
     from backend import sessions as sess
 

@@ -696,28 +696,6 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
 
     await websocket.accept(subprotocol=PROTOCOL)
     subscriber, replay = await manager.attach(session)
-    await websocket.send_json({
-        "type": "ready",
-        "terminal": session.public(),
-        "replay_bytes": len(replay),
-    })
-    if session.buffer_truncated:
-        await websocket.send_bytes(
-            b"\x1b[33m[muselab: earlier terminal output was truncated]\x1b[0m\r\n")
-    if replay:
-        # Historical terminal output may contain device queries (DA/DSR/OSC).
-        # Delimit replay explicitly so the browser can render it without
-        # forwarding newly-generated xterm replies into today's foreground
-        # process.
-        await websocket.send_json({"type": "replay_start"})
-        await websocket.send_bytes(replay)
-        await websocket.send_json({"type": "replay_end"})
-    if session.status != "running":
-        await websocket.send_json({"type": "exit", "exit_code": session.exit_code})
-        await websocket.close(code=1000)
-        await manager.detach(session, subscriber)
-        return
-
     writer = WebSocketWriter(websocket)
 
     async def send_loop() -> None:
@@ -763,9 +741,39 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
                 if not await writer.send_json({"type": "pong"}):
                     return
 
-    sender = asyncio.create_task(send_loop())
-    receiver = asyncio.create_task(receive_loop())
+    sender: asyncio.Task | None = None
+    receiver: asyncio.Task | None = None
     try:
+        # Initial ready/replay writes are part of the subscribed lifecycle too.
+        # Any disconnect from this point must reach the one detach in finally;
+        # otherwise the PTY reaper sees a phantom subscriber forever.
+        if not await writer.send_json({
+            "type": "ready",
+            "terminal": session.public(),
+            "replay_bytes": len(replay),
+        }):
+            return
+        if session.buffer_truncated and not await writer.send_bytes(
+            b"\x1b[33m[muselab: earlier terminal output was truncated]\x1b[0m\r\n"
+        ):
+            return
+        if replay:
+            # Historical terminal output may contain device queries
+            # (DA/DSR/OSC). Delimit replay explicitly so the browser renders
+            # it without forwarding replay-generated replies into today's PTY.
+            if not await writer.send_json({"type": "replay_start"}):
+                return
+            if not await writer.send_bytes(replay):
+                return
+            if not await writer.send_json({"type": "replay_end"}):
+                return
+        if session.status != "running":
+            await writer.send_json({"type": "exit", "exit_code": session.exit_code})
+            await writer.close(code=1000)
+            return
+
+        sender = asyncio.create_task(send_loop())
+        receiver = asyncio.create_task(receive_loop())
         done, pending = await asyncio.wait(
             {sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
@@ -779,4 +787,12 @@ async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     finally:
+        pending = [
+            task for task in (sender, receiver)
+            if task is not None and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await manager.detach(session, subscriber)

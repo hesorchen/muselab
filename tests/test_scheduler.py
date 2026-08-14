@@ -19,6 +19,7 @@ def _sched_mod(app_module):
     # the module-global `_state` may carry over from a prior test in the
     # same process. Reset explicitly for isolation.
     sched._state = {"tasks": {}, "history": [], "unread_count": 0}
+    sched._STATE_ERROR = ""
     return sched
 
 
@@ -64,6 +65,60 @@ def test_create_task_default_is_fresh(app_module):
     t = sched.create_task("t", "p", _daily_at())
     assert t["session_mode"] == "fresh"
     assert t["session_id"] == ""
+
+
+def test_corrupt_state_enters_degraded_mode_without_overwriting_original(
+    app_module,
+):
+    sched = _sched_mod(app_module)
+    state_file = sched._STATE_FILE
+    assert state_file is not None
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    original = b'{"tasks": {"unfinished"'
+    state_file.write_bytes(original)
+
+    with pytest.raises(
+        sched.SchedulerPersistenceError,
+        match="original file preserved",
+    ):
+        sched._load_state()
+
+    assert sched.persistence_status()["available"] is False
+    with pytest.raises(sched.SchedulerPersistenceError):
+        sched.create_task("must-not-write", "prompt", _daily_at())
+    assert sched._state == {"tasks": {}, "history": [], "unread_count": 0}
+    assert state_file.read_bytes() == original
+
+
+def test_update_task_save_failure_rolls_back_memory_and_disk(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    task = sched.create_task("stable-name", "stable-prompt", _daily_at())
+    state_file = sched._STATE_FILE
+    assert state_file is not None
+    durable_before = state_file.read_bytes()
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("simulated scheduler disk failure")
+
+    monkeypatch.setattr(sched, "atomic_write_text", fail_write)
+    with pytest.raises(
+        sched.SchedulerPersistenceError,
+        match="change was not committed",
+    ):
+        sched.update_task(
+            task["id"],
+            name="must-roll-back",
+            prompt="must-roll-back",
+        )
+
+    restored = sched._state["tasks"][task["id"]]
+    assert restored["name"] == "stable-name"
+    assert restored["prompt"] == "stable-prompt"
+    assert state_file.read_bytes() == durable_before
+    assert sched.persistence_status()["available"] is False
 
 
 # ---- _effective_session_mode ----
@@ -449,6 +504,41 @@ async def test_execute_task_publishes_activity_and_success_history(
 
 
 @pytest.mark.asyncio
+async def test_execute_task_save_failure_rolls_back_and_finishes_failed(
+    app_module,
+    monkeypatch,
+):
+    sched = _sched_mod(app_module)
+    from backend import activity as activity_module
+    from backend import presence
+    transitions = []
+
+    async def run_turn(_sid, _model, _prompt, **_kwargs):
+        return "finished but not durable", None
+
+    def fail_save():
+        raise sched.SchedulerPersistenceError("simulated durable write failure")
+
+    monkeypatch.setattr(sched, "_run_sdk_task_turn", run_turn)
+    monkeypatch.setattr(sched, "_save_state", fail_save)
+    monkeypatch.setattr(
+        activity_module.activity,
+        "finish",
+        lambda sid, status, **_kwargs: transitions.append((sid, status)),
+    )
+    monkeypatch.setattr(presence, "recently_active", lambda: True)
+    monkeypatch.setattr(presence, "last_seen_age", lambda: 0.0)
+
+    task = _execution_task("save-failure")
+    await sched._execute_task(task)
+
+    assert sched._state["history"] == []
+    assert sched._state["unread_count"] == 0
+    assert sched._state["tasks"] == {}
+    assert transitions == [(task["session_id"], "failed")]
+
+
+@pytest.mark.asyncio
 async def test_execute_task_cancellation_is_not_recorded_as_success(
     app_module,
     monkeypatch,
@@ -768,6 +858,57 @@ def test_api_create_task_default_is_fresh(client, auth, app_module):
     })
     assert r.status_code == 200, r.text
     assert r.json()["session_mode"] == "fresh"
+
+
+def test_api_rejects_past_once_schedule_on_create_and_patch(
+    client,
+    auth,
+    app_module,
+):
+    sched = _sched_mod(app_module)
+    past_once = {
+        "kind": "once",
+        "year": 2024,
+        "month": 1,
+        "day": 1,
+        "hour": 9,
+        "minute": 0,
+        "tz_offset_minutes": 480,
+    }
+
+    rejected_create = client.post(
+        "/api/scheduler/tasks",
+        headers=auth,
+        json={
+            "name": "already-past",
+            "prompt": "must not be stored",
+            "schedule": past_once,
+        },
+    )
+    assert rejected_create.status_code == 400, rejected_create.text
+    assert sched._state["tasks"] == {}
+
+    created = client.post(
+        "/api/scheduler/tasks",
+        headers=auth,
+        json={
+            "name": "future-daily",
+            "prompt": "keep this task",
+            "schedule": _daily_at(),
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+
+    rejected_patch = client.patch(
+        f"/api/scheduler/tasks/{task_id}",
+        headers=auth,
+        json={"schedule": past_once},
+    )
+    assert rejected_patch.status_code == 400, rejected_patch.text
+    persisted = sched._state["tasks"][task_id]
+    assert persisted["schedule"]["kind"] == "daily"
+    assert persisted["next_run"] is not None
 
 
 def test_api_task_history_endpoint(client, auth, app_module):

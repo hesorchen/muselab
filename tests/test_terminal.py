@@ -196,6 +196,72 @@ def test_terminal_replays_output_after_websocket_disconnect(terminal_client, aut
     client.delete(f"/api/terminals/{terminal_id}", headers=auth)
 
 
+@pytest.mark.asyncio
+async def test_terminal_initial_ready_send_failure_detaches_subscriber(
+    app_module,
+    monkeypatch,
+):
+    from backend import terminal
+
+    class FakeSession:
+        buffer_truncated = False
+        status = "running"
+        exit_code = None
+
+        def public(self):
+            return {"id": "initial-send-failure"}
+
+    class FailingWebSocket:
+        headers = {}
+        scope = {
+            "subprotocols": [terminal.PROTOCOL, "ticket.fake"],
+        }
+
+        def __init__(self):
+            self.accepted = False
+            self.send_attempts = 0
+
+        async def accept(self, *, subprotocol=None):
+            assert subprotocol == terminal.PROTOCOL
+            self.accepted = True
+
+        async def send_json(self, _payload):
+            self.send_attempts += 1
+            raise RuntimeError("websocket closed during initial ready")
+
+        async def close(self, *, code, reason=""):
+            raise AssertionError(
+                f"writer should stop after failed ready send: {code} {reason}"
+            )
+
+    session = FakeSession()
+    subscriber = object()
+    detached = []
+
+    async def consume_ticket(terminal_id, offered):
+        assert terminal_id == "initial-send-failure"
+        assert terminal.PROTOCOL in offered
+        return session
+
+    async def attach(attached_session):
+        assert attached_session is session
+        return subscriber, b""
+
+    async def detach(detached_session, detached_subscriber):
+        detached.append((detached_session, detached_subscriber))
+
+    monkeypatch.setattr(terminal.manager, "consume_ticket", consume_ticket)
+    monkeypatch.setattr(terminal.manager, "attach", attach)
+    monkeypatch.setattr(terminal.manager, "detach", detach)
+    websocket = FailingWebSocket()
+
+    await terminal.terminal_websocket(websocket, "initial-send-failure")
+
+    assert websocket.accepted is True
+    assert websocket.send_attempts == 1
+    assert detached == [(session, subscriber)]
+
+
 def test_terminal_profiles_crud_default_and_startup_command(
     terminal_client, auth, temp_root,
 ):

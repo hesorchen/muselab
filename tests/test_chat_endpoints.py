@@ -661,10 +661,12 @@ def test_interrupt_pauses_nonempty_queue_before_sdk_call(chat_mod, client):
 async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
     sid = "sid-delete-continuation"
     watcher = asyncio.create_task(asyncio.sleep(60))
+    prewarm = asyncio.create_task(asyncio.sleep(60))
     pump = asyncio.create_task(asyncio.sleep(60))
     broadcast = chat_mod.TurnBroadcast(sid)
     broadcast.task = pump
     chat_mod._task_watchers[sid] = watcher
+    chat_mod._runtime_prewarm_tasks[sid] = prewarm
     chat_mod._continuation_generations[sid] = 3
     chat_mod._active_turns[sid] = broadcast
     chat_mod._recent_turns[sid] = broadcast
@@ -674,10 +676,11 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
     chat_mod._background_origin_turn_id[sid] = "origin-turn"
 
     chat_mod._clear_session_runtime_state(sid)
-    await asyncio.gather(watcher, pump, return_exceptions=True)
+    await asyncio.gather(watcher, prewarm, pump, return_exceptions=True)
 
     assert chat_mod._continuation_generations[sid] == 4
     assert sid not in chat_mod._task_watchers
+    assert sid not in chat_mod._runtime_prewarm_tasks
     assert sid not in chat_mod._active_turns
     assert sid not in chat_mod._recent_turns
     assert sid not in chat_mod._sessions_with_inflight_tasks
@@ -686,6 +689,7 @@ async def test_session_runtime_cleanup_invalidates_continuation_owner(chat_mod):
     assert "task-1" not in chat_mod._bg_task_descriptions
     assert broadcast.cancelled is True
     assert broadcast.done is True
+    assert prewarm.cancelled() is True
 
 
 @pytest.mark.asyncio
@@ -768,19 +772,16 @@ async def test_get_client_rejects_cold_commit_after_delete_fence(
 @pytest.mark.asyncio
 async def test_async_purge_aborts_when_scheduler_join_fails(
         chat_mod, monkeypatch):
-    from backend import scheduler
-
     disk_purges = []
 
-    async def fail_join(_runs):
+    async def fail_join(_sid, _runs, *, timeout):
         raise RuntimeError("scheduler join failed")
 
     monkeypatch.setattr(
-        scheduler,
-        "cancel_runs_for_session_now",
-        lambda _sid: ([], False, set()),
+        chat_mod,
+        "_join_session_runtime_cleanup",
+        fail_join,
     )
-    monkeypatch.setattr(scheduler, "join_cancelled_runs", fail_join)
     monkeypatch.setattr(
         chat_mod,
         "purge_session_storage",
@@ -790,6 +791,61 @@ async def test_async_purge_aborts_when_scheduler_join_fails(
     with pytest.raises(RuntimeError, match="scheduler join failed"):
         await chat_mod.purge_session_storage_async("sid-join-failure")
     assert disk_purges == []
+
+
+@pytest.mark.asyncio
+async def test_async_purge_timeout_keeps_disk_until_owner_finishes(
+        chat_mod, monkeypatch):
+    disk_purges = []
+
+    async def incomplete_cleanup(_sid, _runs, *, timeout):
+        return False
+
+    monkeypatch.setattr(
+        chat_mod,
+        "_join_session_runtime_cleanup",
+        incomplete_cleanup,
+    )
+    monkeypatch.setattr(
+        chat_mod,
+        "purge_session_storage",
+        lambda sid: disk_purges.append(sid) or True,
+    )
+
+    with pytest.raises(chat_mod.RuntimeCleanupTimeout):
+        await chat_mod.purge_session_storage_async("sid-owner-pending")
+    assert disk_purges == []
+
+
+@pytest.mark.asyncio
+async def test_async_purge_public_deadline_reuses_same_owner(
+        chat_mod, monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_purge(_sid):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(chat_mod, "_SESSION_DELETE_DEADLINE_S", 0.01)
+    monkeypatch.setattr(
+        chat_mod,
+        "_purge_session_storage_async_inner",
+        slow_purge,
+    )
+
+    with pytest.raises(chat_mod.RuntimeCleanupTimeout):
+        await chat_mod.purge_session_storage_async("sid-slow-purge")
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert calls == 1
+
+    release.set()
+    assert await chat_mod.purge_session_storage_async("sid-slow-purge") is True
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -1409,6 +1465,451 @@ def test_fork_snapshots_source_while_background_task_keeps_running(
     assert called is True
     assert response.json()["source_background_tasks_pending"] == 2
     assert chat_mod._sessions_with_inflight_tasks[sid] == {"task-a", "task-b"}
+
+
+def test_continue_detached_forks_once_hides_source_and_migrates_queue(
+    chat_mod, client, monkeypatch, tmp_path,
+):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "background source"},
+    ).json()
+    sid = source["id"]
+    boundary = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    child_sid = "11111111-2222-4333-8444-555555555555"
+    chat_mod.sess.set_runtime_background_boundary(sid, boundary)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-a"}
+    chat_mod.sess.set_runtime_task_overlay(
+        sid, "task-a", state="running", tool_use_id="tool-a",
+        owner_session_id=sid,
+    )
+    queued = chat_mod.sess.enqueue_existing_message(
+        sid, "continue now", permission="default")
+    assert queued["ok"] is True
+    fork_calls = []
+
+    def fake_fork(source_sid, **kwargs):
+        fork_calls.append((source_sid, kwargs))
+        return SimpleNamespace(session_id=child_sid)
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    monkeypatch.setattr(chat_mod, "_backfill_runtime_task_overlays", lambda _sid: None)
+    monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
+
+    headers = {"X-Auth-Token": TEST_TOKEN}
+    first = client.post(
+        f"/api/chat/sessions/{sid}/continue-detached", headers=headers)
+    second = client.post(
+        f"/api/chat/sessions/{sid}/continue-detached", headers=headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["session_id"] == child_sid
+    assert first.json()["source_session_id"] == sid
+    assert first.json()["owner_session_id"] == sid
+    assert first.json()["inherited_background_tasks_pending"] == 1
+    assert first.json()["queue_migrated"] == 1
+    assert second.json()["reused"] is True
+    assert len(fork_calls) == 1
+    assert fork_calls[0][1]["up_to_message_id"] == boundary
+    assert chat_mod.sess.get_session_meta(sid)["runtime_shadow"] is True
+    assert chat_mod.sess.get_session_meta(child_sid)["runtime_predecessor"] == sid
+    listed = {row["id"] for row in chat_mod.sess.list_sessions()}
+    assert sid not in listed
+    assert child_sid in listed
+    assert chat_mod.sess.get_queue(sid)["items"] == []
+    assert [row["text"] for row in chat_mod.sess.get_queue(child_sid)["items"]] == [
+        "continue now",
+    ]
+    overlay = chat_mod.sess.get_runtime_task_overlays(child_sid)["task-a"]
+    assert overlay["owner_session_id"] == sid
+
+
+def test_continue_detached_rejects_foreground_active(chat_mod, client, monkeypatch):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "busy source"},
+    ).json()
+    sid = source["id"]
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-a"}
+    chat_mod._active_turns[sid] = SimpleNamespace(
+        done=False, is_continuation=False)
+    called = False
+
+    def fake_fork(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    response = client.post(
+        f"/api/chat/sessions/{sid}/continue-detached",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+    assert response.status_code == 409
+    assert called is False
+
+
+def test_continue_detached_allows_canonical_done_during_postlude(
+    chat_mod, client, monkeypatch,
+):
+    source = client.post(
+        "/api/chat/sessions",
+        headers={"X-Auth-Token": TEST_TOKEN, "Content-Type": "application/json"},
+        json={"name": "postlude source"},
+    ).json()
+    sid = source["id"]
+    boundary = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    child_sid = "22222222-3333-4444-8555-666666666666"
+    chat_mod.sess.set_runtime_background_boundary(sid, boundary)
+    chat_mod._sessions_with_inflight_tasks[sid] = {"task-a"}
+    chat_mod._active_turns[sid] = SimpleNamespace(
+        done=False,
+        is_continuation=False,
+        canonical_terminal_published=True,
+    )
+
+    def fake_fork(source_sid, **_kwargs):
+        assert source_sid == sid
+        return SimpleNamespace(session_id=child_sid)
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    monkeypatch.setattr(chat_mod, "_backfill_runtime_task_overlays", lambda _sid: None)
+    monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
+
+    response = client.post(
+        f"/api/chat/sessions/{sid}/continue-detached",
+        headers={"X-Auth-Token": TEST_TOKEN},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["session_id"] == child_sid
+    assert chat_mod.sess.get_session_meta(sid)["runtime_successor"] == child_sid
+
+
+@pytest.mark.asyncio
+async def test_eager_prewarm_and_manual_continue_share_one_successor(
+    chat_mod, monkeypatch,
+):
+    source_sid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+    child_sid = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+    boundary = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    chat_mod.sess.register_session(
+        source_sid,
+        name="eager source",
+        model="claude-sonnet-4-6",
+        permission="default",
+        effort="high",
+        service_tier="",
+    )
+    chat_mod.sess.set_runtime_background_boundary(source_sid, boundary)
+    chat_mod._sessions_with_inflight_tasks[source_sid] = {"task-a"}
+    chat_mod._active_turns[source_sid] = SimpleNamespace(
+        done=False,
+        is_continuation=False,
+        canonical_terminal_published=True,
+    )
+
+    fork_entered = threading.Event()
+    allow_fork = threading.Event()
+    fork_calls = []
+    warmed = []
+
+    def fake_fork(sid, **_kwargs):
+        fork_calls.append(sid)
+        fork_entered.set()
+        assert allow_fork.wait(timeout=2)
+        return SimpleNamespace(session_id=child_sid)
+
+    async def fake_get_client(sid, model, permission, **kwargs):
+        warmed.append((sid, model, permission, kwargs))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setattr(chat_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    monkeypatch.setattr(
+        chat_mod, "_backfill_runtime_task_overlays", lambda _sid: None)
+    monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
+
+    chat_mod._schedule_detached_successor_prewarm(source_sid)
+    eager = chat_mod._runtime_prewarm_tasks[source_sid]
+    assert await asyncio.to_thread(fork_entered.wait, 1)
+    manual = asyncio.create_task(
+        chat_mod._continue_detached_runtime(source_sid))
+    await asyncio.sleep(0.02)
+
+    assert fork_calls == [source_sid]
+    assert not manual.done()
+    allow_fork.set()
+    manual_result = await manual
+    await eager
+    await asyncio.sleep(0)
+
+    assert manual_result["session_id"] == child_sid
+    assert manual_result["reused"] is True
+    assert fork_calls == [source_sid]
+    assert warmed == [(
+        child_sid,
+        "claude-sonnet-4-6",
+        "default",
+        {"effort": "high", "service_tier": ""},
+    )]
+    assert source_sid not in chat_mod._runtime_prewarm_tasks
+    assert (
+        chat_mod.sess.get_session_meta(source_sid)["runtime_successor"]
+        == child_sid
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_fences_and_rolls_back_inflight_eager_successor(
+    chat_mod, monkeypatch,
+):
+    source_sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1"
+    child_sid = "bbbbbbbb-cccc-4ddd-8eee-fffffffffff2"
+    chat_mod.sess.register_session(
+        source_sid,
+        name="delete while eager",
+        model="claude-sonnet-4-6",
+        permission="default",
+    )
+    chat_mod.sess.set_runtime_background_boundary(
+        source_sid, "cccccccc-dddd-4eee-8fff-aaaaaaaaaaa3")
+    chat_mod._sessions_with_inflight_tasks[source_sid] = {"task-a"}
+    active = chat_mod.TurnBroadcast(source_sid)
+    active.canonical_terminal_published = True
+    chat_mod._active_turns[source_sid] = active
+
+    fork_entered = threading.Event()
+    allow_fork = threading.Event()
+    sdk_deletes = []
+
+    def fake_fork(_sid, **_kwargs):
+        fork_entered.set()
+        assert allow_fork.wait(timeout=2)
+        return SimpleNamespace(session_id=child_sid)
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setattr(
+        chat_mod, "sdk_delete_session",
+        lambda sid, **_kwargs: sdk_deletes.append(sid),
+    )
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    monkeypatch.setattr(
+        chat_mod, "_backfill_runtime_task_overlays", lambda _sid: None)
+    monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
+
+    chat_mod._schedule_detached_successor_prewarm(source_sid)
+    assert await asyncio.to_thread(fork_entered.wait, 1)
+    deleting = asyncio.create_task(chat_mod.delete_session_api(source_sid))
+    for _ in range(100):
+        if chat_mod.sess.session_is_deleting(source_sid):
+            break
+        await asyncio.sleep(0.01)
+    assert chat_mod.sess.session_is_deleting(source_sid) is True
+
+    allow_fork.set()
+    result = await asyncio.wait_for(deleting, timeout=5)
+    await asyncio.sleep(0)
+
+    assert result == {"ok": True}
+    assert chat_mod.sess.get_session_meta(source_sid) is None
+    assert chat_mod.sess.get_session_meta(child_sid) is None
+    assert source_sid not in chat_mod._runtime_prewarm_tasks
+    assert not any(key[0] == child_sid for key in chat_mod._clients)
+    assert child_sid in sdk_deletes
+    assert source_sid in sdk_deletes
+
+
+@pytest.mark.asyncio
+async def test_cancelled_continue_detached_keeps_lock_until_owner_commits(
+    chat_mod, monkeypatch,
+):
+    source_sid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+    child_sid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+    chat_mod.sess.register_session(source_sid, name="cancel source")
+    chat_mod.sess.set_runtime_background_boundary(
+        source_sid, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    chat_mod._sessions_with_inflight_tasks[source_sid] = {"task-a"}
+    queued = chat_mod.sess.enqueue_existing_message(
+        source_sid, "preserve me", permission="default")
+    assert queued["ok"] is True
+
+    fork_entered = threading.Event()
+    allow_fork = threading.Event()
+    fork_calls = []
+
+    def fake_fork(sid, **_kwargs):
+        fork_calls.append(sid)
+        fork_entered.set()
+        assert allow_fork.wait(timeout=2)
+        return SimpleNamespace(session_id=child_sid)
+
+    monkeypatch.setattr(chat_mod, "sdk_fork_session", fake_fork)
+    monkeypatch.setattr(chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {})
+    monkeypatch.setattr(chat_mod, "_backfill_runtime_task_overlays", lambda _sid: None)
+    monkeypatch.setattr(chat_mod, "_schedule_queue_drain", lambda _sid: None)
+
+    first = asyncio.create_task(
+        chat_mod._continue_detached_runtime(source_sid))
+    assert await asyncio.to_thread(fork_entered.wait, 1)
+    first.cancel()
+    await asyncio.sleep(0)
+    retry = asyncio.create_task(
+        chat_mod._continue_detached_runtime(source_sid))
+    await asyncio.sleep(0.02)
+
+    assert not first.done()
+    assert not retry.done()
+    assert fork_calls == [source_sid]
+
+    allow_fork.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    result = await retry
+
+    assert result["session_id"] == child_sid
+    assert result["reused"] is True
+    assert fork_calls == [source_sid]
+    assert chat_mod.sess.get_queue(source_sid)["items"] == []
+    assert [
+        item["text"]
+        for item in chat_mod.sess.get_queue(child_sid)["items"]
+    ] == ["preserve me"]
+
+
+def test_runtime_postlude_syncs_annotations_and_auto_name_through_chain(
+    chat_mod, monkeypatch,
+):
+    source_sid = "33333333-4444-4555-8666-777777777777"
+    child_sid = "44444444-5555-4666-8777-888888888888"
+    grandchild_sid = "55555555-6666-4777-8888-999999999999"
+    inherited_name = "New session"
+    chat_mod.sess.register_session(
+        source_sid, name=inherited_name, auto_named=True)
+    chat_mod.sess.register_session(
+        child_sid,
+        name=inherited_name,
+        auto_named=False,
+        forked_from=source_sid,
+        forked_from_name=inherited_name,
+        runtime_predecessor=source_sid,
+    )
+    chat_mod.sess.register_session(
+        grandchild_sid,
+        name=inherited_name,
+        auto_named=False,
+        forked_from=child_sid,
+        forked_from_name=inherited_name,
+        runtime_predecessor=child_sid,
+    )
+    assert chat_mod.sess.link_runtime_successor(source_sid, child_sid)
+    assert chat_mod.sess.link_runtime_successor(child_sid, grandchild_sid)
+
+    source_uuid = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
+    child_uuid = "bbbbbbbb-2222-4333-8444-cccccccccccc"
+    grandchild_uuid = "cccccccc-3333-4444-8555-dddddddddddd"
+    chat_mod.sess.set_message_annotation(
+        source_sid,
+        source_uuid,
+        turn_status="completed",
+        memory_recall={"count": 2},
+    )
+    mappings = {
+        child_sid: {source_uuid: child_uuid},
+        grandchild_sid: {child_uuid: grandchild_uuid},
+    }
+    monkeypatch.setattr(
+        chat_mod,
+        "_runtime_fork_uuid_mapping",
+        lambda sid: mappings[sid],
+    )
+    rename_calls = []
+    monkeypatch.setattr(
+        chat_mod,
+        "sdk_rename_session",
+        lambda sid, name, **_kwargs: rename_calls.append((sid, name)),
+    )
+
+    chat_mod.sess.bump_session(
+        source_sid, auto_rename_from="late automatic title")
+    final_name = chat_mod.sess.get_session_meta(source_sid)["name"]
+    result = chat_mod._sync_runtime_successor_postlude(source_sid)
+
+    assert result == {"annotations": 2, "renamed": 2}
+    assert chat_mod.sess.get_message_annotations(child_sid)[child_uuid] == {
+        "turn_status": "completed",
+        "memory_recall": {"count": 2},
+    }
+    assert chat_mod.sess.get_message_annotations(
+        grandchild_sid)[grandchild_uuid] == {
+            "turn_status": "completed",
+            "memory_recall": {"count": 2},
+        }
+    assert chat_mod.sess.get_session_meta(child_sid)["name"] == final_name
+    assert chat_mod.sess.get_session_meta(grandchild_sid)["name"] == final_name
+    assert rename_calls == [
+        (child_sid, final_name),
+        (grandchild_sid, final_name),
+    ]
+
+
+def test_runtime_postlude_preserves_explicit_successor_name(
+    chat_mod, monkeypatch,
+):
+    source = chat_mod.sess.create_session("automatic source")
+    child = chat_mod.sess.create_session("inherited title")
+    assert chat_mod.sess.link_runtime_successor(source["id"], child["id"])
+    # Simulate a user rename after the successor became visible.
+    assert chat_mod.sess.rename_session(child["id"], "my explicit title")
+    rename_calls = []
+    monkeypatch.setattr(
+        chat_mod, "sdk_rename_session",
+        lambda *_args, **_kwargs: rename_calls.append(True),
+    )
+    monkeypatch.setattr(
+        chat_mod, "_runtime_fork_uuid_mapping", lambda _sid: {},
+    )
+
+    result = chat_mod._sync_runtime_successor_postlude(source["id"])
+
+    assert result == {"annotations": 0, "renamed": 0}
+    assert chat_mod.sess.get_session_meta(child["id"])["name"] == (
+        "my explicit title")
+    assert rename_calls == []
+
+
+def test_runtime_task_terminal_overlay_reaches_every_successor(chat_mod):
+    source = chat_mod.sess.create_session("source")
+    child = chat_mod.sess.create_session("child")
+    grandchild = chat_mod.sess.create_session("grandchild")
+    assert chat_mod.sess.link_runtime_successor(source["id"], child["id"])
+    assert chat_mod.sess.link_runtime_successor(child["id"], grandchild["id"])
+    chat_mod._pin_background_task(source["id"], "task-a")
+    chat_mod._record_background_task_launch(
+        source["id"], "task-a", tool_use_id="tool-a", description="sleep")
+
+    assert chat_mod._on_task_settled(
+        source["id"], "task-a", status="completed",
+        tool_use_id="tool-a", summary="done", output_file="/tmp/a.output",
+    ) is True
+    # A second, sparse terminal patch is a common SDK shape. It may update the
+    # state but must not erase richer typed-notification metadata.
+    assert chat_mod._on_task_settled(
+        source["id"], "task-a", status="completed",
+    ) is False
+
+    for sid in (source["id"], child["id"], grandchild["id"]):
+        overlay = chat_mod.sess.get_runtime_task_overlays(sid)["task-a"]
+        assert overlay["state"] == "completed"
+        assert overlay["owner_session_id"] == source["id"]
+        assert overlay["tool_use_id"] == "tool-a"
+        assert overlay["summary"] == "done"
+        assert overlay["output_file"] == "/tmp/a.output"
 
 
 def test_native_compact_rejects_success_without_token_drop(chat_mod, client, monkeypatch):

@@ -114,13 +114,12 @@ jobs:
 
   # Dependency vulnerability scan. dependabot keeps deps current, but doesn't
   # surface KNOWN CVEs in the currently-pinned set — pip-audit does. Runs
-  # against the frozen lockfile so it reflects what actually ships. Non-blocking
-  # for now (informational) so a freshly-disclosed advisory doesn't wedge all
-  # PRs before maintainers can triage; flip to blocking once the baseline is clean.
+  # against the frozen lockfile so it reflects what actually ships. The current
+  # frozen baseline is clean, so a newly introduced known vulnerability blocks
+  # the change instead of being hidden behind a green workflow conclusion.
   security:
     name: pip-audit (dependency CVE scan)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -133,6 +132,39 @@ jobs:
         # Audit the resolved environment. pip-audit is pulled ephemerally via
         # `uv run --with` so it doesn't touch the frozen lockfile.
         run: uv run --with pip-audit pip-audit
+
+  # Small, deliberately stable browser contract. The full suite below remains
+  # observational while its workspace-SSE race is being fixed; these critical
+  # user journeys have been green on the latest main run and must block regressions.
+  e2e-core:
+    name: e2e core (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install Chromium
+        run: uv run --with pytest-playwright playwright install --with-deps chromium
+      - name: Run blocking browser contracts
+        env:
+          RUN_E2E: "1"
+          MUSELAB_TOKEN: "ci-test-token-1234567890abcdef-min-32"
+          MUSELAB_ROOT: ${{ github.workspace }}/.e2e-core-workspace
+        run: |
+          mkdir -p $MUSELAB_ROOT
+          uv run --with pytest-playwright pytest -q \
+            tests/e2e/test_activity_center.py::test_memory_shortcut_opens_memory_settings_page \
+            tests/e2e/test_chat_render_perf.py::test_chat_ime_commit_enter_keeps_chinese_text_and_next_enter_sends \
+            tests/e2e/test_chat_render_perf.py::test_desktop_done_reconcile_preserves_live_message_dom_identity \
+            tests/e2e/test_chat_render_perf.py::test_background_completion_no_active_fallback_never_blanks_visible_messages \
+            tests/e2e/test_chat_render_perf.py::test_fast_completed_queued_turn_reconciles_footer_without_refresh \
+            tests/e2e/test_files_preview.py::test_os_file_drop_uses_whole_window_root_except_explicit_directory \
+            tests/e2e/test_files_preview.py::test_external_file_changes_refresh_tree_without_manual_reload \
+            tests/e2e/test_multi_tab.py::test_pending_send_text_survives_hard_refresh
 
   # End-to-end Playwright browser tests. Gated behind RUN_E2E=1 (default-skip
   # locally so contributors don't need Chromium). This job installs the browser
