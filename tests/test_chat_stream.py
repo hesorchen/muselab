@@ -885,6 +885,16 @@ def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
     old_uuids = frozenset({"old-stream", "old-assistant", "old-user", "old-result"})
     monkeypatch.setattr(
         chat_mod, "_session_message_uuids", lambda _sid, _model: old_uuids)
+    # The delayed lifecycle record is only authoritative when it belongs to a
+    # task launched by this runtime.  Keep that ownership durable but leave the
+    # in-memory pin clear: this models a prior observer already releasing the
+    # runtime while the typed terminal record remains buffered in the pooled
+    # SDK queue.  The new turn may start, and the late record may still patch
+    # the old card without resurrecting the task or creating a notification.
+    assert chat_mod.sess.set_runtime_task_overlay(
+        sid, "task-old", state="running", owner_session_id=sid,
+        tool_use_id="tu-old",
+    )
 
     stale_batch = [
         TaskNotificationMessage(
@@ -944,6 +954,16 @@ def test_stream_drops_prior_turn_replay_but_keeps_late_task_lifecycle(
 
     assert fake.receive_calls == 2, "stale Result should reopen receive_response"
     assert kinds.count("task_notification") == 1
+    notification = next(
+        json.loads(data)
+        for kind, data in events
+        if kind == "task_notification"
+    )
+    assert notification["already_reported"] is True
+    assert notification["background_tasks_pending"] == 0
+    assert chat_mod.sess.get_runtime_task_overlays(sid)["task-old"][
+        "state"
+    ] == "completed"
     assert "tool_use" not in kinds
     assert "tool_result" not in kinds
     chunks = [json.loads(d)["text"] for e, d in events if e == "text"]
@@ -4992,6 +5012,8 @@ def test_watcher_without_a_task_pin_is_not_user_visible_active(stream_env):
             "active": False,
             "background_tasks_pending": 0,
             "runtime_background_tasks_pending": 0,
+            "runtime_continuation_pending": False,
+            "runtime_ui_revision": "",
             "activity_source": "",
         }
 
