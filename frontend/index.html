@@ -281,7 +281,8 @@
 
   <!-- 主界面 -->
   <div class="layout" x-show="authed" :style="layoutStyle()"
-       :data-mobile-tab="mobileTab" :data-desktop-full="desktopFullPane">
+       :data-mobile-tab="mobileTab" :data-desktop-full="desktopFullPane"
+       :aria-busy="workspaceSurfaceTransition">
 
     <!-- ============ 左：文件树 ============ -->
     <aside class="pane files"
@@ -1854,10 +1855,7 @@
                  short row of hints. Muses are still reachable from the
                  mascot itself (cycleMascot). -->
             <div class="brand-tips" x-transition.opacity.duration.200ms>
-              <div class="brand-tip"><span x-text="t('chat.empty_tip1')"></span> <span class="kbd">Enter</span> <span x-text="t('chat.empty_tip1b')"></span></div>
               <div class="brand-tip"><span class="kbd">@</span><span x-text="t('chat.empty_tip2')"></span></div>
-              <div class="brand-tip" x-text="t('chat.empty_tip3')"></div>
-              <div class="brand-tip"><span class="kbd">?</span><span x-text="t('chat.empty_tip4')"></span></div>
             </div>
           </div>
           <!-- (The dedicated conv-outline-wrap I added here in eafb7ad has
@@ -3651,6 +3649,18 @@
         <span x-text="t('pane.preview')"></span>
       </button>
     </nav>
+
+    <!-- File, conversation, and preview data resolve independently. Keep the
+         previous surface visually coherent until the target workspace has
+         committed, then reveal all three panes in one paint. -->
+    <div class="workspace-switch-shield" x-show="workspaceSurfaceTransition"
+         x-transition:leave.opacity.duration.120ms x-cloak
+         role="status" aria-live="polite">
+      <div class="workspace-switch-status">
+        <span class="spinner-sm" aria-hidden="true"></span>
+        <span x-text="t('workspace.switching')"></span>
+      </div>
+    </div>
 
   </div>
 
@@ -5869,7 +5879,10 @@
        @click.self="closeSessionTodoBoard()" x-cloak>
     <div class="modal session-todo-modal" role="dialog" aria-modal="true"
          aria-labelledby="session-todo-title" tabindex="-1"
-         @keydown.tab="trapDialogFocus($event, 'session-todo')">
+         @keydown.tab="trapDialogFocus($event, 'session-todo')"
+         @pointermove.window="onSessionTodoPointerMove($event)"
+         @pointerup.window="onSessionTodoPointerEnd($event)"
+         @pointercancel.window="onSessionTodoPointerEnd($event)">
       <div class="modal-head">
         <span class="modal-title" id="session-todo-title">
           <svg class="modal-title-icon"><use href="#i-check-circle"/></svg>
@@ -5903,6 +5916,7 @@
         <div class="session-todo-board" x-show="sessionTodoCount()">
           <template x-for="priority in ['high','medium','low']" :key="priority">
             <section class="session-todo-lane" :class="'is-' + priority"
+                     :data-todo-priority="priority"
                      @dragover.prevent
                      @drop="onSessionTodoDrop($event, priority)">
               <header>
@@ -5929,7 +5943,13 @@
                      @dragend="onSessionTodoDragEnd()"
                      @dragover.prevent
                      @drop.stop="onSessionTodoDrop($event, priority, item.id)">
-                  <span class="session-todo-grip" aria-hidden="true">⋮⋮</span>
+                  <button class="session-todo-grip" type="button"
+                          @pointerdown="onSessionTodoPointerDown($event, item)"
+                          @keydown="onSessionTodoGripKeydown($event, item)"
+                          :aria-label="(lang==='zh' ? '拖动待办；方向键可调整位置：' : 'Drag TODO; arrow keys move it: ') + item.text"
+                          :title="lang==='zh' ? '拖动调整顺序或优先级' : 'Drag to reorder or change priority'">
+                    <span aria-hidden="true">⋮⋮</span>
+                  </button>
                   <button class="session-todo-check" type="button"
                           @click="toggleSessionUserTodo(item.id)"
                           :aria-label="item.completed
@@ -5963,28 +5983,6 @@
                             :title="lang==='zh' ? '编辑' : 'Edit'">
                       <svg><use href="#i-edit"/></svg>
                     </button>
-                    <select class="session-todo-priority-select"
-                            :value="item.priority"
-                            @change="setSessionTodoPriority(item.id, $event.target.value, true)"
-                            :aria-label="(lang==='zh' ? '待办优先级：' : 'TODO priority: ') + item.text">
-                      <option value="high" x-text="lang==='zh' ? '高' : 'High'"></option>
-                      <option value="medium" x-text="lang==='zh' ? '中' : 'Medium'"></option>
-                      <option value="low" x-text="lang==='zh' ? '低' : 'Low'"></option>
-                    </select>
-                    <button class="session-todo-move" type="button"
-                            :disabled="!canMoveSessionTodo(item, -1)"
-                            @click="moveSessionTodoWithinPriority(item.id, -1)"
-                            :aria-label="(lang==='zh' ? '在同优先级中上移：' : 'Move up within priority: ') + item.text"
-                            :title="lang==='zh' ? '上移' : 'Move up'">
-                      <svg><use href="#i-arrow-up"/></svg>
-                    </button>
-                    <button class="session-todo-move" type="button"
-                            :disabled="!canMoveSessionTodo(item, 1)"
-                            @click="moveSessionTodoWithinPriority(item.id, 1)"
-                            :aria-label="(lang==='zh' ? '在同优先级中下移：' : 'Move down within priority: ') + item.text"
-                            :title="lang==='zh' ? '下移' : 'Move down'">
-                      <svg><use href="#i-arrow-down"/></svg>
-                    </button>
                     <button class="session-todo-delete" type="button"
                             @click="deleteSessionUserTodo(item.id)"
                             :aria-label="(lang==='zh' ? '删除待办：' : 'Delete TODO: ') + item.text">×</button>
@@ -5994,6 +5992,8 @@
             </section>
           </template>
         </div>
+        <div class="session-todo-live" aria-live="polite" aria-atomic="true"
+             x-text="sessionTodoAnnouncement"></div>
       </div>
     </div>
   </div>

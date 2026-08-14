@@ -620,6 +620,7 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
    Layout
    ========================================================================== */
 .layout {
+  position: relative;
   display: grid;
   grid-template-columns: 340px 1fr 440px;
   /* dvh = dynamic viewport height — matches the actually-visible area on
@@ -630,6 +631,31 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   grid-template-rows: 100dvh;
   height: 100vh; height: 100dvh;
   width: 100vw; overflow: hidden;
+}
+.workspace-switch-shield {
+  position: absolute;
+  z-index: 760;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--c-bg-0) 76%, transparent);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  cursor: progress;
+}
+.workspace-switch-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  padding: 8px 13px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-full);
+  background: var(--c-bg-1);
+  color: var(--c-fg-1);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-sm);
 }
 /* Desktop information hierarchy: files | chat | preview. Keep a single copy
    of each large Alpine subtree and use Grid's visual ordering, so changing the
@@ -3730,14 +3756,12 @@ pre.text {
 .session-todo-compose button:disabled { opacity:.4; cursor:default; }
 .session-todo-list { display:flex; flex-direction:column; gap:0; padding:2px; border:1px solid var(--c-border); border-radius:var(--r-md); background:var(--c-bg-2); }
 .session-todo-item { min-height:34px; align-items:center; }
-.session-todo-check,.session-todo-edit-button,.session-todo-move,.session-todo-delete { width:26px; height:26px; flex:0 0 26px; display:flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); cursor:pointer; }
-.session-todo-check:hover,.session-todo-edit-button:hover,.session-todo-move:hover,.session-todo-delete:hover { background:var(--c-bg-3); color:var(--c-fg-1); }
-.session-todo-edit-button:focus-visible,.session-todo-move:focus-visible,.session-todo-delete:focus-visible,.session-todo-check:focus-visible,.session-todo-priority-select:focus-visible { outline:2px solid var(--c-accent); outline-offset:1px; }
-.session-todo-edit-button svg,.session-todo-move svg { width:14px; height:14px; }
-.session-todo-move:disabled { opacity:.3; cursor:default; }
+.session-todo-check,.session-todo-edit-button,.session-todo-delete { width:26px; height:26px; flex:0 0 26px; display:flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-3); cursor:pointer; }
+.session-todo-check:hover,.session-todo-edit-button:hover,.session-todo-delete:hover { background:var(--c-bg-3); color:var(--c-fg-1); }
+.session-todo-edit-button:focus-visible,.session-todo-delete:focus-visible,.session-todo-check:focus-visible,.session-todo-grip:focus-visible { outline:2px solid var(--c-accent); outline-offset:1px; }
+.session-todo-edit-button svg { width:14px; height:14px; }
 .session-todo-check svg { width:14px; height:14px; color:var(--c-success); }
 .session-todo-actions { flex:0 0 auto; display:flex; align-items:center; gap:2px; margin-left:auto; }
-.session-todo-priority-select { width:72px; height:26px; padding:0 4px; border:1px solid var(--c-border); border-radius:var(--r-sm); outline:0; background:var(--c-bg-1); color:var(--c-fg-2); font:inherit; font-size:var(--fs-xs); cursor:pointer; }
 .session-todo-delete { opacity:.5; font-size:17px; }
 .session-todo-item:hover .session-todo-delete,.session-todo-delete:focus-visible { opacity:1; }
 .session-todo-board { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
@@ -3755,7 +3779,10 @@ pre.text {
 .session-todo-item.is-dragging { opacity:.35; }
 .session-todo-item.is-editing { cursor:text; border-color:var(--c-accent); }
 .session-todo-modal .session-todo-edit { width:100%; min-width:0; height:28px; margin:0; padding:0 7px; border:1px solid var(--c-accent); border-radius:var(--r-sm); outline:0; background:var(--c-bg-0); color:var(--c-fg-0); font:inherit; font-size:var(--fs-xs); box-shadow:0 0 0 2px var(--c-accent-soft); }
-.session-todo-grip { flex:0 0 auto; color:var(--c-fg-4); font:12px/1 var(--font-mono); letter-spacing:-3px; }
+.session-todo-grip { width:22px; height:28px; flex:0 0 22px; display:flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:var(--r-sm); background:transparent; color:var(--c-fg-4); font:12px/1 var(--font-mono); letter-spacing:-3px; cursor:grab; touch-action:none; }
+.session-todo-grip:hover { background:var(--c-bg-3); color:var(--c-fg-2); }
+.session-todo-grip:active { cursor:grabbing; }
+.session-todo-live { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
 @media (max-width:720px) {
   .session-todo-board { grid-template-columns:1fr; }
   .session-todo-lane { min-height:90px; }
@@ -3765,21 +3792,18 @@ pre.text {
   .session-todo-badge { right:-3px; }
 }
 @media (hover:none), (pointer:coarse), (max-width:720px) {
-  .session-todo-item { flex-wrap:wrap; }
+  .session-todo-item { flex-wrap:nowrap; }
   .session-todo-actions {
-    flex:1 1 100%; justify-content:flex-end;
-    margin-left:24px; padding-top:4px;
+    flex:0 0 auto; justify-content:flex-end;
+    margin-left:auto; padding-top:0;
   }
   .session-todo-check,
   .session-todo-edit-button,
-  .session-todo-move,
   .session-todo-delete {
     width:40px; height:40px; min-width:40px; min-height:40px;
     flex-basis:40px; touch-action:manipulation;
   }
-  .session-todo-priority-select {
-    width:72px; min-height:40px; touch-action:manipulation;
-  }
+  .session-todo-grip { width:40px; height:40px; flex-basis:40px; }
   .session-todo-compose input,
   .session-todo-compose button,
   .session-todo-modal .session-todo-edit,
@@ -9788,7 +9812,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
      - .modal width 100vw lost to global `min-width:360px` (modal too wide)
      - .settings-modal width 100vw lost to global `min-width:560px` (settings overflows)
      - .msg-actions display:none lost to global `display:flex` (copy btn drifts)
-     - .brand-tips display:none lost to global `display:flex` ("press Enter" still showed)
+     - .brand-tips display:none lost to global `display:flex` (empty hint still showed)
 
    Each fix used to need !important on the mobile rule. This block is
    the structural fix: ANY mobile-only width/display rule prone to
@@ -9852,9 +9876,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
     display: flex; flex-direction: column;
   }
 
-  /* Empty-state keyboard hints ("press Enter", "@ for files") don't
-     apply on phones (Enter = newline on soft keyboards, @-mention
-     picker is touch-fiddly). */
+  /* The empty-state file-mention hint is redundant on phones, where the
+     attachment button is the primary touch affordance. */
   .brand-tips { display: none; }
 
   /* Per-message floating action bar (Copy etc.) — `position:absolute;

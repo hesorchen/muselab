@@ -123,6 +123,19 @@ def test_i18n_zh_en_key_parity():
     )
 
 
+def test_empty_chat_keeps_only_the_file_mention_hint():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    i18n = (FRONTEND / "i18n" / "index.js").read_text(encoding="utf-8")
+    start = html.index('<div class="brand-tips"')
+    end = html.index("</div>", html.index("</div>", start) + 1)
+    hints = html[start:end]
+
+    assert "chat.empty_tip2" in hints
+    for removed in ("empty_tip1", "empty_tip1b", "empty_tip3", "empty_tip4"):
+        assert f"chat.{removed}" not in hints
+        assert f'"chat.{removed}"' not in i18n
+
+
 def test_frontend_positions_muselab_as_a_workspace_agent_workbench():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     constants = (FRONTEND / "data" / "constants.js").read_text(encoding="utf-8")
@@ -734,6 +747,16 @@ def test_workspace_switch_moves_files_preview_and_conversation_together():
     assert "this.openTab(" not in target_ready
     assert switch.index("await Promise.all([surfaceReady, targetReady])") < switch.index(
         "await this.openTab(target.id)")
+    assert "workspaceSurfaceTransition: false" in app
+    assert "const switchSeq = ++this._workspaceSwitchSeq" in switch
+    assert "this.workspaceSurfaceTransition = true" in switch
+    assert "await this.$nextTick()" in switch
+    assert "this.workspaceSurfaceTransition = false" in switch
+    assert "const previousMobileTab = this.mobileTab" in switch
+    assert "this.setMobileTab(previousMobileTab)" in switch
+    assert 'class="workspace-switch-shield"' in html
+    assert 'x-show="workspaceSurfaceTransition"' in html
+    assert ':aria-busy="workspaceSurfaceTransition"' in html
     assert "return this.currentWorkspacePath()" in app
     assert "workspaceSurfaces: this.workspaceSurfaces" in app
     files_start = html.index('<aside class="pane files"')
@@ -1601,6 +1624,10 @@ def test_chat_header_exposes_authenticated_session_todo_board():
     assert 'item.priority === "medium"' in app
     assert "onSessionTodoDragStart(ev, item)" in app
     assert "onSessionTodoDrop(ev, priority" in app
+    assert "onSessionTodoPointerDown(ev, item)" in app
+    assert "onSessionTodoPointerMove(ev)" in app
+    assert "onSessionTodoPointerEnd(ev)" in app
+    assert "onSessionTodoGripKeydown(ev, item)" in app
     assert 'priority: "medium"' in app
     todo_start = app.index("\n    _globalUserTodoStorageKey() {")
     todo_impl = app[todo_start:app.index("taskLogLine(m)", todo_start)]
@@ -1637,6 +1664,11 @@ def test_chat_header_exposes_authenticated_session_todo_board():
     assert '@dragstart="onSessionTodoDragStart($event, item)"' in html
     assert '@drop="onSessionTodoDrop($event, priority)"' in html
     assert '@drop.stop="onSessionTodoDrop($event, priority, item.id)"' in html
+    assert '@pointerdown="onSessionTodoPointerDown($event, item)"' in html
+    assert '@pointermove.window="onSessionTodoPointerMove($event)"' in html
+    assert '@keydown="onSessionTodoGripKeydown($event, item)"' in html
+    assert 'class="session-todo-priority-select"' not in html
+    assert 'class="session-todo-move"' not in html
     assert '@click="toggleSessionUserTodo(item.id)"' in html
     assert '@click="deleteSessionUserTodo(item.id)"' in html
     assert '@keydown.tab="trapDialogFocus($event, \'session-todo\')"' in html
