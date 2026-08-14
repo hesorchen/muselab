@@ -1496,6 +1496,8 @@ def test_session_todo_modal_uses_large_desktop_board(
     assert box["width"] >= 900
     assert box["height"] >= 600
     expect(modal.locator(".session-todo-lane")).to_have_count(3)
+    expect(modal.locator(".session-todo-priority-select")).to_have_count(0)
+    expect(modal.locator(".session-todo-move")).to_have_count(0)
 
     high_item = modal.locator(".session-todo-item", has_text="High item")
     high_item.locator(".session-todo-edit-button").click()
@@ -1518,6 +1520,77 @@ def test_session_todo_modal_uses_large_desktop_board(
     medium_edit.press("Escape")
     expect(medium_item.locator("strong")).to_have_text("Medium item")
     expect(modal).to_be_visible()
+
+    # The grip is now the one movement affordance. Left/right crosses priority
+    # lanes and up/down reorders within a lane, using the same persisted model
+    # as pointer/native dragging.
+    medium_grip = modal.locator('[data-todo-id="todo-medium"] .session-todo-grip')
+    medium_grip.focus()
+    medium_grip.press("ArrowLeft")
+    expect(modal.locator('.session-todo-lane.is-high [data-todo-id="todo-medium"]')).to_be_visible()
+    modal.locator('[data-todo-id="todo-medium"] .session-todo-grip').press("ArrowUp")
+    ordered = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const saved = JSON.parse(localStorage.getItem(
+            'muselab.userTodos.global') || '[]');
+          return {
+            high: app.sessionTodosForPriority('high').map(item => item.id),
+            saved: saved.find(item => item.id === 'todo-medium')?.priority,
+          };
+        }"""
+    )
+    assert ordered == {"high": ["todo-medium", "todo-high"], "saved": "high"}
+
+    low_item = modal.locator('[data-todo-id="todo-low"]')
+    high_lane = modal.locator(".session-todo-lane.is-high")
+    lane_box = high_lane.bounding_box()
+    assert lane_box is not None
+    low_item.drag_to(
+        high_lane,
+        target_position={"x": lane_box["width"] / 2, "y": lane_box["height"] - 8},
+    )
+    dragged = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const saved = JSON.parse(localStorage.getItem(
+            'muselab.userTodos.global') || '[]');
+          return {
+            high: app.sessionTodosForPriority('high').map(item => item.id),
+            saved: saved.find(item => item.id === 'todo-low')?.priority,
+          };
+        }"""
+    )
+    assert dragged == {
+        "high": ["todo-medium", "todo-high", "todo-low"],
+        "saved": "high",
+    }
+
+    touch_dragged = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const grip = document.querySelector(
+            '[data-todo-id="todo-high"] .session-todo-grip');
+          const lane = document.querySelector('.session-todo-lane.is-low');
+          const rect = lane.getBoundingClientRect();
+          const init = {
+            pointerId: 41, pointerType: 'touch', button: 0, buttons: 1,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.bottom - 8,
+            bubbles: true, cancelable: true,
+          };
+          grip.dispatchEvent(new PointerEvent('pointerdown', init));
+          window.dispatchEvent(new PointerEvent('pointermove', init));
+          window.dispatchEvent(new PointerEvent('pointerup', {...init, buttons: 0}));
+          const saved = JSON.parse(localStorage.getItem(
+            'muselab.userTodos.global') || '[]');
+          return {
+            low: app.sessionTodosForPriority('low').map(item => item.id),
+            saved: saved.find(item => item.id === 'todo-high')?.priority,
+          };
+        }"""
+    )
+    assert touch_dragged == {"low": ["todo-high"], "saved": "low"}
 
 
 def test_effort_fast_capabilities_and_session_restore(

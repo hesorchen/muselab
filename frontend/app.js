@@ -630,6 +630,8 @@ function portal() {
     sessionTodoOpen: false,
     sessionTodoDraft: "",
     sessionTodoDragId: "",
+    sessionTodoPointerId: null,
+    sessionTodoAnnouncement: "",
     sessionTodoEditId: "",
     sessionTodoEditDraft: "",
     _sessionTodoEditOwner: null,
@@ -732,6 +734,11 @@ function portal() {
     activeWorkspace: "",
     workspaceMenuOpen: false,
     workspaceSwitching: false,
+    // The file tree and preview switch ownership before the target transcript
+    // is ready. Keep that valid intermediate state behind one visual barrier
+    // so the three workspace surfaces are revealed together.
+    workspaceSurfaceTransition: false,
+    _workspaceSwitchSeq: 0,
     workspaceDrag: { path: "", overPath: "", pointerId: null, originalPaths: [] },
     workspaceBrowser: {
       show: false, loading: false, error: "", path: "", name: "", parent: "",
@@ -10488,7 +10495,10 @@ function portal() {
         this.toast(this.lang === "zh" ? "工作目录未登记" : "Workspace is not registered", "error");
         return;
       }
+      const switchSeq = ++this._workspaceSwitchSeq;
+      const previousMobileTab = this.mobileTab;
       this.workspaceSwitching = true;
+      this.workspaceSurfaceTransition = true;
       try {
         // A workspace owns the conversation cwd, file tree, preview tabs, and
         // editor together. Start the tree request first (it changes the owner
@@ -10513,13 +10523,42 @@ function portal() {
           return target || null;
         })().catch(() => null);
         const [surfaceOk, target] = await Promise.all([surfaceReady, targetReady]);
-        if (!surfaceOk || !this._workspaceIsCurrent(path)) return;
+        if (switchSeq !== this._workspaceSwitchSeq
+            || !surfaceOk || !this._workspaceIsCurrent(path)) return;
         if (target) await this.openTab(target.id);
         else this.newSession({ cwd: path });
+        if (switchSeq !== this._workspaceSwitchSeq
+            || !this._workspaceIsCurrent(path)) return;
+        // A normal session activation intentionally reveals Chat on phones.
+        // A workspace switch is different: Files/Preview is often where the
+        // user initiated it, so preserve that page across the atomic reveal.
+        if (this._isMobileLayout()) this.setMobileTab(previousMobileTab);
         this.toast((this.lang === "zh" ? "已切换到 " : "Switched to ")
           + this.workspaceLabel(path), "success", 1600);
       } finally {
-        this.workspaceSwitching = false;
+        if (switchSeq === this._workspaceSwitchSeq) {
+          // Let Alpine commit the target tree, panes, and conversation behind
+          // the shield before its leave transition begins.
+          await this.$nextTick();
+          if (switchSeq === this._workspaceSwitchSeq) {
+            await new Promise(resolve => {
+              let settled = false;
+              const done = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(fallback);
+                resolve();
+              };
+              const fallback = setTimeout(done, 80);
+              if (typeof requestAnimationFrame === "function") requestAnimationFrame(done);
+              else done();
+            });
+          }
+          if (switchSeq === this._workspaceSwitchSeq) {
+            this.workspaceSwitching = false;
+            this.workspaceSurfaceTransition = false;
+          }
+        }
       }
     },
     closeWorkspaceBrowser() {
@@ -12015,46 +12054,8 @@ function portal() {
     sessionTodosForPriority(priority) {
       return this.sessionTodoItems().filter(item => item.priority === priority);
     },
-    setSessionTodoPriority(id, priority, restoreFocus = false) {
-      if (!id || !["high", "medium", "low"].includes(priority)) return;
-      let changed = false;
-      this.userTodos = this.sessionTodoItems().map(item => {
-        if (item.id !== id || item.priority === priority) return item;
-        changed = true;
-        return { ...item, priority };
-      });
-      if (!changed) return;
-      this._persistGlobalUserTodos();
-      if (restoreFocus) {
-        this.$nextTick(() => {
-          const selector = `.session-todo-item[data-todo-id="${CSS.escape(id)}"] .session-todo-priority-select`;
-          this._focusWithoutScroll(document.querySelector(selector));
-        });
-      }
-    },
-    canMoveSessionTodo(item, delta) {
-      if (!item || !item.id || !delta) return false;
-      const peers = this.sessionTodosForPriority(item.priority);
-      const index = peers.findIndex(peer => peer.id === item.id);
-      const target = index + (delta < 0 ? -1 : 1);
-      return index >= 0 && target >= 0 && target < peers.length;
-    },
-    moveSessionTodoWithinPriority(id, delta) {
-      const items = this.sessionTodoItems().slice();
-      const source = items.findIndex(item => item.id === id);
-      if (source < 0 || !delta) return;
-      const priority = items[source].priority;
-      const peerIndexes = items.map((item, index) => item.priority === priority ? index : -1)
-        .filter(index => index >= 0);
-      const peerIndex = peerIndexes.indexOf(source);
-      const targetPeer = peerIndex + (delta < 0 ? -1 : 1);
-      if (targetPeer < 0 || targetPeer >= peerIndexes.length) return;
-      const target = peerIndexes[targetPeer];
-      [items[source], items[target]] = [items[target], items[source]];
-      this.userTodos = items;
-      this._persistGlobalUserTodos();
-    },
     onSessionTodoDragStart(ev, item) {
+      this.sessionTodoPointerId = null;
       this.sessionTodoDragId = item.id;
       if (ev?.dataTransfer) {
         ev.dataTransfer.effectAllowed = "move";
@@ -12064,22 +12065,134 @@ function portal() {
     onSessionTodoDragEnd() {
       this.sessionTodoDragId = "";
     },
+    _focusSessionTodoGrip(id) {
+      this.$nextTick(() => {
+        const selector = `.session-todo-item[data-todo-id="${CSS.escape(id)}"] .session-todo-grip`;
+        this._focusWithoutScroll(document.querySelector(selector));
+      });
+    },
+    _announceSessionTodoMove(item, action) {
+      this.sessionTodoAnnouncement = "";
+      this.$nextTick(() => {
+        const text = String(item?.text || "");
+        this.sessionTodoAnnouncement = this.lang === "zh"
+          ? `${text}${action}` : `${text} ${action}`;
+      });
+    },
+    _moveSessionTodoTo(id, priority, beforeId = "", persist = true) {
+      if (!id || !["high", "medium", "low"].includes(priority)) return false;
+      const previous = this.sessionTodoItems();
+      const current = previous.slice();
+      const source = current.findIndex(item => item.id === id);
+      if (source < 0) return false;
+      const [sourceItem] = current.splice(source, 1);
+      const moved = { ...sourceItem, priority };
+      const target = beforeId && beforeId !== id
+        ? current.findIndex(item => item.id === beforeId) : -1;
+      if (target >= 0) current.splice(target, 0, moved);
+      else current.push(moved);
+      const changed = current.length !== previous.length || current.some((item, index) =>
+        item.id !== previous[index]?.id || item.priority !== previous[index]?.priority);
+      if (!changed) return false;
+      this.userTodos = current;
+      if (persist) this._persistGlobalUserTodos();
+      return true;
+    },
+    _sessionTodoDropAnchor(target, clientY, movingId) {
+      if (!target) return "";
+      const targetId = target.dataset?.todoId || "";
+      const priority = target.closest?.("[data-todo-priority]")?.dataset?.todoPriority || "";
+      if (!targetId || targetId === movingId || !priority) return "";
+      const rect = target.getBoundingClientRect();
+      if (!Number.isFinite(clientY) || clientY <= rect.top + rect.height / 2) return targetId;
+      const peers = this.sessionTodosForPriority(priority)
+        .filter(item => item.id !== movingId);
+      const index = peers.findIndex(item => item.id === targetId);
+      return index >= 0 && index + 1 < peers.length ? peers[index + 1].id : "";
+    },
+    onSessionTodoPointerDown(ev, item) {
+      if (!item?.id || ev?.pointerType === "mouse"
+          || (ev?.button != null && ev.button !== 0)
+          || this.sessionTodoEditId === item.id) return;
+      this.sessionTodoPointerId = ev.pointerId;
+      this.sessionTodoDragId = item.id;
+      ev.preventDefault?.();
+      try { ev.currentTarget?.setPointerCapture?.(ev.pointerId); } catch (_) {}
+    },
+    onSessionTodoPointerMove(ev) {
+      if (this.sessionTodoPointerId !== ev?.pointerId || !this.sessionTodoDragId) return;
+      ev.preventDefault?.();
+      const hit = document.elementFromPoint(ev.clientX, ev.clientY);
+      const lane = hit?.closest?.("[data-todo-priority]");
+      if (!lane) return;
+      const priority = lane.dataset.todoPriority;
+      const target = hit.closest?.(".session-todo-item");
+      if (target?.dataset?.todoId === this.sessionTodoDragId) return;
+      const beforeId = this._sessionTodoDropAnchor(
+        target, Number(ev.clientY), this.sessionTodoDragId,
+      );
+      this._moveSessionTodoTo(this.sessionTodoDragId, priority, beforeId, false);
+    },
+    onSessionTodoPointerEnd(ev) {
+      if (this.sessionTodoPointerId !== ev?.pointerId || !this.sessionTodoDragId) return;
+      const id = this.sessionTodoDragId;
+      this.sessionTodoPointerId = null;
+      this.sessionTodoDragId = "";
+      this._persistGlobalUserTodos();
+      this._focusSessionTodoGrip(id);
+    },
+    onSessionTodoGripKeydown(ev, item) {
+      if (!item?.id || ev?.altKey || ev?.ctrlKey || ev?.metaKey
+          || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.key)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const priorities = ["high", "medium", "low"];
+      let changed = false;
+      let action = "";
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+        const index = priorities.indexOf(item.priority);
+        const targetIndex = index + (ev.key === "ArrowLeft" ? -1 : 1);
+        if (targetIndex >= 0 && targetIndex < priorities.length) {
+          const priority = priorities[targetIndex];
+          changed = this._moveSessionTodoTo(item.id, priority, "", true);
+          const label = priority === "high"
+            ? (this.lang === "zh" ? "高优先级" : "high priority")
+            : priority === "medium"
+              ? (this.lang === "zh" ? "中优先级" : "medium priority")
+              : (this.lang === "zh" ? "低优先级" : "low priority");
+          action = this.lang === "zh" ? `已移至${label}` : `moved to ${label}`;
+        }
+      } else {
+        const peers = this.sessionTodosForPriority(item.priority);
+        const index = peers.findIndex(peer => peer.id === item.id);
+        if (ev.key === "ArrowUp" && index > 0) {
+          changed = this._moveSessionTodoTo(item.id, item.priority, peers[index - 1].id, true);
+          action = this.lang === "zh" ? "已上移" : "moved up";
+        } else if (ev.key === "ArrowDown" && index >= 0 && index + 1 < peers.length) {
+          const beforeId = index + 2 < peers.length ? peers[index + 2].id : "";
+          changed = this._moveSessionTodoTo(item.id, item.priority, beforeId, true);
+          action = this.lang === "zh" ? "已下移" : "moved down";
+        }
+      }
+      if (changed) {
+        this._announceSessionTodoMove(item, action);
+        this._focusSessionTodoGrip(item.id);
+      }
+    },
     onSessionTodoDrop(ev, priority, beforeId = "") {
       ev?.preventDefault?.();
       const id = this.sessionTodoDragId
         || ev?.dataTransfer?.getData("text/plain") || "";
       if (!id || !["high", "medium", "low"].includes(priority)) return;
-      const current = this.sessionTodoItems().slice();
-      const source = current.findIndex(item => item.id === id);
-      if (source < 0) return;
-      const [sourceItem] = current.splice(source, 1);
-      const moved = { ...sourceItem, priority };
-      const target = beforeId ? current.findIndex(item => item.id === beforeId) : -1;
-      if (target >= 0) current.splice(target, 0, moved);
-      else current.push(moved);
-      this.userTodos = current;
+      if (beforeId === id) {
+        this.sessionTodoDragId = "";
+        return;
+      }
+      const anchor = beforeId
+        ? this._sessionTodoDropAnchor(ev?.currentTarget, Number(ev?.clientY), id)
+        : "";
+      this._moveSessionTodoTo(id, priority, anchor, true);
       this.sessionTodoDragId = "";
-      this._persistGlobalUserTodos();
     },
     toggleSessionTodoBoard() {
       if (this.sessionTodoOpen) this.closeSessionTodoBoard();
@@ -12096,6 +12209,8 @@ function portal() {
       const wasOpen = this.sessionTodoOpen;
       this.sessionTodoOpen = false;
       this.sessionTodoDraft = "";
+      this.sessionTodoPointerId = null;
+      this.sessionTodoDragId = "";
       this.cancelSessionTodoEdit();
       if (wasOpen) this._closeFocusSurface("session-todo");
     },

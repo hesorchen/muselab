@@ -906,6 +906,8 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
             events.preloadStart = performance.now();
             events.preloadedSid = sid;
             events.currentAtPreloadStart = app.currentId;
+            events.shieldDuringPreload = app.workspaceSurfaceTransition
+              && getComputedStyle(document.querySelector('.workspace-switch-shield')).display !== 'none';
             await new Promise(resolve => setTimeout(resolve, 150));
             events.preloadEnd = performance.now();
             events.currentAtPreloadEnd = app.currentId;
@@ -931,6 +933,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
               current: app.currentId, opened, newCount,
               stalePresent: app.sessions.some(row => row.id === staleId),
               switching: app.workspaceSwitching,
+              surfaceTransition: app.workspaceSurfaceTransition,
             };
           } finally {
             app.loadRoot = originals.loadRoot;
@@ -963,6 +966,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
     assert concurrent_duration < tree_duration + target_duration - 80
     assert events["currentAtPreloadStart"] == result["originalCurrent"]
     assert events["currentAtPreloadEnd"] == result["originalCurrent"]
+    assert events["shieldDuringPreload"] is True
     assert events["currentBeforeOpen"] == result["originalCurrent"]
     assert events["preloadedSid"] == result["targetId"]
     assert result["stalePresent"] is False
@@ -970,6 +974,7 @@ def test_workspace_switch_overlaps_tree_sessions_and_transcript_without_early_ac
     assert result["current"] == result["targetId"]
     assert result["newCount"] == 0
     assert result["switching"] is False
+    assert result["surfaceTransition"] is False
 
 
 def test_concurrent_session_list_does_not_advance_an_older_transcript_revision(
